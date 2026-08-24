@@ -1,0 +1,51 @@
+{
+  "name": "@unblocklabs/openclaw-unblock-qmd",
+  "version": "0.1.0",
+  "description": "QMD-backed canonical memory for OpenClaw",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unblocklabs-ai/unblock-qmd.git"
+  },
+  "homepage": "https://github.com/unblocklabs-ai/unblock-qmd#readme",
+  "bugs": {
+    "url": "https://github.com/unblocklabs-ai/unblock-qmd/issues"
+  },
+  "files": ["dist", "README.md", "openclaw.plugin.json"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/**/*.test.ts",
+    "plugin:inspect": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw",
+    "plugin:inspect:runtime": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw --runtime --mock-sdk --allow-execute",
+    "preflight": "npm run build && npm run typecheck && npm test && npm run plugin:inspect && npm run plugin:inspect:runtime && npm pack --dry-run"
+  },
+  "dependencies": {
+    "@unblocklabs/qmd": "github:unblocklabs-ai/qmd#0a6b15d",
+    "chokidar": "5.0.0",
+    "typebox": "1.3.6"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-inspector": "^0.3.10",
+    "@types/node": "^24.6.0",
+    "openclaw": "2026.8.1-beta.3",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.8.1-beta.3"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": { "optional": true }
+  },
+  "engines": { "node": ">=22.0.0" },
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "compat": { "pluginApi": ">=2026.8.1-beta.3", "minGatewayVersion": "2026.8.1-beta.3" },
+    "build": { "openclawVersion": "2026.8.1-beta.3", "pluginSdkVersion": "2026.8.1-beta.3" },
+    "release": { "publishToClawHub": false, "publishToNpm": false }
+  }
+}

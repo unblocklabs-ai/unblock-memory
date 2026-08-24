@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "plugin": {
+    "id": "unblock-qmd",
+    "priority": "high",
+    "seams": ["plugin-runtime"],
+    "sourceRoot": "src",
+    "expect": {
+      "registrations": ["registerMemoryCapability", "registerTool"],
+      "manifestContracts": ["tools"]
+    }
+  },
+  "capture": { "mockSdk": true }
+}

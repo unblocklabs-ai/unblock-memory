@@ -1,0 +1,26 @@
+{
+  "id": "unblock-qmd",
+  "name": "Unblock QMD Memory",
+  "version": "0.1.0",
+  "description": "Indexes configured Markdown sources with semantic chunking and serves OpenClaw memory search.",
+  "kind": "memory",
+  "activation": { "onStartup": false },
+  "contracts": { "tools": ["memory_search", "memory_get"] },
+  "uiHints": {
+    "paths": {
+      "label": "Memory Paths",
+      "help": "Exact Markdown files, directories, or globs. Relative paths resolve from each agent workspace."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "paths": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "default": ["MEMORY.md", "USER.md", "memory/**/*.md"]
+      }
+    }
+  }
+}
