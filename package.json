@@ -14,6 +14,10 @@
   "bugs": {
     "url": "https://github.com/unblocklabs-ai/unblock-qmd/issues"
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "files": ["dist", "README.md", "openclaw.plugin.json"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -21,6 +25,7 @@
     "test": "node --import tsx --test tests/**/*.test.ts",
     "plugin:inspect": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw",
     "plugin:inspect:runtime": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw --runtime --mock-sdk --allow-execute",
+    "release:check": "node scripts/check-release-version.mjs",
     "preflight": "npm run build && npm run typecheck && npm test && npm run plugin:inspect && npm run plugin:inspect:runtime && npm pack --dry-run"
   },
   "dependencies": {
@@ -46,6 +51,11 @@
     "extensions": ["./dist/index.js"],
     "compat": { "pluginApi": ">=2026.8.1-beta.3", "minGatewayVersion": "2026.8.1-beta.3" },
     "build": { "openclawVersion": "2026.8.1-beta.3", "pluginSdkVersion": "2026.8.1-beta.3" },
-    "release": { "publishToClawHub": false, "publishToNpm": false }
+    "install": {
+      "npmSpec": "@unblocklabs/openclaw-unblock-qmd",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.8.1-beta.3"
+    },
+    "release": { "publishToClawHub": false, "publishToNpm": true }
   }
 }
