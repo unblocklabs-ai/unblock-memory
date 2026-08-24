@@ -7,6 +7,14 @@ reranker.
 
 ## Installation
 
+From npm:
+
+```bash
+openclaw plugins install @unblocklabs/openclaw-unblock-qmd
+```
+
+Or directly from GitHub:
+
 ```bash
 openclaw plugins install git:github.com/unblocklabs-ai/unblock-qmd
 ```
