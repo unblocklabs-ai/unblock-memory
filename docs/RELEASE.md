@@ -5,21 +5,19 @@ The release tag, `package.json`, and `openclaw.plugin.json` must all contain the
 same version. Stable releases use npm's `latest` tag; GitHub prereleases use
 `next`.
 
-## One-time trusted publisher setup
+## Trusted publisher
 
-npm requires a package to exist before it can have a trusted publisher.
-Version `0.1.0` was published as that one-time bootstrap release. After this
-workflow exists on the repository's default branch, an npm owner must establish
-the trust relationship once:
+npm trusted publishing is configured with:
 
-```bash
-npx --yes npm@11.13.0 trust github @unblocklabs/openclaw-unblock-qmd \
-  --repo unblocklabs-ai/unblock-qmd \
-  --file release.yml
-```
+- GitHub organization: `unblocklabs-ai`
+- repository: `unblock-qmd`
+- workflow: `release.yml`
+- allowed action: `npm publish`
 
-Do not republish `0.1.0` and do not add an `NPM_TOKEN` GitHub secret. Trusted
-publishing gives subsequent workflow runs short-lived credentials through OIDC.
+Manage this configuration through the package settings on npm. The npm 11.13
+`npm trust` command cannot select the required allowed action and the registry
+rejects it with `E400`. Do not add an `NPM_TOKEN` GitHub secret; trusted
+publishing gives workflow runs short-lived credentials through OIDC.
 
 ## Publish a release
 

@@ -1,7 +1,7 @@
 {
   "id": "unblock-qmd",
   "name": "Unblock QMD Memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Indexes configured Markdown sources with semantic chunking and serves OpenClaw memory search.",
   "kind": "memory",
   "activation": { "onStartup": false },
