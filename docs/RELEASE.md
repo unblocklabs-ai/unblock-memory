@@ -10,7 +10,7 @@ same version. Stable releases use npm's `latest` tag; GitHub prereleases use
 npm trusted publishing is configured with:
 
 - GitHub organization: `unblocklabs-ai`
-- repository: `unblock-qmd`
+- repository: `unblock-memory`
 - workflow: `release.yml`
 - allowed action: `npm publish`
 

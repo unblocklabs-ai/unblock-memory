@@ -37,7 +37,7 @@ function createSearchTool(runtime, ctx) {
             if (!manager)
                 return jsonResult({ results: [], error: error ?? "memory unavailable" });
             const results = await manager.search(query, { maxResults, minScore, signal });
-            return jsonResult({ results, provider: "unblock-qmd" });
+            return jsonResult({ results, provider: "unblock-memory" });
         },
     };
 }
@@ -67,6 +67,170 @@ function createGetTool(runtime, ctx) {
                 from: typeof raw.from === "number" ? raw.from : undefined,
                 lines: typeof raw.lines === "number" ? raw.lines : undefined,
             }));
+        },
+    };
+}
+const reclusterParameters = Type.Object({
+    space: Type.Optional(Type.Object({
+        method: Type.Optional(Type.Union([Type.Literal("umap"), Type.Literal("none")])),
+        nComponents: Type.Optional(Type.Integer({ minimum: 2, maximum: 100 })),
+        nNeighbors: Type.Optional(Type.Integer({ minimum: 2, maximum: 200 })),
+        minDist: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+    }, { additionalProperties: false })),
+    hdbscan: Type.Optional(Type.Object({
+        minClusterSize: Type.Optional(Type.Integer({ minimum: 2, maximum: 100_000 })),
+        minSamples: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+        clusterSelectionMethod: Type.Optional(Type.Union([Type.Literal("eom"), Type.Literal("leaf")])),
+        clusterSelectionEpsilon: Type.Optional(Type.Number({ minimum: 0 })),
+        allowSingleCluster: Type.Optional(Type.Boolean()),
+    }, { additionalProperties: false })),
+    seed: Type.Optional(Type.Integer({ minimum: 0, maximum: 4_294_967_295 })),
+}, { additionalProperties: false });
+function requireObject(value, name) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${name} must be an object`);
+    }
+    return Object.fromEntries(Object.entries(value));
+}
+function optionalNumber(value, key, constraints) {
+    const candidate = value[key];
+    if (candidate === undefined)
+        return undefined;
+    const valid = typeof candidate === "number" && Number.isFinite(candidate) &&
+        candidate >= constraints.minimum &&
+        (constraints.maximum === undefined || candidate <= constraints.maximum) &&
+        (!constraints.integer || Number.isInteger(candidate));
+    if (!valid)
+        throw new Error(`${key} is invalid`);
+    return candidate;
+}
+function requireOnlyKeys(value, allowed) {
+    const unexpected = Object.keys(value).find((key) => !allowed.includes(key));
+    if (unexpected)
+        throw new Error(`${unexpected} is not allowed`);
+}
+function parseReclusterOptions(params) {
+    const raw = toolParams(params);
+    requireOnlyKeys(raw, ["space", "hdbscan", "seed"]);
+    const options = {};
+    if (raw.space !== undefined) {
+        const space = requireObject(raw.space, "space");
+        requireOnlyKeys(space, ["method", "nComponents", "nNeighbors", "minDist"]);
+        const method = space.method;
+        if (method !== undefined && method !== "umap" && method !== "none") {
+            throw new Error("space.method is invalid");
+        }
+        options.space = {
+            ...(method === undefined ? {} : { method }),
+            ...optionalEntry("nComponents", optionalNumber(space, "nComponents", { minimum: 2, maximum: 100, integer: true })),
+            ...optionalEntry("nNeighbors", optionalNumber(space, "nNeighbors", { minimum: 2, maximum: 200, integer: true })),
+            ...optionalEntry("minDist", optionalNumber(space, "minDist", { minimum: 0, maximum: 1 })),
+        };
+    }
+    if (raw.hdbscan !== undefined) {
+        const hdbscan = requireObject(raw.hdbscan, "hdbscan");
+        requireOnlyKeys(hdbscan, [
+            "minClusterSize",
+            "minSamples",
+            "clusterSelectionMethod",
+            "clusterSelectionEpsilon",
+            "allowSingleCluster",
+        ]);
+        const method = hdbscan.clusterSelectionMethod;
+        if (method !== undefined && method !== "eom" && method !== "leaf") {
+            throw new Error("hdbscan.clusterSelectionMethod is invalid");
+        }
+        const allowSingleCluster = hdbscan.allowSingleCluster;
+        if (allowSingleCluster !== undefined && typeof allowSingleCluster !== "boolean") {
+            throw new Error("hdbscan.allowSingleCluster is invalid");
+        }
+        options.hdbscan = {
+            ...optionalEntry("minClusterSize", optionalNumber(hdbscan, "minClusterSize", { minimum: 2, maximum: 100_000, integer: true })),
+            ...optionalEntry("minSamples", optionalNumber(hdbscan, "minSamples", { minimum: 1, maximum: 100_000, integer: true })),
+            ...(method === undefined ? {} : { clusterSelectionMethod: method }),
+            ...optionalEntry("clusterSelectionEpsilon", optionalNumber(hdbscan, "clusterSelectionEpsilon", { minimum: 0 })),
+            ...(allowSingleCluster === undefined ? {} : { allowSingleCluster }),
+        };
+    }
+    const seed = optionalNumber(raw, "seed", { minimum: 0, maximum: 4_294_967_295, integer: true });
+    if (seed !== undefined)
+        options.seed = seed;
+    return options;
+}
+function optionalEntry(key, value) {
+    return value === undefined ? {} : { [key]: value };
+}
+function createReclusterTool(runtime, ctx) {
+    const active = getContext(ctx);
+    if (!active)
+        return null;
+    return {
+        name: "memory_recluster",
+        label: "Recluster Memory",
+        description: "Rebuild memory clusters from existing QMD vectors. Call only when memory_list_clusters reports missing or stale analysis.",
+        parameters: reclusterParameters,
+        async execute(_toolCallId, params, signal) {
+            const options = parseReclusterOptions(params);
+            const { manager, error } = await runtime.getMemorySearchManager(active);
+            if (!manager)
+                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+            try {
+                return jsonResult(await manager.recluster(options, signal));
+            }
+            catch (analysisError) {
+                return jsonResult({
+                    status: "unavailable",
+                    error: analysisError instanceof Error ? analysisError.message : String(analysisError),
+                });
+            }
+        },
+    };
+}
+function createListClustersTool(runtime, ctx) {
+    const active = getContext(ctx);
+    if (!active)
+        return null;
+    return {
+        name: "memory_list_clusters",
+        label: "List Memory Clusters",
+        description: "List current memory clusters and freshness. Call this before memory_recluster or memory_fetch_cluster.",
+        parameters: Type.Object({
+            limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+        }, { additionalProperties: false }),
+        async execute(_toolCallId, params) {
+            const raw = toolParams(params);
+            requireOnlyKeys(raw, ["limit"]);
+            const limit = optionalNumber(raw, "limit", { minimum: 1, maximum: 50, integer: true });
+            const { manager, error } = await runtime.getMemorySearchManager(active);
+            if (!manager)
+                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+            return jsonResult(await manager.listClusters(limit));
+        },
+    };
+}
+function createFetchClusterTool(runtime, ctx) {
+    const active = getContext(ctx);
+    if (!active)
+        return null;
+    return {
+        name: "memory_fetch_cluster",
+        label: "Fetch Memory Cluster",
+        description: "Fetch the top representative QMD chunks for a clusterId returned by memory_list_clusters.",
+        parameters: Type.Object({
+            clusterId: Type.String({ pattern: "^[0-9a-f]{10}$" }),
+            topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+        }, { additionalProperties: false }),
+        async execute(_toolCallId, params) {
+            const raw = toolParams(params);
+            requireOnlyKeys(raw, ["clusterId", "topK"]);
+            const clusterId = readStringParam(raw, "clusterId");
+            if (!clusterId || !/^[0-9a-f]{10}$/.test(clusterId))
+                throw new Error("clusterId is invalid");
+            const topK = optionalNumber(raw, "topK", { minimum: 1, maximum: 50, integer: true });
+            const { manager, error } = await runtime.getMemorySearchManager(active);
+            if (!manager)
+                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+            return jsonResult(await manager.fetchCluster({ clusterId, topK }));
         },
     };
 }
@@ -140,9 +304,9 @@ export function resolveFlushPlan(params = {}) {
         relativePath: target,
     };
 }
-export function registerUnblockQmd(api) {
+export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
-    const runtime = new QmdMemoryRuntime(config.paths);
+    const runtime = new QmdMemoryRuntime(config.paths, config.analysis.executable);
     const capability = {
         deterministicRecallToolName: "memory_search",
         supportsPrivateTranscriptRecall: false,
@@ -155,4 +319,7 @@ export function registerUnblockQmd(api) {
     api.registerMemoryCapability(capability);
     api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
+    api.registerTool((ctx) => createReclusterTool(runtime, ctx), { names: ["memory_recluster"] });
+    api.registerTool((ctx) => createListClustersTool(runtime, ctx), { names: ["memory_list_clusters"] });
+    api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), { names: ["memory_fetch_cluster"] });
 }

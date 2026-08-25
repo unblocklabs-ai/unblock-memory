@@ -2,6 +2,20 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
+import {
+  ensureMemoryAnalysisSchema,
+  latestAnalysisRunId,
+  markMemoryAnalysisStale,
+  readAnalysisSummary,
+  readCluster,
+  readClusters,
+  runAnalysisWorker,
+  type AnalysisRunner,
+  type MemoryAnalysisSummary,
+  type MemoryClusterDetail,
+  type MemoryClusterList,
+  type MemoryReclusterOptions,
+} from "./analysis.js";
 import type {
   MemoryEmbeddingProbeResult,
   MemoryProviderStatus,
@@ -30,6 +44,8 @@ export type ManagerStore = Pick<
   | "close"
 >;
 
+type AnalysisStore = ManagerStore & Pick<QMDStore, "internal">;
+
 export function enableSecureDelete(store: QMDStore): void {
   store.internal.db.exec("PRAGMA secure_delete = ON");
 }
@@ -52,11 +68,11 @@ export function cleanupRemovedDocuments(store: QMDStore, changedDocuments = 0): 
 export async function pruneStaleCollections(
   store: QMDStore,
   configuredCollections: ReadonlySet<string>,
-): Promise<void> {
+): Promise<number> {
   const staleCollections = (await store.getStatus()).collections
     .map((collection) => collection.name)
     .filter((name) => !configuredCollections.has(name));
-  if (staleCollections.length === 0) return;
+  if (staleCollections.length === 0) return 0;
 
   enableSecureDelete(store);
   const deleteDocuments = store.internal.db.prepare(
@@ -68,6 +84,7 @@ export async function pruneStaleCollections(
     return count;
   }).immediate();
   cleanupRemovedDocuments(store, removed);
+  return removed;
 }
 
 export function buildReadResult(params: {
@@ -134,9 +151,11 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   readonly #workspaceDir: string;
   readonly #sources: ReadonlyMap<string, ResolvedSource>;
   readonly #storeFactory?: () => Promise<ManagerStore>;
+  readonly #analysisExecutable?: string;
+  readonly #analysisRunner: AnalysisRunner;
   #store?: ManagerStore;
   #cleanupRemovedDocuments?: (changedDocuments: number) => void;
-  #syncChain?: Promise<void>;
+  #operationChain?: Promise<void>;
   #watcher?: FSWatcher;
   #watchReady?: Promise<void>;
   #watchTimer?: NodeJS.Timeout;
@@ -150,11 +169,15 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     workspaceDir: string;
     sources: readonly ResolvedSource[];
     storeFactory?: () => Promise<ManagerStore>;
+    analysisExecutable?: string;
+    analysisRunner?: AnalysisRunner;
   }) {
     this.#dbPath = params.dbPath;
     this.#workspaceDir = params.workspaceDir;
     this.#sources = new Map(params.sources.map((source) => [source.collection, source]));
     this.#storeFactory = params.storeFactory;
+    this.#analysisExecutable = params.analysisExecutable;
+    this.#analysisRunner = params.analysisRunner ?? runAnalysisWorker;
   }
 
   async start(): Promise<void> {
@@ -194,6 +217,8 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     await mkdir(dirname(this.#dbPath), { recursive: true });
     if (this.#storeFactory) {
       this.#store = await this.#storeFactory();
+      const store = this.#store as Partial<AnalysisStore>;
+      if (store.internal) ensureMemoryAnalysisSchema(store.internal.db);
       return this.#store;
     }
     const { createStore } = await qmdModule;
@@ -209,7 +234,9 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       },
     });
     enableSecureDelete(store);
-    await pruneStaleCollections(store, new Set(this.#collectionNames()));
+    ensureMemoryAnalysisSchema(store.internal.db);
+    const prunedDocuments = await pruneStaleCollections(store, new Set(this.#collectionNames()));
+    if (prunedDocuments > 0) markMemoryAnalysisStale(store.internal.db);
     this.#cleanupRemovedDocuments = (changedDocuments) => {
       cleanupRemovedDocuments(store, changedDocuments);
     };
@@ -227,15 +254,80 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       this.#dirty = true;
       const update = await store.update();
       this.#cleanupRemovedDocuments?.(update.updated + update.removed);
-      await store.embed({ force: params?.force, chunkStrategy: "semantic" });
+      const analysisStore = store as Partial<AnalysisStore>;
+      const invalidatesAnalysis =
+        update.indexed + update.updated + update.removed > 0 ||
+        update.needsEmbedding > 0 ||
+        params?.force === true;
+      if (invalidatesAnalysis && analysisStore.internal) {
+        markMemoryAnalysisStale(analysisStore.internal.db);
+      }
+      const embed = await store.embed({ force: params?.force, chunkStrategy: "semantic" });
+      if (!invalidatesAnalysis && embed.chunksEmbedded > 0 && analysisStore.internal) {
+        markMemoryAnalysisStale(analysisStore.internal.db);
+      }
       const status = await store.getStatus();
       const collections = await store.listCollections();
       this.#files = collections.reduce((total, collection) => total + collection.active_count, 0);
       this.#dirty = status.needsEmbedding > 0;
     };
-    const next = (this.#syncChain ?? Promise.resolve()).then(run, run);
-    this.#syncChain = next;
-    return next;
+    return this.#enqueue(run);
+  }
+
+  recluster(options?: MemoryReclusterOptions, signal?: AbortSignal): Promise<MemoryAnalysisSummary> {
+    return this.#enqueue(async () => {
+      if (!this.#analysisExecutable) {
+        throw new Error("Memory analysis is unavailable: configure analysis.executable with an absolute worker path");
+      }
+      signal?.throwIfAborted();
+      const store = await this.#getAnalysisStore();
+      const status = await store.getStatus();
+      if (status.needsEmbedding > 0) {
+        throw new Error(
+          `Memory analysis requires an up-to-date QMD vector index: ${status.needsEmbedding} chunks need embedding. ` +
+          "Run memory sync and retry memory_recluster after embedding finishes.",
+        );
+      }
+      const previousRunId = latestAnalysisRunId(store.internal.db);
+      await this.#analysisRunner({
+        executable: this.#analysisExecutable,
+        dbPath: this.#dbPath,
+        options,
+        signal,
+      });
+      const summary = readAnalysisSummary(store.internal.db);
+      if (!summary || summary.runId === previousRunId || summary.stale) {
+        throw new Error("Memory analysis worker did not produce a new complete analysis run");
+      }
+      return summary;
+    });
+  }
+
+  listClusters(limit?: number): Promise<MemoryClusterList> {
+    return this.#enqueue(async () => readClusters((await this.#getAnalysisStore()).internal.db, limit));
+  }
+
+  fetchCluster(params: {
+    clusterId: string;
+    topK?: number;
+  }): Promise<MemoryClusterDetail> {
+    return this.#enqueue(async () => readCluster(
+      (await this.#getAnalysisStore()).internal.db,
+      params.clusterId,
+      params.topK,
+    ));
+  }
+
+  async #getAnalysisStore(): Promise<AnalysisStore> {
+    const store = await this.#getStore();
+    if (!("internal" in store)) throw new Error("Memory analysis requires the QMD SQLite store");
+    return store as AnalysisStore;
+  }
+
+  #enqueue<T>(run: () => Promise<T>): Promise<T> {
+    const result = (this.#operationChain ?? Promise.resolve()).then(run, run);
+    this.#operationChain = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   async search(
@@ -245,7 +337,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     if (opts?.sources && !opts.sources.includes("memory")) return [];
     if (this.#sources.size === 0) return [];
     opts?.signal?.throwIfAborted();
-    await this.#syncChain;
+    await this.#operationChain;
     const store = await this.#getStore();
     if (opts?.lexicalOnly) {
       const hits = await store.searchLex(query, {
@@ -278,7 +370,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   async readFile(params: { relPath: string; from?: number; lines?: number }): Promise<MemoryReadResult> {
     const safe = parseSafeVirtualPath(params.relPath, this.#sources);
     if (!safe) return { status: "not_found", text: "", path: params.relPath };
-    await this.#syncChain;
+    await this.#operationChain;
     const store = await this.#getStore();
     const doc = await store.get(safe.normalized);
     if ("error" in doc || doc.filepath !== safe.normalized) {
@@ -297,7 +389,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   status(): MemoryProviderStatus {
     return {
       backend: "builtin",
-      provider: "unblock-qmd",
+      provider: "unblock-memory",
       files: this.#files,
       dirty: this.#dirty,
       workspaceDir: this.#workspaceDir,
@@ -328,7 +420,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     await this.#watcher?.close();
     this.#watcher = undefined;
     this.#watchReady = undefined;
-    await this.#syncChain?.catch(() => undefined);
+    await this.#operationChain?.catch(() => undefined);
     await this.#store?.close();
     this.#store = undefined;
   }

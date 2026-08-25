@@ -13,7 +13,7 @@ const [packageJson, manifest] = await Promise.all([
 ]);
 const releaseVersion = match[1];
 
-if (packageJson.name !== "@unblocklabs/openclaw-unblock-qmd") {
+if (packageJson.name !== "@unblocklabs/unblock-memory") {
   throw new Error(`Unexpected package name: ${String(packageJson.name)}`);
 }
 if (packageJson.version !== releaseVersion) {

@@ -1,15 +1,24 @@
 {
-  "id": "unblock-qmd",
-  "name": "Unblock QMD Memory",
+  "id": "unblock-memory",
+  "name": "Unblock Memory",
   "version": "0.1.1",
-  "description": "Indexes configured Markdown sources with semantic chunking and serves OpenClaw memory search.",
+  "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": false },
-  "contracts": { "tools": ["memory_search", "memory_get"] },
+  "contracts": { "tools": ["memory_search", "memory_get", "memory_recluster", "memory_list_clusters", "memory_fetch_cluster"] },
+  "toolMetadata": {
+    "memory_recluster": { "sideEffecting": true },
+    "memory_list_clusters": { "replaySafe": true },
+    "memory_fetch_cluster": { "replaySafe": true }
+  },
   "uiHints": {
     "paths": {
       "label": "Memory Paths",
       "help": "Exact Markdown files, directories, or globs. Relative paths resolve from each agent workspace."
+    },
+    "analysis.executable": {
+      "label": "Memory Analysis Worker",
+      "help": "Optional absolute path to the locally installed unblock-memory-analysis executable."
     }
   },
   "configSchema": {
@@ -20,6 +29,13 @@
         "type": "array",
         "items": { "type": "string", "minLength": 1 },
         "default": ["MEMORY.md", "USER.md", "memory/**/*.md"]
+      },
+      "analysis": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "executable": { "type": "string", "minLength": 1 }
+        }
       }
     }
   }
