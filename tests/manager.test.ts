@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createStore } from "@unblocklabs/qmd";
+import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import {
   buildReadResult,
   cleanupRemovedDocuments,
@@ -47,7 +47,7 @@ test("bounds default memory reads and provides continuation", () => {
 });
 
 test("watches modified and new Markdown, serializes refreshes, and stops on close", async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "unblock-qmd-watch-"));
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-watch-"));
   const memoryDir = join(workspace, "memory");
   const existing = join(memoryDir, "today.md");
   await mkdir(memoryDir);
@@ -104,7 +104,7 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
 });
 
 test("purges documents and plaintext from collections removed from configuration", async () => {
-  const root = await mkdtemp(join(tmpdir(), "unblock-qmd-stale-"));
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-stale-"));
   const sourceDir = join(root, "old");
   const dbPath = join(root, "index.sqlite");
   await mkdir(sourceDir);
@@ -139,7 +139,7 @@ test("purges documents and plaintext from collections removed from configuration
 });
 
 test("purges plaintext after an indexed Markdown file is deleted", async () => {
-  const root = await mkdtemp(join(tmpdir(), "unblock-qmd-deleted-"));
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-deleted-"));
   const sourceDir = join(root, "memory");
   const memoryFile = join(sourceDir, "deleted.md");
   await mkdir(sourceDir);
@@ -171,7 +171,7 @@ test("purges plaintext after an indexed Markdown file is deleted", async () => {
 });
 
 test("purges replaced plaintext after an indexed Markdown file is edited", async () => {
-  const root = await mkdtemp(join(tmpdir(), "unblock-qmd-edited-"));
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-edited-"));
   const sourceDir = join(root, "memory");
   const memoryFile = join(sourceDir, "edited.md");
   const marker = "oldeditplaintextmarkerz";
@@ -203,7 +203,7 @@ test("purges replaced plaintext after an indexed Markdown file is edited", async
 });
 
 test("lexical-only search returns useful document content and its virtual path", async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "unblock-qmd-lexical-"));
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-lexical-"));
   const source = resolveSource(workspace, "MEMORY.md");
   const store = {
     async update() { return { collections: 1, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 }; },
@@ -243,6 +243,324 @@ test("lexical-only search returns useful document content and its virtual path",
     assert.equal(hit?.path, `qmd://${source.collection}/MEMORY.md`);
     assert.equal(hit?.snippet, "Rico leads client operations.");
     assert.equal(hit?.textScore, 0.8);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("serializes QMD writes and analysis on one operation queue", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-serialize-analysis-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  const events: string[] = [];
+  let active = 0;
+  let maxActive = 0;
+  const enter = (event: string) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    events.push(`${event}:start`);
+  };
+  const leave = (event: string) => {
+    events.push(`${event}:end`);
+    active -= 1;
+  };
+  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+    internal: backing.internal,
+    async update() {
+      enter("sync");
+      await delay(50);
+      return { collections: 0, indexed: 1, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 };
+    },
+    async embed() {
+      await delay(50);
+      leave("sync");
+      return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 50 };
+    },
+    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
+    async listCollections() { return []; },
+    async searchLex() { return []; },
+    async vsearch() { return []; },
+    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+    async getDocumentBody() { return null; },
+    async close() { await backing.close(); },
+  };
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [],
+    storeFactory: async () => store,
+    analysisExecutable: "/worker",
+    analysisRunner: async () => {
+      enter("analysis");
+      await delay(25);
+      backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+        (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+        VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+      leave("analysis");
+    },
+  });
+  try {
+    const sync = manager.sync();
+    const analysis = manager.recluster();
+    await Promise.all([sync, analysis]);
+    assert.equal(maxActive, 1);
+    assert.deepEqual(events, ["sync:start", "sync:end", "analysis:start", "analysis:end"]);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("analysis failure does not disable ordinary memory search", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-failure-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  const source = resolveSource(root, "MEMORY.md");
+  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+    internal: backing.internal,
+    async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 }; },
+    async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
+    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
+    async listCollections() { return []; },
+    async searchLex() { return [{
+      filepath: `qmd://${source.collection}/MEMORY.md`, displayPath: `${source.collection}/MEMORY.md`,
+      title: "Memory", context: null, hash: "hash", docid: "hash", collectionName: source.collection,
+      modifiedAt: "", bodyLength: 11, body: "still works", score: 0.8, source: "fts" as const,
+    }]; },
+    async vsearch() { return []; },
+    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+    async getDocumentBody() { return null; },
+    async close() { await backing.close(); },
+  };
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [source],
+    storeFactory: async () => store,
+    analysisExecutable: "/missing-worker",
+    analysisRunner: async () => { throw new Error("worker missing"); },
+  });
+  try {
+    await assert.rejects(manager.recluster(), /worker missing/);
+    assert.equal((await manager.search("memory", { lexicalOnly: true }))[0]?.snippet, "still works");
+  } finally {
+    await manager.close();
+  }
+});
+
+test("analysis is unavailable until an explicit worker is configured", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-disabled-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [],
+    storeFactory: async () => ({
+      internal: backing.internal,
+      async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 }; },
+      async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
+      async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
+      async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
+      async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+      async getDocumentBody() { return null; }, async close() { await backing.close(); },
+    }),
+  });
+  try {
+    await assert.rejects(manager.recluster(), /configure analysis\.executable/);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("refuses reclustering while QMD reports chunks needing embedding", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-needs-embedding-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  let workerCalled = false;
+  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+    internal: backing.internal,
+    async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 2 }; },
+    async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
+    async getStatus() { return { totalDocuments: 2, needsEmbedding: 2, hasVectorIndex: true, collections: [] }; },
+    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
+    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+    async getDocumentBody() { return null; }, async close() { await backing.close(); },
+  };
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [],
+    storeFactory: async () => store,
+    analysisExecutable: "/worker",
+    analysisRunner: async () => { workerCalled = true; },
+  });
+  try {
+    await assert.rejects(
+      manager.recluster(),
+      /2 chunks need embedding.*Run memory sync.*retry memory_recluster/,
+    );
+    assert.equal(workerCalled, false);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("keeps analysis fresh for a no-op sync and marks it stale before embedding changed inputs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-invalidation-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  let inputsChanged = false;
+  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+    internal: backing.internal,
+    async update() {
+      return {
+        collections: 0,
+        indexed: inputsChanged ? 1 : 0,
+        updated: 0,
+        unchanged: inputsChanged ? 0 : 1,
+        removed: 0,
+        skipped: 0,
+        needsEmbedding: 0,
+      };
+    },
+    async embed() {
+      if (inputsChanged) throw new Error("embedding failed");
+      return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+    },
+    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
+    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
+    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+    async getDocumentBody() { return null; }, async close() { await backing.close(); },
+  };
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [],
+    storeFactory: async () => store,
+  });
+  try {
+    await manager.start();
+    backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+
+    await manager.sync();
+    assert.equal((await manager.listClusters()).status, "ok");
+    assert.equal((await manager.listClusters()).stale, false);
+
+    inputsChanged = true;
+    await assert.rejects(manager.sync(), /embedding failed/);
+    const stale = await manager.listClusters();
+    assert.equal(stale.status, "ok");
+    assert.equal(stale.stale, true);
+    assert.match(stale.hint ?? "", /memory_recluster/);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("marks retained analysis stale for add, edit, delete, embedding, and forced sync", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-stale-cases-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  let update = { collections: 0, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 };
+  let chunksEmbedded = 0;
+  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+    internal: backing.internal,
+    async update() { return update; },
+    async embed() { return { docsProcessed: 0, chunksEmbedded, errors: 0, durationMs: 0 }; },
+    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
+    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
+    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+    async getDocumentBody() { return null; }, async close() { await backing.close(); },
+  };
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [],
+    storeFactory: async () => store,
+  });
+  try {
+    await manager.start();
+    backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+    const resetFresh = () => backing.internal.db.prepare(
+      "UPDATE memory_analysis_runs SET stale_at = NULL WHERE id = 'run'",
+    ).run();
+    const assertStale = async () => assert.equal((await manager.listClusters()).stale, true);
+
+    for (const changed of [
+      { indexed: 1 },
+      { updated: 1 },
+      { removed: 1 },
+      { needsEmbedding: 1 },
+    ]) {
+      resetFresh();
+      update = { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0, ...changed };
+      chunksEmbedded = 0;
+      await manager.sync();
+      await assertStale();
+    }
+
+    resetFresh();
+    update = { collections: 0, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 };
+    chunksEmbedded = 1;
+    await manager.sync();
+    await assertStale();
+
+    resetFresh();
+    chunksEmbedded = 0;
+    await manager.sync({ force: true });
+    await assertStale();
+  } finally {
+    await manager.close();
+  }
+});
+
+test("failed reclustering preserves stale results and successful reclustering replaces them fresh", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-recluster-lifecycle-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  let fail = true;
+  let capturedOptions: unknown;
+  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+    internal: backing.internal,
+    async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 }; },
+    async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
+    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
+    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
+    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+    async getDocumentBody() { return null; }, async close() { await backing.close(); },
+  };
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [],
+    storeFactory: async () => store,
+    analysisExecutable: "/worker",
+    analysisRunner: async ({ options }) => {
+      capturedOptions = options;
+      if (fail) throw new Error("worker failed");
+      backing.internal.db.transaction(() => {
+        backing.internal.db.prepare("DELETE FROM memory_analysis_runs").run();
+        backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+          (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+          VALUES ('fresh', 'later', 'later', 'new-digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+      }).immediate();
+    },
+  });
+  try {
+    await manager.start();
+    backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('stale', 'now', 'now', 'digest', 'model', 'fingerprint', 768, '{}', 'stale-time')`).run();
+
+    await assert.rejects(manager.recluster(), /worker failed/);
+    const retained = await manager.listClusters();
+    assert.equal(retained.runId, "stale");
+    assert.equal(retained.stale, true);
+
+    fail = false;
+    const options = { hdbscan: { minClusterSize: 12 }, seed: 7 };
+    const summary = await manager.recluster(options);
+    assert.deepEqual(capturedOptions, options);
+    assert.equal(summary.runId, "fresh");
+    assert.equal(summary.stale, false);
+    assert.equal((await manager.listClusters()).runId, "fresh");
   } finally {
     await manager.close();
   }

@@ -10,10 +10,12 @@ import { resolveSource } from "./sources.js";
 
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #paths: readonly string[];
+  readonly #analysisExecutable?: string;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
 
-  constructor(paths: readonly string[]) {
+  constructor(paths: readonly string[], analysisExecutable?: string) {
     this.#paths = paths;
+    this.#analysisExecutable = analysisExecutable;
   }
 
   async getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }) {
@@ -50,8 +52,9 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
     const manager = new QmdMemoryManager({
       workspaceDir,
-      dbPath: join(resolveStateDir(), "agents", agentId, "unblock-qmd", "index.sqlite"),
+      dbPath: join(resolveStateDir(), "agents", agentId, "unblock-memory", "index.sqlite"),
       sources: this.#paths.map((source) => resolveSource(workspaceDir, source)),
+      analysisExecutable: this.#analysisExecutable,
     });
     await manager.start();
     return manager;

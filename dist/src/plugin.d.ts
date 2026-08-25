@@ -11,4 +11,4 @@ export declare function resolveFlushPlan(params?: {
     systemPrompt: string;
     relativePath: string;
 } | null;
-export declare function registerUnblockQmd(api: OpenClawPluginApi): void;
+export declare function registerUnblockMemory(api: OpenClawPluginApi): void;

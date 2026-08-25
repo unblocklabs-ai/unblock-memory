@@ -3,7 +3,7 @@ import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager } from "./manager.js";
 export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     #private;
-    constructor(paths: readonly string[]);
+    constructor(paths: readonly string[], analysisExecutable?: string);
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;
         agentId: string;

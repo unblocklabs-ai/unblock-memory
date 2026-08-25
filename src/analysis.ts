@@ -1,0 +1,567 @@
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import type { QMDStore } from "@unblocklabs/qmd";
+
+export const DEFAULT_CLUSTER_LIMIT = 20;
+export const MAX_CLUSTER_LIMIT = 50;
+export const DEFAULT_MEMBER_LIMIT = 20;
+export const MAX_MEMBER_LIMIT = 50;
+const MAX_EXCERPT_BYTES = 2_000;
+const MAX_TOTAL_EXCERPT_BYTES = 12_000;
+const MAX_ALIASES_PER_MEMBER = 5;
+const MAX_TOTAL_ALIASES = 50;
+
+type AnalysisDatabase = QMDStore["internal"]["db"];
+
+export type MemoryReclusterOptions = {
+  space?: {
+    method?: "umap" | "none";
+    nComponents?: number;
+    nNeighbors?: number;
+    minDist?: number;
+  };
+  hdbscan?: {
+    minClusterSize?: number;
+    minSamples?: number;
+    clusterSelectionMethod?: "eom" | "leaf";
+    clusterSelectionEpsilon?: number;
+    allowSingleCluster?: boolean;
+  };
+  seed?: number;
+};
+
+export type AnalysisRunner = (params: {
+  executable: string;
+  dbPath: string;
+  options?: MemoryReclusterOptions;
+  signal?: AbortSignal;
+}) => Promise<void>;
+
+export type MemoryAnalysisMember = {
+  hash: string;
+  seq: number;
+  probability: number;
+  outlierScore: number;
+  x: number;
+  y: number;
+  representativeRank: number | null;
+  text: string;
+  sourcePaths: string[];
+};
+
+export type MemoryAnalysisSummary = {
+  status: "ok";
+  runId: string;
+  createdAt: string;
+  completedAt: string;
+  inputDigest: string;
+  model: string;
+  embeddingFingerprint: string;
+  dimensions: number;
+  clusters: number;
+  members: number;
+  noise: number;
+  stale: boolean;
+  staleSince: string | null;
+};
+
+export type MemoryClusterSummary = {
+  clusterId: string;
+  size: number;
+  availableSize: number;
+  meanProbability: number;
+  preview?: Pick<MemoryAnalysisMember, "hash" | "seq" | "probability" | "text" | "sourcePaths">;
+};
+
+type AnalysisReadMetadata = {
+  stale: boolean;
+  staleSince: string | null;
+  analyzedAt: string | null;
+  hint?: string;
+};
+
+export type MemoryClusterList = AnalysisReadMetadata & {
+  status: "ok" | "not_analyzed";
+  runId?: string;
+  clusters: MemoryClusterSummary[];
+  noise: MemoryClusterSummary | null;
+};
+
+export type MemoryClusterDetail = AnalysisReadMetadata & {
+  status: "ok" | "not_found" | "not_analyzed";
+  runId?: string;
+  cluster?: Omit<MemoryClusterSummary, "preview">;
+  members?: MemoryAnalysisMember[];
+};
+
+type RunRow = {
+  id: string;
+  created_at: string;
+  completed_at: string;
+  input_digest: string;
+  model: string;
+  embedding_fingerprint: string;
+  dimensions: number;
+  stale_at: string | null;
+};
+
+type ClusterRow = {
+  cluster_id: number;
+  size: number;
+  available_size: number;
+  mean_probability: number;
+};
+
+type MemberRow = {
+  hash: string;
+  seq: number;
+  probability: number;
+  outlier_score: number;
+  x: number;
+  y: number;
+  representative_rank: number | null;
+  pos: number;
+  chunk_len: number;
+  doc: string;
+};
+
+type CountRow = { count: number };
+type SourcePathRow = { collection: string; path: string };
+
+export function ensureMemoryAnalysisSchema(db: AnalysisDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_analysis_runs (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      input_digest TEXT NOT NULL,
+      model TEXT NOT NULL,
+      embedding_fingerprint TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      params_json TEXT NOT NULL,
+      stale_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_analysis_clusters (
+      run_id TEXT NOT NULL,
+      cluster_id INTEGER NOT NULL,
+      size INTEGER NOT NULL,
+      mean_probability REAL NOT NULL,
+      PRIMARY KEY (run_id, cluster_id),
+      FOREIGN KEY (run_id) REFERENCES memory_analysis_runs(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_analysis_memberships (
+      run_id TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      cluster_id INTEGER NOT NULL,
+      probability REAL NOT NULL,
+      outlier_score REAL NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      representative_rank INTEGER,
+      PRIMARY KEY (run_id, hash, seq),
+      FOREIGN KEY (run_id) REFERENCES memory_analysis_runs(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memory_analysis_memberships_cluster
+      ON memory_analysis_memberships(run_id, cluster_id, representative_rank);
+  `);
+}
+
+export function markMemoryAnalysisStale(db: AnalysisDatabase): void {
+  db.prepare(`
+    UPDATE memory_analysis_runs
+    SET stale_at = COALESCE(stale_at, CURRENT_TIMESTAMP)
+    WHERE id = (
+      SELECT id
+      FROM memory_analysis_runs
+      WHERE completed_at IS NOT NULL
+      ORDER BY completed_at DESC, created_at DESC, id DESC
+      LIMIT 1
+    )
+  `).run();
+}
+
+export function clusterReference(runId: string, clusterId: number): string {
+  return createHash("sha256").update(`${runId}\0${clusterId}`).digest("hex").slice(0, 10);
+}
+
+export function runAnalysisWorker(params: {
+  executable: string;
+  dbPath: string;
+  options?: MemoryReclusterOptions;
+  signal?: AbortSignal;
+}): Promise<void> {
+  return new Promise((resolve, reject) => {
+    params.signal?.throwIfAborted();
+    const args = ["--db", params.dbPath];
+    if (params.options && Object.keys(params.options).length > 0) {
+      args.push("--config-json", JSON.stringify(params.options));
+    }
+    const child = spawn(params.executable, args, {
+      shell: false,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const stderr: Buffer[] = [];
+    let stderrBytes = 0;
+    const maxErrorBytes = 16_384;
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderrBytes >= maxErrorBytes) return;
+      const remaining = maxErrorBytes - stderrBytes;
+      stderr.push(chunk.subarray(0, remaining));
+      stderrBytes += Math.min(chunk.length, remaining);
+    });
+    let settled = false;
+    let abortError: Error | undefined;
+    const cleanup = () => params.signal?.removeEventListener("abort", onAbort);
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      error ? reject(error) : resolve();
+    };
+    const onAbort = () => {
+      if (abortError) return;
+      abortError = params.signal?.reason instanceof Error
+        ? params.signal.reason
+        : new Error("Memory reclustering aborted");
+      child.kill("SIGTERM");
+    };
+    params.signal?.addEventListener("abort", onAbort, { once: true });
+    if (params.signal?.aborted) onAbort();
+    child.on("error", (error) => finish(abortError ?? error));
+    child.on("close", (code, signal) => {
+      if (abortError) {
+        finish(abortError);
+        return;
+      }
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const detail = Buffer.concat(stderr).toString("utf8").trim();
+      finish(new Error(
+        `Memory analysis worker ${signal ? `was terminated by ${signal}` : `exited with code ${code ?? "unknown"}`}${detail ? `: ${detail}` : ""}`,
+      ));
+    });
+  });
+}
+
+function latestRun(db: AnalysisDatabase): RunRow | undefined {
+  return db.prepare(`
+    SELECT id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, stale_at
+    FROM memory_analysis_runs
+    WHERE completed_at IS NOT NULL
+    ORDER BY completed_at DESC, created_at DESC, id DESC
+    LIMIT 1
+  `).get<RunRow>();
+}
+
+export function latestAnalysisRunId(db: AnalysisDatabase): string | undefined {
+  return latestRun(db)?.id;
+}
+
+function count(db: AnalysisDatabase, sql: string, runId: string): number {
+  return db.prepare(sql).get<CountRow>(runId)?.count ?? 0;
+}
+
+export function readAnalysisSummary(db: AnalysisDatabase): MemoryAnalysisSummary | undefined {
+  const run = latestRun(db);
+  if (!run) return undefined;
+  const clusters = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_clusters WHERE run_id = ?", run.id);
+  const members = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_memberships WHERE run_id = ?", run.id);
+  const expectedNonNoise = count(db, "SELECT COALESCE(SUM(size), 0) AS count FROM memory_analysis_clusters WHERE run_id = ?", run.id);
+  const nonNoise = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_memberships WHERE run_id = ? AND cluster_id <> -1", run.id);
+  const noise = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_memberships WHERE run_id = ? AND cluster_id = -1", run.id);
+  const unassigned = count(db, `
+    SELECT COUNT(*) AS count
+    FROM memory_analysis_memberships m
+    LEFT JOIN memory_analysis_clusters c
+      ON c.run_id = m.run_id AND c.cluster_id = m.cluster_id
+    WHERE m.run_id = ? AND m.cluster_id <> -1 AND c.cluster_id IS NULL
+  `, run.id);
+  if (nonNoise !== expectedNonNoise || members !== nonNoise + noise || unassigned > 0) return undefined;
+  return {
+    status: "ok",
+    runId: run.id,
+    createdAt: run.created_at,
+    completedAt: run.completed_at,
+    inputDigest: run.input_digest,
+    model: run.model,
+    embeddingFingerprint: run.embedding_fingerprint,
+    dimensions: run.dimensions,
+    clusters,
+    members,
+    noise,
+    stale: run.stale_at !== null,
+    staleSince: run.stale_at,
+  };
+}
+
+function sourcePaths(db: AnalysisDatabase, hash: string, limit: number): string[] {
+  if (limit <= 0) return [];
+  return db.prepare(`
+    SELECT collection, path
+    FROM documents
+    WHERE hash = ? AND active = 1
+    ORDER BY collection, path
+    LIMIT ?
+  `).all<SourcePathRow>(hash, limit).map((row) => `qmd://${row.collection}/${row.path}`);
+}
+
+function byteSlice(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text);
+  if (bytes.length <= maxBytes) return text;
+  if (maxBytes <= 3) return "";
+  return bytes.subarray(0, maxBytes - 3).toString("utf8").replace(/\uFFFD$/u, "") + "…";
+}
+
+function members(
+  db: AnalysisDatabase,
+  runId: string,
+  clusterId: number,
+  limit: number,
+  maxExcerptBytes = MAX_EXCERPT_BYTES,
+  maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES,
+  maxTotalAliases = MAX_TOTAL_ALIASES,
+): MemoryAnalysisMember[] {
+  const noiseOrder = clusterId === -1
+    ? "m.outlier_score DESC, m.hash, m.seq"
+    : `CASE WHEN m.representative_rank IS NULL THEN 1 ELSE 0 END,
+       m.representative_rank,
+       m.probability DESC,
+       m.outlier_score,
+       m.hash,
+       m.seq`;
+  const rows = db.prepare(`
+    SELECT
+      m.hash, m.seq, m.probability, m.outlier_score, m.x, m.y,
+      m.representative_rank, cv.pos, cv.chunk_len, c.doc
+    FROM memory_analysis_memberships m
+    JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
+    JOIN content c ON c.hash = m.hash
+    WHERE m.run_id = ? AND m.cluster_id = ?
+      AND EXISTS (
+        SELECT 1
+        FROM documents d
+        WHERE d.hash = m.hash AND d.active = 1
+      )
+    ORDER BY ${noiseOrder}
+    LIMIT ?
+  `).all<MemberRow>(runId, clusterId, limit);
+  let remaining = maxTotalBytes;
+  let remainingAliases = maxTotalAliases;
+  return rows.map((row) => {
+    const text = remaining <= 0
+      ? ""
+      : byteSlice(row.doc.slice(row.pos, row.pos + row.chunk_len), Math.min(maxExcerptBytes, remaining));
+    remaining -= Buffer.byteLength(text);
+    const aliases = sourcePaths(
+      db,
+      row.hash,
+      Math.min(MAX_ALIASES_PER_MEMBER, remainingAliases),
+    );
+    remainingAliases -= aliases.length;
+    return {
+      hash: row.hash,
+      seq: row.seq,
+      probability: row.probability,
+      outlierScore: row.outlier_score,
+      x: row.x,
+      y: row.y,
+      representativeRank: row.representative_rank,
+      text,
+      sourcePaths: aliases,
+    };
+  });
+}
+
+function availableSize(db: AnalysisDatabase, runId: string, clusterId: number): number {
+  return db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM memory_analysis_memberships m
+    JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
+    JOIN content c ON c.hash = m.hash
+    WHERE m.run_id = ? AND m.cluster_id = ?
+      AND EXISTS (
+        SELECT 1
+        FROM documents d
+        WHERE d.hash = m.hash AND d.active = 1
+      )
+  `).get<CountRow>(runId, clusterId)?.count ?? 0;
+}
+
+function readMetadata(run?: RunRow): AnalysisReadMetadata {
+  if (!run) {
+    return {
+      stale: true,
+      staleSince: null,
+      analyzedAt: null,
+      hint: "No memory analysis exists. Call memory_recluster, then memory_list_clusters.",
+    };
+  }
+  if (run.stale_at) {
+    return {
+      stale: true,
+      staleSince: run.stale_at,
+      analyzedAt: run.completed_at,
+      hint: "Memory changed after this analysis. Call memory_recluster to refresh it.",
+    };
+  }
+  return { stale: false, staleSince: null, analyzedAt: run.completed_at };
+}
+
+function toSummary(
+  db: AnalysisDatabase,
+  run: RunRow,
+  row: ClusterRow,
+  includePreview: boolean,
+  previewBytes = 600,
+  aliasLimit = MAX_TOTAL_ALIASES,
+): MemoryClusterSummary {
+  const preview = includePreview
+    ? members(db, run.id, row.cluster_id, 1, previewBytes, previewBytes, aliasLimit)[0]
+    : undefined;
+  return {
+    clusterId: clusterReference(run.id, row.cluster_id),
+    size: row.size,
+    availableSize: row.available_size,
+    meanProbability: row.mean_probability,
+    ...(preview ? {
+      preview: {
+        hash: preview.hash,
+        seq: preview.seq,
+        probability: preview.probability,
+        text: preview.text,
+        sourcePaths: preview.sourcePaths,
+      },
+    } : {}),
+  };
+}
+
+function noiseRow(db: AnalysisDatabase, runId: string): ClusterRow | undefined {
+  return db.prepare(`
+    SELECT
+      -1 AS cluster_id,
+      COUNT(*) AS size,
+      COUNT(CASE WHEN cv.hash IS NOT NULL AND c.hash IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM documents d
+        WHERE d.hash = m.hash AND d.active = 1
+      ) THEN 1 END) AS available_size,
+      COALESCE(AVG(m.probability), 0) AS mean_probability
+    FROM memory_analysis_memberships m
+    LEFT JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
+    LEFT JOIN content c ON c.hash = m.hash
+    WHERE m.run_id = ? AND m.cluster_id = -1
+    HAVING COUNT(*) > 0
+  `).get<ClusterRow>(runId);
+}
+
+export function readClusters(
+  db: AnalysisDatabase,
+  requestedLimit = DEFAULT_CLUSTER_LIMIT,
+): MemoryClusterList {
+  const run = latestRun(db);
+  if (!run || !readAnalysisSummary(db)) {
+    return { status: "not_analyzed", ...readMetadata(), clusters: [], noise: null };
+  }
+  const limit = Math.max(1, Math.min(MAX_CLUSTER_LIMIT, Math.floor(requestedLimit)));
+  const rows = db.prepare(`
+    SELECT
+      c.cluster_id,
+      c.size,
+      COUNT(CASE WHEN cv.hash IS NOT NULL AND content_row.hash IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM documents d
+        WHERE d.hash = m.hash AND d.active = 1
+      ) THEN 1 END) AS available_size,
+      c.mean_probability
+    FROM memory_analysis_clusters c
+    LEFT JOIN memory_analysis_memberships m
+      ON m.run_id = c.run_id AND m.cluster_id = c.cluster_id
+    LEFT JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
+    LEFT JOIN content content_row ON content_row.hash = m.hash
+    WHERE c.run_id = ?
+    GROUP BY c.cluster_id, c.size, c.mean_probability
+    ORDER BY c.size DESC, c.cluster_id
+    LIMIT ?
+  `).all<ClusterRow>(run.id, limit);
+  let remainingBytes = MAX_TOTAL_EXCERPT_BYTES;
+  let remainingAliases = MAX_TOTAL_ALIASES;
+  const clusters = rows.map((row) => {
+    const previewBytes = Math.min(600, remainingBytes);
+    const summary = toSummary(db, run, row, previewBytes > 0, previewBytes, remainingAliases);
+    remainingBytes -= Buffer.byteLength(summary.preview?.text ?? "");
+    remainingAliases -= summary.preview?.sourcePaths.length ?? 0;
+    return summary;
+  });
+  const noise = noiseRow(db, run.id);
+  return {
+    status: "ok",
+    runId: run.id,
+    ...readMetadata(run),
+    clusters,
+    noise: noise ? toSummary(db, run, noise, false) : null,
+  };
+}
+
+function resolveClusterId(db: AnalysisDatabase, runId: string, reference: string): number | undefined {
+  const clusterIds = db.prepare(`
+    SELECT cluster_id
+    FROM memory_analysis_clusters
+    WHERE run_id = ?
+    UNION ALL
+    SELECT -1
+    WHERE EXISTS (
+      SELECT 1 FROM memory_analysis_memberships WHERE run_id = ? AND cluster_id = -1
+    )
+  `).all<{ cluster_id: number }>(runId, runId);
+  return clusterIds.find((row) => clusterReference(runId, row.cluster_id) === reference)?.cluster_id;
+}
+
+export function readCluster(
+  db: AnalysisDatabase,
+  clusterReferenceId: string,
+  requestedLimit = DEFAULT_MEMBER_LIMIT,
+): MemoryClusterDetail {
+  const run = latestRun(db);
+  if (!run || !readAnalysisSummary(db)) {
+    return { status: "not_analyzed", ...readMetadata() };
+  }
+  const metadata = readMetadata(run);
+  const clusterId = resolveClusterId(db, run.id, clusterReferenceId);
+  if (clusterId === undefined) {
+    return {
+      status: "not_found",
+      runId: run.id,
+      ...metadata,
+      hint: "Cluster IDs change after reclustering. Call memory_list_clusters and use a current clusterId.",
+    };
+  }
+  const row = clusterId === -1
+    ? noiseRow(db, run.id)
+    : db.prepare(`
+        SELECT cluster_id, size, mean_probability, 0 AS available_size
+        FROM memory_analysis_clusters
+        WHERE run_id = ? AND cluster_id = ?
+      `).get<ClusterRow>(run.id, clusterId);
+  if (!row) {
+    return { status: "not_found", runId: run.id, ...metadata };
+  }
+  const limit = Math.max(1, Math.min(MAX_MEMBER_LIMIT, Math.floor(requestedLimit)));
+  return {
+    status: "ok",
+    runId: run.id,
+    ...metadata,
+    cluster: {
+      clusterId: clusterReferenceId,
+      size: row.size,
+      availableSize: availableSize(db, run.id, clusterId),
+      meanProbability: row.mean_probability,
+    },
+    members: members(db, run.id, clusterId, limit),
+  };
+}

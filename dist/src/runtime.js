@@ -4,9 +4,11 @@ import { QmdMemoryManager } from "./manager.js";
 import { resolveSource } from "./sources.js";
 export class QmdMemoryRuntime {
     #paths;
+    #analysisExecutable;
     #managers = new Map();
-    constructor(paths) {
+    constructor(paths, analysisExecutable) {
         this.#paths = paths;
+        this.#analysisExecutable = analysisExecutable;
     }
     async getMemorySearchManager(params) {
         let pending = this.#managers.get(params.agentId);
@@ -39,8 +41,9 @@ export class QmdMemoryRuntime {
         const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
         const manager = new QmdMemoryManager({
             workspaceDir,
-            dbPath: join(resolveStateDir(), "agents", agentId, "unblock-qmd", "index.sqlite"),
+            dbPath: join(resolveStateDir(), "agents", agentId, "unblock-memory", "index.sqlite"),
             sources: this.#paths.map((source) => resolveSource(workspaceDir, source)),
+            analysisExecutable: this.#analysisExecutable,
         });
         await manager.start();
         return manager;

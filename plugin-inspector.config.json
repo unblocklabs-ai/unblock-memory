@@ -1,7 +1,7 @@
 {
   "version": 1,
   "plugin": {
-    "id": "unblock-qmd",
+    "id": "unblock-memory",
     "priority": "high",
     "seams": ["plugin-runtime"],
     "sourceRoot": "src",
