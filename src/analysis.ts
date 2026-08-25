@@ -2,10 +2,10 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 
-export const DEFAULT_CLUSTER_LIMIT = 20;
-export const MAX_CLUSTER_LIMIT = 50;
-export const DEFAULT_MEMBER_LIMIT = 20;
-export const MAX_MEMBER_LIMIT = 50;
+const DEFAULT_CLUSTER_LIMIT = 20;
+const MAX_CLUSTER_LIMIT = 50;
+const DEFAULT_MEMBER_LIMIT = 20;
+const MAX_MEMBER_LIMIT = 50;
 const MAX_EXCERPT_BYTES = 2_000;
 const MAX_TOTAL_EXCERPT_BYTES = 12_000;
 const MAX_ALIASES_PER_MEMBER = 5;
@@ -37,7 +37,7 @@ export type AnalysisRunner = (params: {
   signal?: AbortSignal;
 }) => Promise<void>;
 
-export type MemoryAnalysisMember = {
+type MemoryAnalysisMember = {
   hash: string;
   seq: number;
   probability: number;
@@ -65,7 +65,7 @@ export type MemoryAnalysisSummary = {
   staleSince: string | null;
 };
 
-export type MemoryClusterSummary = {
+type MemoryClusterSummary = {
   clusterId: string;
   size: number;
   availableSize: number;
@@ -167,6 +167,19 @@ export function ensureMemoryAnalysisSchema(db: AnalysisDatabase): void {
 
     CREATE INDEX IF NOT EXISTS idx_memory_analysis_memberships_cluster
       ON memory_analysis_memberships(run_id, cluster_id, representative_rank);
+
+    CREATE VIEW IF NOT EXISTS memory_analysis_available_memberships AS
+    SELECT
+      m.run_id, m.hash, m.seq, m.cluster_id, m.probability, m.outlier_score,
+      m.x, m.y, m.representative_rank, cv.pos, cv.chunk_len, c.doc
+    FROM memory_analysis_memberships m
+    JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
+    JOIN content c ON c.hash = m.hash
+    WHERE EXISTS (
+      SELECT 1
+      FROM documents d
+      WHERE d.hash = m.hash AND d.active = 1
+    );
   `);
 }
 
@@ -267,9 +280,7 @@ function count(db: AnalysisDatabase, sql: string, runId: string): number {
   return db.prepare(sql).get<CountRow>(runId)?.count ?? 0;
 }
 
-export function readAnalysisSummary(db: AnalysisDatabase): MemoryAnalysisSummary | undefined {
-  const run = latestRun(db);
-  if (!run) return undefined;
+function analysisSummary(db: AnalysisDatabase, run: RunRow): MemoryAnalysisSummary | undefined {
   const clusters = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_clusters WHERE run_id = ?", run.id);
   const members = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_memberships WHERE run_id = ?", run.id);
   const expectedNonNoise = count(db, "SELECT COALESCE(SUM(size), 0) AS count FROM memory_analysis_clusters WHERE run_id = ?", run.id);
@@ -298,6 +309,16 @@ export function readAnalysisSummary(db: AnalysisDatabase): MemoryAnalysisSummary
     stale: run.stale_at !== null,
     staleSince: run.stale_at,
   };
+}
+
+export function readAnalysisSummary(db: AnalysisDatabase): MemoryAnalysisSummary | undefined {
+  const run = latestRun(db);
+  return run ? analysisSummary(db, run) : undefined;
+}
+
+function latestValidRun(db: AnalysisDatabase): RunRow | undefined {
+  const run = latestRun(db);
+  return run && analysisSummary(db, run) ? run : undefined;
 }
 
 function sourcePaths(db: AnalysisDatabase, hash: string, limit: number): string[] {
@@ -338,16 +359,9 @@ function members(
   const rows = db.prepare(`
     SELECT
       m.hash, m.seq, m.probability, m.outlier_score, m.x, m.y,
-      m.representative_rank, cv.pos, cv.chunk_len, c.doc
-    FROM memory_analysis_memberships m
-    JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
-    JOIN content c ON c.hash = m.hash
+      m.representative_rank, m.pos, m.chunk_len, m.doc
+    FROM memory_analysis_available_memberships m
     WHERE m.run_id = ? AND m.cluster_id = ?
-      AND EXISTS (
-        SELECT 1
-        FROM documents d
-        WHERE d.hash = m.hash AND d.active = 1
-      )
     ORDER BY ${noiseOrder}
     LIMIT ?
   `).all<MemberRow>(runId, clusterId, limit);
@@ -381,15 +395,8 @@ function members(
 function availableSize(db: AnalysisDatabase, runId: string, clusterId: number): number {
   return db.prepare(`
     SELECT COUNT(*) AS count
-    FROM memory_analysis_memberships m
-    JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
-    JOIN content c ON c.hash = m.hash
-    WHERE m.run_id = ? AND m.cluster_id = ?
-      AND EXISTS (
-        SELECT 1
-        FROM documents d
-        WHERE d.hash = m.hash AND d.active = 1
-      )
+    FROM memory_analysis_available_memberships
+    WHERE run_id = ? AND cluster_id = ?
   `).get<CountRow>(runId, clusterId)?.count ?? 0;
 }
 
@@ -446,26 +453,24 @@ function noiseRow(db: AnalysisDatabase, runId: string): ClusterRow | undefined {
     SELECT
       -1 AS cluster_id,
       COUNT(*) AS size,
-      COUNT(CASE WHEN cv.hash IS NOT NULL AND c.hash IS NOT NULL AND EXISTS (
-        SELECT 1
-        FROM documents d
-        WHERE d.hash = m.hash AND d.active = 1
-      ) THEN 1 END) AS available_size,
+      (
+        SELECT COUNT(*)
+        FROM memory_analysis_available_memberships available
+        WHERE available.run_id = ? AND available.cluster_id = -1
+      ) AS available_size,
       COALESCE(AVG(m.probability), 0) AS mean_probability
     FROM memory_analysis_memberships m
-    LEFT JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
-    LEFT JOIN content c ON c.hash = m.hash
     WHERE m.run_id = ? AND m.cluster_id = -1
     HAVING COUNT(*) > 0
-  `).get<ClusterRow>(runId);
+  `).get<ClusterRow>(runId, runId);
 }
 
 export function readClusters(
   db: AnalysisDatabase,
   requestedLimit = DEFAULT_CLUSTER_LIMIT,
 ): MemoryClusterList {
-  const run = latestRun(db);
-  if (!run || !readAnalysisSummary(db)) {
+  const run = latestValidRun(db);
+  if (!run) {
     return { status: "not_analyzed", ...readMetadata(), clusters: [], noise: null };
   }
   const limit = Math.max(1, Math.min(MAX_CLUSTER_LIMIT, Math.floor(requestedLimit)));
@@ -473,19 +478,14 @@ export function readClusters(
     SELECT
       c.cluster_id,
       c.size,
-      COUNT(CASE WHEN cv.hash IS NOT NULL AND content_row.hash IS NOT NULL AND EXISTS (
-        SELECT 1
-        FROM documents d
-        WHERE d.hash = m.hash AND d.active = 1
-      ) THEN 1 END) AS available_size,
+      (
+        SELECT COUNT(*)
+        FROM memory_analysis_available_memberships available
+        WHERE available.run_id = c.run_id AND available.cluster_id = c.cluster_id
+      ) AS available_size,
       c.mean_probability
     FROM memory_analysis_clusters c
-    LEFT JOIN memory_analysis_memberships m
-      ON m.run_id = c.run_id AND m.cluster_id = c.cluster_id
-    LEFT JOIN content_vectors cv ON cv.hash = m.hash AND cv.seq = m.seq
-    LEFT JOIN content content_row ON content_row.hash = m.hash
     WHERE c.run_id = ?
-    GROUP BY c.cluster_id, c.size, c.mean_probability
     ORDER BY c.size DESC, c.cluster_id
     LIMIT ?
   `).all<ClusterRow>(run.id, limit);
@@ -527,8 +527,8 @@ export function readCluster(
   clusterReferenceId: string,
   requestedLimit = DEFAULT_MEMBER_LIMIT,
 ): MemoryClusterDetail {
-  const run = latestRun(db);
-  if (!run || !readAnalysisSummary(db)) {
+  const run = latestValidRun(db);
+  if (!run) {
     return { status: "not_analyzed", ...readMetadata() };
   }
   const metadata = readMetadata(run);

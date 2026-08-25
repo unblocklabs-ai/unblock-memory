@@ -61,6 +61,12 @@ test("creates only the clean analysis schema", async () => {
       "memory_analysis_memberships",
       "memory_analysis_runs",
     ]);
+    const views = db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'view' AND name LIKE 'memory_analysis_%'
+      ORDER BY name
+    `).all<{ name: string }>();
+    assert.deepEqual(views.map((row) => row.name), ["memory_analysis_available_memberships"]);
     const runColumns = db.prepare("PRAGMA table_info(memory_analysis_runs)").all<{ name: string }>();
     assert.ok(runColumns.some((column) => column.name === "stale_at"));
     const membershipColumns = db.prepare("PRAGMA table_info(memory_analysis_memberships)").all<{ name: string }>();
@@ -68,6 +74,25 @@ test("creates only the clean analysis schema", async () => {
     const foreignKeys = db.prepare("PRAGMA foreign_key_list(memory_analysis_memberships)")
       .all<{ table: string }>();
     assert.deepEqual([...new Set(foreignKeys.map((key) => key.table))], ["memory_analysis_runs"]);
+  } finally {
+    await store.close();
+  }
+});
+
+test("rejects an incomplete latest run for summary, list, and fetch reads", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-invalid-analysis-"));
+  const store = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  try {
+    const db = store.internal.db;
+    ensureMemoryAnalysisSchema(db);
+    insertChunk(db, "hash", "memory");
+    insertRun(db);
+    db.prepare("INSERT INTO memory_analysis_clusters VALUES ('run', 1, 2, 0.9)").run();
+    db.prepare("INSERT INTO memory_analysis_memberships VALUES ('run', 'hash', 0, 1, 0.9, 0.1, 0, 0, 1)").run();
+
+    assert.equal(readAnalysisSummary(db), undefined);
+    assert.equal(readClusters(db).status, "not_analyzed");
+    assert.equal(readCluster(db, clusterReference("run", 1)).status, "not_analyzed");
   } finally {
     await store.close();
   }

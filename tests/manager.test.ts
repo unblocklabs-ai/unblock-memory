@@ -35,6 +35,31 @@ async function assertMarkerAbsent(dbPath: string, marker: string): Promise<void>
   }
 }
 
+type ManagerStoreOverrides = Partial<ManagerStore> & Partial<Pick<QMDStore, "internal">>;
+
+function createManagerStore(
+  overrides: ManagerStoreOverrides = {},
+): ManagerStore & Partial<Pick<QMDStore, "internal">> {
+  return {
+    async update() {
+      return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 };
+    },
+    async embed() {
+      return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+    },
+    async getStatus() {
+      return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] };
+    },
+    async listCollections() { return []; },
+    async searchLex() { return []; },
+    async vsearch() { return []; },
+    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
+    async getDocumentBody() { return null; },
+    async close() {},
+    ...overrides,
+  };
+}
+
 test("bounds default memory reads and provides continuation", () => {
   const content = Array.from({ length: 150 }, (_, index) => `line ${index + 1}`).join("\n");
   const result = buildReadResult({ content, path: "qmd://memory/daily.md" });
@@ -263,7 +288,7 @@ test("serializes QMD writes and analysis on one operation queue", async () => {
     events.push(`${event}:end`);
     active -= 1;
   };
-  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+  const store = createManagerStore({
     internal: backing.internal,
     async update() {
       enter("sync");
@@ -275,14 +300,8 @@ test("serializes QMD writes and analysis on one operation queue", async () => {
       leave("sync");
       return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 50 };
     },
-    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
-    async listCollections() { return []; },
-    async searchLex() { return []; },
-    async vsearch() { return []; },
-    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; },
     async close() { await backing.close(); },
-  };
+  });
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,
@@ -313,22 +332,15 @@ test("analysis failure does not disable ordinary memory search", async () => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-failure-"));
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   const source = resolveSource(root, "MEMORY.md");
-  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+  const store = createManagerStore({
     internal: backing.internal,
-    async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 }; },
-    async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
-    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
-    async listCollections() { return []; },
     async searchLex() { return [{
       filepath: `qmd://${source.collection}/MEMORY.md`, displayPath: `${source.collection}/MEMORY.md`,
       title: "Memory", context: null, hash: "hash", docid: "hash", collectionName: source.collection,
       modifiedAt: "", bodyLength: 11, body: "still works", score: 0.8, source: "fts" as const,
     }]; },
-    async vsearch() { return []; },
-    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; },
     async close() { await backing.close(); },
-  };
+  });
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,
@@ -352,14 +364,9 @@ test("analysis is unavailable until an explicit worker is configured", async () 
     dbPath: backing.dbPath,
     workspaceDir: root,
     sources: [],
-    storeFactory: async () => ({
+    storeFactory: async () => createManagerStore({
       internal: backing.internal,
-      async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 }; },
-      async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
-      async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
-      async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
-      async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-      async getDocumentBody() { return null; }, async close() { await backing.close(); },
+      async close() { await backing.close(); },
     }),
   });
   try {
@@ -373,15 +380,12 @@ test("refuses reclustering while QMD reports chunks needing embedding", async ()
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-needs-embedding-"));
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   let workerCalled = false;
-  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+  const store = createManagerStore({
     internal: backing.internal,
     async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 2 }; },
-    async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
     async getStatus() { return { totalDocuments: 2, needsEmbedding: 2, hasVectorIndex: true, collections: [] }; },
-    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
-    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; }, async close() { await backing.close(); },
-  };
+    async close() { await backing.close(); },
+  });
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,
@@ -405,7 +409,7 @@ test("keeps analysis fresh for a no-op sync and marks it stale before embedding 
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-invalidation-"));
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   let inputsChanged = false;
-  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+  const store = createManagerStore({
     internal: backing.internal,
     async update() {
       return {
@@ -422,11 +426,8 @@ test("keeps analysis fresh for a no-op sync and marks it stale before embedding 
       if (inputsChanged) throw new Error("embedding failed");
       return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
     },
-    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
-    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
-    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; }, async close() { await backing.close(); },
-  };
+    async close() { await backing.close(); },
+  });
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,
@@ -459,15 +460,12 @@ test("marks retained analysis stale for add, edit, delete, embedding, and forced
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   let update = { collections: 0, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 };
   let chunksEmbedded = 0;
-  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+  const store = createManagerStore({
     internal: backing.internal,
     async update() { return update; },
     async embed() { return { docsProcessed: 0, chunksEmbedded, errors: 0, durationMs: 0 }; },
-    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
-    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
-    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; }, async close() { await backing.close(); },
-  };
+    async close() { await backing.close(); },
+  });
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,
@@ -517,15 +515,11 @@ test("failed reclustering preserves stale results and successful reclustering re
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   let fail = true;
   let capturedOptions: unknown;
-  const store: ManagerStore & Pick<QMDStore, "internal"> = {
+  const store = createManagerStore({
     internal: backing.internal,
     async update() { return { collections: 0, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 }; },
-    async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
-    async getStatus() { return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
-    async listCollections() { return []; }, async searchLex() { return []; }, async vsearch() { return []; },
-    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; }, async close() { await backing.close(); },
-  };
+    async close() { await backing.close(); },
+  });
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,

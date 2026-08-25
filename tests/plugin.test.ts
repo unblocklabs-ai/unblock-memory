@@ -37,7 +37,7 @@ test("flush plan honors disable, thresholds, model, and agent timezone", () => {
   assert.equal(plan?.model, "local/fast");
 });
 
-test("registers exactly the clean memory tool contract and rejects invalid analysis arguments", async () => {
+test("registers exactly the clean memory tool contract and validates every tool at execution", async () => {
   type Tool = {
     name: string;
     execute(toolCallId: string, params: unknown, signal?: AbortSignal): Promise<unknown>;
@@ -71,28 +71,21 @@ test("registers exactly the clean memory tool contract and rejects invalid analy
   } as OpenClawPluginToolContext;
   const tool = (name: string) => registrations.find((registration) => registration.names.includes(name))!.factory(context)!;
 
-  await assert.rejects(
-    tool("memory_recluster").execute("call", { hdbscan: { clusterSelectionEpsilon: Number.POSITIVE_INFINITY } }),
-    /clusterSelectionEpsilon is invalid/,
-  );
-  await assert.rejects(
-    tool("memory_recluster").execute("call", { seed: -1 }),
-    /seed is invalid/,
-  );
-  await assert.rejects(
-    tool("memory_recluster").execute("call", { extra: true }),
-    /extra is not allowed/,
-  );
-  await assert.rejects(
-    tool("memory_list_clusters").execute("call", { limit: 0 }),
-    /limit is invalid/,
-  );
-  await assert.rejects(
-    tool("memory_fetch_cluster").execute("call", { clusterId: "cluster-1" }),
-    /clusterId is invalid/,
-  );
-  await assert.rejects(
-    tool("memory_fetch_cluster").execute("call", { clusterId: "0123456789", topK: 51 }),
-    /topK is invalid/,
-  );
+  const invalidCalls: Array<[name: string, params: unknown]> = [
+    ["memory_search", { query: "memory", maxResults: 21 }],
+    ["memory_search", { query: "   " }],
+    ["memory_search", { query: "memory", extra: true }],
+    ["memory_get", { path: "qmd://memory/MEMORY.md", lines: 1_001 }],
+    ["memory_get", { path: "   " }],
+    ["memory_get", { path: "qmd://memory/MEMORY.md", extra: true }],
+    ["memory_recluster", { hdbscan: { clusterSelectionEpsilon: Number.POSITIVE_INFINITY } }],
+    ["memory_recluster", { seed: -1 }],
+    ["memory_recluster", { extra: true }],
+    ["memory_list_clusters", { limit: 0 }],
+    ["memory_fetch_cluster", { clusterId: "cluster-1" }],
+    ["memory_fetch_cluster", { clusterId: "0123456789", topK: 51 }],
+  ];
+  for (const [name, params] of invalidCalls) {
+    await assert.rejects(tool(name).execute("call", params));
+  }
 });

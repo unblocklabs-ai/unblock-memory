@@ -1,8 +1,4 @@
 import type { QMDStore } from "@unblocklabs/qmd";
-export declare const DEFAULT_CLUSTER_LIMIT = 20;
-export declare const MAX_CLUSTER_LIMIT = 50;
-export declare const DEFAULT_MEMBER_LIMIT = 20;
-export declare const MAX_MEMBER_LIMIT = 50;
 type AnalysisDatabase = QMDStore["internal"]["db"];
 export type MemoryReclusterOptions = {
     space?: {
@@ -26,7 +22,7 @@ export type AnalysisRunner = (params: {
     options?: MemoryReclusterOptions;
     signal?: AbortSignal;
 }) => Promise<void>;
-export type MemoryAnalysisMember = {
+type MemoryAnalysisMember = {
     hash: string;
     seq: number;
     probability: number;
@@ -52,7 +48,7 @@ export type MemoryAnalysisSummary = {
     stale: boolean;
     staleSince: string | null;
 };
-export type MemoryClusterSummary = {
+type MemoryClusterSummary = {
     clusterId: string;
     size: number;
     availableSize: number;
