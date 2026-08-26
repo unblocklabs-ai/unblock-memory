@@ -37,7 +37,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     });
     start(): Promise<void>;
     sync(params?: MemorySyncParams): Promise<void>;
-    syncSessions(force?: boolean): Promise<SessionSyncResult>;
+    syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void): Promise<SessionSyncResult>;
     recluster(options?: MemoryReclusterOptions, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
     listClusters(limit?: number): Promise<MemoryClusterList>;
     fetchCluster(params: {

@@ -44,6 +44,8 @@ const syncSessionsParameters = Type.Object({
   force: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 
+const syncStatusParameters = Type.Object({}, { additionalProperties: false });
+
 function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
   const active = getContext(ctx);
   if (!active) return null;
@@ -97,20 +99,26 @@ function createSyncSessionsTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
   return {
     name: "memory_sync_sessions",
     label: "Sync Memory Sessions",
-    description: "Project and index this agent's configured OpenClaw session transcripts.",
+    description: "Start projecting and indexing this agent's configured OpenClaw session transcripts. Use memory_sync_status to check completion.",
     parameters: syncSessionsParameters,
     async execute(_toolCallId: string, params: unknown) {
       const { force } = Value.Parse(syncSessionsParameters, params);
-      const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
-      try {
-        return jsonResult(await manager.syncSessions(force));
-      } catch (syncError) {
-        return jsonResult({
-          status: "unavailable",
-          error: syncError instanceof Error ? syncError.message : String(syncError),
-        });
-      }
+      return jsonResult(runtime.startSessionSync(active, force));
+    },
+  };
+}
+
+function createSyncStatusTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
+  const active = getContext(ctx);
+  if (!active) return null;
+  return {
+    name: "memory_sync_status",
+    label: "Memory Session Sync Status",
+    description: "Check the current or latest session transcript sync.",
+    parameters: syncStatusParameters,
+    async execute(_toolCallId: string, params: unknown) {
+      Value.Parse(syncStatusParameters, params);
+      return jsonResult(runtime.sessionSyncStatus(active.agentId));
     },
   };
 }
@@ -290,6 +298,7 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
   api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
   api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), { names: ["memory_sync_sessions"] });
+  api.registerTool((ctx) => createSyncStatusTool(runtime, ctx), { names: ["memory_sync_status"] });
   api.registerTool((ctx) => createReclusterTool(runtime, ctx), { names: ["memory_recluster"] });
   api.registerTool((ctx) => createListClustersTool(runtime, ctx), { names: ["memory_list_clusters"] });
   api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), { names: ["memory_fetch_cluster"] });

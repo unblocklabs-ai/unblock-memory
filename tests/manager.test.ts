@@ -483,7 +483,7 @@ test("filters session paths without restricting file corpora", async () => {
   const secondPath = "discord/group/team/G456/second.md";
   const startedAt = Date.parse("2026-08-25T12:00:00Z");
   const manifestPath = join(root, "sessions-manifest.json");
-  await writeFile(manifestPath, JSON.stringify({
+  const manifest = {
     version: 1,
     sessions: {
       first: {
@@ -505,7 +505,8 @@ test("filters session paths without restricting file corpora", async () => {
         documentPath: secondPath,
       },
     },
-  }));
+  };
+  await writeFile(manifestPath, JSON.stringify(manifest));
   const hits = [
     { file: `qmd://${memory.collection}/MEMORY.md`, body: "file memory" },
     { file: `qmd://${sessions.collection}/${firstPath}`, body: "first session" },
@@ -573,6 +574,15 @@ test("filters session paths without restricting file corpora", async () => {
       sessionFilter: { provider: "teams" },
     }), []);
     assert.deepEqual(receivedFilters[1], { [sessions.collection]: [] });
+
+    manifest.sessions.first.provider = "teams";
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    await manager.search("decision", {
+      corpora: ["sessions"],
+      sessionFilter: { provider: "teams" },
+    });
+    assert.deepEqual(receivedFilters[2], { [sessions.collection]: [firstPath] });
+
     await assert.rejects(manager.search("decision", {
       sessionFilter: {
         startedFrom: "2026-08-26T00:00:00Z",

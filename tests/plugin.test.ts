@@ -6,6 +6,18 @@ import type {
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { registerUnblockMemory, resolveFlushPlan } from "../src/plugin.js";
+import type { QmdMemoryRuntime } from "../src/runtime.js";
+
+type Tool = {
+  name: string;
+  parameters: { properties?: Record<string, unknown> };
+  execute(toolCallId: string, params: unknown, signal?: AbortSignal): Promise<unknown>;
+};
+
+function parseJsonResult(result: unknown): Record<string, unknown> {
+  const content = (result as { content?: Array<{ text?: string }> }).content;
+  return JSON.parse(content?.[0]?.text ?? "") as Record<string, unknown>;
+}
 
 test("flush plan honors disable, thresholds, model, and agent timezone", () => {
   const disabled = {
@@ -38,11 +50,6 @@ test("flush plan honors disable, thresholds, model, and agent timezone", () => {
 });
 
 test("registers exactly the clean memory tool contract and validates every tool at execution", async () => {
-  type Tool = {
-    name: string;
-    parameters: { properties?: Record<string, unknown> };
-    execute(toolCallId: string, params: unknown, signal?: AbortSignal): Promise<unknown>;
-  };
   const registrations: Array<{
     names: string[];
     factory: (ctx: OpenClawPluginToolContext) => Tool | null;
@@ -60,6 +67,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
     "memory_search",
     "memory_get",
     "memory_sync_sessions",
+    "memory_sync_status",
     "memory_recluster",
     "memory_list_clusters",
     "memory_fetch_cluster",
@@ -90,6 +98,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
     ["memory_get", { path: "qmd://memory/MEMORY.md", extra: true }],
     ["memory_sync_sessions", { force: "yes" }],
     ["memory_sync_sessions", { extra: true }],
+    ["memory_sync_status", { extra: true }],
     ["memory_recluster", { hdbscan: { clusterSelectionEpsilon: Number.POSITIVE_INFINITY } }],
     ["memory_recluster", { seed: -1 }],
     ["memory_recluster", { extra: true }],
@@ -100,4 +109,62 @@ test("registers exactly the clean memory tool contract and validates every tool 
   for (const [name, params] of invalidCalls) {
     await assert.rejects(tool(name).execute("call", params));
   }
+});
+
+test("session sync tools accept and report status without awaiting cold initialization", async () => {
+  const registrations = new Map<string, (ctx: OpenClawPluginToolContext) => Tool | null>();
+  let runtime: QmdMemoryRuntime | undefined;
+  const api = {
+    pluginConfig: {
+      corpora: [
+        { name: "memory", kind: "files", paths: ["MEMORY.md"] },
+        { name: "sessions", kind: "sessions" },
+      ],
+    },
+    registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
+      runtime = capability.runtime;
+    },
+    registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+      for (const name of options.names) registrations.set(name, factory);
+    },
+  } as unknown as OpenClawPluginApi;
+  registerUnblockMemory(api);
+  assert.ok(runtime);
+
+  let releaseManager = () => {};
+  const managerGate = new Promise<void>((resolve) => { releaseManager = resolve; });
+  Object.defineProperty(runtime, "getMemorySearchManager", {
+    value: async () => {
+      await managerGate;
+      return {
+        manager: {
+          async syncSessions() {
+            return {
+              scanned: 0,
+              unchanged: 0,
+              updated: 0,
+              removed: 0,
+              skipped: 0,
+              failed: 0,
+              embedded: 0,
+              lastSuccessfulSyncAt: Date.now(),
+            };
+          },
+        },
+      };
+    },
+  });
+
+  const context = { agentId: "bill", config: {} } as OpenClawPluginToolContext;
+  const tool = (name: string) => registrations.get(name)!(context)!;
+  const accepted = await Promise.race([
+    tool("memory_sync_sessions").execute("sync", {}),
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("sync acceptance blocked")), 100)),
+  ]);
+  assert.equal(parseJsonResult(accepted).status, "started");
+  const status = parseJsonResult(await tool("memory_sync_status").execute("status", {}));
+  assert.equal(status.status, "running");
+  assert.equal(status.phase, "queued");
+
+  releaseManager();
 });

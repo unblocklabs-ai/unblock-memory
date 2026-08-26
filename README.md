@@ -103,7 +103,8 @@ eligible.
 The optional `sessions` corpus reads the current agent's normal OpenClaw SQLite
 store and indexes its active user/assistant transcript branch. It defaults to
 channel and group conversations; add `direct` explicitly to include DMs. Run
-`memory_sync_sessions` to refresh it. Projections are private derived Markdown
+`memory_sync_sessions` to start a refresh, then use `memory_sync_status` to
+check its progress or result. Projections are private derived Markdown
 under the agent's `unblock-memory/sessions` state directory and can be rebuilt
 from OpenClaw at any time. Session results include provider, chat type,
 conversation identity, and start time. They participate in the same search and
