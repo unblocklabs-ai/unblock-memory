@@ -29,9 +29,18 @@ export type SessionSyncStartResult = {
     status: "unavailable";
     error: string;
 };
+type StoredSessionSyncStatus = Exclude<SessionSyncStatus, {
+    status: "idle";
+}>;
+type StoredRunningSessionSync = Extract<StoredSessionSyncStatus, {
+    status: "running";
+}> & {
+    pid: number;
+};
+export declare function recoverInterruptedSessionSync(directory: string, statusPath: string, stale: StoredRunningSessionSync): Promise<SessionSyncStatus>;
 export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     #private;
-    constructor(corpora: readonly CorpusConfig[], analysisExecutable?: string);
+    constructor(corpora: readonly CorpusConfig[], analysisExecutable?: string, stateRoot?: string);
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;
         agentId: string;
@@ -49,10 +58,11 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     startSessionSync(params: {
         cfg: OpenClawConfig;
         agentId: string;
-    }, force?: boolean): SessionSyncStartResult;
-    sessionSyncStatus(agentId: string): SessionSyncStatus;
+    }, force?: boolean): Promise<SessionSyncStartResult>;
+    sessionSyncStatus(agentId: string): Promise<SessionSyncStatus>;
     closeMemorySearchManager(params: {
         agentId: string;
     }): Promise<void>;
     closeAllMemorySearchManagers(): Promise<void>;
 }
+export {};

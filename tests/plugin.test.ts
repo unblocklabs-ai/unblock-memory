@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type {
   OpenClawConfig,
@@ -128,7 +131,14 @@ test("session sync tools accept and report status without awaiting cold initiali
       for (const name of options.names) registrations.set(name, factory);
     },
   } as unknown as OpenClawPluginApi;
-  registerUnblockMemory(api);
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "unblock-memory-plugin-status-"));
+  try {
+    registerUnblockMemory(api);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+  }
   assert.ok(runtime);
 
   let releaseManager = () => {};
