@@ -38,6 +38,10 @@ directories, or globs into named corpora:
     slots: { memory: "unblock-memory" },
     entries: {
       "unblock-memory": {
+        hooks: {
+          // Required only when skillWhisperer.enabled is true.
+          allowConversationAccess: true,
+        },
         config: {
           // Default: avoid repeated model cold starts after idle periods.
           keepEmbeddingModelWarm: true,
@@ -57,7 +61,24 @@ directories, or globs into named corpora:
               kind: "files",
               paths: ["knowledge/**/*.md"],
             },
+            {
+              name: "skills",
+              kind: "skills",
+              paths: [
+                "skills/**/SKILL.md",
+                ".agents/skills/**/SKILL.md",
+                "~/.agents/skills/**/SKILL.md",
+                "~/.openclaw/skills/**/SKILL.md",
+                "~/.openclaw/plugin-skills/**/SKILL.md",
+              ],
+            },
           ],
+          skillWhisperer: {
+            enabled: false,
+            historyMessages: 5,
+            minScore: 0.4,
+            cooldownTurns: 10,
+          },
           // Optional: omit unless the local analysis worker is installed.
           analysis: {
             executable: "/absolute/path/to/unblock-cluster/bin/unblock-memory-analysis",
@@ -79,10 +100,33 @@ corpus; other unique names may be added for custom material.
 context resident after first use. Set it to `false` to restore QMD's five-minute
 idle unload behavior.
 
-`memory_search` searches every configured corpus by default. Pass
+`memory_search` searches every configured non-skill corpus by default. Pass
 `corpora: ["knowledge"]` to search selected corpora or `corpora: ["all"]` to
 request all of them explicitly. Search results include their corpus name and
 remain readable by passing the returned `qmd://` path to `memory_get`.
+
+### Skill Whisperer
+
+Skill Whisperer is an optional semantic reminder for user turns. Configure one
+isolated `skills` corpus, set `skillWhisperer.enabled` to `true`, and authorize
+`plugins.entries.unblock-memory.hooks.allowConversationAccess`. The feature
+embeds the current prompt plus the configured number of prior user/assistant
+messages, searches only skill files, and prepends at most one name/path hint
+when the best eligible match reaches `minScore`. It never opens or invokes a
+skill automatically.
+
+The defaults use five prior messages, a calibrated score threshold of `0.4`,
+and a ten-turn cooldown. A skill is cooling down after either a suggestion or a
+successful direct `read` of its indexed `SKILL.md`; the next result is eligible
+only when it independently meets the same score threshold. Cooldown state is
+per session and intentionally resets with the Gateway. Shell-command reads are
+not tracked.
+
+The `skills` corpus shares the existing QMD store and warm embedding model but
+is private to Skill Whisperer: it is excluded from ordinary `memory_search`
+(including `corpora: ["all"]`), `memory_get`, clustering, and memory-maintenance
+tasks. Paths are explicit by design; the plugin does not reconstruct
+OpenClaw's effective skill inventory from `openclaw.json`.
 
 Use `sessionFilter` to restrict session results by metadata while leaving file
 corpora searchable. Supported fields are `startedFrom` and `startedTo`
@@ -145,9 +189,10 @@ python3 -m venv .venv
 Set `analysis.executable` to the absolute path of
 `bin/unblock-memory-analysis` in that checkout. One worker installation can
 serve every agent on the host. The plugin invokes it directly with
-`--db <the agent's known index path>` and, when requested, a validated
-`--config-json <clustering options>` payload. Agents cannot choose a database,
-executable, shell command, or arbitrary arguments.
+`--db <the agent's known index path>`, the plugin's non-skill collection IDs,
+and, when requested, a validated `--config-json <clustering options>` payload.
+Agents cannot choose a database, executable, collection, shell command, or
+arbitrary arguments.
 
 Without the worker, `memory_list_clusters` reports that memory has not been
 analyzed and `memory_recluster` reports that analysis is unavailable. Ordinary
@@ -189,9 +234,11 @@ whole corpus for chores. Persisted exact-duplicate analysis can likewise create
 review proposals for non-session Markdown. `memory_list_maintenance_tasks`
 returns at most ten tasks, while `memory_update_maintenance_task` can resolve,
 defer, or mark one irrelevant and optionally attach a supported event date.
-These tools never edit or delete source Markdown. Duplicate cleanup remains a
-reviewed source change outside the maintenance tool, and generated session
-projections must never be edited directly.
+For duplicate proposals, defer confirmed cleanup until the source change is
+complete, mark intentional repetition irrelevant, and resolve only completed
+work. These tools never edit or delete source Markdown. Duplicate cleanup
+remains a reviewed source change outside the maintenance tool, and generated
+session projections must never be edited directly.
 
 Member excerpts are capped at 2 KB each and 12 KB across a response; source
 aliases are capped at five per member and 50 across a response. These budgets

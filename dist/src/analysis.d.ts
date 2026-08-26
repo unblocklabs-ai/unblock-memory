@@ -22,6 +22,7 @@ export type MemoryReclusterOptions = {
 export type AnalysisRunner = (params: {
     executable: string;
     dbPath: string;
+    collections: readonly string[];
     options?: MemoryReclusterOptions;
     signal?: AbortSignal;
 }) => Promise<void>;
@@ -95,10 +96,12 @@ export declare function clusterReference(runId: string, clusterId: number): stri
 export declare function runAnalysisWorker(params: {
     executable: string;
     dbPath: string;
+    collections: readonly string[];
     options?: MemoryReclusterOptions;
     signal?: AbortSignal;
 }): Promise<void>;
 export declare function latestAnalysisRunId(db: AnalysisDatabase): string | undefined;
+export declare function latestAnalysisCollections(db: AnalysisDatabase): readonly string[] | undefined;
 export declare function readAnalysisSummary(db: AnalysisDatabase): MemoryAnalysisSummary | undefined;
 export declare function readClusters(db: AnalysisDatabase, requestedLimit?: number): MemoryClusterList;
 export declare function readCluster(db: AnalysisDatabase, clusterReferenceId: string, requestedLimit?: number, requestedOffset?: number, sort?: MemoryClusterSort, temporal?: TemporalReadOptions): MemoryClusterDetail;

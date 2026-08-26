@@ -3,6 +3,11 @@ export type FileCorpusConfig = {
     kind: "files";
     paths: readonly string[];
 };
+export type SkillCorpusConfig = {
+    name: "skills";
+    kind: "skills";
+    paths: readonly string[];
+};
 declare const CHAT_TYPES: readonly ["channel", "group", "direct"];
 export type ChatType = typeof CHAT_TYPES[number];
 type SessionCorpusConfig = {
@@ -10,13 +15,19 @@ type SessionCorpusConfig = {
     kind: "sessions";
     chatTypes: readonly ChatType[];
 };
-export type CorpusConfig = FileCorpusConfig | SessionCorpusConfig;
+export type CorpusConfig = FileCorpusConfig | SkillCorpusConfig | SessionCorpusConfig;
 export declare const DEFAULT_CORPORA: readonly FileCorpusConfig[];
 export type UnblockMemoryConfig = {
     corpora: readonly CorpusConfig[];
     keepEmbeddingModelWarm: boolean;
     analysis: {
         executable?: string;
+    };
+    skillWhisperer: {
+        enabled: boolean;
+        historyMessages: number;
+        minScore: number;
+        cooldownTurns: number;
     };
 };
 export declare function resolveConfig(value: unknown): UnblockMemoryConfig;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,8 +12,8 @@ import {
   QmdMemoryManager,
   type ManagerStore,
 } from "../src/manager.js";
-import { clusterReference } from "../src/analysis.js";
-import { resolveSessionSource, resolveSource } from "../src/sources.js";
+import { clusterReference, ensureMemoryAnalysisSchema } from "../src/analysis.js";
+import { resolveSessionSource, resolveSource, resolveSources } from "../src/sources.js";
 import { createAgentDatabase } from "./helpers/session-database.js";
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -391,6 +391,196 @@ test("scopes vector search to named corpora and labels results", async () => {
       { name: "memory", kind: "files", paths: ["MEMORY.md"] },
       { name: "projects", kind: "files", paths: ["projects/**/*.md"] },
     ]);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("keeps skill vectors private to direct skill search", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-skills-"));
+  await mkdir(join(workspace, "skills", "deploy"), { recursive: true });
+  await mkdir(join(workspace, "global-skills", "deploy"), { recursive: true });
+  await writeFile(join(workspace, "MEMORY.md"), "memory body\n");
+  await writeFile(join(workspace, "skills", "deploy", "SKILL.md"), "---\nname: deploy-helper\n---\nDeploy safely.\n");
+  await writeFile(join(workspace, "global-skills", "deploy", "SKILL.md"), "---\nname: deploy-helper\n---\nDeploy globally.\n");
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const [skills, globalSkills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md", "global-skills/**/SKILL.md"],
+  }]);
+  const seen: Array<{ collections: readonly string[]; expand?: boolean; minScore?: number }> = [];
+  const store = createManagerStore({
+    async vsearch(_query, options) {
+      const collections = typeof options?.collection === "string"
+        ? [options.collection]
+        : [...(options?.collection ?? [])];
+      seen.push({ collections, expand: options?.expand, minScore: options?.minScore });
+      if (collections.includes(skills!.collection)) {
+        return [{
+          file: `qmd://${skills!.collection}/deploy/SKILL.md`,
+          displayPath: `${skills!.collection}/deploy/SKILL.md`,
+          title: "Deploy",
+          body: "---\nname: deploy-helper\n---\nDeploy safely.",
+          score: 0.72,
+          context: null,
+          docid: "skill-hash",
+          bestChunk: "Deploy safely.",
+          chunkPos: 28,
+          chunkLen: 14,
+        }, {
+          file: `qmd://${globalSkills!.collection}/deploy/SKILL.md`,
+          displayPath: `${globalSkills!.collection}/deploy/SKILL.md`,
+          title: "Global Deploy",
+          body: "---\nname: deploy-helper\n---\nDeploy globally.",
+          score: 0.92,
+          context: null,
+          docid: "global-skill-hash",
+          bestChunk: "Deploy globally.",
+          chunkPos: 28,
+          chunkLen: 16,
+        }];
+      }
+      return [];
+    },
+  });
+  const manager = new QmdMemoryManager({
+    dbPath: join(workspace, "index.sqlite"),
+    workspaceDir: workspace,
+    sources: [memory, skills!, globalSkills!],
+    storeFactory: async () => store,
+  });
+  try {
+    await manager.start();
+    assert.deepEqual(await manager.search("deploy"), []);
+    assert.deepEqual(await manager.search("deploy", { corpora: ["all"] }), []);
+    await assert.rejects(manager.search("deploy", { corpora: ["skills"] }), /unknown corpus: skills/);
+    assert.deepEqual(await manager.searchSkills("deploy", 0.6, 10), [{
+      name: "deploy-helper",
+      path: await realpath(join(workspace, "skills", "deploy", "SKILL.md")),
+      score: 0.72,
+    }]);
+    assert.equal((await manager.readFile({
+      relPath: `qmd://${skills!.collection}/deploy/SKILL.md`,
+    })).status, "not_found");
+    assert.deepEqual(seen.slice(-1)[0], {
+      collections: [skills!.collection, globalSkills!.collection],
+      expand: false,
+      minScore: 0.6,
+    });
+  } finally {
+    await manager.close();
+  }
+});
+
+test("passes only non-skill collections to memory analysis", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-skills-"));
+  const backing = await createStore({ dbPath: join(workspace, "index.sqlite"), config: { collections: {} } });
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const [skills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+  let analyzed: readonly string[] = [];
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: workspace,
+    sources: [memory, skills!],
+    storeFactory: async () => createManagerStore({
+      internal: backing.internal,
+      async close() { await backing.close(); },
+    }),
+    analysisExecutable: "/worker",
+    analysisRunner: async ({ collections }) => {
+      analyzed = collections;
+      backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+        (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+        VALUES ('fresh', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+    },
+  });
+  try {
+    await manager.start();
+    await manager.recluster();
+    assert.deepEqual(analyzed, [memory.collection]);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("marks analysis stale when a configured collection becomes skills-only", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-reclassified-skill-"));
+  const backing = await createStore({ dbPath: join(workspace, "index.sqlite"), config: { collections: {} } });
+  ensureMemoryAnalysisSchema(backing.internal.db);
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const [skills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+  backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+    (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+    VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, ?, NULL)`)
+    .run(JSON.stringify({ collections: [memory.collection, skills!.collection].toSorted() }));
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: workspace,
+    sources: [memory, skills!],
+    storeFactory: async () => createManagerStore({
+      internal: backing.internal,
+      async close() { await backing.close(); },
+    }),
+  });
+  try {
+    await manager.start();
+    assert.equal((await manager.listClusters()).stale, true);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("skill-only indexing changes do not invalidate memory analysis", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-skill-refresh-"));
+  const backing = await createStore({ dbPath: join(workspace, "index.sqlite"), config: { collections: {} } });
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const [skills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+  let changedCollection: string | undefined;
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: workspace,
+    sources: [memory, skills!],
+    storeFactory: async () => createManagerStore({
+      internal: backing.internal,
+      async update(options) {
+        const changed = options?.collections?.includes(changedCollection ?? "") ?? false;
+        return {
+          collections: 1,
+          indexed: changed ? 1 : 0,
+          updated: 0,
+          unchanged: changed ? 0 : 1,
+          removed: 0,
+          skipped: 0,
+          needsEmbedding: 0,
+        };
+      },
+      async close() { await backing.close(); },
+    }),
+  });
+  try {
+    await manager.start();
+    backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+    changedCollection = skills!.collection;
+    await manager.sync();
+    assert.equal((await manager.listClusters()).stale, false);
+    changedCollection = memory.collection;
+    await manager.sync();
+    assert.equal((await manager.listClusters()).stale, true);
   } finally {
     await manager.close();
   }

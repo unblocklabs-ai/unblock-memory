@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.2.7",
+  "version": "0.3.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": false },
@@ -23,7 +23,11 @@
     },
     "corpora": {
       "label": "Memory Corpora",
-      "help": "Named groups of exact Markdown files, directories, or globs. Relative paths resolve from each agent workspace."
+      "help": "Named groups of exact Markdown files, directories, or globs. Relative paths resolve from each agent workspace. Skill files use the isolated skills corpus."
+    },
+    "skillWhisperer.enabled": {
+      "label": "Skill Whisperer",
+      "help": "Suggest at most one semantically relevant configured skill before a user turn. Requires hook conversation access."
     },
     "analysis.executable": {
       "label": "Memory Analysis Worker",
@@ -71,6 +75,20 @@
                   "default": ["channel", "group"]
                 }
               }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "kind", "paths"],
+              "properties": {
+                "name": { "const": "skills" },
+                "kind": { "const": "skills" },
+                "paths": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "pattern": "\\S" }
+                }
+              }
             }
           ]
         },
@@ -87,6 +105,22 @@
         "additionalProperties": false,
         "properties": {
           "executable": { "type": "string", "minLength": 1 }
+        }
+      },
+      "skillWhisperer": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "historyMessages": { "type": "integer", "minimum": 0, "default": 5 },
+          "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4 },
+          "cooldownTurns": { "type": "integer", "minimum": 0, "default": 10 }
+        },
+        "default": {
+          "enabled": false,
+          "historyMessages": 5,
+          "minScore": 0.4,
+          "cooldownTurns": 10
         }
       }
     }

@@ -68,5 +68,13 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         agentId: string;
     }): Promise<void>;
     closeAllMemorySearchManagers(): Promise<void>;
+    searchSkills(params: {
+        cfg: OpenClawConfig;
+        agentId: string;
+    }, query: string, minScore: number, limit: number): Promise<import("./manager.js").SkillSearchCandidate[]>;
+    resolveSkillPath(params: {
+        cfg: OpenClawConfig;
+        agentId: string;
+    }, path: string): string | undefined;
 }
 export {};

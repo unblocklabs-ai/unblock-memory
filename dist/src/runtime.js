@@ -5,7 +5,7 @@ import { resolveAgentDir, resolveAgentWorkspaceDir, resolveStateDir, } from "ope
 import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { QmdMemoryManager } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
-import { resolveSessionSource, resolveSources } from "./sources.js";
+import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
 import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
 const activeSessionSyncs = new Map();
 async function readJson(path) {
@@ -190,10 +190,21 @@ export class QmdMemoryRuntime {
         this.#managers.clear();
         await Promise.all(managers.map(async (pending) => (await pending).close()));
     }
+    async searchSkills(params, query, minScore, limit) {
+        const { manager, error } = await this.getMemorySearchManager(params);
+        if (!manager)
+            throw new Error(error ?? "memory unavailable");
+        return manager.searchSkills(query, minScore, limit);
+    }
+    resolveSkillPath(params, path) {
+        const workspaceDir = resolveAgentWorkspaceDir(params.cfg, params.agentId);
+        const skillCorpora = this.#corpora.filter((corpus) => corpus.kind === "skills");
+        return resolveConfiguredSkillPath(workspaceDir, path, resolveSources(workspaceDir, skillCorpora));
+    }
     async #createManager(cfg, agentId) {
         const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
         const stateDir = join(this.#stateRoot, "agents", agentId, "unblock-memory");
-        const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files");
+        const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files" || corpus.kind === "skills");
         const sessionCorpus = this.#corpora.find((corpus) => corpus.kind === "sessions");
         const sources = resolveSources(workspaceDir, fileCorpora);
         const sessionSource = sessionCorpus

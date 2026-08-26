@@ -104,7 +104,7 @@ export function clusterReference(runId, clusterId) {
 export function runAnalysisWorker(params) {
     return new Promise((resolve, reject) => {
         params.signal?.throwIfAborted();
-        const args = ["--db", params.dbPath];
+        const args = ["--db", params.dbPath, "--collections-json", JSON.stringify(params.collections)];
         if (params.options && Object.keys(params.options).length > 0) {
             args.push("--config-json", JSON.stringify(params.options));
         }
@@ -169,6 +169,26 @@ function latestRun(db) {
 }
 export function latestAnalysisRunId(db) {
     return latestRun(db)?.id;
+}
+export function latestAnalysisCollections(db) {
+    const row = db.prepare(`
+    SELECT params_json
+    FROM memory_analysis_runs
+    WHERE completed_at IS NOT NULL
+    ORDER BY completed_at DESC, created_at DESC, id DESC
+    LIMIT 1
+  `).get();
+    if (!row)
+        return undefined;
+    try {
+        const collections = JSON.parse(row.params_json).collections;
+        return Array.isArray(collections) && collections.every((value) => typeof value === "string")
+            ? collections
+            : undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 function count(db, sql, runId) {
     return db.prepare(sql).get(runId)?.count ?? 0;

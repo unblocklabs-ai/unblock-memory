@@ -3,7 +3,7 @@ import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import picomatch from "picomatch";
-import type { ChatType, FileCorpusConfig } from "./config.js";
+import type { ChatType, FileCorpusConfig, SkillCorpusConfig } from "./config.js";
 
 const GLOB_MAGIC = /[*?[{(]/;
 
@@ -11,7 +11,7 @@ export type ResolvedSource = {
   collection: string;
   corpus: string;
   configuredPath: string;
-  kind: "files" | "sessions";
+  kind: "files" | "skills" | "sessions";
   root: string;
   pattern: string;
   watchPath: string;
@@ -89,6 +89,14 @@ export function resolveSource(workspaceDir: string, configuredPath: string, corp
   return { collection: collectionName(absolute), corpus, configuredPath, kind: "files", root, pattern, watchPath: root };
 }
 
+function resolveFileSource(
+  workspaceDir: string,
+  configuredPath: string,
+  corpus: FileCorpusConfig | SkillCorpusConfig,
+): ResolvedSource {
+  return { ...resolveSource(workspaceDir, configuredPath, corpus.name), kind: corpus.kind };
+}
+
 export function resolveSessionSource(
   sessionsDir: string,
   chatTypes: readonly ChatType[],
@@ -103,13 +111,13 @@ export function resolveSessionSource(
 
 export function resolveSources(
   workspaceDir: string,
-  corpora: readonly FileCorpusConfig[],
+  corpora: readonly (FileCorpusConfig | SkillCorpusConfig)[],
 ): ResolvedSource[] {
   const sources: ResolvedSource[] = [];
   const configured = new Map<string, ResolvedSource>();
   for (const corpus of corpora) {
     for (const path of corpus.paths) {
-      const source = resolveSource(workspaceDir, path, corpus.name);
+      const source = resolveFileSource(workspaceDir, path, corpus);
       const identity = `${source.root}\0${source.pattern}`;
       const duplicate = configured.get(identity);
       if (duplicate) {
@@ -123,6 +131,39 @@ export function resolveSources(
     }
   }
   return sources;
+}
+
+export function resolveConfiguredSkillPath(
+  workspaceDir: string,
+  inputPath: string,
+  sources: readonly ResolvedSource[],
+): string | undefined {
+  if (basename(inputPath).toLowerCase() !== "skill.md") return undefined;
+  const target = resolve(isAbsolute(expandHome(inputPath))
+    ? expandHome(inputPath)
+    : resolve(workspaceDir, inputPath));
+  let canonicalTarget: string;
+  try {
+    canonicalTarget = realpathSync(target);
+  } catch {
+    return undefined;
+  }
+  for (const source of sources) {
+    if (source.kind !== "skills") continue;
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(source.root);
+    } catch {
+      continue;
+    }
+    const relativePath = relative(canonicalRoot, canonicalTarget);
+    const safe = parseSafeVirtualPath(
+      `qmd://${source.collection}/${relativePath.split(sep).join("/")}`,
+      new Map([[source.collection, source]]),
+    );
+    if (safe) return canonicalTarget;
+  }
+  return undefined;
 }
 
 export function parseSafeVirtualPath(

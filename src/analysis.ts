@@ -37,6 +37,7 @@ export type MemoryReclusterOptions = {
 export type AnalysisRunner = (params: {
   executable: string;
   dbPath: string;
+  collections: readonly string[];
   options?: MemoryReclusterOptions;
   signal?: AbortSignal;
 }) => Promise<void>;
@@ -255,12 +256,13 @@ export function clusterReference(runId: string, clusterId: number): string {
 export function runAnalysisWorker(params: {
   executable: string;
   dbPath: string;
+  collections: readonly string[];
   options?: MemoryReclusterOptions;
   signal?: AbortSignal;
 }): Promise<void> {
   return new Promise((resolve, reject) => {
     params.signal?.throwIfAborted();
-    const args = ["--db", params.dbPath];
+    const args = ["--db", params.dbPath, "--collections-json", JSON.stringify(params.collections)];
     if (params.options && Object.keys(params.options).length > 0) {
       args.push("--config-json", JSON.stringify(params.options));
     }
@@ -325,6 +327,25 @@ function latestRun(db: AnalysisDatabase): RunRow | undefined {
 
 export function latestAnalysisRunId(db: AnalysisDatabase): string | undefined {
   return latestRun(db)?.id;
+}
+
+export function latestAnalysisCollections(db: AnalysisDatabase): readonly string[] | undefined {
+  const row = db.prepare(`
+    SELECT params_json
+    FROM memory_analysis_runs
+    WHERE completed_at IS NOT NULL
+    ORDER BY completed_at DESC, created_at DESC, id DESC
+    LIMIT 1
+  `).get<{ params_json: string }>();
+  if (!row) return undefined;
+  try {
+    const collections = (JSON.parse(row.params_json) as { collections?: unknown }).collections;
+    return Array.isArray(collections) && collections.every((value) => typeof value === "string")
+      ? collections
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function count(db: AnalysisDatabase, sql: string, runId: string): number {

@@ -8,6 +8,7 @@ import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import {
   clusterReference,
   ensureMemoryAnalysisSchema,
+  latestAnalysisCollections,
   markMemoryAnalysisStale,
   readAnalysisSummary,
   readCluster,
@@ -97,6 +98,22 @@ test("creates only the clean analysis schema", async () => {
       "PRAGMA foreign_key_list(memory_analysis_duplicate_occurrences)",
     ).all<{ table: string }>();
     assert.deepEqual([...new Set(duplicateForeignKeys.map((key) => key.table))], ["memory_analysis_runs"]);
+  } finally {
+    await store.close();
+  }
+});
+
+test("reads the latest analysis collection allowlist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-collections-"));
+  const store = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  try {
+    ensureMemoryAnalysisSchema(store.internal.db);
+    insertRun(store.internal.db);
+    assert.equal(latestAnalysisCollections(store.internal.db), undefined);
+    store.internal.db.prepare(
+      `UPDATE memory_analysis_runs SET params_json = ? WHERE id = 'run'`,
+    ).run(JSON.stringify({ collections: ["sessions", "memory"] }));
+    assert.deepEqual(latestAnalysisCollections(store.internal.db), ["sessions", "memory"]);
   } finally {
     await store.close();
   }
@@ -415,18 +432,23 @@ test("spawns the configured executable with fixed database and optional config a
   const capture = join(root, "args.txt");
   await writeFile(executable, `#!/bin/sh\nprintf '%s\\n' "$@" > '${capture}'\n`);
   await chmod(executable, 0o700);
-  await runAnalysisWorker({ executable, dbPath: "/tmp/index path.sqlite" });
-  assert.equal(await readFile(capture, "utf8"), "--db\n/tmp/index path.sqlite\n");
+  const collections = ["memory", "sessions"];
+  await runAnalysisWorker({ executable, dbPath: "/tmp/index path.sqlite", collections });
+  assert.equal(
+    await readFile(capture, "utf8"),
+    `--db\n/tmp/index path.sqlite\n--collections-json\n${JSON.stringify(collections)}\n`,
+  );
 
   const options = {
     space: { method: "none" as const, nComponents: 20 },
     hdbscan: { minClusterSize: 12, clusterSelectionMethod: "leaf" as const },
     seed: 7,
   };
-  await runAnalysisWorker({ executable, dbPath: "/tmp/index path.sqlite", options });
+  await runAnalysisWorker({ executable, dbPath: "/tmp/index path.sqlite", collections, options });
   assert.equal(
     await readFile(capture, "utf8"),
-    `--db\n/tmp/index path.sqlite\n--config-json\n${JSON.stringify(options)}\n`,
+    `--db\n/tmp/index path.sqlite\n--collections-json\n${JSON.stringify(collections)}\n` +
+      `--config-json\n${JSON.stringify(options)}\n`,
   );
 });
 
@@ -447,7 +469,12 @@ setInterval(() => {}, 1_000);
   await chmod(executable, 0o700);
   const controller = new AbortController();
   const listenerCount = getEventListeners(controller.signal, "abort").length;
-  const pending = runAnalysisWorker({ executable, dbPath: join(root, "index.sqlite"), signal: controller.signal });
+  const pending = runAnalysisWorker({
+    executable,
+    dbPath: join(root, "index.sqlite"),
+    collections: ["memory"],
+    signal: controller.signal,
+  });
   assert.equal(getEventListeners(controller.signal, "abort").length, listenerCount + 1);
   await waitForFile(ready);
   controller.abort(new Error("cancelled"));

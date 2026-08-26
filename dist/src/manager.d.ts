@@ -16,6 +16,11 @@ export type ManagerSessionConfig = {
     outputDir: string;
     timezone: string;
 };
+export type SkillSearchCandidate = {
+    name: string;
+    path: string;
+    score: number;
+};
 export declare function enableSecureDelete(store: QMDStore): void;
 export declare function cleanupRemovedDocuments(store: QMDStore, changedDocuments?: number): number;
 export declare function pruneStaleCollections(store: QMDStore, configuredCollections: ReadonlySet<string>): Promise<number>;
@@ -65,6 +70,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         };
     }): import("./curation.js").MaintenanceTask | undefined;
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
+    searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
     readFile(params: {
         relPath: string;
         from?: number;

@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { parseSafeVirtualPath, resolveSource, resolveSources } from "../src/sources.js";
+import {
+  parseSafeVirtualPath,
+  resolveConfiguredSkillPath,
+  resolveSource,
+  resolveSources,
+} from "../src/sources.js";
 
 test("resolves exact files, directories, and globs deterministically", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-paths-"));
@@ -40,6 +45,25 @@ test("assigns corpus identity without changing physical collection identity", as
   assert.throws(() => resolveSources(workspace, [
     { name: "memory", kind: "files", paths: ["memory", "./memory/**/*.md"] },
   ]), /duplicates/);
+});
+
+test("recognizes only configured skill files for read tracking", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-skill-path-"));
+  const skill = join(workspace, "skills", "deploy", "SKILL.md");
+  const other = join(workspace, "skills", "deploy", "notes.md");
+  await mkdir(join(skill, ".."), { recursive: true });
+  await writeFile(skill, "---\nname: deploy\n---\n");
+  await writeFile(other, "notes\n");
+  const sources = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+  const canonicalSkill = await realpath(skill);
+  assert.equal(resolveConfiguredSkillPath(workspace, skill, sources), canonicalSkill);
+  assert.equal(resolveConfiguredSkillPath(workspace, "skills/deploy/SKILL.md", sources), canonicalSkill);
+  assert.equal(resolveConfiguredSkillPath(workspace, other, sources), undefined);
+  assert.equal(resolveConfiguredSkillPath(workspace, join(workspace, "outside", "SKILL.md"), sources), undefined);
 });
 
 test("virtual reads reject traversal and accept exact in-root markdown", async () => {

@@ -6,6 +6,7 @@
     "seams": ["plugin-runtime"],
     "sourceRoot": "src",
     "expect": {
+      "hooks": ["before_prompt_build", "after_tool_call", "session_end"],
       "registrations": ["registerMemoryCapability", "registerTool"],
       "manifestContracts": ["tools"]
     }

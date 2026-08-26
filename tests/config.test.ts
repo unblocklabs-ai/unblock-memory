@@ -13,6 +13,38 @@ test("keeps the embedding model warm by default and accepts an opt-out", () => {
   assert.throws(() => resolveConfig({ keepEmbeddingModelWarm: "yes" }), /must be a boolean/);
 });
 
+test("keeps skill whispering disabled by default and validates its lean controls", () => {
+  assert.deepEqual(resolveConfig(undefined).skillWhisperer, {
+    enabled: false,
+    historyMessages: 5,
+    minScore: 0.4,
+    cooldownTurns: 10,
+  });
+  const corpora = [
+    { name: "memory", kind: "files", paths: ["MEMORY.md"] },
+    { name: "skills", kind: "skills", paths: [" skills/**/SKILL.md "] },
+  ];
+  assert.deepEqual(resolveConfig({
+    corpora,
+    skillWhisperer: { enabled: true, historyMessages: 0, minScore: 0.7, cooldownTurns: 0 },
+  }).skillWhisperer, {
+    enabled: true,
+    historyMessages: 0,
+    minScore: 0.7,
+    cooldownTurns: 0,
+  });
+  assert.deepEqual(resolveConfig({ corpora }).corpora[1], {
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  });
+  assert.throws(() => resolveConfig({ skillWhisperer: { enabled: true } }), /requires.*skills/);
+  assert.throws(() => resolveConfig({ skillWhisperer: { historyMessages: -1 } }), /non-negative integer/);
+  assert.throws(() => resolveConfig({ skillWhisperer: { minScore: 1.1 } }), /between 0 and 1/);
+  assert.throws(() => resolveConfig({ skillWhisperer: { cooldownTurns: 1.5 } }), /non-negative integer/);
+  assert.throws(() => resolveConfig({ skillWhisperer: { extra: true } }), /unknown property/);
+});
+
 test("validates and trims named file corpora", () => {
   assert.deepEqual(resolveConfig({
     corpora: [
@@ -65,6 +97,7 @@ test("rejects malformed or ambiguous corpora", () => {
   assert.throws(() => resolveConfig({ corpora: [{ ...memory, kind: "sessions" }] }), /unknown property: paths/);
   assert.throws(() => resolveConfig({ corpora: [{ ...memory, name: "all" }] }), /reserved/);
   assert.throws(() => resolveConfig({ corpora: [{ ...memory, name: "sessions" }] }), /must have kind "sessions"/);
+  assert.throws(() => resolveConfig({ corpora: [{ ...memory, name: "skills" }] }), /must have kind "skills"/);
   assert.throws(() => resolveConfig({ corpora: [{ ...memory, extra: true }] }), /unknown property/);
   assert.throws(() => resolveConfig({
     corpora: [memory, { ...memory, paths: ["other.md"] }],
@@ -79,4 +112,7 @@ test("rejects malformed or ambiguous corpora", () => {
   assert.throws(() => resolveConfig({ corpora: [memory, {
     name: "history", kind: "sessions",
   }] }), /must be named "sessions"/);
+  assert.throws(() => resolveConfig({ corpora: [memory, {
+    name: "abilities", kind: "skills", paths: ["skills/**/SKILL.md"],
+  }] }), /must be named "skills"/);
 });

@@ -68,6 +68,9 @@ export function resolveSource(workspaceDir, configuredPath, corpus = "memory") {
     assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
     return { collection: collectionName(absolute), corpus, configuredPath, kind: "files", root, pattern, watchPath: root };
 }
+function resolveFileSource(workspaceDir, configuredPath, corpus) {
+    return { ...resolveSource(workspaceDir, configuredPath, corpus.name), kind: corpus.kind };
+}
 export function resolveSessionSource(sessionsDir, chatTypes) {
     return {
         ...resolveSource(sessionsDir, sessionsDir, "sessions"),
@@ -81,7 +84,7 @@ export function resolveSources(workspaceDir, corpora) {
     const configured = new Map();
     for (const corpus of corpora) {
         for (const path of corpus.paths) {
-            const source = resolveSource(workspaceDir, path, corpus.name);
+            const source = resolveFileSource(workspaceDir, path, corpus);
             const identity = `${source.root}\0${source.pattern}`;
             const duplicate = configured.get(identity);
             if (duplicate) {
@@ -93,6 +96,36 @@ export function resolveSources(workspaceDir, corpora) {
         }
     }
     return sources;
+}
+export function resolveConfiguredSkillPath(workspaceDir, inputPath, sources) {
+    if (basename(inputPath).toLowerCase() !== "skill.md")
+        return undefined;
+    const target = resolve(isAbsolute(expandHome(inputPath))
+        ? expandHome(inputPath)
+        : resolve(workspaceDir, inputPath));
+    let canonicalTarget;
+    try {
+        canonicalTarget = realpathSync(target);
+    }
+    catch {
+        return undefined;
+    }
+    for (const source of sources) {
+        if (source.kind !== "skills")
+            continue;
+        let canonicalRoot;
+        try {
+            canonicalRoot = realpathSync(source.root);
+        }
+        catch {
+            continue;
+        }
+        const relativePath = relative(canonicalRoot, canonicalTarget);
+        const safe = parseSafeVirtualPath(`qmd://${source.collection}/${relativePath.split(sep).join("/")}`, new Map([[source.collection, source]]));
+        if (safe)
+            return canonicalTarget;
+    }
+    return undefined;
 }
 export function parseSafeVirtualPath(virtualPath, sources) {
     const match = /^qmd:\/\/([^/]+)\/(.+)$/.exec(virtualPath.trim());

@@ -1,7 +1,8 @@
+import { realpathSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import chokidar from "chokidar";
-import { ensureMemoryAnalysisSchema, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
+import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
 import { CurationStore, chunkFingerprint, } from "./curation.js";
 import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, } from "./session-sync.js";
 import { parseSafeVirtualPath } from "./sources.js";
@@ -9,6 +10,15 @@ const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
 const qmdModule = import("@unblocklabs/qmd");
+function markStaleForAnalysisCollectionChange(db, collections, hasSkills) {
+    const current = collections.toSorted();
+    const previous = latestAnalysisCollections(db)?.toSorted();
+    if (previous
+        ? previous.join("\0") !== current.join("\0")
+        : hasSkills && latestAnalysisRunId(db) !== undefined) {
+        markMemoryAnalysisStale(db);
+    }
+}
 function completedEmbeddingCount(result) {
     if (result.errors > 0) {
         throw new Error(`QMD failed to embed ${result.errors} chunk${result.errors === 1 ? "" : "s"}`);
@@ -204,7 +214,7 @@ export class QmdMemoryManager {
     }
     #startWatcher() {
         const paths = [...new Set([...this.#sources.values()]
-                .filter((source) => source.kind === "files")
+                .filter((source) => source.kind !== "sessions")
                 .map((source) => source.watchPath))];
         if (paths.length === 0 || this.#watcher)
             return;
@@ -239,8 +249,10 @@ export class QmdMemoryManager {
         if (this.#storeFactory) {
             this.#store = await this.#storeFactory();
             const store = this.#store;
-            if (store.internal)
+            if (store.internal) {
                 ensureMemoryAnalysisSchema(store.internal.db);
+                markStaleForAnalysisCollectionChange(store.internal.db, this.#analysisCollectionNames(), this.#skillCollectionNames().length > 0);
+            }
             return this.#store;
         }
         const { createStore } = await qmdModule;
@@ -256,8 +268,26 @@ export class QmdMemoryManager {
         });
         enableSecureDelete(store);
         ensureMemoryAnalysisSchema(store.internal.db);
-        const prunedDocuments = await pruneStaleCollections(store, new Set(this.#collectionNames()));
-        if (prunedDocuments > 0)
+        markStaleForAnalysisCollectionChange(store.internal.db, this.#analysisCollectionNames(), this.#skillCollectionNames().length > 0);
+        const configuredCollections = new Set(this.#allCollectionNames());
+        const staleCollections = (await store.getStatus()).collections
+            .map((collection) => collection.name)
+            .filter((collection) => !configuredCollections.has(collection));
+        const appearsInAnalysis = store.internal.db.prepare(`
+      SELECT 1
+      FROM memory_analysis_memberships membership
+      JOIN documents document ON document.hash = membership.hash
+      WHERE membership.run_id = (
+        SELECT id FROM memory_analysis_runs
+        WHERE completed_at IS NOT NULL
+        ORDER BY completed_at DESC, created_at DESC, id DESC
+        LIMIT 1
+      ) AND document.collection = ?
+      LIMIT 1
+    `);
+        const prunedAnalysisInput = staleCollections.some((collection) => appearsInAnalysis.get(collection));
+        const prunedDocuments = await pruneStaleCollections(store, configuredCollections);
+        if (prunedDocuments > 0 && prunedAnalysisInput)
             markMemoryAnalysisStale(store.internal.db);
         try {
             await ensureSemanticChunking(store);
@@ -272,22 +302,36 @@ export class QmdMemoryManager {
         this.#store = store;
         return store;
     }
+    #allCollectionNames() {
+        return [...this.#sources.keys()];
+    }
+    #analysisCollectionNames() {
+        return [...this.#sources.values()]
+            .filter((source) => source.kind !== "skills")
+            .map((source) => source.collection);
+    }
+    #skillCollectionNames() {
+        return [...this.#sources.values()]
+            .filter((source) => source.kind === "skills")
+            .map((source) => source.collection);
+    }
     #collectionNames(corpora) {
+        const publicSources = [...this.#sources.values()].filter((source) => source.kind !== "skills");
         if (corpora === undefined)
-            return [...this.#sources.keys()];
+            return publicSources.map((source) => source.collection);
         if (corpora.length === 0)
             throw new Error("memory_search corpora must not be empty");
         const selected = new Set(corpora);
         if (selected.has("all")) {
             if (selected.size > 1)
                 throw new Error('memory_search corpus "all" must be used alone');
-            return [...this.#sources.keys()];
+            return publicSources.map((source) => source.collection);
         }
-        const known = new Set([...this.#sources.values()].map((source) => source.corpus));
+        const known = new Set(publicSources.map((source) => source.corpus));
         const unknown = [...selected].find((corpus) => !known.has(corpus));
         if (unknown)
             throw new Error(`memory_search unknown corpus: ${unknown}`);
-        return [...this.#sources.values()]
+        return publicSources
             .filter((source) => selected.has(source.corpus))
             .map((source) => source.collection);
     }
@@ -295,29 +339,39 @@ export class QmdMemoryManager {
         const run = async () => {
             const store = await this.#getStore();
             this.#dirty = true;
-            const collections = [...this.#sources.values()]
-                .filter((source) => source.kind === "files")
-                .map((source) => source.collection);
-            const update = await store.update({ collections });
-            this.#cleanupRemovedDocuments?.(update.updated + update.removed);
             const analysisStore = store;
-            const invalidatesAnalysis = update.indexed + update.updated + update.removed > 0 ||
-                update.needsEmbedding > 0 ||
-                params?.force === true;
-            if (invalidatesAnalysis && analysisStore.internal) {
+            const collections = [...this.#sources.values()].filter((source) => source.kind !== "sessions");
+            let analysisMarkedStale = false;
+            const markAnalysisStale = () => {
+                if (analysisMarkedStale || !analysisStore.internal)
+                    return;
                 markMemoryAnalysisStale(analysisStore.internal.db);
+                analysisMarkedStale = true;
+            };
+            if (collections.length === 0) {
+                const update = await store.update({ collections: [] });
+                this.#cleanupRemovedDocuments?.(update.updated + update.removed);
+                if (update.indexed + update.updated + update.removed > 0 ||
+                    update.needsEmbedding > 0 || params?.force === true) {
+                    markAnalysisStale();
+                }
+                const embed = await store.embed({ force: params?.force, chunkStrategy: "semantic" });
+                if (completedEmbeddingCount(embed) > 0)
+                    markAnalysisStale();
             }
-            let chunksEmbedded = 0;
-            for (const collection of collections.length > 0 ? collections : [undefined]) {
+            for (const source of collections) {
+                const update = await store.update({ collections: [source.collection] });
+                this.#cleanupRemovedDocuments?.(update.updated + update.removed);
+                const changed = update.indexed + update.updated + update.removed > 0 || update.needsEmbedding > 0;
+                if (source.kind !== "skills" && (changed || params?.force === true))
+                    markAnalysisStale();
                 const embed = await store.embed({
-                    ...(collection ? { collection } : {}),
+                    collection: source.collection,
                     force: params?.force,
                     chunkStrategy: "semantic",
                 });
-                chunksEmbedded += completedEmbeddingCount(embed);
-            }
-            if (!invalidatesAnalysis && chunksEmbedded > 0 && analysisStore.internal) {
-                markMemoryAnalysisStale(analysisStore.internal.db);
+                if (source.kind !== "skills" && completedEmbeddingCount(embed) > 0)
+                    markAnalysisStale();
             }
             const status = await store.getStatus();
             const indexedCollections = await store.listCollections();
@@ -381,6 +435,7 @@ export class QmdMemoryManager {
             await this.#analysisRunner({
                 executable: this.#analysisExecutable,
                 dbPath: this.#dbPath,
+                collections: this.#analysisCollectionNames(),
                 options,
                 signal,
             });
@@ -589,10 +644,54 @@ export class QmdMemoryManager {
                 }];
         });
     }
+    async searchSkills(query, minScore, limit) {
+        const collections = this.#skillCollectionNames();
+        if (collections.length === 0)
+            return [];
+        await this.#operationChain;
+        const hits = await (await this.#getStore()).vsearch(query, {
+            collection: collections,
+            limit,
+            minScore,
+            expand: false,
+        });
+        const sourceOrder = new Map([...this.#sources.keys()].map((collection, index) => [collection, index]));
+        const candidates = new Map();
+        for (const hit of hits) {
+            const safe = parseSafeVirtualPath(hit.file, this.#sources);
+            if (!safe || safe.source.kind !== "skills")
+                continue;
+            const path = realpathSync(resolve(safe.source.root, safe.relativePath));
+            if (basename(path).toLowerCase() !== "skill.md")
+                continue;
+            const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\n|$)/u.exec(hit.body)?.[1];
+            const configuredName = frontmatter?.split("\n")
+                .map((line) => /^name:\s*(.+?)\s*$/u.exec(line)?.[1])
+                .find((name) => name !== undefined)
+                ?.replace(/^(?:"(.*)"|'(.*)')$/u, "$1$2");
+            const candidate = {
+                name: configuredName?.trim() || basename(dirname(path)),
+                path,
+                score: hit.score,
+            };
+            const key = candidate.name.toLowerCase();
+            const order = sourceOrder.get(safe.source.collection) ?? Number.MAX_SAFE_INTEGER;
+            const current = candidates.get(key);
+            if (!current || order < current.sourceOrder ||
+                (order === current.sourceOrder && candidate.score > current.candidate.score)) {
+                candidates.set(key, { candidate, sourceOrder: order });
+            }
+        }
+        return [...candidates.values()]
+            .map(({ candidate }) => candidate)
+            .sort((left, right) => right.score - left.score)
+            .slice(0, limit);
+    }
     async readFile(params) {
         const safe = parseSafeVirtualPath(params.relPath, this.#sources);
-        if (!safe)
+        if (!safe || safe.source.kind === "skills") {
             return { status: "not_found", text: "", path: params.relPath };
+        }
         await this.#operationChain;
         const store = await this.#getStore();
         const doc = await store.get(safe.normalized);
@@ -628,7 +727,11 @@ export class QmdMemoryManager {
             custom: {
                 corpora: [...corpora].map(([name, sources]) => sources[0]?.kind === "sessions"
                     ? { name, kind: "sessions", chatTypes: sources[0].chatTypes }
-                    : { name, kind: "files", paths: sources.map((source) => source.configuredPath) }),
+                    : {
+                        name,
+                        kind: sources[0]?.kind === "skills" ? "skills" : "files",
+                        paths: sources.map((source) => source.configuredPath),
+                    }),
                 ...(this.#watchError ? { watchError: this.#watchError } : {}),
             },
         };

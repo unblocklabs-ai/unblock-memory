@@ -3,6 +3,7 @@ import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveConfig } from "./config.js";
 import { QmdMemoryRuntime } from "./runtime.js";
+import { registerSkillWhisperer } from "./skill-whisperer.js";
 function getContext(ctx) {
     const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
     if (!cfg || !ctx.agentId)
@@ -43,7 +44,7 @@ function createSearchTool(runtime, ctx) {
     return {
         name: "memory_search",
         label: "Memory Search",
-        description: "Search configured Markdown corpora with semantic vector retrieval. Omit corpora to search all of them.",
+        description: "Search configured memory corpora with semantic vector retrieval. The isolated skills corpus is never included.",
         parameters: searchParameters,
         async execute(_toolCallId, params, signal) {
             const { query: untrimmedQuery, corpora, sessionFilter, maxResults, minScore } = Value.Parse(searchParameters, params);
@@ -277,7 +278,7 @@ function createUpdateMaintenanceTool(runtime, ctx) {
     return {
         name: "memory_update_maintenance_task",
         label: "Update Memory Maintenance Task",
-        description: "Resolve, defer, or dismiss a memory-maintenance proposal. This tool never edits source Markdown.",
+        description: "Resolve completed work, defer outstanding work, or dismiss an irrelevant memory-maintenance proposal. This tool never edits source Markdown.",
         parameters: updateMaintenanceParameters,
         async execute(_toolCallId, params) {
             const { taskId, action, note, annotation } = Value.Parse(updateMaintenanceParameters, params);
@@ -380,6 +381,7 @@ export function registerUnblockMemory(api) {
         runtime,
     };
     api.registerMemoryCapability(capability);
+    registerSkillWhisperer(api, runtime, config.skillWhisperer);
     api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
     api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), { names: ["memory_sync_sessions"] });
