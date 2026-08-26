@@ -122,9 +122,10 @@ does not sync sessions at startup or on a schedule; refreshes are manual through
 `memory_sync_sessions`.
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
-equivalent configured OpenClaw state directory). The first lookup builds the
-index; Markdown filesystem changes queue a debounced, serialized background
-refresh.
+equivalent configured OpenClaw state directory). Durable agent-supplied event
+dates and maintenance proposals live separately in `curation.sqlite`, so a QMD
+index rebuild does not discard them. The first lookup builds the index;
+Markdown filesystem changes queue a debounced, serialized background refresh.
 
 ## Memory analysis
 
@@ -175,10 +176,22 @@ and a deterministic seed. Omitting them uses the worker's defaults.
 `memory_fetch_cluster` accepts `topK` (1–50), a zero-based `offset`, and
 `sort`: `representative` (the default), `score_desc`, `score_asc`, `date_desc`,
 or `date_asc`. Score is cluster membership probability for normal clusters and
-outlier score for noise. Each member includes `sourceDate`, the latest
-modification time among its active source aliases. For projected sessions that
-date is the session start time. Responses include page totals and the next
-offset when more members remain.
+outlier score for noise. Each member reports raw `sourceModifiedAt` separately
+from `eventTime` and `eventTimeBasis`. Session start times and dated memory paths
+resolve programmatically; reviewed annotations resolve otherwise ambiguous
+chunks or whole documents. Date sorting uses resolved event time when available
+and the clearly labeled source modification time only as a fallback. Responses
+include page totals and the next offset when more members remain.
+
+A chronological cluster read creates a coalesced maintenance proposal only for
+returned documents whose event time remains ambiguous; it does not scan the
+whole corpus for chores. Persisted exact-duplicate analysis can likewise create
+review proposals for non-session Markdown. `memory_list_maintenance_tasks`
+returns at most ten tasks, while `memory_update_maintenance_task` can resolve,
+defer, or mark one irrelevant and optionally attach a supported event date.
+These tools never edit or delete source Markdown. Duplicate cleanup remains a
+reviewed source change outside the maintenance tool, and generated session
+projections must never be edited directly.
 
 Member excerpts are capped at 2 KB each and 12 KB across a response; source
 aliases are capped at five per member and 50 across a response. These budgets

@@ -64,6 +64,7 @@ test("creates only the clean analysis schema", async () => {
     `).all<{ name: string }>();
     assert.deepEqual(rows.map((row) => row.name), [
       "memory_analysis_clusters",
+      "memory_analysis_duplicate_occurrences",
       "memory_analysis_memberships",
       "memory_analysis_runs",
     ]);
@@ -80,6 +81,22 @@ test("creates only the clean analysis schema", async () => {
     const foreignKeys = db.prepare("PRAGMA foreign_key_list(memory_analysis_memberships)")
       .all<{ table: string }>();
     assert.deepEqual([...new Set(foreignKeys.map((key) => key.table))], ["memory_analysis_runs"]);
+    const duplicateColumns = db.prepare("PRAGMA table_info(memory_analysis_duplicate_occurrences)")
+      .all<{ name: string; pk: number }>();
+    assert.deepEqual(duplicateColumns.map((column) => column.name), [
+      "run_id",
+      "content_fingerprint",
+      "canonical_hash",
+      "canonical_seq",
+      "duplicate_hash",
+      "duplicate_seq",
+    ]);
+    assert.deepEqual(duplicateColumns.filter((column) => column.pk > 0).map((column) => column.name),
+      ["run_id", "duplicate_hash", "duplicate_seq"]);
+    const duplicateForeignKeys = db.prepare(
+      "PRAGMA foreign_key_list(memory_analysis_duplicate_occurrences)",
+    ).all<{ table: string }>();
+    assert.deepEqual([...new Set(duplicateForeignKeys.map((key) => key.table))], ["memory_analysis_runs"]);
   } finally {
     await store.close();
   }
@@ -184,7 +201,7 @@ test("lists short cluster references and fetches representative and noise member
 
     const cluster = readCluster(db, listed.clusters[0]!.clusterId, 20);
     assert.deepEqual(cluster.members?.map((member) => member.hash), ["rank-one", "rank-two", "unranked"]);
-    assert.deepEqual(cluster.members?.map((member) => member.sourceDate), [
+    assert.deepEqual(cluster.members?.map((member) => member.sourceModifiedAt), [
       "2026-08-03T00:00:00Z",
       "2026-08-02T00:00:00Z",
       "2026-08-04T00:00:00Z",
@@ -221,6 +238,77 @@ test("lists short cluster references and fetches representative and noise member
       readCluster(db, listed.noise!.clusterId, 20, 0, "score_asc").members?.map((member) => member.hash),
       ["noise-low", "noise-high"],
     );
+  } finally {
+    await store.close();
+  }
+});
+
+test("sorts by resolved event time while labeling modified-time fallbacks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-event-time-"));
+  const store = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  try {
+    const db = store.internal.db;
+    ensureMemoryAnalysisSchema(db);
+    insertChunk(db, "dated", "dated memory", 1, "2026-08-25T12:00:00Z");
+    insertChunk(db, "ambiguous", "ambiguous memory", 1, "2026-08-01T12:00:00Z");
+    db.prepare("UPDATE documents SET path = 'memory/2026-07-01.md' WHERE hash = 'dated'").run();
+    db.prepare("UPDATE documents SET path = 'archive.md' WHERE hash = 'ambiguous'").run();
+    insertRun(db);
+    db.prepare("INSERT INTO memory_analysis_clusters VALUES ('run', 2, 2, 0.8)").run();
+    db.prepare(`INSERT INTO memory_analysis_memberships VALUES
+      ('run', 'dated', 0, 2, 0.9, 0.1, 0, 0, 1),
+      ('run', 'ambiguous', 0, 2, 0.8, 0.2, 0, 0, 2)`).run();
+
+    const clusterId = clusterReference("run", 2);
+    const first = readCluster(db, clusterId, 20, 0, "date_asc");
+    assert.deepEqual(first.members?.map((member) => member.hash), ["dated", "ambiguous"]);
+    assert.deepEqual(first.members?.map((member) => ({
+      eventTime: member.eventTime,
+      basis: member.eventTimeBasis,
+      sourceModifiedAt: member.sourceModifiedAt,
+    })), [
+      {
+        eventTime: "2026-07-01T00:00:00.000Z",
+        basis: "path",
+        sourceModifiedAt: "2026-08-25T12:00:00Z",
+      },
+      { eventTime: null, basis: null, sourceModifiedAt: "2026-08-01T12:00:00Z" },
+    ]);
+
+    db.prepare(`INSERT INTO memory_temporal_annotations
+      (collection, path, qmd_hash, qmd_seq, event_time, basis, document_wide)
+      VALUES ('memory', 'archive.md', 'ambiguous', 0, '2026-06-01T00:00:00Z', 'agent_verified', 0)`)
+      .run();
+    const annotated = readCluster(db, clusterId, 20, 0, "date_asc");
+    assert.deepEqual(annotated.members?.map((member) => member.hash), ["ambiguous", "dated"]);
+    assert.equal(annotated.members?.[0]?.eventTimeBasis, "agent_verified");
+  } finally {
+    await store.close();
+  }
+});
+
+test("sorts timezone-offset dates and candidate aliases by actual instant", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-offset-time-"));
+  const store = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  try {
+    const db = store.internal.db;
+    ensureMemoryAnalysisSchema(db);
+    insertChunk(db, "offset", "offset memory", 1, "2026-08-01T00:30:00+02:00");
+    insertChunk(db, "zulu", "zulu memory", 1, "2026-07-31T23:00:00Z");
+    db.prepare("UPDATE documents SET path = 'offset.md' WHERE hash = 'offset'").run();
+    db.prepare("UPDATE documents SET path = 'zulu.md' WHERE hash = 'zulu'").run();
+    db.prepare(`INSERT INTO documents(collection, path, title, hash, created_at, modified_at, active)
+      VALUES ('memory', 'zulu-earlier-alias.md', 'Memory', 'zulu', 'now',
+              '2026-08-01T00:30:00+02:00', 1)`).run();
+    insertRun(db);
+    db.prepare("INSERT INTO memory_analysis_clusters VALUES ('run', 3, 2, 0.8)").run();
+    db.prepare(`INSERT INTO memory_analysis_memberships VALUES
+      ('run', 'offset', 0, 3, 0.9, 0.1, 0, 0, 1),
+      ('run', 'zulu', 0, 3, 0.8, 0.2, 0, 0, 2)`).run();
+
+    const detail = readCluster(db, clusterReference("run", 3), 20, 0, "date_asc");
+    assert.deepEqual(detail.members?.map((member) => member.hash), ["offset", "zulu"]);
+    assert.equal(detail.members?.[1]?.eventTimeSource, "qmd://memory/zulu.md");
   } finally {
     await store.close();
   }

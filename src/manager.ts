@@ -30,6 +30,12 @@ import type {
 } from "./contracts.js";
 import type { ChatType } from "./config.js";
 import {
+  CurationStore,
+  chunkFingerprint,
+  type MaintenanceStatus,
+  type TemporalBasis,
+} from "./curation.js";
+import {
   readSessionManifest,
   sessionMetadataByPath,
   syncSessionProjections,
@@ -227,6 +233,7 @@ function sessionAllowedPaths(
 export class QmdMemoryManager implements MemorySearchManagerContract {
   readonly #dbPath: string;
   readonly #workspaceDir: string;
+  readonly #curationPath: string;
   readonly #sources: ReadonlyMap<string, ResolvedSource>;
   readonly #storeFactory?: () => Promise<ManagerStore>;
   readonly #keepModelsWarm: boolean;
@@ -234,6 +241,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   readonly #analysisRunner: AnalysisRunner;
   readonly #sessions?: ManagerSessionConfig;
   #store?: ManagerStore;
+  #curation?: CurationStore;
   #cleanupRemovedDocuments?: (changedDocuments: number) => void;
   #operationChain?: Promise<void>;
   #watcher?: FSWatcher;
@@ -248,6 +256,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
 
   constructor(params: {
     dbPath: string;
+    curationPath?: string;
     workspaceDir: string;
     sources: readonly ResolvedSource[];
     storeFactory?: () => Promise<ManagerStore>;
@@ -257,6 +266,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     sessions?: ManagerSessionConfig;
   }) {
     this.#dbPath = params.dbPath;
+    this.#curationPath = params.curationPath ?? `${params.dbPath}.curation.sqlite`;
     this.#workspaceDir = params.workspaceDir;
     this.#sources = new Map(params.sources.map((source) => [source.collection, source]));
     this.#storeFactory = params.storeFactory;
@@ -502,13 +512,177 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     offset?: number;
     sort?: MemoryClusterSort;
   }): Promise<MemoryClusterDetail> {
-    return this.#enqueue(async () => readCluster(
-      (await this.#getAnalysisStore()).internal.db,
-      params.clusterId,
-      params.topK,
-      params.offset,
-      params.sort,
-    ));
+    return this.#enqueue(async () => {
+      const db = (await this.#getAnalysisStore()).internal.db;
+      this.#loadTemporalAnnotations(db);
+      const detail = readCluster(
+        db,
+        params.clusterId,
+        params.topK,
+        params.offset,
+        params.sort,
+        { sessionCollection: this.#sessions?.collection },
+      );
+      if (params.sort === "date_asc" || params.sort === "date_desc") {
+        for (const member of detail.members ?? []) {
+          if (member.eventTime !== null) continue;
+          const safe = parseSafeVirtualPath(member.eventTimeSource, this.#sources);
+          if (!safe) continue;
+          this.#getCuration().addTask({
+            type: "ambiguous_event_time",
+            corpus: safe.source.corpus,
+            collection: safe.source.collection,
+            path: safe.relativePath,
+            reason: "cluster chronology has no reliable event time",
+            contentFingerprint: member.contentFingerprint,
+            detail: "Inspect the document and relevant evidence; annotate a date only when one can be supported.",
+          });
+        }
+      }
+      if (detail.runId && detail.members) {
+        this.#addDuplicateTasks(db, detail.runId, detail.members);
+      }
+      return detail;
+    });
+  }
+
+  listMaintenanceTasks(params: { status?: MaintenanceStatus; limit?: number } = {}) {
+    return this.#getCuration().listTasks(params);
+  }
+
+  updateMaintenanceTask(params: {
+    id: string;
+    status: Exclude<MaintenanceStatus, "pending">;
+    note?: string;
+    annotation?: {
+      scope: "chunk" | "document";
+      eventTime: string;
+      basis: TemporalBasis;
+      evidence: string;
+    };
+  }) {
+    return this.#getCuration().updateTask(params);
+  }
+
+  #getCuration(): CurationStore {
+    this.#curation ??= new CurationStore(this.#curationPath);
+    return this.#curation;
+  }
+
+  #loadTemporalAnnotations(db: AnalysisStore["internal"]["db"]): void {
+    db.exec("DELETE FROM memory_temporal_annotations");
+    const findChunks = db.prepare(`
+      SELECT d.hash, vectors.seq, vectors.pos, vectors.chunk_len, content.doc
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      JOIN content_vectors vectors ON vectors.hash = d.hash
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+      ORDER BY vectors.seq
+    `);
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO memory_temporal_annotations
+        (collection, path, qmd_hash, qmd_seq, event_time, basis, document_wide)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const curation = this.#getCuration();
+    for (const annotation of curation.annotations()) {
+      if (!annotation.contentFingerprint) {
+        insert.run(
+          annotation.collection,
+          annotation.path,
+          null,
+          null,
+          annotation.eventTime,
+          annotation.basis,
+          1,
+        );
+        continue;
+      }
+      const rows = findChunks.all(annotation.collection, annotation.path) as Array<{
+        hash: string;
+        seq: number;
+        pos: number;
+        chunk_len: number;
+        doc: string;
+      }>;
+      const matched = rows.find((row) =>
+        chunkFingerprint(row.doc.slice(row.pos, row.pos + row.chunk_len)) === annotation.contentFingerprint);
+      curation.updateAnnotationLocation({
+        annotation,
+        qmdHash: matched?.hash ?? null,
+        qmdSeq: matched?.seq ?? null,
+      });
+      if (matched) {
+        insert.run(
+          annotation.collection,
+          annotation.path,
+          matched.hash,
+          matched.seq,
+          annotation.eventTime,
+          annotation.basis,
+          0,
+        );
+      }
+    }
+  }
+
+  #addDuplicateTasks(
+    db: AnalysisStore["internal"]["db"],
+    runId: string,
+    members: readonly { hash: string; seq: number }[],
+  ): void {
+    if (members.length === 0) return;
+    const pageMatch = members.map(() =>
+      "(duplicates.canonical_hash = ? AND duplicates.canonical_seq = ?) OR " +
+      "(duplicates.duplicate_hash = ? AND duplicates.duplicate_seq = ?)").join(" OR ");
+    const pageParams = members.flatMap((member) => [member.hash, member.seq, member.hash, member.seq]);
+    const sessionCollections = [...this.#sources.values()]
+      .filter((source) => source.kind === "sessions")
+      .map((source) => source.collection);
+    const excludeSessions = sessionCollections.length > 0
+      ? `duplicate_document.collection NOT IN (${sessionCollections.map(() => "?").join(", ")})`
+      : "1 = 1";
+    const rows = db.prepare(`
+      SELECT
+        duplicate_document.collection,
+        duplicate_document.path,
+        duplicates.content_fingerprint,
+        COUNT(*) AS occurrence_count
+      FROM memory_analysis_duplicate_occurrences duplicates
+      JOIN (SELECT DISTINCT hash FROM documents WHERE active = 1) canonical_document
+        ON canonical_document.hash = duplicates.canonical_hash
+      JOIN documents duplicate_document
+        ON duplicate_document.hash = duplicates.duplicate_hash
+       AND duplicate_document.active = 1
+      WHERE duplicates.run_id = ?
+        AND (${pageMatch})
+        AND ${excludeSessions}
+      GROUP BY duplicate_document.collection, duplicate_document.path,
+               duplicates.content_fingerprint
+      ORDER BY duplicate_document.collection, duplicate_document.path,
+               duplicates.content_fingerprint
+      LIMIT 10
+    `).all<{
+      collection: string;
+      path: string;
+      content_fingerprint: string;
+      occurrence_count: number;
+    }>(runId, ...pageParams, ...sessionCollections);
+    const curation = this.#getCuration();
+    for (const row of rows) {
+      const source = this.#sources.get(row.collection);
+      if (!source || source.kind === "sessions") continue;
+      curation.addTask({
+        type: "exact_duplicate",
+        corpus: source.corpus,
+        collection: row.collection,
+        path: row.path,
+        reason: "exact chunk content repeats in this source document",
+        contentFingerprint: row.content_fingerprint,
+        detail: `${row.occurrence_count} exact duplicate occurrence${row.occurrence_count === 1 ? "" : "s"}. ` +
+          "Review the source and propose cleanup only if repetition is accidental.",
+      });
+    }
   }
 
   async #getAnalysisStore(): Promise<AnalysisStore> {
@@ -650,5 +824,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     await this.#operationChain?.catch(() => undefined);
     await this.#store?.close();
     this.#store = undefined;
+    this.#curation?.close();
+    this.#curation = undefined;
   }
 }

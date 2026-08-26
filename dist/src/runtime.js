@@ -204,6 +204,7 @@ export class QmdMemoryRuntime {
         const manager = new QmdMemoryManager({
             workspaceDir,
             dbPath: join(stateDir, "index.sqlite"),
+            curationPath: join(stateDir, "curation.sqlite"),
             sources,
             keepModelsWarm: this.#keepEmbeddingModelWarm,
             analysisExecutable: this.#analysisExecutable,

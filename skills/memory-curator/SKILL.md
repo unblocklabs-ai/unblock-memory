@@ -16,7 +16,9 @@ weak, duplicative, or easily looked-up knowledge.
    `memory_recluster`, then list again.
 2. Fetch a useful cluster with `memory_fetch_cluster`. Start with
    `sort: "representative"`; use `score_desc`, `date_asc`, or `date_desc` and
-   pagination when relevance, evolution, or recent state matters.
+   pagination when relevance, evolution, or recent state matters. Treat
+   `eventTime` as event chronology; `sourceModifiedAt` is only a labeled
+   fallback when `eventTime` is unresolved.
 3. State the question the cluster raises: what may be repeated, contradictory,
    changing, or worth understanding?
 4. Search existing knowledge with `memory_search`, using
@@ -67,6 +69,13 @@ rigid document template.
 ## Finish the cycle
 
 - Do not rewrite raw memory or session projections.
+- Review a small page from `memory_list_maintenance_tasks`. For ambiguous dates,
+  investigate supporting evidence and use `memory_update_maintenance_task` to
+  attach a chunk or document date only when supported; otherwise defer or mark
+  it irrelevant. For exact-duplicate proposals, decide whether cleanup should
+  be proposed, but do not treat repetition across historical files as an error.
+  The maintenance tools never change source Markdown, and generated session
+  projections must never be manually cleaned.
 - Verify an updated file with `memory_search`, using
   `corpora: ["knowledge"]`, and check all-corpora ranking when useful.
 - Report the questions investigated, evidence consulted beyond each cluster,

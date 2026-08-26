@@ -13,6 +13,10 @@ const MAX_TOTAL_ALIASES = 50;
 
 type AnalysisDatabase = QMDStore["internal"]["db"];
 
+export type TemporalReadOptions = {
+  sessionCollection?: string;
+};
+
 export type MemoryReclusterOptions = {
   space?: {
     method?: "umap" | "none";
@@ -45,7 +49,11 @@ type MemoryAnalysisMember = {
   x: number;
   y: number;
   representativeRank: number | null;
-  sourceDate: string;
+  sourceModifiedAt: string;
+  eventTime: string | null;
+  eventTimeBasis: "path" | "frontmatter" | "session" | "agent_verified" | null;
+  eventTimeSource: string;
+  contentFingerprint: string;
   text: string;
   sourcePaths: string[];
 };
@@ -138,7 +146,11 @@ type MemberRow = {
   pos: number;
   chunk_len: number;
   doc: string;
-  source_date: string;
+  source_modified_at: string;
+  event_time: string | null;
+  event_time_basis: MemoryAnalysisMember["eventTimeBasis"];
+  event_collection: string;
+  event_path: string;
 };
 
 type CountRow = { count: number };
@@ -184,6 +196,17 @@ export function ensureMemoryAnalysisSchema(db: AnalysisDatabase): void {
     CREATE INDEX IF NOT EXISTS idx_memory_analysis_memberships_cluster
       ON memory_analysis_memberships(run_id, cluster_id, representative_rank);
 
+    CREATE TABLE IF NOT EXISTS memory_analysis_duplicate_occurrences (
+      run_id TEXT NOT NULL,
+      content_fingerprint TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      canonical_seq INTEGER NOT NULL,
+      duplicate_hash TEXT NOT NULL,
+      duplicate_seq INTEGER NOT NULL,
+      PRIMARY KEY (run_id, duplicate_hash, duplicate_seq),
+      FOREIGN KEY (run_id) REFERENCES memory_analysis_runs(id) ON DELETE CASCADE
+    );
+
     CREATE VIEW IF NOT EXISTS memory_analysis_available_memberships AS
     SELECT
       m.run_id, m.hash, m.seq, m.cluster_id, m.probability, m.outlier_score,
@@ -195,6 +218,18 @@ export function ensureMemoryAnalysisSchema(db: AnalysisDatabase): void {
       SELECT 1
       FROM documents d
       WHERE d.hash = m.hash AND d.active = 1
+    );
+  `);
+  db.exec(`
+    CREATE TEMP TABLE IF NOT EXISTS memory_temporal_annotations (
+      collection TEXT NOT NULL,
+      path TEXT NOT NULL,
+      qmd_hash TEXT,
+      qmd_seq INTEGER,
+      event_time TEXT NOT NULL,
+      basis TEXT NOT NULL,
+      document_wide INTEGER NOT NULL,
+      PRIMARY KEY (collection, path, qmd_hash, qmd_seq, document_wide)
     );
   `);
 }
@@ -365,6 +400,7 @@ function members(
   maxExcerptBytes = MAX_EXCERPT_BYTES,
   maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES,
   maxTotalAliases = MAX_TOTAL_ALIASES,
+  temporal: TemporalReadOptions = {},
 ): MemoryAnalysisMember[] {
   const representativeOrder = clusterId === -1
     ? "m.outlier_score DESC, m.hash, m.seq"
@@ -379,32 +415,89 @@ function members(
     representative: representativeOrder,
     score_desc: `${score} DESC, m.hash, m.seq`,
     score_asc: `${score} ASC, m.hash, m.seq`,
-    date_desc: "m.source_date DESC, m.hash, m.seq",
-    date_asc: "m.source_date ASC, m.hash, m.seq",
+    date_desc: "julianday(COALESCE(m.event_time, m.source_modified_at)) DESC, m.hash, m.seq",
+    date_asc: "julianday(COALESCE(m.event_time, m.source_modified_at)) ASC, m.hash, m.seq",
   }[sort];
   const rows = db.prepare(`
-    WITH member_rows AS (
+    WITH candidate_times AS (
+      SELECT
+        m.hash,
+        m.seq,
+        d.collection,
+        d.path,
+        d.modified_at AS source_modified_at,
+        CASE
+          WHEN d.collection = ? THEN d.modified_at
+          WHEN d.path GLOB '*[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9].md'
+            THEN substr(d.path, length(d.path) - 12, 10) || 'T00:00:00.000Z'
+          ELSE annotation.event_time
+        END AS event_time,
+        CASE
+          WHEN d.collection = ? THEN 'session'
+          WHEN d.path GLOB '*[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9].md' THEN 'path'
+          ELSE annotation.basis
+        END AS event_time_basis,
+        CASE
+          WHEN d.collection = ? THEN 1
+          WHEN d.path GLOB '*[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9].md' THEN 2
+          WHEN annotation.event_time IS NOT NULL THEN 3
+          ELSE 4
+        END AS priority
+      FROM memory_analysis_available_memberships m
+      JOIN documents d ON d.hash = m.hash AND d.active = 1
+      LEFT JOIN memory_temporal_annotations annotation
+        ON annotation.collection = d.collection
+       AND annotation.path = d.path
+       AND (annotation.document_wide = 1 OR
+            (annotation.qmd_hash = m.hash AND annotation.qmd_seq = m.seq))
+      WHERE m.run_id = ? AND m.cluster_id = ?
+    ), ranked_times AS (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY hash, seq
+        ORDER BY priority, julianday(COALESCE(event_time, source_modified_at)) DESC, collection, path
+      ) AS rank
+      FROM candidate_times
+    ), member_rows AS (
       SELECT
         m.hash, m.seq, m.probability, m.outlier_score, m.x, m.y,
         m.representative_rank, m.pos, m.chunk_len, m.doc,
         (
-          SELECT MAX(d.modified_at)
+          SELECT d.modified_at
           FROM documents d
           WHERE d.hash = m.hash AND d.active = 1
-        ) AS source_date
+          ORDER BY julianday(d.modified_at) DESC, d.collection, d.path
+          LIMIT 1
+        ) AS source_modified_at,
+        temporal.event_time,
+        temporal.event_time_basis,
+        temporal.collection AS event_collection,
+        temporal.path AS event_path
       FROM memory_analysis_available_memberships m
+      JOIN ranked_times temporal
+        ON temporal.hash = m.hash AND temporal.seq = m.seq AND temporal.rank = 1
       WHERE m.run_id = ? AND m.cluster_id = ?
     )
     SELECT * FROM member_rows m
     ORDER BY ${order}
     LIMIT ? OFFSET ?
-  `).all<MemberRow>(runId, clusterId, limit, offset);
+  `).all<MemberRow>(
+    temporal.sessionCollection ?? "",
+    temporal.sessionCollection ?? "",
+    temporal.sessionCollection ?? "",
+    runId,
+    clusterId,
+    runId,
+    clusterId,
+    limit,
+    offset,
+  );
   let remaining = maxTotalBytes;
   let remainingAliases = maxTotalAliases;
   return rows.map((row, index) => {
     const remainingRows = rows.length - index;
     const excerptBudget = Math.min(maxExcerptBytes, Math.floor(remaining / remainingRows));
-    const text = byteSlice(row.doc.slice(row.pos, row.pos + row.chunk_len), excerptBudget);
+    const fullText = row.doc.slice(row.pos, row.pos + row.chunk_len);
+    const text = byteSlice(fullText, excerptBudget);
     remaining -= Buffer.byteLength(text);
     const aliasBudget = Math.min(MAX_ALIASES_PER_MEMBER, Math.floor(remainingAliases / remainingRows));
     const aliases = sourcePaths(
@@ -421,7 +514,11 @@ function members(
       x: row.x,
       y: row.y,
       representativeRank: row.representative_rank,
-      sourceDate: row.source_date,
+      sourceModifiedAt: row.source_modified_at,
+      eventTime: row.event_time,
+      eventTimeBasis: row.event_time_basis,
+      eventTimeSource: `qmd://${row.event_collection}/${row.event_path}`,
+      contentFingerprint: createHash("sha256").update(fullText).digest("hex"),
       text,
       sourcePaths: aliases,
     };
@@ -564,6 +661,7 @@ export function readCluster(
   requestedLimit = DEFAULT_MEMBER_LIMIT,
   requestedOffset = 0,
   sort: MemoryClusterSort = "representative",
+  temporal: TemporalReadOptions = {},
 ): MemoryClusterDetail {
   const run = latestValidRun(db);
   if (!run) {
@@ -592,7 +690,18 @@ export function readCluster(
   const limit = Math.max(1, Math.min(MAX_MEMBER_LIMIT, Math.floor(requestedLimit)));
   const offset = Math.max(0, Math.floor(requestedOffset));
   const total = availableSize(db, run.id, clusterId);
-  const pageMembers = members(db, run.id, clusterId, limit, offset, sort);
+  const pageMembers = members(
+    db,
+    run.id,
+    clusterId,
+    limit,
+    offset,
+    sort,
+    MAX_EXCERPT_BYTES,
+    MAX_TOTAL_EXCERPT_BYTES,
+    MAX_TOTAL_ALIASES,
+    temporal,
+  );
   const nextOffset = offset + pageMembers.length;
   const hasMore = nextOffset < total;
   return {

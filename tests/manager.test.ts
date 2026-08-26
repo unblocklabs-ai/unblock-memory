@@ -12,6 +12,7 @@ import {
   QmdMemoryManager,
   type ManagerStore,
 } from "../src/manager.js";
+import { clusterReference } from "../src/analysis.js";
 import { resolveSessionSource, resolveSource } from "../src/sources.js";
 import { createAgentDatabase } from "./helpers/session-database.js";
 
@@ -714,6 +715,127 @@ test("analysis failure does not disable ordinary memory search", async () => {
   try {
     await assert.rejects(manager.recluster(), /worker missing/);
     assert.equal((await manager.search("memory", { lexicalOnly: true }))[0]?.snippet, "still works");
+  } finally {
+    await manager.close();
+  }
+});
+
+test("queues ambiguous chronology once and applies a durable agent annotation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-maintenance-"));
+  const sourcePath = join(root, "archive.md");
+  await writeFile(sourcePath, "ambiguous memory");
+  const source = resolveSource(root, sourcePath);
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    curationPath: join(root, "curation.sqlite"),
+    workspaceDir: root,
+    sources: [source],
+    storeFactory: async () => createManagerStore({
+      internal: backing.internal,
+      async close() { await backing.close(); },
+    }),
+  });
+  try {
+    await manager.start();
+    const db = backing.internal.db;
+    db.prepare("INSERT INTO content(hash, doc, created_at) VALUES ('hash', 'ambiguous memory', 'now')").run();
+    db.prepare(`INSERT INTO documents(collection, path, title, hash, created_at, modified_at, active)
+      VALUES (?, 'archive.md', 'Archive', 'hash', 'now', '2026-08-20T00:00:00Z', 1)`).run(source.collection);
+    db.prepare(`INSERT INTO content_vectors
+      (hash, seq, pos, chunk_len, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES ('hash', 0, 0, 16, 'model', 'fingerprint', 1, 'now')`).run();
+    db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+    db.prepare("INSERT INTO memory_analysis_clusters VALUES ('run', 1, 1, 0.9)").run();
+    db.prepare("INSERT INTO memory_analysis_memberships VALUES ('run', 'hash', 0, 1, 0.9, 0.1, 0, 0, 1)").run();
+
+    const clusterId = clusterReference("run", 1);
+    const first = await manager.fetchCluster({ clusterId, sort: "date_asc" });
+    assert.equal(first.members?.[0]?.eventTime, null);
+    await manager.fetchCluster({ clusterId, sort: "date_desc" });
+    const tasks = manager.listMaintenanceTasks();
+    assert.equal(tasks.length, 1);
+
+    manager.updateMaintenanceTask({
+      id: tasks[0]!.id,
+      status: "resolved",
+      annotation: {
+        scope: "chunk",
+        eventTime: "2026-07-15T00:00:00.000Z",
+        basis: "agent_verified",
+        evidence: "Confirmed in the adjacent deployment record.",
+      },
+    });
+    const resolved = await manager.fetchCluster({ clusterId, sort: "representative" });
+    assert.equal(resolved.members?.[0]?.eventTime, "2026-07-15T00:00:00.000Z");
+    assert.equal(resolved.members?.[0]?.eventTimeBasis, "agent_verified");
+    assert.deepEqual(manager.listMaintenanceTasks(), []);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("queues duplicate proposals only for the fetched page and excludes sessions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-duplicate-proposals-"));
+  const source = resolveSource(root, root);
+  const sessionSource = resolveSessionSource(join(root, "sessions"), ["channel"]);
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    curationPath: join(root, "curation.sqlite"),
+    workspaceDir: root,
+    sources: [source, sessionSource],
+    storeFactory: async () => createManagerStore({
+      internal: backing.internal,
+      async close() { await backing.close(); },
+    }),
+  });
+  try {
+    await manager.start();
+    const db = backing.internal.db;
+    const insertContent = db.prepare("INSERT INTO content(hash, doc, created_at) VALUES (?, ?, 'now')");
+    const insertDocument = db.prepare(`INSERT INTO documents
+      (collection, path, title, hash, created_at, modified_at, active)
+      VALUES (?, ?, 'Memory', ?, 'now', '2026-08-20T00:00:00Z', 1)`);
+    const insertVector = db.prepare(`INSERT INTO content_vectors
+      (hash, seq, pos, chunk_len, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, 0, 0, ?, 'model', 'fingerprint', 1, 'now')`);
+    for (const [hash, collection, path] of [
+      ["canonical", source.collection, "canonical.md"],
+      ["duplicate", source.collection, "duplicate.md"],
+      ["also-duplicate", source.collection, "also-duplicate.md"],
+      ["unrelated", source.collection, "unrelated.md"],
+      ["unrelated-duplicate", source.collection, "unrelated-duplicate.md"],
+    ] as const) {
+      insertContent.run(hash, `${hash} content`);
+      insertDocument.run(collection, path, hash);
+      insertVector.run(hash, `${hash} content`.length);
+    }
+    db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+    db.prepare("INSERT INTO memory_analysis_clusters VALUES ('run', 1, 1, 0.9)").run();
+    db.prepare("INSERT INTO memory_analysis_memberships VALUES ('run', 'canonical', 0, 1, 0.9, 0.1, 0, 0, 1)").run();
+    const insertDuplicate = db.prepare(`INSERT INTO memory_analysis_duplicate_occurrences
+      (run_id, content_fingerprint, canonical_hash, canonical_seq, duplicate_hash, duplicate_seq)
+      VALUES ('run', ?, ?, 0, ?, ?)`);
+    for (let seq = 0; seq < 12; seq += 1) {
+      insertDuplicate.run("same", "canonical", "duplicate", seq);
+      const sessionHash = `session-duplicate-${seq}`;
+      insertContent.run(sessionHash, "session duplicate");
+      insertDocument.run(sessionSource.collection, `slack/channel/${seq}.md`, sessionHash);
+      insertDuplicate.run("session", "canonical", sessionHash, 0);
+    }
+    insertDuplicate.run("also", "canonical", "also-duplicate", 0);
+    insertDuplicate.run("other", "unrelated", "unrelated-duplicate", 0);
+
+    await manager.fetchCluster({ clusterId: clusterReference("run", 1), sort: "representative" });
+    const tasks = manager.listMaintenanceTasks({ limit: 10 });
+    assert.deepEqual(tasks.map((task) => task.path).sort(), ["also-duplicate.md", "duplicate.md"]);
+    assert.ok(tasks.every((task) => task.type === "exact_duplicate"));
+    assert.match(tasks.find((task) => task.path === "duplicate.md")?.detail ?? "", /^12 exact duplicate occurrences/);
   } finally {
     await manager.close();
   }

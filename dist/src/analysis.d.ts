@@ -1,5 +1,8 @@
 import type { QMDStore } from "@unblocklabs/qmd";
 type AnalysisDatabase = QMDStore["internal"]["db"];
+export type TemporalReadOptions = {
+    sessionCollection?: string;
+};
 export type MemoryReclusterOptions = {
     space?: {
         method?: "umap" | "none";
@@ -30,7 +33,11 @@ type MemoryAnalysisMember = {
     x: number;
     y: number;
     representativeRank: number | null;
-    sourceDate: string;
+    sourceModifiedAt: string;
+    eventTime: string | null;
+    eventTimeBasis: "path" | "frontmatter" | "session" | "agent_verified" | null;
+    eventTimeSource: string;
+    contentFingerprint: string;
     text: string;
     sourcePaths: string[];
 };
@@ -94,5 +101,5 @@ export declare function runAnalysisWorker(params: {
 export declare function latestAnalysisRunId(db: AnalysisDatabase): string | undefined;
 export declare function readAnalysisSummary(db: AnalysisDatabase): MemoryAnalysisSummary | undefined;
 export declare function readClusters(db: AnalysisDatabase, requestedLimit?: number): MemoryClusterList;
-export declare function readCluster(db: AnalysisDatabase, clusterReferenceId: string, requestedLimit?: number, requestedOffset?: number, sort?: MemoryClusterSort): MemoryClusterDetail;
+export declare function readCluster(db: AnalysisDatabase, clusterReferenceId: string, requestedLimit?: number, requestedOffset?: number, sort?: MemoryClusterSort, temporal?: TemporalReadOptions): MemoryClusterDetail;
 export {};

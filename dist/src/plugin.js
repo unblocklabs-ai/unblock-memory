@@ -219,6 +219,81 @@ function createFetchClusterTool(runtime, ctx) {
         },
     };
 }
+const maintenanceStatus = Type.Union([
+    Type.Literal("pending"),
+    Type.Literal("resolved"),
+    Type.Literal("deferred"),
+    Type.Literal("irrelevant"),
+]);
+const listMaintenanceParameters = Type.Object({
+    status: Type.Optional(maintenanceStatus),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+}, { additionalProperties: false });
+function createListMaintenanceTool(runtime, ctx) {
+    const active = getContext(ctx);
+    if (!active)
+        return null;
+    return {
+        name: "memory_list_maintenance_tasks",
+        label: "List Memory Maintenance Tasks",
+        description: "List a bounded curation inbox of memory chronology and duplicate-review proposals.",
+        parameters: listMaintenanceParameters,
+        async execute(_toolCallId, params) {
+            const options = Value.Parse(listMaintenanceParameters, params);
+            const { manager, error } = await runtime.getMemorySearchManager(active);
+            if (!manager)
+                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+            return jsonResult({ status: "ok", tasks: manager.listMaintenanceTasks(options) });
+        },
+    };
+}
+const isoTimestamp = Type.String({
+    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+});
+const updateMaintenanceParameters = Type.Object({
+    taskId: Type.String({ pattern: "\\S" }),
+    action: Type.Union([
+        Type.Literal("resolve"),
+        Type.Literal("defer"),
+        Type.Literal("irrelevant"),
+    ]),
+    note: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+    annotation: Type.Optional(Type.Object({
+        scope: Type.Optional(Type.Union([Type.Literal("chunk"), Type.Literal("document")])),
+        eventTime: isoTimestamp,
+        basis: Type.Union([
+            Type.Literal("path"),
+            Type.Literal("frontmatter"),
+            Type.Literal("session"),
+            Type.Literal("agent_verified"),
+        ]),
+        evidence: Type.String({ minLength: 1, maxLength: 500 }),
+    }, { additionalProperties: false })),
+}, { additionalProperties: false });
+function createUpdateMaintenanceTool(runtime, ctx) {
+    const active = getContext(ctx);
+    if (!active)
+        return null;
+    return {
+        name: "memory_update_maintenance_task",
+        label: "Update Memory Maintenance Task",
+        description: "Resolve, defer, or dismiss a memory-maintenance proposal. This tool never edits source Markdown.",
+        parameters: updateMaintenanceParameters,
+        async execute(_toolCallId, params) {
+            const { taskId, action, note, annotation } = Value.Parse(updateMaintenanceParameters, params);
+            const { manager, error } = await runtime.getMemorySearchManager(active);
+            if (!manager)
+                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+            const updated = manager.updateMaintenanceTask({
+                id: taskId,
+                status: action === "resolve" ? "resolved" : action === "defer" ? "deferred" : "irrelevant",
+                note,
+                ...(annotation ? { annotation: { ...annotation, scope: annotation.scope ?? "chunk" } } : {}),
+            });
+            return jsonResult(updated ? { status: "ok", task: updated } : { status: "not_found" });
+        },
+    };
+}
 function formatDateInTimezone(timestamp, timezone) {
     const parts = new Intl.DateTimeFormat("en-US", {
         timeZone: timezone,
@@ -312,4 +387,6 @@ export function registerUnblockMemory(api) {
     api.registerTool((ctx) => createReclusterTool(runtime, ctx), { names: ["memory_recluster"] });
     api.registerTool((ctx) => createListClustersTool(runtime, ctx), { names: ["memory_list_clusters"] });
     api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), { names: ["memory_fetch_cluster"] });
+    api.registerTool((ctx) => createListMaintenanceTool(runtime, ctx), { names: ["memory_list_maintenance_tasks"] });
+    api.registerTool((ctx) => createUpdateMaintenanceTool(runtime, ctx), { names: ["memory_update_maintenance_task"] });
 }

@@ -2,6 +2,7 @@ import type { QMDStore } from "@unblocklabs/qmd";
 import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadResult, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
 import type { ChatType } from "./config.js";
+import { type MaintenanceStatus, type TemporalBasis } from "./curation.js";
 import { type SessionSyncResult } from "./session-sync.js";
 import { type ResolvedSource } from "./sources.js";
 export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "searchLex" | "vsearch" | "get" | "getDocumentBody" | "close">;
@@ -28,6 +29,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     #private;
     constructor(params: {
         dbPath: string;
+        curationPath?: string;
         workspaceDir: string;
         sources: readonly ResolvedSource[];
         storeFactory?: () => Promise<ManagerStore>;
@@ -47,6 +49,21 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         offset?: number;
         sort?: MemoryClusterSort;
     }): Promise<MemoryClusterDetail>;
+    listMaintenanceTasks(params?: {
+        status?: MaintenanceStatus;
+        limit?: number;
+    }): import("./curation.js").MaintenanceTask[];
+    updateMaintenanceTask(params: {
+        id: string;
+        status: Exclude<MaintenanceStatus, "pending">;
+        note?: string;
+        annotation?: {
+            scope: "chunk" | "document";
+            eventTime: string;
+            basis: TemporalBasis;
+            evidence: string;
+        };
+    }): import("./curation.js").MaintenanceTask | undefined;
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     readFile(params: {
         relPath: string;

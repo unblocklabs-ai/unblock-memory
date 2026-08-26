@@ -74,6 +74,8 @@ test("registers exactly the clean memory tool contract and validates every tool 
     "memory_recluster",
     "memory_list_clusters",
     "memory_fetch_cluster",
+    "memory_list_maintenance_tasks",
+    "memory_update_maintenance_task",
   ]);
   assert.ok(!registrations.some((registration) =>
     registration.names.some((name) => ["memory_analyze", "memory_clusters", "memory_cluster"].includes(name))));
@@ -87,6 +89,8 @@ test("registers exactly the clean memory tool contract and validates every tool 
   assert.ok(tool("memory_search").parameters.properties?.sessionFilter);
   assert.ok(tool("memory_fetch_cluster").parameters.properties?.offset);
   assert.ok(tool("memory_fetch_cluster").parameters.properties?.sort);
+  assert.ok(tool("memory_list_maintenance_tasks").parameters.properties?.limit);
+  assert.ok(tool("memory_update_maintenance_task").parameters.properties?.action);
 
   const invalidCalls: Array<[name: string, params: unknown]> = [
     ["memory_search", { query: "memory", maxResults: 21 }],
@@ -112,6 +116,18 @@ test("registers exactly the clean memory tool contract and validates every tool 
     ["memory_fetch_cluster", { clusterId: "0123456789", topK: 51 }],
     ["memory_fetch_cluster", { clusterId: "0123456789", offset: -1 }],
     ["memory_fetch_cluster", { clusterId: "0123456789", sort: "newest" }],
+    ["memory_list_maintenance_tasks", { limit: 11 }],
+    ["memory_list_maintenance_tasks", { status: "ignored" }],
+    ["memory_update_maintenance_task", { taskId: "task", action: "delete" }],
+    ["memory_update_maintenance_task", {
+      taskId: "task",
+      action: "resolve",
+      annotation: {
+        eventTime: "yesterday",
+        basis: "agent_verified",
+        evidence: "checked",
+      },
+    }],
   ];
   for (const [name, params] of invalidCalls) {
     await assert.rejects(tool(name).execute("call", params));
