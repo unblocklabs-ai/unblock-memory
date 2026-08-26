@@ -78,6 +78,28 @@ corpus; other unique names may be added for custom material.
 request all of them explicitly. Search results include their corpus name and
 remain readable by passing the returned `qmd://` path to `memory_get`.
 
+Use `sessionFilter` to restrict session results by metadata while leaving file
+corpora searchable. Supported fields are `startedFrom` and `startedTo`
+(inclusive ISO 8601 timestamps), `provider`, `chatType`, `accountId`, and
+`conversationId`:
+
+```json
+{
+  "query": "deployment decision",
+  "sessionFilter": {
+    "startedFrom": "2026-08-01T00:00:00Z",
+    "provider": "slack",
+    "chatType": "channel"
+  }
+}
+```
+
+Provider matching is case-normalized; `chatType` uses the lowercase values
+shown in the configuration example. Account and conversation IDs are trimmed
+and matched exactly. When only `sessions` is selected and no sessions match,
+search returns no results. With other corpora selected, their results remain
+eligible.
+
 The optional `sessions` corpus reads the current agent's normal OpenClaw SQLite
 store and indexes its active user/assistant transcript branch. It defaults to
 channel and group conversations; add `direct` explicitly to include DMs. Run

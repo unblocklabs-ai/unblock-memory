@@ -1,5 +1,6 @@
 import type { MemoryPluginCapability } from "openclaw/plugin-sdk/memory-host-core";
 import type { SessionMetadata } from "./session-projector.js";
+import type { ChatType } from "./config.js";
 
 export type MemoryPluginRuntimeContract = NonNullable<MemoryPluginCapability["runtime"]>;
 
@@ -16,9 +17,20 @@ export type CorpusMemorySearchResult = MemorySearchResult & {
   corpus: string;
   session?: SessionMetadata;
 };
+export type SessionSearchFilter = {
+  startedFrom?: string;
+  startedTo?: string;
+  provider?: string;
+  chatType?: ChatType;
+  accountId?: string;
+  conversationId?: string;
+};
 export type CorpusSearchOptions = NonNullable<
   Parameters<MemorySearchManagerContract["search"]>[1]
-> & { corpora?: readonly string[] };
+> & {
+  corpora?: readonly string[];
+  sessionFilter?: SessionSearchFilter;
+};
 export type MemoryEmbeddingProbeResult = Awaited<
   ReturnType<MemorySearchManagerContract["probeEmbeddingAvailability"]>
 >;

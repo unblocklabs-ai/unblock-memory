@@ -18,6 +18,18 @@ function getContext(ctx: OpenClawPluginToolContext) {
 const searchParameters = Type.Object({
   query: Type.String({ pattern: "\\S" }),
   corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
+  sessionFilter: Type.Optional(Type.Object({
+    startedFrom: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
+    startedTo: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
+    provider: Type.Optional(Type.String({ pattern: "\\S" })),
+    chatType: Type.Optional(Type.Union([
+      Type.Literal("channel"),
+      Type.Literal("group"),
+      Type.Literal("direct"),
+    ])),
+    accountId: Type.Optional(Type.String({ pattern: "\\S" })),
+    conversationId: Type.Optional(Type.String({ pattern: "\\S" })),
+  }, { additionalProperties: false })),
   maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
   minScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
 }, { additionalProperties: false });
@@ -41,12 +53,13 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
     description: "Search configured Markdown corpora with semantic vector retrieval. Omit corpora to search all of them.",
     parameters: searchParameters,
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
-      const { query: untrimmedQuery, corpora, maxResults, minScore } = Value.Parse(searchParameters, params);
+      const { query: untrimmedQuery, corpora, sessionFilter, maxResults, minScore } = Value.Parse(searchParameters, params);
       const query = untrimmedQuery.trim();
       const { manager, error } = await runtime.getMemorySearchManager(active);
       if (!manager) return jsonResult({ results: [], error: error ?? "memory unavailable" });
       const results = await manager.search(query, {
         corpora: corpora?.map((corpus) => corpus.trim()),
+        sessionFilter,
         maxResults,
         minScore,
         signal,

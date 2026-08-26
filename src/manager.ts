@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
+import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
 import {
   ensureMemoryAnalysisSchema,
@@ -25,6 +25,7 @@ import type {
   MemorySearchManagerContract,
   MemorySearchResult,
   MemorySyncParams,
+  SessionSearchFilter,
 } from "./contracts.js";
 import type { ChatType } from "./config.js";
 import {
@@ -188,6 +189,38 @@ function lexicalResult(
     ...(session ? { session } : {}),
     citation: `${hit.displayPath}#L1-L${endLine}`,
   };
+}
+
+function sessionAllowedPaths(
+  metadataByPath: ReadonlyMap<string, SessionMetadata>,
+  collection: string,
+  filter: SessionSearchFilter,
+): AllowedDocumentPaths {
+  const startedFrom = filter.startedFrom === undefined ? undefined : Date.parse(filter.startedFrom);
+  const startedTo = filter.startedTo === undefined ? undefined : Date.parse(filter.startedTo);
+  if (startedFrom !== undefined && !Number.isFinite(startedFrom)) {
+    throw new Error("memory_search sessionFilter.startedFrom must be an ISO 8601 timestamp");
+  }
+  if (startedTo !== undefined && !Number.isFinite(startedTo)) {
+    throw new Error("memory_search sessionFilter.startedTo must be an ISO 8601 timestamp");
+  }
+  if (startedFrom !== undefined && startedTo !== undefined && startedFrom > startedTo) {
+    throw new Error("memory_search sessionFilter.startedFrom must not be after startedTo");
+  }
+  const provider = filter.provider?.trim().toLowerCase();
+  const accountId = filter.accountId?.trim();
+  const conversationId = filter.conversationId?.trim();
+  const paths = [...metadataByPath].flatMap(([path, metadata]) =>
+    (startedFrom === undefined || metadata.startedAt >= startedFrom) &&
+    (startedTo === undefined || metadata.startedAt <= startedTo) &&
+    (provider === undefined || metadata.provider?.trim().toLowerCase() === provider) &&
+    (filter.chatType === undefined || metadata.chatType === filter.chatType) &&
+    (accountId === undefined || metadata.accountId?.trim() === accountId) &&
+    (conversationId === undefined || metadata.conversationId?.trim() === conversationId)
+      ? [path]
+      : [],
+  );
+  return { [collection]: paths };
 }
 
 export class QmdMemoryManager implements MemorySearchManagerContract {
@@ -461,6 +494,10 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const collections = this.#collectionNames(opts?.corpora);
     opts?.signal?.throwIfAborted();
     await this.#operationChain;
+    const sessions = this.#sessions;
+    const allowedPaths = opts?.sessionFilter && sessions && collections.includes(sessions.collection)
+      ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter)
+      : undefined;
     const store = await this.#getStore();
     if (opts?.lexicalOnly) {
       const hits = await store.searchLex(query, {
@@ -480,6 +517,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       collection: collections,
       limit: opts?.maxResults ?? 5,
       minScore: opts?.minScore ?? 0.3,
+      allowedPaths,
     });
     return hits.flatMap((hit) => {
       const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];

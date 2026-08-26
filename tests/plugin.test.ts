@@ -73,12 +73,17 @@ test("registers exactly the clean memory tool contract and validates every tool 
   } as OpenClawPluginToolContext;
   const tool = (name: string) => registrations.find((registration) => registration.names.includes(name))!.factory(context)!;
   assert.ok(tool("memory_search").parameters.properties?.corpora);
+  assert.ok(tool("memory_search").parameters.properties?.sessionFilter);
 
   const invalidCalls: Array<[name: string, params: unknown]> = [
     ["memory_search", { query: "memory", maxResults: 21 }],
     ["memory_search", { query: "   " }],
     ["memory_search", { query: "memory", corpora: [] }],
     ["memory_search", { query: "memory", corpora: [""] }],
+    ["memory_search", { query: "memory", sessionFilter: { startedFrom: "yesterday" } }],
+    ["memory_search", { query: "memory", sessionFilter: { chatType: "thread" } }],
+    ["memory_search", { query: "memory", sessionFilter: { provider: " " } }],
+    ["memory_search", { query: "memory", sessionFilter: { extra: true } }],
     ["memory_search", { query: "memory", extra: true }],
     ["memory_get", { path: "qmd://memory/MEMORY.md", lines: 1_001 }],
     ["memory_get", { path: "   " }],

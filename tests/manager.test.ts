@@ -474,6 +474,116 @@ test("adds manifest metadata to session search results", async () => {
   }
 });
 
+test("filters session paths without restricting file corpora", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-filter-sessions-"));
+  const sessionsDir = join(root, "sessions");
+  const memory = resolveSource(root, "MEMORY.md", "memory");
+  const sessions = resolveSessionSource(sessionsDir, ["channel", "group"]);
+  const firstPath = "slack/channel/workspace/C123/first.md";
+  const secondPath = "discord/group/team/G456/second.md";
+  const startedAt = Date.parse("2026-08-25T12:00:00Z");
+  const manifestPath = join(root, "sessions-manifest.json");
+  await writeFile(manifestPath, JSON.stringify({
+    version: 1,
+    sessions: {
+      first: {
+        sessionId: "first",
+        provider: "Slack",
+        chatType: "channel",
+        accountId: "workspace",
+        conversationId: "C123",
+        startedAt,
+        documentPath: firstPath,
+      },
+      second: {
+        sessionId: "second",
+        provider: "discord",
+        chatType: "group",
+        accountId: "team",
+        conversationId: "G456",
+        startedAt: Date.parse("2026-08-20T12:00:00Z"),
+        documentPath: secondPath,
+      },
+    },
+  }));
+  const hits = [
+    { file: `qmd://${memory.collection}/MEMORY.md`, body: "file memory" },
+    { file: `qmd://${sessions.collection}/${firstPath}`, body: "first session" },
+    { file: `qmd://${sessions.collection}/${secondPath}`, body: "second session" },
+  ];
+  const receivedFilters: unknown[] = [];
+  const store = createManagerStore({
+    async vsearch(_query, options) {
+      receivedFilters.push(options?.allowedPaths);
+      const collections = typeof options?.collection === "string"
+        ? [options.collection]
+        : [...(options?.collection ?? [])];
+      return hits.flatMap((hit) => {
+        const match = /^qmd:\/\/([^/]+)\/(.*)$/u.exec(hit.file);
+        if (!match || !collections.includes(match[1]!)) return [];
+        const restricted = options?.allowedPaths?.[match[1]!];
+        if (restricted && !restricted.includes(match[2]!)) return [];
+        return [{
+          ...hit,
+          displayPath: hit.file.slice("qmd://".length),
+          title: "Memory",
+          score: 0.8,
+          context: null,
+          docid: hit.file,
+          bestChunk: hit.body,
+          chunkPos: 0,
+          chunkLen: hit.body.length,
+        }];
+      });
+    },
+  });
+  const manager = new QmdMemoryManager({
+    dbPath: join(root, "index.sqlite"),
+    workspaceDir: root,
+    sources: [memory, sessions],
+    storeFactory: async () => store,
+    sessions: {
+      agentId: "main",
+      agentName: "Agent",
+      chatTypes: ["channel", "group"],
+      collection: sessions.collection,
+      databasePath: join(root, "openclaw-agent.sqlite"),
+      manifestPath,
+      outputDir: sessionsDir,
+      timezone: "UTC",
+    },
+  });
+  try {
+    await manager.start();
+    const results = await manager.search("decision", {
+      sessionFilter: {
+        startedFrom: "2026-08-25T12:00:00Z",
+        startedTo: "2026-08-25T12:00:00Z",
+        provider: " slack ",
+        chatType: "channel",
+        accountId: " workspace ",
+        conversationId: " C123 ",
+      },
+    });
+    assert.deepEqual(results.map((result) => result.corpus), ["memory", "sessions"]);
+    assert.deepEqual(receivedFilters[0], { [sessions.collection]: [firstPath] });
+
+    assert.deepEqual(await manager.search("decision", {
+      corpora: ["sessions"],
+      sessionFilter: { provider: "teams" },
+    }), []);
+    assert.deepEqual(receivedFilters[1], { [sessions.collection]: [] });
+    await assert.rejects(manager.search("decision", {
+      sessionFilter: {
+        startedFrom: "2026-08-26T00:00:00Z",
+        startedTo: "2026-08-25T00:00:00Z",
+      },
+    }), /must not be after startedTo/);
+  } finally {
+    await manager.close();
+  }
+});
+
 test("keeps analysis fresh for a no-op manual session sync", async () => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-session-noop-"));
   const databasePath = join(root, "openclaw-agent.sqlite");
