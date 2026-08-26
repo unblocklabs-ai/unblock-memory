@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",
@@ -18,7 +18,7 @@
     "access": "public",
     "provenance": true
   },
-  "files": ["dist", "README.md", "openclaw.plugin.json"],
+  "files": ["dist", "skills", "README.md", "openclaw.plugin.json"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

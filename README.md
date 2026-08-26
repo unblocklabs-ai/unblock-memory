@@ -48,14 +48,19 @@ directories, or globs into named corpora:
               paths: ["MEMORY.md", "USER.md", "memory/**/*.md"],
             },
             {
-              name: "projects",
-              kind: "files",
-              paths: ["/absolute/shared/**/*.md"],
-            },
-            {
               name: "sessions",
               kind: "sessions",
               chatTypes: ["channel", "group"],
+            },
+            {
+              name: "canon",
+              kind: "files",
+              paths: ["knowledge/canon/**/*.md"],
+            },
+            {
+              name: "reflections",
+              kind: "files",
+              paths: ["knowledge/reflections/**/*.md"],
             },
           ],
           // Optional: omit unless the local analysis worker is installed.
@@ -80,7 +85,7 @@ context resident after first use. Set it to `false` to restore QMD's five-minute
 idle unload behavior.
 
 `memory_search` searches every configured corpus by default. Pass
-`corpora: ["projects"]` to search selected corpora or `corpora: ["all"]` to
+`corpora: ["canon"]` to search selected corpora or `corpora: ["all"]` to
 request all of them explicitly. Search results include their corpus name and
 remain readable by passing the returned `qmd://` path to `memory_get`.
 
@@ -180,6 +185,51 @@ without copying canonical text into analysis tables. A no-op sync stays fresh.
 A failed rebuild leaves the stale result intact, while a successful rebuild
 atomically replaces it. Analysis is never scheduled automatically. If the worker
 is absent or fails, `memory_search` and `memory_get` continue to work.
+
+## Curating canon and reflections
+
+The plugin bundles the `memory-curator` skill for turning useful clusters into
+durable knowledge. It becomes available when the plugin is enabled. If the
+agent has an explicit skill allowlist, include `memory-curator`.
+
+Keep curated files outside `memory/**` so each file belongs to only one corpus:
+
+```text
+knowledge/
+├── canon/
+│   └── gateway-restarts.md
+└── reflections/
+    └── 2026-08-26.md
+```
+
+Canon files are stable topic files updated in place. Each one contains only the
+current affirmative rule or understanding, its update time, current rationale,
+and `qmd://` evidence links. Do not include old procedures, changelogs, or a
+`Supersedes` section: semantic chunking may retrieve those passages without the
+surrounding warning that they are obsolete.
+
+Reflection files are daily or timestamped and append-oriented. They hold useful
+patterns, hypotheses, contradictions, and uncertainty, but are not
+authoritative. Both corpora participate in later search and clustering, so a
+later run can reconsider prior reasoning. Repeated derived text is not
+independent corroboration; durable canon still needs underlying source evidence.
+
+For a manual run, ask the agent:
+
+```text
+Use $memory-curator to review my memory clusters and curate any durable updates.
+```
+
+For recurring curation, use an OpenClaw automation with the same thin message:
+
+```text
+Use $memory-curator to run the scheduled memory curation cycle.
+```
+
+The skill lists current clusters, reclusters only when analysis is missing or
+stale, follows representative sources with `memory_get`, and may correctly
+write nothing. Its own writes are indexed for the next cycle; it does not
+recluster recursively in the same run.
 
 Existing `unblock-qmd` indexes are derived caches and may be left in place;
 Unblock Memory rebuilds its own index from configured corpora.
