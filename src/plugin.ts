@@ -66,7 +66,18 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
         minScore,
         signal,
       });
-      return jsonResult({ results, provider: "unblock-memory" });
+      return jsonResult({
+        results: results.map((result) => result.session
+          ? {
+              ...result,
+              session: {
+                ...result.session,
+                startedAt: new Date(result.session.startedAt).toISOString(),
+              },
+            }
+          : result),
+        provider: "unblock-memory",
+      });
     },
   };
 }
@@ -283,7 +294,10 @@ export function resolveFlushPlan(params: { cfg?: OpenClawConfig; nowMs?: number 
 
 export function registerUnblockMemory(api: OpenClawPluginApi): void {
   const config = resolveConfig(api.pluginConfig);
-  const runtime = new QmdMemoryRuntime(config.corpora, config.analysis.executable);
+  const runtime = new QmdMemoryRuntime(config.corpora, {
+    analysisExecutable: config.analysis.executable,
+    keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
+  });
   const capability = {
     deterministicRecallToolName: "memory_search",
     supportsPrivateTranscriptRecall: false,

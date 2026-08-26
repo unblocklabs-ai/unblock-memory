@@ -2,8 +2,8 @@
 
 Workspace-native memory for OpenClaw, powered internally by `@unblocklabs/qmd`.
 It keeps one warm QMD store per agent and exposes the standard `memory_search`
-and `memory_get` tools. Search uses semantic chunking v2 and QMD vsearch without
-a reranker.
+and `memory_get` tools. Search uses semantic chunking v2 and direct QMD vector
+search without query expansion or a reranker, so only the embedding model loads.
 
 Optional memory analysis uses those same stored vectors in the same SQLite
 index. It does not re-embed memory, copy vectors, or create another database.
@@ -39,6 +39,8 @@ directories, or globs into named corpora:
     entries: {
       "unblock-memory": {
         config: {
+          // Default: avoid repeated model cold starts after idle periods.
+          keepEmbeddingModelWarm: true,
           corpora: [
             {
               name: "memory",
@@ -72,6 +74,10 @@ paths are supported. A directory means recursive Markdown. When `corpora` is
 omitted, the plugin creates a `memory` corpus containing `MEMORY.md`, `USER.md`,
 and `memory/**/*.md`. Explicit configuration must include exactly one `memory`
 corpus; other unique names may be added for custom material.
+
+`keepEmbeddingModelWarm` defaults to `true`, keeping the embedding model and
+context resident after first use. Set it to `false` to restore QMD's five-minute
+idle unload behavior.
 
 `memory_search` searches every configured corpus by default. Pass
 `corpora: ["projects"]` to search selected corpora or `corpora: ["all"]` to
@@ -107,9 +113,10 @@ channel and group conversations; add `direct` explicitly to include DMs. Run
 check its progress or result. Projections are private derived Markdown
 under the agent's `unblock-memory/sessions` state directory and can be rebuilt
 from OpenClaw at any time. Session results include provider, chat type,
-conversation identity, and start time. They participate in the same search and
-clustering index as file memory. This phase does not sync sessions at startup or
-on a schedule; refreshes are manual through `memory_sync_sessions`.
+conversation identity, and start time as an ISO 8601 timestamp. They participate
+in the same search and clustering index as file memory. This phase does not sync
+sessions at startup or on a schedule; refreshes are manual through
+`memory_sync_sessions`.
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
 equivalent configured OpenClaw state directory). The first lookup builds the

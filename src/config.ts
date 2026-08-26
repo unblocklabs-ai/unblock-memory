@@ -27,6 +27,7 @@ export const DEFAULT_CORPORA: readonly FileCorpusConfig[] = [{
 
 export type UnblockMemoryConfig = {
   corpora: readonly CorpusConfig[];
+  keepEmbeddingModelWarm: boolean;
   analysis: { executable?: string };
 };
 
@@ -90,24 +91,28 @@ function resolveCorpora(value: unknown): readonly CorpusConfig[] {
 
 export function resolveConfig(value: unknown): UnblockMemoryConfig {
   if (value === undefined || value === null) {
-    return { corpora: DEFAULT_CORPORA, analysis: {} };
+    return { corpora: DEFAULT_CORPORA, keepEmbeddingModelWarm: true, analysis: {} };
   }
   if (typeof value !== "object" || Array.isArray(value)) {
     throw new Error("unblock-memory config must be an object");
   }
   const config = value as Record<string, unknown>;
-  assertOnlyKeys(config, ["corpora", "analysis"], "config");
+  assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis"], "config");
   const corpora = resolveCorpora(config.corpora);
-  if (config.analysis === undefined) return { corpora, analysis: {} };
+  if (config.keepEmbeddingModelWarm !== undefined && typeof config.keepEmbeddingModelWarm !== "boolean") {
+    throw new Error("unblock-memory keepEmbeddingModelWarm must be a boolean");
+  }
+  const keepEmbeddingModelWarm = config.keepEmbeddingModelWarm ?? true;
+  if (config.analysis === undefined) return { corpora, keepEmbeddingModelWarm, analysis: {} };
   if (!config.analysis || typeof config.analysis !== "object" || Array.isArray(config.analysis)) {
     throw new Error("unblock-memory analysis must be an object");
   }
   const analysis = config.analysis as Record<string, unknown>;
   assertOnlyKeys(analysis, ["executable"], "analysis");
   const configured = analysis.executable;
-  if (configured === undefined) return { corpora, analysis: {} };
+  if (configured === undefined) return { corpora, keepEmbeddingModelWarm, analysis: {} };
   if (typeof configured !== "string" || !configured.trim() || !isAbsolute(configured.trim())) {
     throw new Error("unblock-memory analysis.executable must be an absolute non-empty path");
   }
-  return { corpora, analysis: { executable: configured.trim() } };
+  return { corpora, keepEmbeddingModelWarm, analysis: { executable: configured.trim() } };
 }

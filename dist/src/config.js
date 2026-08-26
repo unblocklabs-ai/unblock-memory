@@ -65,16 +65,20 @@ function resolveCorpora(value) {
 }
 export function resolveConfig(value) {
     if (value === undefined || value === null) {
-        return { corpora: DEFAULT_CORPORA, analysis: {} };
+        return { corpora: DEFAULT_CORPORA, keepEmbeddingModelWarm: true, analysis: {} };
     }
     if (typeof value !== "object" || Array.isArray(value)) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "analysis"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis"], "config");
     const corpora = resolveCorpora(config.corpora);
+    if (config.keepEmbeddingModelWarm !== undefined && typeof config.keepEmbeddingModelWarm !== "boolean") {
+        throw new Error("unblock-memory keepEmbeddingModelWarm must be a boolean");
+    }
+    const keepEmbeddingModelWarm = config.keepEmbeddingModelWarm ?? true;
     if (config.analysis === undefined)
-        return { corpora, analysis: {} };
+        return { corpora, keepEmbeddingModelWarm, analysis: {} };
     if (!config.analysis || typeof config.analysis !== "object" || Array.isArray(config.analysis)) {
         throw new Error("unblock-memory analysis must be an object");
     }
@@ -82,9 +86,9 @@ export function resolveConfig(value) {
     assertOnlyKeys(analysis, ["executable"], "analysis");
     const configured = analysis.executable;
     if (configured === undefined)
-        return { corpora, analysis: {} };
+        return { corpora, keepEmbeddingModelWarm, analysis: {} };
     if (typeof configured !== "string" || !configured.trim() || !isAbsolute(configured.trim())) {
         throw new Error("unblock-memory analysis.executable must be an absolute non-empty path");
     }
-    return { corpora, analysis: { executable: configured.trim() } };
+    return { corpora, keepEmbeddingModelWarm, analysis: { executable: configured.trim() } };
 }

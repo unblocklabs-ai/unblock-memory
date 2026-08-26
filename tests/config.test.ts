@@ -7,6 +7,12 @@ test("uses the canonical memory corpus when corpora are absent", () => {
   assert.deepEqual(resolveConfig({}).corpora, DEFAULT_CORPORA);
 });
 
+test("keeps the embedding model warm by default and accepts an opt-out", () => {
+  assert.equal(resolveConfig(undefined).keepEmbeddingModelWarm, true);
+  assert.equal(resolveConfig({ keepEmbeddingModelWarm: false }).keepEmbeddingModelWarm, false);
+  assert.throws(() => resolveConfig({ keepEmbeddingModelWarm: "yes" }), /must be a boolean/);
+});
+
 test("validates and trims named file corpora", () => {
   assert.deepEqual(resolveConfig({
     corpora: [

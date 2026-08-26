@@ -62,7 +62,7 @@ test("classifies only canonical workspace memory as trusted", async () => {
 
 test("reports session sync unavailable when sessions are not configured", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-unavailable-"));
-  const runtime = new QmdMemoryRuntime([], undefined, stateRoot);
+  const runtime = new QmdMemoryRuntime([], { stateRoot });
   assert.deepEqual(await runtime.startSessionSync(active), {
     status: "unavailable",
     error: 'memory session sync requires a configured "sessions" corpus',
@@ -72,8 +72,8 @@ test("reports session sync unavailable when sessions are not configured", async 
 
 test("shares running and completed session sync status across runtime instances", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-status-"));
-  const runtime = new QmdMemoryRuntime(sessionCorpora, undefined, stateRoot);
-  const reloadedRuntime = new QmdMemoryRuntime(sessionCorpora, undefined, stateRoot);
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  const reloadedRuntime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   let releaseManager = () => {};
   const managerGate = new Promise<void>((resolve) => { releaseManager = resolve; });
   let releaseSync = () => {};
@@ -150,8 +150,8 @@ test("shares running and completed session sync status across runtime instances"
 
 test("shares failed session sync status and allows a retry from a new runtime", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-failure-"));
-  const runtime = new QmdMemoryRuntime(sessionCorpora, undefined, stateRoot);
-  const reloadedRuntime = new QmdMemoryRuntime(sessionCorpora, undefined, stateRoot);
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  const reloadedRuntime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   let releaseManager = () => {};
   const managerGate = new Promise<void>((resolve) => { releaseManager = resolve; });
   Object.defineProperty(runtime, "getMemorySearchManager", {
@@ -219,7 +219,7 @@ test("marks persisted running status interrupted after a Gateway restart", async
     pid: 99_999_999,
     startedAt,
   }));
-  const runtime = new QmdMemoryRuntime(sessionCorpora, undefined, stateRoot);
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
 
   const failed = await runtime.sessionSyncStatus(active.agentId);
   assert.equal(failed.status, "failed");
@@ -257,7 +257,7 @@ test("clears the active registry when the initial status write fails", async () 
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-write-failure-"));
   const stateRoot = join(root, "state");
   await writeFile(stateRoot, "not a directory");
-  const runtime = new QmdMemoryRuntime(sessionCorpora, undefined, stateRoot);
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   await assert.rejects(runtime.startSessionSync(active), /ENOTDIR/);
 
   await unlink(stateRoot);

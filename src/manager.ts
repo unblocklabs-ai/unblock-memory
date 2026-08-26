@@ -228,6 +228,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   readonly #workspaceDir: string;
   readonly #sources: ReadonlyMap<string, ResolvedSource>;
   readonly #storeFactory?: () => Promise<ManagerStore>;
+  readonly #keepModelsWarm: boolean;
   readonly #analysisExecutable?: string;
   readonly #analysisRunner: AnalysisRunner;
   readonly #sessions?: ManagerSessionConfig;
@@ -249,6 +250,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     workspaceDir: string;
     sources: readonly ResolvedSource[];
     storeFactory?: () => Promise<ManagerStore>;
+    keepModelsWarm?: boolean;
     analysisExecutable?: string;
     analysisRunner?: AnalysisRunner;
     sessions?: ManagerSessionConfig;
@@ -257,6 +259,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     this.#workspaceDir = params.workspaceDir;
     this.#sources = new Map(params.sources.map((source) => [source.collection, source]));
     this.#storeFactory = params.storeFactory;
+    this.#keepModelsWarm = params.keepModelsWarm ?? true;
     this.#analysisExecutable = params.analysisExecutable;
     this.#analysisRunner = params.analysisRunner ?? runAnalysisWorker;
     this.#sessions = params.sessions;
@@ -336,6 +339,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const { createStore } = await qmdModule;
     const store = await createStore({
       dbPath: this.#dbPath,
+      keepModelsWarm: this.#keepModelsWarm,
       config: {
         collections: Object.fromEntries(
           [...this.#sources.values()].map((source) => [
@@ -550,6 +554,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       limit: opts?.maxResults ?? 5,
       minScore: opts?.minScore ?? 0.3,
       allowedPaths,
+      expand: false,
     });
     return hits.flatMap((hit) => {
       const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];

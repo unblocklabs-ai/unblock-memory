@@ -137,6 +137,7 @@ export class QmdMemoryManager {
     #workspaceDir;
     #sources;
     #storeFactory;
+    #keepModelsWarm;
     #analysisExecutable;
     #analysisRunner;
     #sessions;
@@ -157,6 +158,7 @@ export class QmdMemoryManager {
         this.#workspaceDir = params.workspaceDir;
         this.#sources = new Map(params.sources.map((source) => [source.collection, source]));
         this.#storeFactory = params.storeFactory;
+        this.#keepModelsWarm = params.keepModelsWarm ?? true;
         this.#analysisExecutable = params.analysisExecutable;
         this.#analysisRunner = params.analysisRunner ?? runAnalysisWorker;
         this.#sessions = params.sessions;
@@ -240,6 +242,7 @@ export class QmdMemoryManager {
         const { createStore } = await qmdModule;
         const store = await createStore({
             dbPath: this.#dbPath,
+            keepModelsWarm: this.#keepModelsWarm,
             config: {
                 collections: Object.fromEntries([...this.#sources.values()].map((source) => [
                     source.collection,
@@ -436,6 +439,7 @@ export class QmdMemoryManager {
             limit: opts?.maxResults ?? 5,
             minScore: opts?.minScore ?? 0.3,
             allowedPaths,
+            expand: false,
         });
         return hits.flatMap((hit) => {
             const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];

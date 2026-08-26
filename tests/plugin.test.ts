@@ -114,6 +114,60 @@ test("registers exactly the clean memory tool contract and validates every tool 
   }
 });
 
+test("memory_search exposes session start time as ISO 8601", async () => {
+  let runtime: QmdMemoryRuntime | undefined;
+  let searchFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
+  const api = {
+    pluginConfig: {},
+    registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
+      runtime = capability.runtime;
+    },
+    registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+      if (options.names.includes("memory_search")) searchFactory = factory;
+    },
+  } as unknown as OpenClawPluginApi;
+  registerUnblockMemory(api);
+  assert.ok(runtime);
+  assert.ok(searchFactory);
+
+  const startedAt = Date.parse("2026-08-25T14:00:00Z");
+  const internalResult = {
+    path: "qmd://sessions/session.md",
+    startLine: 1,
+    endLine: 2,
+    score: 0.8,
+    snippet: "session body",
+    source: "memory" as const,
+    corpus: "sessions",
+    citation: "sessions/session.md#L1-L2",
+    session: {
+      sessionId: "session-1",
+      provider: "slack",
+      chatType: "channel" as const,
+      accountId: "workspace",
+      conversationId: "C123",
+      startedAt,
+    },
+  };
+  Object.defineProperty(runtime, "getMemorySearchManager", {
+    value: async () => ({ manager: { search: async () => [internalResult] } }),
+  });
+
+  const tool = searchFactory({ agentId: "bill", config: {} } as OpenClawPluginToolContext)!;
+  const result = parseJsonResult(await tool.execute("search", { query: "session" }));
+  assert.deepEqual(result, {
+    results: [{
+      ...internalResult,
+      session: {
+        ...internalResult.session,
+        startedAt: "2026-08-25T14:00:00.000Z",
+      },
+    }],
+    provider: "unblock-memory",
+  });
+  assert.equal(internalResult.session.startedAt, startedAt);
+});
+
 test("session sync tools accept and report status without awaiting cold initialization", async () => {
   const registrations = new Map<string, (ctx: OpenClawPluginToolContext) => Tool | null>();
   let runtime: QmdMemoryRuntime | undefined;

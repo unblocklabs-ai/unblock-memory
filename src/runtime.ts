@@ -91,17 +91,22 @@ export async function recoverInterruptedSessionSync(
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #corpora: readonly CorpusConfig[];
   readonly #analysisExecutable?: string;
+  readonly #keepEmbeddingModelWarm: boolean;
   readonly #stateRoot: string;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
 
   constructor(
     corpora: readonly CorpusConfig[],
-    analysisExecutable?: string,
-    stateRoot = resolveStateDir(),
+    options: {
+      analysisExecutable?: string;
+      keepEmbeddingModelWarm?: boolean;
+      stateRoot?: string;
+    } = {},
   ) {
     this.#corpora = corpora;
-    this.#analysisExecutable = analysisExecutable;
-    this.#stateRoot = stateRoot;
+    this.#analysisExecutable = options.analysisExecutable;
+    this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
+    this.#stateRoot = options.stateRoot ?? resolveStateDir();
   }
 
   async getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }) {
@@ -235,6 +240,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       workspaceDir,
       dbPath: join(stateDir, "index.sqlite"),
       sources,
+      keepModelsWarm: this.#keepEmbeddingModelWarm,
       analysisExecutable: this.#analysisExecutable,
       ...(sessionCorpus && sessionSource ? {
         sessions: {

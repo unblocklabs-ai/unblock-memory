@@ -31,6 +31,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         workspaceDir: string;
         sources: readonly ResolvedSource[];
         storeFactory?: () => Promise<ManagerStore>;
+        keepModelsWarm?: boolean;
         analysisExecutable?: string;
         analysisRunner?: AnalysisRunner;
         sessions?: ManagerSessionConfig;

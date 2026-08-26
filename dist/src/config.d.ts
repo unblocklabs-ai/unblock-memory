@@ -14,6 +14,7 @@ export type CorpusConfig = FileCorpusConfig | SessionCorpusConfig;
 export declare const DEFAULT_CORPORA: readonly FileCorpusConfig[];
 export type UnblockMemoryConfig = {
     corpora: readonly CorpusConfig[];
+    keepEmbeddingModelWarm: boolean;
     analysis: {
         executable?: string;
     };

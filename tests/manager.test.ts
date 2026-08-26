@@ -334,12 +334,14 @@ test("scopes vector search to named corpora and labels results", async () => {
     chunkLen: source.corpus.length + 5,
   }));
   const searchedCollections: string[][] = [];
+  const searchedWithoutExpansion: boolean[] = [];
   const store = createManagerStore({
     async vsearch(_query, options) {
       const collections = typeof options?.collection === "string"
         ? [options.collection]
         : [...(options?.collection ?? [])];
       searchedCollections.push(collections);
+      searchedWithoutExpansion.push(options?.expand === false);
       return hits.filter((hit) => collections.some((collection) => hit.file.startsWith(`qmd://${collection}/`)));
     },
     async get(query) {
@@ -380,6 +382,7 @@ test("scopes vector search to named corpora and labels results", async () => {
       [projects.collection],
       [memory.collection, projects.collection],
     ]);
+    assert.deepEqual(searchedWithoutExpansion, [true, true, true, true]);
     await assert.rejects(manager.search("notes", { corpora: ["unknown"] }), /unknown corpus: unknown/);
     await assert.rejects(manager.search("notes", { corpora: ["all", "memory"] }), /must be used alone/);
     await assert.rejects(manager.search("notes", { corpora: [] }), /must not be empty/);

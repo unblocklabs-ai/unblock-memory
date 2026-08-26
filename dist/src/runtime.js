@@ -65,12 +65,14 @@ export async function recoverInterruptedSessionSync(directory, statusPath, stale
 export class QmdMemoryRuntime {
     #corpora;
     #analysisExecutable;
+    #keepEmbeddingModelWarm;
     #stateRoot;
     #managers = new Map();
-    constructor(corpora, analysisExecutable, stateRoot = resolveStateDir()) {
+    constructor(corpora, options = {}) {
         this.#corpora = corpora;
-        this.#analysisExecutable = analysisExecutable;
-        this.#stateRoot = stateRoot;
+        this.#analysisExecutable = options.analysisExecutable;
+        this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
+        this.#stateRoot = options.stateRoot ?? resolveStateDir();
     }
     async getMemorySearchManager(params) {
         let pending = this.#managers.get(params.agentId);
@@ -203,6 +205,7 @@ export class QmdMemoryRuntime {
             workspaceDir,
             dbPath: join(stateDir, "index.sqlite"),
             sources,
+            keepModelsWarm: this.#keepEmbeddingModelWarm,
             analysisExecutable: this.#analysisExecutable,
             ...(sessionCorpus && sessionSource ? {
                 sessions: {
