@@ -10,12 +10,26 @@ import type { CorpusConfig } from "./config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
+import type { SessionSyncResult } from "./session-sync.js";
 import { resolveSessionSource, resolveSources } from "./sources.js";
+import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
+
+export type SessionSyncStatus =
+  | { status: "idle" }
+  | { status: "running"; phase: "queued" | "projecting" | "indexing"; startedAt: string }
+  | ({ status: "completed"; startedAt: string; completedAt: string } & SessionSyncResult)
+  | { status: "failed"; startedAt: string; completedAt: string; error: string };
+
+export type SessionSyncStartResult =
+  | { status: "started"; startedAt: string }
+  | { status: "already_running"; startedAt: string }
+  | { status: "unavailable"; error: string };
 
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #corpora: readonly CorpusConfig[];
   readonly #analysisExecutable?: string;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
+  readonly #sessionSyncStatuses = new Map<string, SessionSyncStatus>();
 
   constructor(corpora: readonly CorpusConfig[], analysisExecutable?: string) {
     this.#corpora = corpora;
@@ -38,6 +52,58 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   resolveMemoryBackendConfig() {
     return { backend: "builtin" as const };
+  }
+
+  classifyWorkspaceMemoryPaths: NonNullable<
+    MemoryPluginRuntimeContract["classifyWorkspaceMemoryPaths"]
+  > = classifyWorkspaceMemoryPaths;
+
+  startSessionSync(
+    params: { cfg: OpenClawConfig; agentId: string },
+    force = false,
+  ): SessionSyncStartResult {
+    if (!this.#corpora.some((corpus) => corpus.kind === "sessions")) {
+      return {
+        status: "unavailable",
+        error: 'memory session sync requires a configured "sessions" corpus',
+      };
+    }
+    const current = this.sessionSyncStatus(params.agentId);
+    if (current.status === "running") {
+      return { status: "already_running", startedAt: current.startedAt };
+    }
+    const startedAt = new Date().toISOString();
+    this.#sessionSyncStatuses.set(params.agentId, { status: "running", phase: "queued", startedAt });
+    const run = async () => {
+      const { manager, error } = await this.getMemorySearchManager(params);
+      if (!manager) throw new Error(error ?? "memory unavailable");
+      return await manager.syncSessions(force, (phase) => {
+        this.#sessionSyncStatuses.set(params.agentId, { status: "running", phase, startedAt });
+      });
+    };
+    void run().then(
+      (result) => {
+        this.#sessionSyncStatuses.set(params.agentId, {
+          status: "completed",
+          startedAt,
+          completedAt: new Date().toISOString(),
+          ...result,
+        });
+      },
+      (error) => {
+        this.#sessionSyncStatuses.set(params.agentId, {
+          status: "failed",
+          startedAt,
+          completedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+    return { status: "started", startedAt };
+  }
+
+  sessionSyncStatus(agentId: string): SessionSyncStatus {
+    return this.#sessionSyncStatuses.get(agentId) ?? { status: "idle" };
   }
 
   async closeMemorySearchManager(params: { agentId: string }): Promise<void> {

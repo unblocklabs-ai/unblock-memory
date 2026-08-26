@@ -1,13 +1,14 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": false },
-  "contracts": { "tools": ["memory_search", "memory_get", "memory_sync_sessions", "memory_recluster", "memory_list_clusters", "memory_fetch_cluster"] },
+  "contracts": { "tools": ["memory_search", "memory_get", "memory_sync_sessions", "memory_sync_status", "memory_recluster", "memory_list_clusters", "memory_fetch_cluster"] },
   "toolMetadata": {
     "memory_sync_sessions": { "sideEffecting": true },
+    "memory_sync_status": { "replaySafe": true },
     "memory_recluster": { "sideEffecting": true },
     "memory_list_clusters": { "replaySafe": true },
     "memory_fetch_cluster": { "replaySafe": true }

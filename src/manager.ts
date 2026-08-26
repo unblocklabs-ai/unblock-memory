@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
@@ -242,6 +242,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   #files = 0;
   #dirty = true;
   #sessionMetadata = new Map<string, SessionMetadata>();
+  #sessionManifestMtimeNs?: bigint;
 
   constructor(params: {
     dbPath: string;
@@ -263,13 +264,36 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
 
   async start(): Promise<void> {
     if (this.#sessions) {
-      this.#sessionMetadata = sessionMetadataByPath(
-        await readSessionManifest(this.#sessions.manifestPath),
-      );
+      await this.#reloadSessionMetadata();
     }
     this.#startWatcher();
     await this.sync({ reason: "first-use" });
     await this.#watchReady;
+  }
+
+  async #manifestMtimeNs(path: string): Promise<bigint | undefined> {
+    try {
+      return (await stat(path, { bigint: true })).mtimeNs;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  async #reloadSessionMetadata(): Promise<void> {
+    const sessions = this.#sessions;
+    if (!sessions) return;
+    const mtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
+    const manifest = await readSessionManifest(sessions.manifestPath);
+    this.#sessionMetadata = sessionMetadataByPath(manifest);
+    this.#sessionManifestMtimeNs = mtimeNs;
+  }
+
+  async #refreshSessionMetadata(): Promise<void> {
+    const sessions = this.#sessions;
+    if (!sessions) return;
+    const mtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
+    if (mtimeNs !== this.#sessionManifestMtimeNs) await this.#reloadSessionMetadata();
   }
 
   #startWatcher(): void {
@@ -391,15 +415,20 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     return this.#enqueue(run);
   }
 
-  syncSessions(force = false): Promise<SessionSyncResult> {
+  syncSessions(
+    force = false,
+    onPhase?: (phase: "projecting" | "indexing") => void,
+  ): Promise<SessionSyncResult> {
     return this.#enqueue(async () => {
       const sessions = this.#sessions;
       if (!sessions) throw new Error('memory session sync requires a configured "sessions" corpus');
+      onPhase?.("projecting");
       const store = await this.#getStore();
       const synced = await syncSessionProjections({
         ...sessions,
         force,
         index: async () => {
+          onPhase?.("indexing");
           const update = await store.update({ collections: [sessions.collection] });
           this.#cleanupRemovedDocuments?.(update.updated + update.removed);
           const analysisStore = store as Partial<AnalysisStore>;
@@ -495,6 +524,9 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     opts?.signal?.throwIfAborted();
     await this.#operationChain;
     const sessions = this.#sessions;
+    if (opts?.sessionFilter && sessions && collections.includes(sessions.collection)) {
+      await this.#refreshSessionMetadata();
+    }
     const allowedPaths = opts?.sessionFilter && sessions && collections.includes(sessions.collection)
       ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter)
       : undefined;

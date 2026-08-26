@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import chokidar from "chokidar";
 import { ensureMemoryAnalysisSchema, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
@@ -151,6 +151,7 @@ export class QmdMemoryManager {
     #files = 0;
     #dirty = true;
     #sessionMetadata = new Map();
+    #sessionManifestMtimeNs;
     constructor(params) {
         this.#dbPath = params.dbPath;
         this.#workspaceDir = params.workspaceDir;
@@ -162,11 +163,38 @@ export class QmdMemoryManager {
     }
     async start() {
         if (this.#sessions) {
-            this.#sessionMetadata = sessionMetadataByPath(await readSessionManifest(this.#sessions.manifestPath));
+            await this.#reloadSessionMetadata();
         }
         this.#startWatcher();
         await this.sync({ reason: "first-use" });
         await this.#watchReady;
+    }
+    async #manifestMtimeNs(path) {
+        try {
+            return (await stat(path, { bigint: true })).mtimeNs;
+        }
+        catch (error) {
+            if (error.code === "ENOENT")
+                return undefined;
+            throw error;
+        }
+    }
+    async #reloadSessionMetadata() {
+        const sessions = this.#sessions;
+        if (!sessions)
+            return;
+        const mtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
+        const manifest = await readSessionManifest(sessions.manifestPath);
+        this.#sessionMetadata = sessionMetadataByPath(manifest);
+        this.#sessionManifestMtimeNs = mtimeNs;
+    }
+    async #refreshSessionMetadata() {
+        const sessions = this.#sessions;
+        if (!sessions)
+            return;
+        const mtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
+        if (mtimeNs !== this.#sessionManifestMtimeNs)
+            await this.#reloadSessionMetadata();
     }
     #startWatcher() {
         const paths = [...new Set([...this.#sources.values()]
@@ -291,16 +319,18 @@ export class QmdMemoryManager {
         };
         return this.#enqueue(run);
     }
-    syncSessions(force = false) {
+    syncSessions(force = false, onPhase) {
         return this.#enqueue(async () => {
             const sessions = this.#sessions;
             if (!sessions)
                 throw new Error('memory session sync requires a configured "sessions" corpus');
+            onPhase?.("projecting");
             const store = await this.#getStore();
             const synced = await syncSessionProjections({
                 ...sessions,
                 force,
                 index: async () => {
+                    onPhase?.("indexing");
                     const update = await store.update({ collections: [sessions.collection] });
                     this.#cleanupRemovedDocuments?.(update.updated + update.removed);
                     const analysisStore = store;
@@ -380,6 +410,9 @@ export class QmdMemoryManager {
         opts?.signal?.throwIfAborted();
         await this.#operationChain;
         const sessions = this.#sessions;
+        if (opts?.sessionFilter && sessions && collections.includes(sessions.collection)) {
+            await this.#refreshSessionMetadata();
+        }
         const allowedPaths = opts?.sessionFilter && sessions && collections.includes(sessions.collection)
             ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter)
             : undefined;

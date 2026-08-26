@@ -4,10 +4,12 @@ import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { QmdMemoryManager } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
 import { resolveSessionSource, resolveSources } from "./sources.js";
+import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
 export class QmdMemoryRuntime {
     #corpora;
     #analysisExecutable;
     #managers = new Map();
+    #sessionSyncStatuses = new Map();
     constructor(corpora, analysisExecutable) {
         this.#corpora = corpora;
         this.#analysisExecutable = analysisExecutable;
@@ -28,6 +30,48 @@ export class QmdMemoryRuntime {
     }
     resolveMemoryBackendConfig() {
         return { backend: "builtin" };
+    }
+    classifyWorkspaceMemoryPaths = classifyWorkspaceMemoryPaths;
+    startSessionSync(params, force = false) {
+        if (!this.#corpora.some((corpus) => corpus.kind === "sessions")) {
+            return {
+                status: "unavailable",
+                error: 'memory session sync requires a configured "sessions" corpus',
+            };
+        }
+        const current = this.sessionSyncStatus(params.agentId);
+        if (current.status === "running") {
+            return { status: "already_running", startedAt: current.startedAt };
+        }
+        const startedAt = new Date().toISOString();
+        this.#sessionSyncStatuses.set(params.agentId, { status: "running", phase: "queued", startedAt });
+        const run = async () => {
+            const { manager, error } = await this.getMemorySearchManager(params);
+            if (!manager)
+                throw new Error(error ?? "memory unavailable");
+            return await manager.syncSessions(force, (phase) => {
+                this.#sessionSyncStatuses.set(params.agentId, { status: "running", phase, startedAt });
+            });
+        };
+        void run().then((result) => {
+            this.#sessionSyncStatuses.set(params.agentId, {
+                status: "completed",
+                startedAt,
+                completedAt: new Date().toISOString(),
+                ...result,
+            });
+        }, (error) => {
+            this.#sessionSyncStatuses.set(params.agentId, {
+                status: "failed",
+                startedAt,
+                completedAt: new Date().toISOString(),
+                error: error instanceof Error ? error.message : String(error),
+            });
+        });
+        return { status: "started", startedAt };
+    }
+    sessionSyncStatus(agentId) {
+        return this.#sessionSyncStatuses.get(agentId) ?? { status: "idle" };
     }
     async closeMemorySearchManager(params) {
         const pending = this.#managers.get(params.agentId);
