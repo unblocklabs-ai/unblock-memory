@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { parseSafeVirtualPath, resolveSource } from "../src/sources.js";
+import { parseSafeVirtualPath, resolveSource, resolveSources } from "../src/sources.js";
 
 test("resolves exact files, directories, and globs deterministically", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-paths-"));
@@ -24,6 +24,22 @@ test("treats a not-yet-created non-Markdown path as a directory", async () => {
   const source = resolveSource(workspace, "notes");
   assert.equal(source.root, join(workspace, "notes"));
   assert.equal(source.pattern, "**/*.md");
+});
+
+test("assigns corpus identity without changing physical collection identity", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-corpora-"));
+  await mkdir(join(workspace, "memory"));
+  const memory = resolveSource(workspace, "memory", "memory");
+  const projects = resolveSource(workspace, "memory", "projects");
+  assert.equal(memory.collection, projects.collection);
+  assert.equal(projects.corpus, "projects");
+  assert.throws(() => resolveSources(workspace, [
+    { name: "memory", kind: "files", paths: ["memory"] },
+    { name: "projects", kind: "files", paths: ["./memory/**/*.md"] },
+  ]), /projects.*duplicates.*memory/);
+  assert.throws(() => resolveSources(workspace, [
+    { name: "memory", kind: "files", paths: ["memory", "./memory/**/*.md"] },
+  ]), /duplicates/);
 });
 
 test("virtual reads reject traversal and accept exact in-root markdown", async () => {

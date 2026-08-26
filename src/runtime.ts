@@ -1,20 +1,24 @@
 import { join } from "node:path";
 import {
+  resolveAgentDir,
   resolveAgentWorkspaceDir,
   resolveStateDir,
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
+import type { CorpusConfig } from "./config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager } from "./manager.js";
-import { resolveSource } from "./sources.js";
+import { resolveTimezone } from "./session-projector.js";
+import { resolveSessionSource, resolveSources } from "./sources.js";
 
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
-  readonly #paths: readonly string[];
+  readonly #corpora: readonly CorpusConfig[];
   readonly #analysisExecutable?: string;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
 
-  constructor(paths: readonly string[], analysisExecutable?: string) {
-    this.#paths = paths;
+  constructor(corpora: readonly CorpusConfig[], analysisExecutable?: string) {
+    this.#corpora = corpora;
     this.#analysisExecutable = analysisExecutable;
   }
 
@@ -50,11 +54,31 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   async #createManager(cfg: OpenClawConfig, agentId: string): Promise<QmdMemoryManager> {
     const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+    const stateDir = join(resolveStateDir(), "agents", agentId, "unblock-memory");
+    const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files");
+    const sessionCorpus = this.#corpora.find((corpus) => corpus.kind === "sessions");
+    const sources = resolveSources(workspaceDir, fileCorpora);
+    const sessionSource = sessionCorpus
+      ? resolveSessionSource(join(stateDir, "sessions"), sessionCorpus.chatTypes)
+      : undefined;
+    if (sessionSource) sources.push(sessionSource);
     const manager = new QmdMemoryManager({
       workspaceDir,
-      dbPath: join(resolveStateDir(), "agents", agentId, "unblock-memory", "index.sqlite"),
-      sources: this.#paths.map((source) => resolveSource(workspaceDir, source)),
+      dbPath: join(stateDir, "index.sqlite"),
+      sources,
       analysisExecutable: this.#analysisExecutable,
+      ...(sessionCorpus && sessionSource ? {
+        sessions: {
+          agentId,
+          agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
+          chatTypes: sessionCorpus.chatTypes,
+          collection: sessionSource.collection,
+          databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
+          manifestPath: join(stateDir, "sessions-manifest.json"),
+          outputDir: sessionSource.root,
+          timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
+        },
+      } : {}),
     });
     await manager.start();
     return manager;

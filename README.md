@@ -13,7 +13,7 @@ index. It does not re-embed memory, copy vectors, or create another database.
 From npm:
 
 ```bash
-openclaw plugins install @unblocklabs/unblock-memory
+openclaw plugins install npm:@unblocklabs/unblock-memory
 ```
 
 Or directly from GitHub:
@@ -22,10 +22,15 @@ Or directly from GitHub:
 openclaw plugins install git:github.com/unblocklabs-ai/unblock-memory
 ```
 
+Install the plugin once on each OpenClaw host, not once per agent. It installs
+its pinned `@unblocklabs/qmd` runtime dependency automatically, so QMD does not
+need to be installed separately. Each agent gets its own QMD index when it first
+uses memory.
+
 ## Configuration
 
-Select the plugin as the memory provider and list any exact Markdown files,
-directories, or globs to index:
+Select the plugin as the memory provider and group exact Markdown files,
+directories, or globs into named corpora:
 
 ```json5
 {
@@ -34,14 +39,26 @@ directories, or globs to index:
     entries: {
       "unblock-memory": {
         config: {
-          paths: [
-            "MEMORY.md",
-            "USER.md",
-            "memory/**/*.md",
-            "/absolute/shared/**/*.md",
+          corpora: [
+            {
+              name: "memory",
+              kind: "files",
+              paths: ["MEMORY.md", "USER.md", "memory/**/*.md"],
+            },
+            {
+              name: "projects",
+              kind: "files",
+              paths: ["/absolute/shared/**/*.md"],
+            },
+            {
+              name: "sessions",
+              kind: "sessions",
+              chatTypes: ["channel", "group"],
+            },
           ],
+          // Optional: omit unless the local analysis worker is installed.
           analysis: {
-            executable: "/absolute/path/to/unblock-memory-analysis",
+            executable: "/absolute/path/to/unblock-cluster/bin/unblock-memory-analysis",
           },
         },
       },
@@ -51,9 +68,25 @@ directories, or globs to index:
 ```
 
 Relative entries resolve from each agent workspace. Absolute paths and `~/`
-paths are supported. A directory means recursive Markdown. When `paths` is
-omitted, the defaults are `MEMORY.md`, `USER.md`, and `memory/**/*.md`; an
-explicit array replaces those defaults.
+paths are supported. A directory means recursive Markdown. When `corpora` is
+omitted, the plugin creates a `memory` corpus containing `MEMORY.md`, `USER.md`,
+and `memory/**/*.md`. Explicit configuration must include exactly one `memory`
+corpus; other unique names may be added for custom material.
+
+`memory_search` searches every configured corpus by default. Pass
+`corpora: ["projects"]` to search selected corpora or `corpora: ["all"]` to
+request all of them explicitly. Search results include their corpus name and
+remain readable by passing the returned `qmd://` path to `memory_get`.
+
+The optional `sessions` corpus reads the current agent's normal OpenClaw SQLite
+store and indexes its active user/assistant transcript branch. It defaults to
+channel and group conversations; add `direct` explicitly to include DMs. Run
+`memory_sync_sessions` to refresh it. Projections are private derived Markdown
+under the agent's `unblock-memory/sessions` state directory and can be rebuilt
+from OpenClaw at any time. Session results include provider, chat type,
+conversation identity, and start time. They participate in the same search and
+clustering index as file memory. This phase does not sync sessions at startup or
+on a schedule; refreshes are manual through `memory_sync_sessions`.
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
 equivalent configured OpenClaw state directory). The first lookup builds the
@@ -62,11 +95,29 @@ refresh.
 
 ## Memory analysis
 
-Analysis is opt-in and requires the separately installed local analysis worker.
-Set `analysis.executable` to its absolute path. The plugin invokes that file
-directly with `--db <the agent's known index path>` and, when requested,
-`--config-json <validated clustering options>`. Agents cannot choose a database,
+Analysis is opt-in. Core indexing, `memory_search`, and `memory_get` need only
+Unblock Memory and its automatically installed QMD dependency. To enable
+clustering, install the
+[`unblock-cluster`](https://github.com/unblocklabs-ai/unblock-cluster) worker once
+on the same host:
+
+```bash
+git clone https://github.com/unblocklabs-ai/unblock-cluster.git
+cd unblock-cluster
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Set `analysis.executable` to the absolute path of
+`bin/unblock-memory-analysis` in that checkout. One worker installation can
+serve every agent on the host. The plugin invokes it directly with
+`--db <the agent's known index path>` and, when requested, a validated
+`--config-json <clustering options>` payload. Agents cannot choose a database,
 executable, shell command, or arbitrary arguments.
+
+Without the worker, `memory_list_clusters` reports that memory has not been
+analyzed and `memory_recluster` reports that analysis is unavailable. Ordinary
+memory search and reads continue to work.
 
 The analysis worker reads QMD's existing semantic vectors and writes only
 derived results into three namespaced tables in that same `index.sqlite`:
@@ -100,6 +151,5 @@ A failed rebuild leaves the stale result intact, while a successful rebuild
 atomically replaces it. Analysis is never scheduled automatically. If the worker
 is absent or fails, `memory_search` and `memory_get` continue to work.
 
-Session transcripts are intentionally out of scope for this first version. Existing
-`unblock-qmd` indexes are derived caches and may be left in place; Unblock Memory
-rebuilds its new index from the configured workspace Markdown.
+Existing `unblock-qmd` indexes are derived caches and may be left in place;
+Unblock Memory rebuilds its own index from configured corpora.

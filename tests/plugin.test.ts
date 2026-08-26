@@ -40,6 +40,7 @@ test("flush plan honors disable, thresholds, model, and agent timezone", () => {
 test("registers exactly the clean memory tool contract and validates every tool at execution", async () => {
   type Tool = {
     name: string;
+    parameters: { properties?: Record<string, unknown> };
     execute(toolCallId: string, params: unknown, signal?: AbortSignal): Promise<unknown>;
   };
   const registrations: Array<{
@@ -58,6 +59,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
   assert.deepEqual(registrations.flatMap((registration) => registration.names), [
     "memory_search",
     "memory_get",
+    "memory_sync_sessions",
     "memory_recluster",
     "memory_list_clusters",
     "memory_fetch_cluster",
@@ -70,14 +72,19 @@ test("registers exactly the clean memory tool contract and validates every tool 
     config: {},
   } as OpenClawPluginToolContext;
   const tool = (name: string) => registrations.find((registration) => registration.names.includes(name))!.factory(context)!;
+  assert.ok(tool("memory_search").parameters.properties?.corpora);
 
   const invalidCalls: Array<[name: string, params: unknown]> = [
     ["memory_search", { query: "memory", maxResults: 21 }],
     ["memory_search", { query: "   " }],
+    ["memory_search", { query: "memory", corpora: [] }],
+    ["memory_search", { query: "memory", corpora: [""] }],
     ["memory_search", { query: "memory", extra: true }],
     ["memory_get", { path: "qmd://memory/MEMORY.md", lines: 1_001 }],
     ["memory_get", { path: "   " }],
     ["memory_get", { path: "qmd://memory/MEMORY.md", extra: true }],
+    ["memory_sync_sessions", { force: "yes" }],
+    ["memory_sync_sessions", { extra: true }],
     ["memory_recluster", { hdbscan: { clusterSelectionEpsilon: Number.POSITIVE_INFINITY } }],
     ["memory_recluster", { seed: -1 }],
     ["memory_recluster", { extra: true }],

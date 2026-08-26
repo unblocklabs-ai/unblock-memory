@@ -11,6 +11,7 @@ function getContext(ctx) {
 }
 const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
+    corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
     maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
     minScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
 }, { additionalProperties: false });
@@ -19,6 +20,9 @@ const getParameters = Type.Object({
     from: Type.Optional(Type.Integer({ minimum: 1 })),
     lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
 }, { additionalProperties: false });
+const syncSessionsParameters = Type.Object({
+    force: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
 function createSearchTool(runtime, ctx) {
     const active = getContext(ctx);
     if (!active)
@@ -26,15 +30,20 @@ function createSearchTool(runtime, ctx) {
     return {
         name: "memory_search",
         label: "Memory Search",
-        description: "Search canonical Markdown memory with semantic vector retrieval.",
+        description: "Search configured Markdown corpora with semantic vector retrieval. Omit corpora to search all of them.",
         parameters: searchParameters,
         async execute(_toolCallId, params, signal) {
-            const { query: untrimmedQuery, maxResults, minScore } = Value.Parse(searchParameters, params);
+            const { query: untrimmedQuery, corpora, maxResults, minScore } = Value.Parse(searchParameters, params);
             const query = untrimmedQuery.trim();
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
                 return jsonResult({ results: [], error: error ?? "memory unavailable" });
-            const results = await manager.search(query, { maxResults, minScore, signal });
+            const results = await manager.search(query, {
+                corpora: corpora?.map((corpus) => corpus.trim()),
+                maxResults,
+                minScore,
+                signal,
+            });
             return jsonResult({ results, provider: "unblock-memory" });
         },
     };
@@ -59,6 +68,32 @@ function createGetTool(runtime, ctx) {
                 from,
                 lines,
             }));
+        },
+    };
+}
+function createSyncSessionsTool(runtime, ctx) {
+    const active = getContext(ctx);
+    if (!active)
+        return null;
+    return {
+        name: "memory_sync_sessions",
+        label: "Sync Memory Sessions",
+        description: "Project and index this agent's configured OpenClaw session transcripts.",
+        parameters: syncSessionsParameters,
+        async execute(_toolCallId, params) {
+            const { force } = Value.Parse(syncSessionsParameters, params);
+            const { manager, error } = await runtime.getMemorySearchManager(active);
+            if (!manager)
+                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+            try {
+                return jsonResult(await manager.syncSessions(force));
+            }
+            catch (syncError) {
+                return jsonResult({
+                    status: "unavailable",
+                    error: syncError instanceof Error ? syncError.message : String(syncError),
+                });
+            }
         },
     };
 }
@@ -219,7 +254,7 @@ export function resolveFlushPlan(params = {}) {
 }
 export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
-    const runtime = new QmdMemoryRuntime(config.paths, config.analysis.executable);
+    const runtime = new QmdMemoryRuntime(config.corpora, config.analysis.executable);
     const capability = {
         deterministicRecallToolName: "memory_search",
         supportsPrivateTranscriptRecall: false,
@@ -232,6 +267,7 @@ export function registerUnblockMemory(api) {
     api.registerMemoryCapability(capability);
     api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
+    api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), { names: ["memory_sync_sessions"] });
     api.registerTool((ctx) => createReclusterTool(runtime, ctx), { names: ["memory_recluster"] });
     api.registerTool((ctx) => createListClustersTool(runtime, ctx), { names: ["memory_list_clusters"] });
     api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), { names: ["memory_fetch_cluster"] });

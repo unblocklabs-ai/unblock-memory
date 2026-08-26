@@ -2,11 +2,24 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import chokidar from "chokidar";
 import { ensureMemoryAnalysisSchema, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
+import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, } from "./session-sync.js";
 import { parseSafeVirtualPath } from "./sources.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
 const qmdModule = import("@unblocklabs/qmd");
+function completedEmbeddingCount(result) {
+    if (result.errors > 0) {
+        throw new Error(`QMD failed to embed ${result.errors} chunk${result.errors === 1 ? "" : "s"}`);
+    }
+    return result.chunksEmbedded;
+}
+async function ensureSemanticChunking(store) {
+    const configured = store.internal.db.prepare("SELECT value FROM store_config WHERE key = 'embedding_chunk_strategy'").get();
+    if (configured?.value === "semantic")
+        return;
+    completedEmbeddingCount(await store.embed({ chunkStrategy: "semantic" }));
+}
 export function enableSecureDelete(store) {
     store.internal.db.exec("PRAGMA secure_delete = ON");
 }
@@ -78,7 +91,7 @@ function lineSpan(result) {
     const endLine = startLine + Math.max(0, result.bestChunk.split("\n").length - 1);
     return { startLine, endLine };
 }
-function lexicalResult(hit) {
+function lexicalResult(hit, corpus, session) {
     const body = hit.body ?? hit.title;
     const endLine = Math.max(1, body.split("\n").length);
     return {
@@ -89,6 +102,8 @@ function lexicalResult(hit) {
         textScore: hit.score,
         snippet: body,
         source: "memory",
+        corpus,
+        ...(session ? { session } : {}),
         citation: `${hit.displayPath}#L1-L${endLine}`,
     };
 }
@@ -99,6 +114,7 @@ export class QmdMemoryManager {
     #storeFactory;
     #analysisExecutable;
     #analysisRunner;
+    #sessions;
     #store;
     #cleanupRemovedDocuments;
     #operationChain;
@@ -109,6 +125,7 @@ export class QmdMemoryManager {
     #closed = false;
     #files = 0;
     #dirty = true;
+    #sessionMetadata = new Map();
     constructor(params) {
         this.#dbPath = params.dbPath;
         this.#workspaceDir = params.workspaceDir;
@@ -116,14 +133,20 @@ export class QmdMemoryManager {
         this.#storeFactory = params.storeFactory;
         this.#analysisExecutable = params.analysisExecutable;
         this.#analysisRunner = params.analysisRunner ?? runAnalysisWorker;
+        this.#sessions = params.sessions;
     }
     async start() {
+        if (this.#sessions) {
+            this.#sessionMetadata = sessionMetadataByPath(await readSessionManifest(this.#sessions.manifestPath));
+        }
         this.#startWatcher();
         await this.sync({ reason: "first-use" });
         await this.#watchReady;
     }
     #startWatcher() {
-        const paths = [...new Set([...this.#sources.values()].map((source) => source.watchPath))];
+        const paths = [...new Set([...this.#sources.values()]
+                .filter((source) => source.kind === "files")
+                .map((source) => source.watchPath))];
         if (paths.length === 0 || this.#watcher)
             return;
         this.#watcher = chokidar.watch(paths, {
@@ -176,20 +199,46 @@ export class QmdMemoryManager {
         const prunedDocuments = await pruneStaleCollections(store, new Set(this.#collectionNames()));
         if (prunedDocuments > 0)
             markMemoryAnalysisStale(store.internal.db);
+        try {
+            await ensureSemanticChunking(store);
+        }
+        catch (error) {
+            await store.close();
+            throw error;
+        }
         this.#cleanupRemovedDocuments = (changedDocuments) => {
             cleanupRemovedDocuments(store, changedDocuments);
         };
         this.#store = store;
         return store;
     }
-    #collectionNames() {
-        return [...this.#sources.keys()];
+    #collectionNames(corpora) {
+        if (corpora === undefined)
+            return [...this.#sources.keys()];
+        if (corpora.length === 0)
+            throw new Error("memory_search corpora must not be empty");
+        const selected = new Set(corpora);
+        if (selected.has("all")) {
+            if (selected.size > 1)
+                throw new Error('memory_search corpus "all" must be used alone');
+            return [...this.#sources.keys()];
+        }
+        const known = new Set([...this.#sources.values()].map((source) => source.corpus));
+        const unknown = [...selected].find((corpus) => !known.has(corpus));
+        if (unknown)
+            throw new Error(`memory_search unknown corpus: ${unknown}`);
+        return [...this.#sources.values()]
+            .filter((source) => selected.has(source.corpus))
+            .map((source) => source.collection);
     }
     sync(params) {
         const run = async () => {
             const store = await this.#getStore();
             this.#dirty = true;
-            const update = await store.update();
+            const collections = [...this.#sources.values()]
+                .filter((source) => source.kind === "files")
+                .map((source) => source.collection);
+            const update = await store.update({ collections });
             this.#cleanupRemovedDocuments?.(update.updated + update.removed);
             const analysisStore = store;
             const invalidatesAnalysis = update.indexed + update.updated + update.removed > 0 ||
@@ -198,16 +247,61 @@ export class QmdMemoryManager {
             if (invalidatesAnalysis && analysisStore.internal) {
                 markMemoryAnalysisStale(analysisStore.internal.db);
             }
-            const embed = await store.embed({ force: params?.force, chunkStrategy: "semantic" });
-            if (!invalidatesAnalysis && embed.chunksEmbedded > 0 && analysisStore.internal) {
+            let chunksEmbedded = 0;
+            for (const collection of collections.length > 0 ? collections : [undefined]) {
+                const embed = await store.embed({
+                    ...(collection ? { collection } : {}),
+                    force: params?.force,
+                    chunkStrategy: "semantic",
+                });
+                chunksEmbedded += completedEmbeddingCount(embed);
+            }
+            if (!invalidatesAnalysis && chunksEmbedded > 0 && analysisStore.internal) {
                 markMemoryAnalysisStale(analysisStore.internal.db);
             }
+            const status = await store.getStatus();
+            const indexedCollections = await store.listCollections();
+            this.#files = indexedCollections.reduce((total, collection) => total + collection.active_count, 0);
+            this.#dirty = status.needsEmbedding > 0;
+        };
+        return this.#enqueue(run);
+    }
+    syncSessions(force = false) {
+        return this.#enqueue(async () => {
+            const sessions = this.#sessions;
+            if (!sessions)
+                throw new Error('memory session sync requires a configured "sessions" corpus');
+            const store = await this.#getStore();
+            const synced = await syncSessionProjections({
+                ...sessions,
+                force,
+                index: async () => {
+                    const update = await store.update({ collections: [sessions.collection] });
+                    this.#cleanupRemovedDocuments?.(update.updated + update.removed);
+                    const analysisStore = store;
+                    const invalidatesAnalysis = update.indexed + update.updated + update.removed > 0 ||
+                        update.needsEmbedding > 0;
+                    if (invalidatesAnalysis && analysisStore.internal) {
+                        markMemoryAnalysisStale(analysisStore.internal.db);
+                    }
+                    const embed = await store.embed({
+                        collection: sessions.collection,
+                        chunkStrategy: "semantic",
+                    });
+                    const chunksEmbedded = completedEmbeddingCount(embed);
+                    if (!invalidatesAnalysis && chunksEmbedded > 0 && analysisStore.internal) {
+                        markMemoryAnalysisStale(analysisStore.internal.db);
+                    }
+                    return chunksEmbedded;
+                },
+            });
+            this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
             const status = await store.getStatus();
             const collections = await store.listCollections();
             this.#files = collections.reduce((total, collection) => total + collection.active_count, 0);
             this.#dirty = status.needsEmbedding > 0;
-        };
-        return this.#enqueue(run);
+            return synced.result;
+        });
     }
     recluster(options, signal) {
         return this.#enqueue(async () => {
@@ -257,34 +351,52 @@ export class QmdMemoryManager {
             return [];
         if (this.#sources.size === 0)
             return [];
+        const collections = this.#collectionNames(opts?.corpora);
         opts?.signal?.throwIfAborted();
         await this.#operationChain;
         const store = await this.#getStore();
         if (opts?.lexicalOnly) {
             const hits = await store.searchLex(query, {
                 limit: opts.maxResults ?? 5,
-                collection: this.#collectionNames(),
+                collection: collections,
             });
-            return hits
-                .filter((hit) => hit.score >= (opts.minScore ?? 0))
-                .map(lexicalResult);
+            return hits.flatMap((hit) => {
+                const corpus = this.#sources.get(hit.collectionName)?.corpus;
+                const prefix = `qmd://${hit.collectionName}/`;
+                const session = corpus === "sessions" && hit.filepath.startsWith(prefix)
+                    ? this.#sessionMetadata.get(hit.filepath.slice(prefix.length))
+                    : undefined;
+                return hit.score >= (opts.minScore ?? 0) && corpus ? [lexicalResult(hit, corpus, session)] : [];
+            });
         }
         const hits = await store.vsearch(query, {
-            collection: this.#collectionNames(),
+            collection: collections,
             limit: opts?.maxResults ?? 5,
             minScore: opts?.minScore ?? 0.3,
         });
-        return hits.map((hit) => {
+        return hits.flatMap((hit) => {
+            const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
+            const corpus = collection ? this.#sources.get(collection)?.corpus : undefined;
+            if (!corpus)
+                return [];
             const span = lineSpan(hit);
-            return {
-                path: hit.file,
-                ...span,
-                score: hit.score,
-                vectorScore: hit.score,
-                snippet: hit.bestChunk,
-                source: "memory",
-                citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
-            };
+            const relativePath = collection && hit.file.startsWith(`qmd://${collection}/`)
+                ? hit.file.slice(`qmd://${collection}/`.length)
+                : undefined;
+            const session = corpus === "sessions" && relativePath
+                ? this.#sessionMetadata.get(relativePath)
+                : undefined;
+            return [{
+                    path: hit.file,
+                    ...span,
+                    score: hit.score,
+                    vectorScore: hit.score,
+                    snippet: hit.bestChunk,
+                    source: "memory",
+                    corpus,
+                    ...(session ? { session } : {}),
+                    citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
+                }];
         });
     }
     async readFile(params) {
@@ -308,6 +420,12 @@ export class QmdMemoryManager {
         });
     }
     status() {
+        const corpora = new Map();
+        for (const source of this.#sources.values()) {
+            const sources = corpora.get(source.corpus) ?? [];
+            sources.push(source);
+            corpora.set(source.corpus, sources);
+        }
         return {
             backend: "builtin",
             provider: "unblock-memory",
@@ -318,7 +436,9 @@ export class QmdMemoryManager {
             sources: ["memory"],
             vector: { enabled: true, available: !this.#dirty },
             custom: {
-                paths: [...this.#sources.values()].map((source) => source.configuredPath),
+                corpora: [...corpora].map(([name, sources]) => sources[0]?.kind === "sessions"
+                    ? { name, kind: "sessions", chatTypes: sources[0].chatTypes }
+                    : { name, kind: "files", paths: sources.map((source) => source.configuredPath) }),
                 ...(this.#watchError ? { watchError: this.#watchError } : {}),
             },
         };

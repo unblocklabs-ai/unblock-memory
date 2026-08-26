@@ -12,7 +12,8 @@ import {
   QmdMemoryManager,
   type ManagerStore,
 } from "../src/manager.js";
-import { resolveSource } from "../src/sources.js";
+import { resolveSessionSource, resolveSource } from "../src/sources.js";
+import { createAgentDatabase } from "./helpers/session-database.js";
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -69,6 +70,45 @@ test("bounds default memory reads and provides continuation", () => {
   assert.equal(result.nextFrom, 121);
   assert.equal(result.truncated, true);
   assert.match(result.text, /Use from=121/);
+});
+
+test("initializes semantic chunking before collection-scoped embeds", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-semantic-init-"));
+  const dbPath = join(workspace, "index.sqlite");
+  const manager = new QmdMemoryManager({
+    dbPath,
+    workspaceDir: workspace,
+    sources: [resolveSource(workspace, "MEMORY.md")],
+  });
+  await manager.start();
+  await manager.close();
+
+  const store = await createStore({ dbPath, config: { collections: {} } });
+  try {
+    const configured = store.internal.db.prepare(
+      "SELECT value FROM store_config WHERE key = 'embedding_chunk_strategy'",
+    ).get() as { value?: unknown } | undefined;
+    assert.equal(configured?.value, "semantic");
+  } finally {
+    await store.close();
+  }
+});
+
+test("fails sync when QMD reports embedding errors", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-embed-errors-"));
+  const source = resolveSource(workspace, "MEMORY.md");
+  const manager = new QmdMemoryManager({
+    dbPath: join(workspace, "index.sqlite"),
+    workspaceDir: workspace,
+    sources: [source],
+    storeFactory: async () => createManagerStore({
+      async embed() {
+        return { docsProcessed: 1, chunksEmbedded: 0, errors: 1, durationMs: 0 };
+      },
+    }),
+  });
+  await assert.rejects(manager.start(), /QMD failed to embed 1 chunk/);
+  await manager.close();
 });
 
 test("watches modified and new Markdown, serializes refreshes, and stops on close", async () => {
@@ -266,8 +306,207 @@ test("lexical-only search returns useful document content and its virtual path",
     await manager.start();
     const [hit] = await manager.search("Rico", { lexicalOnly: true });
     assert.equal(hit?.path, `qmd://${source.collection}/MEMORY.md`);
+    assert.equal(hit?.corpus, "memory");
     assert.equal(hit?.snippet, "Rico leads client operations.");
     assert.equal(hit?.textScore, 0.8);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("scopes vector search to named corpora and labels results", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-corpora-"));
+  await mkdir(join(workspace, "projects"));
+  await writeFile(join(workspace, "MEMORY.md"), "memory body\n");
+  await writeFile(join(workspace, "projects", "note.md"), "projects body\n");
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const projects = resolveSource(workspace, "projects/**/*.md", "projects");
+  const hits = [memory, projects].map((source) => ({
+    file: `qmd://${source.collection}/${source.corpus === "memory" ? "MEMORY.md" : "note.md"}`,
+    displayPath: `${source.collection}/${source.corpus === "memory" ? "MEMORY.md" : "note.md"}`,
+    title: source.corpus,
+    body: `${source.corpus} body`,
+    score: 0.8,
+    context: null,
+    docid: `${source.corpus}-hash`,
+    bestChunk: `${source.corpus} body`,
+    chunkPos: 0,
+    chunkLen: source.corpus.length + 5,
+  }));
+  const searchedCollections: string[][] = [];
+  const store = createManagerStore({
+    async vsearch(_query, options) {
+      const collections = typeof options?.collection === "string"
+        ? [options.collection]
+        : [...(options?.collection ?? [])];
+      searchedCollections.push(collections);
+      return hits.filter((hit) => collections.some((collection) => hit.file.startsWith(`qmd://${collection}/`)));
+    },
+    async get(query) {
+      return {
+        filepath: query,
+        displayPath: "note.md",
+        title: "note",
+        context: null,
+        hash: "projects-hash",
+        docid: "projects-hash",
+        collectionName: projects.collection,
+        modifiedAt: "",
+        bodyLength: 13,
+      };
+    },
+    async getDocumentBody() { return "projects body\n"; },
+  });
+  const manager = new QmdMemoryManager({
+    dbPath: join(workspace, "index.sqlite"),
+    workspaceDir: workspace,
+    sources: [memory, projects],
+    storeFactory: async () => store,
+  });
+  try {
+    await manager.start();
+    assert.deepEqual((await manager.search("notes")).map((hit) => hit.corpus), ["memory", "projects"]);
+    assert.deepEqual((await manager.search("notes", { corpora: ["all"] })).map((hit) => hit.corpus), ["memory", "projects"]);
+    const [projectHit] = await manager.search("notes", { corpora: ["projects"] });
+    assert.equal(projectHit?.corpus, "projects");
+    assert.equal((await manager.readFile({ relPath: projectHit!.path })).status, "ok");
+    assert.deepEqual(
+      (await manager.search("notes", { corpora: ["memory", "projects", "memory"] })).map((hit) => hit.corpus),
+      ["memory", "projects"],
+    );
+    assert.deepEqual(searchedCollections, [
+      [memory.collection, projects.collection],
+      [memory.collection, projects.collection],
+      [projects.collection],
+      [memory.collection, projects.collection],
+    ]);
+    await assert.rejects(manager.search("notes", { corpora: ["unknown"] }), /unknown corpus: unknown/);
+    await assert.rejects(manager.search("notes", { corpora: ["all", "memory"] }), /must be used alone/);
+    await assert.rejects(manager.search("notes", { corpora: [] }), /must not be empty/);
+    assert.deepEqual(manager.status().custom?.corpora, [
+      { name: "memory", kind: "files", paths: ["MEMORY.md"] },
+      { name: "projects", kind: "files", paths: ["projects/**/*.md"] },
+    ]);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("adds manifest metadata to session search results", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-search-sessions-"));
+  const sessionsDir = join(root, "sessions");
+  const documentPath = "slack/channel/workspace/C123/2026-08-25T14-00-00Z--session-1.md";
+  const document = join(sessionsDir, documentPath);
+  await mkdir(join(document, ".."), { recursive: true });
+  await writeFile(document, "session body\n");
+  const source = resolveSessionSource(sessionsDir, ["channel", "group"]);
+  const manifestPath = join(root, "sessions-manifest.json");
+  await writeFile(manifestPath, JSON.stringify({
+    version: 1,
+    sessions: {
+      "session-1": {
+        sessionId: "session-1",
+        provider: "slack",
+        chatType: "channel",
+        accountId: "workspace",
+        conversationId: "C123",
+        startedAt: 1,
+        sourceGeneration: "generation",
+        maxSeq: 1,
+        activeEventCount: 1,
+        sizeBytes: 13,
+        projectionHash: "hash",
+        documentPath,
+        projectorVersion: 1,
+      },
+    },
+  }));
+  const store = createManagerStore({
+    async vsearch() {
+      return [{
+        file: `qmd://${source.collection}/${documentPath}`,
+        displayPath: `${source.collection}/${documentPath}`,
+        title: "Session",
+        body: "session body",
+        score: 0.8,
+        context: null,
+        docid: "hash",
+        bestChunk: "session body",
+        chunkPos: 0,
+        chunkLen: 12,
+      }];
+    },
+  });
+  const manager = new QmdMemoryManager({
+    dbPath: join(root, "index.sqlite"),
+    workspaceDir: root,
+    sources: [source],
+    storeFactory: async () => store,
+    sessions: {
+      agentId: "main",
+      agentName: "Agent",
+      chatTypes: ["channel", "group"],
+      collection: source.collection,
+      databasePath: join(root, "openclaw-agent.sqlite"),
+      manifestPath,
+      outputDir: sessionsDir,
+      timezone: "UTC",
+    },
+  });
+  try {
+    await manager.start();
+    const [hit] = await manager.search("session", { corpora: ["sessions"] });
+    assert.deepEqual(hit?.session, {
+      sessionId: "session-1",
+      provider: "slack",
+      chatType: "channel",
+      accountId: "workspace",
+      conversationId: "C123",
+      startedAt: 1,
+    });
+    assert.deepEqual(manager.status().custom?.corpora, [{
+      name: "sessions",
+      kind: "sessions",
+      chatTypes: ["channel", "group"],
+    }]);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("keeps analysis fresh for a no-op manual session sync", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-session-noop-"));
+  const databasePath = join(root, "openclaw-agent.sqlite");
+  const sessionsDir = join(root, "sessions");
+  const source = resolveSessionSource(sessionsDir, ["channel", "group"]);
+  createAgentDatabase(databasePath).close();
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [source],
+    storeFactory: async () => createManagerStore({
+      internal: backing.internal,
+      async close() { await backing.close(); },
+    }),
+    sessions: {
+      agentId: "main",
+      agentName: "Agent",
+      chatTypes: ["channel", "group"],
+      collection: source.collection,
+      databasePath,
+      manifestPath: join(root, "sessions-manifest.json"),
+      outputDir: sessionsDir,
+      timezone: "UTC",
+    },
+  });
+  try {
+    await manager.start();
+    backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+    await manager.syncSessions();
+    assert.equal((await manager.listClusters()).stale, false);
   } finally {
     await manager.close();
   }

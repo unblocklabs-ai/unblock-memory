@@ -3,15 +3,19 @@ import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import picomatch from "picomatch";
+import type { ChatType, FileCorpusConfig } from "./config.js";
 
 const GLOB_MAGIC = /[*?[{(]/;
 
 export type ResolvedSource = {
   collection: string;
+  corpus: string;
   configuredPath: string;
+  kind: "files" | "sessions";
   root: string;
   pattern: string;
   watchPath: string;
+  chatTypes?: readonly ChatType[];
 };
 
 function expandHome(value: string): string {
@@ -44,7 +48,7 @@ function assertWorkspaceSourceHasNoSymlinkRoot(
   }
 }
 
-export function resolveSource(workspaceDir: string, configuredPath: string): ResolvedSource {
+export function resolveSource(workspaceDir: string, configuredPath: string, corpus = "memory"): ResolvedSource {
   const expanded = expandHome(configuredPath);
   const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(workspaceDir, expanded);
   if (existsSync(absolute)) {
@@ -54,7 +58,9 @@ export function resolveSource(workspaceDir: string, configuredPath: string): Res
     assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
     return {
       collection: collectionName(absolute),
+      corpus,
       configuredPath,
+      kind: "files",
       root,
       pattern,
       watchPath: absolute,
@@ -68,7 +74,9 @@ export function resolveSource(workspaceDir: string, configuredPath: string): Res
     assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
     return {
       collection: collectionName(absolute),
+      corpus,
       configuredPath,
+      kind: "files",
       root,
       pattern: isExactMarkdownFile ? basename(absolute) : "**/*.md",
       watchPath: absolute,
@@ -78,7 +86,43 @@ export function resolveSource(workspaceDir: string, configuredPath: string): Res
   const root = prefix.slice(0, prefix.lastIndexOf(sep)) || sep;
   const pattern = relative(root, absolute).split(sep).join("/");
   assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
-  return { collection: collectionName(absolute), configuredPath, root, pattern, watchPath: root };
+  return { collection: collectionName(absolute), corpus, configuredPath, kind: "files", root, pattern, watchPath: root };
+}
+
+export function resolveSessionSource(
+  sessionsDir: string,
+  chatTypes: readonly ChatType[],
+): ResolvedSource {
+  return {
+    ...resolveSource(sessionsDir, sessionsDir, "sessions"),
+    configuredPath: sessionsDir,
+    kind: "sessions",
+    chatTypes,
+  };
+}
+
+export function resolveSources(
+  workspaceDir: string,
+  corpora: readonly FileCorpusConfig[],
+): ResolvedSource[] {
+  const sources: ResolvedSource[] = [];
+  const configured = new Map<string, ResolvedSource>();
+  for (const corpus of corpora) {
+    for (const path of corpus.paths) {
+      const source = resolveSource(workspaceDir, path, corpus.name);
+      const identity = `${source.root}\0${source.pattern}`;
+      const duplicate = configured.get(identity);
+      if (duplicate) {
+        throw new Error(
+          `unblock-memory source ${path} in corpus ${corpus.name} duplicates ` +
+          `${duplicate.configuredPath} in corpus ${duplicate.corpus}`,
+        );
+      }
+      configured.set(identity, source);
+      sources.push(source);
+    }
+  }
+  return sources;
 }
 
 export function parseSafeVirtualPath(

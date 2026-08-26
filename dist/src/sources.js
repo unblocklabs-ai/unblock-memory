@@ -29,7 +29,7 @@ function assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, roo
         current = parent;
     }
 }
-export function resolveSource(workspaceDir, configuredPath) {
+export function resolveSource(workspaceDir, configuredPath, corpus = "memory") {
     const expanded = expandHome(configuredPath);
     const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(workspaceDir, expanded);
     if (existsSync(absolute)) {
@@ -39,7 +39,9 @@ export function resolveSource(workspaceDir, configuredPath) {
         assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
         return {
             collection: collectionName(absolute),
+            corpus,
             configuredPath,
+            kind: "files",
             root,
             pattern,
             watchPath: absolute,
@@ -52,7 +54,9 @@ export function resolveSource(workspaceDir, configuredPath) {
         assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
         return {
             collection: collectionName(absolute),
+            corpus,
             configuredPath,
+            kind: "files",
             root,
             pattern: isExactMarkdownFile ? basename(absolute) : "**/*.md",
             watchPath: absolute,
@@ -62,7 +66,33 @@ export function resolveSource(workspaceDir, configuredPath) {
     const root = prefix.slice(0, prefix.lastIndexOf(sep)) || sep;
     const pattern = relative(root, absolute).split(sep).join("/");
     assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
-    return { collection: collectionName(absolute), configuredPath, root, pattern, watchPath: root };
+    return { collection: collectionName(absolute), corpus, configuredPath, kind: "files", root, pattern, watchPath: root };
+}
+export function resolveSessionSource(sessionsDir, chatTypes) {
+    return {
+        ...resolveSource(sessionsDir, sessionsDir, "sessions"),
+        configuredPath: sessionsDir,
+        kind: "sessions",
+        chatTypes,
+    };
+}
+export function resolveSources(workspaceDir, corpora) {
+    const sources = [];
+    const configured = new Map();
+    for (const corpus of corpora) {
+        for (const path of corpus.paths) {
+            const source = resolveSource(workspaceDir, path, corpus.name);
+            const identity = `${source.root}\0${source.pattern}`;
+            const duplicate = configured.get(identity);
+            if (duplicate) {
+                throw new Error(`unblock-memory source ${path} in corpus ${corpus.name} duplicates ` +
+                    `${duplicate.configuredPath} in corpus ${duplicate.corpus}`);
+            }
+            configured.set(identity, source);
+            sources.push(source);
+        }
+    }
+    return sources;
 }
 export function parseSafeVirtualPath(virtualPath, sources) {
     const match = /^qmd:\/\/([^/]+)\/(.+)$/.exec(virtualPath.trim());
