@@ -14,6 +14,7 @@ import {
   type MemoryAnalysisSummary,
   type MemoryClusterDetail,
   type MemoryClusterList,
+  type MemoryClusterSort,
   type MemoryReclusterOptions,
 } from "./analysis.js";
 import type {
@@ -498,11 +499,15 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   fetchCluster(params: {
     clusterId: string;
     topK?: number;
+    offset?: number;
+    sort?: MemoryClusterSort;
   }): Promise<MemoryClusterDetail> {
     return this.#enqueue(async () => readCluster(
       (await this.#getAnalysisStore()).internal.db,
       params.clusterId,
       params.topK,
+      params.offset,
+      params.sort,
     ));
   }
 

@@ -5,6 +5,14 @@
 Accepted product direction; the first naming and analysis-boundary proof is implemented.
 The broader memory platform remains in planning.
 
+### Current MVP decision (2026-08-26)
+
+The current curator uses one `knowledge` corpus and stable `knowledge/<topic>.md` files;
+the earlier canon/reflection split is superseded for the MVP. A cluster only prompts an
+investigation across memory and appropriate external or live sources. The agent writes
+its qualified current understanding or nothing, rather than forcing an artifact from
+each cluster. Historical canon/reflection sections below remain design context.
+
 This document is the final ownership and architecture decision for the **Unblock Memory**
 repository and plugin. The former `unblock-qmd` name is implementation history, not a
 separate product identity.

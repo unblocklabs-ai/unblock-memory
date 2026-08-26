@@ -1,5 +1,5 @@
 import type { QMDStore } from "@unblocklabs/qmd";
-import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryReclusterOptions } from "./analysis.js";
+import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadResult, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
 import type { ChatType } from "./config.js";
 import { type SessionSyncResult } from "./session-sync.js";
@@ -44,6 +44,8 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     fetchCluster(params: {
         clusterId: string;
         topK?: number;
+        offset?: number;
+        sort?: MemoryClusterSort;
     }): Promise<MemoryClusterDetail>;
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     readFile(params: {

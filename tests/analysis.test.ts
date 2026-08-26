@@ -30,10 +30,16 @@ async function waitForFile(path: string): Promise<void> {
   }
 }
 
-function insertChunk(db: AnalysisDatabase, hash: string, text: string, active = 1): void {
+function insertChunk(
+  db: AnalysisDatabase,
+  hash: string,
+  text: string,
+  active = 1,
+  modifiedAt = "now",
+): void {
   db.prepare("INSERT INTO content(hash, doc, created_at) VALUES (?, ?, ?)").run(hash, text, "now");
   db.prepare(`INSERT INTO documents(collection, path, title, hash, created_at, modified_at, active)
-    VALUES ('memory', ?, 'Memory', ?, 'now', 'now', ?)`).run(`${hash}.md`, hash, active);
+    VALUES ('memory', ?, 'Memory', ?, 'now', ?, ?)`).run(`${hash}.md`, hash, modifiedAt, active);
   db.prepare(`INSERT INTO content_vectors(hash, seq, pos, chunk_len, model, embed_fingerprint, total_chunks, embedded_at)
     VALUES (?, 0, 0, ?, 'model', 'fingerprint', 1, 'now')`).run(hash, text.length);
 }
@@ -143,9 +149,19 @@ test("lists short cluster references and fetches representative and noise member
   try {
     const db = store.internal.db;
     ensureMemoryAnalysisSchema(db);
-    for (const hash of ["rank-two", "rank-one", "unranked", "noise-low", "noise-high"]) {
-      insertChunk(db, hash, `${hash} context `.repeat(300));
+    const dates = new Map([
+      ["rank-two", "2026-08-02T00:00:00Z"],
+      ["rank-one", "2026-08-03T00:00:00Z"],
+      ["unranked", "2026-08-01T00:00:00Z"],
+      ["noise-low", "2026-08-04T00:00:00Z"],
+      ["noise-high", "2026-08-05T00:00:00Z"],
+    ]);
+    for (const [hash, modifiedAt] of dates) {
+      insertChunk(db, hash, `${hash} context `.repeat(300), 1, modifiedAt);
     }
+    db.prepare(`INSERT INTO documents(collection, path, title, hash, created_at, modified_at, active)
+      VALUES ('sessions', 'unranked-alias.md', 'Session', 'unranked', 'now', '2026-08-04T00:00:00Z', 1),
+             ('sessions', 'unranked-inactive.md', 'Session', 'unranked', 'now', '2026-08-10T00:00:00Z', 0)`).run();
     insertRun(db);
     db.prepare("INSERT INTO memory_analysis_clusters VALUES ('run', 4, 3, 0.8)").run();
     const insertMembership = db.prepare(`INSERT INTO memory_analysis_memberships
@@ -168,11 +184,72 @@ test("lists short cluster references and fetches representative and noise member
 
     const cluster = readCluster(db, listed.clusters[0]!.clusterId, 20);
     assert.deepEqual(cluster.members?.map((member) => member.hash), ["rank-one", "rank-two", "unranked"]);
+    assert.deepEqual(cluster.members?.map((member) => member.sourceDate), [
+      "2026-08-03T00:00:00Z",
+      "2026-08-02T00:00:00Z",
+      "2026-08-04T00:00:00Z",
+    ]);
     assert.ok(cluster.members?.every((member) => Buffer.byteLength(member.text) <= 2_000));
     assert.ok((cluster.members?.reduce((sum, member) => sum + Buffer.byteLength(member.text), 0) ?? 0) <= 12_000);
+    assert.deepEqual(cluster.page, { offset: 0, returned: 3, total: 3, hasMore: false });
+
+    const scoreDescending = readCluster(db, listed.clusters[0]!.clusterId, 1, 1, "score_desc");
+    assert.deepEqual(scoreDescending.members?.map((member) => member.hash), ["unranked"]);
+    assert.deepEqual(scoreDescending.page, {
+      offset: 1,
+      returned: 1,
+      total: 3,
+      hasMore: true,
+      nextOffset: 2,
+    });
+    assert.deepEqual(
+      readCluster(db, listed.clusters[0]!.clusterId, 20, 0, "score_asc").members?.map((member) => member.hash),
+      ["rank-one", "unranked", "rank-two"],
+    );
+    assert.deepEqual(
+      readCluster(db, listed.clusters[0]!.clusterId, 20, 0, "date_asc").members?.map((member) => member.hash),
+      ["rank-two", "rank-one", "unranked"],
+    );
+    assert.deepEqual(
+      readCluster(db, listed.clusters[0]!.clusterId, 20, 0, "date_desc").members?.map((member) => member.hash),
+      ["unranked", "rank-one", "rank-two"],
+    );
 
     const noise = readCluster(db, listed.noise!.clusterId, 20);
     assert.deepEqual(noise.members?.map((member) => member.hash), ["noise-high", "noise-low"]);
+    assert.deepEqual(
+      readCluster(db, listed.noise!.clusterId, 20, 0, "score_asc").members?.map((member) => member.hash),
+      ["noise-low", "noise-high"],
+    );
+  } finally {
+    await store.close();
+  }
+});
+
+test("uses stable score ties and shares excerpt and alias budgets across full pages", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-analysis-page-"));
+  const store = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  try {
+    const db = store.internal.db;
+    ensureMemoryAnalysisSchema(db);
+    insertRun(db);
+    db.prepare("INSERT INTO memory_analysis_clusters VALUES ('run', 3, 50, 0.5)").run();
+    const insertMembership = db.prepare(`INSERT INTO memory_analysis_memberships
+      VALUES ('run', ?, 0, 3, 0.5, 0.5, 1.0, 2.0, NULL)`);
+    for (let index = 49; index >= 0; index -= 1) {
+      const hash = `hash-${String(index).padStart(2, "0")}`;
+      insertChunk(db, hash, `${hash} ${"context ".repeat(500)}`, 1, "2026-08-01T00:00:00Z");
+      insertMembership.run(hash);
+    }
+
+    const detail = readCluster(db, readClusters(db).clusters[0]!.clusterId, 50, 0, "score_desc");
+    assert.equal(detail.members?.length, 50);
+    assert.equal(detail.members?.[0]?.hash, "hash-00");
+    assert.equal(detail.members?.[49]?.hash, "hash-49");
+    assert.ok(detail.members?.every((member) => member.text.length > 0));
+    assert.ok(detail.members?.every((member) => member.sourcePaths.length >= 1));
+    assert.ok((detail.members?.reduce((sum, member) => sum + Buffer.byteLength(member.text), 0) ?? 0) <= 12_000);
+    assert.ok((detail.members?.reduce((sum, member) => sum + member.sourcePaths.length, 0) ?? 0) <= 50);
   } finally {
     await store.close();
   }

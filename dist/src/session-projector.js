@@ -100,9 +100,6 @@ function formatTimestamp(value, timezone) {
     return `${part("year")}-${part("month")}-${part("day")} ` +
         `${part("hour")}:${part("minute")}:${part("second")} ${part("timeZoneName")}`.trim();
 }
-function inline(value) {
-    return value.replace(/[\r\n]+/gu, " ").replaceAll("`", "\\`");
-}
 export function projectSession(input) {
     const messages = input.events.flatMap((event) => {
         const projected = projectMessage(event, input);
@@ -110,22 +107,8 @@ export function projectSession(input) {
     });
     if (messages.length === 0)
         return undefined;
-    const provider = input.provider ?? "unknown";
-    const header = [
-        "# Session",
-        "",
-        `- Session ID: \`${inline(input.sessionId)}\``,
-        `- Provider: ${inline(provider)}`,
-        `- Chat type: ${input.chatType}`,
-        ...(input.label ? [`- Conversation: ${inline(input.label)}`] : []),
-        ...(input.conversationId ? [`- Conversation ID: \`${inline(input.conversationId)}\``] : []),
-        `- Started: ${new Date(input.startedAt).toISOString()}`,
-        "",
-        "## Transcript",
-        "",
-    ];
     const transcript = messages.map((message) => `${formatTimestamp(message.timestamp, input.timezone)} — ${message.speaker}: ${message.text}`);
-    return `${[...header, ...transcript].join("\n\n")}\n`;
+    return `# Transcript\n\n${transcript.join("\n\n")}\n`;
 }
 function hash(value) {
     return createHash("sha256").update(value).digest("hex").slice(0, 16);

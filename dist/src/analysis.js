@@ -208,8 +208,8 @@ function byteSlice(text, maxBytes) {
         return "";
     return bytes.subarray(0, maxBytes - 3).toString("utf8").replace(/\uFFFD$/u, "") + "…";
 }
-function members(db, runId, clusterId, limit, maxExcerptBytes = MAX_EXCERPT_BYTES, maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES, maxTotalAliases = MAX_TOTAL_ALIASES) {
-    const noiseOrder = clusterId === -1
+function members(db, runId, clusterId, limit, offset = 0, sort = "representative", maxExcerptBytes = MAX_EXCERPT_BYTES, maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES, maxTotalAliases = MAX_TOTAL_ALIASES) {
+    const representativeOrder = clusterId === -1
         ? "m.outlier_score DESC, m.hash, m.seq"
         : `CASE WHEN m.representative_rank IS NULL THEN 1 ELSE 0 END,
        m.representative_rank,
@@ -217,23 +217,40 @@ function members(db, runId, clusterId, limit, maxExcerptBytes = MAX_EXCERPT_BYTE
        m.outlier_score,
        m.hash,
        m.seq`;
+    const score = clusterId === -1 ? "m.outlier_score" : "m.probability";
+    const order = {
+        representative: representativeOrder,
+        score_desc: `${score} DESC, m.hash, m.seq`,
+        score_asc: `${score} ASC, m.hash, m.seq`,
+        date_desc: "m.source_date DESC, m.hash, m.seq",
+        date_asc: "m.source_date ASC, m.hash, m.seq",
+    }[sort];
     const rows = db.prepare(`
-    SELECT
-      m.hash, m.seq, m.probability, m.outlier_score, m.x, m.y,
-      m.representative_rank, m.pos, m.chunk_len, m.doc
-    FROM memory_analysis_available_memberships m
-    WHERE m.run_id = ? AND m.cluster_id = ?
-    ORDER BY ${noiseOrder}
-    LIMIT ?
-  `).all(runId, clusterId, limit);
+    WITH member_rows AS (
+      SELECT
+        m.hash, m.seq, m.probability, m.outlier_score, m.x, m.y,
+        m.representative_rank, m.pos, m.chunk_len, m.doc,
+        (
+          SELECT MAX(d.modified_at)
+          FROM documents d
+          WHERE d.hash = m.hash AND d.active = 1
+        ) AS source_date
+      FROM memory_analysis_available_memberships m
+      WHERE m.run_id = ? AND m.cluster_id = ?
+    )
+    SELECT * FROM member_rows m
+    ORDER BY ${order}
+    LIMIT ? OFFSET ?
+  `).all(runId, clusterId, limit, offset);
     let remaining = maxTotalBytes;
     let remainingAliases = maxTotalAliases;
-    return rows.map((row) => {
-        const text = remaining <= 0
-            ? ""
-            : byteSlice(row.doc.slice(row.pos, row.pos + row.chunk_len), Math.min(maxExcerptBytes, remaining));
+    return rows.map((row, index) => {
+        const remainingRows = rows.length - index;
+        const excerptBudget = Math.min(maxExcerptBytes, Math.floor(remaining / remainingRows));
+        const text = byteSlice(row.doc.slice(row.pos, row.pos + row.chunk_len), excerptBudget);
         remaining -= Buffer.byteLength(text);
-        const aliases = sourcePaths(db, row.hash, Math.min(MAX_ALIASES_PER_MEMBER, remainingAliases));
+        const aliasBudget = Math.min(MAX_ALIASES_PER_MEMBER, Math.floor(remainingAliases / remainingRows));
+        const aliases = sourcePaths(db, row.hash, aliasBudget);
         remainingAliases -= aliases.length;
         return {
             hash: row.hash,
@@ -243,6 +260,7 @@ function members(db, runId, clusterId, limit, maxExcerptBytes = MAX_EXCERPT_BYTE
             x: row.x,
             y: row.y,
             representativeRank: row.representative_rank,
+            sourceDate: row.source_date,
             text,
             sourcePaths: aliases,
         };
@@ -276,7 +294,7 @@ function readMetadata(run) {
 }
 function toSummary(db, run, row, includePreview, previewBytes = 600, aliasLimit = MAX_TOTAL_ALIASES) {
     const preview = includePreview
-        ? members(db, run.id, row.cluster_id, 1, previewBytes, previewBytes, aliasLimit)[0]
+        ? members(db, run.id, row.cluster_id, 1, 0, "representative", previewBytes, previewBytes, aliasLimit)[0]
         : undefined;
     return {
         clusterId: clusterReference(run.id, row.cluster_id),
@@ -362,7 +380,7 @@ function resolveClusterId(db, runId, reference) {
   `).all(runId, runId);
     return clusterIds.find((row) => clusterReference(runId, row.cluster_id) === reference)?.cluster_id;
 }
-export function readCluster(db, clusterReferenceId, requestedLimit = DEFAULT_MEMBER_LIMIT) {
+export function readCluster(db, clusterReferenceId, requestedLimit = DEFAULT_MEMBER_LIMIT, requestedOffset = 0, sort = "representative") {
     const run = latestValidRun(db);
     if (!run) {
         return { status: "not_analyzed", ...readMetadata() };
@@ -388,6 +406,11 @@ export function readCluster(db, clusterReferenceId, requestedLimit = DEFAULT_MEM
         return { status: "not_found", runId: run.id, ...metadata };
     }
     const limit = Math.max(1, Math.min(MAX_MEMBER_LIMIT, Math.floor(requestedLimit)));
+    const offset = Math.max(0, Math.floor(requestedOffset));
+    const total = availableSize(db, run.id, clusterId);
+    const pageMembers = members(db, run.id, clusterId, limit, offset, sort);
+    const nextOffset = offset + pageMembers.length;
+    const hasMore = nextOffset < total;
     return {
         status: "ok",
         runId: run.id,
@@ -395,9 +418,16 @@ export function readCluster(db, clusterReferenceId, requestedLimit = DEFAULT_MEM
         cluster: {
             clusterId: clusterReferenceId,
             size: row.size,
-            availableSize: availableSize(db, run.id, clusterId),
+            availableSize: total,
             meanProbability: row.mean_probability,
         },
-        members: members(db, run.id, clusterId, limit),
+        members: pageMembers,
+        page: {
+            offset,
+            returned: pageMembers.length,
+            total,
+            hasMore,
+            ...(hasMore ? { nextOffset } : {}),
+        },
     };
 }

@@ -30,9 +30,11 @@ type MemoryAnalysisMember = {
     x: number;
     y: number;
     representativeRank: number | null;
+    sourceDate: string;
     text: string;
     sourcePaths: string[];
 };
+export type MemoryClusterSort = "representative" | "score_desc" | "score_asc" | "date_desc" | "date_asc";
 export type MemoryAnalysisSummary = {
     status: "ok";
     runId: string;
@@ -72,6 +74,13 @@ export type MemoryClusterDetail = AnalysisReadMetadata & {
     runId?: string;
     cluster?: Omit<MemoryClusterSummary, "preview">;
     members?: MemoryAnalysisMember[];
+    page?: {
+        offset: number;
+        returned: number;
+        total: number;
+        hasMore: boolean;
+        nextOffset?: number;
+    };
 };
 export declare function ensureMemoryAnalysisSchema(db: AnalysisDatabase): void;
 export declare function markMemoryAnalysisStale(db: AnalysisDatabase): void;
@@ -85,5 +94,5 @@ export declare function runAnalysisWorker(params: {
 export declare function latestAnalysisRunId(db: AnalysisDatabase): string | undefined;
 export declare function readAnalysisSummary(db: AnalysisDatabase): MemoryAnalysisSummary | undefined;
 export declare function readClusters(db: AnalysisDatabase, requestedLimit?: number): MemoryClusterList;
-export declare function readCluster(db: AnalysisDatabase, clusterReferenceId: string, requestedLimit?: number): MemoryClusterDetail;
+export declare function readCluster(db: AnalysisDatabase, clusterReferenceId: string, requestedLimit?: number, requestedOffset?: number, sort?: MemoryClusterSort): MemoryClusterDetail;
 export {};

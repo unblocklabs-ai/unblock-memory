@@ -391,7 +391,7 @@ export class QmdMemoryManager {
         return this.#enqueue(async () => readClusters((await this.#getAnalysisStore()).internal.db, limit));
     }
     fetchCluster(params) {
-        return this.#enqueue(async () => readCluster((await this.#getAnalysisStore()).internal.db, params.clusterId, params.topK));
+        return this.#enqueue(async () => readCluster((await this.#getAnalysisStore()).internal.db, params.clusterId, params.topK, params.offset, params.sort));
     }
     async #getAnalysisStore() {
         const store = await this.#getStore();

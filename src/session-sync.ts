@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ChatType } from "./config.js";
@@ -12,7 +12,7 @@ import {
 } from "./session-projector.js";
 
 const MANIFEST_VERSION = 1;
-const PROJECTOR_VERSION = 1;
+const PROJECTOR_VERSION = 2;
 const SUPPORTED_SCHEMA_VERSION = 17;
 
 const REQUIRED_COLUMNS = {
@@ -329,6 +329,7 @@ export async function syncSessionProjections(params: {
 
     const target = projectionPath(params.outputDir, documentPath);
     await atomicWrite(target, content, 0o600);
+    await utimes(target, new Date(), new Date(metadata.startedAt));
     if (previous?.documentPath && previous.documentPath !== documentPath) {
       await remove(projectionPath(params.outputDir, previous.documentPath));
     }

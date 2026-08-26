@@ -83,9 +83,11 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.match(document, /Bek: Hello memory/);
   assert.doesNotMatch(document, /Private DM/);
   assert.doesNotMatch(document, /Abandoned branch/);
+  assert.equal(session.projectorVersion, 2);
   assert.equal((await stat(outputDir)).mode & 0o777, 0o700);
   assert.equal((await stat(join(outputDir, session.documentPath))).mode & 0o777, 0o600);
   const firstModifiedAt = (await stat(join(outputDir, session.documentPath))).mtimeMs;
+  assert.equal(Math.round(firstModifiedAt), session.startedAt);
 
   const second = await run();
   assert.equal(second.result.unchanged, 1);
@@ -93,6 +95,14 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.equal(second.result.embedded, 3);
   assert.equal(indexRuns, 2);
   assert.equal((await stat(join(outputDir, session.documentPath))).mtimeMs, firstModifiedAt);
+
+  const oldProjectorManifest = structuredClone(second.manifest);
+  oldProjectorManifest.sessions["channel-1"]!.projectorVersion = 1;
+  await writeFile(manifestPath, JSON.stringify(oldProjectorManifest));
+  const migrated = await run();
+  assert.equal(migrated.result.updated, 1);
+  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 2);
+  assert.equal(indexRuns, 3);
 
   const changed = new DatabaseSync(databasePath);
   changed.prepare("UPDATE transcript_rewrite_watermarks SET generation = 'generation-2' WHERE session_id = 'channel-1'").run();
@@ -105,7 +115,7 @@ test("incrementally projects only configured active sessions and indexes changed
 
   const third = await run();
   assert.equal(third.result.updated, 1);
-  assert.equal(indexRuns, 3);
+  assert.equal(indexRuns, 4);
   assert.match(await readFile(join(outputDir, third.manifest.sessions["channel-1"]!.documentPath), "utf8"), /Bill: Indexed response/);
 
   const removed = new DatabaseSync(databasePath);
@@ -117,7 +127,7 @@ test("incrementally projects only configured active sessions and indexes changed
   const swept = await run();
   assert.equal(swept.result.removed, 1);
   assert.equal(Object.keys(swept.manifest.sessions).length, 0);
-  assert.equal(indexRuns, 4);
+  assert.equal(indexRuns, 5);
 });
 
 test("rejects manifest document paths outside the private projection directory", async () => {

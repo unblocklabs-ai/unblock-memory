@@ -85,6 +85,8 @@ test("registers exactly the clean memory tool contract and validates every tool 
   const tool = (name: string) => registrations.find((registration) => registration.names.includes(name))!.factory(context)!;
   assert.ok(tool("memory_search").parameters.properties?.corpora);
   assert.ok(tool("memory_search").parameters.properties?.sessionFilter);
+  assert.ok(tool("memory_fetch_cluster").parameters.properties?.offset);
+  assert.ok(tool("memory_fetch_cluster").parameters.properties?.sort);
 
   const invalidCalls: Array<[name: string, params: unknown]> = [
     ["memory_search", { query: "memory", maxResults: 21 }],
@@ -108,6 +110,8 @@ test("registers exactly the clean memory tool contract and validates every tool 
     ["memory_list_clusters", { limit: 0 }],
     ["memory_fetch_cluster", { clusterId: "cluster-1" }],
     ["memory_fetch_cluster", { clusterId: "0123456789", topK: 51 }],
+    ["memory_fetch_cluster", { clusterId: "0123456789", offset: -1 }],
+    ["memory_fetch_cluster", { clusterId: "0123456789", sort: "newest" }],
   ];
   for (const [name, params] of invalidCalls) {
     await assert.rejects(tool(name).execute("call", params));

@@ -6,6 +6,15 @@ Planning document. This describes the intended end state and a lean path to prov
 It is not a claim that the integration, scheduler, metadata model, or agent tools already
 exist.
 
+### Current MVP decision (2026-08-26)
+
+The shipped curator workflow supersedes this document's separate canon and reflection
+outputs with one `knowledge` corpus backed by stable `knowledge/<topic>.md` files. Facts,
+agent assessments, and uncertainty may coexist when each claim is qualified where it
+appears. Clusters are incomplete attention signals: the agent investigates beyond the
+selected cluster, then updates current knowledge or writes nothing. Historical sections
+below remain design context, not the current curator contract.
+
 The existing [QMD Memory Bundle v1](https://github.com/unblocklabs-ai/unblock-cluster/blob/main/docs/planning/qmd-memory-bundle-v1.md)
 remains the portable and remote import contract. Directly reading QMD SQLite is the
 preferred local integration for the first working version.

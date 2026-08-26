@@ -68,7 +68,8 @@ test("projects timestamped user and assistant text while excluding internal bloc
   assert.match(projected!, /2026-08-25 14:32:09 UTC — Bek: Can you review \*\*memory\*\*\?/);
   assert.match(projected!, /2026-08-25 14:33:02 UTC — Bill: Yes\.\n\nIt uses vector search\./);
   assert.doesNotMatch(projected!, /private|secret tool output|toolCall|heartbeat poll|HEARTBEAT_OK/);
-  assert.match(projected!, /Conversation: project-memory/);
+  assert.match(projected!, /^# Transcript\n\n/);
+  assert.doesNotMatch(projected!, /# Session|Session ID:|Provider:|Chat type:|Conversation:|Started:/);
 });
 
 test("returns no document for internal-only sessions and rejects malformed messages", () => {

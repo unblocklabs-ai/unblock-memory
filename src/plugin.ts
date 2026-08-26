@@ -199,6 +199,14 @@ function createListClustersTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
 const fetchClusterParameters = Type.Object({
   clusterId: Type.String({ pattern: "^[0-9a-f]{10}$" }),
   topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+  offset: Type.Optional(Type.Integer({ minimum: 0 })),
+  sort: Type.Optional(Type.Union([
+    Type.Literal("representative"),
+    Type.Literal("score_desc"),
+    Type.Literal("score_asc"),
+    Type.Literal("date_desc"),
+    Type.Literal("date_asc"),
+  ])),
 }, { additionalProperties: false });
 
 function createFetchClusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
@@ -207,13 +215,13 @@ function createFetchClusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
   return {
     name: "memory_fetch_cluster",
     label: "Fetch Memory Cluster",
-    description: "Fetch the top representative QMD chunks for a clusterId returned by memory_list_clusters.",
+    description: "Fetch a sorted page of QMD chunks for a clusterId returned by memory_list_clusters.",
     parameters: fetchClusterParameters,
     async execute(_toolCallId: string, params: unknown) {
-      const { clusterId, topK } = Value.Parse(fetchClusterParameters, params);
+      const { clusterId, topK, offset, sort } = Value.Parse(fetchClusterParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
       if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
-      return jsonResult(await manager.fetchCluster({ clusterId, topK }));
+      return jsonResult(await manager.fetchCluster({ clusterId, topK, offset, sort }));
     },
   };
 }
