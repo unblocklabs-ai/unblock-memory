@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   resolveAgentDir,
@@ -25,15 +27,81 @@ export type SessionSyncStartResult =
   | { status: "already_running"; startedAt: string }
   | { status: "unavailable"; error: string };
 
+type StoredSessionSyncStatus = Exclude<SessionSyncStatus, { status: "idle" }>;
+type StoredRunningSessionSync = Extract<StoredSessionSyncStatus, { status: "running" }> & {
+  pid: number;
+};
+type SessionSyncState = StoredRunningSessionSync |
+  Exclude<StoredSessionSyncStatus, { status: "running" }>;
+const activeSessionSyncs = new Map<string, string>();
+
+async function readJson<T>(path: string): Promise<T | undefined> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as T;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function removeIfPresent(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+async function atomicWriteJson(path: string, value: unknown): Promise<void> {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, path);
+  } finally {
+    await removeIfPresent(temporary);
+  }
+}
+
+export async function recoverInterruptedSessionSync(
+  directory: string,
+  statusPath: string,
+  stale: StoredRunningSessionSync,
+): Promise<SessionSyncStatus> {
+  activeSessionSyncs.set(directory, stale.startedAt);
+  try {
+    const current = await readJson<SessionSyncState>(statusPath);
+    if (!current) return { status: "idle" };
+    if (current.status !== "running") return current;
+    if (current.startedAt !== stale.startedAt) {
+      return { status: "running", phase: current.phase, startedAt: current.startedAt };
+    }
+    const failed = {
+      status: "failed" as const,
+      startedAt: stale.startedAt,
+      completedAt: new Date().toISOString(),
+      error: "session sync interrupted by Gateway restart",
+    };
+    await atomicWriteJson(statusPath, failed);
+    return failed;
+  } finally {
+    if (activeSessionSyncs.get(directory) === stale.startedAt) activeSessionSyncs.delete(directory);
+  }
+}
+
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #corpora: readonly CorpusConfig[];
   readonly #analysisExecutable?: string;
+  readonly #stateRoot: string;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
-  readonly #sessionSyncStatuses = new Map<string, SessionSyncStatus>();
 
-  constructor(corpora: readonly CorpusConfig[], analysisExecutable?: string) {
+  constructor(
+    corpora: readonly CorpusConfig[],
+    analysisExecutable?: string,
+    stateRoot = resolveStateDir(),
+  ) {
     this.#corpora = corpora;
     this.#analysisExecutable = analysisExecutable;
+    this.#stateRoot = stateRoot;
   }
 
   async getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }) {
@@ -58,52 +126,87 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     MemoryPluginRuntimeContract["classifyWorkspaceMemoryPaths"]
   > = classifyWorkspaceMemoryPaths;
 
-  startSessionSync(
+  async startSessionSync(
     params: { cfg: OpenClawConfig; agentId: string },
     force = false,
-  ): SessionSyncStartResult {
+  ): Promise<SessionSyncStartResult> {
     if (!this.#corpora.some((corpus) => corpus.kind === "sessions")) {
       return {
         status: "unavailable",
         error: 'memory session sync requires a configured "sessions" corpus',
       };
     }
-    const current = this.sessionSyncStatus(params.agentId);
-    if (current.status === "running") {
-      return { status: "already_running", startedAt: current.startedAt };
-    }
+    const directory = this.#sessionSyncDirectory(params.agentId);
+    const statusPath = join(directory, "session-sync-status.json");
+    const running = activeSessionSyncs.get(directory);
+    if (running) return { status: "already_running", startedAt: running };
     const startedAt = new Date().toISOString();
-    this.#sessionSyncStatuses.set(params.agentId, { status: "running", phase: "queued", startedAt });
-    const run = async () => {
-      const { manager, error } = await this.getMemorySearchManager(params);
-      if (!manager) throw new Error(error ?? "memory unavailable");
-      return await manager.syncSessions(force, (phase) => {
-        this.#sessionSyncStatuses.set(params.agentId, { status: "running", phase, startedAt });
+    activeSessionSyncs.set(directory, startedAt);
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await atomicWriteJson(statusPath, {
+        status: "running",
+        phase: "queued",
+        pid: process.pid,
+        startedAt,
       });
-    };
-    void run().then(
-      (result) => {
-        this.#sessionSyncStatuses.set(params.agentId, {
+    } catch (error) {
+      if (activeSessionSyncs.get(directory) === startedAt) activeSessionSyncs.delete(directory);
+      throw error;
+    }
+    void (async () => {
+      let statusWrites = Promise.resolve();
+      const writePhase = (phase: "projecting" | "indexing") => {
+        statusWrites = statusWrites.then(() => atomicWriteJson(statusPath, {
+          status: "running",
+          phase,
+          pid: process.pid,
+          startedAt,
+        }));
+      };
+      try {
+        const { manager, error } = await this.getMemorySearchManager(params);
+        if (!manager) throw new Error(error ?? "memory unavailable");
+        const result = await manager.syncSessions(force, writePhase);
+        await statusWrites;
+        await atomicWriteJson(statusPath, {
           status: "completed",
           startedAt,
           completedAt: new Date().toISOString(),
           ...result,
         });
-      },
-      (error) => {
-        this.#sessionSyncStatuses.set(params.agentId, {
-          status: "failed",
-          startedAt,
-          completedAt: new Date().toISOString(),
-          error: error instanceof Error ? error.message : String(error),
-        });
-      },
-    );
+      } catch (error) {
+        await statusWrites.catch(() => {});
+        try {
+          await atomicWriteJson(statusPath, {
+            status: "failed",
+            startedAt,
+            completedAt: new Date().toISOString(),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch {
+          // The next status read converts the persisted running state to interrupted.
+        }
+      } finally {
+        if (activeSessionSyncs.get(directory) === startedAt) activeSessionSyncs.delete(directory);
+      }
+    })().catch(() => {});
     return { status: "started", startedAt };
   }
 
-  sessionSyncStatus(agentId: string): SessionSyncStatus {
-    return this.#sessionSyncStatuses.get(agentId) ?? { status: "idle" };
+  async sessionSyncStatus(agentId: string): Promise<SessionSyncStatus> {
+    const directory = this.#sessionSyncDirectory(agentId);
+    const statusPath = join(directory, "session-sync-status.json");
+    const status = await readJson<SessionSyncState>(statusPath);
+    const running = activeSessionSyncs.get(directory);
+    if (running) {
+      return status?.status === "running" && status.startedAt === running
+        ? { status: "running", phase: status.phase, startedAt: running }
+        : { status: "running", phase: "queued", startedAt: running };
+    }
+    if (!status) return { status: "idle" };
+    if (status.status !== "running") return status;
+    return await recoverInterruptedSessionSync(directory, statusPath, status);
   }
 
   async closeMemorySearchManager(params: { agentId: string }): Promise<void> {
@@ -120,7 +223,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   async #createManager(cfg: OpenClawConfig, agentId: string): Promise<QmdMemoryManager> {
     const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-    const stateDir = join(resolveStateDir(), "agents", agentId, "unblock-memory");
+    const stateDir = join(this.#stateRoot, "agents", agentId, "unblock-memory");
     const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files");
     const sessionCorpus = this.#corpora.find((corpus) => corpus.kind === "sessions");
     const sources = resolveSources(workspaceDir, fileCorpora);
@@ -149,4 +252,9 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     await manager.start();
     return manager;
   }
+
+  #sessionSyncDirectory(agentId: string): string {
+    return join(this.#stateRoot, "agents", agentId, "unblock-memory");
+  }
+
 }

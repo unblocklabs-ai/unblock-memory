@@ -96,7 +96,7 @@ function createSyncSessionsTool(runtime, ctx) {
         parameters: syncSessionsParameters,
         async execute(_toolCallId, params) {
             const { force } = Value.Parse(syncSessionsParameters, params);
-            return jsonResult(runtime.startSessionSync(active, force));
+            return jsonResult(await runtime.startSessionSync(active, force));
         },
     };
 }
@@ -111,7 +111,7 @@ function createSyncStatusTool(runtime, ctx) {
         parameters: syncStatusParameters,
         async execute(_toolCallId, params) {
             Value.Parse(syncStatusParameters, params);
-            return jsonResult(runtime.sessionSyncStatus(active.agentId));
+            return jsonResult(await runtime.sessionSyncStatus(active.agentId));
         },
     };
 }

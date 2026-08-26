@@ -103,7 +103,7 @@ function createSyncSessionsTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
     parameters: syncSessionsParameters,
     async execute(_toolCallId: string, params: unknown) {
       const { force } = Value.Parse(syncSessionsParameters, params);
-      return jsonResult(runtime.startSessionSync(active, force));
+      return jsonResult(await runtime.startSessionSync(active, force));
     },
   };
 }
@@ -118,7 +118,7 @@ function createSyncStatusTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTool
     parameters: syncStatusParameters,
     async execute(_toolCallId: string, params: unknown) {
       Value.Parse(syncStatusParameters, params);
-      return jsonResult(runtime.sessionSyncStatus(active.agentId));
+      return jsonResult(await runtime.sessionSyncStatus(active.agentId));
     },
   };
 }
