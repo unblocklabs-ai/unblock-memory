@@ -13,7 +13,18 @@ import { registerSkillWhisperer } from "./skill-whisperer.js";
 function getContext(ctx: OpenClawPluginToolContext) {
   const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
   if (!cfg || !ctx.agentId) return undefined;
-  return { cfg, agentId: ctx.agentId };
+  return {
+    cfg,
+    agentId: ctx.agentId,
+    requestContext: {
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      messageChannel: ctx.messageChannel,
+      agentAccountId: ctx.agentAccountId,
+      nativeChannelId: ctx.nativeChannelId,
+      deliveryContext: ctx.deliveryContext,
+    },
+  };
 }
 
 const searchParameters = Type.Object({
@@ -66,6 +77,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
         maxResults,
         minScore,
         signal,
+        requestContext: active.requestContext,
       });
       return jsonResult({
         results: results.map((result) => result.session
@@ -100,6 +112,7 @@ function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext
         relPath: path,
         from,
         lines,
+        requestContext: active.requestContext,
       }));
     },
   };

@@ -26,6 +26,7 @@ import type {
   MemoryEmbeddingProbeResult,
   MemoryProviderStatus,
   MemoryReadResult,
+  MemoryRequestContext,
   MemorySearchManagerContract,
   MemorySearchResult,
   MemorySyncParams,
@@ -984,7 +985,12 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       .slice(0, limit);
   }
 
-  async readFile(params: { relPath: string; from?: number; lines?: number }): Promise<MemoryReadResult> {
+  async readFile(params: {
+    relPath: string;
+    from?: number;
+    lines?: number;
+    requestContext?: MemoryRequestContext;
+  }): Promise<MemoryReadResult> {
     const safe = parseSafeVirtualPath(params.relPath, this.#sources);
     if (!safe || safe.source.kind === "skills") {
       return { status: "not_found", text: "", path: params.relPath };

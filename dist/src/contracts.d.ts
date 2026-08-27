@@ -1,4 +1,5 @@
 import type { MemoryPluginCapability } from "openclaw/plugin-sdk/memory-host-core";
+import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import type { SessionMetadata } from "./session-projector.js";
 import type { ChatType } from "./config.js";
 export type MemoryPluginRuntimeContract = NonNullable<MemoryPluginCapability["runtime"]>;
@@ -18,9 +19,11 @@ export type SessionSearchFilter = {
     accountId?: string;
     conversationId?: string;
 };
+export type MemoryRequestContext = Pick<OpenClawPluginToolContext, "sessionKey" | "sessionId" | "messageChannel" | "agentAccountId" | "nativeChannelId" | "deliveryContext">;
 export type CorpusSearchOptions = NonNullable<Parameters<MemorySearchManagerContract["search"]>[1]> & {
     corpora?: readonly string[];
     sessionFilter?: SessionSearchFilter;
+    requestContext?: MemoryRequestContext;
 };
 export type MemoryEmbeddingProbeResult = Awaited<ReturnType<MemorySearchManagerContract["probeEmbeddingAvailability"]>>;
 export type MemorySyncParams = Parameters<NonNullable<MemorySearchManagerContract["sync"]>>[0];

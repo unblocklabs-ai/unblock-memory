@@ -134,9 +134,10 @@ test("registers exactly the clean memory tool contract and validates every tool 
   }
 });
 
-test("memory_search exposes session start time as ISO 8601", async () => {
+test("memory tools preserve request context and expose session start time as ISO 8601", async () => {
   let runtime: QmdMemoryRuntime | undefined;
   let searchFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
+  let getFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   const api = {
     pluginConfig: {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
@@ -144,11 +145,13 @@ test("memory_search exposes session start time as ISO 8601", async () => {
     },
     registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
       if (options.names.includes("memory_search")) searchFactory = factory;
+      if (options.names.includes("memory_get")) getFactory = factory;
     },
   } as unknown as OpenClawPluginApi;
   registerUnblockMemory(api);
   assert.ok(runtime);
   assert.ok(searchFactory);
+  assert.ok(getFactory);
 
   const startedAt = Date.parse("2026-08-25T14:00:00Z");
   const internalResult = {
@@ -169,12 +172,34 @@ test("memory_search exposes session start time as ISO 8601", async () => {
       startedAt,
     },
   };
+  let searchContext: unknown;
+  let readContext: unknown;
   Object.defineProperty(runtime, "getMemorySearchManager", {
-    value: async () => ({ manager: { search: async () => [internalResult] } }),
+    value: async () => ({ manager: {
+      search: async (_query: string, options: { requestContext?: unknown }) => {
+        searchContext = options.requestContext;
+        return [internalResult];
+      },
+      readFile: async (params: { requestContext?: unknown }) => {
+        readContext = params.requestContext;
+        return { status: "not_found", text: "", path: "qmd://memory/missing.md" };
+      },
+    } }),
   });
 
-  const tool = searchFactory({ agentId: "bill", config: {} } as OpenClawPluginToolContext)!;
+  const context = {
+    agentId: "bill",
+    config: {},
+    sessionKey: "agent:bill:slack:channel:C123",
+    sessionId: "session-123",
+    messageChannel: "slack",
+    agentAccountId: "workspace-1",
+    nativeChannelId: "C123",
+    deliveryContext: { channel: "slack", accountId: "workspace-1", to: "channel:C123" },
+  } satisfies OpenClawPluginToolContext;
+  const tool = searchFactory(context)!;
   const result = parseJsonResult(await tool.execute("search", { query: "session" }));
+  await getFactory(context)!.execute("get", { path: "qmd://memory/missing.md" });
   assert.deepEqual(result, {
     results: [{
       ...internalResult,
@@ -186,6 +211,16 @@ test("memory_search exposes session start time as ISO 8601", async () => {
     provider: "unblock-memory",
   });
   assert.equal(internalResult.session.startedAt, startedAt);
+  const expected = {
+    sessionKey: context.sessionKey,
+    sessionId: context.sessionId,
+    messageChannel: context.messageChannel,
+    agentAccountId: context.agentAccountId,
+    nativeChannelId: context.nativeChannelId,
+    deliveryContext: context.deliveryContext,
+  };
+  assert.deepEqual(searchContext, expected);
+  assert.deepEqual(readContext, expected);
 });
 
 test("session sync tools accept and report status without awaiting cold initialization", async () => {

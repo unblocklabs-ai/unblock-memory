@@ -8,7 +8,18 @@ function getContext(ctx) {
     const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
     if (!cfg || !ctx.agentId)
         return undefined;
-    return { cfg, agentId: ctx.agentId };
+    return {
+        cfg,
+        agentId: ctx.agentId,
+        requestContext: {
+            sessionKey: ctx.sessionKey,
+            sessionId: ctx.sessionId,
+            messageChannel: ctx.messageChannel,
+            agentAccountId: ctx.agentAccountId,
+            nativeChannelId: ctx.nativeChannelId,
+            deliveryContext: ctx.deliveryContext,
+        },
+    };
 }
 const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
@@ -58,6 +69,7 @@ function createSearchTool(runtime, ctx) {
                 maxResults,
                 minScore,
                 signal,
+                requestContext: active.requestContext,
             });
             return jsonResult({
                 results: results.map((result) => result.session
@@ -93,6 +105,7 @@ function createGetTool(runtime, ctx) {
                 relPath: path,
                 from,
                 lines,
+                requestContext: active.requestContext,
             }));
         },
     };
