@@ -127,7 +127,9 @@ The `skills` corpus shares the existing QMD store and warm embedding model but
 is private to Skill Whisperer: it is excluded from ordinary `memory_search`
 (including `corpora: ["all"]`), `memory_get`, clustering, and memory-maintenance
 tasks. Paths are explicit by design; the plugin does not reconstruct
-OpenClaw's effective skill inventory from `openclaw.json`.
+OpenClaw's effective skill inventory from `openclaw.json`. Configured skill
+globs follow symlinked directories, including OpenClaw's `plugin-skills`
+directory.
 
 Use `sessionFilter` to restrict session results by metadata while leaving file
 corpora searchable. Supported fields are `startedFrom` and `startedTo`

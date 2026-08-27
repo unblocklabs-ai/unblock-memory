@@ -1,8 +1,9 @@
-import { realpathSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
+import picomatch from "picomatch";
 import {
   ensureMemoryAnalysisSchema,
   latestAnalysisCollections,
@@ -87,11 +88,52 @@ type SkillIndexEntry = SkillSearchCandidate & {
   embedding: number[];
 };
 
-type SkillDocumentRow = {
-  collection: string;
+type SkillDocument = {
   path: string;
   body: string;
 };
+
+function readSkillDocuments(source: ResolvedSource): SkillDocument[] {
+  const documents: SkillDocument[] = [];
+  const visitedDirectories = new Set<string>();
+  const visit = (directory: string) => {
+    let canonicalDirectory: string;
+    try {
+      canonicalDirectory = realpathSync(directory);
+    } catch {
+      return;
+    }
+    if (visitedDirectories.has(canonicalDirectory)) return;
+    visitedDirectories.add(canonicalDirectory);
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) =>
+      left.name.localeCompare(right.name))) {
+      const path = resolve(directory, entry.name);
+      let kind: "directory" | "file" | undefined = entry.isDirectory()
+        ? "directory"
+        : entry.isFile()
+          ? "file"
+          : undefined;
+      if (entry.isSymbolicLink()) {
+        try {
+          const target = statSync(path);
+          kind = target.isDirectory() ? "directory" : target.isFile() ? "file" : undefined;
+        } catch {
+          continue;
+        }
+      }
+      if (kind === "directory") {
+        visit(path);
+        continue;
+      }
+      const relativePath = relative(source.root, path).split(sep).join("/");
+      if (kind !== "file" || basename(path).toLowerCase() !== "skill.md" ||
+        !picomatch.isMatch(relativePath, source.pattern, { dot: true })) continue;
+      documents.push({ path, body: readFileSync(path, "utf8") });
+    }
+  };
+  visit(source.root);
+  return documents;
+}
 
 function frontmatterValue(body: string, key: "name" | "description"): string | undefined {
   const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\n|$)/u.exec(body)?.[1];
@@ -398,8 +440,9 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     this.#watcher.on("error", (error) => {
       this.#watchError = error instanceof Error ? error.message : String(error);
     });
-    this.#watcher.on("all", () => {
+    this.#watcher.on("all", (_event, path) => {
       if (this.#closed) return;
+      if (basename(path).toLowerCase() === "skill.md") this.#skillIndex = undefined;
       this.#dirty = true;
       if (this.#watchTimer) clearTimeout(this.#watchTimer);
       this.#watchTimer = setTimeout(() => {
@@ -892,33 +935,27 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     if (!store.internal?.llm) throw new Error("Skill Whisperer requires the QMD embedding model");
     const llm = store.internal.llm;
     this.#skillIndex ??= (async () => {
-      const placeholders = collections.map(() => "?").join(", ");
-      const rows = store.internal!.db.prepare(`
-        SELECT document.collection, document.path, content.doc AS body
-        FROM documents document
-        JOIN content ON content.hash = document.hash
-        WHERE document.active = 1 AND document.collection IN (${placeholders})
-        ORDER BY document.collection, document.path
-      `).all(...collections) as SkillDocumentRow[];
       const sourceOrder = new Map([...this.#sources.keys()].map((collection, index) => [collection, index]));
       const metadata = new Map<string, {
         candidate: Omit<SkillSearchCandidate, "score">;
         description: string;
         sourceOrder: number;
       }>();
-      for (const row of rows) {
-        const file = `qmd://${row.collection}/${row.path}`;
-        const safe = parseSafeVirtualPath(file, this.#sources);
-        if (!safe || safe.source.kind !== "skills") continue;
-        const path = realpathSync(resolve(safe.source.root, safe.relativePath));
-        if (basename(path).toLowerCase() !== "skill.md") continue;
-        const name = frontmatterValue(row.body, "name") || basename(dirname(path));
-        const description = frontmatterValue(row.body, "description") ?? "";
-        const key = name.toLowerCase();
-        const order = sourceOrder.get(row.collection) ?? Number.MAX_SAFE_INTEGER;
-        const current = metadata.get(key);
-        if (!current || order < current.sourceOrder) {
-          metadata.set(key, { candidate: { name, path }, description, sourceOrder: order });
+      for (const source of this.#sources.values()) {
+        if (source.kind !== "skills") continue;
+        for (const document of readSkillDocuments(source)) {
+          const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
+          const description = frontmatterValue(document.body, "description") ?? "";
+          const key = name.toLowerCase();
+          const order = sourceOrder.get(source.collection) ?? Number.MAX_SAFE_INTEGER;
+          const current = metadata.get(key);
+          if (!current || order < current.sourceOrder) {
+            metadata.set(key, {
+              candidate: { name, path: document.path },
+              description,
+              sourceOrder: order,
+            });
+          }
         }
       }
       const skills = [...metadata.values()];

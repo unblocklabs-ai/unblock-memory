@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -400,12 +400,17 @@ test("keeps skill vectors private to direct skill search", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-skills-"));
   const dbPath = join(workspace, "index.sqlite");
   await mkdir(join(workspace, "skills", "deploy"), { recursive: true });
-  await mkdir(join(workspace, "global-skills", "deploy"), { recursive: true });
+  await mkdir(join(workspace, "global-skills"));
+  await mkdir(join(workspace, "global-target", "deploy"), { recursive: true });
+  await mkdir(join(workspace, "global-target", "inspect"), { recursive: true });
+  await symlink(join(workspace, "global-target"), join(workspace, "global-skills", "bundle"), "dir");
   await writeFile(join(workspace, "MEMORY.md"), "memory body\n");
   const localSkill = "---\nname: deploy-helper\ndescription: Deploy releases safely.\n---\nLOCAL PROCEDURE MUST NOT BE EMBEDDED.\n";
   const globalSkill = "---\nname: deploy-helper\ndescription: Deploy releases globally.\n---\nGLOBAL PROCEDURE MUST NOT BE EMBEDDED.\n";
+  const globalInspector = "---\nname: global-inspector\ndescription: Inspect global releases.\n---\nINSPECT PROCEDURE MUST NOT BE EMBEDDED.\n";
   await writeFile(join(workspace, "skills", "deploy", "SKILL.md"), localSkill);
-  await writeFile(join(workspace, "global-skills", "deploy", "SKILL.md"), globalSkill);
+  await writeFile(join(workspace, "global-target", "deploy", "SKILL.md"), globalSkill);
+  await writeFile(join(workspace, "global-target", "inspect", "SKILL.md"), globalInspector);
   const memory = resolveSource(workspace, "MEMORY.md", "memory");
   const [skills, globalSkills] = resolveSources(workspace, [{
     name: "skills",
@@ -413,19 +418,6 @@ test("keeps skill vectors private to direct skill search", async () => {
     paths: ["skills/**/SKILL.md", "global-skills/**/SKILL.md"],
   }]);
   const backing = await createStore({ dbPath, config: { collections: {} } });
-  const now = new Date().toISOString();
-  const insertContent = backing.internal.db.prepare(
-    "INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)",
-  );
-  const insertDocument = backing.internal.db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, 'deploy/SKILL.md', 'Deploy', ?, ?, ?, 1)
-  `);
-  insertContent.run("local-skill-hash", localSkill, now);
-  insertDocument.run(skills!.collection, "local-skill-hash", now, now);
-  insertContent.run("global-skill-hash", globalSkill, now);
-  insertDocument.run(globalSkills!.collection, "global-skill-hash", now, now);
-
   const embedded: string[] = [];
   backing.internal.llm = {
     embedModelName: "embeddinggemma-300M",
@@ -453,16 +445,24 @@ test("keeps skill vectors private to direct skill search", async () => {
     assert.deepEqual(await manager.search("deploy"), []);
     assert.deepEqual(await manager.search("deploy", { corpora: ["all"] }), []);
     await assert.rejects(manager.search("deploy", { corpora: ["skills"] }), /unknown corpus: skills/);
-    assert.deepEqual(await manager.searchSkills("deploy", 0.6, 10), [{
-      name: "deploy-helper",
-      path: await realpath(join(workspace, "skills", "deploy", "SKILL.md")),
-      score: 1,
-    }]);
+    assert.deepEqual(await manager.searchSkills("deploy", 0.6, 10), [
+      {
+        name: "deploy-helper",
+        path: join(workspace, "skills", "deploy", "SKILL.md"),
+        score: 1,
+      },
+      {
+        name: "global-inspector",
+        path: join(workspace, "global-skills", "bundle", "inspect", "SKILL.md"),
+        score: 1,
+      },
+    ]);
     assert.equal((await manager.readFile({
       relPath: `qmd://${skills!.collection}/deploy/SKILL.md`,
     })).status, "not_found");
     assert.deepEqual(embedded, [
       "title: deploy-helper | text: Deploy releases safely.",
+      "title: global-inspector | text: Inspect global releases.",
       "task: search result | query: deploy",
     ]);
     assert.equal(embedded.some((text) => text.includes("PROCEDURE")), false);

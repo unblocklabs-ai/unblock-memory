@@ -64,6 +64,16 @@ test("recognizes only configured skill files for read tracking", async () => {
   assert.equal(resolveConfiguredSkillPath(workspace, "skills/deploy/SKILL.md", sources), canonicalSkill);
   assert.equal(resolveConfiguredSkillPath(workspace, other, sources), undefined);
   assert.equal(resolveConfiguredSkillPath(workspace, join(workspace, "outside", "SKILL.md"), sources), undefined);
+
+  const linkedRoot = join(workspace, "plugin-skills");
+  await mkdir(linkedRoot);
+  await symlink(join(workspace, "skills", "deploy"), join(linkedRoot, "deploy"), "dir");
+  const linkedSources = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["plugin-skills/**/SKILL.md"],
+  }]);
+  assert.equal(resolveConfiguredSkillPath(workspace, "plugin-skills/deploy/SKILL.md", linkedSources), canonicalSkill);
 });
 
 test("virtual reads reject traversal and accept exact in-root markdown", async () => {

@@ -150,18 +150,9 @@ export function resolveConfiguredSkillPath(
   }
   for (const source of sources) {
     if (source.kind !== "skills") continue;
-    let canonicalRoot: string;
-    try {
-      canonicalRoot = realpathSync(source.root);
-    } catch {
-      continue;
-    }
-    const relativePath = relative(canonicalRoot, canonicalTarget);
-    const safe = parseSafeVirtualPath(
-      `qmd://${source.collection}/${relativePath.split(sep).join("/")}`,
-      new Map([[source.collection, source]]),
-    );
-    if (safe) return canonicalTarget;
+    const relativePath = relative(source.root, target);
+    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) continue;
+    if (picomatch.isMatch(relativePath.split(sep).join("/"), source.pattern, { dot: true })) return canonicalTarget;
   }
   return undefined;
 }

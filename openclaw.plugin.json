@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": false },
