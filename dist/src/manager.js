@@ -10,6 +10,39 @@ const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
 const qmdModule = import("@unblocklabs/qmd");
+function frontmatterValue(body, key) {
+    const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\n|$)/u.exec(body)?.[1];
+    const raw = frontmatter?.split("\n")
+        .map((line) => new RegExp(`^${key}:\\s*(.+?)\\s*$`, "u").exec(line)?.[1])
+        .find((value) => value !== undefined);
+    return raw?.replace(/^(?:"(.*)"|'(.*)')$/u, "$1$2").trim();
+}
+function embeddingText(name, description, model) {
+    return model.toLowerCase().includes("qwen3-embedding")
+        ? `${name}\n${description}`
+        : `title: ${name} | text: ${description}`;
+}
+function queryText(query, model) {
+    return model.toLowerCase().includes("qwen3-embedding")
+        ? `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`
+        : `task: search result | query: ${query}`;
+}
+function cosineSimilarity(left, right) {
+    if (left.length !== right.length || left.length === 0)
+        return 0;
+    let dot = 0;
+    let leftMagnitude = 0;
+    let rightMagnitude = 0;
+    for (let index = 0; index < left.length; index += 1) {
+        const leftValue = left[index];
+        const rightValue = right[index];
+        dot += leftValue * rightValue;
+        leftMagnitude += leftValue * leftValue;
+        rightMagnitude += rightValue * rightValue;
+    }
+    const denominator = Math.sqrt(leftMagnitude * rightMagnitude);
+    return denominator === 0 ? 0 : dot / denominator;
+}
 function markStaleForAnalysisCollectionChange(db, collections, hasSkills) {
     const current = collections.toSorted();
     const previous = latestAnalysisCollections(db)?.toSorted();
@@ -166,6 +199,7 @@ export class QmdMemoryManager {
     #dirty = true;
     #sessionMetadata = new Map();
     #sessionManifestMtimeNs;
+    #skillIndex;
     constructor(params) {
         this.#dbPath = params.dbPath;
         this.#curationPath = params.curationPath ?? `${params.dbPath}.curation.sqlite`;
@@ -363,6 +397,8 @@ export class QmdMemoryManager {
                 const update = await store.update({ collections: [source.collection] });
                 this.#cleanupRemovedDocuments?.(update.updated + update.removed);
                 const changed = update.indexed + update.updated + update.removed > 0 || update.needsEmbedding > 0;
+                if (source.kind === "skills" && (changed || params?.force === true))
+                    this.#skillIndex = undefined;
                 if (source.kind !== "skills" && (changed || params?.force === true))
                     markAnalysisStale();
                 const embed = await store.embed({
@@ -649,41 +685,58 @@ export class QmdMemoryManager {
         if (collections.length === 0)
             return [];
         await this.#operationChain;
-        const hits = await (await this.#getStore()).vsearch(query, {
-            collection: collections,
-            limit,
-            minScore,
-            expand: false,
-        });
-        const sourceOrder = new Map([...this.#sources.keys()].map((collection, index) => [collection, index]));
-        const candidates = new Map();
-        for (const hit of hits) {
-            const safe = parseSafeVirtualPath(hit.file, this.#sources);
-            if (!safe || safe.source.kind !== "skills")
-                continue;
-            const path = realpathSync(resolve(safe.source.root, safe.relativePath));
-            if (basename(path).toLowerCase() !== "skill.md")
-                continue;
-            const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\n|$)/u.exec(hit.body)?.[1];
-            const configuredName = frontmatter?.split("\n")
-                .map((line) => /^name:\s*(.+?)\s*$/u.exec(line)?.[1])
-                .find((name) => name !== undefined)
-                ?.replace(/^(?:"(.*)"|'(.*)')$/u, "$1$2");
-            const candidate = {
-                name: configuredName?.trim() || basename(dirname(path)),
-                path,
-                score: hit.score,
-            };
-            const key = candidate.name.toLowerCase();
-            const order = sourceOrder.get(safe.source.collection) ?? Number.MAX_SAFE_INTEGER;
-            const current = candidates.get(key);
-            if (!current || order < current.sourceOrder ||
-                (order === current.sourceOrder && candidate.score > current.candidate.score)) {
-                candidates.set(key, { candidate, sourceOrder: order });
+        const store = await this.#getStore();
+        if (!store.internal?.llm)
+            throw new Error("Skill Whisperer requires the QMD embedding model");
+        const llm = store.internal.llm;
+        this.#skillIndex ??= (async () => {
+            const placeholders = collections.map(() => "?").join(", ");
+            const rows = store.internal.db.prepare(`
+        SELECT document.collection, document.path, content.doc AS body
+        FROM documents document
+        JOIN content ON content.hash = document.hash
+        WHERE document.active = 1 AND document.collection IN (${placeholders})
+        ORDER BY document.collection, document.path
+      `).all(...collections);
+            const sourceOrder = new Map([...this.#sources.keys()].map((collection, index) => [collection, index]));
+            const metadata = new Map();
+            for (const row of rows) {
+                const file = `qmd://${row.collection}/${row.path}`;
+                const safe = parseSafeVirtualPath(file, this.#sources);
+                if (!safe || safe.source.kind !== "skills")
+                    continue;
+                const path = realpathSync(resolve(safe.source.root, safe.relativePath));
+                if (basename(path).toLowerCase() !== "skill.md")
+                    continue;
+                const name = frontmatterValue(row.body, "name") || basename(dirname(path));
+                const description = frontmatterValue(row.body, "description") ?? "";
+                const key = name.toLowerCase();
+                const order = sourceOrder.get(row.collection) ?? Number.MAX_SAFE_INTEGER;
+                const current = metadata.get(key);
+                if (!current || order < current.sourceOrder) {
+                    metadata.set(key, { candidate: { name, path }, description, sourceOrder: order });
+                }
             }
-        }
-        return [...candidates.values()]
-            .map(({ candidate }) => candidate)
+            const skills = [...metadata.values()];
+            const embeddings = await llm.embedBatch(skills.map(({ candidate, description }) => embeddingText(candidate.name, description, llm.embedModelName)));
+            return skills.flatMap(({ candidate }, index) => {
+                const embedding = embeddings[index]?.embedding;
+                return embedding ? [{ ...candidate, score: 0, embedding }] : [];
+            });
+        })().catch((error) => {
+            this.#skillIndex = undefined;
+            throw error;
+        });
+        const queryEmbedding = await llm.embed(queryText(query, llm.embedModelName), { isQuery: true });
+        if (!queryEmbedding)
+            return [];
+        const candidates = await this.#skillIndex;
+        return candidates
+            .map(({ embedding, ...candidate }) => ({
+            ...candidate,
+            score: cosineSimilarity(queryEmbedding.embedding, embedding),
+        }))
+            .filter((candidate) => candidate.score >= minScore)
             .sort((left, right) => right.score - left.score)
             .slice(0, limit);
     }

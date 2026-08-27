@@ -76,7 +76,7 @@ directories, or globs into named corpora:
           skillWhisperer: {
             enabled: false,
             historyMessages: 5,
-            minScore: 0.4,
+            minScore: 0.5,
             cooldownTurns: 10,
           },
           // Optional: omit unless the local analysis worker is installed.
@@ -111,16 +111,17 @@ Skill Whisperer is an optional semantic reminder for user turns. Configure one
 isolated `skills` corpus, set `skillWhisperer.enabled` to `true`, and authorize
 `plugins.entries.unblock-memory.hooks.allowConversationAccess`. The feature
 embeds the current prompt plus the configured number of prior user/assistant
-messages, searches only skill files, and prepends at most one name/path hint
-when the best eligible match reaches `minScore`. It never opens or invokes a
-skill automatically.
+messages, compares it with each configured skill's frontmatter `name` and
+`description`, and prepends at most one name/path hint when the best match
+reaches `minScore`. Full skill procedures do not influence routing. The plugin
+never opens or invokes a skill automatically.
 
-The defaults use five prior messages, a calibrated score threshold of `0.4`,
+The defaults use five prior messages, a calibrated score threshold of `0.5`,
 and a ten-turn cooldown. A skill is cooling down after either a suggestion or a
-successful direct `read` of its indexed `SKILL.md`; the next result is eligible
-only when it independently meets the same score threshold. Cooldown state is
-per session and intentionally resets with the Gateway. Shell-command reads are
-not tracked.
+successful direct `read` of its indexed `SKILL.md`. When the best qualifying
+skill is cooling down, no hint is emitted; Skill Whisperer does not fall through
+to a weaker match. Cooldown state is per session and intentionally resets with
+the Gateway. Shell-command reads are not tracked.
 
 The `skills` corpus shares the existing QMD store and warm embedding model but
 is private to Skill Whisperer: it is excluded from ordinary `memory_search`

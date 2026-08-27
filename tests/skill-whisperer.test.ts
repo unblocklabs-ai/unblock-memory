@@ -75,7 +75,7 @@ test("builds a bounded semantic query from only the configured recent conversati
   ], 0), "user: current request");
 });
 
-test("suggests one eligible skill, applies one cooldown, and is idempotent per run", async () => {
+test("suggests the best skill, emits nothing while it cools down, and is idempotent per run", async () => {
   const skillA = { name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 };
   const skillB = { name: "beta", path: "/skills/beta/SKILL.md", score: 0.8 };
   const testHarness = harness([skillA, skillB]);
@@ -85,12 +85,12 @@ test("suggests one eligible skill, applies one cooldown, and is idempotent per r
   assert.match((await testHarness.before(event, context("run-1")))?.prependContext ?? "", /alpha/);
   assert.equal(await testHarness.before(event, context("run-1")), undefined);
   assert.equal(testHarness.queries.length, 1);
-  assert.match((await testHarness.before(event, context("run-2")))?.prependContext ?? "", /beta/);
+  assert.equal(await testHarness.before(event, context("run-2")), undefined);
   assert.equal(await testHarness.before(event, context("run-3")), undefined);
   assert.match((await testHarness.before(event, context("run-4")))?.prependContext ?? "", /alpha/);
 });
 
-test("requires every cooldown fallback to meet minScore", async () => {
+test("does not fall through when the best skill is cooling down", async () => {
   const testHarness = harness([
     { name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 },
     { name: "weak", path: "/skills/weak/SKILL.md", score: 0.59 },
@@ -111,7 +111,7 @@ test("successful direct reads share the suggestion cooldown and session end clea
     toolName: "read",
     params: { file_path: "/skills/beta/SKILL.md" },
   }, context);
-  assert.match((await testHarness.before({ prompt: "task", messages: [] }, context))?.prependContext ?? "", /alpha/);
+  assert.equal(await testHarness.before({ prompt: "task", messages: [] }, context), undefined);
 
   await testHarness.end({ sessionId: "session" }, context);
   await testHarness.after({

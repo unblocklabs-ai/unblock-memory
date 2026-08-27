@@ -9,7 +9,7 @@ export const DEFAULT_CORPORA = [{
 const DEFAULT_SKILL_WHISPERER = {
     enabled: false,
     historyMessages: 5,
-    minScore: 0.4,
+    minScore: 0.5,
     cooldownTurns: 10,
 };
 function assertOnlyKeys(value, allowed, label) {
@@ -126,7 +126,7 @@ export function resolveConfig(value) {
         assertOnlyKeys(value, ["enabled", "historyMessages", "minScore", "cooldownTurns"], "skillWhisperer");
         const enabled = value.enabled ?? false;
         const historyMessages = value.historyMessages ?? 5;
-        const minScore = value.minScore ?? 0.4;
+        const minScore = value.minScore ?? 0.5;
         const cooldownTurns = value.cooldownTurns ?? 10;
         if (typeof enabled !== "boolean")
             throw new Error("unblock-memory skillWhisperer.enabled must be a boolean");

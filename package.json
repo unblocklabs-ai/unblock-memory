@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",
@@ -18,7 +18,12 @@
     "access": "public",
     "provenance": true
   },
-  "files": ["dist", "skills", "README.md", "openclaw.plugin.json"],
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "openclaw.plugin.json"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -48,18 +53,33 @@
     "openclaw": ">=2026.8.1-beta.3"
   },
   "peerDependenciesMeta": {
-    "openclaw": { "optional": true }
+    "openclaw": {
+      "optional": true
+    }
   },
-  "engines": { "node": ">=22.0.0" },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "openclaw": {
-    "extensions": ["./dist/index.js"],
-    "compat": { "pluginApi": ">=2026.8.1-beta.3", "minGatewayVersion": "2026.8.1-beta.3" },
-    "build": { "openclawVersion": "2026.8.1-beta.3", "pluginSdkVersion": "2026.8.1-beta.3" },
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.8.1-beta.3",
+      "minGatewayVersion": "2026.8.1-beta.3"
+    },
+    "build": {
+      "openclawVersion": "2026.8.1-beta.3",
+      "pluginSdkVersion": "2026.8.1-beta.3"
+    },
     "install": {
       "npmSpec": "@unblocklabs/unblock-memory",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.8.1-beta.3"
     },
-    "release": { "publishToClawHub": false, "publishToNpm": true }
+    "release": {
+      "publishToClawHub": false,
+      "publishToNpm": true
+    }
   }
 }

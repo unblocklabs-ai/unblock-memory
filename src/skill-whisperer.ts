@@ -94,13 +94,11 @@ export function registerSkillWhisperer(
         config.minScore,
         CANDIDATE_LIMIT,
       );
-      const selected = candidates.find((candidate) => {
-        if (candidate.score < config.minScore) return false;
-        const history = state.skills.get(candidate.path);
-        const lastSeen = Math.max(history?.suggested ?? -Infinity, history?.opened ?? -Infinity);
-        return state.turn - lastSeen > config.cooldownTurns;
-      });
-      if (!selected) return;
+      const selected = candidates[0];
+      if (!selected || selected.score < config.minScore) return;
+      const previous = state.skills.get(selected.path);
+      const lastSeen = Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity);
+      if (state.turn - lastSeen <= config.cooldownTurns) return;
       const history = state.skills.get(selected.path) ?? {};
       history.suggested = state.turn;
       state.skills.set(selected.path, history);

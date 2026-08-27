@@ -398,54 +398,52 @@ test("scopes vector search to named corpora and labels results", async () => {
 
 test("keeps skill vectors private to direct skill search", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-skills-"));
+  const dbPath = join(workspace, "index.sqlite");
   await mkdir(join(workspace, "skills", "deploy"), { recursive: true });
   await mkdir(join(workspace, "global-skills", "deploy"), { recursive: true });
   await writeFile(join(workspace, "MEMORY.md"), "memory body\n");
-  await writeFile(join(workspace, "skills", "deploy", "SKILL.md"), "---\nname: deploy-helper\n---\nDeploy safely.\n");
-  await writeFile(join(workspace, "global-skills", "deploy", "SKILL.md"), "---\nname: deploy-helper\n---\nDeploy globally.\n");
+  const localSkill = "---\nname: deploy-helper\ndescription: Deploy releases safely.\n---\nLOCAL PROCEDURE MUST NOT BE EMBEDDED.\n";
+  const globalSkill = "---\nname: deploy-helper\ndescription: Deploy releases globally.\n---\nGLOBAL PROCEDURE MUST NOT BE EMBEDDED.\n";
+  await writeFile(join(workspace, "skills", "deploy", "SKILL.md"), localSkill);
+  await writeFile(join(workspace, "global-skills", "deploy", "SKILL.md"), globalSkill);
   const memory = resolveSource(workspace, "MEMORY.md", "memory");
   const [skills, globalSkills] = resolveSources(workspace, [{
     name: "skills",
     kind: "skills",
     paths: ["skills/**/SKILL.md", "global-skills/**/SKILL.md"],
   }]);
-  const seen: Array<{ collections: readonly string[]; expand?: boolean; minScore?: number }> = [];
-  const store = createManagerStore({
-    async vsearch(_query, options) {
-      const collections = typeof options?.collection === "string"
-        ? [options.collection]
-        : [...(options?.collection ?? [])];
-      seen.push({ collections, expand: options?.expand, minScore: options?.minScore });
-      if (collections.includes(skills!.collection)) {
-        return [{
-          file: `qmd://${skills!.collection}/deploy/SKILL.md`,
-          displayPath: `${skills!.collection}/deploy/SKILL.md`,
-          title: "Deploy",
-          body: "---\nname: deploy-helper\n---\nDeploy safely.",
-          score: 0.72,
-          context: null,
-          docid: "skill-hash",
-          bestChunk: "Deploy safely.",
-          chunkPos: 28,
-          chunkLen: 14,
-        }, {
-          file: `qmd://${globalSkills!.collection}/deploy/SKILL.md`,
-          displayPath: `${globalSkills!.collection}/deploy/SKILL.md`,
-          title: "Global Deploy",
-          body: "---\nname: deploy-helper\n---\nDeploy globally.",
-          score: 0.92,
-          context: null,
-          docid: "global-skill-hash",
-          bestChunk: "Deploy globally.",
-          chunkPos: 28,
-          chunkLen: 16,
-        }];
-      }
-      return [];
+  const backing = await createStore({ dbPath, config: { collections: {} } });
+  const now = new Date().toISOString();
+  const insertContent = backing.internal.db.prepare(
+    "INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)",
+  );
+  const insertDocument = backing.internal.db.prepare(`
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
+    VALUES (?, 'deploy/SKILL.md', 'Deploy', ?, ?, ?, 1)
+  `);
+  insertContent.run("local-skill-hash", localSkill, now);
+  insertDocument.run(skills!.collection, "local-skill-hash", now, now);
+  insertContent.run("global-skill-hash", globalSkill, now);
+  insertDocument.run(globalSkills!.collection, "global-skill-hash", now, now);
+
+  const embedded: string[] = [];
+  backing.internal.llm = {
+    embedModelName: "embeddinggemma-300M",
+    async embed(text: string) {
+      embedded.push(text);
+      return { embedding: [1, 0], model: "test" };
     },
+    async embedBatch(texts: string[]) {
+      embedded.push(...texts);
+      return texts.map(() => ({ embedding: [1, 0], model: "test" }));
+    },
+  } as QMDStore["internal"]["llm"];
+  const store = createManagerStore({
+    internal: backing.internal,
+    async close() { await backing.close(); },
   });
   const manager = new QmdMemoryManager({
-    dbPath: join(workspace, "index.sqlite"),
+    dbPath,
     workspaceDir: workspace,
     sources: [memory, skills!, globalSkills!],
     storeFactory: async () => store,
@@ -458,16 +456,16 @@ test("keeps skill vectors private to direct skill search", async () => {
     assert.deepEqual(await manager.searchSkills("deploy", 0.6, 10), [{
       name: "deploy-helper",
       path: await realpath(join(workspace, "skills", "deploy", "SKILL.md")),
-      score: 0.72,
+      score: 1,
     }]);
     assert.equal((await manager.readFile({
       relPath: `qmd://${skills!.collection}/deploy/SKILL.md`,
     })).status, "not_found");
-    assert.deepEqual(seen.slice(-1)[0], {
-      collections: [skills!.collection, globalSkills!.collection],
-      expand: false,
-      minScore: 0.6,
-    });
+    assert.deepEqual(embedded, [
+      "title: deploy-helper | text: Deploy releases safely.",
+      "task: search result | query: deploy",
+    ]);
+    assert.equal(embedded.some((text) => text.includes("PROCEDURE")), false);
   } finally {
     await manager.close();
   }

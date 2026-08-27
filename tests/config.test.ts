@@ -17,7 +17,7 @@ test("keeps skill whispering disabled by default and validates its lean controls
   assert.deepEqual(resolveConfig(undefined).skillWhisperer, {
     enabled: false,
     historyMessages: 5,
-    minScore: 0.4,
+    minScore: 0.5,
     cooldownTurns: 10,
   });
   const corpora = [
