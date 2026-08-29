@@ -206,6 +206,7 @@ function codexPrompt(input: PeopleRefinementInput): string {
     "Return only the JSON object required by the supplied output schema.",
     "Preserve useful current claims when evidence still supports them.",
     "Every claim must cite an evidence source and locator already present in the input.",
+    "Copy observedAt from the matching supplied evidence and provide confidence for every claim.",
     JSON.stringify(input),
   ].join("\n\n");
 }
@@ -308,6 +309,22 @@ function codexEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   );
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function codexOutputSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(codexOutputSchema);
+  if (!isRecord(value)) return value;
+  const schema = Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [key, codexOutputSchema(child)]),
+  );
+  if (schema.type === "object" && isRecord(schema.properties)) {
+    schema.required = Object.keys(schema.properties);
+  }
+  return schema;
+}
+
 export function createCodexPeopleRefinementRunner(
   runCommand: CodexCommandRunner = runCodexProcess,
   options: {
@@ -323,7 +340,7 @@ export function createCodexPeopleRefinementRunner(
     try {
       const timeout = AbortSignal.timeout(options.timeoutMs ?? 15 * 60_000);
       const commandSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-      await writeFile(schemaPath, JSON.stringify(outputSchema), { mode: 0o600 });
+      await writeFile(schemaPath, JSON.stringify(codexOutputSchema(outputSchema)), { mode: 0o600 });
       await runCommand({
         executable: "codex",
         args: [

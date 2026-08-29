@@ -123,6 +123,7 @@ function codexPrompt(input) {
         "Return only the JSON object required by the supplied output schema.",
         "Preserve useful current claims when evidence still supports them.",
         "Every claim must cite an evidence source and locator already present in the input.",
+        "Copy observedAt from the matching supplied evidence and provide confidence for every claim.",
         JSON.stringify(input),
     ].join("\n\n");
 }
@@ -209,6 +210,20 @@ const CODEX_ENV_KEYS = [
 function codexEnvironment(source) {
     return Object.fromEntries(CODEX_ENV_KEYS.flatMap((key) => (source[key] === undefined ? [] : [[key, source[key]]])));
 }
+function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function codexOutputSchema(value) {
+    if (Array.isArray(value))
+        return value.map(codexOutputSchema);
+    if (!isRecord(value))
+        return value;
+    const schema = Object.fromEntries(Object.entries(value).map(([key, child]) => [key, codexOutputSchema(child)]));
+    if (schema.type === "object" && isRecord(schema.properties)) {
+        schema.required = Object.keys(schema.properties);
+    }
+    return schema;
+}
 export function createCodexPeopleRefinementRunner(runCommand = runCodexProcess, options = {}) {
     return async ({ input, outputSchema, signal }) => {
         const scratch = await mkdtemp(join(tmpdir(), "unblock-memory-people-refinement-"));
@@ -217,7 +232,7 @@ export function createCodexPeopleRefinementRunner(runCommand = runCodexProcess, 
         try {
             const timeout = AbortSignal.timeout(options.timeoutMs ?? 15 * 60_000);
             const commandSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-            await writeFile(schemaPath, JSON.stringify(outputSchema), { mode: 0o600 });
+            await writeFile(schemaPath, JSON.stringify(codexOutputSchema(outputSchema)), { mode: 0o600 });
             await runCommand({
                 executable: "codex",
                 args: [
