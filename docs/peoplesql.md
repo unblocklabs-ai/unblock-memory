@@ -33,7 +33,7 @@ mapping with a source-backed dossier that Codex periodically refines.
 ## Product loop
 
 ```text
-Sessions + configured Markdown + verified directory metadata
+Exact-attributed sessions + verified directory identities
                               |
                               v
                   Attribute evidence to people
@@ -132,10 +132,9 @@ not synchronize or share PeopleSQL records. Cross-agent maintenance, when explic
 needed, operates on each agent's store independently rather than creating a shared people
 database that could expose company-sensitive information.
 
-The dossier is not a QMD corpus and must not enter the normal embedding path. Existing
-session projections and explicitly configured Markdown remain evidence. A prior dossier
-may be supplied for comparison during refinement, but it is not independent evidence for
-its own claims.
+The dossier is not a QMD corpus and must not enter the normal embedding path. Exact-attributed
+session events are the sole MVP evidence source. A prior dossier may be supplied for comparison
+during refinement, but it is not independent evidence for its own claims.
 
 ## Schema policy
 
@@ -401,11 +400,10 @@ Refinement is asynchronous and bounded:
 
 1. Select only people with `refinementEnabled = true` and new evidence.
 2. Resolve attributed sessions through exact structured identity metadata.
-3. Search configured Markdown and adjacent memory for source evidence.
-4. Load the current dossier for comparison, not as independent corroboration.
-5. Ask Codex to confirm, revise, retract, or make no change.
-6. Validate the typed dossier and evidence references.
-7. Atomically replace the current dossier only when it changed, then update `reviewed_at`.
+3. Load the current dossier for comparison, not as independent corroboration.
+4. Ask Codex to confirm, revise, retract, or make no change.
+5. Validate the typed dossier and evidence references.
+6. Atomically replace the current dossier only when it changed, then update `reviewed_at`.
 
 The MVP rejects non-baseline dossier categories. Identity merges and changes to refinement
 or injection policy require an explicit validated action outside the refinement response.
@@ -453,7 +451,6 @@ automation schedule:
 {
   people: {
     enabled: false,
-    evidenceCorpora: ["sessions"],
     refinement: {
       maxPeoplePerRun: 10,
     },
@@ -467,6 +464,8 @@ automation schedule:
   },
 }
 ```
+
+Session evidence is the sole refinement source in the MVP and is not configurable.
 
 A weekly operator-authored OpenClaw command automation should invoke
 `openclaw unblock-memory people refine --agent <id>`. OpenClaw owns scheduling,

@@ -53,7 +53,6 @@ export declare function refinePeople(params: {
     runner: PeopleRefinementRunner;
     candidateLimit?: number;
     evidenceLimit?: number;
-    includeSessionEvidence?: boolean;
     signal?: AbortSignal;
 }): Promise<PeopleRefinementSummary>;
 export type CodexCommandRunner = (params: {

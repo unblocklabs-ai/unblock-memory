@@ -42,7 +42,7 @@ function dossier(locator: string) {
   };
 }
 
-test("refines one candidate and preserves its watermark", async () => {
+test("always reads session evidence and preserves the candidate watermark", async () => {
   const testHarness = await harness();
   try {
     insertSession(testHarness.db, {

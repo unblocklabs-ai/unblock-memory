@@ -39,7 +39,6 @@ export type UnblockMemoryConfig = {
   analysis: { executable?: string };
   people: {
     enabled: boolean;
-    evidenceCorpora: readonly string[];
     refinement: { maxPeoplePerRun: number };
     whisperer: { enabled: boolean; maxChars: number };
     todos: { maxOpen: number };
@@ -54,7 +53,6 @@ export type UnblockMemoryConfig = {
 
 export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
   enabled: false,
-  evidenceCorpora: ["sessions"],
   refinement: { maxPeoplePerRun: 10 },
   whisperer: { enabled: false, maxChars: 1200 },
   todos: { maxOpen: 1000 },
@@ -187,25 +185,13 @@ function resolvePeople(value: unknown): UnblockMemoryConfig["people"] {
   const people = value as Record<string, unknown>;
   assertOnlyKeys(
     people,
-    ["enabled", "evidenceCorpora", "refinement", "whisperer", "todos"],
+    ["enabled", "refinement", "whisperer", "todos"],
     "people",
   );
 
   const enabled = people.enabled ?? false;
   if (typeof enabled !== "boolean")
     throw new Error("unblock-memory people.enabled must be a boolean");
-
-  const configuredCorpora = people.evidenceCorpora ?? DEFAULT_PEOPLE_CONFIG.evidenceCorpora;
-  if (
-    !Array.isArray(configuredCorpora) ||
-    configuredCorpora.length === 0 ||
-    !configuredCorpora.every((name) => typeof name === "string" && name.trim())
-  ) {
-    throw new Error(
-      "unblock-memory people.evidenceCorpora must be a non-empty array of non-empty strings",
-    );
-  }
-  const evidenceCorpora = [...new Set(configuredCorpora.map((name) => name.trim()))];
 
   const refinement = people.refinement ?? {};
   if (!refinement || typeof refinement !== "object" || Array.isArray(refinement)) {
@@ -234,7 +220,6 @@ function resolvePeople(value: unknown): UnblockMemoryConfig["people"] {
 
   return {
     enabled,
-    evidenceCorpora,
     refinement: {
       maxPeoplePerRun: positiveInteger(
         refinementRecord.maxPeoplePerRun,

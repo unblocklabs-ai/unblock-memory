@@ -452,7 +452,48 @@ test("spawns the configured executable with fixed database and optional config a
   );
 });
 
-test("aborting reclustering terminates the worker", async () => {
+test("rejects with arbitrary reasons without spawning an already-aborted worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-worker-pre-abort-"));
+  const executable = join(root, "does-not-exist");
+  for (const reason of [
+    undefined,
+    null,
+    "cancelled",
+    42,
+    false,
+    { message: "cancelled" },
+  ] as const) {
+    const controller = new AbortController();
+    if (reason === undefined) controller.abort();
+    else controller.abort(reason);
+    const expected = controller.signal.reason;
+    await assert.rejects(
+      runAnalysisWorker({
+        executable,
+        dbPath: join(root, "index.sqlite"),
+        collections: ["memory"],
+        signal: controller.signal,
+      }),
+      (error) => error === expected,
+    );
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  }
+});
+
+test("settles once when spawning the worker emits an error and close", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-worker-error-"));
+  const controller = new AbortController();
+  const pending = runAnalysisWorker({
+    executable: join(root, "does-not-exist"),
+    dbPath: join(root, "index.sqlite"),
+    collections: ["memory"],
+    signal: controller.signal,
+  });
+  await assert.rejects(pending, (error) => (error as NodeJS.ErrnoException).code === "ENOENT");
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("aborting reclustering force-kills a worker that ignores SIGTERM", async () => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-worker-abort-"));
   const executable = join(root, "worker");
   const ready = join(root, "ready.txt");
@@ -461,7 +502,6 @@ test("aborting reclustering terminates the worker", async () => {
 import { writeFileSync } from "node:fs";
 process.on("SIGTERM", () => {
   writeFileSync(${JSON.stringify(stopped)}, "stopped");
-  setTimeout(() => process.exit(0), 50);
 });
 writeFileSync(${JSON.stringify(ready)}, "ready");
 setInterval(() => {}, 1_000);
@@ -477,8 +517,11 @@ setInterval(() => {}, 1_000);
   });
   assert.equal(getEventListeners(controller.signal, "abort").length, listenerCount + 1);
   await waitForFile(ready);
-  controller.abort(new Error("cancelled"));
-  await assert.rejects(pending, /cancelled/);
+  const reason = { message: "cancelled" };
+  const abortedAt = Date.now();
+  controller.abort(reason);
+  await assert.rejects(pending, (error) => error === reason);
+  assert.ok(Date.now() - abortedAt < 2_000);
   assert.equal(await readFile(stopped, "utf8"), "stopped");
   assert.equal(getEventListeners(controller.signal, "abort").length, listenerCount);
 });

@@ -51,7 +51,7 @@ export function readPersonSessionEvidence(params) {
       JOIN session_windows AS sessions ON sessions.session_id = active.session_id
       LEFT JOIN conversations ON conversations.conversation_id = sessions.primary_conversation_id
       WHERE active.message_position IS NOT NULL
-        AND sessions.channel = 'slack'
+        AND COALESCE(sessions.channel, conversations.channel) = 'slack'
         AND COALESCE(sessions.account_id, conversations.account_id) = ?
         AND json_extract(events.event_json, '$.type') = 'message'
         AND json_extract(events.event_json, '$.message.role') = 'user'

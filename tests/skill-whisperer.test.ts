@@ -131,6 +131,29 @@ test("successful direct reads share the suggestion cooldown and session end clea
   ))?.prependContext ?? "", /beta/);
 });
 
+test("symlinked suggestions and canonical reads share cooldown state", async () => {
+  const hooks = new Map<string, (...args: never[]) => unknown>();
+  const api = {
+    config: {},
+    logger: { warn() {} },
+    on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, handler); },
+  } as unknown as OpenClawPluginApi;
+  const lexicalPath = "/skills-linked/deploy/SKILL.md";
+  const canonicalPath = "/skills/deploy/SKILL.md";
+  registerSkillWhisperer(api, {
+    async searchSkills() { return [{ name: "deploy", path: lexicalPath, score: 0.9 }]; },
+    resolveSkillPath(_params, path) {
+      return path === lexicalPath || path === canonicalPath ? canonicalPath : undefined;
+    },
+  }, enabled);
+  const before = hooks.get("before_prompt_build") as unknown as BeforePromptBuild;
+  const after = hooks.get("after_tool_call") as unknown as AfterToolCall;
+  const context: HookContext = { trigger: "user", runId: "run-1", agentId: "bill", sessionId: "session" };
+
+  await after({ toolName: "read", params: { path: canonicalPath } }, context);
+  assert.equal(await before({ prompt: "deploy", messages: [] }, context), undefined);
+});
+
 test("disabled whispering registers no hooks", () => {
   let registrations = 0;
   const api = {

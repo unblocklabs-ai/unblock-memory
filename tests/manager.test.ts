@@ -18,9 +18,9 @@ import { createAgentDatabase } from "./helpers/session-database.js";
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-async function waitFor(check: () => boolean, label: string): Promise<void> {
+async function waitFor(check: () => boolean | Promise<boolean>, label: string): Promise<void> {
   const deadline = Date.now() + 5_000;
-  while (!check()) {
+  while (!(await check())) {
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
     await delay(25);
   }
@@ -396,7 +396,7 @@ test("scopes vector search to named corpora and labels results", async () => {
   }
 });
 
-test("keeps skill vectors private to direct skill search", async () => {
+test("keeps skills out of QMD while direct skill search watches frontmatter", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-skills-"));
   const dbPath = join(workspace, "index.sqlite");
   await mkdir(join(workspace, "skills", "deploy"), { recursive: true });
@@ -419,6 +419,8 @@ test("keeps skill vectors private to direct skill search", async () => {
   }]);
   const backing = await createStore({ dbPath, config: { collections: {} } });
   const embedded: string[] = [];
+  const qmdUpdates: Array<readonly string[]> = [];
+  const qmdEmbeds: Array<string | undefined> = [];
   backing.internal.llm = {
     embedModelName: "embeddinggemma-300M",
     async embed(text: string) {
@@ -432,6 +434,14 @@ test("keeps skill vectors private to direct skill search", async () => {
   } as QMDStore["internal"]["llm"];
   const store = createManagerStore({
     internal: backing.internal,
+    async update(options) {
+      qmdUpdates.push(options?.collections ?? []);
+      return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 };
+    },
+    async embed(options) {
+      qmdEmbeds.push(options?.collection);
+      return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+    },
     async close() { await backing.close(); },
   });
   const manager = new QmdMemoryManager({
@@ -466,9 +476,164 @@ test("keeps skill vectors private to direct skill search", async () => {
       "task: search result | query: deploy",
     ]);
     assert.equal(embedded.some((text) => text.includes("PROCEDURE")), false);
+    assert.deepEqual(qmdUpdates, [[memory.collection]]);
+    assert.deepEqual(qmdEmbeds, [memory.collection]);
+
+    await writeFile(join(workspace, "skills", "deploy", "SKILL.md"),
+      "---\nname: release-helper\ndescription: Ship releases safely.\n---\nUPDATED PROCEDURE MUST NOT BE EMBEDDED.\n");
+    await waitFor(async () => (await manager.searchSkills("release", 0.6, 10))
+      .some((candidate) => candidate.name === "release-helper"), "skill frontmatter refresh");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(qmdUpdates.length, 1);
+
+    await writeFile(join(workspace, "MEMORY.md"), "updated memory body\n");
+    await waitFor(() => qmdUpdates.length === 2, "regular memory refresh");
+    assert.equal(embedded.some((text) => text.includes("PROCEDURE")), false);
+    assert.equal(qmdUpdates.every((collections) =>
+      !collections.includes(skills!.collection) && !collections.includes(globalSkills!.collection)), true);
+    assert.equal(qmdEmbeds.every((collection) =>
+      collection !== skills!.collection && collection !== globalSkills!.collection), true);
   } finally {
     await manager.close();
   }
+});
+
+test("syncs a skill edit when the changed path also matches regular memory", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-overlapping-sources-"));
+  const skillPath = join(workspace, "skills", "deploy", "SKILL.md");
+  await mkdir(join(skillPath, ".."), { recursive: true });
+  await writeFile(skillPath, "---\nname: deploy\n---\n");
+  const memory = resolveSource(workspace, "skills/**/*.md");
+  const [skills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+  let qmdUpdates = 0;
+  const manager = new QmdMemoryManager({
+    dbPath: join(workspace, "index.sqlite"),
+    workspaceDir: workspace,
+    sources: [memory, skills!],
+    storeFactory: async () => createManagerStore({
+      async update() {
+        qmdUpdates += 1;
+        return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 };
+      },
+    }),
+  });
+  try {
+    await manager.start();
+    assert.equal(qmdUpdates, 1);
+    await writeFile(skillPath, "---\nname: deploy-updated\n---\n");
+    await waitFor(() => qmdUpdates === 2, "overlapping skill and memory refresh");
+  } finally {
+    await manager.close();
+  }
+});
+
+test("a failed stale skill-index build cannot clear the replacement snapshot", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-skill-index-snapshot-"));
+  const skillPath = join(workspace, "skills", "deploy", "SKILL.md");
+  await mkdir(join(skillPath, ".."), { recursive: true });
+  await writeFile(skillPath, "---\nname: old-skill\ndescription: deploy\n---\n");
+  const memory = resolveSource(workspace, "skills/**/*.md");
+  const [skills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+  let releaseFirstBuild: (() => void) | undefined;
+  let buildCount = 0;
+  let qmdUpdates = 0;
+  const firstBuild = new Promise<void>((resolve) => { releaseFirstBuild = resolve; });
+  const backing = await createStore({ dbPath: join(workspace, "index.sqlite"), config: { collections: {} } });
+  backing.internal.llm = {
+    embedModelName: "embeddinggemma-300M",
+    async embed(_text: string) {
+      return { embedding: [1], model: "test" };
+    },
+    async embedBatch(texts: string[]) {
+      buildCount += 1;
+      if (buildCount === 1) {
+        await firstBuild;
+        throw new Error("stale index failed");
+      }
+      return texts.map(() => ({ embedding: [1], model: "test" }));
+    },
+  } as QMDStore["internal"]["llm"];
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: workspace,
+    sources: [memory, skills!],
+    storeFactory: async () => createManagerStore({
+      internal: backing.internal,
+      async update() {
+        qmdUpdates += 1;
+        return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 };
+      },
+      async close() { await backing.close(); },
+    }),
+  });
+  try {
+    await manager.start();
+    const stale = manager.searchSkills("deploy", 0, 10);
+    await waitFor(() => buildCount === 1, "first skill-index build");
+    await writeFile(skillPath, "---\nname: new-skill\ndescription: deploy\n---\n");
+    await waitFor(() => qmdUpdates === 2, "overlapping skill and memory refresh");
+    assert.equal((await manager.searchSkills("deploy", 0, 10))[0]?.name, "new-skill");
+    assert.equal(buildCount, 2);
+
+    releaseFirstBuild?.();
+    await assert.rejects(stale, /stale index failed/);
+    assert.equal((await manager.searchSkills("deploy", 0, 10))[0]?.name, "new-skill");
+    assert.equal(buildCount, 2);
+  } finally {
+    releaseFirstBuild?.();
+    await manager.close();
+  }
+});
+
+test("prunes obsolete QMD skill collections instead of configuring them", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-prune-derived-skills-"));
+  const dbPath = join(workspace, "index.sqlite");
+  const skillDir = join(workspace, "skills", "deploy");
+  await mkdir(skillDir, { recursive: true });
+  const marker = "obsoleteqmdskillembeddingmarkerx";
+  await writeFile(join(skillDir, "SKILL.md"),
+    `---\nname: deploy-helper\ndescription: Deploy safely.\n---\n${marker}\n`);
+
+  const [skills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+  const oldStore = await createStore({
+    dbPath,
+    config: { collections: {
+      [skills!.collection]: { path: skills!.root, pattern: skills!.pattern },
+    } },
+  });
+  await oldStore.update({ collections: [skills!.collection] });
+  await oldStore.close();
+
+  const manager = new QmdMemoryManager({
+    dbPath,
+    workspaceDir: workspace,
+    sources: [skills!],
+  });
+  await manager.start();
+  await manager.close();
+
+  const reopened = await createStore({ dbPath, config: { collections: {} } });
+  try {
+    assert.deepEqual((await reopened.getStatus()).collections, []);
+    assert.deepEqual(reopened.internal.db.prepare(
+      "SELECT COUNT(*) AS count FROM documents WHERE collection = ?",
+    ).get(skills!.collection), { count: 0 });
+  } finally {
+    await reopened.close();
+  }
+  await assertMarkerAbsent(dbPath, marker);
 });
 
 test("passes only non-skill collections to memory analysis", async () => {

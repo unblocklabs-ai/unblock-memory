@@ -25,7 +25,6 @@ export type UnblockMemoryConfig = {
     };
     people: {
         enabled: boolean;
-        evidenceCorpora: readonly string[];
         refinement: {
             maxPeoplePerRun: number;
         };

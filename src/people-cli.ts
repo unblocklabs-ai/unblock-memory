@@ -39,7 +39,6 @@ export function registerPeopleCli(
                 "openclaw-agent.sqlite",
               ),
               candidateLimit: config.refinement.maxPeoplePerRun,
-              includeSessionEvidence: config.evidenceCorpora.includes("sessions"),
               maxBlurbChars: config.whisperer.maxChars,
               runner,
             });

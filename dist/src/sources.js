@@ -121,6 +121,13 @@ export function resolveConfiguredSkillPath(workspaceDir, inputPath, sources) {
     }
     return undefined;
 }
+export function sourceMatchesPath(source, inputPath) {
+    const target = resolve(inputPath);
+    const relativePath = relative(source.root, target);
+    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath))
+        return false;
+    return picomatch.isMatch(relativePath.split(sep).join("/"), source.pattern, { dot: true });
+}
 export function parseSafeVirtualPath(virtualPath, sources) {
     const match = /^qmd:\/\/([^/]+)\/(.+)$/.exec(virtualPath.trim());
     if (!match)

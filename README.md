@@ -179,7 +179,8 @@ openclaw automations create "0 4 * * 0" \
 batch, reads exact-sender session evidence, and invokes one
 ephemeral, read-only `codex exec` with structured output. It validates the
 complete result set, person IDs, dossier schema, and evidence locators before
-writing each dossier transactionally.
+writing each dossier transactionally. Refinement uses exact-attributed session
+evidence; additional evidence sources can be added when they are implemented.
 The host running the command must already have working Codex CLI authentication.
 The plugin performs no model call on the prompt-injection path.
 

@@ -46,7 +46,7 @@ import {
   type SessionSyncResult,
 } from "./session-sync.js";
 import type { SessionMetadata } from "./session-projector.js";
-import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
+import { parseSafeVirtualPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
 
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
@@ -443,7 +443,10 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     });
     this.#watcher.on("all", (_event, path) => {
       if (this.#closed) return;
-      if (basename(path).toLowerCase() === "skill.md") this.#skillIndex = undefined;
+      const matchingSources = [...this.#sources.values()].filter((source) =>
+        source.kind !== "sessions" && sourceMatchesPath(source, path));
+      if (matchingSources.some((source) => source.kind === "skills")) this.#skillIndex = undefined;
+      if (!matchingSources.some((source) => source.kind !== "skills")) return;
       this.#dirty = true;
       if (this.#watchTimer) clearTimeout(this.#watchTimer);
       this.#watchTimer = setTimeout(() => {
@@ -475,7 +478,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       keepModelsWarm: this.#keepModelsWarm,
       config: {
         collections: Object.fromEntries(
-          [...this.#sources.values()].map((source) => [
+          this.#qmdSources().map((source) => [
             source.collection,
             { path: source.root, pattern: source.pattern },
           ]),
@@ -489,7 +492,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       this.#analysisCollectionNames(),
       this.#skillCollectionNames().length > 0,
     );
-    const configuredCollections = new Set(this.#allCollectionNames());
+    const configuredCollections = new Set(this.#qmdSources().map((source) => source.collection));
     const staleCollections = (await store.getStatus()).collections
       .map((collection) => collection.name)
       .filter((collection) => !configuredCollections.has(collection));
@@ -521,8 +524,8 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     return store;
   }
 
-  #allCollectionNames(): string[] {
-    return [...this.#sources.keys()];
+  #qmdSources(): ResolvedSource[] {
+    return [...this.#sources.values()].filter((source) => source.kind !== "skills");
   }
 
   #analysisCollectionNames(): string[] {
@@ -559,7 +562,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       const store = await this.#getStore();
       this.#dirty = true;
       const analysisStore = store as Partial<AnalysisStore>;
-      const collections = [...this.#sources.values()].filter((source) => source.kind !== "sessions");
+      const collections = this.#qmdSources().filter((source) => source.kind !== "sessions");
       let analysisMarkedStale = false;
       const markAnalysisStale = () => {
         if (analysisMarkedStale || !analysisStore.internal) return;
@@ -580,14 +583,13 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
         const update = await store.update({ collections: [source.collection] });
         this.#cleanupRemovedDocuments?.(update.updated + update.removed);
         const changed = update.indexed + update.updated + update.removed > 0 || update.needsEmbedding > 0;
-        if (source.kind === "skills" && (changed || params?.force === true)) this.#skillIndex = undefined;
-        if (source.kind !== "skills" && (changed || params?.force === true)) markAnalysisStale();
+        if (changed || params?.force === true) markAnalysisStale();
         const embed = await store.embed({
           collection: source.collection,
           force: params?.force,
           chunkStrategy: "semantic",
         });
-        if (source.kind !== "skills" && completedEmbeddingCount(embed) > 0) markAnalysisStale();
+        if (completedEmbeddingCount(embed) > 0) markAnalysisStale();
       }
       const status = await store.getStatus();
       const indexedCollections = await store.listCollections();
@@ -935,46 +937,51 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const store = await this.#getStore() as Partial<AnalysisStore>;
     if (!store.internal?.llm) throw new Error("Skill Whisperer requires the QMD embedding model");
     const llm = store.internal.llm;
-    this.#skillIndex ??= (async () => {
-      const sourceOrder = new Map([...this.#sources.keys()].map((collection, index) => [collection, index]));
-      const metadata = new Map<string, {
-        candidate: Omit<SkillSearchCandidate, "score">;
-        description: string;
-        sourceOrder: number;
-      }>();
-      for (const source of this.#sources.values()) {
-        if (source.kind !== "skills") continue;
-        for (const document of readSkillDocuments(source)) {
-          const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
-          const description = frontmatterValue(document.body, "description") ?? "";
-          const key = name.toLowerCase();
-          const order = sourceOrder.get(source.collection) ?? Number.MAX_SAFE_INTEGER;
-          const current = metadata.get(key);
-          if (!current || order < current.sourceOrder) {
-            metadata.set(key, {
-              candidate: { name, path: document.path },
-              description,
-              sourceOrder: order,
-            });
+    let skillIndex = this.#skillIndex;
+    if (!skillIndex) {
+      const pending = (async () => {
+        const sourceOrder = new Map([...this.#sources.keys()].map((collection, index) => [collection, index]));
+        const metadata = new Map<string, {
+          candidate: Omit<SkillSearchCandidate, "score">;
+          description: string;
+          sourceOrder: number;
+        }>();
+        for (const source of this.#sources.values()) {
+          if (source.kind !== "skills") continue;
+          for (const document of readSkillDocuments(source)) {
+            const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
+            const description = frontmatterValue(document.body, "description") ?? "";
+            const key = name.toLowerCase();
+            const order = sourceOrder.get(source.collection) ?? Number.MAX_SAFE_INTEGER;
+            const current = metadata.get(key);
+            if (!current || order < current.sourceOrder) {
+              metadata.set(key, {
+                candidate: { name, path: document.path },
+                description,
+                sourceOrder: order,
+              });
+            }
           }
         }
-      }
-      const skills = [...metadata.values()];
-      const embeddings = await llm.embedBatch(
-        skills.map(({ candidate, description }) =>
-          embeddingText(candidate.name, description, llm.embedModelName)),
-      );
-      return skills.flatMap(({ candidate }, index) => {
-        const embedding = embeddings[index]?.embedding;
-        return embedding ? [{ ...candidate, score: 0, embedding }] : [];
+        const skills = [...metadata.values()];
+        const embeddings = await llm.embedBatch(
+          skills.map(({ candidate, description }) =>
+            embeddingText(candidate.name, description, llm.embedModelName)),
+        );
+        return skills.flatMap(({ candidate }, index) => {
+          const embedding = embeddings[index]?.embedding;
+          return embedding ? [{ ...candidate, score: 0, embedding }] : [];
+        });
+      })();
+      skillIndex = pending.catch((error) => {
+        if (this.#skillIndex === skillIndex) this.#skillIndex = undefined;
+        throw error;
       });
-    })().catch((error) => {
-      this.#skillIndex = undefined;
-      throw error;
-    });
+      this.#skillIndex = skillIndex;
+    }
     const queryEmbedding = await llm.embed(queryText(query, llm.embedModelName), { isQuery: true });
     if (!queryEmbedding) return [];
-    const candidates = await this.#skillIndex;
+    const candidates = await skillIndex;
     return candidates
       .map(({ embedding, ...candidate }) => ({
         ...candidate,

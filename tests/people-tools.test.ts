@@ -17,7 +17,6 @@ import { createOpenClawSlackDirectory } from "../src/slack-directory.js";
 
 const peopleConfig: UnblockMemoryConfig["people"] = {
   enabled: true,
-  evidenceCorpora: ["memory", "sessions"],
   refinement: { maxPeoplePerRun: 2 },
   whisperer: { enabled: true, maxChars: 1200 },
   todos: { maxOpen: 10 },

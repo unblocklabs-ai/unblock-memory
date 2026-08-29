@@ -88,20 +88,25 @@ export function registerSkillWhisperer(
     state.lastRunId = context.runId;
     state.turn += 1;
     try {
+      const runtimeParams = active(context.agentId);
       const candidates = await runtime.searchSkills(
-        active(context.agentId),
+        runtimeParams,
         buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages),
         config.minScore,
         CANDIDATE_LIMIT,
       );
-      const selected = candidates[0];
-      if (!selected || selected.score < config.minScore) return;
-      const previous = state.skills.get(selected.path);
+      const resolved = candidates.flatMap((candidate) => {
+        const canonicalPath = runtime.resolveSkillPath(runtimeParams, candidate.path);
+        return canonicalPath ? [{ candidate, canonicalPath }] : [];
+      })[0];
+      if (!resolved || resolved.candidate.score < config.minScore) return;
+      const { candidate: selected, canonicalPath } = resolved;
+      const previous = state.skills.get(canonicalPath);
       const lastSeen = Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity);
       if (state.turn - lastSeen <= config.cooldownTurns) return;
-      const history = state.skills.get(selected.path) ?? {};
+      const history = state.skills.get(canonicalPath) ?? {};
       history.suggested = state.turn;
-      state.skills.set(selected.path, history);
+      state.skills.set(canonicalPath, history);
       return {
         prependContext:
           `A potentially relevant skill is available: ${JSON.stringify(selected.name)} ` +

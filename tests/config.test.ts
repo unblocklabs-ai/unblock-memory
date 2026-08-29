@@ -19,7 +19,6 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
     resolveConfig({
       people: {
         enabled: true,
-        evidenceCorpora: [" memory ", "sessions", "memory"],
         refinement: { maxPeoplePerRun: 2 },
         whisperer: { enabled: true, maxChars: 800 },
         todos: { maxOpen: 20 },
@@ -27,7 +26,6 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
     }).people,
     {
       enabled: true,
-      evidenceCorpora: ["memory", "sessions"],
       refinement: { maxPeoplePerRun: 2 },
       whisperer: { enabled: true, maxChars: 800 },
       todos: { maxOpen: 20 },
@@ -35,7 +33,10 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
   );
   assert.throws(() => resolveConfig({ people: true }), /people must be an object/);
   assert.throws(() => resolveConfig({ people: { enabled: "yes" } }), /enabled must be a boolean/);
-  assert.throws(() => resolveConfig({ people: { evidenceCorpora: [] } }), /non-empty array/);
+  assert.throws(
+    () => resolveConfig({ people: { evidenceCorpora: ["sessions"] } }),
+    /unknown property: evidenceCorpora/,
+  );
   assert.throws(
     () => resolveConfig({ people: { refinement: { maxPeoplePerRun: 0 } } }),
     /positive integer/,

@@ -280,27 +280,35 @@ export function runAnalysisWorker(params: {
       stderrBytes += Math.min(chunk.length, remaining);
     });
     let settled = false;
-    let abortError: Error | undefined;
-    const cleanup = () => params.signal?.removeEventListener("abort", onAbort);
-    const finish = (error?: Error) => {
+    let aborted = false;
+    let abortReason: unknown;
+    let forceKill: NodeJS.Timeout | undefined;
+    const cleanup = () => {
+      params.signal?.removeEventListener("abort", onAbort);
+      if (forceKill) clearTimeout(forceKill);
+    };
+    const finish = (error?: unknown, shouldReject = error !== undefined) => {
       if (settled) return;
       settled = true;
       cleanup();
-      error ? reject(error) : resolve();
+      shouldReject ? reject(error) : resolve();
     };
     const onAbort = () => {
-      if (abortError) return;
-      abortError = params.signal?.reason instanceof Error
-        ? params.signal.reason
-        : new Error("Memory reclustering aborted");
+      if (aborted) return;
+      aborted = true;
+      abortReason = params.signal?.reason;
       child.kill("SIGTERM");
+      forceKill = setTimeout(() => {
+        if (!settled) child.kill("SIGKILL");
+      }, 250);
+      forceKill.unref();
     };
     params.signal?.addEventListener("abort", onAbort, { once: true });
     if (params.signal?.aborted) onAbort();
-    child.on("error", (error) => finish(abortError ?? error));
+    child.on("error", (error) => finish(aborted ? abortReason : error, true));
     child.on("close", (code, signal) => {
-      if (abortError) {
-        finish(abortError);
+      if (aborted) {
+        finish(abortReason, true);
         return;
       }
       if (code === 0) {

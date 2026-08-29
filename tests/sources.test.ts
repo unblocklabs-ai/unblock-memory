@@ -8,6 +8,7 @@ import {
   resolveConfiguredSkillPath,
   resolveSource,
   resolveSources,
+  sourceMatchesPath,
 } from "../src/sources.js";
 
 test("resolves exact files, directories, and globs deterministically", async () => {
@@ -22,6 +23,14 @@ test("resolves exact files, directories, and globs deterministically", async () 
   assert.equal(glob.pattern, "**/*.md");
   assert.equal(glob.root, join(workspace, "memory"));
   assert.equal(resolveSource(workspace, "MEMORY.md").collection, file.collection);
+});
+
+test("matches changed paths against source roots and patterns", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-source-match-"));
+  const source = resolveSource(workspace, "memory/**/SKILL.md");
+  assert.equal(sourceMatchesPath(source, join(workspace, "memory", "deploy", "SKILL.md")), true);
+  assert.equal(sourceMatchesPath(source, join(workspace, "memory", "deploy", "notes.md")), false);
+  assert.equal(sourceMatchesPath(source, join(workspace, "outside", "SKILL.md")), false);
 });
 
 test("treats a not-yet-created non-Markdown path as a directory", async () => {

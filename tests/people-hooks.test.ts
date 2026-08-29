@@ -44,7 +44,6 @@ type SessionEnd = (
 
 const peopleConfig: UnblockMemoryConfig["people"] = {
   enabled: true,
-  evidenceCorpora: ["memory", "sessions"],
   refinement: { maxPeoplePerRun: 10 },
   whisperer: { enabled: true, maxChars: 30 },
   todos: { maxOpen: 10 },

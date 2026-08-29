@@ -157,6 +157,13 @@ export function resolveConfiguredSkillPath(
   return undefined;
 }
 
+export function sourceMatchesPath(source: ResolvedSource, inputPath: string): boolean {
+  const target = resolve(inputPath);
+  const relativePath = relative(source.root, target);
+  if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) return false;
+  return picomatch.isMatch(relativePath.split(sep).join("/"), source.pattern, { dot: true });
+}
+
 export function parseSafeVirtualPath(
   virtualPath: string,
   sources: ReadonlyMap<string, ResolvedSource>,

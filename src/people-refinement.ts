@@ -100,7 +100,6 @@ export async function refinePeople(params: {
   runner: PeopleRefinementRunner;
   candidateLimit?: number;
   evidenceLimit?: number;
-  includeSessionEvidence?: boolean;
   signal?: AbortSignal;
 }): Promise<PeopleRefinementSummary> {
   const evidenceLimit = Math.max(1, Math.min(50, Math.floor(params.evidenceLimit ?? 20)));
@@ -115,26 +114,23 @@ export async function refinePeople(params: {
     considered += 1;
     if (!person.lastSeenAt) continue;
     const identities = params.store.listIdentities(person.id);
-    const evidence =
-      params.includeSessionEvidence === false
-        ? []
-        : identities
-            .filter((identity) => identity.provider === "slack")
-            .flatMap((identity) =>
-              readPersonSessionEvidence({
-                databasePath: params.agentDatabasePath,
-                agentId: params.agentId,
-                accountScope: identity.accountScope,
-                externalId: identity.externalId,
-                limit: evidenceLimit,
-              }),
-            )
-            .filter(
-              (entry, index, all) =>
-                all.findIndex((other) => other.locator === entry.locator) === index,
-            )
-            .sort((left, right) => right.observedAt.localeCompare(left.observedAt))
-            .slice(0, evidenceLimit);
+    const evidence = identities
+      .filter((identity) => identity.provider === "slack")
+      .flatMap((identity) =>
+        readPersonSessionEvidence({
+          databasePath: params.agentDatabasePath,
+          agentId: params.agentId,
+          accountScope: identity.accountScope,
+          externalId: identity.externalId,
+          limit: evidenceLimit,
+        }),
+      )
+      .filter(
+        (entry, index, all) =>
+          all.findIndex((other) => other.locator === entry.locator) === index,
+      )
+      .sort((left, right) => right.observedAt.localeCompare(left.observedAt))
+      .slice(0, evidenceLimit);
     if (evidence.length === 0) {
       skippedWithoutEvidence += 1;
       continue;
