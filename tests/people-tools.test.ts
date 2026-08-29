@@ -13,7 +13,6 @@ import type { UnblockMemoryConfig } from "../src/config.js";
 import { registerPeopleTools } from "../src/people-tools.js";
 import { PeopleStores } from "../src/people-store.js";
 import type { SlackDirectoryReader } from "../src/slack-directory.js";
-import { createOpenClawSlackDirectory } from "../src/slack-directory.js";
 
 const peopleConfig: UnblockMemoryConfig["people"] = {
   enabled: true,
@@ -260,51 +259,4 @@ test("manual Slack sync is owner-only, idempotent, normalized, and preserves the
   } finally {
     testHarness.stores.closeAll();
   }
-});
-
-test("production Slack reader delegates auth to the bounded OpenClaw directory CLI", async () => {
-  const calls: Array<{ executable: string; args: readonly string[]; maxBuffer: number }> = [];
-  const reader = createOpenClawSlackDirectory(async (executable, args, options) => {
-    calls.push({ executable, args, maxBuffer: options.maxBuffer });
-    return {
-      stdout: JSON.stringify([
-        {
-          kind: "user",
-          id: " user:U123 ",
-          name: " Bek ",
-          handle: " @bek ",
-          raw: { token: "DO_NOT_COPY", profile: { title: "unsupported raw field" } },
-        },
-      ]),
-    };
-  });
-  assert.deepEqual(await reader.listUsers({ accountId: "workspace", limit: 25 }), [
-    {
-      id: "U123",
-      name: "Bek",
-      handle: "bek",
-    },
-  ]);
-  assert.deepEqual(calls, [
-    {
-      executable: "openclaw",
-      args: [
-        "directory",
-        "peers",
-        "list",
-        "--channel",
-        "slack",
-        "--account",
-        "workspace",
-        "--limit",
-        "25",
-        "--json",
-      ],
-      maxBuffer: 1024 * 1024,
-    },
-  ]);
-  assert.doesNotMatch(
-    JSON.stringify(await reader.listUsers({ accountId: "workspace", limit: 25 })),
-    /DO_NOT_COPY/,
-  );
 });

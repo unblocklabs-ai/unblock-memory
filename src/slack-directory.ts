@@ -1,8 +1,6 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { inspectReadOnlyChannelAccount } from "openclaw/plugin-sdk/directory-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { PeopleStore } from "./people-store.js";
-
-const execFileAsync = promisify(execFile);
 
 type SlackDirectoryEntry = {
   id: string;
@@ -15,66 +13,102 @@ export type SlackDirectoryReader = {
   listUsers(params: { accountId: string; limit: number }): Promise<readonly SlackDirectoryEntry[]>;
 };
 
-type DirectoryCommand = (
-  executable: string,
-  args: readonly string[],
-  options: { maxBuffer: number },
-) => Promise<{ stdout: string }>;
+type SlackAccountInspector = (params: {
+  channelId: "slack";
+  cfg: OpenClawConfig;
+  accountId: string;
+}) => Promise<Record<string, unknown> | null>;
+
+type SlackRequest = (
+  input: string | URL,
+  init: { headers: { authorization: string }; signal: AbortSignal },
+) => Promise<Pick<Response, "json" | "ok" | "status">>;
 
 function text(value: unknown, maxLength: number): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, maxLength) : undefined;
 }
 
-export function createOpenClawSlackDirectory(
-  run: DirectoryCommand = async (executable, args, options) => {
-    const result = await execFileAsync(executable, args, options);
-    return { stdout: result.stdout };
-  },
-): SlackDirectoryReader {
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function slackToken(account: Record<string, unknown>): string | undefined {
+  return text(account.userToken, 10_000) ?? text(account.botToken, 10_000);
+}
+
+function slackEntry(value: unknown): SlackDirectoryEntry | undefined {
+  const member = record(value);
+  const id = text(member?.id, 200);
+  if (!id) return undefined;
+  const profile = record(member?.profile);
   return {
-    async listUsers({ accountId, limit }) {
-      const { stdout } = await run(
-        "openclaw",
-        [
-          "directory",
-          "peers",
-          "list",
-          "--channel",
-          "slack",
-          "--account",
-          accountId,
-          "--limit",
-          String(limit),
-          "--json",
-        ],
-        { maxBuffer: 1024 * 1024 },
-      );
-      const parsed: unknown = JSON.parse(stdout);
-      if (!Array.isArray(parsed))
-        throw new Error("OpenClaw Slack directory returned an invalid response");
-      return parsed.flatMap((value): SlackDirectoryEntry[] => {
-        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-        const entry = value as Record<string, unknown>;
-        if (entry.kind !== "user") return [];
-        const prefixedId = text(entry.id, 200);
-        if (!prefixedId?.startsWith("user:")) return [];
-        const id = text(prefixedId.slice("user:".length), 200);
-        const handle = text(entry.handle, 200);
-        return id
-          ? [
-              {
-                id,
-                name: text(entry.name, 500),
-                handle: text(handle?.startsWith("@") ? handle.slice(1) : handle, 200),
-              },
-            ]
-          : [];
-      });
-    },
+    id,
+    name:
+      text(profile?.display_name, 500) ??
+      text(profile?.real_name, 500) ??
+      text(member?.real_name, 500) ??
+      text(member?.name, 500),
+    handle: text(member?.name, 200),
+    avatarUrl:
+      text(profile?.image_512, 2_000) ??
+      text(profile?.image_192, 2_000) ??
+      text(profile?.image_72, 2_000),
   };
 }
 
-export const openClawSlackDirectory = createOpenClawSlackDirectory();
+export function createOpenClawSlackDirectory(params: {
+  getConfig: () => OpenClawConfig | undefined;
+  inspectAccount?: SlackAccountInspector;
+  request?: SlackRequest;
+}): SlackDirectoryReader {
+  const inspectAccount = params.inspectAccount ?? inspectReadOnlyChannelAccount;
+  const request: SlackRequest = params.request ?? fetch;
+  return {
+    async listUsers({ accountId, limit }) {
+      const cfg = params.getConfig();
+      if (!cfg) throw new Error("OpenClaw runtime config is unavailable");
+      const account = await inspectAccount({ channelId: "slack", cfg, accountId });
+      const token = account ? slackToken(account) : undefined;
+      if (!token) {
+        throw new Error(
+          `Slack credentials for account "${accountId}" are unavailable in the active runtime snapshot`,
+        );
+      }
+
+      const entries: SlackDirectoryEntry[] = [];
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      while (entries.length < limit) {
+        const url = new URL("https://slack.com/api/users.list");
+        url.searchParams.set("limit", String(Math.min(limit, 200)));
+        if (cursor) url.searchParams.set("cursor", cursor);
+        const response = await request(url, {
+          headers: { authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(30_000),
+        });
+        const payload = record(await response.json());
+        if (!response.ok || payload?.ok !== true) {
+          const detail = text(payload?.error, 200) ?? `HTTP ${response.status}`;
+          throw new Error(`Slack directory request failed: ${detail}`);
+        }
+        const members = Array.isArray(payload.members) ? payload.members : [];
+        for (const member of members) {
+          const entry = slackEntry(member);
+          if (entry) entries.push(entry);
+          if (entries.length === limit) break;
+        }
+        const next = text(record(payload.response_metadata)?.next_cursor, 2_000);
+        if (!next) break;
+        if (cursors.has(next)) throw new Error("Slack directory returned a repeated cursor");
+        cursors.add(next);
+        cursor = next;
+      }
+      return entries;
+    },
+  };
+}
 
 export async function syncSlackDirectory(params: {
   store: PeopleStore;

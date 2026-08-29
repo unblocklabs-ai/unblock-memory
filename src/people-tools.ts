@@ -9,7 +9,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import { renderPeopleWhisper } from "./people-hooks.js";
 import type { PeopleStores } from "./people-store.js";
 import {
-  openClawSlackDirectory,
+  createOpenClawSlackDirectory,
   syncSlackDirectory,
   type SlackDirectoryReader,
 } from "./slack-directory.js";
@@ -252,7 +252,7 @@ export function registerPeopleTools(
   api: OpenClawPluginApi,
   stores: PeopleStores,
   config: UnblockMemoryConfig["people"],
-  directoryReader: SlackDirectoryReader = openClawSlackDirectory,
+  directoryReader?: SlackDirectoryReader,
 ): void {
   api.registerTool((ctx) => createInspectTool(stores, config, ctx), {
     names: ["memory_people_inspect"],
@@ -262,8 +262,19 @@ export function registerPeopleTools(
     names: ["memory_people_update"],
     optional: true,
   });
-  api.registerTool((ctx) => createSyncTool(stores, directoryReader, ctx), {
-    names: ["memory_people_sync"],
-    optional: true,
-  });
+  api.registerTool(
+    (ctx) =>
+      createSyncTool(
+        stores,
+        directoryReader ??
+          createOpenClawSlackDirectory({
+            getConfig: () => ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config,
+          }),
+        ctx,
+      ),
+    {
+      names: ["memory_people_sync"],
+      optional: true,
+    },
+  );
 }

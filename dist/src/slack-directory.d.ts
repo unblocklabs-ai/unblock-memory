@@ -1,3 +1,4 @@
+import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { PeopleStore } from "./people-store.js";
 type SlackDirectoryEntry = {
     id: string;
@@ -11,13 +12,22 @@ export type SlackDirectoryReader = {
         limit: number;
     }): Promise<readonly SlackDirectoryEntry[]>;
 };
-type DirectoryCommand = (executable: string, args: readonly string[], options: {
-    maxBuffer: number;
-}) => Promise<{
-    stdout: string;
-}>;
-export declare function createOpenClawSlackDirectory(run?: DirectoryCommand): SlackDirectoryReader;
-export declare const openClawSlackDirectory: SlackDirectoryReader;
+type SlackAccountInspector = (params: {
+    channelId: "slack";
+    cfg: OpenClawConfig;
+    accountId: string;
+}) => Promise<Record<string, unknown> | null>;
+type SlackRequest = (input: string | URL, init: {
+    headers: {
+        authorization: string;
+    };
+    signal: AbortSignal;
+}) => Promise<Pick<Response, "json" | "ok" | "status">>;
+export declare function createOpenClawSlackDirectory(params: {
+    getConfig: () => OpenClawConfig | undefined;
+    inspectAccount?: SlackAccountInspector;
+    request?: SlackRequest;
+}): SlackDirectoryReader;
 export declare function syncSlackDirectory(params: {
     store: PeopleStore;
     reader: SlackDirectoryReader;
