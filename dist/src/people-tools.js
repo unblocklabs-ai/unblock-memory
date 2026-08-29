@@ -2,7 +2,7 @@ import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { renderPeopleWhisper } from "./people-hooks.js";
-import { openClawSlackDirectory, syncSlackDirectory, } from "./slack-directory.js";
+import { createOpenClawSlackDirectory, syncSlackDirectory, } from "./slack-directory.js";
 const nonEmpty = Type.String({ pattern: "\\S", maxLength: 1000 });
 const personSelector = Type.Union([
     Type.Object({ view: Type.Literal("person"), personId: nonEmpty }, { additionalProperties: false }),
@@ -174,7 +174,7 @@ function createSyncTool(stores, reader, ctx) {
         },
     };
 }
-export function registerPeopleTools(api, stores, config, directoryReader = openClawSlackDirectory) {
+export function registerPeopleTools(api, stores, config, directoryReader) {
     api.registerTool((ctx) => createInspectTool(stores, config, ctx), {
         names: ["memory_people_inspect"],
         optional: true,
@@ -183,7 +183,10 @@ export function registerPeopleTools(api, stores, config, directoryReader = openC
         names: ["memory_people_update"],
         optional: true,
     });
-    api.registerTool((ctx) => createSyncTool(stores, directoryReader, ctx), {
+    api.registerTool((ctx) => createSyncTool(stores, directoryReader ??
+        createOpenClawSlackDirectory({
+            getConfig: () => ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config,
+        }), ctx), {
         names: ["memory_people_sync"],
         optional: true,
     });
