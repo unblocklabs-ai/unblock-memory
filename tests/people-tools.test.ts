@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { normalizeToolParameterSchema } from "@openclaw/ai/internal/openai";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,10 +23,17 @@ const peopleConfig: UnblockMemoryConfig["people"] = {
 };
 
 type Tool = {
+  parameters: unknown;
   execute(
     toolCallId: string,
     params: unknown,
   ): Promise<{ content: Array<{ type: string; text: string }> }>;
+};
+
+type ObjectSchema = {
+  type?: string;
+  required?: string[];
+  properties?: Record<string, unknown>;
 };
 
 function resultJson(result: {
@@ -141,6 +149,51 @@ test("people tools are optional and administrative updates use host owner author
     assert.equal((inspected.company as { name: string }).name, "Unblock Labs");
     assert.equal(inspected.injectionEligible, true);
     assert.equal(inspected.contribution, dossier.blurb);
+
+    const inspectedById = resultJson(
+      await testHarness.tool("memory_people_inspect", true).execute("call", {
+        view: "person",
+        personId: person.id,
+      }),
+    );
+    assert.equal(inspectedById.status, "ok");
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("person selectors survive OpenClaw model schema normalization", async () => {
+  const testHarness = await harness();
+  try {
+    const inspect = testHarness.tool("memory_people_inspect", true);
+    const normalized = normalizeToolParameterSchema(inspect.parameters) as ObjectSchema;
+
+    assert.equal(normalized.type, "object");
+    assert.deepEqual(normalized.required, ["view"]);
+    assert.deepEqual(Object.keys(normalized.properties ?? {}).sort(), [
+      "identity",
+      "limit",
+      "personId",
+      "view",
+    ]);
+    assert.deepEqual(
+      (normalized.properties?.view as { enum?: string[] } | undefined)?.enum,
+      ["person", "todos"],
+    );
+    assert.deepEqual(
+      Object.keys(
+        ((normalized.properties?.identity as ObjectSchema | undefined)?.properties ?? {}),
+      ).sort(),
+      ["accountScope", "externalId", "provider"],
+    );
+
+    await assert.rejects(
+      inspect.execute("call", {
+        view: "person",
+        id: "U123",
+        accountId: "default",
+      }),
+    );
   } finally {
     testHarness.stores.closeAll();
   }

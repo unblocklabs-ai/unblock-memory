@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",
@@ -41,6 +41,7 @@
     "typebox": "1.3.6"
   },
   "devDependencies": {
+    "@openclaw/ai": "2026.8.1-beta.3",
     "@openclaw/plugin-inspector": "^0.3.10",
     "@types/node": "^24.6.0",
     "@types/picomatch": "^4.0.2",
