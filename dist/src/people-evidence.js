@@ -1,0 +1,93 @@
+import { DatabaseSync } from "node:sqlite";
+function record(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : undefined;
+}
+function messageText(value) {
+    if (typeof value === "string")
+        return value.trim() || undefined;
+    if (!Array.isArray(value))
+        return undefined;
+    const text = value
+        .flatMap((part) => {
+        const block = record(part);
+        return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
+    })
+        .join("\n")
+        .trim();
+    return text || undefined;
+}
+function evidenceTimestamp(event, fallback) {
+    const raw = event.timestamp;
+    const milliseconds = typeof raw === "number" && Number.isFinite(raw)
+        ? raw
+        : typeof raw === "string"
+            ? Date.parse(raw)
+            : fallback;
+    return new Date(Number.isFinite(milliseconds) ? milliseconds : fallback).toISOString();
+}
+export function readPersonSessionEvidence(params) {
+    const limit = Math.max(1, Math.min(50, Math.floor(params.limit ?? 20)));
+    const maxMessageChars = Math.max(1, Math.min(4000, Math.floor(params.maxMessageChars ?? 2000)));
+    const db = new DatabaseSync(params.databasePath, { readOnly: true });
+    try {
+        db.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; BEGIN");
+        const version = db.prepare("PRAGMA user_version").get();
+        const meta = db
+            .prepare("SELECT schema_version, agent_id FROM schema_meta WHERE meta_key = 'primary'")
+            .get();
+        if (version?.user_version !== 17 ||
+            meta?.schema_version !== 17 ||
+            meta.agent_id !== params.agentId) {
+            throw new Error("unsupported or mismatched OpenClaw agent database");
+        }
+        const rows = db
+            .prepare(`
+      SELECT events.session_id, active.event_seq, events.event_json, events.created_at
+      FROM session_transcript_active_events AS active
+      JOIN transcript_events AS events
+        ON events.session_id = active.session_id AND events.seq = active.event_seq
+      JOIN session_windows AS sessions ON sessions.session_id = active.session_id
+      LEFT JOIN conversations ON conversations.conversation_id = sessions.primary_conversation_id
+      WHERE active.message_position IS NOT NULL
+        AND sessions.channel = 'slack'
+        AND COALESCE(sessions.account_id, conversations.account_id) = ?
+        AND json_extract(events.event_json, '$.type') = 'message'
+        AND json_extract(events.event_json, '$.message.role') = 'user'
+        AND json_extract(events.event_json, '$.message.__openclaw.senderId') = ?
+      ORDER BY events.created_at DESC, events.session_id, active.active_position DESC
+      LIMIT ?
+    `)
+            .all(params.accountScope, params.externalId, limit);
+        const evidence = rows.flatMap((row) => {
+            const event = record(JSON.parse(row.event_json));
+            const message = record(event?.message);
+            const text = messageText(message?.content);
+            if (!event || !message || !text)
+                return [];
+            return [
+                {
+                    source: "session",
+                    locator: `session:${row.session_id}:event:${row.event_seq}`,
+                    observedAt: evidenceTimestamp(event, row.created_at),
+                    text: text.slice(0, maxMessageChars),
+                },
+            ];
+        });
+        db.exec("COMMIT");
+        return evidence;
+    }
+    catch (error) {
+        try {
+            db.exec("ROLLBACK");
+        }
+        catch {
+            // The read transaction may not have started if opening the schema failed.
+        }
+        throw error;
+    }
+    finally {
+        db.close();
+    }
+}

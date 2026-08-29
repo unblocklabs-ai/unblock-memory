@@ -7,6 +7,10 @@ import type {
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "./config.js";
+import { registerPeopleCli } from "./people-cli.js";
+import { registerPeopleHooks } from "./people-hooks.js";
+import { PeopleStores } from "./people-store.js";
+import { registerPeopleTools } from "./people-tools.js";
 import { QmdMemoryRuntime } from "./runtime.js";
 import { registerSkillWhisperer } from "./skill-whisperer.js";
 
@@ -27,34 +31,56 @@ function getContext(ctx: OpenClawPluginToolContext) {
   };
 }
 
-const searchParameters = Type.Object({
-  query: Type.String({ pattern: "\\S" }),
-  corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
-  sessionFilter: Type.Optional(Type.Object({
-    startedFrom: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
-    startedTo: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
-    provider: Type.Optional(Type.String({ pattern: "\\S" })),
-    chatType: Type.Optional(Type.Union([
-      Type.Literal("channel"),
-      Type.Literal("group"),
-      Type.Literal("direct"),
-    ])),
-    accountId: Type.Optional(Type.String({ pattern: "\\S" })),
-    conversationId: Type.Optional(Type.String({ pattern: "\\S" })),
-  }, { additionalProperties: false })),
-  maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
-  minScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-}, { additionalProperties: false });
+const searchParameters = Type.Object(
+  {
+    query: Type.String({ pattern: "\\S" }),
+    corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
+    sessionFilter: Type.Optional(
+      Type.Object(
+        {
+          startedFrom: Type.Optional(
+            Type.String({
+              pattern:
+                "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+            }),
+          ),
+          startedTo: Type.Optional(
+            Type.String({
+              pattern:
+                "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+            }),
+          ),
+          provider: Type.Optional(Type.String({ pattern: "\\S" })),
+          chatType: Type.Optional(
+            Type.Union([Type.Literal("channel"), Type.Literal("group"), Type.Literal("direct")]),
+          ),
+          accountId: Type.Optional(Type.String({ pattern: "\\S" })),
+          conversationId: Type.Optional(Type.String({ pattern: "\\S" })),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+    maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    minScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  },
+  { additionalProperties: false },
+);
 
-const getParameters = Type.Object({
-  path: Type.String({ pattern: "\\S" }),
-  from: Type.Optional(Type.Integer({ minimum: 1 })),
-  lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
-}, { additionalProperties: false });
+const getParameters = Type.Object(
+  {
+    path: Type.String({ pattern: "\\S" }),
+    from: Type.Optional(Type.Integer({ minimum: 1 })),
+    lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+  },
+  { additionalProperties: false },
+);
 
-const syncSessionsParameters = Type.Object({
-  force: Type.Optional(Type.Boolean()),
-}, { additionalProperties: false });
+const syncSessionsParameters = Type.Object(
+  {
+    force: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
 
 const syncStatusParameters = Type.Object({}, { additionalProperties: false });
 
@@ -64,10 +90,17 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
   return {
     name: "memory_search",
     label: "Memory Search",
-    description: "Search configured memory corpora with semantic vector retrieval. The isolated skills corpus is never included.",
+    description:
+      "Search configured memory corpora with semantic vector retrieval. The isolated skills corpus is never included.",
     parameters: searchParameters,
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
-      const { query: untrimmedQuery, corpora, sessionFilter, maxResults, minScore } = Value.Parse(searchParameters, params);
+      const {
+        query: untrimmedQuery,
+        corpora,
+        sessionFilter,
+        maxResults,
+        minScore,
+      } = Value.Parse(searchParameters, params);
       const query = untrimmedQuery.trim();
       const { manager, error } = await runtime.getMemorySearchManager(active);
       if (!manager) return jsonResult({ results: [], error: error ?? "memory unavailable" });
@@ -80,15 +113,17 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
         requestContext: active.requestContext,
       });
       return jsonResult({
-        results: results.map((result) => result.session
-          ? {
-              ...result,
-              session: {
-                ...result.session,
-                startedAt: new Date(result.session.startedAt).toISOString(),
-              },
-            }
-          : result),
+        results: results.map((result) =>
+          result.session
+            ? {
+                ...result,
+                session: {
+                  ...result.session,
+                  startedAt: new Date(result.session.startedAt).toISOString(),
+                },
+              }
+            : result,
+        ),
         provider: "unblock-memory",
       });
     },
@@ -107,13 +142,16 @@ function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext
       const { path: untrimmedPath, from, lines } = Value.Parse(getParameters, params);
       const path = untrimmedPath.trim();
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
-      return jsonResult(await manager.readFile({
-        relPath: path,
-        from,
-        lines,
-        requestContext: active.requestContext,
-      }));
+      if (!manager)
+        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      return jsonResult(
+        await manager.readFile({
+          relPath: path,
+          from,
+          lines,
+          requestContext: active.requestContext,
+        }),
+      );
     },
   };
 }
@@ -124,7 +162,8 @@ function createSyncSessionsTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
   return {
     name: "memory_sync_sessions",
     label: "Sync Memory Sessions",
-    description: "Start projecting and indexing this agent's configured OpenClaw session transcripts. Use memory_sync_status to check completion.",
+    description:
+      "Start projecting and indexing this agent's configured OpenClaw session transcripts. Use memory_sync_status to check completion.",
     parameters: syncSessionsParameters,
     async execute(_toolCallId: string, params: unknown) {
       const { force } = Value.Parse(syncSessionsParameters, params);
@@ -148,22 +187,37 @@ function createSyncStatusTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTool
   };
 }
 
-const reclusterParameters = Type.Object({
-  space: Type.Optional(Type.Object({
-    method: Type.Optional(Type.Union([Type.Literal("umap"), Type.Literal("none")])),
-    nComponents: Type.Optional(Type.Integer({ minimum: 2, maximum: 100 })),
-    nNeighbors: Type.Optional(Type.Integer({ minimum: 2, maximum: 200 })),
-    minDist: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-  }, { additionalProperties: false })),
-  hdbscan: Type.Optional(Type.Object({
-    minClusterSize: Type.Optional(Type.Integer({ minimum: 2, maximum: 100_000 })),
-    minSamples: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
-    clusterSelectionMethod: Type.Optional(Type.Union([Type.Literal("eom"), Type.Literal("leaf")])),
-    clusterSelectionEpsilon: Type.Optional(Type.Number({ minimum: 0 })),
-    allowSingleCluster: Type.Optional(Type.Boolean()),
-  }, { additionalProperties: false })),
-  seed: Type.Optional(Type.Integer({ minimum: 0, maximum: 4_294_967_295 })),
-}, { additionalProperties: false });
+const reclusterParameters = Type.Object(
+  {
+    space: Type.Optional(
+      Type.Object(
+        {
+          method: Type.Optional(Type.Union([Type.Literal("umap"), Type.Literal("none")])),
+          nComponents: Type.Optional(Type.Integer({ minimum: 2, maximum: 100 })),
+          nNeighbors: Type.Optional(Type.Integer({ minimum: 2, maximum: 200 })),
+          minDist: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+    hdbscan: Type.Optional(
+      Type.Object(
+        {
+          minClusterSize: Type.Optional(Type.Integer({ minimum: 2, maximum: 100_000 })),
+          minSamples: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+          clusterSelectionMethod: Type.Optional(
+            Type.Union([Type.Literal("eom"), Type.Literal("leaf")]),
+          ),
+          clusterSelectionEpsilon: Type.Optional(Type.Number({ minimum: 0 })),
+          allowSingleCluster: Type.Optional(Type.Boolean()),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+    seed: Type.Optional(Type.Integer({ minimum: 0, maximum: 4_294_967_295 })),
+  },
+  { additionalProperties: false },
+);
 
 function createReclusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
   const active = getContext(ctx);
@@ -171,12 +225,14 @@ function createReclusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolC
   return {
     name: "memory_recluster",
     label: "Recluster Memory",
-    description: "Rebuild memory clusters from existing QMD vectors. Call only when memory_list_clusters reports missing or stale analysis.",
+    description:
+      "Rebuild memory clusters from existing QMD vectors. Call only when memory_list_clusters reports missing or stale analysis.",
     parameters: reclusterParameters,
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
       const options = Value.Parse(reclusterParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager)
+        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
       try {
         return jsonResult(await manager.recluster(options, signal));
       } catch (analysisError) {
@@ -189,9 +245,12 @@ function createReclusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolC
   };
 }
 
-const listClustersParameters = Type.Object({
-  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
-}, { additionalProperties: false });
+const listClustersParameters = Type.Object(
+  {
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+  },
+  { additionalProperties: false },
+);
 
 function createListClustersTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
   const active = getContext(ctx);
@@ -199,29 +258,36 @@ function createListClustersTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
   return {
     name: "memory_list_clusters",
     label: "List Memory Clusters",
-    description: "List current memory clusters and freshness. Call this before memory_recluster or memory_fetch_cluster.",
+    description:
+      "List current memory clusters and freshness. Call this before memory_recluster or memory_fetch_cluster.",
     parameters: listClustersParameters,
     async execute(_toolCallId: string, params: unknown) {
       const { limit } = Value.Parse(listClustersParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager)
+        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
       return jsonResult(await manager.listClusters(limit));
     },
   };
 }
 
-const fetchClusterParameters = Type.Object({
-  clusterId: Type.String({ pattern: "^[0-9a-f]{10}$" }),
-  topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
-  offset: Type.Optional(Type.Integer({ minimum: 0 })),
-  sort: Type.Optional(Type.Union([
-    Type.Literal("representative"),
-    Type.Literal("score_desc"),
-    Type.Literal("score_asc"),
-    Type.Literal("date_desc"),
-    Type.Literal("date_asc"),
-  ])),
-}, { additionalProperties: false });
+const fetchClusterParameters = Type.Object(
+  {
+    clusterId: Type.String({ pattern: "^[0-9a-f]{10}$" }),
+    topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+    offset: Type.Optional(Type.Integer({ minimum: 0 })),
+    sort: Type.Optional(
+      Type.Union([
+        Type.Literal("representative"),
+        Type.Literal("score_desc"),
+        Type.Literal("score_asc"),
+        Type.Literal("date_desc"),
+        Type.Literal("date_asc"),
+      ]),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 function createFetchClusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
   const active = getContext(ctx);
@@ -229,12 +295,14 @@ function createFetchClusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
   return {
     name: "memory_fetch_cluster",
     label: "Fetch Memory Cluster",
-    description: "Fetch a sorted page of QMD chunks for a clusterId returned by memory_list_clusters.",
+    description:
+      "Fetch a sorted page of QMD chunks for a clusterId returned by memory_list_clusters.",
     parameters: fetchClusterParameters,
     async execute(_toolCallId: string, params: unknown) {
       const { clusterId, topK, offset, sort } = Value.Parse(fetchClusterParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager)
+        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
       return jsonResult(await manager.fetchCluster({ clusterId, topK, offset, sort }));
     },
   };
@@ -247,10 +315,13 @@ const maintenanceStatus = Type.Union([
   Type.Literal("irrelevant"),
 ]);
 
-const listMaintenanceParameters = Type.Object({
-  status: Type.Optional(maintenanceStatus),
-  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
-}, { additionalProperties: false });
+const listMaintenanceParameters = Type.Object(
+  {
+    status: Type.Optional(maintenanceStatus),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+  },
+  { additionalProperties: false },
+);
 
 function createListMaintenanceTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
   const active = getContext(ctx);
@@ -258,12 +329,14 @@ function createListMaintenanceTool(runtime: QmdMemoryRuntime, ctx: OpenClawPlugi
   return {
     name: "memory_list_maintenance_tasks",
     label: "List Memory Maintenance Tasks",
-    description: "List a bounded curation inbox of memory chronology and duplicate-review proposals.",
+    description:
+      "List a bounded curation inbox of memory chronology and duplicate-review proposals.",
     parameters: listMaintenanceParameters,
     async execute(_toolCallId: string, params: unknown) {
       const options = Value.Parse(listMaintenanceParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager)
+        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
       return jsonResult({ status: "ok", tasks: manager.listMaintenanceTasks(options) });
     },
   };
@@ -273,26 +346,34 @@ const isoTimestamp = Type.String({
   pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
 });
 
-const updateMaintenanceParameters = Type.Object({
-  taskId: Type.String({ pattern: "\\S" }),
-  action: Type.Union([
-    Type.Literal("resolve"),
-    Type.Literal("defer"),
-    Type.Literal("irrelevant"),
-  ]),
-  note: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
-  annotation: Type.Optional(Type.Object({
-    scope: Type.Optional(Type.Union([Type.Literal("chunk"), Type.Literal("document")])),
-    eventTime: isoTimestamp,
-    basis: Type.Union([
-      Type.Literal("path"),
-      Type.Literal("frontmatter"),
-      Type.Literal("session"),
-      Type.Literal("agent_verified"),
+const updateMaintenanceParameters = Type.Object(
+  {
+    taskId: Type.String({ pattern: "\\S" }),
+    action: Type.Union([
+      Type.Literal("resolve"),
+      Type.Literal("defer"),
+      Type.Literal("irrelevant"),
     ]),
-    evidence: Type.String({ minLength: 1, maxLength: 500 }),
-  }, { additionalProperties: false })),
-}, { additionalProperties: false });
+    note: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+    annotation: Type.Optional(
+      Type.Object(
+        {
+          scope: Type.Optional(Type.Union([Type.Literal("chunk"), Type.Literal("document")])),
+          eventTime: isoTimestamp,
+          basis: Type.Union([
+            Type.Literal("path"),
+            Type.Literal("frontmatter"),
+            Type.Literal("session"),
+            Type.Literal("agent_verified"),
+          ]),
+          evidence: Type.String({ minLength: 1, maxLength: 500 }),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 function createUpdateMaintenanceTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
   const active = getContext(ctx);
@@ -300,17 +381,21 @@ function createUpdateMaintenanceTool(runtime: QmdMemoryRuntime, ctx: OpenClawPlu
   return {
     name: "memory_update_maintenance_task",
     label: "Update Memory Maintenance Task",
-    description: "Resolve completed work, defer outstanding work, or dismiss an irrelevant memory-maintenance proposal. This tool never edits source Markdown.",
+    description:
+      "Resolve completed work, defer outstanding work, or dismiss an irrelevant memory-maintenance proposal. This tool never edits source Markdown.",
     parameters: updateMaintenanceParameters,
     async execute(_toolCallId: string, params: unknown) {
       const { taskId, action, note, annotation } = Value.Parse(updateMaintenanceParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager)
+        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
       const updated = manager.updateMaintenanceTask({
         id: taskId,
         status: action === "resolve" ? "resolved" : action === "defer" ? "deferred" : "irrelevant",
         note,
-        ...(annotation ? { annotation: { ...annotation, scope: annotation.scope ?? "chunk" } } : {}),
+        ...(annotation
+          ? { annotation: { ...annotation, scope: annotation.scope ?? "chunk" } }
+          : {}),
       });
       return jsonResult(updated ? { status: "ok", task: updated } : { status: "not_found" });
     },
@@ -393,6 +478,8 @@ export function resolveFlushPlan(params: { cfg?: OpenClawConfig; nowMs?: number 
 
 export function registerUnblockMemory(api: OpenClawPluginApi): void {
   const config = resolveConfig(api.pluginConfig);
+  registerPeopleCli(api, config.people);
+  if (api.registrationMode === "cli-metadata") return;
   const runtime = new QmdMemoryRuntime(config.corpora, {
     analysisExecutable: config.analysis.executable,
     keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
@@ -402,20 +489,41 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     supportsPrivateTranscriptRecall: false,
     promptBuilder: ({ availableTools }: { availableTools: Set<string> }) =>
       availableTools.has("memory_search")
-        ? ["Use memory_search for relevant past facts, then memory_get when more surrounding context is needed."]
+        ? [
+            "Use memory_search for relevant past facts, then memory_get when more surrounding context is needed.",
+          ]
         : [],
     flushPlanResolver: resolveFlushPlan,
     runtime,
   };
   api.registerMemoryCapability(capability);
+  if (config.people.enabled) {
+    const peopleStores = new PeopleStores({
+      maxOpenTodos: config.people.todos.maxOpen,
+      maxBlurbChars: config.people.whisperer.maxChars,
+    });
+    registerPeopleHooks(api, peopleStores, config.people);
+    registerPeopleTools(api, peopleStores, config.people);
+    api.on("gateway_stop", () => peopleStores.closeAll());
+  }
   registerSkillWhisperer(api, runtime, config.skillWhisperer);
   api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
   api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
-  api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), { names: ["memory_sync_sessions"] });
+  api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
+    names: ["memory_sync_sessions"],
+  });
   api.registerTool((ctx) => createSyncStatusTool(runtime, ctx), { names: ["memory_sync_status"] });
   api.registerTool((ctx) => createReclusterTool(runtime, ctx), { names: ["memory_recluster"] });
-  api.registerTool((ctx) => createListClustersTool(runtime, ctx), { names: ["memory_list_clusters"] });
-  api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), { names: ["memory_fetch_cluster"] });
-  api.registerTool((ctx) => createListMaintenanceTool(runtime, ctx), { names: ["memory_list_maintenance_tasks"] });
-  api.registerTool((ctx) => createUpdateMaintenanceTool(runtime, ctx), { names: ["memory_update_maintenance_task"] });
+  api.registerTool((ctx) => createListClustersTool(runtime, ctx), {
+    names: ["memory_list_clusters"],
+  });
+  api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), {
+    names: ["memory_fetch_cluster"],
+  });
+  api.registerTool((ctx) => createListMaintenanceTool(runtime, ctx), {
+    names: ["memory_list_maintenance_tasks"],
+  });
+  api.registerTool((ctx) => createUpdateMaintenanceTool(runtime, ctx), {
+    names: ["memory_update_maintenance_task"],
+  });
 }

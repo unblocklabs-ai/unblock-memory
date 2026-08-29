@@ -6,8 +6,14 @@
     "seams": ["plugin-runtime"],
     "sourceRoot": "src",
     "expect": {
-      "hooks": ["before_prompt_build", "after_tool_call", "session_end"],
-      "registrations": ["registerMemoryCapability", "registerTool"],
+      "hooks": [
+        "before_prompt_build",
+        "after_tool_call",
+        "message_received",
+        "session_end",
+        "gateway_stop"
+      ],
+      "registrations": ["registerCli", "registerMemoryCapability", "registerTool"],
       "manifestContracts": ["tools"]
     }
   },

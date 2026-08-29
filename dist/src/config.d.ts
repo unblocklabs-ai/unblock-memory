@@ -9,7 +9,7 @@ export type SkillCorpusConfig = {
     paths: readonly string[];
 };
 declare const CHAT_TYPES: readonly ["channel", "group", "direct"];
-export type ChatType = typeof CHAT_TYPES[number];
+export type ChatType = (typeof CHAT_TYPES)[number];
 type SessionCorpusConfig = {
     name: "sessions";
     kind: "sessions";
@@ -23,6 +23,20 @@ export type UnblockMemoryConfig = {
     analysis: {
         executable?: string;
     };
+    people: {
+        enabled: boolean;
+        evidenceCorpora: readonly string[];
+        refinement: {
+            maxPeoplePerRun: number;
+        };
+        whisperer: {
+            enabled: boolean;
+            maxChars: number;
+        };
+        todos: {
+            maxOpen: number;
+        };
+    };
     skillWhisperer: {
         enabled: boolean;
         historyMessages: number;
@@ -30,5 +44,6 @@ export type UnblockMemoryConfig = {
         cooldownTurns: number;
     };
 };
+export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];
 export declare function resolveConfig(value: unknown): UnblockMemoryConfig;
 export {};

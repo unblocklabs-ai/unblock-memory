@@ -59,32 +59,45 @@ test("registers exactly the clean memory tool contract and validates every tool 
   }> = [];
   const api = {
     pluginConfig: {},
+    registerCli() {},
     registerMemoryCapability() {},
-    registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+    registerTool(
+      factory: (ctx: OpenClawPluginToolContext) => Tool | null,
+      options: { names: string[] },
+    ) {
       registrations.push({ factory, names: options.names });
     },
   } as unknown as OpenClawPluginApi;
 
   registerUnblockMemory(api);
-  assert.deepEqual(registrations.flatMap((registration) => registration.names), [
-    "memory_search",
-    "memory_get",
-    "memory_sync_sessions",
-    "memory_sync_status",
-    "memory_recluster",
-    "memory_list_clusters",
-    "memory_fetch_cluster",
-    "memory_list_maintenance_tasks",
-    "memory_update_maintenance_task",
-  ]);
-  assert.ok(!registrations.some((registration) =>
-    registration.names.some((name) => ["memory_analyze", "memory_clusters", "memory_cluster"].includes(name))));
+  assert.deepEqual(
+    registrations.flatMap((registration) => registration.names),
+    [
+      "memory_search",
+      "memory_get",
+      "memory_sync_sessions",
+      "memory_sync_status",
+      "memory_recluster",
+      "memory_list_clusters",
+      "memory_fetch_cluster",
+      "memory_list_maintenance_tasks",
+      "memory_update_maintenance_task",
+    ],
+  );
+  assert.ok(
+    !registrations.some((registration) =>
+      registration.names.some((name) =>
+        ["memory_analyze", "memory_clusters", "memory_cluster"].includes(name),
+      ),
+    ),
+  );
 
   const context = {
     agentId: "bill",
     config: {},
   } as OpenClawPluginToolContext;
-  const tool = (name: string) => registrations.find((registration) => registration.names.includes(name))!.factory(context)!;
+  const tool = (name: string) =>
+    registrations.find((registration) => registration.names.includes(name))!.factory(context)!;
   assert.ok(tool("memory_search").parameters.properties?.corpora);
   assert.ok(tool("memory_search").parameters.properties?.sessionFilter);
   assert.ok(tool("memory_fetch_cluster").parameters.properties?.offset);
@@ -119,15 +132,18 @@ test("registers exactly the clean memory tool contract and validates every tool 
     ["memory_list_maintenance_tasks", { limit: 11 }],
     ["memory_list_maintenance_tasks", { status: "ignored" }],
     ["memory_update_maintenance_task", { taskId: "task", action: "delete" }],
-    ["memory_update_maintenance_task", {
-      taskId: "task",
-      action: "resolve",
-      annotation: {
-        eventTime: "yesterday",
-        basis: "agent_verified",
-        evidence: "checked",
+    [
+      "memory_update_maintenance_task",
+      {
+        taskId: "task",
+        action: "resolve",
+        annotation: {
+          eventTime: "yesterday",
+          basis: "agent_verified",
+          evidence: "checked",
+        },
       },
-    }],
+    ],
   ];
   for (const [name, params] of invalidCalls) {
     await assert.rejects(tool(name).execute("call", params));
@@ -140,10 +156,14 @@ test("memory tools preserve request context and expose session start time as ISO
   let getFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   const api = {
     pluginConfig: {},
+    registerCli() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
       runtime = capability.runtime;
     },
-    registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+    registerTool(
+      factory: (ctx: OpenClawPluginToolContext) => Tool | null,
+      options: { names: string[] },
+    ) {
       if (options.names.includes("memory_search")) searchFactory = factory;
       if (options.names.includes("memory_get")) getFactory = factory;
     },
@@ -175,16 +195,18 @@ test("memory tools preserve request context and expose session start time as ISO
   let searchContext: unknown;
   let readContext: unknown;
   Object.defineProperty(runtime, "getMemorySearchManager", {
-    value: async () => ({ manager: {
-      search: async (_query: string, options: { requestContext?: unknown }) => {
-        searchContext = options.requestContext;
-        return [internalResult];
+    value: async () => ({
+      manager: {
+        search: async (_query: string, options: { requestContext?: unknown }) => {
+          searchContext = options.requestContext;
+          return [internalResult];
+        },
+        readFile: async (params: { requestContext?: unknown }) => {
+          readContext = params.requestContext;
+          return { status: "not_found", text: "", path: "qmd://memory/missing.md" };
+        },
       },
-      readFile: async (params: { requestContext?: unknown }) => {
-        readContext = params.requestContext;
-        return { status: "not_found", text: "", path: "qmd://memory/missing.md" };
-      },
-    } }),
+    }),
   });
 
   const context = {
@@ -201,13 +223,15 @@ test("memory tools preserve request context and expose session start time as ISO
   const result = parseJsonResult(await tool.execute("search", { query: "session" }));
   await getFactory(context)!.execute("get", { path: "qmd://memory/missing.md" });
   assert.deepEqual(result, {
-    results: [{
-      ...internalResult,
-      session: {
-        ...internalResult.session,
-        startedAt: "2026-08-25T14:00:00.000Z",
+    results: [
+      {
+        ...internalResult,
+        session: {
+          ...internalResult.session,
+          startedAt: "2026-08-25T14:00:00.000Z",
+        },
       },
-    }],
+    ],
     provider: "unblock-memory",
   });
   assert.equal(internalResult.session.startedAt, startedAt);
@@ -233,10 +257,14 @@ test("session sync tools accept and report status without awaiting cold initiali
         { name: "sessions", kind: "sessions" },
       ],
     },
+    registerCli() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
       runtime = capability.runtime;
     },
-    registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+    registerTool(
+      factory: (ctx: OpenClawPluginToolContext) => Tool | null,
+      options: { names: string[] },
+    ) {
       for (const name of options.names) registrations.set(name, factory);
     },
   } as unknown as OpenClawPluginApi;
@@ -251,7 +279,9 @@ test("session sync tools accept and report status without awaiting cold initiali
   assert.ok(runtime);
 
   let releaseManager = () => {};
-  const managerGate = new Promise<void>((resolve) => { releaseManager = resolve; });
+  const managerGate = new Promise<void>((resolve) => {
+    releaseManager = resolve;
+  });
   Object.defineProperty(runtime, "getMemorySearchManager", {
     value: async () => {
       await managerGate;
@@ -278,7 +308,9 @@ test("session sync tools accept and report status without awaiting cold initiali
   const tool = (name: string) => registrations.get(name)!(context)!;
   const accepted = await Promise.race([
     tool("memory_sync_sessions").execute("sync", {}),
-    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("sync acceptance blocked")), 100)),
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("sync acceptance blocked")), 100),
+    ),
   ]);
   assert.equal(parseJsonResult(accepted).status, "started");
   const status = parseJsonResult(await tool("memory_sync_status").execute("status", {}));

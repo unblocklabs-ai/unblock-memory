@@ -39,7 +39,7 @@ directories, or globs into named corpora:
     entries: {
       "unblock-memory": {
         hooks: {
-          // Required only when skillWhisperer.enabled is true.
+          // Required when either whisperer is enabled.
           allowConversationAccess: true,
         },
         config: {
@@ -78,6 +78,10 @@ directories, or globs into named corpora:
             historyMessages: 5,
             minScore: 0.5,
             cooldownTurns: 10,
+          },
+          people: {
+            enabled: false,
+            whisperer: { enabled: false, maxChars: 1200 },
           },
           // Optional: omit unless the local analysis worker is installed.
           analysis: {
@@ -130,6 +134,61 @@ tasks. Paths are explicit by design; the plugin does not reconstruct
 OpenClaw's effective skill inventory from `openclaw.json`. Configured skill
 globs follow symlinked directories, including OpenClaw's `plugin-skills`
 directory.
+
+### People Whisperer
+
+PeopleSQL is an optional agent-local people store. When `people.enabled` is
+true, incoming Slack messages with a canonical agent session key and exact
+account and sender IDs create or refresh a disabled-by-default person record.
+Incomplete Slack identities create a bounded, deduplicated todo without storing
+message content. Other channels are ignored.
+
+PeopleSQL registers three optional tools when enabled:
+
+- `memory_people_inspect` lets an owner read one exact person or bounded actionable todos;
+- `memory_people_update` changes explicit policy, company, todo, deletion, or
+  restoration state; and
+- `memory_people_sync` manually enriches one Slack account through OpenClaw's
+  authenticated directory CLI without accepting or reading a token.
+
+Allow the tools you intend the agent to use through OpenClaw's `tools.allow`
+configuration; enabling PeopleSQL alone does not expose optional tools.
+
+Inspection, administrative updates, and directory sync require OpenClaw's
+host-derived owner authorization. Dossier replacement runs only through the plugin-owned
+Codex refinement command. Soft-deleted people can be restored explicitly; restoration
+leaves both policies disabled. The sync is bounded to
+200 normalized directory entries per call and is safe to rerun. With pinned
+OpenClaw `2026.8.1-beta.3`, the directory contract supplies ID, name, and handle;
+Unblock Memory ignores raw provider payloads. Slack requires the
+`users:read` scope.
+
+For weekly dossier maintenance, schedule the plugin-owned CLI with an
+operator-authored OpenClaw command automation rather than adding a plugin
+scheduler:
+
+```bash
+openclaw automations create "0 4 * * 0" \
+  --name "People Whisperer refinement" \
+  --command-argv '["openclaw","unblock-memory","people","refine","--agent","main"]' \
+  --timeout-seconds 1800 \
+  --no-deliver
+```
+
+`openclaw unblock-memory people refine --agent <id>` selects a bounded candidate
+batch, reads exact-sender session evidence, and invokes one
+ephemeral, read-only `codex exec` with structured output. It validates the
+complete result set, person IDs, dossier schema, and evidence locators before
+writing each dossier transactionally.
+The host running the command must already have working Codex CLI authentication.
+The plugin performs no model call on the prompt-injection path.
+
+Set both `people.whisperer.enabled` and the person's injection policy to enable
+prompt context. The plugin then prepends only that exact person's stored dossier
+blurb, bounded by `maxChars`, once per session. Unknown, unavailable, or
+incomplete identities produce no context. This non-bundled prompt hook requires
+`plugins.entries.unblock-memory.hooks.allowConversationAccess: true` and remains
+subject to OpenClaw's `allowPromptInjection` policy.
 
 Use `sessionFilter` to restrict session results by metadata while leaving file
 corpora searchable. Supported fields are `startedFrom` and `startedTo`

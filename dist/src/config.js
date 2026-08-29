@@ -1,11 +1,20 @@
 import { isAbsolute } from "node:path";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"];
 const CHAT_TYPES = ["channel", "group", "direct"];
-export const DEFAULT_CORPORA = [{
+export const DEFAULT_CORPORA = [
+    {
         name: "memory",
         kind: "files",
         paths: DEFAULT_PATHS,
-    }];
+    },
+];
+export const DEFAULT_PEOPLE_CONFIG = {
+    enabled: false,
+    evidenceCorpora: ["sessions"],
+    refinement: { maxPeoplePerRun: 10 },
+    whisperer: { enabled: false, maxChars: 1200 },
+    todos: { maxOpen: 1000 },
+};
 const DEFAULT_SKILL_WHISPERER = {
     enabled: false,
     historyMessages: 5,
@@ -44,7 +53,8 @@ function resolveCorpora(value) {
             if (name !== "skills") {
                 throw new Error('unblock-memory skills corpus must be named "skills"');
             }
-            if (!Array.isArray(corpus.paths) || corpus.paths.length === 0 ||
+            if (!Array.isArray(corpus.paths) ||
+                corpus.paths.length === 0 ||
                 !corpus.paths.every((path) => typeof path === "string" && path.trim())) {
                 throw new Error("unblock-memory corpus skills paths must be a non-empty array of non-empty strings");
             }
@@ -56,11 +66,16 @@ function resolveCorpora(value) {
                 throw new Error('unblock-memory session corpus must be named "sessions"');
             }
             const chatTypes = corpus.chatTypes ?? ["channel", "group"];
-            if (!Array.isArray(chatTypes) || chatTypes.length === 0 ||
+            if (!Array.isArray(chatTypes) ||
+                chatTypes.length === 0 ||
                 !chatTypes.every((chatType) => CHAT_TYPES.includes(chatType))) {
                 throw new Error(`unblock-memory corpus sessions chatTypes must contain channel, group, or direct`);
             }
-            return { name: "sessions", kind: "sessions", chatTypes: [...new Set(chatTypes)] };
+            return {
+                name: "sessions",
+                kind: "sessions",
+                chatTypes: [...new Set(chatTypes)],
+            };
         }
         assertOnlyKeys(corpus, ["name", "kind", "paths"], `corpora[${index}]`);
         if (name === "sessions") {
@@ -72,7 +87,8 @@ function resolveCorpora(value) {
         if (corpus.kind !== "files") {
             throw new Error(`unblock-memory corpus ${name} must have kind "files", "skills", or "sessions"`);
         }
-        if (!Array.isArray(corpus.paths) || corpus.paths.length === 0 ||
+        if (!Array.isArray(corpus.paths) ||
+            corpus.paths.length === 0 ||
             !corpus.paths.every((path) => typeof path === "string" && path.trim())) {
             throw new Error(`unblock-memory corpus ${name} paths must be a non-empty array of non-empty strings`);
         }
@@ -83,12 +99,78 @@ function resolveCorpora(value) {
     }
     return corpora;
 }
+function positiveInteger(value, fallback, label, maximum) {
+    const resolved = value ?? fallback;
+    if (typeof resolved !== "number" ||
+        !Number.isInteger(resolved) ||
+        resolved < 1 ||
+        resolved > maximum) {
+        throw new Error(`unblock-memory ${label} must be a positive integer no greater than ${maximum}`);
+    }
+    return resolved;
+}
+function resolvePeople(value) {
+    if (value === undefined)
+        return DEFAULT_PEOPLE_CONFIG;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("unblock-memory people must be an object");
+    }
+    const people = value;
+    assertOnlyKeys(people, ["enabled", "evidenceCorpora", "refinement", "whisperer", "todos"], "people");
+    const enabled = people.enabled ?? false;
+    if (typeof enabled !== "boolean")
+        throw new Error("unblock-memory people.enabled must be a boolean");
+    const configuredCorpora = people.evidenceCorpora ?? DEFAULT_PEOPLE_CONFIG.evidenceCorpora;
+    if (!Array.isArray(configuredCorpora) ||
+        configuredCorpora.length === 0 ||
+        !configuredCorpora.every((name) => typeof name === "string" && name.trim())) {
+        throw new Error("unblock-memory people.evidenceCorpora must be a non-empty array of non-empty strings");
+    }
+    const evidenceCorpora = [...new Set(configuredCorpora.map((name) => name.trim()))];
+    const refinement = people.refinement ?? {};
+    if (!refinement || typeof refinement !== "object" || Array.isArray(refinement)) {
+        throw new Error("unblock-memory people.refinement must be an object");
+    }
+    const refinementRecord = refinement;
+    assertOnlyKeys(refinementRecord, ["maxPeoplePerRun"], "people.refinement");
+    const whisperer = people.whisperer ?? {};
+    if (!whisperer || typeof whisperer !== "object" || Array.isArray(whisperer)) {
+        throw new Error("unblock-memory people.whisperer must be an object");
+    }
+    const whispererRecord = whisperer;
+    assertOnlyKeys(whispererRecord, ["enabled", "maxChars"], "people.whisperer");
+    const whispererEnabled = whispererRecord.enabled ?? false;
+    if (typeof whispererEnabled !== "boolean") {
+        throw new Error("unblock-memory people.whisperer.enabled must be a boolean");
+    }
+    const todos = people.todos ?? {};
+    if (!todos || typeof todos !== "object" || Array.isArray(todos)) {
+        throw new Error("unblock-memory people.todos must be an object");
+    }
+    const todosRecord = todos;
+    assertOnlyKeys(todosRecord, ["maxOpen"], "people.todos");
+    return {
+        enabled,
+        evidenceCorpora,
+        refinement: {
+            maxPeoplePerRun: positiveInteger(refinementRecord.maxPeoplePerRun, DEFAULT_PEOPLE_CONFIG.refinement.maxPeoplePerRun, "people.refinement.maxPeoplePerRun", 50),
+        },
+        whisperer: {
+            enabled: whispererEnabled,
+            maxChars: positiveInteger(whispererRecord.maxChars, DEFAULT_PEOPLE_CONFIG.whisperer.maxChars, "people.whisperer.maxChars", 4000),
+        },
+        todos: {
+            maxOpen: positiveInteger(todosRecord.maxOpen, DEFAULT_PEOPLE_CONFIG.todos.maxOpen, "people.todos.maxOpen", 10_000),
+        },
+    };
+}
 export function resolveConfig(value) {
     if (value === undefined || value === null) {
         return {
             corpora: DEFAULT_CORPORA,
             keepEmbeddingModelWarm: true,
             analysis: {},
+            people: DEFAULT_PEOPLE_CONFIG,
             skillWhisperer: DEFAULT_SKILL_WHISPERER,
         };
     }
@@ -96,9 +178,11 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "skillWhisperer"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer"], "config");
     const corpora = resolveCorpora(config.corpora);
-    if (config.keepEmbeddingModelWarm !== undefined && typeof config.keepEmbeddingModelWarm !== "boolean") {
+    const people = resolvePeople(config.people);
+    if (config.keepEmbeddingModelWarm !== undefined &&
+        typeof config.keepEmbeddingModelWarm !== "boolean") {
         throw new Error("unblock-memory keepEmbeddingModelWarm must be a boolean");
     }
     const keepEmbeddingModelWarm = config.keepEmbeddingModelWarm ?? true;
@@ -119,7 +203,9 @@ export function resolveConfig(value) {
     }
     let skillWhisperer = DEFAULT_SKILL_WHISPERER;
     if (config.skillWhisperer !== undefined) {
-        if (!config.skillWhisperer || typeof config.skillWhisperer !== "object" || Array.isArray(config.skillWhisperer)) {
+        if (!config.skillWhisperer ||
+            typeof config.skillWhisperer !== "object" ||
+            Array.isArray(config.skillWhisperer)) {
             throw new Error("unblock-memory skillWhisperer must be an object");
         }
         const value = config.skillWhisperer;
@@ -130,13 +216,20 @@ export function resolveConfig(value) {
         const cooldownTurns = value.cooldownTurns ?? 10;
         if (typeof enabled !== "boolean")
             throw new Error("unblock-memory skillWhisperer.enabled must be a boolean");
-        if (typeof historyMessages !== "number" || !Number.isInteger(historyMessages) || historyMessages < 0) {
+        if (typeof historyMessages !== "number" ||
+            !Number.isInteger(historyMessages) ||
+            historyMessages < 0) {
             throw new Error("unblock-memory skillWhisperer.historyMessages must be a non-negative integer");
         }
-        if (typeof minScore !== "number" || !Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
+        if (typeof minScore !== "number" ||
+            !Number.isFinite(minScore) ||
+            minScore < 0 ||
+            minScore > 1) {
             throw new Error("unblock-memory skillWhisperer.minScore must be between 0 and 1");
         }
-        if (typeof cooldownTurns !== "number" || !Number.isInteger(cooldownTurns) || cooldownTurns < 0) {
+        if (typeof cooldownTurns !== "number" ||
+            !Number.isInteger(cooldownTurns) ||
+            cooldownTurns < 0) {
             throw new Error("unblock-memory skillWhisperer.cooldownTurns must be a non-negative integer");
         }
         skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns };
@@ -144,5 +237,5 @@ export function resolveConfig(value) {
     if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
         throw new Error('unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"');
     }
-    return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, skillWhisperer };
+    return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer };
 }

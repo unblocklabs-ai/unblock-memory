@@ -6,7 +6,29 @@
   "kind": "memory",
   "activation": { "onStartup": false },
   "skills": ["./skills"],
-  "contracts": { "tools": ["memory_search", "memory_get", "memory_sync_sessions", "memory_sync_status", "memory_recluster", "memory_list_clusters", "memory_fetch_cluster", "memory_list_maintenance_tasks", "memory_update_maintenance_task"] },
+  "cliCommands": [
+    {
+      "name": "unblock-memory",
+      "description": "Unblock Memory administration",
+      "hasSubcommands": true
+    }
+  ],
+  "contracts": {
+    "tools": [
+      "memory_search",
+      "memory_get",
+      "memory_sync_sessions",
+      "memory_sync_status",
+      "memory_recluster",
+      "memory_list_clusters",
+      "memory_fetch_cluster",
+      "memory_list_maintenance_tasks",
+      "memory_update_maintenance_task",
+      "memory_people_inspect",
+      "memory_people_update",
+      "memory_people_sync"
+    ]
+  },
   "toolMetadata": {
     "memory_sync_sessions": { "sideEffecting": true },
     "memory_sync_status": { "replaySafe": true },
@@ -14,7 +36,10 @@
     "memory_list_clusters": { "replaySafe": true },
     "memory_fetch_cluster": { "replaySafe": true },
     "memory_list_maintenance_tasks": { "replaySafe": true },
-    "memory_update_maintenance_task": { "sideEffecting": true }
+    "memory_update_maintenance_task": { "sideEffecting": true },
+    "memory_people_inspect": { "replaySafe": true, "optional": true },
+    "memory_people_update": { "sideEffecting": true, "optional": true },
+    "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
     "keepEmbeddingModelWarm": {
@@ -28,6 +53,14 @@
     "skillWhisperer.enabled": {
       "label": "Skill Whisperer",
       "help": "Suggest at most one semantically relevant configured skill before a user turn. Requires hook conversation access."
+    },
+    "people.enabled": {
+      "label": "PeopleSQL",
+      "help": "Maintain an agent-local people store. Disabled by default."
+    },
+    "people.whisperer.enabled": {
+      "label": "People Whisperer",
+      "help": "Inject an enabled person's bounded dossier blurb after exact identity matching. Requires hook conversation access."
     },
     "analysis.executable": {
       "label": "Memory Analysis Worker",
@@ -105,6 +138,51 @@
         "additionalProperties": false,
         "properties": {
           "executable": { "type": "string", "minLength": 1 }
+        }
+      },
+      "people": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "evidenceCorpora": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "pattern": "\\S" },
+            "default": ["sessions"]
+          },
+          "refinement": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "maxPeoplePerRun": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+            },
+            "default": { "maxPeoplePerRun": 10 }
+          },
+          "whisperer": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": false },
+              "maxChars": { "type": "integer", "minimum": 1, "maximum": 4000, "default": 1200 }
+            },
+            "default": { "enabled": false, "maxChars": 1200 }
+          },
+          "todos": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "maxOpen": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
+            },
+            "default": { "maxOpen": 1000 }
+          }
+        },
+        "default": {
+          "enabled": false,
+          "evidenceCorpora": ["sessions"],
+          "refinement": { "maxPeoplePerRun": 10 },
+          "whisperer": { "enabled": false, "maxChars": 1200 },
+          "todos": { "maxOpen": 1000 }
         }
       },
       "skillWhisperer": {

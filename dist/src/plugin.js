@@ -2,6 +2,10 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveConfig } from "./config.js";
+import { registerPeopleCli } from "./people-cli.js";
+import { registerPeopleHooks } from "./people-hooks.js";
+import { PeopleStores } from "./people-store.js";
+import { registerPeopleTools } from "./people-tools.js";
 import { QmdMemoryRuntime } from "./runtime.js";
 import { registerSkillWhisperer } from "./skill-whisperer.js";
 function getContext(ctx) {
@@ -25,14 +29,14 @@ const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
     corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
     sessionFilter: Type.Optional(Type.Object({
-        startedFrom: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
-        startedTo: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
+        startedFrom: Type.Optional(Type.String({
+            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+        })),
+        startedTo: Type.Optional(Type.String({
+            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+        })),
         provider: Type.Optional(Type.String({ pattern: "\\S" })),
-        chatType: Type.Optional(Type.Union([
-            Type.Literal("channel"),
-            Type.Literal("group"),
-            Type.Literal("direct"),
-        ])),
+        chatType: Type.Optional(Type.Union([Type.Literal("channel"), Type.Literal("group"), Type.Literal("direct")])),
         accountId: Type.Optional(Type.String({ pattern: "\\S" })),
         conversationId: Type.Optional(Type.String({ pattern: "\\S" })),
     }, { additionalProperties: false })),
@@ -58,7 +62,7 @@ function createSearchTool(runtime, ctx) {
         description: "Search configured memory corpora with semantic vector retrieval. The isolated skills corpus is never included.",
         parameters: searchParameters,
         async execute(_toolCallId, params, signal) {
-            const { query: untrimmedQuery, corpora, sessionFilter, maxResults, minScore } = Value.Parse(searchParameters, params);
+            const { query: untrimmedQuery, corpora, sessionFilter, maxResults, minScore, } = Value.Parse(searchParameters, params);
             const query = untrimmedQuery.trim();
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
@@ -302,7 +306,9 @@ function createUpdateMaintenanceTool(runtime, ctx) {
                 id: taskId,
                 status: action === "resolve" ? "resolved" : action === "defer" ? "deferred" : "irrelevant",
                 note,
-                ...(annotation ? { annotation: { ...annotation, scope: annotation.scope ?? "chunk" } } : {}),
+                ...(annotation
+                    ? { annotation: { ...annotation, scope: annotation.scope ?? "chunk" } }
+                    : {}),
             });
             return jsonResult(updated ? { status: "ok", task: updated } : { status: "not_found" });
         },
@@ -380,6 +386,9 @@ export function resolveFlushPlan(params = {}) {
 }
 export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
+    registerPeopleCli(api, config.people);
+    if (api.registrationMode === "cli-metadata")
+        return;
     const runtime = new QmdMemoryRuntime(config.corpora, {
         analysisExecutable: config.analysis.executable,
         keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
@@ -388,20 +397,41 @@ export function registerUnblockMemory(api) {
         deterministicRecallToolName: "memory_search",
         supportsPrivateTranscriptRecall: false,
         promptBuilder: ({ availableTools }) => availableTools.has("memory_search")
-            ? ["Use memory_search for relevant past facts, then memory_get when more surrounding context is needed."]
+            ? [
+                "Use memory_search for relevant past facts, then memory_get when more surrounding context is needed.",
+            ]
             : [],
         flushPlanResolver: resolveFlushPlan,
         runtime,
     };
     api.registerMemoryCapability(capability);
+    if (config.people.enabled) {
+        const peopleStores = new PeopleStores({
+            maxOpenTodos: config.people.todos.maxOpen,
+            maxBlurbChars: config.people.whisperer.maxChars,
+        });
+        registerPeopleHooks(api, peopleStores, config.people);
+        registerPeopleTools(api, peopleStores, config.people);
+        api.on("gateway_stop", () => peopleStores.closeAll());
+    }
     registerSkillWhisperer(api, runtime, config.skillWhisperer);
     api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
-    api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), { names: ["memory_sync_sessions"] });
+    api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
+        names: ["memory_sync_sessions"],
+    });
     api.registerTool((ctx) => createSyncStatusTool(runtime, ctx), { names: ["memory_sync_status"] });
     api.registerTool((ctx) => createReclusterTool(runtime, ctx), { names: ["memory_recluster"] });
-    api.registerTool((ctx) => createListClustersTool(runtime, ctx), { names: ["memory_list_clusters"] });
-    api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), { names: ["memory_fetch_cluster"] });
-    api.registerTool((ctx) => createListMaintenanceTool(runtime, ctx), { names: ["memory_list_maintenance_tasks"] });
-    api.registerTool((ctx) => createUpdateMaintenanceTool(runtime, ctx), { names: ["memory_update_maintenance_task"] });
+    api.registerTool((ctx) => createListClustersTool(runtime, ctx), {
+        names: ["memory_list_clusters"],
+    });
+    api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), {
+        names: ["memory_fetch_cluster"],
+    });
+    api.registerTool((ctx) => createListMaintenanceTool(runtime, ctx), {
+        names: ["memory_list_maintenance_tasks"],
+    });
+    api.registerTool((ctx) => createUpdateMaintenanceTool(runtime, ctx), {
+        names: ["memory_update_maintenance_task"],
+    });
 }
