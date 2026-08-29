@@ -4,22 +4,41 @@ import { Value } from "typebox/value";
 import { renderPeopleWhisper } from "./people-hooks.js";
 import { createOpenClawSlackDirectory, syncSlackDirectory, } from "./slack-directory.js";
 const nonEmpty = Type.String({ pattern: "\\S", maxLength: 1000 });
-const personSelector = Type.Union([
-    Type.Object({ view: Type.Literal("person"), personId: nonEmpty }, { additionalProperties: false }),
+const inspectParameters = Type.Union([
+    Type.Object({
+        view: Type.Literal("person"),
+        personId: Type.String({
+            pattern: "\\S",
+            maxLength: 1000,
+            description: "PeopleSQL person ID. Use identity when only Slack IDs are known.",
+        }),
+    }, { additionalProperties: false }),
     Type.Object({
         view: Type.Literal("person"),
         identity: Type.Object({
             provider: Type.Literal("slack"),
-            accountScope: nonEmpty,
-            externalId: nonEmpty,
-        }, { additionalProperties: false }),
+            accountScope: Type.String({
+                pattern: "\\S",
+                maxLength: 1000,
+                description: "Configured Slack account ID, for example default.",
+            }),
+            externalId: Type.String({
+                pattern: "\\S",
+                maxLength: 1000,
+                description: "Exact Slack user ID.",
+            }),
+        }, {
+            additionalProperties: false,
+            description: "Exact Slack identity for the person to inspect.",
+        }),
     }, { additionalProperties: false }),
-]);
-const inspectParameters = Type.Union([
-    personSelector,
     Type.Object({
         view: Type.Literal("todos"),
-        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+        limit: Type.Optional(Type.Integer({
+            minimum: 1,
+            maximum: 100,
+            description: "Maximum actionable todos to return.",
+        })),
     }, { additionalProperties: false }),
 ]);
 const updateParameters = Type.Union([
@@ -85,7 +104,7 @@ function createInspectTool(stores, config, ctx) {
     return {
         name: "memory_people_inspect",
         label: "Inspect People Memory",
-        description: "Inspect one exact person or bounded actionable people todos.",
+        description: "Inspect one person by PeopleSQL personId or exact Slack identity, or list bounded actionable people todos.",
         parameters: inspectParameters,
         async execute(_toolCallId, raw) {
             const input = Value.Parse(inspectParameters, raw);
