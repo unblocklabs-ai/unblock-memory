@@ -13,6 +13,10 @@ type MessageReceived = (
     from: string;
     content: string;
     timestamp?: number;
+    threadId?: string | number;
+    messageId?: string;
+    replyToId?: string;
+    runId?: string;
     metadata?: Record<string, unknown>;
   },
   context: {
@@ -21,6 +25,7 @@ type MessageReceived = (
     senderId?: string;
     conversationId?: string;
     sessionKey?: string;
+    runId?: string;
   },
 ) => void;
 
@@ -37,20 +42,20 @@ type BeforePromptBuild = (
   },
 ) => { prependContext?: string } | void;
 
-type SessionEnd = (
-  event: { sessionId: string; sessionKey?: string },
-  context: { sessionId: string; sessionKey?: string },
+type AgentEnd = (
+  event: { messages: unknown[]; success: boolean; runId?: string },
+  context: { runId?: string },
 ) => void;
 
 const peopleConfig: UnblockMemoryConfig["people"] = {
   enabled: true,
-  refinement: { maxPeoplePerRun: 10 },
   whisperer: { enabled: true, maxChars: 30 },
   todos: { maxOpen: 10 },
 };
 
-async function harness(config = peopleConfig) {
-  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-people-hooks-"));
+async function harness(config = peopleConfig, existingStateRoot?: string) {
+  const stateRoot =
+    existingStateRoot ?? (await mkdtemp(join(tmpdir(), "unblock-memory-people-hooks-")));
   const stores = new PeopleStores({ stateRoot, maxOpenTodos: 10, maxBlurbChars: 1200 });
   const hooks = new Map<string, unknown>();
   const warnings: string[] = [];
@@ -71,7 +76,7 @@ async function harness(config = peopleConfig) {
     warnings,
     received: hooks.get("message_received") as MessageReceived,
     before: hooks.get("before_prompt_build") as BeforePromptBuild | undefined,
-    end: hooks.get("session_end") as SessionEnd | undefined,
+    agentEnd: hooks.get("agent_end") as AgentEnd | undefined,
   };
 }
 
@@ -82,6 +87,18 @@ const slackContext = {
   conversationId: "C123",
   sessionKey: "agent:bill:slack:channel:C123",
 };
+
+function promptContext(senderId: string, runId: string, sessionKey = slackContext.sessionKey) {
+  return {
+    trigger: "user",
+    messageProvider: "slack",
+    accountId: "workspace-a",
+    senderId,
+    sessionId: "session-1",
+    sessionKey,
+    runId,
+  };
+}
 
 test("observes exact Slack identities under the canonical session owner", async () => {
   const testHarness = await harness();
@@ -108,8 +125,7 @@ test("observes exact Slack identities under the canonical session owner", async 
     const person = store.findPersonByIdentity("slack", "workspace-a", "U123");
     const identity = store.findIdentity("slack", "workspace-a", "U123");
     assert.ok(person);
-    assert.equal(person.refinementEnabled, false);
-    assert.equal(person.injectionEnabled, false);
+    assert.equal(person.injectionEnabled, true);
     assert.equal(identity?.personId, person.id);
     assert.equal(identity?.displayName, "Bek Farryn");
     assert.equal(identity?.handle, "bek");
@@ -134,17 +150,11 @@ test("ignores non-Slack and noncanonical sessions without opening a store", asyn
   const path = join(testHarness.stateRoot, "agents", "bill", "unblock-memory", "people.sqlite");
   testHarness.received(
     { from: "discord:user", content: "ignored" },
-    {
-      ...slackContext,
-      channelId: "discord",
-    },
+    { ...slackContext, channelId: "discord" },
   );
   testHarness.received(
     { from: "slack:C123", content: "ignored" },
-    {
-      ...slackContext,
-      sessionKey: "main",
-    },
+    { ...slackContext, sessionKey: "main" },
   );
   await assert.rejects(access(path));
   testHarness.stores.closeAll();
@@ -172,7 +182,7 @@ test("deduplicates incomplete Slack identities without retaining message content
   }
 });
 
-test("injects one bounded exact-match dossier blurb per session", async () => {
+test("deduplicates a person per Slack thread, replays retries, and injects in a new thread", async () => {
   const testHarness = await harness();
   try {
     const store = testHarness.stores.get("bill");
@@ -181,53 +191,208 @@ test("injects one bounded exact-match dossier blurb per session", async () => {
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    const context = {
-      trigger: "user",
-      messageProvider: "slack",
-      accountId: "workspace-a",
-      senderId: "U123",
-      sessionId: "session-1",
-      sessionKey: "agent:bill:slack:channel:C123",
-      runId: "run-1",
-    };
-    assert.equal(testHarness.before?.({ prompt: "disabled", messages: [] }, context), undefined);
-    store.setPolicies(person.id, { injectionEnabled: true });
-    assert.equal(testHarness.before?.({ prompt: "no dossier", messages: [] }, context), undefined);
     store.replaceDossier(person.id, {
       schemaVersion: 1,
       blurb: "Prefers concise decisions with explicit owners and deadlines.",
-      sections: [
-        {
-          category: "preferences",
-          claims: [
-            {
-              statement: "Prefers concise decisions.",
-              evidence: [{ source: "manual", locator: "operator note" }],
-              epistemicType: "reported",
-            },
-          ],
-        },
-      ],
+      sections: [],
     });
-    const first = testHarness.before?.({ prompt: "hello", messages: [] }, context);
+
+    testHarness.received(
+      { from: "slack:C123", content: "root", messageId: "100.0" },
+      slackContext,
+    );
+    const first = testHarness.before?.(
+      { prompt: "first attempt", messages: [] },
+      promptContext("U123", "run-1"),
+    );
     assert.equal(first?.prependContext, "Prefers concise decisions with");
-    assert.equal(first?.prependContext?.length, 30);
+
+    store.replaceDossier(person.id, {
+      schemaVersion: 1,
+      blurb: "This later dossier must not change a retry.",
+      sections: [],
+    });
+    assert.deepEqual(
+      testHarness.before?.(
+        { prompt: "retry", messages: [] },
+        promptContext("U123", "run-1"),
+      ),
+      first,
+    );
+
+    testHarness.received(
+      {
+        from: "slack:C123",
+        content: "reply",
+        threadId: "100.0",
+        messageId: "101.0",
+      },
+      slackContext,
+    );
     assert.equal(
-      testHarness.before?.({ prompt: "next turn", messages: [] }, { ...context, runId: "run-2" }),
+      testHarness.before?.(
+        { prompt: "later turn", messages: [] },
+        promptContext("U123", "run-2"),
+      ),
       undefined,
     );
 
-    testHarness.end?.({ sessionId: "session-1", sessionKey: context.sessionKey }, context);
+    testHarness.received(
+      { from: "slack:C123", content: "new root", messageId: "200.0" },
+      slackContext,
+    );
     assert.equal(
-      testHarness.before?.({ prompt: "new session", messages: [] }, context)?.prependContext,
-      "Prefers concise decisions with",
+      testHarness.before?.(
+        { prompt: "new thread", messages: [] },
+        promptContext("U123", "run-3"),
+      )?.prependContext,
+      "This later dossier must not ch",
     );
   } finally {
     testHarness.stores.closeAll();
   }
 });
 
-test("replays the same dossier contribution on retries without injecting on later runs", async () => {
+test("injects three different people once each in one Slack thread", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const people = [
+      ["UA", "Person A context."],
+      ["UB", "Person B context."],
+      ["UC", "Person C context."],
+    ] as const;
+
+    for (const [senderId, blurb] of people) {
+      const { person } = store.upsertIdentity({
+        provider: "slack",
+        accountScope: "workspace-a",
+        externalId: senderId,
+      });
+      store.replaceDossier(person.id, { schemaVersion: 1, blurb, sections: [] });
+    }
+
+    const contributions: string[] = [];
+    for (const [index, [senderId]] of people.entries()) {
+      const runId = `run-${index}`;
+      testHarness.received(
+        {
+          from: "slack:C123",
+          content: "message",
+          ...(index === 0 ? { messageId: "300.0" } : { threadId: "300.0" }),
+        },
+        { ...slackContext, senderId },
+      );
+      const contribution = testHarness.before?.(
+        { prompt: "message", messages: [] },
+        promptContext(senderId, runId),
+      )?.prependContext;
+      assert.ok(contribution);
+      contributions.push(contribution);
+    }
+
+    assert.deepEqual(contributions, ["Person A context.", "Person B context.", "Person C context."]);
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("keeps pending thread correlation isolated by session and sender", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    for (const [externalId, blurb] of [
+      ["UA", "Person A context."],
+      ["UB", "Person B context."],
+    ] as const) {
+      const { person } = store.upsertIdentity({
+        provider: "slack",
+        accountScope: "workspace-a",
+        externalId,
+      });
+      store.replaceDossier(person.id, { schemaVersion: 1, blurb, sections: [] });
+    }
+
+    const sessionA = "agent:bill:slack:channel:C123";
+    const sessionB = "agent:bill:slack:channel:C456";
+    testHarness.received(
+      { from: "slack:C123", content: "first", messageId: "700.0" },
+      { ...slackContext, senderId: "UA", sessionKey: sessionA },
+    );
+    testHarness.received(
+      { from: "slack:C456", content: "second", messageId: "800.0" },
+      { ...slackContext, senderId: "UB", conversationId: "C456", sessionKey: sessionB },
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "second", messages: [] },
+        promptContext("UB", "run-b", sessionB),
+      )?.prependContext,
+      "Person B context.",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "first", messages: [] },
+        promptContext("UA", "run-a", sessionA),
+      )?.prependContext,
+      "Person A context.",
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("durable receipts survive hook and store restart", async () => {
+  const firstHarness = await harness();
+  const store = firstHarness.stores.get("bill");
+  const { person } = store.upsertIdentity({
+    provider: "slack",
+    accountScope: "workspace-a",
+    externalId: "U123",
+  });
+  store.replaceDossier(person.id, {
+    schemaVersion: 1,
+    blurb: "Durable context.",
+    sections: [],
+  });
+  firstHarness.received(
+    { from: "slack:C123", content: "root", messageId: "400.0" },
+    slackContext,
+  );
+  assert.equal(
+    firstHarness.before?.(
+      { prompt: "root", messages: [] },
+      promptContext("U123", "run-before"),
+    )?.prependContext,
+    "Durable context.",
+  );
+  firstHarness.stores.closeAll();
+
+  const restarted = await harness(peopleConfig, firstHarness.stateRoot);
+  try {
+    restarted.received(
+      {
+        from: "slack:C123",
+        content: "reply",
+        threadId: "400.0",
+        messageId: "401.0",
+      },
+      slackContext,
+    );
+    assert.equal(
+      restarted.before?.(
+        { prompt: "reply", messages: [] },
+        promptContext("U123", "run-after"),
+      ),
+      undefined,
+    );
+  } finally {
+    restarted.stores.closeAll();
+  }
+});
+
+test("uses the OpenClaw session for unthreaded Slack DMs across DM scopes", async () => {
   const testHarness = await harness();
   try {
     const store = testHarness.stores.get("bill");
@@ -236,32 +401,95 @@ test("replays the same dossier contribution on retries without injecting on late
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    store.setPolicies(person.id, { injectionEnabled: true });
-    store.replaceDossier(person.id, {
-      schemaVersion: 1,
-      blurb: "Prefers concise decisions.",
-      sections: [],
-    });
-    const context = {
-      trigger: "user",
-      messageProvider: "slack",
-      accountId: "workspace-a",
-      senderId: "U123",
-      sessionId: "session-1",
-      sessionKey: "agent:bill:slack:channel:C123",
-      runId: "run-1",
-    };
+    store.replaceDossier(person.id, { schemaVersion: 1, blurb: "DM context.", sections: [] });
+    const dmSessions = [
+      "agent:bill:main",
+      "agent:bill:direct:U123",
+      "agent:bill:slack:direct:U123",
+      "agent:bill:slack:workspace-a:direct:U123",
+    ];
 
-    const first = testHarness.before?.({ prompt: "first attempt", messages: [] }, context);
-    assert.deepEqual(testHarness.before?.({ prompt: "retry", messages: [] }, context), first);
-    assert.equal(
-      testHarness.before?.({ prompt: "next turn", messages: [] }, { ...context, runId: "run-2" }),
-      undefined,
+    for (const [index, dmSession] of dmSessions.entries()) {
+      const conversationId = `D12${index}`;
+      testHarness.received(
+        {
+          from: "slack:U123",
+          content: "first",
+          messageId: `${index}00.0`,
+        },
+        { ...slackContext, conversationId, sessionKey: dmSession },
+      );
+      assert.equal(
+        testHarness.before?.(
+          { prompt: "first", messages: [] },
+          promptContext("U123", `dm-${index}-1`, dmSession),
+        )?.prependContext,
+        "DM context.",
+      );
+
+      testHarness.received(
+        {
+          from: "slack:U123",
+          content: "second",
+          messageId: `${index}01.0`,
+        },
+        { ...slackContext, conversationId, sessionKey: dmSession },
+      );
+      assert.equal(
+        testHarness.before?.(
+          { prompt: "second", messages: [] },
+          promptContext("U123", `dm-${index}-2`, dmSession),
+        ),
+        undefined,
+      );
+    }
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("deduplicates a Slack DM root and reply when only replyToId survives", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    store.replaceDossier(person.id, { schemaVersion: 1, blurb: "DM context.", sections: [] });
+    const dmSession = "agent:bill:slack:direct:U123";
+
+    testHarness.received(
+      {
+        from: "slack:U123",
+        content: "thread root",
+        threadId: "550.0",
+        messageId: "550.0",
+      },
+      { ...slackContext, conversationId: "D123", sessionKey: dmSession },
     );
     assert.equal(
       testHarness.before?.(
-        { prompt: "missing run", messages: [] },
-        { ...context, runId: undefined },
+        { prompt: "root", messages: [] },
+        promptContext("U123", "dm-thread-root", dmSession),
+      )?.prependContext,
+      "DM context.",
+    );
+
+    testHarness.received(
+      {
+        from: "slack:U123",
+        content: "thread reply",
+        messageId: "551.0",
+        replyToId: "550.0",
+      },
+      { ...slackContext, conversationId: "D123", sessionKey: dmSession },
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "reply", messages: [] },
+        promptContext("U123", "dm-thread-reply", dmSession),
       ),
       undefined,
     );
@@ -270,37 +498,66 @@ test("replays the same dossier contribution on retries without injecting on late
   }
 });
 
-test("fails closed for missing prompt identity and unknown people", async () => {
+test("unknown, dossierless, and disabled people create no receipt", async () => {
   const testHarness = await harness();
   try {
     const store = testHarness.stores.get("bill");
-    const { person } = store.upsertIdentity({
+    const { person: dossierless } = store.upsertIdentity({
       provider: "slack",
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    store.setPolicies(person.id, { injectionEnabled: true });
-    store.replaceDossier(person.id, {
+    const { person: disabled } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U456",
+    });
+    store.replaceDossier(disabled.id, {
       schemaVersion: 1,
-      blurb: "Eligible context.",
+      blurb: "Disabled context.",
       sections: [],
     });
-    const event = { prompt: "hello", messages: [] };
-    const base = {
-      trigger: "user",
-      messageProvider: "slack",
-      accountId: "workspace-a",
-      senderId: "U123",
-      sessionId: "session-1",
-      sessionKey: "agent:bill:slack:channel:C123",
-      runId: "run-1",
-    };
-    assert.equal(testHarness.before?.(event, { ...base, senderId: "unknown" }), undefined);
-    assert.equal(testHarness.before?.(event, base)?.prependContext, "Eligible context.");
-    assert.equal(testHarness.before?.(event, { ...base, accountId: undefined }), undefined);
-    assert.equal(testHarness.before?.(event, { ...base, senderId: undefined }), undefined);
-    assert.equal(testHarness.before?.(event, { ...base, sessionKey: "main" }), undefined);
-    assert.equal(testHarness.before?.(event, { ...base, messageProvider: "discord" }), undefined);
+    store.setInjection(disabled.id, false);
+
+    testHarness.received(
+      { from: "slack:C123", content: "message", messageId: "600.0" },
+      { ...slackContext, senderId: undefined },
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "message", messages: [] },
+        promptContext("unknown", "unknown-run"),
+      ),
+      undefined,
+    );
+
+    const cases = [
+      ["U123", "dossierless-run", "601.0"],
+      ["U456", "disabled-run", "602.0"],
+    ] as const;
+    for (const [senderId, runId, messageId] of cases) {
+      testHarness.received(
+        { from: "slack:C123", content: "message", messageId },
+        { ...slackContext, senderId },
+      );
+      assert.equal(
+        testHarness.before?.({ prompt: "message", messages: [] }, promptContext(senderId, runId)),
+        undefined,
+      );
+    }
+
+    assert.equal(
+      store.getWhisperReceipt("slack:workspace-a:C123:601.0", dossierless.id),
+      undefined,
+    );
+    assert.equal(store.getWhisperReceipt("slack:workspace-a:C123:602.0", disabled.id), undefined);
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "missing identity", messages: [] },
+        { ...promptContext("U123", "dossierless-run"), senderId: undefined },
+      ),
+      undefined,
+    );
   } finally {
     testHarness.stores.closeAll();
   }
@@ -313,7 +570,7 @@ test("registers only observation when People Whisperer is disabled", async () =>
   });
   assert.ok(testHarness.received);
   assert.equal(testHarness.before, undefined);
-  assert.equal(testHarness.end, undefined);
+  assert.equal(testHarness.agentEnd, undefined);
   testHarness.stores.closeAll();
 });
 

@@ -1,13 +1,16 @@
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import type {
+  OpenClawConfig,
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
+import { resolveAgentDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import type { UnblockMemoryConfig } from "./config.js";
 import { renderPeopleWhisper } from "./people-hooks.js";
-import type { PeopleStores } from "./people-store.js";
+import { nextPeopleRefinement } from "./people-refinement.js";
+import { PERSON_DOSSIER_SCHEMA, type PeopleStores } from "./people-store.js";
 import {
   createOpenClawSlackDirectory,
   syncSlackDirectory,
@@ -65,15 +68,43 @@ const inspectParameters = Type.Union([
     },
     { additionalProperties: false },
   ),
+  Type.Object(
+    {
+      view: Type.Literal("refinement_next"),
+      evidenceLimit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+    },
+    { additionalProperties: false },
+  ),
 ]);
 
 const updateParameters = Type.Union([
   Type.Object(
     {
-      action: Type.Literal("set_policy"),
+      action: Type.Literal("set_injection"),
       personId: nonEmpty,
-      refinementEnabled: Type.Optional(Type.Boolean()),
-      injectionEnabled: Type.Optional(Type.Boolean()),
+      enabled: Type.Boolean(),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      action: Type.Literal("replace_dossier"),
+      personId: nonEmpty,
+      dossier: Type.Optional(PERSON_DOSSIER_SCHEMA),
+      consumedEvidenceLocators: Type.Optional(
+        Type.Array(Type.String({ pattern: "^session:.+:event:\\d+$", maxLength: 1000 }), {
+          minItems: 1,
+          maxItems: 50,
+          uniqueItems: true,
+        }),
+      ),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      action: Type.Literal("delete_dossier"),
+      personId: nonEmpty,
     },
     { additionalProperties: false },
   ),
@@ -118,9 +149,11 @@ const syncParameters = Type.Object(
   { additionalProperties: false },
 );
 
-function context(ctx: OpenClawPluginToolContext): { agentId: string } | undefined {
+function context(
+  ctx: OpenClawPluginToolContext,
+): { agentId: string; cfg: OpenClawConfig } | undefined {
   const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
-  return cfg && ctx.agentId ? { agentId: ctx.agentId } : undefined;
+  return cfg && ctx.agentId ? { agentId: ctx.agentId, cfg } : undefined;
 }
 
 function personView(
@@ -166,17 +199,35 @@ function createInspectTool(
   ctx: OpenClawPluginToolContext,
 ) {
   const active = context(ctx);
-  if (!active || ctx.senderIsOwner !== true) return null;
+  if (!active) return null;
   return {
     name: "memory_people_inspect",
     label: "Inspect People Memory",
     description:
-      "Inspect one person by PeopleSQL personId or exact Slack identity, or list bounded actionable people todos.",
+      "Inspect a person, list actionable people todos, or read the next person's unseen interaction evidence for dossier refinement.",
     parameters: inspectParameters,
     async execute(_toolCallId: string, raw: unknown) {
       const input = Value.Parse(inspectParameters, raw);
       if (input.view === "person") {
         return jsonResult(personView(stores, active.agentId, input, config.whisperer.maxChars));
+      }
+      if (input.view === "refinement_next") {
+        try {
+          const refinement = nextPeopleRefinement({
+            store: stores.get(active.agentId),
+            agentId: active.agentId,
+            agentDatabasePath: `${resolveAgentDir(active.cfg, active.agentId)}/openclaw-agent.sqlite`,
+            evidenceLimit: input.evidenceLimit,
+          });
+          return jsonResult(
+            refinement ? { status: "ok", refinement } : { status: "empty" },
+          );
+        } catch (error) {
+          return jsonResult({
+            status: "unavailable",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
       return jsonResult({
         status: "ok",
@@ -188,27 +239,45 @@ function createInspectTool(
 
 function createUpdateTool(stores: PeopleStores, ctx: OpenClawPluginToolContext) {
   const active = context(ctx);
-  if (!active || ctx.senderIsOwner !== true) return null;
+  if (!active) return null;
   return {
     name: "memory_people_update",
     label: "Update People Memory",
     description:
-      "Apply one validated people policy, company, todo, deletion, or restoration action.",
+      "Update a dossier, one person's injection preference, company, todo, or person status.",
     parameters: updateParameters,
     async execute(_toolCallId: string, raw: unknown) {
-      if (ctx.senderIsOwner !== true)
-        return jsonResult({ status: "forbidden", error: "owner authorization required" });
       const input = Value.Parse(updateParameters, raw);
       const store = stores.get(active.agentId);
-      if (input.action === "set_policy") {
-        if (input.refinementEnabled === undefined && input.injectionEnabled === undefined) {
+      if (input.action === "set_injection") {
+        const person = store.setInjection(input.personId, input.enabled);
+        return jsonResult(person ? { status: "ok", person } : { status: "not_found" });
+      }
+      if (input.action === "replace_dossier") {
+        if (input.dossier === undefined && input.consumedEvidenceLocators === undefined) {
           return jsonResult({
             status: "invalid",
-            error: "set_policy requires at least one policy value",
+            error: "replace_dossier requires a dossier or consumed evidence locators",
           });
         }
-        const person = store.setPolicies(input.personId, input);
-        return jsonResult(person ? { status: "ok", person } : { status: "not_found" });
+        try {
+          const dossier = store.replaceDossier(
+            input.personId,
+            input.dossier,
+            input.consumedEvidenceLocators,
+          );
+          return jsonResult({ status: "ok", dossier });
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("person not found:")) {
+            return jsonResult({ status: "not_found" });
+          }
+          throw error;
+        }
+      }
+      if (input.action === "delete_dossier") {
+        return jsonResult(
+          store.deleteDossier(input.personId) ? { status: "ok" } : { status: "not_found" },
+        );
       }
       if (input.action === "set_company") {
         const company = store.setCompany(input.personId, {
@@ -240,7 +309,7 @@ function createSyncTool(
   ctx: OpenClawPluginToolContext,
 ) {
   const active = context(ctx);
-  if (!active || ctx.senderIsOwner !== true) return null;
+  if (!active) return null;
   return {
     name: "memory_people_sync",
     label: "Sync Slack People",
@@ -249,8 +318,6 @@ function createSyncTool(
     parameters: syncParameters,
     async execute(_toolCallId: string, raw: unknown) {
       const input = Value.Parse(syncParameters, raw);
-      if (ctx.senderIsOwner !== true)
-        return jsonResult({ status: "forbidden", error: "owner authorization required" });
       try {
         return jsonResult(
           await syncSlackDirectory({
@@ -278,11 +345,9 @@ export function registerPeopleTools(
 ): void {
   api.registerTool((ctx) => createInspectTool(stores, config, ctx), {
     names: ["memory_people_inspect"],
-    optional: true,
   });
   api.registerTool((ctx) => createUpdateTool(stores, ctx), {
     names: ["memory_people_update"],
-    optional: true,
   });
   api.registerTool(
     (ctx) =>

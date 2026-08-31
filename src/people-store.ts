@@ -56,7 +56,7 @@ const claimSchema = Type.Object(
 export const PERSON_DOSSIER_SCHEMA = Type.Object(
   {
     schemaVersion: Type.Literal(1),
-    blurb: Type.String({ minLength: 1 }),
+    blurb: Type.String({ minLength: 1, pattern: "\\S" }),
     sections: Type.Array(
       Type.Object(
         {
@@ -81,7 +81,6 @@ export type Person = {
   preferredName: string | null;
   status: "active" | "unavailable" | "archived";
   companyId: string | null;
-  refinementEnabled: boolean;
   injectionEnabled: boolean;
   lastSeenAt: string | null;
   createdAt: string;
@@ -133,7 +132,6 @@ type PersonRow = {
   preferred_name: string | null;
   status: Person["status"];
   company_id: string | null;
-  refinement_enabled: number;
   injection_enabled: number;
   last_seen_at: string | null;
   created_at: string;
@@ -198,7 +196,6 @@ function person(row: PersonRow): Person {
     preferredName: row.preferred_name,
     status: row.status,
     companyId: row.company_id,
-    refinementEnabled: row.refinement_enabled === 1,
     injectionEnabled: row.injection_enabled === 1,
     lastSeenAt: row.last_seen_at,
     createdAt: row.created_at,
@@ -314,9 +311,8 @@ export class PeopleStore {
         this.#db
           .prepare(`
           INSERT INTO people
-            (id, display_name, status, refinement_enabled, injection_enabled,
-             last_seen_at, created_at, updated_at)
-          VALUES (?, ?, 'active', 0, 0, ?, ?, ?)
+            (id, display_name, status, injection_enabled, last_seen_at, created_at, updated_at)
+          VALUES (?, ?, 'active', 1, ?, ?, ?)
         `)
           .run(personId, displayName, directorySync ? null : now, now, now);
         this.#db
@@ -391,8 +387,8 @@ export class PeopleStore {
       if (input.isDeactivated === true) {
         this.#db
           .prepare(`
-          UPDATE people SET status = 'unavailable', refinement_enabled = 0,
-            injection_enabled = 0, updated_at = ? WHERE id = ?
+          UPDATE people SET status = 'unavailable', injection_enabled = 0,
+            updated_at = ? WHERE id = ?
         `)
           .run(now, personId);
       }
@@ -494,20 +490,14 @@ export class PeopleStore {
     }
   }
 
-  listRefinementCandidates(limit: number): Person[] {
-    const bounded = Math.max(1, Math.min(100, Math.floor(limit)));
+  listActivePeople(): Person[] {
     return this.#db
       .prepare(`
-      SELECT people.* FROM people
-      LEFT JOIN person_dossiers ON person_dossiers.person_id = people.id
-      WHERE people.status = 'active'
-        AND people.refinement_enabled = 1
-        AND people.last_seen_at IS NOT NULL
-        AND (person_dossiers.reviewed_at IS NULL OR people.last_seen_at > person_dossiers.reviewed_at)
-      ORDER BY people.last_seen_at DESC, people.id
-      LIMIT ?
+      SELECT * FROM people
+      WHERE status = 'active'
+      ORDER BY last_seen_at DESC, id
     `)
-      .all(bounded)
+      .all()
       .map((row) => person(row as PersonRow));
   }
 
@@ -520,25 +510,11 @@ export class PeopleStore {
     return row ? identity(row) : undefined;
   }
 
-  setPolicies(
-    personId: string,
-    policies: { refinementEnabled?: boolean; injectionEnabled?: boolean },
-  ): Person | undefined {
+  setInjection(personId: string, enabled: boolean): Person | undefined {
     const now = new Date().toISOString();
     this.#db
-      .prepare(`
-      UPDATE people SET
-        refinement_enabled = COALESCE(?, refinement_enabled),
-        injection_enabled = COALESCE(?, injection_enabled),
-        updated_at = ?
-      WHERE id = ?
-    `)
-      .run(
-        policies.refinementEnabled === undefined ? null : Number(policies.refinementEnabled),
-        policies.injectionEnabled === undefined ? null : Number(policies.injectionEnabled),
-        now,
-        personId,
-      );
+      .prepare("UPDATE people SET injection_enabled = ?, updated_at = ? WHERE id = ?")
+      .run(Number(enabled), now, personId);
     const row = this.#db.prepare("SELECT * FROM people WHERE id = ?").get(personId) as
       | PersonRow
       | undefined;
@@ -547,36 +523,20 @@ export class PeopleStore {
 
   replaceDossier(
     personId: string,
-    input: unknown,
-    reviewedAt = new Date().toISOString(),
-    options: { requireRefinementEnabled?: boolean } = {},
-  ): PersonDossier {
-    const dossier = Value.Parse(PERSON_DOSSIER_SCHEMA, input);
-    if (dossier.blurb.length > this.#maxBlurbChars) {
-      throw new Error(`dossier blurb must not exceed ${this.#maxBlurbChars} characters`);
-    }
-    const categories = dossier.sections.map((section) => section.category);
-    if (new Set(categories).size !== categories.length) {
-      throw new Error("dossier sections must have unique categories");
-    }
+    input: unknown | undefined,
+    consumedEvidenceLocators: readonly string[] = [],
+  ): PersonDossier | undefined {
+    const dossier = input === undefined ? undefined : Value.Parse(PERSON_DOSSIER_SCHEMA, input);
+    if (dossier) this.#validateDossier(dossier);
+    const locators = this.#validateEvidenceLocators(consumedEvidenceLocators);
+    const reviewedAt = new Date().toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const target = this.#db
-        .prepare("SELECT refinement_enabled FROM people WHERE id = ?")
-        .get(personId) as { refinement_enabled: number } | undefined;
+      const target = this.#db.prepare("SELECT id FROM people WHERE id = ?").get(personId) as
+        | { id: string }
+        | undefined;
       if (!target) throw new Error(`person not found: ${personId}`);
-      if (options.requireRefinementEnabled && target.refinement_enabled !== 1) {
-        throw new Error("person is not enabled for refinement");
-      }
-      const dossierJson = JSON.stringify(dossier);
-      const current = this.#db
-        .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
-        .get(personId) as { dossier_json: string } | undefined;
-      if (current?.dossier_json === dossierJson) {
-        this.#db
-          .prepare("UPDATE person_dossiers SET reviewed_at = ? WHERE person_id = ?")
-          .run(reviewedAt, personId);
-      } else {
+      if (dossier) {
         this.#db
           .prepare(`
           INSERT INTO person_dossiers (person_id, dossier_json, blurb, reviewed_at)
@@ -586,14 +546,74 @@ export class PeopleStore {
             blurb = excluded.blurb,
             reviewed_at = excluded.reviewed_at
         `)
-          .run(personId, dossierJson, dossier.blurb, reviewedAt);
+          .run(personId, JSON.stringify(dossier), dossier.blurb, reviewedAt);
+      }
+      const consume = this.#db.prepare(`
+        INSERT OR IGNORE INTO person_evidence_receipts
+          (person_id, source, locator, processed_at)
+        VALUES (?, 'session', ?, ?)
+      `);
+      for (const locator of locators) {
+        consume.run(personId, locator, reviewedAt);
       }
       this.#db.exec("COMMIT");
-      return dossier;
+      return dossier ?? this.getDossier(personId)?.dossier;
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  deleteDossier(personId: string): boolean {
+    return this.#db.prepare("DELETE FROM person_dossiers WHERE person_id = ?").run(personId)
+      .changes === 1;
+  }
+
+  listProcessedEvidenceLocators(personId: string, source: "session"): Set<string> {
+    const rows = this.#db
+      .prepare(`
+      SELECT locator FROM person_evidence_receipts
+      WHERE person_id = ? AND source = ?
+    `)
+      .all(personId, source) as Array<{ locator: string }>;
+    return new Set(rows.map((row) => row.locator));
+  }
+
+  getWhisperReceipt(
+    threadKey: string,
+    personId: string,
+  ): { runId: string; contribution: string; injectedAt: string } | undefined {
+    const row = this.#db
+      .prepare(`
+      SELECT run_id, contribution, injected_at FROM person_whisper_receipts
+      WHERE thread_key = ? AND person_id = ?
+    `)
+      .get(threadKey, personId) as
+      | { run_id: string; contribution: string; injected_at: string }
+      | undefined;
+    return row
+      ? { runId: row.run_id, contribution: row.contribution, injectedAt: row.injected_at }
+      : undefined;
+  }
+
+  recordWhisperReceipt(input: {
+    threadKey: string;
+    personId: string;
+    runId: string;
+    contribution: string;
+  }): { runId: string; contribution: string; injectedAt: string } {
+    const threadKey = required(input.threadKey, "threadKey");
+    const runId = required(input.runId, "runId");
+    const contribution = required(input.contribution, "contribution");
+    const injectedAt = new Date().toISOString();
+    this.#db
+      .prepare(`
+      INSERT OR IGNORE INTO person_whisper_receipts
+        (thread_key, person_id, run_id, contribution, injected_at)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+      .run(threadKey, input.personId, runId, contribution, injectedAt);
+    return this.getWhisperReceipt(threadKey, input.personId)!;
   }
 
   getDossier(personId: string): { dossier: PersonDossier; reviewedAt: string } | undefined {
@@ -621,8 +641,8 @@ export class PeopleStore {
     try {
       const changed = this.#db
         .prepare(`
-        UPDATE people SET status = 'unavailable', refinement_enabled = 0,
-          injection_enabled = 0, updated_at = ? WHERE id = ?
+        UPDATE people SET status = 'unavailable', injection_enabled = 0,
+          updated_at = ? WHERE id = ?
       `)
         .run(now, personId);
       if (changed.changes === 0) {
@@ -652,8 +672,7 @@ export class PeopleStore {
     try {
       const changed = this.#db
         .prepare(`
-        UPDATE people SET status = 'active', refinement_enabled = 0,
-          injection_enabled = 0, updated_at = ?
+        UPDATE people SET status = 'active', injection_enabled = 0, updated_at = ?
         WHERE id = ? AND status = 'unavailable'
       `)
         .run(now, personId);
@@ -806,14 +825,59 @@ export class PeopleStore {
       .get(provider, accountScope, externalId) as IdentityRow | undefined;
   }
 
+  #validateDossier(dossier: PersonDossier): void {
+    if (dossier.blurb.length > this.#maxBlurbChars) {
+      throw new Error(`dossier blurb must not exceed ${this.#maxBlurbChars} characters`);
+    }
+    const categories = dossier.sections.map((section) => section.category);
+    if (new Set(categories).size !== categories.length) {
+      throw new Error("dossier sections must have unique categories");
+    }
+  }
+
+  #validateEvidenceLocators(locators: readonly string[]): string[] {
+    const unique = [...new Set(locators.map((locator) => locator.trim()))];
+    const invalid = unique.find((locator) => !/^session:.+:event:\d+$/.test(locator));
+    if (invalid !== undefined) throw new Error(`invalid session evidence locator: ${invalid}`);
+    return unique;
+  }
+
   #migrate(): void {
     const current = this.#db.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (current.user_version === 1) return;
-    if (current.user_version !== 0) {
+    if (current.user_version === 2) return;
+    if (current.user_version !== 0 && current.user_version !== 1) {
       throw new Error(`unsupported PeopleSQL schema version: ${current.user_version}`);
     }
     this.#db.exec("BEGIN IMMEDIATE");
     try {
+      if (current.user_version === 1) {
+        this.#db.exec(`
+          DROP INDEX people_policy_seen;
+          ALTER TABLE people DROP COLUMN refinement_enabled;
+          UPDATE people SET injection_enabled = 1 WHERE status = 'active';
+
+          CREATE TABLE person_evidence_receipts (
+            person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            locator TEXT NOT NULL,
+            processed_at TEXT NOT NULL,
+            PRIMARY KEY (person_id, source, locator)
+          ) STRICT;
+
+          CREATE TABLE person_whisper_receipts (
+            thread_key TEXT NOT NULL,
+            person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL,
+            contribution TEXT NOT NULL,
+            injected_at TEXT NOT NULL,
+            PRIMARY KEY (thread_key, person_id)
+          ) STRICT;
+
+          PRAGMA user_version = 2;
+        `);
+        this.#db.exec("COMMIT");
+        return;
+      }
       this.#db.exec(`
         CREATE TABLE companies (
           id TEXT PRIMARY KEY,
@@ -830,8 +894,7 @@ export class PeopleStore {
           preferred_name TEXT,
           status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'unavailable', 'archived')),
           company_id TEXT REFERENCES companies(id),
-          refinement_enabled INTEGER NOT NULL DEFAULT 0 CHECK (refinement_enabled IN (0, 1)),
-          injection_enabled INTEGER NOT NULL DEFAULT 0 CHECK (injection_enabled IN (0, 1)),
+          injection_enabled INTEGER NOT NULL DEFAULT 1 CHECK (injection_enabled IN (0, 1)),
           last_seen_at TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
@@ -875,10 +938,26 @@ export class PeopleStore {
           resolution_note TEXT
         ) STRICT;
 
+        CREATE TABLE person_evidence_receipts (
+          person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+          source TEXT NOT NULL,
+          locator TEXT NOT NULL,
+          processed_at TEXT NOT NULL,
+          PRIMARY KEY (person_id, source, locator)
+        ) STRICT;
+
+        CREATE TABLE person_whisper_receipts (
+          thread_key TEXT NOT NULL,
+          person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL,
+          contribution TEXT NOT NULL,
+          injected_at TEXT NOT NULL,
+          PRIMARY KEY (thread_key, person_id)
+        ) STRICT;
+
         CREATE INDEX people_status_seen ON people(status, last_seen_at);
-        CREATE INDEX people_policy_seen ON people(refinement_enabled, last_seen_at);
         CREATE INDEX people_todos_status_seen ON people_todos(status, last_seen_at);
-        PRAGMA user_version = 1;
+        PRAGMA user_version = 2;
       `);
       this.#db.exec("COMMIT");
     } catch (error) {

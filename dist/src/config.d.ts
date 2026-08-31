@@ -25,9 +25,6 @@ export type UnblockMemoryConfig = {
     };
     people: {
         enabled: boolean;
-        refinement: {
-            maxPeoplePerRun: number;
-        };
         whisperer: {
             enabled: boolean;
             maxChars: number;

@@ -5,10 +5,17 @@ export type PersonSessionEvidence = {
   locator: string;
   observedAt: string;
   text: string;
+  context: Array<{
+    locator: string;
+    role: string;
+    text: string;
+    senderId?: string;
+  }>;
 };
 
 type EvidenceRow = {
   session_id: string;
+  active_position: number;
   event_seq: number;
   event_json: string;
   created_at: number;
@@ -51,6 +58,7 @@ export function readPersonSessionEvidence(params: {
   externalId: string;
   limit?: number;
   maxMessageChars?: number;
+  excludeLocators?: ReadonlySet<string>;
 }): PersonSessionEvidence[] {
   const limit = Math.max(1, Math.min(50, Math.floor(params.limit ?? 20)));
   const maxMessageChars = Math.max(1, Math.min(4000, Math.floor(params.maxMessageChars ?? 2000)));
@@ -70,9 +78,9 @@ export function readPersonSessionEvidence(params: {
     ) {
       throw new Error("unsupported or mismatched OpenClaw agent database");
     }
-    const rows = db
-      .prepare(`
-      SELECT events.session_id, active.event_seq, events.event_json, events.created_at
+    const rows = db.prepare(`
+      SELECT events.session_id, active.active_position, active.event_seq,
+        events.event_json, events.created_at
       FROM session_transcript_active_events AS active
       JOIN transcript_events AS events
         ON events.session_id = active.session_id AND events.seq = active.event_seq
@@ -85,23 +93,53 @@ export function readPersonSessionEvidence(params: {
         AND json_extract(events.event_json, '$.message.role') = 'user'
         AND json_extract(events.event_json, '$.message.__openclaw.senderId') = ?
       ORDER BY events.created_at DESC, events.session_id, active.active_position DESC
-      LIMIT ?
-    `)
-      .all(params.accountScope, params.externalId, limit) as EvidenceRow[];
-    const evidence = rows.flatMap((row) => {
+    `);
+    const contextStatement = db.prepare(`
+      SELECT active.event_seq, events.event_json
+      FROM session_transcript_active_events AS active
+      JOIN transcript_events AS events
+        ON events.session_id = active.session_id AND events.seq = active.event_seq
+      WHERE active.session_id = ?
+        AND active.message_position IS NOT NULL
+        AND active.active_position BETWEEN ? AND ?
+        AND json_extract(events.event_json, '$.type') = 'message'
+      ORDER BY active.active_position
+    `);
+    const evidence: PersonSessionEvidence[] = [];
+    for (const row of rows.iterate(params.accountScope, params.externalId) as Iterable<EvidenceRow>) {
+      const locator = `session:${row.session_id}:event:${row.event_seq}`;
+      if (params.excludeLocators?.has(locator)) continue;
       const event = record(JSON.parse(row.event_json));
       const message = record(event?.message);
       const text = messageText(message?.content);
-      if (!event || !message || !text) return [];
-      return [
-        {
-          source: "session" as const,
-          locator: `session:${row.session_id}:event:${row.event_seq}`,
-          observedAt: evidenceTimestamp(event, row.created_at),
-          text: text.slice(0, maxMessageChars),
-        },
-      ];
-    });
+      if (!event || !message || !text) continue;
+      const context = contextStatement
+        .all(row.session_id, row.active_position - 1, row.active_position + 2)
+        .flatMap((contextRow) => {
+          const candidate = contextRow as { event_seq: number; event_json: string };
+          const contextEvent = record(JSON.parse(candidate.event_json));
+          const contextMessage = record(contextEvent?.message);
+          const contextText = messageText(contextMessage?.content);
+          if (!contextMessage || !contextText || typeof contextMessage.role !== "string") return [];
+          const metadata = record(contextMessage.__openclaw);
+          return [
+            {
+              locator: `session:${row.session_id}:event:${candidate.event_seq}`,
+              role: contextMessage.role,
+              text: contextText.slice(0, maxMessageChars),
+              ...(typeof metadata?.senderId === "string" ? { senderId: metadata.senderId } : {}),
+            },
+          ];
+        });
+      evidence.push({
+        source: "session",
+        locator,
+        observedAt: evidenceTimestamp(event, row.created_at),
+        text: text.slice(0, maxMessageChars),
+        context,
+      });
+      if (evidence.length === limit) break;
+    }
     db.exec("COMMIT");
     return evidence;
   } catch (error) {

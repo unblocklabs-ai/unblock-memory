@@ -9,11 +9,12 @@
       "hooks": [
         "before_prompt_build",
         "after_tool_call",
+        "agent_end",
         "message_received",
         "session_end",
         "gateway_stop"
       ],
-      "registrations": ["registerCli", "registerMemoryCapability", "registerTool"],
+      "registrations": ["registerMemoryCapability", "registerTool"],
       "manifestContracts": ["tools"]
     }
   },

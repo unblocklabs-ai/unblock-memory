@@ -7,7 +7,6 @@ import type {
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "./config.js";
-import { registerPeopleCli } from "./people-cli.js";
 import { registerPeopleHooks } from "./people-hooks.js";
 import { PeopleStores } from "./people-store.js";
 import { registerPeopleTools } from "./people-tools.js";
@@ -478,7 +477,6 @@ export function resolveFlushPlan(params: { cfg?: OpenClawConfig; nowMs?: number 
 
 export function registerUnblockMemory(api: OpenClawPluginApi): void {
   const config = resolveConfig(api.pluginConfig);
-  registerPeopleCli(api, config.people);
   if (api.registrationMode === "cli-metadata") return;
   const runtime = new QmdMemoryRuntime(config.corpora, {
     analysisExecutable: config.analysis.executable,

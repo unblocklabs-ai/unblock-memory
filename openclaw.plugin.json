@@ -1,18 +1,11 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": false },
   "skills": ["./skills"],
-  "cliCommands": [
-    {
-      "name": "unblock-memory",
-      "description": "Unblock Memory administration",
-      "hasSubcommands": true
-    }
-  ],
   "contracts": {
     "tools": [
       "memory_search",
@@ -37,8 +30,8 @@
     "memory_fetch_cluster": { "replaySafe": true },
     "memory_list_maintenance_tasks": { "replaySafe": true },
     "memory_update_maintenance_task": { "sideEffecting": true },
-    "memory_people_inspect": { "replaySafe": true, "optional": true },
-    "memory_people_update": { "sideEffecting": true, "optional": true },
+    "memory_people_inspect": { "replaySafe": true },
+    "memory_people_update": { "sideEffecting": true },
     "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
@@ -147,11 +140,11 @@
           "enabled": { "type": "boolean", "default": false },
           "refinement": {
             "type": "object",
+            "description": "Deprecated compatibility field; accepted but ignored.",
             "additionalProperties": false,
             "properties": {
-              "maxPeoplePerRun": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
-            },
-            "default": { "maxPeoplePerRun": 10 }
+              "maxPeoplePerRun": { "type": "integer", "minimum": 1, "maximum": 50 }
+            }
           },
           "whisperer": {
             "type": "object",
@@ -173,7 +166,6 @@
         },
         "default": {
           "enabled": false,
-          "refinement": { "maxPeoplePerRun": 10 },
           "whisperer": { "enabled": false, "maxChars": 1200 },
           "todos": { "maxOpen": 1000 }
         }

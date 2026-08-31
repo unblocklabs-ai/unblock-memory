@@ -2,7 +2,6 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveConfig } from "./config.js";
-import { registerPeopleCli } from "./people-cli.js";
 import { registerPeopleHooks } from "./people-hooks.js";
 import { PeopleStores } from "./people-store.js";
 import { registerPeopleTools } from "./people-tools.js";
@@ -386,7 +385,6 @@ export function resolveFlushPlan(params = {}) {
 }
 export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
-    registerPeopleCli(api, config.people);
     if (api.registrationMode === "cli-metadata")
         return;
     const runtime = new QmdMemoryRuntime(config.corpora, {

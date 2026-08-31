@@ -13,7 +13,7 @@ async function temporaryPath(name = "people.sqlite"): Promise<string> {
   return join(root, name);
 }
 
-test("creates only the five version-1 tables with secure SQLite settings", async () => {
+test("creates only the seven version-2 tables with secure SQLite settings", async () => {
   const path = await temporaryPath();
   const store = new PeopleStore(path, options);
   store.close();
@@ -34,11 +34,13 @@ test("creates only the five version-1 tables with secure SQLite settings", async
       "people",
       "people_todos",
       "person_dossiers",
+      "person_evidence_receipts",
       "person_identities",
+      "person_whisper_receipts",
     ]);
     assert.equal(
       (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-      1,
+      2,
     );
     assert.equal(
       (db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode,
@@ -90,7 +92,7 @@ test("rejects agent ids that could escape the state root", async () => {
   }
 });
 
-test("deduplicates exact identities and defaults both policies off", async () => {
+test("deduplicates exact identities and enables injection for new people", async () => {
   const store = new PeopleStore(await temporaryPath(), options);
   try {
     const first = store.upsertIdentity({
@@ -116,8 +118,7 @@ test("deduplicates exact identities and defaults both policies off", async () =>
     assert.equal(second.person.id, first.person.id);
     assert.equal(second.identity.displayName, "Current Slack Name");
     assert.equal(second.person.displayName, "First Name");
-    assert.equal(second.person.refinementEnabled, false);
-    assert.equal(second.person.injectionEnabled, false);
+    assert.equal(second.person.injectionEnabled, true);
     assert.notEqual(otherAccount.person.id, first.person.id);
   } finally {
     store.close();
@@ -314,6 +315,7 @@ test("validates and replaces one bounded baseline dossier", async () => {
     assert.deepEqual(store.getDossier(person.id)?.dossier, dossier);
     assert.equal(store.getDossierBlurb(person.id), dossier.blurb);
 
+    assert.throws(() => store.replaceDossier(person.id, { ...dossier, blurb: "   " }));
     assert.throws(
       () => store.replaceDossier(person.id, { ...dossier, blurb: "x".repeat(21) }),
       /20 characters/,
@@ -337,7 +339,7 @@ test("validates and replaces one bounded baseline dossier", async () => {
   }
 });
 
-test("restores an unavailable person without restoring policies or deleting related records", async () => {
+test("restores an unavailable person without restoring injection or deleting related records", async () => {
   const store = new PeopleStore(await temporaryPath(), options);
   try {
     const { person } = store.upsertIdentity({
@@ -345,7 +347,7 @@ test("restores an unavailable person without restoring policies or deleting rela
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    store.setPolicies(person.id, { refinementEnabled: true, injectionEnabled: true });
+    store.setInjection(person.id, true);
     const company = store.setCompany(person.id, { name: "Unblock Labs" });
     const dossier = {
       schemaVersion: 1,
@@ -357,7 +359,6 @@ test("restores an unavailable person without restoring policies or deleting rela
 
     const restored = store.restorePerson(person.id);
     assert.equal(restored?.status, "active");
-    assert.equal(restored?.refinementEnabled, false);
     assert.equal(restored?.injectionEnabled, false);
     assert.equal(restored?.companyId, company?.id);
     assert.equal(store.listIdentities(person.id).length, 1);
@@ -369,6 +370,153 @@ test("restores an unavailable person without restoring policies or deleting rela
     );
     assert.equal(store.restorePerson(person.id), undefined);
     assert.equal(store.restorePerson("missing"), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test("atomically replaces or retains a dossier while consuming exact evidence", async () => {
+  const store = new PeopleStore(await temporaryPath(), { ...options, maxBlurbChars: 50 });
+  try {
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    const first = {
+      schemaVersion: 1,
+      blurb: "Initial blurb.",
+      sections: [],
+    } as const;
+    const firstLocator = "session:first:event:1";
+    assert.deepEqual(store.replaceDossier(person.id, first, [firstLocator]), first);
+    assert.equal(
+      store.listProcessedEvidenceLocators(person.id, "session").has(firstLocator),
+      true,
+    );
+
+    const secondLocator = "session:second:event:2";
+    assert.deepEqual(store.replaceDossier(person.id, undefined, [secondLocator]), first);
+    assert.equal(
+      store.listProcessedEvidenceLocators(person.id, "session").has(secondLocator),
+      true,
+    );
+    assert.deepEqual(store.getDossier(person.id)?.dossier, first);
+
+    const rejectedLocator = "session:rejected:event:3";
+    assert.throws(
+      () =>
+        store.replaceDossier(person.id, { ...first, blurb: "x".repeat(51) }, [rejectedLocator]),
+      /50 characters/,
+    );
+    assert.equal(
+      store.listProcessedEvidenceLocators(person.id, "session").has(rejectedLocator),
+      false,
+    );
+    assert.deepEqual(store.getDossier(person.id)?.dossier, first);
+
+    assert.equal(store.deleteDossier(person.id), true);
+    assert.equal(store.getDossier(person.id), undefined);
+    assert.equal(store.deleteDossier(person.id), false);
+  } finally {
+    store.close();
+  }
+});
+
+test("stores one durable whisper receipt per thread and person", async () => {
+  const store = new PeopleStore(await temporaryPath(), options);
+  try {
+    const first = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    }).person;
+    const second = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U456",
+    }).person;
+
+    const receipt = store.recordWhisperReceipt({
+      threadKey: "slack:workspace-a:C1:1.0",
+      personId: first.id,
+      runId: "run-1",
+      contribution: "first contribution",
+    });
+    assert.equal(receipt.runId, "run-1");
+    assert.deepEqual(store.getWhisperReceipt("slack:workspace-a:C1:1.0", first.id), receipt);
+    assert.deepEqual(
+      store.recordWhisperReceipt({
+        threadKey: "slack:workspace-a:C1:1.0",
+        personId: first.id,
+        runId: "run-2",
+        contribution: "replacement",
+      }),
+      receipt,
+    );
+    assert.equal(
+      store.recordWhisperReceipt({
+        threadKey: "slack:workspace-a:C1:1.0",
+        personId: second.id,
+        runId: "run-3",
+        contribution: "second person",
+      }).runId,
+      "run-3",
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("migrates version 1 people to agent-owned injection semantics", async () => {
+  const path = await temporaryPath();
+  const db = new DatabaseSync(path);
+  db.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE companies (id TEXT PRIMARY KEY, name TEXT NOT NULL, primary_domain TEXT,
+      status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL) STRICT;
+    CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, preferred_name TEXT,
+      status TEXT NOT NULL, company_id TEXT REFERENCES companies(id),
+      refinement_enabled INTEGER NOT NULL DEFAULT 0, injection_enabled INTEGER NOT NULL DEFAULT 0,
+      last_seen_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL) STRICT;
+    CREATE TABLE person_identities (person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL, account_scope TEXT NOT NULL, external_id TEXT NOT NULL,
+      display_name TEXT, real_name TEXT, handle TEXT, avatar_url TEXT, title TEXT, is_bot INTEGER,
+      is_deactivated INTEGER NOT NULL DEFAULT 0, first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL, last_synced_at TEXT,
+      PRIMARY KEY (provider, account_scope, external_id)) STRICT;
+    CREATE TABLE person_dossiers (person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
+      dossier_json TEXT NOT NULL, blurb TEXT NOT NULL, reviewed_at TEXT NOT NULL) STRICT;
+    CREATE TABLE people_todos (id TEXT PRIMARY KEY, deduplication_key TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL, context_json TEXT NOT NULL, status TEXT NOT NULL,
+      occurrence_count INTEGER NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+      resolved_at TEXT, resolution_note TEXT) STRICT;
+    CREATE INDEX people_policy_seen ON people(refinement_enabled, last_seen_at);
+    INSERT INTO people VALUES
+      ('active', 'Active', NULL, 'active', NULL, 0, 0, NULL, 'now', 'now'),
+      ('archived', 'Archived', NULL, 'archived', NULL, 1, 0, NULL, 'now', 'now');
+    PRAGMA user_version = 1;
+  `);
+  db.close();
+
+  const store = new PeopleStore(path, options);
+  try {
+    assert.equal(store.getPerson("active")?.injectionEnabled, true);
+    assert.equal(store.getPerson("archived")?.injectionEnabled, false);
+    const migrated = new DatabaseSync(path, { readOnly: true });
+    try {
+      const columns = migrated
+        .prepare("PRAGMA table_info(people)")
+        .all()
+        .map((row) => (row as { name: string }).name);
+      assert.equal(columns.includes("refinement_enabled"), false);
+      assert.equal(
+        (migrated.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+        2,
+      );
+    } finally {
+      migrated.close();
+    }
   } finally {
     store.close();
   }

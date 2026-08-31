@@ -3,6 +3,12 @@ export type PersonSessionEvidence = {
     locator: string;
     observedAt: string;
     text: string;
+    context: Array<{
+        locator: string;
+        role: string;
+        text: string;
+        senderId?: string;
+    }>;
 };
 export declare function readPersonSessionEvidence(params: {
     databasePath: string;
@@ -11,4 +17,5 @@ export declare function readPersonSessionEvidence(params: {
     externalId: string;
     limit?: number;
     maxMessageChars?: number;
+    excludeLocators?: ReadonlySet<string>;
 }): PersonSessionEvidence[];

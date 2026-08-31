@@ -23,7 +23,6 @@ export type Person = {
     preferredName: string | null;
     status: "active" | "unavailable" | "archived";
     companyId: string | null;
-    refinementEnabled: boolean;
     injectionEnabled: boolean;
     lastSeenAt: string | null;
     createdAt: string;
@@ -98,15 +97,27 @@ export declare class PeopleStore {
         name: string;
         primaryDomain?: string;
     }): Company | undefined;
-    listRefinementCandidates(limit: number): Person[];
+    listActivePeople(): Person[];
     findIdentity(provider: string, accountScope: string, externalId: string): PersonIdentity | undefined;
-    setPolicies(personId: string, policies: {
-        refinementEnabled?: boolean;
-        injectionEnabled?: boolean;
-    }): Person | undefined;
-    replaceDossier(personId: string, input: unknown, reviewedAt?: string, options?: {
-        requireRefinementEnabled?: boolean;
-    }): PersonDossier;
+    setInjection(personId: string, enabled: boolean): Person | undefined;
+    replaceDossier(personId: string, input: unknown | undefined, consumedEvidenceLocators?: readonly string[]): PersonDossier | undefined;
+    deleteDossier(personId: string): boolean;
+    listProcessedEvidenceLocators(personId: string, source: "session"): Set<string>;
+    getWhisperReceipt(threadKey: string, personId: string): {
+        runId: string;
+        contribution: string;
+        injectedAt: string;
+    } | undefined;
+    recordWhisperReceipt(input: {
+        threadKey: string;
+        personId: string;
+        runId: string;
+        contribution: string;
+    }): {
+        runId: string;
+        contribution: string;
+        injectedAt: string;
+    };
     getDossier(personId: string): {
         dossier: PersonDossier;
         reviewedAt: string;

@@ -10,7 +10,6 @@ export const DEFAULT_CORPORA = [
 ];
 export const DEFAULT_PEOPLE_CONFIG = {
     enabled: false,
-    refinement: { maxPeoplePerRun: 10 },
     whisperer: { enabled: false, maxChars: 1200 },
     todos: { maxOpen: 1000 },
 };
@@ -119,12 +118,18 @@ function resolvePeople(value) {
     const enabled = people.enabled ?? false;
     if (typeof enabled !== "boolean")
         throw new Error("unblock-memory people.enabled must be a boolean");
-    const refinement = people.refinement ?? {};
-    if (!refinement || typeof refinement !== "object" || Array.isArray(refinement)) {
-        throw new Error("unblock-memory people.refinement must be an object");
+    // Accepted only so existing installations can upgrade without first rewriting config.
+    const legacyRefinement = people.refinement;
+    if (legacyRefinement !== undefined) {
+        if (!legacyRefinement ||
+            typeof legacyRefinement !== "object" ||
+            Array.isArray(legacyRefinement)) {
+            throw new Error("unblock-memory people.refinement must be an object");
+        }
+        const legacy = legacyRefinement;
+        assertOnlyKeys(legacy, ["maxPeoplePerRun"], "people.refinement");
+        positiveInteger(legacy.maxPeoplePerRun, 10, "people.refinement.maxPeoplePerRun", 50);
     }
-    const refinementRecord = refinement;
-    assertOnlyKeys(refinementRecord, ["maxPeoplePerRun"], "people.refinement");
     const whisperer = people.whisperer ?? {};
     if (!whisperer || typeof whisperer !== "object" || Array.isArray(whisperer)) {
         throw new Error("unblock-memory people.whisperer must be an object");
@@ -143,9 +148,6 @@ function resolvePeople(value) {
     assertOnlyKeys(todosRecord, ["maxOpen"], "people.todos");
     return {
         enabled,
-        refinement: {
-            maxPeoplePerRun: positiveInteger(refinementRecord.maxPeoplePerRun, DEFAULT_PEOPLE_CONFIG.refinement.maxPeoplePerRun, "people.refinement.maxPeoplePerRun", 50),
-        },
         whisperer: {
             enabled: whispererEnabled,
             maxChars: positiveInteger(whispererRecord.maxChars, DEFAULT_PEOPLE_CONFIG.whisperer.maxChars, "people.whisperer.maxChars", 4000),

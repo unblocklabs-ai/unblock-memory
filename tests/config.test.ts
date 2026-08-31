@@ -19,14 +19,12 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
     resolveConfig({
       people: {
         enabled: true,
-        refinement: { maxPeoplePerRun: 2 },
         whisperer: { enabled: true, maxChars: 800 },
         todos: { maxOpen: 20 },
       },
     }).people,
     {
       enabled: true,
-      refinement: { maxPeoplePerRun: 2 },
       whisperer: { enabled: true, maxChars: 800 },
       todos: { maxOpen: 20 },
     },
@@ -37,15 +35,19 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
     () => resolveConfig({ people: { evidenceCorpora: ["sessions"] } }),
     /unknown property: evidenceCorpora/,
   );
+  assert.deepEqual(
+    resolveConfig({ people: { refinement: { maxPeoplePerRun: 2 } } }).people,
+    DEFAULT_PEOPLE_CONFIG,
+  );
   assert.throws(
     () => resolveConfig({ people: { refinement: { maxPeoplePerRun: 0 } } }),
-    /positive integer/,
+    /people.refinement.maxPeoplePerRun/,
   );
+  assert.throws(() => resolveConfig({ people: { refinement: { maxPeoplePerRun: 51 } } }), /50/);
   assert.throws(
     () => resolveConfig({ people: { whisperer: { maxChars: 1.5 } } }),
     /positive integer/,
   );
-  assert.throws(() => resolveConfig({ people: { refinement: { maxPeoplePerRun: 51 } } }), /50/);
   assert.throws(() => resolveConfig({ people: { whisperer: { maxChars: 4001 } } }), /4000/);
   assert.throws(() => resolveConfig({ people: { todos: { maxOpen: 10_001 } } }), /10000/);
   assert.throws(() => resolveConfig({ people: { todos: { maxOpen: 0 } } }), /positive integer/);

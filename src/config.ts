@@ -39,7 +39,6 @@ export type UnblockMemoryConfig = {
   analysis: { executable?: string };
   people: {
     enabled: boolean;
-    refinement: { maxPeoplePerRun: number };
     whisperer: { enabled: boolean; maxChars: number };
     todos: { maxOpen: number };
   };
@@ -53,7 +52,6 @@ export type UnblockMemoryConfig = {
 
 export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
   enabled: false,
-  refinement: { maxPeoplePerRun: 10 },
   whisperer: { enabled: false, maxChars: 1200 },
   todos: { maxOpen: 1000 },
 };
@@ -183,22 +181,26 @@ function resolvePeople(value: unknown): UnblockMemoryConfig["people"] {
     throw new Error("unblock-memory people must be an object");
   }
   const people = value as Record<string, unknown>;
-  assertOnlyKeys(
-    people,
-    ["enabled", "refinement", "whisperer", "todos"],
-    "people",
-  );
+  assertOnlyKeys(people, ["enabled", "refinement", "whisperer", "todos"], "people");
 
   const enabled = people.enabled ?? false;
   if (typeof enabled !== "boolean")
     throw new Error("unblock-memory people.enabled must be a boolean");
 
-  const refinement = people.refinement ?? {};
-  if (!refinement || typeof refinement !== "object" || Array.isArray(refinement)) {
-    throw new Error("unblock-memory people.refinement must be an object");
+  // Accepted only so existing installations can upgrade without first rewriting config.
+  const legacyRefinement = people.refinement;
+  if (legacyRefinement !== undefined) {
+    if (
+      !legacyRefinement ||
+      typeof legacyRefinement !== "object" ||
+      Array.isArray(legacyRefinement)
+    ) {
+      throw new Error("unblock-memory people.refinement must be an object");
+    }
+    const legacy = legacyRefinement as Record<string, unknown>;
+    assertOnlyKeys(legacy, ["maxPeoplePerRun"], "people.refinement");
+    positiveInteger(legacy.maxPeoplePerRun, 10, "people.refinement.maxPeoplePerRun", 50);
   }
-  const refinementRecord = refinement as Record<string, unknown>;
-  assertOnlyKeys(refinementRecord, ["maxPeoplePerRun"], "people.refinement");
 
   const whisperer = people.whisperer ?? {};
   if (!whisperer || typeof whisperer !== "object" || Array.isArray(whisperer)) {
@@ -220,14 +222,6 @@ function resolvePeople(value: unknown): UnblockMemoryConfig["people"] {
 
   return {
     enabled,
-    refinement: {
-      maxPeoplePerRun: positiveInteger(
-        refinementRecord.maxPeoplePerRun,
-        DEFAULT_PEOPLE_CONFIG.refinement.maxPeoplePerRun,
-        "people.refinement.maxPeoplePerRun",
-        50,
-      ),
-    },
     whisperer: {
       enabled: whispererEnabled,
       maxChars: positiveInteger(

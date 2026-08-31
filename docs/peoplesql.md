@@ -2,6 +2,11 @@
 
 ## Status
 
+> Superseded by
+> [`planning/people-whisperer-agent-owned-dossiers.md`](planning/people-whisperer-agent-owned-dossiers.md).
+> This document describes the earlier plugin-owned refinement design and is retained only
+> as historical context.
+
 Product and architecture direction. This document narrows the broader relationship-memory
 and `platform.sqlite` planning to one useful loop:
 
