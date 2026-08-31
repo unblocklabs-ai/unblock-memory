@@ -10,6 +10,20 @@ understanding of its world. A cluster shows similarity, not a complete timeline,
 truth, or consensus. Do not write from a cluster alone, and prefer no write over
 weak, duplicative, or easily looked-up knowledge.
 
+## Clusters and the knowledge corpus
+
+Clustering and knowledge are separate. `memory_recluster` analyzes every
+configured non-skill corpus, so a cluster may connect raw memory, sessions,
+meeting notes, other source material, and previously maintained knowledge.
+
+`knowledge` is not a special cluster type. It is the dedicated indexed corpus
+for the agent's maintained synthesis, normally backed by
+`knowledge/**/*.md`. Source corpora preserve what happened or was recorded;
+the knowledge corpus preserves the agent's supported current understanding
+when that understanding would be expensive to reconstruct. A cluster is only
+an invitation to investigate, not evidence that something belongs in
+knowledge.
+
 ## Investigate
 
 1. Call `memory_list_clusters`. If analysis is missing or stale, call
@@ -21,7 +35,7 @@ weak, duplicative, or easily looked-up knowledge.
    fallback when `eventTime` is unresolved.
 3. State the question the cluster raises: what may be repeated, contradictory,
    changing, or worth understanding?
-4. Search existing knowledge with `memory_search`, using
+4. Search existing maintained knowledge with `memory_search`, using
    `corpora: ["knowledge"]`. If that corpus is not configured, report that and
    do not create an unindexed file.
 5. Investigate the evidence needed to answer the question. Follow important

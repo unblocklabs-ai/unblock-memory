@@ -268,7 +268,7 @@ Markdown filesystem changes queue a debounced, serialized background refresh.
 
 Analysis is opt-in. Core indexing, `memory_search`, and `memory_get` need only
 Unblock Memory and its automatically installed QMD dependency. To enable
-clustering, install the
+clustering, install the public
 [`unblock-cluster`](https://github.com/unblocklabs-ai/unblock-cluster) worker once
 on the same host:
 
@@ -276,7 +276,7 @@ on the same host:
 git clone https://github.com/unblocklabs-ai/unblock-cluster.git
 cd unblock-cluster
 python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements-analysis.txt
 ```
 
 Set `analysis.executable` to the absolute path of
@@ -292,11 +292,12 @@ analyzed and `memory_recluster` reports that analysis is unavailable. Ordinary
 memory search and reads continue to work.
 
 The analysis worker reads QMD's existing semantic vectors and writes only
-derived results into three namespaced tables in that same `index.sqlite`:
+derived results into four namespaced tables in that same `index.sqlite`:
 
 - `memory_analysis_runs`
 - `memory_analysis_clusters`
 - `memory_analysis_memberships`
+- `memory_analysis_duplicate_occurrences`
 
 Unblock Memory exposes:
 
