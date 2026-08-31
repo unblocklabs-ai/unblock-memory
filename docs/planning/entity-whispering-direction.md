@@ -2,7 +2,7 @@
 
 ## Status
 
-Planning conversation consolidation, captured **2026-08-29** and revised **2026-08-30**
+Planning conversation consolidation, captured **2026-08-29** and revised **2026-08-31**
 after checking the direction against the current PeopleSQL, QMD, and Unblock Cluster
 implementations. This is the freshest statement of direction for whispering and
 consolidation; where it conflicts with older planning documents, prefer this one, except
@@ -10,10 +10,16 @@ where an older document is explicitly cited as still governing.
 Nothing here is implemented beyond what the README already describes. The overall
 product vision lives in `../vision.md`.
 
-Builds on:
+For the implemented People Whisperer maintenance boundary, defer to
+`people-whisperer-agent-owned-dossiers.md`: the agent uses ordinary memory tools and
+replaces dossiers when useful. The plugin owns no cursor, dirty queue, evidence packet,
+or refinement workflow.
 
-- `people-whisperer-materialized-relationship-cache.md` (evidence packet design; still
-  the reference for the full refresh packet)
+Related material:
+
+- `people-whisperer-agent-owned-dossiers.md` (implemented People Whisperer boundary)
+- `people-whisperer-materialized-relationship-cache.md` (superseded exploration of a
+  plugin-owned refresh packet; retained for future QMD/Cluster research)
 - `contextual-relationship-memory.md` (context compiler; superseded in part — see
   "Injection model" below)
 - `memory-consolidation-and-reflection.md` (dreaming; unchanged)
@@ -165,56 +171,47 @@ Cheap mitigations (prompt- and schema-level, no math):
 
 Do not over-engineer past this until real rough edges hurt.
 
-## Consolidation v0 (decided 2026-08-29)
+## Superseded consolidation sketch (2026-08-29)
 
-Keep it simple to start; adjust when it hurts. Anything beats hoping the agent runs
-memory_search and gets the right hits just to remember the one person it talks to 99%
-of the time.
+The watermark and dirty-queue design below was considered, then deliberately removed
+from People Whisperer. It remains useful background if a future entity system proves
+that agent-owned maintenance cannot provide adequate coverage.
 
 - A floated v0 was: per entity, take top-K + recent-K hits above minScore and ask
   whether anything materially changed versus the dossier summary.
   `people-whisperer-materialized-relationship-cache.md` already critiques exactly this
   shape: top-K overrepresents the dominant topic and recent-K repeats the MVP flaw.
-- **The one piece to keep even in the crudest v0 is the evidence watermark.** Without
+- The sketch treated an evidence watermark as essential. Without
   it, "has anything materially changed?" is ill-posed — top-K resamples the same
   dominant chunks every run, old information keeps presenting itself as candidate
   news, and the model re-litigates the whole dossier each cycle. With it, the question
   becomes "here is the dossier; here is only what you have not seen — does any of it
   matter?" That is cheaper and structurally biased against recency over-indexing,
   since the unseen set is small and explicitly labeled as new.
-- v0 = **watermark + prior-framed prompt + two-tier dossier.** No weights, no
+- Its proposed v0 was **watermark + prior-framed prompt + two-tier dossier.** No weights, no
   frequency analysis, no mini-clusters, no graph structure.
 - Defer until a real dossier goes visibly stale or lopsided on Bill:
   cluster-stratified representative sampling, chunk frequency/weighting, mini-clusters
   within a large cluster, and any Unblock Cluster mini-graph expansion. The full
-  refresh packet in `people-whisperer-materialized-relationship-cache.md` remains the
-  reference design for that next step.
+  refresh packet in `people-whisperer-materialized-relationship-cache.md` preserves
+  that research, but does not define current People Whisperer maintenance.
 
-### Immediate People Whisperer slice
+### Current People Whisperer slice
 
-Finish the people loop before generalizing the storage model or expanding Cluster:
+Finish proving the deliberately smaller people loop before generalizing the storage
+model or expanding Cluster:
 
-1. Add a durable per-person evidence cursor and dirty state. The cursor must identify
-   processed evidence, not merely compare wall-clock timestamps, so late projection or
-   imported history cannot be skipped.
-2. Replace the recent-message selector with bounded pages of unseen exact-attributed
-   evidence. Include the surrounding conversational exchange, not only isolated messages
-   from the person; agreements, agent responses, outcomes, and relationship dynamics live
-   in the interaction.
-3. Add the two-tier dossier and prior-framed refinement prompt while keeping `blurb` as
-   the single bounded materialized injection.
-4. Process dirty people outside the interactive path with persistent coalescing, one
-   active refinement per person, retry state, and last-good-dossier fallback. A frequent
-   operator-owned command that exits immediately when nothing is dirty is sufficient;
-   do not add a resident orchestration service yet.
-5. Inspect the resulting dossiers and whispers on Bill. Measure stale or incorrect
-   claims, missed durable facts, inappropriate anomaly promotion, refinement no-op rate,
-   and whether ordinary turns stop reaching for person-identification searches.
+1. Let the agent list or inspect people, use ordinary `memory_search` and `memory_get`,
+   and replace a complete dossier only when doing so improves future conversations.
+2. Keep `dossier.blurb` as the single bounded materialized injection.
+3. Do not track which evidence was consumed or which person is due. A cron may update
+   several people or nobody.
+4. Inspect the resulting dossiers and whispers on Bill. Measure stale or incorrect
+   claims, missed durable facts, and whether ordinary turns stop reaching for
+   person-identification searches.
 
-Only add person-attributed QMD projection and cluster-stratified refresh packets when
-that evidence shows the simpler loop is losing coverage. Current QMD vectors do not carry
-arbitrary per-chunk person identity, so exact person scoping will require an intentional
-attributed projection or schema extension rather than a search query disguised as one.
+Only add person-attributed QMD projection or cluster-stratified evidence organization
+if actual use shows the lean loop is losing important context.
 
 ## The identity layer (Inside Out synthesis, 2026-08-29)
 
@@ -338,8 +335,7 @@ not aliases for those clusters.
 1. **Evidence and attribution** — canonical chunks plus exact or explicit subject edges.
 2. **Subjects** — stable addresses with no required type-specific ontology.
 3. **Trigger bindings and policy** — exact or semantic cues tied to a subject.
-4. **Claims, blurbs, and evidence cursors** — curated two-tier understanding keyed to
-   subjects and citing evidence.
+4. **Claims and blurbs** — curated understanding keyed to subjects and citing evidence.
 
 Clusters, trees, mass, arrival events, layouts, and representative selections remain
 derived and disposable. This is the eventual shared model, not a request to replace the
@@ -366,10 +362,9 @@ working PeopleSQL tables before the second entity type exists.
 - Guard against recency over-indexing with prior framing and a two-tier dossier
   (core understanding vs. recent observations); severity or accumulation is required
   to revise core claims.
-- Consolidation v0 keeps the evidence watermark and skips weights, stratified
-  sampling, and graph structure until real usage hurts. The immediate slice adds a
-  durable evidence cursor, surrounding interaction evidence, two-tier refinement, and
-  persistent dirty/coalesced processing, then evaluates the result on Bill.
+- People Whisperer maintenance is agent-owned: ordinary memory tools, no evidence
+  watermark or dirty queue, and complete dossier replacement only when useful. Evaluate
+  that boundary on Bill before adding deterministic coverage machinery.
 - Sequencing: finish people → places/channels → extract the shared subject seam →
   semantic idea subjects → the self scope.
 - Endgame: the static system prompt shrinks to a personality kernel; situational rules

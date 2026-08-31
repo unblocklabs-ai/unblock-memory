@@ -191,7 +191,7 @@ test("deduplicates a person per Slack thread, replays retries, and injects in a 
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    store.replaceDossier(person.id, {
+    store.replaceDossier(person.id, "test setup", {
       schemaVersion: 1,
       blurb: "Prefers concise decisions with explicit owners and deadlines.",
       sections: [],
@@ -207,7 +207,7 @@ test("deduplicates a person per Slack thread, replays retries, and injects in a 
     );
     assert.equal(first?.prependContext, "Prefers concise decisions with");
 
-    store.replaceDossier(person.id, {
+    store.replaceDossier(person.id, "test setup", {
       schemaVersion: 1,
       blurb: "This later dossier must not change a retry.",
       sections: [],
@@ -269,7 +269,7 @@ test("injects three different people once each in one Slack thread", async () =>
         accountScope: "workspace-a",
         externalId: senderId,
       });
-      store.replaceDossier(person.id, { schemaVersion: 1, blurb, sections: [] });
+      store.replaceDossier(person.id, "test setup", { schemaVersion: 1, blurb, sections: [] });
     }
 
     const contributions: string[] = [];
@@ -310,7 +310,7 @@ test("keeps pending thread correlation isolated by session and sender", async ()
         accountScope: "workspace-a",
         externalId,
       });
-      store.replaceDossier(person.id, { schemaVersion: 1, blurb, sections: [] });
+      store.replaceDossier(person.id, "test setup", { schemaVersion: 1, blurb, sections: [] });
     }
 
     const sessionA = "agent:bill:slack:channel:C123";
@@ -343,6 +343,148 @@ test("keeps pending thread correlation isolated by session and sender", async ()
   }
 });
 
+test("fails closed when run-less messages from one sender overlap across threads", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    store.replaceDossier(person.id, "test setup", {
+      schemaVersion: 1,
+      blurb: "Person context.",
+      sections: [],
+    });
+
+    testHarness.received(
+      { from: "slack:C123", content: "first", messageId: "900.0" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "second", messageId: "901.0" },
+      slackContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "ambiguous", messages: [] },
+        promptContext("U123", "run-ambiguous"),
+      ),
+      undefined,
+    );
+    assert.equal(
+      store.getWhisperReceipt("slack:workspace-a:C123:900.0", person.id),
+      undefined,
+    );
+    assert.equal(
+      store.getWhisperReceipt("slack:workspace-a:C123:901.0", person.id),
+      undefined,
+    );
+
+    testHarness.received(
+      { from: "slack:C123", content: "third", messageId: "902.0" },
+      slackContext,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "unambiguous", messages: [] },
+        promptContext("U123", "run-fresh"),
+      )?.prependContext,
+      "Person context.",
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("an exact run mapping does not consume a later run-less message", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    store.replaceDossier(person.id, "test setup", {
+      schemaVersion: 1,
+      blurb: "Person context.",
+      sections: [],
+    });
+
+    testHarness.received(
+      { from: "slack:C123", content: "mapped", messageId: "910.0", runId: "run-mapped" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "pending", messageId: "911.0" },
+      slackContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "mapped", messages: [] },
+        promptContext("U123", "run-mapped"),
+      )?.prependContext,
+      "Person context.",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "pending", messages: [] },
+        promptContext("U123", "run-pending"),
+      )?.prependContext,
+      "Person context.",
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("a later exact run does not discard an earlier run-less message", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    store.replaceDossier(person.id, "test setup", {
+      schemaVersion: 1,
+      blurb: "Person context.",
+      sections: [],
+    });
+
+    testHarness.received(
+      { from: "slack:C123", content: "pending", messageId: "920.0" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "mapped", messageId: "921.0", runId: "run-mapped" },
+      slackContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "mapped", messages: [] },
+        promptContext("U123", "run-mapped"),
+      )?.prependContext,
+      "Person context.",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "pending", messages: [] },
+        promptContext("U123", "run-pending"),
+      )?.prependContext,
+      "Person context.",
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
 test("durable receipts survive hook and store restart", async () => {
   const firstHarness = await harness();
   const store = firstHarness.stores.get("bill");
@@ -351,7 +493,7 @@ test("durable receipts survive hook and store restart", async () => {
     accountScope: "workspace-a",
     externalId: "U123",
   });
-  store.replaceDossier(person.id, {
+  store.replaceDossier(person.id, "test setup", {
     schemaVersion: 1,
     blurb: "Durable context.",
     sections: [],
@@ -401,7 +543,7 @@ test("uses the OpenClaw session for unthreaded Slack DMs across DM scopes", asyn
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    store.replaceDossier(person.id, { schemaVersion: 1, blurb: "DM context.", sections: [] });
+    store.replaceDossier(person.id, "test setup", { schemaVersion: 1, blurb: "DM context.", sections: [] });
     const dmSessions = [
       "agent:bill:main",
       "agent:bill:direct:U123",
@@ -457,7 +599,7 @@ test("deduplicates a Slack DM root and reply when only replyToId survives", asyn
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    store.replaceDossier(person.id, { schemaVersion: 1, blurb: "DM context.", sections: [] });
+    store.replaceDossier(person.id, "test setup", { schemaVersion: 1, blurb: "DM context.", sections: [] });
     const dmSession = "agent:bill:slack:direct:U123";
 
     testHarness.received(
@@ -512,7 +654,7 @@ test("unknown, dossierless, and disabled people create no receipt", async () => 
       accountScope: "workspace-a",
       externalId: "U456",
     });
-    store.replaceDossier(disabled.id, {
+    store.replaceDossier(disabled.id, "test setup", {
       schemaVersion: 1,
       blurb: "Disabled context.",
       sections: [],

@@ -35,15 +35,10 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
     () => resolveConfig({ people: { evidenceCorpora: ["sessions"] } }),
     /unknown property: evidenceCorpora/,
   );
-  assert.deepEqual(
-    resolveConfig({ people: { refinement: { maxPeoplePerRun: 2 } } }).people,
-    DEFAULT_PEOPLE_CONFIG,
-  );
   assert.throws(
-    () => resolveConfig({ people: { refinement: { maxPeoplePerRun: 0 } } }),
-    /people.refinement.maxPeoplePerRun/,
+    () => resolveConfig({ people: { refinement: { maxPeoplePerRun: 2 } } }),
+    /unknown property: refinement/,
   );
-  assert.throws(() => resolveConfig({ people: { refinement: { maxPeoplePerRun: 51 } } }), /50/);
   assert.throws(
     () => resolveConfig({ people: { whisperer: { maxChars: 1.5 } } }),
     /positive integer/,

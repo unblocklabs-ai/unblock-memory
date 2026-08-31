@@ -33,7 +33,7 @@ export function registerPeopleHooks(
   config: UnblockMemoryConfig["people"],
 ): void {
   const threadByRun = new Map<string, string>();
-  const pendingThreadByIdentity = new Map<string, string>();
+  const pendingThreadByIdentity = new Map<string, string | null>();
 
   api.on("message_received", (event, context) => {
     if (context.channelId !== "slack") return;
@@ -57,10 +57,13 @@ export function registerPeopleHooks(
       if (threadKey) {
         const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
         if (runId) {
-          pendingThreadByIdentity.delete(identityKey);
           threadByRun.set(runId, threadKey);
         } else {
-          pendingThreadByIdentity.set(identityKey, threadKey);
+          const pendingThreadKey = pendingThreadByIdentity.get(identityKey);
+          pendingThreadByIdentity.set(
+            identityKey,
+            pendingThreadKey === undefined || pendingThreadKey === threadKey ? threadKey : null,
+          );
         }
       }
     }
@@ -105,11 +108,14 @@ export function registerPeopleHooks(
     const runId = nonBlank(context.runId);
     if (!sessionKey || !parsed || !accountScope || !externalId || !runId) return;
     const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
-    const pendingThreadKey = pendingThreadByIdentity.get(identityKey);
-    const threadKey = threadByRun.get(runId) ?? pendingThreadKey;
-    if (!threadKey) return;
-    if (pendingThreadKey) {
+    const mappedThreadKey = threadByRun.get(runId);
+    const pendingThreadKey = mappedThreadKey ? undefined : pendingThreadByIdentity.get(identityKey);
+    if (!mappedThreadKey && pendingThreadByIdentity.has(identityKey)) {
       pendingThreadByIdentity.delete(identityKey);
+    }
+    const threadKey = mappedThreadKey ?? pendingThreadKey ?? undefined;
+    if (!threadKey) return;
+    if (typeof pendingThreadKey === "string") {
       threadByRun.set(runId, pendingThreadKey);
     }
 

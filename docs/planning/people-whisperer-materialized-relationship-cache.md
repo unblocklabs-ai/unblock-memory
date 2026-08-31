@@ -1,26 +1,30 @@
 # People Whisperer — Materialized Relationship Cache
 
-Status: current planning direction, not yet implemented.
+Status: superseded for People Whisperer maintenance by
+[`people-whisperer-agent-owned-dossiers.md`](people-whisperer-agent-owned-dossiers.md).
 
-## Goal
+This document remains historical exploration of exact attribution and possible future
+QMD/Cluster organization. Its plugin-owned maintenance mechanics are not the current
+implementation direction. Current maintenance is documented in the linked plan and the
+bundled `$people-whisperer` skill.
 
-When a known person first appears in a session, the agent should receive a fresh,
-precomputed understanding of that person through a near-instant local lookup. There is no
-interactive memory search, summarization, or model call. More dynamic thought injection
-during a conversation is explicitly later scope.
+## Historical goal
 
-## Architecture
+The proposal aimed to give the agent a fresh, precomputed understanding of a known
+person through a near-instant local lookup. It kept interactive memory search,
+summarization, and model calls off the injection path.
 
-People Whisperer should be a **materialized relationship cache**:
+## Historical architecture proposal
+
+The proposal treated People Whisperer as a **materialized relationship cache**:
 
 1. exact interaction evidence is associated with a person;
 2. QMD/Cluster organize the person's complete evidence into representative themes;
 3. an asynchronous consolidator refreshes the dossier only after the person generated
    meaningful new evidence;
-4. the stored blurb is injected once per person per session through the existing fast
-   SQLite path.
+4. the stored blurb is injected through the fast SQLite path.
 
-The expensive work happens after interaction, not when recognition is needed.
+Its durable insight remains: expensive work belongs outside the recognition path.
 
 ## The pseudo graph
 
@@ -54,53 +58,44 @@ only **after attribution** to cluster, rank, diversify, and discover candidate u
 evidence. Later, semantically discovered cross-memory candidates can be added as explicit
 low-confidence candidate edges, but they should not silently become person evidence.
 
-## Refresh packet
+## Deferred evidence-organization research
 
-For one dirty person, consolidate from:
+If ordinary agent-directed search proves insufficient, a future consolidator could
+investigate:
 
 - the current dossier, for continuity and explicit claim retention;
-- every unseen exact-attributed chunk since the prior evidence watermark, bounded high
-  enough not to drop a busy session;
+- exact-attributed interaction evidence;
 - one or two person-specific representative chunks from each of the strongest semantic
   clusters, subject to Cluster's membership/probability floor;
 - the most recent K prior chunks, to retain current work and open loops; and
 - a very small number of high-outlier/noise chunks, because novel personal facts often
   look like outliers.
 
-This is stronger than `top K + recent K` alone. Top global hits overrepresent a dominant
-topic, while recent-only repeats the MVP flaw. Cluster-stratified representatives provide
-coverage, unseen chunks provide freshness, recent chunks preserve current state, and the
-old dossier prevents stable facts from disappearing merely because they were not sampled.
+This research is stronger than `top K + recent K` alone. Top global hits overrepresent a
+dominant topic, while recent-only repeats the MVP flaw. Cluster-stratified
+representatives diversify themes, recent chunks preserve current state, and the old
+dossier prevents stable facts from disappearing merely because they were not sampled.
 
-## Activity-driven refresh
+## Current maintenance boundary
 
-- During a session, exact observation marks that person's evidence dirty. Current thread
-  context already covers the ongoing interaction, so the injected blurb does not change.
-- When the session becomes idle/ends, enqueue projection, incremental QMD embedding, and
-  dossier consolidation for only the people who produced new evidence.
-- Persist the evidence watermark/dirty state so Gateway restart does not lose work.
-- Coalesce repeated turns/sessions for the same person and allow only one active refresh.
-- If no new evidence exists, do nothing indefinitely. A person not seen for two weeks is
-  not refreshed for two weeks.
-- On the next session, inject the completed cached blurb once using the existing local
-  lookup. If refresh failed, retain the last good blurb and retry asynchronously.
+- The plugin observes exact Slack identities, stores dossiers, and injects
+  `dossier.blurb` once per person per thread.
+- The agent chooses whom, when, and how to investigate with ordinary memory search and
+  optional session sync.
+- The agent directly replaces a dossier only when doing so would make future
+  conversations meaningfully better. It may update several people or nobody.
+- `reviewedAt` records a successful dossier write; it is not scheduling state.
+- The plugin does not promise that every interaction has been reviewed.
 
-The freshness invariant is therefore: **the dossier should reflect all successfully
-processed evidence from prior completed sessions**, not "was refreshed today."
+## Deferred research sequence
 
-## Lean implementation sequence
+Only if tests on Bill show ordinary agent-owned maintenance is losing important context:
 
-1. Replace the recent-20 evidence selector with exact person evidence plus a durable
-   evidence watermark; keep manual CLI refinement initially.
-2. Add person-attributed relationship projection into QMD so the full history is
-   semantically chunked and linked by exact identity.
-3. Build the cluster-stratified + unseen + recent evidence packet and inspect it on Bill.
-4. Refine the existing typed dossier/blurb from that packet; do not invent a second profile
-   schema or a graph service.
-5. Add persistent dirty/coalescing orchestration at session idle/end, making refinement
-   automatic and restart-resilient.
-6. Keep the existing once-per-session injection path and prove it remains a local SQLite
-   lookup with no QMD/model work.
+1. Add exact person attribution to a derived QMD projection.
+2. Compare cluster-stratified representatives with ordinary targeted memory search.
+3. Improve evidence organization only where it materially improves dossiers.
+4. Keep `dossier.blurb` as the sole injected artifact and the injection path as a local
+   SQLite lookup with no QMD/model work.
 
 ## Sources reviewed
 
@@ -110,6 +105,6 @@ processed evidence from prior completed sessions**, not "was refreshed today."
 - `docs/planning/enhacements-aug25.md`
 - `docs/planning/future-features.md`
 - `docs/planning/memory-consolidation-and-reflection.md`
-- current PeopleSQL evidence, refinement, storage, and prompt-hook implementation
+- the PeopleSQL storage and prompt-hook implementation at the time of the proposal
 - QMD semantic chunking and exact vector-filter implementation
 - Unblock Cluster records, views, memberships, representative selection, and QMD adapter

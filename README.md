@@ -145,11 +145,10 @@ message content. Other channels are ignored.
 
 PeopleSQL registers three tools when enabled:
 
-- `memory_people_inspect` reads one exact person, bounded actionable todos, or
-  the next person's unseen exact-attributed interaction evidence;
-- `memory_people_update` replaces or deletes dossiers, consumes evidence,
-  toggles one person's injection, and manages company, todo, deletion, or
-  restoration state; and
+- `memory_people_inspect` lists active people, reads one exact person, reads one
+  person's dossier change history, or lists bounded actionable todos;
+- `memory_people_update` replaces or deletes dossiers, toggles one person's
+  injection, and manages company, todo, deletion, or restoration state; and
 - the optional `memory_people_sync` enriches one active OpenClaw Slack account;
   its tool input accepts an account ID, not a token.
 
@@ -160,12 +159,24 @@ may need to be allowed explicitly. The sync is bounded to
 keeps only normalized ID, name, handle, and avatar fields. Slack requires the
 `users:read` scope.
 
-The agent owns dossier generation and refresh. A cron or isolated agent session
-can repeatedly inspect `refinement_next`, synthesize a dossier from its current
-state and bounded unseen interaction windows, then call `replace_dossier` with
-the evidence locators it consumed. Dossier replacement and evidence consumption
-commit atomically; a no-change run may consume evidence without replacing the
-dossier. The plugin performs no model call for refinement or prompt injection.
+The agent owns dossier generation and refresh. It can list people, inspect one
+person's current dossier, search ordinary memory and sessions with
+`memory_search`/`memory_get`, and replace the dossier when that would improve a
+future conversation. The plugin owns no dossier-maintenance workflow or refresh
+schedule. A dossier's `reviewedAt` value records its last successful write; it
+is not scheduling state. The plugin performs no model call for dossier
+maintenance or prompt injection.
+
+Every `replace_dossier` and `delete_dossier` action requires a concise `reason`.
+The plugin transactionally records that reason with its authoritative before and
+after dossier snapshots. List small newest-first summaries with
+`memory_people_inspect({ view: "dossier_changes", personId, limit?, offset? })`,
+then fetch one exact diff with
+`memory_people_inspect({ view: "dossier_change", personId, changeId })`. List
+responses include `nextOffset`, so all history remains reachable without loading
+many dossiers into one tool result. Because the injected snippet is the dossier's
+`blurb`, its changes are included in the same history. A complete new serialized
+dossier is capped at 64 KiB; larger legacy dossiers remain readable and repairable.
 
 Set `people.whisperer.enabled` to inject context. For each exact Slack sender,
 the plugin prepends that person's stored dossier blurb, bounded by `maxChars`,
@@ -174,6 +185,33 @@ Gateway restarts, while different people in one thread are handled independently
 Unthreaded DMs use their OpenClaw session as the conversational scope. Unknown,
 unavailable, disabled, or dossierless people produce no context. Injection
 remains subject to OpenClaw's `allowPromptInjection` policy.
+
+The package includes a `$people-whisperer` skill with the canonical agent
+procedure and dossier shape. For a manual refresh, ask:
+
+```text
+Use $people-whisperer to improve your understanding of this person. Search memory
+and recent sessions, inspect their current PeopleSQL dossier, and update it only
+if the result would make future conversations meaningfully better.
+```
+
+For an optional cron or isolated agent session, use this goal:
+
+```text
+Use $people-whisperer to improve your understanding of people you interact with.
+
+Search recent sessions and memory for meaningful information about people. Inspect
+their existing PeopleSQL dossiers when useful. Update a dossier only when doing so
+would make future conversations meaningfully better. Ignore routine conversation,
+repetition, and weak inference. You may update several people or nobody.
+```
+
+Choose any cadence appropriate for the agent; the plugin does not require or
+track one. If session transcripts are a source, configure a `sessions` corpus
+(including `direct` when DMs matter) and refresh it with
+`memory_sync_sessions`. Ordinary `memory_search` calls accept targeted queries,
+corpora, session metadata filters, score thresholds, and up to 20 results per
+call; People Whisperer itself imposes no evidence-window limit.
 
 Use `sessionFilter` to restrict session results by metadata while leaving file
 corpora searchable. Supported fields are `startedFrom` and `startedTo`

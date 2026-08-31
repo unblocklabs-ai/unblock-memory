@@ -149,6 +149,7 @@ test("people tools let the agent inspect and update dossiers without owner gatin
           action: "replace_dossier",
           personId: person.id,
           dossier,
+          reason: "Captured a durable preference",
         }),
       ).status,
       "ok",
@@ -185,11 +186,37 @@ test("people tools let the agent inspect and update dossiers without owner gatin
         await testHarness.tool("memory_people_update").execute("call", {
           action: "delete_dossier",
           personId: person.id,
+          reason: "The dossier became unreliable",
         }),
       ).status,
       "ok",
     );
     assert.equal(store.getDossier(person.id), undefined);
+    const history = resultJson(
+      await testHarness.tool("memory_people_inspect").execute("call", {
+        view: "dossier_changes",
+        personId: person.id,
+      }),
+    );
+    assert.deepEqual(
+      (history.changes as Array<{ action: string; reason: string }>).map(
+        ({ action, reason }) => ({ action, reason }),
+      ),
+      [
+        { action: "delete", reason: "The dossier became unreliable" },
+        { action: "replace", reason: "Captured a durable preference" },
+      ],
+    );
+    const firstChange = (history.changes as Array<{ id: string }>)[0]!;
+    const exactChange = resultJson(
+      await testHarness.tool("memory_people_inspect").execute("call", {
+        view: "dossier_change",
+        personId: person.id,
+        changeId: firstChange.id,
+      }),
+    );
+    assert.equal(exactChange.status, "ok");
+    assert.equal((exactChange.change as { action: string }).action, "delete");
   } finally {
     testHarness.stores.closeAll();
   }
@@ -207,15 +234,16 @@ test("person selectors survive OpenClaw model schema normalization", async () =>
     assert.equal(normalized.type, "object");
     assert.deepEqual(normalized.required, ["view"]);
     assert.deepEqual(Object.keys(normalized.properties ?? {}).sort(), [
-      "evidenceLimit",
+      "changeId",
       "identity",
       "limit",
+      "offset",
       "personId",
       "view",
     ]);
     assert.deepEqual(
       (normalized.properties?.view as { enum?: string[] } | undefined)?.enum,
-      ["person", "todos", "refinement_next"],
+      ["person", "people", "dossier_changes", "dossier_change", "todos"],
     );
     assert.deepEqual(
       Object.keys(
@@ -243,6 +271,81 @@ test("person selectors survive OpenClaw model schema normalization", async () =>
         accountId: "default",
       }),
     );
+    await assert.rejects(
+      testHarness.tool("memory_people_update").execute("call", {
+        action: "replace_dossier",
+        personId: "person-1",
+        dossier,
+      }),
+    );
+    await assert.rejects(
+      testHarness.tool("memory_people_update").execute("call", {
+        action: "delete_dossier",
+        personId: "person-1",
+        reason: "   ",
+      }),
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("agents can list a bounded set of active people without full dossiers", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const older = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace",
+      externalId: "U123",
+      displayName: "Older",
+      seenAt: "2026-08-28T12:00:00.000Z",
+    }).person;
+    const newer = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace",
+      externalId: "U456",
+      displayName: "Newer",
+      seenAt: "2026-08-29T12:00:00.000Z",
+    }).person;
+    const unavailable = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace",
+      externalId: "U789",
+      displayName: "Unavailable",
+      seenAt: "2026-08-30T12:00:00.000Z",
+    }).person;
+    store.softDeletePerson(unavailable.id);
+    store.replaceDossier(newer.id, "test setup", dossier);
+
+    const result = resultJson(
+      await testHarness.tool("memory_people_inspect").execute("call", {
+        view: "people",
+        limit: 2,
+      }),
+    );
+    const people = result.people as Array<Record<string, unknown>>;
+    assert.equal(result.status, "ok");
+    assert.deepEqual(
+      people.map((entry) => (entry.person as { id: string }).id),
+      [newer.id, older.id],
+    );
+    assert.equal(people[0]?.hasDossier, true);
+    assert.equal(typeof people[0]?.dossierReviewedAt, "string");
+    assert.equal("dossier" in (people[0] ?? {}), false);
+    assert.equal(people[1]?.hasDossier, false);
+    assert.equal(people[1]?.dossierReviewedAt, null);
+    assert.equal((people[0]?.identities as unknown[]).length, 1);
+    assert.equal(result.nextOffset, 2);
+    const exhausted = resultJson(
+      await testHarness.tool("memory_people_inspect").execute("call", {
+        view: "people",
+        limit: 2,
+        offset: result.nextOffset,
+      }),
+    );
+    assert.deepEqual(exhausted.people, []);
+    assert.equal(exhausted.nextOffset, null);
   } finally {
     testHarness.stores.closeAll();
   }

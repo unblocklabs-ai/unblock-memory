@@ -17,6 +17,19 @@ export declare const PERSON_DOSSIER_SCHEMA: Type.TObject<{
     }>>;
 }>;
 export type PersonDossier = Static<typeof PERSON_DOSSIER_SCHEMA>;
+export type PersonDossierChange = {
+    id: string;
+    personId: string;
+    action: "replace" | "delete";
+    beforeDossier: PersonDossier | null;
+    afterDossier: PersonDossier | null;
+    reason: string;
+    changedAt: string;
+};
+export type PersonDossierChangeSummary = Omit<PersonDossierChange, "beforeDossier" | "afterDossier"> & {
+    beforeDossierBytes: number | null;
+    afterDossierBytes: number | null;
+};
 export type Person = {
     id: string;
     displayName: string;
@@ -97,12 +110,11 @@ export declare class PeopleStore {
         name: string;
         primaryDomain?: string;
     }): Company | undefined;
-    listActivePeople(): Person[];
+    listActivePeople(limit?: number, offset?: number): Person[];
     findIdentity(provider: string, accountScope: string, externalId: string): PersonIdentity | undefined;
     setInjection(personId: string, enabled: boolean): Person | undefined;
-    replaceDossier(personId: string, input: unknown | undefined, consumedEvidenceLocators?: readonly string[]): PersonDossier | undefined;
-    deleteDossier(personId: string): boolean;
-    listProcessedEvidenceLocators(personId: string, source: "session"): Set<string>;
+    replaceDossier(personId: string, reasonInput: string, input: unknown): PersonDossier;
+    deleteDossier(personId: string, reasonInput: string): boolean;
     getWhisperReceipt(threadKey: string, personId: string): {
         runId: string;
         contribution: string;
@@ -122,6 +134,9 @@ export declare class PeopleStore {
         dossier: PersonDossier;
         reviewedAt: string;
     } | undefined;
+    getDossierReviewedAt(personId: string): string | undefined;
+    listDossierChanges(personId: string, limit?: number, offset?: number): PersonDossierChangeSummary[];
+    getDossierChange(personId: string, changeId: string): PersonDossierChange | undefined;
     getDossierBlurb(personId: string): string | undefined;
     softDeletePerson(personId: string): Person | undefined;
     restorePerson(personId: string): Person | undefined;

@@ -1,6 +1,6 @@
 # Unblock Memory — Vision
 
-**Written 2026-08-29.** This is the whole-product vision as it stands today,
+**Written 2026-08-29; revised 2026-08-31.** This is the whole-product vision as it stands today,
 synthesized from the planning documents, the shipped MVP, and the direction
 conversations consolidated in `planning/entity-whispering-direction.md`. It describes
 the destination; the README describes what is implemented. Where this document
@@ -41,15 +41,15 @@ Human memory runs on two systems, and Unblock Memory implements both:
   relevant and nothing else.
 - **Recollection (memory_search):** deliberate, effortful recall for genuine
   thinking. Its heavy consumers are background processes — dreaming, curation,
-  refinement — and the occasional deep conversational dive, not ordinary inbound
-  turns.
+  agent-owned dossier maintenance — and the occasional deep conversational dive,
+  not ordinary inbound turns.
 
 The interactive path recognizes; the background path thinks. **No model call ever
 runs on the injection path** — whispers are local SQLite lookups of understanding
-that was consolidated asynchronously, off the hot path, with the full evidence base
-and time to think. A dossier is a materialized view: expensive once at write time,
-near-free hundreds of times at read time, and more accurate than any just-in-time
-retrieval because consolidation saw everything while a search sees five chunks.
+that was consolidated asynchronously, off the hot path, with time to investigate. A
+dossier is a materialized view: expensive once at write time and near-free hundreds
+of times at read time. Today the agent maintains it with ordinary memory search and
+PeopleSQL tools; future consolidation may organize a wider evidence base.
 
 ## The architecture: everything is clusters
 
@@ -132,9 +132,9 @@ event-driven**:
 - Assessments never live in clusters. Claims are durable; clusters are rebuildable
   views re-linked to claims by membership overlap after each rebuild. A claim whose
   evidence cluster dissolves is itself an attention signal.
-- An **evidence watermark** keeps consolidation honest: refinement sees the current
-  claims plus only unseen evidence, so old dominant chunks stop presenting
-  themselves as news, and "has anything materially changed?" becomes well-posed.
+- A future general consolidation system may distinguish newly arrived evidence from
+  the evidence already supporting a claim. This is a research concern for dreaming,
+  not scheduling or coverage state owned by the current People Whisperer plugin.
 
 ### Core memories are discovered, not tagged
 
@@ -266,13 +266,13 @@ Shipped (MVP): corpora over workspace Markdown; semantic search and reads; sessi
 projection with speaker labels and exact metadata filters; clustering, cluster reads,
 and chronology via unblock-cluster; the maintenance inbox (ambiguous event times,
 duplicates — attention signals, never auto-edits); PeopleSQL with exact Slack
-attribution, Codex dossier refinement, and once-per-session injection; Skill
-Whisperer; the memory-curator skill.
+attribution, agent-owned dossier maintenance, and once-per-person/thread injection;
+Skill Whisperer; the memory-curator and people-whisperer skills.
 
 Sequencing from here, each step gated on the previous proving itself on a real agent:
 
-1. **People** — the whisper loop on autopilot: watermark-based refinement,
-   prior-framed prompts, two-tier dossiers, activity-driven refresh.
+1. **People** — prove the lean agent-owned loop on Bill: ordinary memory search,
+   complete dossier replacement when useful, and exact local blurb injection.
 2. **Places/channels** — exact triggers again; the audience-awareness slice.
 3. **Entity-scoped nested clustering** — ledgers, arrival events, mass-as-prior,
    claim-scoped dreaming packets.

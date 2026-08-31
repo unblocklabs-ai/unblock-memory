@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -74,6 +75,38 @@ export const PERSON_DOSSIER_SCHEMA = Type.Object(
 );
 
 export type PersonDossier = Static<typeof PERSON_DOSSIER_SCHEMA>;
+
+export type PersonDossierChange = {
+  id: string;
+  personId: string;
+  action: "replace" | "delete";
+  beforeDossier: PersonDossier | null;
+  afterDossier: PersonDossier | null;
+  reason: string;
+  changedAt: string;
+};
+
+export type PersonDossierChangeSummary = Omit<
+  PersonDossierChange,
+  "beforeDossier" | "afterDossier"
+> & {
+  beforeDossierBytes: number | null;
+  afterDossierBytes: number | null;
+};
+
+const MAX_DOSSIER_JSON_BYTES = 64 * 1024;
+
+function serializeDossier(dossier: PersonDossier): string {
+  const json = JSON.stringify(dossier);
+  if (Buffer.byteLength(json, "utf8") > MAX_DOSSIER_JSON_BYTES) {
+    throw new Error(`dossier must serialize to at most ${MAX_DOSSIER_JSON_BYTES} bytes`);
+  }
+  return json;
+}
+
+function parseDossierJson(json: string): PersonDossier {
+  return Value.Parse(PERSON_DOSSIER_SCHEMA, JSON.parse(json));
+}
 
 export type Person = {
   id: string;
@@ -177,6 +210,24 @@ type CompanyRow = {
   updated_at: string;
 };
 
+type DossierChangeRow = {
+  id: string;
+  person_id: string;
+  action: PersonDossierChange["action"];
+  before_dossier_json: string | null;
+  after_dossier_json: string | null;
+  reason: string;
+  changed_at: string;
+};
+
+type DossierChangeSummaryRow = Omit<
+  DossierChangeRow,
+  "before_dossier_json" | "after_dossier_json"
+> & {
+  before_dossier_bytes: number | null;
+  after_dossier_bytes: number | null;
+};
+
 const OVERFLOW_KEY = "__people_todo_overflow__";
 
 function required(value: string, label: string): string {
@@ -187,6 +238,12 @@ function required(value: string, label: string): string {
 
 function optional(value: string | undefined): string | null {
   return value?.trim() || null;
+}
+
+function dossierReason(value: string): string {
+  const reason = required(value, "reason");
+  if (reason.length > 1000) throw new Error("reason must not exceed 1000 characters");
+  return reason;
 }
 
 function person(row: PersonRow): Person {
@@ -490,14 +547,15 @@ export class PeopleStore {
     }
   }
 
-  listActivePeople(): Person[] {
+  listActivePeople(limit = 50, offset = 0): Person[] {
     return this.#db
       .prepare(`
       SELECT * FROM people
       WHERE status = 'active'
       ORDER BY last_seen_at DESC, id
+      LIMIT ? OFFSET ?
     `)
-      .all()
+      .all(limit, offset)
       .map((row) => person(row as PersonRow));
   }
 
@@ -521,14 +579,11 @@ export class PeopleStore {
     return row ? person(row) : undefined;
   }
 
-  replaceDossier(
-    personId: string,
-    input: unknown | undefined,
-    consumedEvidenceLocators: readonly string[] = [],
-  ): PersonDossier | undefined {
-    const dossier = input === undefined ? undefined : Value.Parse(PERSON_DOSSIER_SCHEMA, input);
-    if (dossier) this.#validateDossier(dossier);
-    const locators = this.#validateEvidenceLocators(consumedEvidenceLocators);
+  replaceDossier(personId: string, reasonInput: string, input: unknown): PersonDossier {
+    const dossier = Value.Parse(PERSON_DOSSIER_SCHEMA, input);
+    this.#validateDossier(dossier);
+    const dossierJson = serializeDossier(dossier);
+    const reason = dossierReason(reasonInput);
     const reviewedAt = new Date().toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
@@ -536,9 +591,12 @@ export class PeopleStore {
         | { id: string }
         | undefined;
       if (!target) throw new Error(`person not found: ${personId}`);
-      if (dossier) {
-        this.#db
-          .prepare(`
+      const existing = this.#db
+        .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
+        .get(personId) as { dossier_json: string } | undefined;
+      if (existing) parseDossierJson(existing.dossier_json);
+      this.#db
+        .prepare(`
           INSERT INTO person_dossiers (person_id, dossier_json, blurb, reviewed_at)
           VALUES (?, ?, ?, ?)
           ON CONFLICT(person_id) DO UPDATE SET
@@ -546,37 +604,56 @@ export class PeopleStore {
             blurb = excluded.blurb,
             reviewed_at = excluded.reviewed_at
         `)
-          .run(personId, JSON.stringify(dossier), dossier.blurb, reviewedAt);
-      }
-      const consume = this.#db.prepare(`
-        INSERT OR IGNORE INTO person_evidence_receipts
-          (person_id, source, locator, processed_at)
-        VALUES (?, 'session', ?, ?)
-      `);
-      for (const locator of locators) {
-        consume.run(personId, locator, reviewedAt);
-      }
+        .run(personId, dossierJson, dossier.blurb, reviewedAt);
+      this.#db
+        .prepare(`
+          INSERT INTO person_dossier_changes
+            (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+          VALUES (?, ?, 'replace', ?, ?, ?, ?)
+        `)
+        .run(
+          randomUUID(),
+          personId,
+          existing?.dossier_json ?? null,
+          dossierJson,
+          reason,
+          reviewedAt,
+        );
       this.#db.exec("COMMIT");
-      return dossier ?? this.getDossier(personId)?.dossier;
+      return dossier;
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
     }
   }
 
-  deleteDossier(personId: string): boolean {
-    return this.#db.prepare("DELETE FROM person_dossiers WHERE person_id = ?").run(personId)
-      .changes === 1;
-  }
-
-  listProcessedEvidenceLocators(personId: string, source: "session"): Set<string> {
-    const rows = this.#db
-      .prepare(`
-      SELECT locator FROM person_evidence_receipts
-      WHERE person_id = ? AND source = ?
-    `)
-      .all(personId, source) as Array<{ locator: string }>;
-    return new Set(rows.map((row) => row.locator));
+  deleteDossier(personId: string, reasonInput: string): boolean {
+    const reason = dossierReason(reasonInput);
+    const changedAt = new Date().toISOString();
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.#db
+        .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
+        .get(personId) as { dossier_json: string } | undefined;
+      if (!existing) {
+        this.#db.exec("COMMIT");
+        return false;
+      }
+      parseDossierJson(existing.dossier_json);
+      this.#db.prepare("DELETE FROM person_dossiers WHERE person_id = ?").run(personId);
+      this.#db
+        .prepare(`
+          INSERT INTO person_dossier_changes
+            (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+          VALUES (?, ?, 'delete', ?, NULL, ?, ?)
+        `)
+        .run(randomUUID(), personId, existing.dossier_json, reason, changedAt);
+      this.#db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getWhisperReceipt(
@@ -622,8 +699,70 @@ export class PeopleStore {
       .get(personId) as { dossier_json: string; reviewed_at: string } | undefined;
     return row
       ? {
-          dossier: Value.Parse(PERSON_DOSSIER_SCHEMA, JSON.parse(row.dossier_json)),
+          dossier: parseDossierJson(row.dossier_json),
           reviewedAt: row.reviewed_at,
+        }
+      : undefined;
+  }
+
+  getDossierReviewedAt(personId: string): string | undefined {
+    const row = this.#db
+      .prepare("SELECT reviewed_at FROM person_dossiers WHERE person_id = ?")
+      .get(personId) as { reviewed_at: string } | undefined;
+    return row?.reviewed_at;
+  }
+
+  listDossierChanges(
+    personId: string,
+    limit = 20,
+    offset = 0,
+  ): PersonDossierChangeSummary[] {
+    return this.#db
+      .prepare(`
+        SELECT id, person_id, action, reason, changed_at,
+          CASE WHEN before_dossier_json IS NULL THEN NULL
+            ELSE length(CAST(before_dossier_json AS BLOB)) END AS before_dossier_bytes,
+          CASE WHEN after_dossier_json IS NULL THEN NULL
+            ELSE length(CAST(after_dossier_json AS BLOB)) END AS after_dossier_bytes
+        FROM person_dossier_changes
+        WHERE person_id = ?
+        ORDER BY changed_at DESC, rowid DESC
+        LIMIT ? OFFSET ?
+      `)
+      .all(personId, limit, offset)
+      .map((value) => {
+        const row = value as DossierChangeSummaryRow;
+        return {
+          id: row.id,
+          personId: row.person_id,
+          action: row.action,
+          beforeDossierBytes: row.before_dossier_bytes,
+          afterDossierBytes: row.after_dossier_bytes,
+          reason: row.reason,
+          changedAt: row.changed_at,
+        };
+      });
+  }
+
+  getDossierChange(personId: string, changeId: string): PersonDossierChange | undefined {
+    const row = this.#db
+      .prepare("SELECT * FROM person_dossier_changes WHERE person_id = ? AND id = ?")
+      .get(personId, changeId) as DossierChangeRow | undefined;
+    return row
+      ? {
+          id: row.id,
+          personId: row.person_id,
+          action: row.action,
+          beforeDossier:
+            row.before_dossier_json === null
+              ? null
+              : parseDossierJson(row.before_dossier_json),
+          afterDossier:
+            row.after_dossier_json === null
+              ? null
+              : parseDossierJson(row.after_dossier_json),
+          reason: row.reason,
+          changedAt: row.changed_at,
         }
       : undefined;
   }
@@ -835,34 +974,28 @@ export class PeopleStore {
     }
   }
 
-  #validateEvidenceLocators(locators: readonly string[]): string[] {
-    const unique = [...new Set(locators.map((locator) => locator.trim()))];
-    const invalid = unique.find((locator) => !/^session:.+:event:\d+$/.test(locator));
-    if (invalid !== undefined) throw new Error(`invalid session evidence locator: ${invalid}`);
-    return unique;
-  }
-
   #migrate(): void {
     const current = this.#db.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (current.user_version === 2) return;
-    if (current.user_version !== 0 && current.user_version !== 1) {
+    if (current.user_version === 4) return;
+    if (
+      current.user_version !== 0 &&
+      current.user_version !== 1 &&
+      current.user_version !== 2 &&
+      current.user_version !== 3
+    ) {
       throw new Error(`unsupported PeopleSQL schema version: ${current.user_version}`);
     }
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      if (current.user_version === 1) {
+      if (current.user_version === 2) {
+        this.#db.exec(`
+          DROP TABLE person_evidence_receipts;
+        `);
+      } else if (current.user_version === 1) {
         this.#db.exec(`
           DROP INDEX people_policy_seen;
           ALTER TABLE people DROP COLUMN refinement_enabled;
           UPDATE people SET injection_enabled = 1 WHERE status = 'active';
-
-          CREATE TABLE person_evidence_receipts (
-            person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-            source TEXT NOT NULL,
-            locator TEXT NOT NULL,
-            processed_at TEXT NOT NULL,
-            PRIMARY KEY (person_id, source, locator)
-          ) STRICT;
 
           CREATE TABLE person_whisper_receipts (
             thread_key TEXT NOT NULL,
@@ -872,13 +1005,9 @@ export class PeopleStore {
             injected_at TEXT NOT NULL,
             PRIMARY KEY (thread_key, person_id)
           ) STRICT;
-
-          PRAGMA user_version = 2;
         `);
-        this.#db.exec("COMMIT");
-        return;
-      }
-      this.#db.exec(`
+      } else if (current.user_version === 0) {
+        this.#db.exec(`
         CREATE TABLE companies (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
@@ -938,14 +1067,6 @@ export class PeopleStore {
           resolution_note TEXT
         ) STRICT;
 
-        CREATE TABLE person_evidence_receipts (
-          person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-          source TEXT NOT NULL,
-          locator TEXT NOT NULL,
-          processed_at TEXT NOT NULL,
-          PRIMARY KEY (person_id, source, locator)
-        ) STRICT;
-
         CREATE TABLE person_whisper_receipts (
           thread_key TEXT NOT NULL,
           person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
@@ -957,7 +1078,22 @@ export class PeopleStore {
 
         CREATE INDEX people_status_seen ON people(status, last_seen_at);
         CREATE INDEX people_todos_status_seen ON people_todos(status, last_seen_at);
-        PRAGMA user_version = 2;
+        `);
+      }
+      this.#db.exec(`
+        CREATE TABLE person_dossier_changes (
+          id TEXT PRIMARY KEY,
+          person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+          action TEXT NOT NULL CHECK (action IN ('replace', 'delete')),
+          before_dossier_json TEXT,
+          after_dossier_json TEXT,
+          reason TEXT NOT NULL,
+          changed_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE INDEX person_dossier_changes_person_changed
+          ON person_dossier_changes(person_id, changed_at DESC);
+        PRAGMA user_version = 4;
       `);
       this.#db.exec("COMMIT");
     } catch (error) {

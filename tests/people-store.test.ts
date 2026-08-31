@@ -13,7 +13,7 @@ async function temporaryPath(name = "people.sqlite"): Promise<string> {
   return join(root, name);
 }
 
-test("creates only the seven version-2 tables with secure SQLite settings", async () => {
+test("creates only the seven version-4 tables with secure SQLite settings", async () => {
   const path = await temporaryPath();
   const store = new PeopleStore(path, options);
   store.close();
@@ -33,14 +33,14 @@ test("creates only the seven version-2 tables with secure SQLite settings", asyn
       "companies",
       "people",
       "people_todos",
+      "person_dossier_changes",
       "person_dossiers",
-      "person_evidence_receipts",
       "person_identities",
       "person_whisper_receipts",
     ]);
     assert.equal(
       (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-      2,
+      4,
     );
     assert.equal(
       (db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode,
@@ -311,29 +311,202 @@ test("validates and replaces one bounded baseline dossier", async () => {
         },
       ],
     };
-    assert.deepEqual(store.replaceDossier(person.id, dossier), dossier);
+    assert.deepEqual(store.replaceDossier(person.id, "test setup", dossier), dossier);
     assert.deepEqual(store.getDossier(person.id)?.dossier, dossier);
     assert.equal(store.getDossierBlurb(person.id), dossier.blurb);
 
-    assert.throws(() => store.replaceDossier(person.id, { ...dossier, blurb: "   " }));
+    assert.throws(() => store.replaceDossier(person.id, "test setup", { ...dossier, blurb: "   " }));
     assert.throws(
-      () => store.replaceDossier(person.id, { ...dossier, blurb: "x".repeat(21) }),
+      () => store.replaceDossier(person.id, "test setup", { ...dossier, blurb: "x".repeat(21) }),
       /20 characters/,
     );
     assert.throws(() =>
-      store.replaceDossier(person.id, {
+      store.replaceDossier(person.id, "test setup", {
         ...dossier,
         sections: [{ ...dossier.sections[0], category: "custom:sales" }],
       }),
     );
     assert.throws(
       () =>
-        store.replaceDossier(person.id, {
+        store.replaceDossier(person.id, "test setup", {
           ...dossier,
           sections: [dossier.sections[0], dossier.sections[0]],
         }),
       /unique categories/,
     );
+    assert.throws(() => store.replaceDossier(person.id, "   ", dossier), /reason/);
+    assert.throws(() => store.replaceDossier(person.id, "x".repeat(1001), dossier), /1000/);
+    assert.throws(
+      () =>
+        store.replaceDossier(person.id, "test setup", {
+          ...dossier,
+          sections: [
+            {
+              category: "preferences",
+              claims: Array.from({ length: 70 }, (_, index) => ({
+                statement: `Claim ${index}`,
+                evidence: [{ source: "manual", locator: "x".repeat(1000) }],
+                epistemicType: "observed",
+              })),
+            },
+          ],
+        }),
+      /65536 bytes/,
+    );
+    assert.equal(store.listDossierChanges(person.id).length, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test("records authoritative create, replace, and delete dossier snapshots newest first", async () => {
+  const store = new PeopleStore(await temporaryPath(), options);
+  try {
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U123",
+    });
+    const first = { schemaVersion: 1, blurb: "First context.", sections: [] } as const;
+    const second = { schemaVersion: 1, blurb: "Better context.", sections: [] } as const;
+
+    store.replaceDossier(person.id, "Initial useful context", first);
+    store.replaceDossier(person.id, "Learned a durable preference", second);
+    assert.equal(store.deleteDossier(person.id, "Claims became unreliable"), true);
+    assert.equal(store.deleteDossier(person.id, "Already absent"), false);
+
+    const changes = store.listDossierChanges(person.id);
+    assert.deepEqual(
+      changes.map(({ action, reason }) => ({ action, reason })),
+      [
+        { action: "delete", reason: "Claims became unreliable" },
+        { action: "replace", reason: "Learned a durable preference" },
+        { action: "replace", reason: "Initial useful context" },
+      ],
+    );
+    assert.deepEqual(
+      changes.map((change) => store.getDossierChange(person.id, change.id)),
+      [
+        { ...changes[0], beforeDossier: second, afterDossier: null },
+        { ...changes[1], beforeDossier: first, afterDossier: second },
+        { ...changes[2], beforeDossier: null, afterDossier: first },
+      ].map(({ beforeDossierBytes: _before, afterDossierBytes: _after, ...change }) => change),
+    );
+    assert.equal(store.listDossierChanges(person.id, 1).length, 1);
+    assert.equal(store.listDossierChanges(person.id, 1, 1)[0]?.reason, "Learned a durable preference");
+  } finally {
+    store.close();
+  }
+});
+
+test("reads dossier metadata without parsing the dossier body", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U123",
+    });
+    store.replaceDossier(person.id, "test setup", {
+      schemaVersion: 1,
+      blurb: "Useful context.",
+      sections: [],
+    });
+
+    const db = new DatabaseSync(path);
+    db.prepare("UPDATE person_dossiers SET dossier_json = 'not-json' WHERE person_id = ?").run(
+      person.id,
+    );
+    db.close();
+
+    assert.equal(typeof store.getDossierReviewedAt(person.id), "string");
+    assert.throws(() => store.getDossier(person.id));
+  } finally {
+    store.close();
+  }
+});
+
+test("can read, replace, audit, and delete dossiers written before the byte limit", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const people = ["U123", "U456"].map(
+      (externalId) =>
+        store.upsertIdentity({ provider: "slack", accountScope: "default", externalId }).person,
+    );
+    const initial = { schemaVersion: 1, blurb: "Initial.", sections: [] } as const;
+    for (const person of people) store.replaceDossier(person.id, "test setup", initial);
+
+    const legacy = {
+      schemaVersion: 1,
+      blurb: "Legacy dossier.",
+      sections: [
+        {
+          category: "preferences",
+          claims: Array.from({ length: 70 }, (_, index) => ({
+            statement: `Legacy claim ${index}`,
+            evidence: [{ source: "manual", locator: "x".repeat(1000) }],
+            epistemicType: "observed",
+          })),
+        },
+      ],
+    } as const;
+    const legacyJson = JSON.stringify(legacy);
+    assert.ok(Buffer.byteLength(legacyJson, "utf8") > 64 * 1024);
+    const db = new DatabaseSync(path);
+    for (const person of people) {
+      db.prepare("UPDATE person_dossiers SET dossier_json = ?, blurb = ? WHERE person_id = ?").run(
+        legacyJson,
+        legacy.blurb,
+        person.id,
+      );
+    }
+    db.close();
+
+    assert.deepEqual(store.getDossier(people[0]!.id)?.dossier, legacy);
+    store.replaceDossier(people[0]!.id, "Bound future writes", initial);
+    const replacement = store.listDossierChanges(people[0]!.id)[0]!;
+    assert.deepEqual(store.getDossierChange(people[0]!.id, replacement.id)?.beforeDossier, legacy);
+    assert.equal(store.deleteDossier(people[1]!.id, "Remove legacy dossier"), true);
+    const deletion = store.listDossierChanges(people[1]!.id)[0]!;
+    assert.deepEqual(store.getDossierChange(people[1]!.id, deletion.id)?.beforeDossier, legacy);
+  } finally {
+    store.close();
+  }
+});
+
+test("rolls back dossier mutations when their audit insert fails", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U123",
+    });
+    const dossier = { schemaVersion: 1, blurb: "Original context.", sections: [] } as const;
+    store.replaceDossier(person.id, "Initial context", dossier);
+
+    const db = new DatabaseSync(path);
+    db.exec(`
+      CREATE TRIGGER fail_dossier_audit BEFORE INSERT ON person_dossier_changes
+      BEGIN SELECT RAISE(FAIL, 'audit unavailable'); END;
+    `);
+    db.close();
+
+    assert.throws(
+      () =>
+        store.replaceDossier(person.id, "Should roll back", {
+          ...dossier,
+          blurb: "Uncommitted context.",
+        }),
+      /audit unavailable/,
+    );
+    assert.deepEqual(store.getDossier(person.id)?.dossier, dossier);
+    assert.throws(() => store.deleteDossier(person.id, "Should roll back"), /audit unavailable/);
+    assert.deepEqual(store.getDossier(person.id)?.dossier, dossier);
+    assert.equal(store.listDossierChanges(person.id).length, 1);
   } finally {
     store.close();
   }
@@ -354,7 +527,7 @@ test("restores an unavailable person without restoring injection or deleting rel
       blurb: "Prefers concise decisions.",
       sections: [],
     } as const;
-    store.replaceDossier(person.id, dossier);
+    store.replaceDossier(person.id, "test setup", dossier);
     assert.equal(store.softDeletePerson(person.id)?.status, "unavailable");
 
     const restored = store.restorePerson(person.id);
@@ -370,54 +543,6 @@ test("restores an unavailable person without restoring injection or deleting rel
     );
     assert.equal(store.restorePerson(person.id), undefined);
     assert.equal(store.restorePerson("missing"), undefined);
-  } finally {
-    store.close();
-  }
-});
-
-test("atomically replaces or retains a dossier while consuming exact evidence", async () => {
-  const store = new PeopleStore(await temporaryPath(), { ...options, maxBlurbChars: 50 });
-  try {
-    const { person } = store.upsertIdentity({
-      provider: "slack",
-      accountScope: "workspace-a",
-      externalId: "U123",
-    });
-    const first = {
-      schemaVersion: 1,
-      blurb: "Initial blurb.",
-      sections: [],
-    } as const;
-    const firstLocator = "session:first:event:1";
-    assert.deepEqual(store.replaceDossier(person.id, first, [firstLocator]), first);
-    assert.equal(
-      store.listProcessedEvidenceLocators(person.id, "session").has(firstLocator),
-      true,
-    );
-
-    const secondLocator = "session:second:event:2";
-    assert.deepEqual(store.replaceDossier(person.id, undefined, [secondLocator]), first);
-    assert.equal(
-      store.listProcessedEvidenceLocators(person.id, "session").has(secondLocator),
-      true,
-    );
-    assert.deepEqual(store.getDossier(person.id)?.dossier, first);
-
-    const rejectedLocator = "session:rejected:event:3";
-    assert.throws(
-      () =>
-        store.replaceDossier(person.id, { ...first, blurb: "x".repeat(51) }, [rejectedLocator]),
-      /50 characters/,
-    );
-    assert.equal(
-      store.listProcessedEvidenceLocators(person.id, "session").has(rejectedLocator),
-      false,
-    );
-    assert.deepEqual(store.getDossier(person.id)?.dossier, first);
-
-    assert.equal(store.deleteDossier(person.id), true);
-    assert.equal(store.getDossier(person.id), undefined);
-    assert.equal(store.deleteDossier(person.id), false);
   } finally {
     store.close();
   }
@@ -468,7 +593,7 @@ test("stores one durable whisper receipt per thread and person", async () => {
   }
 });
 
-test("migrates version 1 people to agent-owned injection semantics", async () => {
+test("migrates version 1 people directly to version 4 agent-owned semantics", async () => {
   const path = await temporaryPath();
   const db = new DatabaseSync(path);
   db.exec(`
@@ -512,12 +637,121 @@ test("migrates version 1 people to agent-owned injection semantics", async () =>
       assert.equal(columns.includes("refinement_enabled"), false);
       assert.equal(
         (migrated.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-        2,
+        4,
       );
     } finally {
       migrated.close();
     }
   } finally {
     store.close();
+  }
+});
+
+test("migrates version 2 by dropping only obsolete evidence receipts", async () => {
+  const path = await temporaryPath();
+  const initial = new PeopleStore(path, options);
+  const person = initial.upsertIdentity({
+    provider: "slack",
+    accountScope: "workspace-a",
+    externalId: "U123",
+    displayName: "Bek",
+  }).person;
+  const dossier = {
+    schemaVersion: 1,
+    blurb: "Prefers concise decisions.",
+    sections: [],
+  } as const;
+  initial.replaceDossier(person.id, "test setup", dossier);
+  const receipt = initial.recordWhisperReceipt({
+    threadKey: "slack:workspace-a:C1:1.0",
+    personId: person.id,
+    runId: "run-1",
+    contribution: dossier.blurb,
+  });
+  initial.close();
+
+  const version2 = new DatabaseSync(path);
+  version2.exec(`
+    DROP TABLE person_dossier_changes;
+    CREATE TABLE person_evidence_receipts (
+      person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      source TEXT NOT NULL,
+      locator TEXT NOT NULL,
+      processed_at TEXT NOT NULL,
+      PRIMARY KEY (person_id, source, locator)
+    ) STRICT;
+  `);
+  version2
+    .prepare("INSERT INTO person_evidence_receipts VALUES (?, 'session', ?, 'now')")
+    .run(person.id, "session:one:event:1");
+  version2.exec("PRAGMA user_version = 2");
+  version2.close();
+
+  const migrated = new PeopleStore(path, options);
+  try {
+    assert.equal(migrated.getPerson(person.id)?.displayName, "Bek");
+    assert.deepEqual(migrated.getDossier(person.id)?.dossier, dossier);
+    assert.deepEqual(
+      migrated.getWhisperReceipt("slack:workspace-a:C1:1.0", person.id),
+      receipt,
+    );
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.equal(
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+          .get("person_evidence_receipts"),
+        undefined,
+      );
+      assert.equal(
+        (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+        4,
+      );
+    } finally {
+      db.close();
+    }
+  } finally {
+    migrated.close();
+  }
+});
+
+test("migrates version 3 to version 4 without changing existing people data", async () => {
+  const path = await temporaryPath();
+  const initial = new PeopleStore(path, options);
+  const person = initial.upsertIdentity({
+    provider: "slack",
+    accountScope: "workspace-a",
+    externalId: "U123",
+    displayName: "Bek",
+  }).person;
+  const dossier = {
+    schemaVersion: 1,
+    blurb: "Prefers concise decisions.",
+    sections: [],
+  } as const;
+  initial.replaceDossier(person.id, "Existing dossier", dossier);
+  initial.close();
+
+  const version3 = new DatabaseSync(path);
+  version3.exec("DROP TABLE person_dossier_changes; PRAGMA user_version = 3;");
+  version3.close();
+
+  const migrated = new PeopleStore(path, options);
+  try {
+    assert.equal(migrated.getPerson(person.id)?.displayName, "Bek");
+    assert.deepEqual(migrated.getDossier(person.id)?.dossier, dossier);
+    assert.deepEqual(migrated.listDossierChanges(person.id), []);
+    assert.equal(migrated.deleteDossier(person.id, "No longer useful"), true);
+    assert.equal(migrated.listDossierChanges(person.id)[0]?.action, "delete");
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.equal(
+        (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+        4,
+      );
+    } finally {
+      db.close();
+    }
+  } finally {
+    migrated.close();
   }
 });

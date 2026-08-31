@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -46,6 +47,17 @@ export const PERSON_DOSSIER_SCHEMA = Type.Object({
         claims: Type.Array(claimSchema, { minItems: 1, maxItems: 100 }),
     }, { additionalProperties: false }), { maxItems: BASELINE_DOSSIER_CATEGORIES.length }),
 }, { additionalProperties: false });
+const MAX_DOSSIER_JSON_BYTES = 64 * 1024;
+function serializeDossier(dossier) {
+    const json = JSON.stringify(dossier);
+    if (Buffer.byteLength(json, "utf8") > MAX_DOSSIER_JSON_BYTES) {
+        throw new Error(`dossier must serialize to at most ${MAX_DOSSIER_JSON_BYTES} bytes`);
+    }
+    return json;
+}
+function parseDossierJson(json) {
+    return Value.Parse(PERSON_DOSSIER_SCHEMA, JSON.parse(json));
+}
 const OVERFLOW_KEY = "__people_todo_overflow__";
 function required(value, label) {
     const normalized = value.trim();
@@ -55,6 +67,12 @@ function required(value, label) {
 }
 function optional(value) {
     return value?.trim() || null;
+}
+function dossierReason(value) {
+    const reason = required(value, "reason");
+    if (reason.length > 1000)
+        throw new Error("reason must not exceed 1000 characters");
+    return reason;
 }
 function person(row) {
     return {
@@ -290,14 +308,15 @@ export class PeopleStore {
             throw error;
         }
     }
-    listActivePeople() {
+    listActivePeople(limit = 50, offset = 0) {
         return this.#db
             .prepare(`
       SELECT * FROM people
       WHERE status = 'active'
       ORDER BY last_seen_at DESC, id
+      LIMIT ? OFFSET ?
     `)
-            .all()
+            .all(limit, offset)
             .map((row) => person(row));
     }
     findIdentity(provider, accountScope, externalId) {
@@ -312,20 +331,24 @@ export class PeopleStore {
         const row = this.#db.prepare("SELECT * FROM people WHERE id = ?").get(personId);
         return row ? person(row) : undefined;
     }
-    replaceDossier(personId, input, consumedEvidenceLocators = []) {
-        const dossier = input === undefined ? undefined : Value.Parse(PERSON_DOSSIER_SCHEMA, input);
-        if (dossier)
-            this.#validateDossier(dossier);
-        const locators = this.#validateEvidenceLocators(consumedEvidenceLocators);
+    replaceDossier(personId, reasonInput, input) {
+        const dossier = Value.Parse(PERSON_DOSSIER_SCHEMA, input);
+        this.#validateDossier(dossier);
+        const dossierJson = serializeDossier(dossier);
+        const reason = dossierReason(reasonInput);
         const reviewedAt = new Date().toISOString();
         this.#db.exec("BEGIN IMMEDIATE");
         try {
             const target = this.#db.prepare("SELECT id FROM people WHERE id = ?").get(personId);
             if (!target)
                 throw new Error(`person not found: ${personId}`);
-            if (dossier) {
-                this.#db
-                    .prepare(`
+            const existing = this.#db
+                .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
+                .get(personId);
+            if (existing)
+                parseDossierJson(existing.dossier_json);
+            this.#db
+                .prepare(`
           INSERT INTO person_dossiers (person_id, dossier_json, blurb, reviewed_at)
           VALUES (?, ?, ?, ?)
           ON CONFLICT(person_id) DO UPDATE SET
@@ -333,36 +356,50 @@ export class PeopleStore {
             blurb = excluded.blurb,
             reviewed_at = excluded.reviewed_at
         `)
-                    .run(personId, JSON.stringify(dossier), dossier.blurb, reviewedAt);
-            }
-            const consume = this.#db.prepare(`
-        INSERT OR IGNORE INTO person_evidence_receipts
-          (person_id, source, locator, processed_at)
-        VALUES (?, 'session', ?, ?)
-      `);
-            for (const locator of locators) {
-                consume.run(personId, locator, reviewedAt);
-            }
+                .run(personId, dossierJson, dossier.blurb, reviewedAt);
+            this.#db
+                .prepare(`
+          INSERT INTO person_dossier_changes
+            (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+          VALUES (?, ?, 'replace', ?, ?, ?, ?)
+        `)
+                .run(randomUUID(), personId, existing?.dossier_json ?? null, dossierJson, reason, reviewedAt);
             this.#db.exec("COMMIT");
-            return dossier ?? this.getDossier(personId)?.dossier;
+            return dossier;
         }
         catch (error) {
             this.#db.exec("ROLLBACK");
             throw error;
         }
     }
-    deleteDossier(personId) {
-        return this.#db.prepare("DELETE FROM person_dossiers WHERE person_id = ?").run(personId)
-            .changes === 1;
-    }
-    listProcessedEvidenceLocators(personId, source) {
-        const rows = this.#db
-            .prepare(`
-      SELECT locator FROM person_evidence_receipts
-      WHERE person_id = ? AND source = ?
-    `)
-            .all(personId, source);
-        return new Set(rows.map((row) => row.locator));
+    deleteDossier(personId, reasonInput) {
+        const reason = dossierReason(reasonInput);
+        const changedAt = new Date().toISOString();
+        this.#db.exec("BEGIN IMMEDIATE");
+        try {
+            const existing = this.#db
+                .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
+                .get(personId);
+            if (!existing) {
+                this.#db.exec("COMMIT");
+                return false;
+            }
+            parseDossierJson(existing.dossier_json);
+            this.#db.prepare("DELETE FROM person_dossiers WHERE person_id = ?").run(personId);
+            this.#db
+                .prepare(`
+          INSERT INTO person_dossier_changes
+            (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+          VALUES (?, ?, 'delete', ?, NULL, ?, ?)
+        `)
+                .run(randomUUID(), personId, existing.dossier_json, reason, changedAt);
+            this.#db.exec("COMMIT");
+            return true;
+        }
+        catch (error) {
+            this.#db.exec("ROLLBACK");
+            throw error;
+        }
     }
     getWhisperReceipt(threadKey, personId) {
         const row = this.#db
@@ -395,8 +432,61 @@ export class PeopleStore {
             .get(personId);
         return row
             ? {
-                dossier: Value.Parse(PERSON_DOSSIER_SCHEMA, JSON.parse(row.dossier_json)),
+                dossier: parseDossierJson(row.dossier_json),
                 reviewedAt: row.reviewed_at,
+            }
+            : undefined;
+    }
+    getDossierReviewedAt(personId) {
+        const row = this.#db
+            .prepare("SELECT reviewed_at FROM person_dossiers WHERE person_id = ?")
+            .get(personId);
+        return row?.reviewed_at;
+    }
+    listDossierChanges(personId, limit = 20, offset = 0) {
+        return this.#db
+            .prepare(`
+        SELECT id, person_id, action, reason, changed_at,
+          CASE WHEN before_dossier_json IS NULL THEN NULL
+            ELSE length(CAST(before_dossier_json AS BLOB)) END AS before_dossier_bytes,
+          CASE WHEN after_dossier_json IS NULL THEN NULL
+            ELSE length(CAST(after_dossier_json AS BLOB)) END AS after_dossier_bytes
+        FROM person_dossier_changes
+        WHERE person_id = ?
+        ORDER BY changed_at DESC, rowid DESC
+        LIMIT ? OFFSET ?
+      `)
+            .all(personId, limit, offset)
+            .map((value) => {
+            const row = value;
+            return {
+                id: row.id,
+                personId: row.person_id,
+                action: row.action,
+                beforeDossierBytes: row.before_dossier_bytes,
+                afterDossierBytes: row.after_dossier_bytes,
+                reason: row.reason,
+                changedAt: row.changed_at,
+            };
+        });
+    }
+    getDossierChange(personId, changeId) {
+        const row = this.#db
+            .prepare("SELECT * FROM person_dossier_changes WHERE person_id = ? AND id = ?")
+            .get(personId, changeId);
+        return row
+            ? {
+                id: row.id,
+                personId: row.person_id,
+                action: row.action,
+                beforeDossier: row.before_dossier_json === null
+                    ? null
+                    : parseDossierJson(row.before_dossier_json),
+                afterDossier: row.after_dossier_json === null
+                    ? null
+                    : parseDossierJson(row.after_dossier_json),
+                reason: row.reason,
+                changedAt: row.changed_at,
             }
             : undefined;
     }
@@ -591,35 +681,28 @@ export class PeopleStore {
             throw new Error("dossier sections must have unique categories");
         }
     }
-    #validateEvidenceLocators(locators) {
-        const unique = [...new Set(locators.map((locator) => locator.trim()))];
-        const invalid = unique.find((locator) => !/^session:.+:event:\d+$/.test(locator));
-        if (invalid !== undefined)
-            throw new Error(`invalid session evidence locator: ${invalid}`);
-        return unique;
-    }
     #migrate() {
         const current = this.#db.prepare("PRAGMA user_version").get();
-        if (current.user_version === 2)
+        if (current.user_version === 4)
             return;
-        if (current.user_version !== 0 && current.user_version !== 1) {
+        if (current.user_version !== 0 &&
+            current.user_version !== 1 &&
+            current.user_version !== 2 &&
+            current.user_version !== 3) {
             throw new Error(`unsupported PeopleSQL schema version: ${current.user_version}`);
         }
         this.#db.exec("BEGIN IMMEDIATE");
         try {
-            if (current.user_version === 1) {
+            if (current.user_version === 2) {
+                this.#db.exec(`
+          DROP TABLE person_evidence_receipts;
+        `);
+            }
+            else if (current.user_version === 1) {
                 this.#db.exec(`
           DROP INDEX people_policy_seen;
           ALTER TABLE people DROP COLUMN refinement_enabled;
           UPDATE people SET injection_enabled = 1 WHERE status = 'active';
-
-          CREATE TABLE person_evidence_receipts (
-            person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-            source TEXT NOT NULL,
-            locator TEXT NOT NULL,
-            processed_at TEXT NOT NULL,
-            PRIMARY KEY (person_id, source, locator)
-          ) STRICT;
 
           CREATE TABLE person_whisper_receipts (
             thread_key TEXT NOT NULL,
@@ -629,13 +712,10 @@ export class PeopleStore {
             injected_at TEXT NOT NULL,
             PRIMARY KEY (thread_key, person_id)
           ) STRICT;
-
-          PRAGMA user_version = 2;
         `);
-                this.#db.exec("COMMIT");
-                return;
             }
-            this.#db.exec(`
+            else if (current.user_version === 0) {
+                this.#db.exec(`
         CREATE TABLE companies (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
@@ -695,14 +775,6 @@ export class PeopleStore {
           resolution_note TEXT
         ) STRICT;
 
-        CREATE TABLE person_evidence_receipts (
-          person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-          source TEXT NOT NULL,
-          locator TEXT NOT NULL,
-          processed_at TEXT NOT NULL,
-          PRIMARY KEY (person_id, source, locator)
-        ) STRICT;
-
         CREATE TABLE person_whisper_receipts (
           thread_key TEXT NOT NULL,
           person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
@@ -714,7 +786,22 @@ export class PeopleStore {
 
         CREATE INDEX people_status_seen ON people(status, last_seen_at);
         CREATE INDEX people_todos_status_seen ON people_todos(status, last_seen_at);
-        PRAGMA user_version = 2;
+        `);
+            }
+            this.#db.exec(`
+        CREATE TABLE person_dossier_changes (
+          id TEXT PRIMARY KEY,
+          person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+          action TEXT NOT NULL CHECK (action IN ('replace', 'delete')),
+          before_dossier_json TEXT,
+          after_dossier_json TEXT,
+          reason TEXT NOT NULL,
+          changed_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE INDEX person_dossier_changes_person_changed
+          ON person_dossier_changes(person_id, changed_at DESC);
+        PRAGMA user_version = 4;
       `);
             this.#db.exec("COMMIT");
         }

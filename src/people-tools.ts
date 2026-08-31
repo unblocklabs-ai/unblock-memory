@@ -1,15 +1,12 @@
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import type {
-  OpenClawConfig,
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
-import { resolveAgentDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import type { UnblockMemoryConfig } from "./config.js";
 import { renderPeopleWhisper } from "./people-hooks.js";
-import { nextPeopleRefinement } from "./people-refinement.js";
 import { PERSON_DOSSIER_SCHEMA, type PeopleStores } from "./people-store.js";
 import {
   createOpenClawSlackDirectory,
@@ -57,6 +54,47 @@ const inspectParameters = Type.Union([
   ),
   Type.Object(
     {
+      view: Type.Literal("people"),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 100,
+          description: "Maximum active people to return.",
+        }),
+      ),
+      offset: Type.Optional(
+        Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "People to skip." }),
+      ),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      view: Type.Literal("dossier_changes"),
+      personId: nonEmpty,
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 100,
+          description: "Maximum dossier change summaries to return, newest first.",
+        }),
+      ),
+      offset: Type.Optional(
+        Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "Changes to skip." }),
+      ),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      view: Type.Literal("dossier_change"),
+      personId: nonEmpty,
+      changeId: nonEmpty,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
       view: Type.Literal("todos"),
       limit: Type.Optional(
         Type.Integer({
@@ -65,13 +103,6 @@ const inspectParameters = Type.Union([
           description: "Maximum actionable todos to return.",
         }),
       ),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      view: Type.Literal("refinement_next"),
-      evidenceLimit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
     },
     { additionalProperties: false },
   ),
@@ -90,14 +121,8 @@ const updateParameters = Type.Union([
     {
       action: Type.Literal("replace_dossier"),
       personId: nonEmpty,
-      dossier: Type.Optional(PERSON_DOSSIER_SCHEMA),
-      consumedEvidenceLocators: Type.Optional(
-        Type.Array(Type.String({ pattern: "^session:.+:event:\\d+$", maxLength: 1000 }), {
-          minItems: 1,
-          maxItems: 50,
-          uniqueItems: true,
-        }),
-      ),
+      dossier: PERSON_DOSSIER_SCHEMA,
+      reason: nonEmpty,
     },
     { additionalProperties: false },
   ),
@@ -105,6 +130,7 @@ const updateParameters = Type.Union([
     {
       action: Type.Literal("delete_dossier"),
       personId: nonEmpty,
+      reason: nonEmpty,
     },
     { additionalProperties: false },
   ),
@@ -149,11 +175,9 @@ const syncParameters = Type.Object(
   { additionalProperties: false },
 );
 
-function context(
-  ctx: OpenClawPluginToolContext,
-): { agentId: string; cfg: OpenClawConfig } | undefined {
+function context(ctx: OpenClawPluginToolContext): { agentId: string } | undefined {
   const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
-  return cfg && ctx.agentId ? { agentId: ctx.agentId, cfg } : undefined;
+  return cfg && ctx.agentId ? { agentId: ctx.agentId } : undefined;
 }
 
 function personView(
@@ -204,34 +228,49 @@ function createInspectTool(
     name: "memory_people_inspect",
     label: "Inspect People Memory",
     description:
-      "Inspect a person, list actionable people todos, or read the next person's unseen interaction evidence for dossier refinement.",
+      "List active people, inspect one person, read dossier change history, or list actionable people todos.",
     parameters: inspectParameters,
     async execute(_toolCallId: string, raw: unknown) {
       const input = Value.Parse(inspectParameters, raw);
       if (input.view === "person") {
         return jsonResult(personView(stores, active.agentId, input, config.whisperer.maxChars));
       }
-      if (input.view === "refinement_next") {
-        try {
-          const refinement = nextPeopleRefinement({
-            store: stores.get(active.agentId),
-            agentId: active.agentId,
-            agentDatabasePath: `${resolveAgentDir(active.cfg, active.agentId)}/openclaw-agent.sqlite`,
-            evidenceLimit: input.evidenceLimit,
-          });
-          return jsonResult(
-            refinement ? { status: "ok", refinement } : { status: "empty" },
-          );
-        } catch (error) {
-          return jsonResult({
-            status: "unavailable",
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
+      const store = stores.get(active.agentId);
+      if (input.view === "people") {
+        const limit = input.limit ?? 50;
+        const offset = input.offset ?? 0;
+        const people = store.listActivePeople(limit, offset).map((person) => {
+          const dossierReviewedAt = store.getDossierReviewedAt(person.id);
+          return {
+            person,
+            identities: store.listIdentities(person.id),
+            hasDossier: dossierReviewedAt !== undefined,
+            dossierReviewedAt: dossierReviewedAt ?? null,
+          };
+        });
+        return jsonResult({
+          status: "ok",
+          people,
+          nextOffset: people.length === limit ? offset + people.length : null,
+        });
+      }
+      if (input.view === "dossier_changes") {
+        const limit = input.limit ?? 20;
+        const offset = input.offset ?? 0;
+        const changes = store.listDossierChanges(input.personId, limit, offset);
+        return jsonResult({
+          status: "ok",
+          changes,
+          nextOffset: changes.length === limit ? offset + changes.length : null,
+        });
+      }
+      if (input.view === "dossier_change") {
+        const change = store.getDossierChange(input.personId, input.changeId);
+        return jsonResult(change ? { status: "ok", change } : { status: "not_found" });
       }
       return jsonResult({
         status: "ok",
-        todos: stores.get(active.agentId).listTodos(input.limit ?? 20),
+        todos: store.listTodos(input.limit ?? 20),
       });
     },
   };
@@ -254,18 +293,8 @@ function createUpdateTool(stores: PeopleStores, ctx: OpenClawPluginToolContext) 
         return jsonResult(person ? { status: "ok", person } : { status: "not_found" });
       }
       if (input.action === "replace_dossier") {
-        if (input.dossier === undefined && input.consumedEvidenceLocators === undefined) {
-          return jsonResult({
-            status: "invalid",
-            error: "replace_dossier requires a dossier or consumed evidence locators",
-          });
-        }
         try {
-          const dossier = store.replaceDossier(
-            input.personId,
-            input.dossier,
-            input.consumedEvidenceLocators,
-          );
+          const dossier = store.replaceDossier(input.personId, input.reason, input.dossier);
           return jsonResult({ status: "ok", dossier });
         } catch (error) {
           if (error instanceof Error && error.message.startsWith("person not found:")) {
@@ -276,7 +305,9 @@ function createUpdateTool(stores: PeopleStores, ctx: OpenClawPluginToolContext) 
       }
       if (input.action === "delete_dossier") {
         return jsonResult(
-          store.deleteDossier(input.personId) ? { status: "ok" } : { status: "not_found" },
+          store.deleteDossier(input.personId, input.reason)
+            ? { status: "ok" }
+            : { status: "not_found" },
         );
       }
       if (input.action === "set_company") {

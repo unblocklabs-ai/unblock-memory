@@ -114,22 +114,10 @@ function resolvePeople(value) {
         throw new Error("unblock-memory people must be an object");
     }
     const people = value;
-    assertOnlyKeys(people, ["enabled", "refinement", "whisperer", "todos"], "people");
+    assertOnlyKeys(people, ["enabled", "whisperer", "todos"], "people");
     const enabled = people.enabled ?? false;
     if (typeof enabled !== "boolean")
         throw new Error("unblock-memory people.enabled must be a boolean");
-    // Accepted only so existing installations can upgrade without first rewriting config.
-    const legacyRefinement = people.refinement;
-    if (legacyRefinement !== undefined) {
-        if (!legacyRefinement ||
-            typeof legacyRefinement !== "object" ||
-            Array.isArray(legacyRefinement)) {
-            throw new Error("unblock-memory people.refinement must be an object");
-        }
-        const legacy = legacyRefinement;
-        assertOnlyKeys(legacy, ["maxPeoplePerRun"], "people.refinement");
-        positiveInteger(legacy.maxPeoplePerRun, 10, "people.refinement.maxPeoplePerRun", 50);
-    }
     const whisperer = people.whisperer ?? {};
     if (!whisperer || typeof whisperer !== "object" || Array.isArray(whisperer)) {
         throw new Error("unblock-memory people.whisperer must be an object");
