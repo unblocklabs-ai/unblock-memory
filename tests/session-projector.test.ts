@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { projectSession, sessionDocumentPath } from "../src/session-projector.js";
+import {
+  projectSession,
+  sessionContextSpans,
+  sessionDocumentPath,
+} from "../src/session-projector.js";
 
 test("projects timestamped user and assistant text while excluding internal blocks", () => {
   const projected = projectSession({
@@ -65,11 +69,44 @@ test("projects timestamped user and assistant text while excluding internal bloc
     ],
   });
 
-  assert.match(projected!, /2026-08-25 14:32:09 UTC — Bek: Can you review \*\*memory\*\*\?/);
-  assert.match(projected!, /2026-08-25 14:33:02 UTC — Bill: Yes\.\n\nIt uses vector search\./);
+  assert.match(projected!, /## User — Bek — 2026-08-25 14:32:09 UTC\n\nCan you review \*\*memory\*\*\?/);
+  assert.match(projected!, /## Assistant — Bill — 2026-08-25 14:33:02 UTC\n\nYes\.\n\nIt uses vector search\./);
   assert.doesNotMatch(projected!, /private|secret tool output|toolCall|heartbeat poll|HEARTBEAT_OK/);
   assert.match(projected!, /^# Transcript\n\n/);
   assert.doesNotMatch(projected!, /# Session|Session ID:|Provider:|Chat type:|Conversation:|Started:/);
+});
+
+test("finds the complete message and user-assistant turn around a projected position", () => {
+  const projected = [
+    "# Transcript\n\n",
+    "## User — Rico — 2026-08-25 14:32:09 UTC\n\nPlease review memory.\n\n## Assistant — quoted format\n\n",
+    "## Assistant — Bill — 2026-08-25 14:33:02 UTC\n\nI will inspect it.\n\n",
+    "## Assistant — Bill — 2026-08-25 14:34:02 UTC\n\nThe index is healthy.\n\n",
+    "## User — Bek — 2026-08-25 14:35:02 UTC\n\nThanks.\n",
+  ].join("");
+  const position = projected.indexOf("index is healthy");
+  const spans = sessionContextSpans(projected, position);
+
+  assert.equal(projected.slice(spans?.message.start, spans?.message.end).trim(), [
+    "## Assistant — Bill — 2026-08-25 14:34:02 UTC",
+    "",
+    "The index is healthy.",
+  ].join("\n"));
+  assert.equal(projected.slice(spans?.turn.start, spans?.turn.end).trim(), [
+    "## User — Rico — 2026-08-25 14:32:09 UTC",
+    "",
+    "Please review memory.",
+    "",
+    "## Assistant — quoted format",
+    "",
+    "## Assistant — Bill — 2026-08-25 14:33:02 UTC",
+    "",
+    "I will inspect it.",
+    "",
+    "## Assistant — Bill — 2026-08-25 14:34:02 UTC",
+    "",
+    "The index is healthy.",
+  ].join("\n"));
 });
 
 test("returns no document for internal-only sessions and rejects malformed messages", () => {

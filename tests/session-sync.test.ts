@@ -80,10 +80,10 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.equal(session.provider, "slack");
   assert.equal(session.conversationId, "native-channel-1");
   const document = await readFile(join(outputDir, session.documentPath), "utf8");
-  assert.match(document, /Bek: Hello memory/);
+  assert.match(document, /## User — Bek — .*\n\nHello memory/u);
   assert.doesNotMatch(document, /Private DM/);
   assert.doesNotMatch(document, /Abandoned branch/);
-  assert.equal(session.projectorVersion, 2);
+  assert.equal(session.projectorVersion, 3);
   assert.equal((await stat(outputDir)).mode & 0o777, 0o700);
   assert.equal((await stat(join(outputDir, session.documentPath))).mode & 0o777, 0o600);
   const firstModifiedAt = (await stat(join(outputDir, session.documentPath))).mtimeMs;
@@ -101,7 +101,7 @@ test("incrementally projects only configured active sessions and indexes changed
   await writeFile(manifestPath, JSON.stringify(oldProjectorManifest));
   const migrated = await run();
   assert.equal(migrated.result.updated, 1);
-  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 2);
+  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 3);
   assert.equal(indexRuns, 3);
 
   const changed = new DatabaseSync(databasePath);
@@ -116,7 +116,10 @@ test("incrementally projects only configured active sessions and indexes changed
   const third = await run();
   assert.equal(third.result.updated, 1);
   assert.equal(indexRuns, 4);
-  assert.match(await readFile(join(outputDir, third.manifest.sessions["channel-1"]!.documentPath), "utf8"), /Bill: Indexed response/);
+  assert.match(
+    await readFile(join(outputDir, third.manifest.sessions["channel-1"]!.documentPath), "utf8"),
+    /## Assistant — Bill — .*\n\nIndexed response/u,
+  );
 
   const removed = new DatabaseSync(databasePath);
   removed.prepare("DELETE FROM session_transcript_active_events WHERE session_id = 'channel-1'").run();

@@ -17,7 +17,20 @@ export type SessionProjectionInput = SessionMetadata & {
   events: readonly { eventJson: string; createdAt: number }[];
 };
 
-type ProjectedMessage = { speaker: string; text: string; timestamp: number };
+type ProjectedMessage = {
+  role: "user" | "assistant";
+  speaker: string;
+  text: string;
+  timestamp: number;
+};
+
+export type SessionContextSpans = {
+  message: { start: number; end: number };
+  turn: { start: number; end: number };
+};
+
+const MESSAGE_HEADING =
+  /^## (User|Assistant) — .* — \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S.*$/gmu;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -93,6 +106,7 @@ function projectMessage(row: SessionProjectionInput["events"][number], input: Se
   }
   if (!text) return undefined;
   return {
+    role,
     speaker: speaker.replace(/[\r\n]+/gu, " "),
     text,
     timestamp: timestamp(eventRecord.timestamp) ?? row.createdAt ?? timestamp(message.timestamp) ?? input.startedAt,
@@ -125,8 +139,36 @@ export function projectSession(input: SessionProjectionInput): string | undefine
   if (messages.length === 0) return undefined;
 
   const transcript = messages.map((message) =>
-    `${formatTimestamp(message.timestamp, input.timezone)} — ${message.speaker}: ${message.text}`);
+    `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ` +
+    `${formatTimestamp(message.timestamp, input.timezone)}\n\n${message.text}`);
   return `# Transcript\n\n${transcript.join("\n\n")}\n`;
+}
+
+export function sessionContextSpans(content: string, position: number): SessionContextSpans | undefined {
+  const markers = [...content.matchAll(MESSAGE_HEADING)].map((match) => ({
+    start: match.index,
+    role: match[1] === "User" ? "user" as const : "assistant" as const,
+  }));
+  const containing = markers.findLastIndex((marker) => marker.start <= position);
+  if (containing < 0) return undefined;
+
+  const message = {
+    start: markers[containing]!.start,
+    end: markers[containing + 1]?.start ?? content.length,
+  };
+  let turnStart = containing;
+  while (turnStart > 0 && markers[turnStart]!.role !== "user") turnStart -= 1;
+  if (markers[turnStart]!.role !== "user") turnStart = containing;
+  const nextUser = markers.findIndex(
+    (marker, index) => index > turnStart && marker.role === "user",
+  );
+  return {
+    message,
+    turn: {
+      start: markers[turnStart]!.start,
+      end: nextUser < 0 ? content.length : markers[nextUser]!.start,
+    },
+  };
 }
 
 function hash(value: string): string {

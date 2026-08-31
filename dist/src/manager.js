@@ -6,6 +6,7 @@ import picomatch from "picomatch";
 import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
 import { CurationStore, chunkFingerprint, } from "./curation.js";
 import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, } from "./session-sync.js";
+import { sessionContextSpans } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath } from "./sources.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
@@ -174,11 +175,26 @@ export function buildReadResult(params) {
         ...(nextFrom ? { nextFrom } : {}),
     };
 }
-function lineSpan(result) {
-    const before = result.body.slice(0, result.chunkPos);
+function lineSpan(body, position, text) {
+    const before = body.slice(0, position);
     const startLine = before.split("\n").length;
-    const endLine = startLine + Math.max(0, result.bestChunk.split("\n").length - 1);
+    const endLine = startLine + Math.max(0, text.split("\n").length - 1);
     return { startLine, endLine };
+}
+export async function expandSessionSearchHit(result, maxTokens, countTokens) {
+    const leaf = { text: result.bestChunk, position: result.chunkPos };
+    const spans = sessionContextSpans(result.body, result.chunkPos);
+    if (!spans)
+        return leaf;
+    const leafEnd = result.chunkPos + result.chunkLen;
+    for (const span of [spans.turn, spans.message]) {
+        if (span.start > result.chunkPos || span.end < leafEnd)
+            continue;
+        const text = result.body.slice(span.start, span.end).trimEnd();
+        if (await countTokens(text) <= maxTokens)
+            return { text, position: span.start };
+    }
+    return leaf;
 }
 function lexicalResult(hit, corpus, session) {
     const body = hit.body ?? hit.title;
@@ -703,30 +719,36 @@ export class QmdMemoryManager {
             allowedPaths,
             expand: false,
         });
-        return hits.flatMap((hit) => {
+        const tokenizer = store.internal?.llm;
+        const results = [];
+        for (const hit of hits) {
             const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
             const corpus = collection ? this.#sources.get(collection)?.corpus : undefined;
             if (!corpus)
-                return [];
-            const span = lineSpan(hit);
+                continue;
             const relativePath = collection && hit.file.startsWith(`qmd://${collection}/`)
                 ? hit.file.slice(`qmd://${collection}/`.length)
                 : undefined;
             const session = corpus === "sessions" && relativePath
                 ? this.#sessionMetadata.get(relativePath)
                 : undefined;
-            return [{
-                    path: hit.file,
-                    ...span,
-                    score: hit.score,
-                    vectorScore: hit.score,
-                    snippet: hit.bestChunk,
-                    source: "memory",
-                    corpus,
-                    ...(session ? { session } : {}),
-                    citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
-                }];
-        });
+            const selected = corpus === "sessions" && this.#sessions && tokenizer
+                ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text))
+                : { text: hit.bestChunk, position: hit.chunkPos };
+            const span = lineSpan(hit.body, selected.position, selected.text);
+            results.push({
+                path: hit.file,
+                ...span,
+                score: hit.score,
+                vectorScore: hit.score,
+                snippet: selected.text,
+                source: "memory",
+                corpus,
+                ...(session ? { session } : {}),
+                citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
+            });
+        }
+        return results;
     }
     async searchSkills(query, minScore, limit) {
         const collections = this.#skillCollectionNames();

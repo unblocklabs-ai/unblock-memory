@@ -1,6 +1,8 @@
 import { isAbsolute } from "node:path";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
+const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
+const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
 
 export type FileCorpusConfig = {
   name: string;
@@ -21,6 +23,7 @@ type SessionCorpusConfig = {
   name: "sessions";
   kind: "sessions";
   chatTypes: readonly ChatType[];
+  maxExpandedTokens: number;
 };
 
 export type CorpusConfig = FileCorpusConfig | SkillCorpusConfig | SessionCorpusConfig;
@@ -110,7 +113,11 @@ function resolveCorpora(value: unknown): readonly CorpusConfig[] {
       return { name: "skills", kind: "skills", paths: corpus.paths.map((path) => path.trim()) };
     }
     if (corpus.kind === "sessions") {
-      assertOnlyKeys(corpus, ["name", "kind", "chatTypes"], `corpora[${index}]`);
+      assertOnlyKeys(
+        corpus,
+        ["name", "kind", "chatTypes", "maxExpandedTokens"],
+        `corpora[${index}]`,
+      );
       if (name !== "sessions") {
         throw new Error('unblock-memory session corpus must be named "sessions"');
       }
@@ -128,6 +135,12 @@ function resolveCorpora(value: unknown): readonly CorpusConfig[] {
         name: "sessions",
         kind: "sessions",
         chatTypes: [...new Set(chatTypes)] as ChatType[],
+        maxExpandedTokens: positiveInteger(
+          corpus.maxExpandedTokens,
+          DEFAULT_SESSION_MAX_EXPANDED_TOKENS,
+          "corpus sessions maxExpandedTokens",
+          MAX_SESSION_MAX_EXPANDED_TOKENS,
+        ),
       };
     }
     assertOnlyKeys(corpus, ["name", "kind", "paths"], `corpora[${index}]`);

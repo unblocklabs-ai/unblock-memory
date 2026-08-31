@@ -2,7 +2,7 @@
 
 Workspace-native memory for OpenClaw, powered internally by `@unblocklabs/qmd`.
 It keeps one warm QMD store per agent and exposes the standard `memory_search`
-and `memory_get` tools. Search uses semantic chunking v2 and direct QMD vector
+and `memory_get` tools. Search uses semantic chunking and direct QMD vector
 search without query expansion or a reranker, so only the embedding model loads.
 
 Optional memory analysis uses those same stored vectors in the same SQLite
@@ -55,6 +55,7 @@ directories, or globs into named corpora:
               name: "sessions",
               kind: "sessions",
               chatTypes: ["channel", "group"],
+              maxExpandedTokens: 500,
             },
             {
               name: "knowledge",
@@ -237,17 +238,22 @@ eligible.
 
 The optional `sessions` corpus reads the current agent's normal OpenClaw SQLite
 store and indexes its active user/assistant transcript branch. It defaults to
-channel and group conversations; add `direct` explicitly to include DMs. Run
+channel and group conversations; add `direct` explicitly to include DMs. A
+session vector hit expands to its complete user/assistant turn when the turn
+fits `maxExpandedTokens`, or to its complete enclosing message when only that
+fits. The default is `500`; the original semantic chunk is preserved when
+neither complete context fits, so expansion never clips the matched evidence.
+Run
 `memory_sync_sessions` to start a refresh, then use `memory_sync_status` to
 check its progress or result. The read-only adapter explicitly supports OpenClaw
 agent database schemas 17, 18, and 19 and validates its required columns before
 reading. Projections are private derived Markdown under the
 agent's `unblock-memory/sessions` state directory and can be rebuilt from
 OpenClaw at any time. Their embedded text contains only `# Transcript` and
-timestamped speaker messages; filtering metadata remains in the session
-manifest. The projected file modification time matches the session start time
-for meaningful chronological cluster reads. Session results include provider,
-chat type, conversation identity, and start time as an ISO 8601 timestamp. They
+role-labeled, timestamped speaker messages; filtering metadata remains in the
+session manifest. The projected file modification time matches the session
+start time for meaningful chronological cluster reads. Session results include
+provider, chat type, conversation identity, and start time as an ISO 8601 timestamp. They
 participate in the same search and clustering index as file memory. This phase
 does not sync sessions at startup or on a schedule; refreshes are manual through
 `memory_sync_sessions`.

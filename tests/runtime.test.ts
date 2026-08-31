@@ -21,6 +21,7 @@ const sessionCorpora = [{
   name: "sessions",
   kind: "sessions",
   chatTypes: ["channel", "group"],
+  maxExpandedTokens: 500,
 }] as const;
 
 test("classifies only canonical workspace memory as trusted", async () => {

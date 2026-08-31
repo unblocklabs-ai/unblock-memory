@@ -12,7 +12,7 @@ import {
 } from "./session-projector.js";
 
 const MANIFEST_VERSION = 1;
-const PROJECTOR_VERSION = 2;
+const PROJECTOR_VERSION = 3;
 const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
 
 const REQUIRED_COLUMNS = {

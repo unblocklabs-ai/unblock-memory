@@ -45,7 +45,7 @@ import {
   syncSessionProjections,
   type SessionSyncResult,
 } from "./session-sync.js";
-import type { SessionMetadata } from "./session-projector.js";
+import { sessionContextSpans, type SessionMetadata } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
 
 const DEFAULT_READ_LINES = 120;
@@ -70,6 +70,7 @@ export type ManagerSessionConfig = {
   agentId: string;
   agentName: string;
   chatTypes: readonly ChatType[];
+  maxExpandedTokens: number;
   collection: string;
   databasePath: string;
   manifestPath: string;
@@ -283,11 +284,32 @@ export function buildReadResult(params: {
   };
 }
 
-function lineSpan(result: VectorSearchResult): Pick<MemorySearchResult, "startLine" | "endLine"> {
-  const before = result.body.slice(0, result.chunkPos);
+function lineSpan(
+  body: string,
+  position: number,
+  text: string,
+): Pick<MemorySearchResult, "startLine" | "endLine"> {
+  const before = body.slice(0, position);
   const startLine = before.split("\n").length;
-  const endLine = startLine + Math.max(0, result.bestChunk.split("\n").length - 1);
+  const endLine = startLine + Math.max(0, text.split("\n").length - 1);
   return { startLine, endLine };
+}
+
+export async function expandSessionSearchHit(
+  result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">,
+  maxTokens: number,
+  countTokens: (text: string) => Promise<number>,
+): Promise<{ text: string; position: number }> {
+  const leaf = { text: result.bestChunk, position: result.chunkPos };
+  const spans = sessionContextSpans(result.body, result.chunkPos);
+  if (!spans) return leaf;
+  const leafEnd = result.chunkPos + result.chunkLen;
+  for (const span of [spans.turn, spans.message]) {
+    if (span.start > result.chunkPos || span.end < leafEnd) continue;
+    const text = result.body.slice(span.start, span.end).trimEnd();
+    if (await countTokens(text) <= maxTokens) return { text, position: span.start };
+  }
+  return leaf;
 }
 
 function lexicalResult(
@@ -905,29 +927,39 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       allowedPaths,
       expand: false,
     });
-    return hits.flatMap((hit) => {
+    const tokenizer = (store as Partial<AnalysisStore>).internal?.llm;
+    const results: CorpusMemorySearchResult[] = [];
+    for (const hit of hits) {
       const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
       const corpus = collection ? this.#sources.get(collection)?.corpus : undefined;
-      if (!corpus) return [];
-      const span = lineSpan(hit);
+      if (!corpus) continue;
       const relativePath = collection && hit.file.startsWith(`qmd://${collection}/`)
         ? hit.file.slice(`qmd://${collection}/`.length)
         : undefined;
       const session = corpus === "sessions" && relativePath
         ? this.#sessionMetadata.get(relativePath)
         : undefined;
-      return [{
+      const selected = corpus === "sessions" && this.#sessions && tokenizer
+        ? await expandSessionSearchHit(
+            hit,
+            this.#sessions.maxExpandedTokens,
+            (text) => tokenizer.countTokens(text),
+          )
+        : { text: hit.bestChunk, position: hit.chunkPos };
+      const span = lineSpan(hit.body, selected.position, selected.text);
+      results.push({
         path: hit.file,
         ...span,
         score: hit.score,
         vectorScore: hit.score,
-        snippet: hit.bestChunk,
+        snippet: selected.text,
         source: "memory",
         corpus,
         ...(session ? { session } : {}),
         citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
-      }];
-    });
+      });
+    }
+    return results;
   }
 
   async searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]> {

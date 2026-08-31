@@ -8,6 +8,7 @@ import {
   buildReadResult,
   cleanupRemovedDocuments,
   enableSecureDelete,
+  expandSessionSearchHit,
   pruneStaleCollections,
   QmdMemoryManager,
   type ManagerStore,
@@ -71,6 +72,32 @@ test("bounds default memory reads and provides continuation", () => {
   assert.equal(result.nextFrom, 121);
   assert.equal(result.truncated, true);
   assert.match(result.text, /Use from=121/);
+});
+
+test("expands a session leaf to the largest complete context within the token limit", async () => {
+  const body = [
+    "# Transcript\n\n",
+    "## User — Rico — 2026-08-25 14:32:09 UTC\n\nPlease review memory.\n\n",
+    "## Assistant — Bill — 2026-08-25 14:33:02 UTC\n\nI checked it. The index is healthy.\n\n",
+    "## User — Bek — 2026-08-25 14:35:02 UTC\n\nThanks.\n",
+  ].join("");
+  const bestChunk = "The index is healthy.\n\n";
+  const chunkPos = body.indexOf(bestChunk);
+  const hit = { body, bestChunk, chunkPos, chunkLen: bestChunk.length };
+  const countWords = async (text: string) => text.trim().split(/\s+/u).length;
+
+  const turn = await expandSessionSearchHit(hit, 30, countWords);
+  assert.match(turn.text, /^## User — Rico/u);
+  assert.doesNotMatch(turn.text, /## User — Bek/u);
+
+  const message = await expandSessionSearchHit(hit, 15, countWords);
+  assert.match(message.text, /^## Assistant — Bill/u);
+  assert.doesNotMatch(message.text, /Please review/u);
+
+  assert.deepEqual(await expandSessionSearchHit(hit, 3, countWords), {
+    text: bestChunk,
+    position: chunkPos,
+  });
 });
 
 test("initializes semantic chunking before collection-scoped embeds", async () => {
@@ -803,6 +830,7 @@ test("adds manifest metadata to session search results", async () => {
       agentId: "main",
       agentName: "Agent",
       chatTypes: ["channel", "group"],
+      maxExpandedTokens: 500,
       collection: source.collection,
       databasePath: join(root, "openclaw-agent.sqlite"),
       manifestPath,
@@ -904,6 +932,7 @@ test("filters session paths without restricting file corpora", async () => {
       agentId: "main",
       agentName: "Agent",
       chatTypes: ["channel", "group"],
+      maxExpandedTokens: 500,
       collection: sessions.collection,
       databasePath: join(root, "openclaw-agent.sqlite"),
       manifestPath,
@@ -970,6 +999,7 @@ test("keeps analysis fresh for a no-op manual session sync", async () => {
       agentId: "main",
       agentName: "Agent",
       chatTypes: ["channel", "group"],
+      maxExpandedTokens: 500,
       collection: source.collection,
       databasePath,
       manifestPath: join(root, "sessions-manifest.json"),

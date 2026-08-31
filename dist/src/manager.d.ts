@@ -1,4 +1,4 @@
-import type { QMDStore } from "@unblocklabs/qmd";
+import type { QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadResult, MemoryRequestContext, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
 import type { ChatType } from "./config.js";
@@ -10,6 +10,7 @@ export type ManagerSessionConfig = {
     agentId: string;
     agentName: string;
     chatTypes: readonly ChatType[];
+    maxExpandedTokens: number;
     collection: string;
     databasePath: string;
     manifestPath: string;
@@ -30,6 +31,10 @@ export declare function buildReadResult(params: {
     from?: number;
     lines?: number;
 }): MemoryReadResult;
+export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">, maxTokens: number, countTokens: (text: string) => Promise<number>): Promise<{
+    text: string;
+    position: number;
+}>;
 export declare class QmdMemoryManager implements MemorySearchManagerContract {
     #private;
     constructor(params: {

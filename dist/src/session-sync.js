@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { projectSession, sessionDocumentPath, } from "./session-projector.js";
 const MANIFEST_VERSION = 1;
-const PROJECTOR_VERSION = 2;
+const PROJECTOR_VERSION = 3;
 const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
 const REQUIRED_COLUMNS = {
     schema_meta: ["meta_key", "role", "schema_version", "agent_id", "app_version"],

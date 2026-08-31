@@ -41,7 +41,7 @@
     },
     "corpora": {
       "label": "Memory Corpora",
-      "help": "Named groups of exact Markdown files, directories, or globs. Relative paths resolve from each agent workspace. Skill files use the isolated skills corpus."
+      "help": "Named groups of exact Markdown files, directories, or globs. Relative paths resolve from each agent workspace. Skill files use the isolated skills corpus. Session corpora can expand matching semantic chunks up to maxExpandedTokens."
     },
     "skillWhisperer.enabled": {
       "label": "Skill Whisperer",
@@ -99,6 +99,12 @@
                   "minItems": 1,
                   "items": { "enum": ["channel", "group", "direct"] },
                   "default": ["channel", "group"]
+                },
+                "maxExpandedTokens": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000,
+                  "default": 500
                 }
               }
             },

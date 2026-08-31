@@ -123,6 +123,7 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
         name: "sessions",
         kind: "sessions",
         chatTypes: ["channel", "group"],
+        maxExpandedTokens: 500,
       },
     ],
   );
@@ -141,8 +142,28 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
       name: "sessions",
       kind: "sessions",
       chatTypes: ["direct"],
+      maxExpandedTokens: 500,
     },
   );
+  assert.deepEqual(resolveConfig({
+    corpora: [memory, {
+      name: "sessions",
+      kind: "sessions",
+      maxExpandedTokens: 800,
+    }],
+  }).corpora[1], {
+    name: "sessions",
+    kind: "sessions",
+    chatTypes: ["channel", "group"],
+    maxExpandedTokens: 800,
+  });
+  assert.throws(() => resolveConfig({
+    corpora: [memory, {
+      name: "sessions",
+      kind: "sessions",
+      maxExpandedTokens: 10_001,
+    }],
+  }), /10000/);
 });
 
 test("analysis is opt-in and requires an absolute executable path", () => {

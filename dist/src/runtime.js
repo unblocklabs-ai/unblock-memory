@@ -224,6 +224,7 @@ export class QmdMemoryRuntime {
                     agentId,
                     agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
                     chatTypes: sessionCorpus.chatTypes,
+                    maxExpandedTokens: sessionCorpus.maxExpandedTokens,
                     collection: sessionSource.collection,
                     databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
                     manifestPath: join(stateDir, "sessions-manifest.json"),
