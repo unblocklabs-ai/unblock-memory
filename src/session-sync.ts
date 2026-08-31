@@ -13,7 +13,7 @@ import {
 
 const MANIFEST_VERSION = 1;
 const PROJECTOR_VERSION = 2;
-const SUPPORTED_SCHEMA_VERSION = 17;
+const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
 
 const REQUIRED_COLUMNS = {
   schema_meta: ["meta_key", "role", "schema_version", "agent_id", "app_version"],
@@ -95,10 +95,11 @@ function projectionPath(outputDir: string, documentPath: string): string {
 
 function assertSchema(db: DatabaseSync, expectedAgentId: string): void {
   const pragma = db.prepare("PRAGMA user_version").get() as { user_version?: unknown } | undefined;
-  if (pragma?.user_version !== SUPPORTED_SCHEMA_VERSION) {
+  const schemaVersion = pragma?.user_version;
+  if (typeof schemaVersion !== "number" || !SUPPORTED_SCHEMA_VERSIONS.has(schemaVersion)) {
     throw new Error(
-      `unsupported OpenClaw agent database schema: expected ${SUPPORTED_SCHEMA_VERSION}, ` +
-      `found ${String(pragma?.user_version ?? "unknown")}`,
+      "unsupported OpenClaw agent database schema: expected one of 17, 18, 19, " +
+      `found ${String(schemaVersion ?? "unknown")}`,
     );
   }
   for (const [table, required] of Object.entries(REQUIRED_COLUMNS)) {
@@ -111,7 +112,7 @@ function assertSchema(db: DatabaseSync, expectedAgentId: string): void {
     "SELECT role, schema_version AS schemaVersion, agent_id AS agentId " +
     "FROM schema_meta WHERE meta_key = 'primary' LIMIT 1",
   ).get() as { role?: unknown; schemaVersion?: unknown; agentId?: unknown } | undefined;
-  if (meta?.role !== "agent" || meta.schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
+  if (meta?.role !== "agent" || meta.schemaVersion !== schemaVersion) {
     throw new Error("unsupported OpenClaw agent database primary schema metadata");
   }
   if (meta.agentId !== expectedAgentId) {

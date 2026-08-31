@@ -115,8 +115,9 @@ The database already contains the normalized inventory needed for projection:
   transcript
 
 `session_participants` can enrich known human identities when present, but it is
-not part of the required schema. The live fleet has schema-v17 databases where
-the populated agent has this table and empty agents do not. `session_members`
+not part of the required schema. The initial fleet had schema-v17 databases;
+OpenClaw 2026.8.1 stable advances the schema to v19 without changing the
+projection's required columns. `session_members`
 is a separate optional identity-membership table and is not a replacement for
 transcript sender metadata.
 

@@ -4,15 +4,16 @@ export function createAgentDatabase(
   path: string,
   agentId = "main",
   appVersion = "2026.8.1-beta.3",
+  schemaVersion = 17,
 ): DatabaseSync {
   const db = new DatabaseSync(path);
   db.exec(`
-    PRAGMA user_version = 17;
+    PRAGMA user_version = ${schemaVersion};
     CREATE TABLE schema_meta (
       meta_key TEXT PRIMARY KEY, role TEXT, schema_version INTEGER,
       agent_id TEXT, app_version TEXT
     );
-    INSERT INTO schema_meta VALUES ('primary', 'agent', 17, '${agentId}', '${appVersion}');
+    INSERT INTO schema_meta VALUES ('primary', 'agent', ${schemaVersion}, '${agentId}', '${appVersion}');
     CREATE TABLE session_windows (
       session_id TEXT PRIMARY KEY, session_key TEXT, chat_type TEXT, channel TEXT,
       account_id TEXT, primary_conversation_id TEXT, created_at INTEGER,

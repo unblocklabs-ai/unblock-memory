@@ -178,11 +178,15 @@ test("rejects manifest paths redirected through a projection-directory symlink",
   assert.equal(await readFile(outsidePath, "utf8"), "keep me\n");
 });
 
-test("accepts the tested beta.2 and beta.3 schema-v17 contract", async () => {
-  for (const appVersion of ["2026.8.1-beta.2", "2026.8.1-beta.3"]) {
+test("accepts the tested OpenClaw schema 17 through 19 contract", async () => {
+  for (const { appVersion, schemaVersion } of [
+    { appVersion: "2026.8.1-beta.3", schemaVersion: 17 },
+    { appVersion: "2026.8.1", schemaVersion: 18 },
+    { appVersion: "2026.8.1", schemaVersion: 19 },
+  ]) {
     const root = await mkdtemp(join(tmpdir(), "unblock-memory-session-schema-"));
     const databasePath = join(root, "openclaw-agent.sqlite");
-    createAgentDatabase(databasePath, "main", appVersion).close();
+    createAgentDatabase(databasePath, "main", appVersion, schemaVersion).close();
     const synced = await syncSessionProjections({
       databasePath,
       outputDir: join(root, "sessions"),
@@ -239,7 +243,10 @@ test("schema and malformed-event failures preserve prior projections", async () 
 
   const unsupported = new DatabaseSync(databasePath);
   unsupported.exec("PRAGMA user_version = 16");
+  await assert.rejects(syncSessionProjections(params), /expected one of 17, 18, 19, found 16/);
+  unsupported.exec("PRAGMA user_version = 20");
+  unsupported.prepare("UPDATE schema_meta SET schema_version = 20 WHERE meta_key = 'primary'").run();
   unsupported.close();
-  await assert.rejects(syncSessionProjections(params), /expected 17, found 16/);
+  await assert.rejects(syncSessionProjections(params), /expected one of 17, 18, 19, found 20/);
   assert.equal(await readFile(projectedPath, "utf8"), original);
 });

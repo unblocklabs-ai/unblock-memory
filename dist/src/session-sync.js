@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { projectSession, sessionDocumentPath, } from "./session-projector.js";
 const MANIFEST_VERSION = 1;
 const PROJECTOR_VERSION = 2;
-const SUPPORTED_SCHEMA_VERSION = 17;
+const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
 const REQUIRED_COLUMNS = {
     schema_meta: ["meta_key", "role", "schema_version", "agent_id", "app_version"],
     session_windows: [
@@ -45,9 +45,10 @@ function projectionPath(outputDir, documentPath) {
 }
 function assertSchema(db, expectedAgentId) {
     const pragma = db.prepare("PRAGMA user_version").get();
-    if (pragma?.user_version !== SUPPORTED_SCHEMA_VERSION) {
-        throw new Error(`unsupported OpenClaw agent database schema: expected ${SUPPORTED_SCHEMA_VERSION}, ` +
-            `found ${String(pragma?.user_version ?? "unknown")}`);
+    const schemaVersion = pragma?.user_version;
+    if (typeof schemaVersion !== "number" || !SUPPORTED_SCHEMA_VERSIONS.has(schemaVersion)) {
+        throw new Error("unsupported OpenClaw agent database schema: expected one of 17, 18, 19, " +
+            `found ${String(schemaVersion ?? "unknown")}`);
     }
     for (const [table, required] of Object.entries(REQUIRED_COLUMNS)) {
         const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all()
@@ -58,7 +59,7 @@ function assertSchema(db, expectedAgentId) {
     }
     const meta = db.prepare("SELECT role, schema_version AS schemaVersion, agent_id AS agentId " +
         "FROM schema_meta WHERE meta_key = 'primary' LIMIT 1").get();
-    if (meta?.role !== "agent" || meta.schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
+    if (meta?.role !== "agent" || meta.schemaVersion !== schemaVersion) {
         throw new Error("unsupported OpenClaw agent database primary schema metadata");
     }
     if (meta.agentId !== expectedAgentId) {
