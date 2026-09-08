@@ -61,7 +61,7 @@ function resolveCorpora(value) {
             return { name: "skills", kind: "skills", paths: corpus.paths.map((path) => path.trim()) };
         }
         if (corpus.kind === "sessions") {
-            assertOnlyKeys(corpus, ["name", "kind", "chatTypes", "maxExpandedTokens"], `corpora[${index}]`);
+            assertOnlyKeys(corpus, ["name", "kind", "chatTypes", "maxExpandedTokens", "syncIntervalMinutes"], `corpora[${index}]`);
             if (name !== "sessions") {
                 throw new Error('unblock-memory session corpus must be named "sessions"');
             }
@@ -71,8 +71,14 @@ function resolveCorpora(value) {
                 !chatTypes.every((chatType) => CHAT_TYPES.includes(chatType))) {
                 throw new Error(`unblock-memory corpus sessions chatTypes must contain channel, group, or direct`);
             }
+            const syncIntervalMinutes = corpus.syncIntervalMinutes ?? 15;
+            if (typeof syncIntervalMinutes !== "number" || !Number.isInteger(syncIntervalMinutes) ||
+                syncIntervalMinutes < 0 || syncIntervalMinutes > 1440) {
+                throw new Error("unblock-memory corpus sessions syncIntervalMinutes must be an integer between 0 and 1440");
+            }
             return {
                 name: "sessions",
+                syncIntervalMinutes,
                 kind: "sessions",
                 chatTypes: [...new Set(chatTypes)],
                 maxExpandedTokens: positiveInteger(corpus.maxExpandedTokens, DEFAULT_SESSION_MAX_EXPANDED_TOKENS, "corpus sessions maxExpandedTokens", MAX_SESSION_MAX_EXPANDED_TOKENS),

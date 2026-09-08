@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveAgentDir, resolveAgentWorkspaceDir, resolveStateDir, } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
-import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
+import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { QmdMemoryManager } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
@@ -68,6 +68,24 @@ export class QmdMemoryRuntime {
     #keepEmbeddingModelWarm;
     #stateRoot;
     #managers = new Map();
+    #sessionSyncTimer;
+    startSessionSyncSchedule(cfg, onError) {
+        this.stopSessionSyncSchedule();
+        const sessions = this.#corpora.find((corpus) => corpus.kind === "sessions");
+        if (!sessions?.syncIntervalMinutes)
+            return;
+        this.#sessionSyncTimer = setInterval(() => {
+            for (const agentId of listAgentIds(cfg)) {
+                void this.startSessionSync({ cfg, agentId }).catch(onError);
+            }
+        }, sessions.syncIntervalMinutes * 60_000);
+        this.#sessionSyncTimer.unref();
+    }
+    stopSessionSyncSchedule() {
+        if (this.#sessionSyncTimer)
+            clearInterval(this.#sessionSyncTimer);
+        this.#sessionSyncTimer = undefined;
+    }
     constructor(corpora, options = {}) {
         this.#corpora = corpora;
         this.#analysisExecutable = options.analysisExecutable;
@@ -186,6 +204,7 @@ export class QmdMemoryRuntime {
         await (await pending)?.close();
     }
     async closeAllMemorySearchManagers() {
+        this.stopSessionSyncSchedule();
         const managers = [...this.#managers.values()];
         this.#managers.clear();
         await Promise.all(managers.map(async (pending) => (await pending).close()));

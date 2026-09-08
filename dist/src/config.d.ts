@@ -15,6 +15,7 @@ type SessionCorpusConfig = {
     kind: "sessions";
     chatTypes: readonly ChatType[];
     maxExpandedTokens: number;
+    syncIntervalMinutes: number;
 };
 export type CorpusConfig = FileCorpusConfig | SkillCorpusConfig | SessionCorpusConfig;
 export declare const DEFAULT_CORPORA: readonly FileCorpusConfig[];

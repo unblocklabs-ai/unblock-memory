@@ -254,9 +254,20 @@ role-labeled, timestamped speaker messages; filtering metadata remains in the
 session manifest. The projected file modification time matches the session
 start time for meaningful chronological cluster reads. Session results include
 provider, chat type, conversation identity, and start time as an ISO 8601 timestamp. They
-participate in the same search and clustering index as file memory. This phase
-does not sync sessions at startup or on a schedule; refreshes are manual through
-`memory_sync_sessions`.
+participate in the same search and clustering index as file memory. The plugin
+automatically refreshes each configured agent's sessions every 15 minutes while
+the Gateway runs. Set `syncIntervalMinutes` on the `sessions` corpus to an integer
+from `1` to `1440`, or `0` for manual-only syncing. For example:
+
+```json
+{ "name": "sessions", "kind": "sessions", "syncIntervalMinutes": 15 }
+```
+
+The first refresh runs after one interval, not during startup. Restart the
+Gateway after changing the interval. Refreshes are incremental; an already-running
+sync is skipped, and failures are visible through `memory_sync_status` and retried
+at the next interval. `memory_sync_sessions` still provides an immediate manual
+refresh. Syncing and embedding run inside the Gateway process, without an LLM turn.
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
 equivalent configured OpenClaw state directory). Durable agent-supplied event

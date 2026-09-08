@@ -12,7 +12,8 @@
         "agent_end",
         "message_received",
         "session_end",
-        "gateway_stop"
+        "gateway_stop",
+        "gateway_start"
       ],
       "registrations": ["registerMemoryCapability", "registerTool"],
       "manifestContracts": ["tools"]

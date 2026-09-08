@@ -7,6 +7,20 @@ test("uses the canonical memory corpus when corpora are absent", () => {
   assert.deepEqual(resolveConfig({}).corpora, DEFAULT_CORPORA);
 });
 
+test("validates the session sync interval and manual-only opt-out", () => {
+  const resolve = (syncIntervalMinutes: unknown) => resolveConfig({
+    corpora: [...DEFAULT_CORPORA, { name: "sessions", kind: "sessions", syncIntervalMinutes }],
+  }).corpora[1];
+  for (const minutes of [0, 1, 15, 1440]) {
+    const corpus = resolve(minutes);
+    assert.ok(corpus?.kind === "sessions");
+    assert.equal(corpus.syncIntervalMinutes, minutes);
+  }
+  for (const invalid of [-1, 0.5, 1441, Infinity, "15", true]) {
+    assert.throws(() => resolve(invalid), /syncIntervalMinutes/);
+  }
+});
+
 test("keeps the embedding model warm by default and accepts an opt-out", () => {
   assert.equal(resolveConfig(undefined).keepEmbeddingModelWarm, true);
   assert.equal(resolveConfig({ keepEmbeddingModelWarm: false }).keepEmbeddingModelWarm, false);
@@ -124,6 +138,7 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
         kind: "sessions",
         chatTypes: ["channel", "group"],
         maxExpandedTokens: 500,
+        syncIntervalMinutes: 15,
       },
     ],
   );
@@ -143,6 +158,7 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
       kind: "sessions",
       chatTypes: ["direct"],
       maxExpandedTokens: 500,
+      syncIntervalMinutes: 15,
     },
   );
   assert.deepEqual(resolveConfig({
@@ -156,6 +172,7 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
     kind: "sessions",
     chatTypes: ["channel", "group"],
     maxExpandedTokens: 800,
+    syncIntervalMinutes: 15,
   });
   assert.throws(() => resolveConfig({
     corpora: [memory, {

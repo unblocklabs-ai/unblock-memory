@@ -40,6 +40,8 @@ type StoredRunningSessionSync = Extract<StoredSessionSyncStatus, {
 export declare function recoverInterruptedSessionSync(directory: string, statusPath: string, stale: StoredRunningSessionSync): Promise<SessionSyncStatus>;
 export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     #private;
+    startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void;
+    stopSessionSyncSchedule(): void;
     constructor(corpora: readonly CorpusConfig[], options?: {
         analysisExecutable?: string;
         keepEmbeddingModelWarm?: boolean;

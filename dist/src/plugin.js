@@ -403,6 +403,12 @@ export function registerUnblockMemory(api) {
         runtime,
     };
     api.registerMemoryCapability(capability);
+    if (config.corpora.some((corpus) => corpus.kind === "sessions" && corpus.syncIntervalMinutes > 0)) {
+        api.on("gateway_start", () => runtime.startSessionSyncSchedule(api.config, (error) => {
+            api.logger.warn(`unblock-memory scheduled session sync could not start: ${String(error)}`);
+        }));
+        api.on("gateway_stop", () => runtime.stopSessionSyncSchedule());
+    }
     if (config.people.enabled) {
         const peopleStores = new PeopleStores({
             maxOpenTodos: config.people.todos.maxOpen,

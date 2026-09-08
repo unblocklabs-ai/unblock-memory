@@ -249,8 +249,10 @@ test("memory tools preserve request context and expose session start time as ISO
 
 test("session sync tools accept and report status without awaiting cold initialization", async () => {
   const registrations = new Map<string, (ctx: OpenClawPluginToolContext) => Tool | null>();
+  const hooks: string[] = [];
   let runtime: QmdMemoryRuntime | undefined;
   const api = {
+    on(name: string) { hooks.push(name); },
     pluginConfig: {
       corpora: [
         { name: "memory", kind: "files", paths: ["MEMORY.md"] },
@@ -277,6 +279,7 @@ test("session sync tools accept and report status without awaiting cold initiali
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;
   }
   assert.ok(runtime);
+  assert.deepEqual(hooks, ["gateway_start", "gateway_stop"]);
 
   let releaseManager = () => {};
   const managerGate = new Promise<void>((resolve) => {

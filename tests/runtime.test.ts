@@ -22,7 +22,46 @@ const sessionCorpora = [{
   kind: "sessions",
   chatTypes: ["channel", "group"],
   maxExpandedTokens: 500,
+  syncIntervalMinutes: 15,
 }] as const;
+
+test("schedules configured agents after the interval, retries failures, and stops cleanly", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const runtime = new QmdMemoryRuntime(sessionCorpora);
+  const calls: string[] = [];
+  const errors: unknown[] = [];
+  t.mock.method(runtime, "startSessionSync", async ({ agentId }: { agentId: string }) => {
+    calls.push(agentId);
+    if (agentId === "first") throw new Error("cannot start");
+    return { status: "already_running", startedAt: "now" };
+  });
+  const cfg = { agents: { list: [{ id: "first" }, { id: "second" }] } };
+  runtime.startSessionSyncSchedule(cfg, (error) => errors.push(error));
+  runtime.startSessionSyncSchedule(cfg, (error) => errors.push(error));
+  t.mock.timers.tick(15 * 60_000 - 1);
+  assert.deepEqual(calls, []);
+  t.mock.timers.tick(1);
+  await Promise.resolve();
+  assert.deepEqual(calls, ["first", "second"]);
+  assert.equal(errors.length, 1);
+  t.mock.timers.tick(15 * 60_000);
+  await Promise.resolve();
+  assert.equal(calls.length, 4);
+  runtime.stopSessionSyncSchedule();
+  t.mock.timers.tick(15 * 60_000);
+  assert.equal(calls.length, 4);
+});
+
+test("does not schedule absent or manual-only sessions", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  for (const corpora of [[], [{ ...sessionCorpora[0], syncIntervalMinutes: 0 }]]) {
+    const runtime = new QmdMemoryRuntime(corpora);
+    const start = t.mock.method(runtime, "startSessionSync");
+    runtime.startSessionSyncSchedule({}, (error) => assert.fail(String(error)));
+    t.mock.timers.tick(24 * 60 * 60_000);
+    assert.equal(start.mock.callCount(), 0);
+  }
+});
 
 test("classifies only canonical workspace memory as trusted", async () => {
   const workspaceDir = await mkdtemp(join(tmpdir(), "unblock-memory-provenance-"));

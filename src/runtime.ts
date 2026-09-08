@@ -6,7 +6,7 @@ import {
   resolveAgentWorkspaceDir,
   resolveStateDir,
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
-import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
+import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
@@ -94,6 +94,24 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #keepEmbeddingModelWarm: boolean;
   readonly #stateRoot: string;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
+  #sessionSyncTimer?: NodeJS.Timeout;
+
+  startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void {
+    this.stopSessionSyncSchedule();
+    const sessions = this.#corpora.find((corpus) => corpus.kind === "sessions");
+    if (!sessions?.syncIntervalMinutes) return;
+    this.#sessionSyncTimer = setInterval(() => {
+      for (const agentId of listAgentIds(cfg)) {
+        void this.startSessionSync({ cfg, agentId }).catch(onError);
+      }
+    }, sessions.syncIntervalMinutes * 60_000);
+    this.#sessionSyncTimer.unref();
+  }
+
+  stopSessionSyncSchedule(): void {
+    if (this.#sessionSyncTimer) clearInterval(this.#sessionSyncTimer);
+    this.#sessionSyncTimer = undefined;
+  }
 
   constructor(
     corpora: readonly CorpusConfig[],
@@ -221,6 +239,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   }
 
   async closeAllMemorySearchManagers(): Promise<void> {
+    this.stopSessionSyncSchedule();
     const managers = [...this.#managers.values()];
     this.#managers.clear();
     await Promise.all(managers.map(async (pending) => (await pending).close()));

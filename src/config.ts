@@ -24,6 +24,7 @@ type SessionCorpusConfig = {
   kind: "sessions";
   chatTypes: readonly ChatType[];
   maxExpandedTokens: number;
+  syncIntervalMinutes: number;
 };
 
 export type CorpusConfig = FileCorpusConfig | SkillCorpusConfig | SessionCorpusConfig;
@@ -115,7 +116,7 @@ function resolveCorpora(value: unknown): readonly CorpusConfig[] {
     if (corpus.kind === "sessions") {
       assertOnlyKeys(
         corpus,
-        ["name", "kind", "chatTypes", "maxExpandedTokens"],
+        ["name", "kind", "chatTypes", "maxExpandedTokens", "syncIntervalMinutes"],
         `corpora[${index}]`,
       );
       if (name !== "sessions") {
@@ -131,8 +132,14 @@ function resolveCorpora(value: unknown): readonly CorpusConfig[] {
           `unblock-memory corpus sessions chatTypes must contain channel, group, or direct`,
         );
       }
+      const syncIntervalMinutes = corpus.syncIntervalMinutes ?? 15;
+      if (typeof syncIntervalMinutes !== "number" || !Number.isInteger(syncIntervalMinutes) ||
+        syncIntervalMinutes < 0 || syncIntervalMinutes > 1440) {
+        throw new Error("unblock-memory corpus sessions syncIntervalMinutes must be an integer between 0 and 1440");
+      }
       return {
         name: "sessions",
+        syncIntervalMinutes,
         kind: "sessions",
         chatTypes: [...new Set(chatTypes)] as ChatType[],
         maxExpandedTokens: positiveInteger(
