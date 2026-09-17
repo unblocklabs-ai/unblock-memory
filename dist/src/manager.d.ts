@@ -5,6 +5,7 @@ import type { ChatType } from "./config.js";
 import { type MaintenanceStatus, type TemporalBasis } from "./curation.js";
 import { type SessionSyncResult } from "./session-sync.js";
 import { type ResolvedSource } from "./sources.js";
+import { type QualityCursor } from "./quality-audit.js";
 export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "searchLex" | "vsearch" | "get" | "getDocumentBody" | "close">;
 export type ManagerSessionConfig = {
     agentId: string;
@@ -64,6 +65,38 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         status?: MaintenanceStatus;
         limit?: number;
     }): import("./curation.js").MaintenanceTask[];
+    auditQuality(params: {
+        corpora: readonly string[];
+        apiKey: string;
+        timeoutMs: number;
+        minNoise: number;
+        limit?: number;
+        after?: QualityCursor;
+        signal: AbortSignal;
+    }): Promise<{
+        status: "ok" | "partial";
+        done: boolean;
+        next: QualityCursor | undefined;
+        scanned: number;
+        judged: number;
+        cached: number;
+        skippedOversized: number;
+        skippedStale: number;
+        flagged: number;
+        groups: {
+            corpus: string;
+            source: string;
+            reason: string;
+            pending: number;
+            examples: import("./curation.js").MaintenanceTask[];
+        }[];
+        policy: string;
+        scope: string;
+    } | {
+        status: "busy";
+    } | {
+        status: "unavailable";
+    }>;
     updateMaintenanceTask(params: {
         id: string;
         status: Exclude<MaintenanceStatus, "pending">;

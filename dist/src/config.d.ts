@@ -31,6 +31,11 @@ export type UnblockMemoryConfig = {
         apiKeyFile?: string;
         timeoutMs: number;
     };
+    qualityAudit: {
+        enabled: boolean;
+        corpora: readonly string[];
+        minNoise: number;
+    };
     people: {
         enabled: boolean;
         whisperer: {

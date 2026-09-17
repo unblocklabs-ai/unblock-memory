@@ -8,6 +8,7 @@ import { CurationStore, chunkFingerprint, } from "./curation.js";
 import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, } from "./session-sync.js";
 import { sessionContextSpans } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath } from "./sources.js";
+import { auditQualityPage } from "./quality-audit.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
@@ -264,6 +265,7 @@ export class QmdMemoryManager {
     #sessionMetadata = new Map();
     #sessionManifestMtimeNs;
     #skillIndex;
+    #qualityAuditRunning = false;
     constructor(params) {
         this.#dbPath = params.dbPath;
         this.#curationPath = params.curationPath ?? `${params.dbPath}.curation.sqlite`;
@@ -583,6 +585,27 @@ export class QmdMemoryManager {
     }
     listMaintenanceTasks(params = {}) {
         return this.#getCuration().listTasks(params);
+    }
+    async auditQuality(params) {
+        if (this.#qualityAuditRunning)
+            return { status: "busy" };
+        this.#qualityAuditRunning = true;
+        try {
+            await this.#operationChain;
+            params.signal.throwIfAborted();
+            const store = await this.#getAnalysisStore();
+            params.signal.throwIfAborted();
+            if (this.#closed)
+                return { status: "unavailable" };
+            return await auditQualityPage({
+                ...params, db: store.internal.db, curation: this.#getCuration(),
+                sources: [...this.#sources.values()].filter(source => source.kind !== "skills" && params.corpora.includes(source.corpus)),
+                isActive: () => !this.#closed,
+            });
+        }
+        finally {
+            this.#qualityAuditRunning = false;
+        }
     }
     updateMaintenanceTask(params) {
         return this.#getCuration().updateTask(params);

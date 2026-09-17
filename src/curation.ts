@@ -2,11 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { QualityJudgment } from "./typesafe.js";
 
 const TEMPORAL_BASES = ["path", "frontmatter", "session", "agent_verified"] as const;
 export type TemporalBasis = typeof TEMPORAL_BASES[number];
 
-const MAINTENANCE_TASK_TYPES = ["ambiguous_event_time", "exact_duplicate"] as const;
+const MAINTENANCE_TASK_TYPES = ["ambiguous_event_time", "exact_duplicate", "quality_review"] as const;
 export type MaintenanceTaskType = typeof MAINTENANCE_TASK_TYPES[number];
 
 const MAINTENANCE_STATUSES = ["pending", "resolved", "deferred", "irrelevant"] as const;
@@ -135,13 +136,18 @@ export class CurationStore {
 
     `);
     this.#ensureMaintenanceSchema();
+    this.#db.exec(`CREATE TABLE IF NOT EXISTS quality_judgments (
+      cache_key TEXT PRIMARY KEY,
+      noise REAL NOT NULL CHECK (noise BETWEEN 0 AND 1),
+      evidence REAL NOT NULL CHECK (evidence BETWEEN 0 AND 1)
+    )`);
   }
 
   #ensureMaintenanceSchema(): void {
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS maintenance_tasks (
         id TEXT PRIMARY KEY,
-        type TEXT NOT NULL CHECK (type IN ('ambiguous_event_time', 'exact_duplicate')),
+        type TEXT NOT NULL CHECK (type IN ('ambiguous_event_time', 'exact_duplicate', 'quality_review')),
         corpus TEXT NOT NULL,
         collection TEXT NOT NULL,
         path TEXT NOT NULL,
@@ -155,6 +161,22 @@ export class CurationStore {
         UNIQUE (type, corpus, collection, path, reason, content_fingerprint)
       );
     `);
+    const schema = this.#db.prepare("SELECT sql FROM sqlite_master WHERE name = 'maintenance_tasks'")
+      .get() as { sql: string };
+    if (!schema.sql.includes("'quality_review'")) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(schema.sql.replace("maintenance_tasks", "maintenance_tasks_quality")
+          .replace("'exact_duplicate'", "'exact_duplicate', 'quality_review'"));
+        this.#db.exec(`INSERT INTO maintenance_tasks_quality SELECT * FROM maintenance_tasks;
+          DROP TABLE maintenance_tasks;
+          ALTER TABLE maintenance_tasks_quality RENAME TO maintenance_tasks;`);
+        this.#db.exec("COMMIT");
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     this.#db.exec(`
       CREATE INDEX IF NOT EXISTS maintenance_tasks_status_created
         ON maintenance_tasks(status, created_at);
@@ -163,6 +185,16 @@ export class CurationStore {
 
   close(): void {
     this.#db.close();
+  }
+
+  qualityJudgment(key: string): QualityJudgment | undefined {
+    return this.#db.prepare("SELECT noise, evidence FROM quality_judgments WHERE cache_key = ?")
+      .get(key) as QualityJudgment | undefined;
+  }
+
+  cacheQualityJudgment(key: string, judgment: QualityJudgment): void {
+    this.#db.prepare("INSERT OR REPLACE INTO quality_judgments(cache_key, noise, evidence) VALUES (?, ?, ?)")
+      .run(key, judgment.noise, judgment.evidence);
   }
 
   annotations(): TemporalAnnotation[] {
@@ -180,7 +212,7 @@ export class CurationStore {
     reason: string;
     contentFingerprint?: string;
     detail?: string;
-  }): void {
+  }): MaintenanceTask {
     const now = new Date().toISOString();
     this.#db.prepare(`
       INSERT INTO maintenance_tasks
@@ -207,6 +239,10 @@ export class CurationStore {
       now,
       now,
     );
+    return task(this.#db.prepare(`SELECT * FROM maintenance_tasks
+      WHERE type = ? AND corpus = ? AND collection = ? AND path = ? AND reason = ? AND content_fingerprint = ?`)
+      .get(candidate.type, candidate.corpus, candidate.collection, candidate.path,
+        candidate.reason, candidate.contentFingerprint ?? "") as TaskRow);
   }
 
   listTasks(params: { status?: MaintenanceStatus; limit?: number } = {}): MaintenanceTask[] {
@@ -240,6 +276,9 @@ export class CurationStore {
         return undefined;
       }
       const now = new Date().toISOString();
+      if (row.type === "quality_review" && params.status === "resolved" && !params.note?.trim()) {
+        throw new Error("resolving a quality review requires a note describing source/index verification");
+      }
       if (row.type === "ambiguous_event_time" && params.status === "resolved" && !params.annotation) {
         throw new Error("resolving an ambiguous event-time task requires a date annotation");
       }

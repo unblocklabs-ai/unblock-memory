@@ -19,6 +19,31 @@ const DEFAULT_TYPESAFE_CONFIG = {
     enabled: true,
     timeoutMs: 1500,
 };
+const DEFAULT_QUALITY_AUDIT = {
+    enabled: false, corpora: [], minNoise: 0.8,
+};
+function resolveQualityAudit(value, corpora) {
+    if (value === undefined)
+        return { ...DEFAULT_QUALITY_AUDIT };
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error("qualityAudit must be an object");
+    const config = value;
+    assertOnlyKeys(config, ["enabled", "corpora", "minNoise"], "qualityAudit");
+    const enabled = config.enabled ?? false;
+    const selected = config.corpora ?? [];
+    const minNoise = config.minNoise ?? DEFAULT_QUALITY_AUDIT.minNoise;
+    if (typeof enabled !== "boolean")
+        throw new Error("qualityAudit.enabled must be a boolean");
+    if (!Array.isArray(selected) || !selected.every((name) => typeof name === "string" && corpora.some(corpus => corpus.name === name && corpus.kind !== "skills"))) {
+        throw new Error("qualityAudit.corpora must list configured non-skill corpora");
+    }
+    if (enabled && !selected.length)
+        throw new Error("enabled qualityAudit requires explicit corpora");
+    if (typeof minNoise !== "number" || !Number.isFinite(minNoise) || minNoise < 0 || minNoise > 1) {
+        throw new Error("qualityAudit.minNoise must be between 0 and 1");
+    }
+    return { enabled, corpora: [...new Set(selected)], minNoise };
+}
 function resolveTypeSafe(value) {
     if (value === undefined)
         return { ...DEFAULT_TYPESAFE_CONFIG };
@@ -232,6 +257,7 @@ export function resolveConfig(value) {
             keepEmbeddingModelWarm: true,
             analysis: {},
             typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
+            qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
             people: DEFAULT_PEOPLE_CONFIG,
             skillWhisperer: DEFAULT_SKILL_WHISPERER,
             memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
@@ -241,7 +267,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     if (config.keepEmbeddingModelWarm !== undefined &&
@@ -301,5 +327,6 @@ export function resolveConfig(value) {
         throw new Error('unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"');
     }
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer,
+        qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
         memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora), typesafe: resolveTypeSafe(config.typesafe) };
 }

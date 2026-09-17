@@ -370,6 +370,60 @@ dates and maintenance proposals live separately in `curation.sqlite`, so a QMD
 index rebuild does not discard them. The first lookup builds the index;
 Markdown filesystem changes queue a debounced, serialized background refresh.
 
+## Memory quality audit
+
+`memory_audit_quality` is an on-demand, source-read-only audit. TypeSafe flags likely
+ingestion noise for agent investigation; it never deletes, rewrites, or suppresses
+memory. Enable it with explicit approval for the corpora sent to TypeSafe:
+
+```json5
+qualityAudit: {
+  enabled: true,
+  corpora: ["memory", "knowledge"], // Must be configured non-skill corpora.
+  minNoise: 0.8,
+},
+```
+
+Off by default. Uses the shared TypeSafe credentials and request timeout. Missing
+credentials or disabled TypeSafe produces no audit. Approval includes transmission
+of full eligible chunks and visibility of findings to all audiences using the agent.
+Unlike Memory Whisperer, approving `sessions` includes **all indexed sessions** in
+that corpus, including configured direct conversations. Only approve that when intended.
+
+Call with `{ "limit": 10 }` (maximum 20 indexed chunk occurrences per page), then
+pass the returned `next` as `after` until `done` is true. A `partial` result preserves
+the completed cursor; retry there, or from the beginning if no cursor exists. This
+is not a full-document audit: unindexed content is not scanned. Chunks over 6,000
+characters are counted as skipped, not silently truncated. No clustering is required.
+
+Two independent Noul questions distinguish ingestion noise from identifiable useful
+evidence. High values for both can indicate valuable content trapped in a wrapper.
+Low evidence alone does not create a junk finding. JSON, logs, code, terse facts,
+historical records, and missing context are not automatically defects. Empty chunks
+are detected locally. A JSON string that decodes to a message envelope is also
+flagged as a possible double-encoding defect, even when its content is useful.
+An ordinary JSON message object is not flagged from its shape alone. These are
+review clues, never verdicts about whether the information should be kept.
+
+At most four unique chunks (24,000 characters) and their source kinds are sent in
+one request, without conversation context or source paths. Requests do not retry
+automatically and stop starting new work after a 30-second audit deadline; existing
+manager initialization/indexing may finish later. Judgments are cached in the
+curation database by content, source kind, model and question version. A rescan from
+the beginning reuses cached results, including after corpus/index changes. Changes
+behind a page cursor are picked up on the next rescan.
+
+Suspect chunks become `quality_review` tasks in `memory_list_maintenance_tasks`.
+The audit returns page-local groups by configured source and suspected issue,
+with up to three examples each, not a claim that a whole cluster is defective.
+Findings include source references, bounded previews, probabilities and content
+fingerprints. Reviewed tasks are not reopened for unchanged content. The curator
+inspects the original source and ingestion path, proposes or performs authorized
+repairs, and verifies the resulting source/index before resolving with a required
+note. Prefer repairing a common extractor or inclusion rule over many symptoms;
+never manually edit generated session projections. Thresholds need evaluation on
+your data; model probability is not proof of a defect.
+
 ## Memory analysis
 
 Analysis is opt-in. Core indexing, `memory_search`, and `memory_get` need only

@@ -1,6 +1,6 @@
 ---
 name: memory-curator
-description: Investigate Unblock Memory clusters and maintain supported, agent-specific knowledge that would otherwise be difficult to reconstruct.
+description: Investigate Unblock Memory clusters, audit ingestion quality, and maintain supported, agent-specific knowledge that would otherwise be difficult to reconstruct.
 ---
 
 # Memory Curator
@@ -81,6 +81,31 @@ human-readable update time and useful evidence citations, but do not force a
 rigid document template.
 
 ## Finish the cycle
+
+### When auditing ingestion quality
+
+Use `memory_audit_quality` for a bounded page of explicitly approved indexed
+chunks. Continue with its `next` cursor until `done`, within the requested work
+budget. On `partial`, retry from the returned cursor; stop and report repeated
+provider failures. Restart without a cursor for a cached rescan after changes.
+It does not inspect unindexed content; oversized chunks are reported as skipped.
+
+Treat findings as indicators, not deletion decisions. High noise and high evidence
+can mean useful content trapped in a wrapper. JSON, code, logs, terse facts and
+historical records are not inherently junk. Grouped examples suggest a possible
+shared ingestion cause, not proof that every file has the same defect.
+
+Inspect the source via `memory_get` and the ingestion path. Prefer correcting an
+extractor or corpus inclusion rule over individually cleaning many symptoms.
+Moving or editing source files still requires the applicable authorization;
+never manually repair generated session projections. Preserve original evidence.
+Use the existing maintenance tools to dismiss legitimate content as `irrelevant`
+or defer uncertain cases. A dismissal sticks to that chunk's content version.
+Only resolve after verifying the resulting source and indexed content, recording
+what was checked in the required resolution note. Neither the audit nor marking
+a task resolved modifies or suppresses source data.
+
+### General maintenance
 
 - Do not rewrite raw memory or session projections.
 - Review a small page from `memory_list_maintenance_tasks`. For ambiguous dates,

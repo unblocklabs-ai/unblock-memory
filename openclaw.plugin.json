@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -15,6 +15,7 @@
       "memory_recluster",
       "memory_list_clusters",
       "memory_fetch_cluster",
+      "memory_audit_quality",
       "memory_list_maintenance_tasks",
       "memory_update_maintenance_task",
       "memory_people_inspect",
@@ -28,6 +29,7 @@
     "memory_recluster": { "sideEffecting": true },
     "memory_list_clusters": { "replaySafe": true },
     "memory_fetch_cluster": { "replaySafe": true },
+    "memory_audit_quality": { "sideEffecting": true },
     "memory_list_maintenance_tasks": { "replaySafe": true },
     "memory_update_maintenance_task": { "sideEffecting": true },
     "memory_people_inspect": { "replaySafe": true },
@@ -35,6 +37,14 @@
     "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
+    "qualityAudit.enabled": {
+      "label": "Memory Quality Audit",
+      "help": "Enable an on-demand TypeSafe audit. Records review indicators only; never edits or suppresses data."
+    },
+    "qualityAudit.corpora": {
+      "label": "Approved Audit Corpora",
+      "help": "Explicit non-skill corpora approved for external TypeSafe processing and maintenance results visible to every audience using this agent. Sessions means ALL indexed sessions, not only the current conversation."
+    },
     "typesafe.enabled": {
       "label": "TypeSafe Ranking",
       "help": "Enabled by default when credentials exist. Sends bounded conversation context and skill descriptions or approved memory excerpts to TypeSafe for enabled whisperers."
@@ -81,6 +91,16 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "qualityAudit": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
+          "minNoise": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 }
+        },
+        "default": { "enabled": false, "corpora": [], "minNoise": 0.8 }
+      },
       "keepEmbeddingModelWarm": {
         "type": "boolean",
         "default": true

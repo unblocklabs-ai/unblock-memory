@@ -1,6 +1,7 @@
+import type { QualityJudgment } from "./typesafe.js";
 declare const TEMPORAL_BASES: readonly ["path", "frontmatter", "session", "agent_verified"];
 export type TemporalBasis = typeof TEMPORAL_BASES[number];
-declare const MAINTENANCE_TASK_TYPES: readonly ["ambiguous_event_time", "exact_duplicate"];
+declare const MAINTENANCE_TASK_TYPES: readonly ["ambiguous_event_time", "exact_duplicate", "quality_review"];
 export type MaintenanceTaskType = typeof MAINTENANCE_TASK_TYPES[number];
 declare const MAINTENANCE_STATUSES: readonly ["pending", "resolved", "deferred", "irrelevant"];
 export type MaintenanceStatus = typeof MAINTENANCE_STATUSES[number];
@@ -36,6 +37,8 @@ export declare class CurationStore {
     #private;
     constructor(path: string);
     close(): void;
+    qualityJudgment(key: string): QualityJudgment | undefined;
+    cacheQualityJudgment(key: string, judgment: QualityJudgment): void;
     annotations(): TemporalAnnotation[];
     addTask(candidate: {
         type: MaintenanceTaskType;
@@ -45,7 +48,7 @@ export declare class CurationStore {
         reason: string;
         contentFingerprint?: string;
         detail?: string;
-    }): void;
+    }): MaintenanceTask;
     listTasks(params?: {
         status?: MaintenanceStatus;
         limit?: number;

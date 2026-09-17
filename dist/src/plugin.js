@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveConfig } from "./config.js";
+import { resolveTypeSafeApiKey } from "./typesafe.js";
 import { registerPeopleHooks } from "./people-hooks.js";
 import { PeopleStores } from "./people-store.js";
 import { registerPeopleTools } from "./people-tools.js";
@@ -243,6 +244,46 @@ const maintenanceStatus = Type.Union([
     Type.Literal("deferred"),
     Type.Literal("irrelevant"),
 ]);
+const auditQualityParameters = Type.Object({
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    after: Type.Optional(Type.Object({
+        documentId: Type.Integer({ minimum: 1 }), seq: Type.Integer({ minimum: 0 }),
+    }, { additionalProperties: false })),
+}, { additionalProperties: false });
+function createAuditQualityTool(runtime, ctx, config) {
+    const active = getContext(ctx);
+    if (!active)
+        return null;
+    return {
+        name: "memory_audit_quality", label: "Audit Memory Quality",
+        description: "Audit a bounded page of approved indexed chunks using TypeSafe. Records review indicators in the maintenance inbox; never edits, deletes or suppresses source data. Continue with the returned next cursor; restart without after for a cached rescan.",
+        parameters: auditQualityParameters,
+        async execute(_toolCallId, params, signal) {
+            const options = Value.Parse(auditQualityParameters, params);
+            if (!config.qualityAudit.enabled || !config.typesafe.enabled)
+                return jsonResult({ status: "disabled" });
+            const deadline = AbortSignal.timeout(30_000);
+            const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+            try {
+                combined.throwIfAborted();
+                const apiKey = await resolveTypeSafeApiKey(config.typesafe);
+                if (!apiKey)
+                    return jsonResult({ status: "unavailable", reason: "TypeSafe API key not configured" });
+                combined.throwIfAborted();
+                const { manager } = await runtime.getMemorySearchManager(active);
+                if (!manager)
+                    return jsonResult({ status: "unavailable", reason: "Memory manager unavailable" });
+                return jsonResult(await manager.auditQuality({
+                    ...options, corpora: config.qualityAudit.corpora, minNoise: config.qualityAudit.minNoise,
+                    apiKey, timeoutMs: config.typesafe.timeoutMs, signal: combined,
+                }));
+            }
+            catch {
+                return jsonResult({ status: "unavailable", reason: "Quality audit failed or was cancelled; retry the same page" });
+            }
+        },
+    };
+}
 const listMaintenanceParameters = Type.Object({
     status: Type.Optional(maintenanceStatus),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
@@ -254,7 +295,7 @@ function createListMaintenanceTool(runtime, ctx) {
     return {
         name: "memory_list_maintenance_tasks",
         label: "List Memory Maintenance Tasks",
-        description: "List a bounded curation inbox of memory chronology and duplicate-review proposals.",
+        description: "List a bounded curation inbox of chronology, duplicate and quality-review indicators.",
         parameters: listMaintenanceParameters,
         async execute(_toolCallId, params) {
             const options = Value.Parse(listMaintenanceParameters, params);
@@ -434,6 +475,7 @@ export function registerUnblockMemory(api) {
     api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), {
         names: ["memory_fetch_cluster"],
     });
+    api.registerTool((ctx) => createAuditQualityTool(runtime, ctx, config), { names: ["memory_audit_quality"] });
     api.registerTool((ctx) => createListMaintenanceTool(runtime, ctx), {
         names: ["memory_list_maintenance_tasks"],
     });

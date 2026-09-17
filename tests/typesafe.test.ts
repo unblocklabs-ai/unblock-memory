@@ -3,9 +3,29 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { judgeTypeSafeMemories, resolveTypeSafeApiKey, selectTypeSafeSkill } from "../src/typesafe.js";
+import { judgeTypeSafeMemories, judgeTypeSafeQuality, resolveTypeSafeApiKey, selectTypeSafeSkill } from "../src/typesafe.js";
 
 const config = { enabled: true, timeoutMs: 100 };
+
+test("quality judgments keep evidence and noise independent and validate exact answers", async t => {
+  const params = { apiKey: "fake", timeoutMs: 100, signal: new AbortController().signal,
+    chunks: [{ text: "serialized content", sourceKind: "files" as const }] };
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    assert.equal(init?.redirect, "error");
+    assert.match(request.questions.noise_0.instructions, /chunks\[0\]/);
+    assert.match(request.questions.evidence_0.instructions, /chunks\[0\]/);
+    assert.deepEqual(Object.keys(request.state), ["chunks"]);
+    return Response.json({ answers: { noise_0: { type: "noul", noul: 0.96 }, evidence_0: { type: "noul", noul: 0.97 } } });
+  });
+  assert.deepEqual(await judgeTypeSafeQuality(params), [{ noise: 0.96, evidence: 0.97 }]);
+  for (const answers of [{}, { noise_0: { type: "noul", noul: 0.95 } },
+    { noise_0: { type: "noul", noul: 2 }, evidence_0: { type: "noul", noul: 0.97 } },
+    { noise_0: { type: "noul", noul: 0.95 }, evidence_0: { type: "score", noul: 0.97 } }]) {
+    fetch.mock.mockImplementation(async () => Response.json({ answers }));
+    await assert.rejects(judgeTypeSafeQuality(params), /invalid quality/);
+  }
+});
 const selection = {
   apiKey: "test-secret", timeoutMs: 100,
   currentRequest: "Deploy this project", history: [],

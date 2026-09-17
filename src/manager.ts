@@ -47,6 +47,7 @@ import {
 } from "./session-sync.js";
 import { sessionContextSpans, type SessionMetadata } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
+import { auditQualityPage, type QualityCursor } from "./quality-audit.js";
 
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
@@ -393,6 +394,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   #sessionMetadata = new Map<string, SessionMetadata>();
   #sessionManifestMtimeNs?: bigint;
   #skillIndex?: Promise<SkillIndexEntry[]>;
+  #qualityAuditRunning = false;
 
   constructor(params: {
     dbPath: string;
@@ -744,6 +746,29 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
 
   listMaintenanceTasks(params: { status?: MaintenanceStatus; limit?: number } = {}) {
     return this.#getCuration().listTasks(params);
+  }
+
+  async auditQuality(params: {
+    corpora: readonly string[]; apiKey: string; timeoutMs: number; minNoise: number;
+    limit?: number; after?: QualityCursor; signal: AbortSignal;
+  }) {
+    if (this.#qualityAuditRunning) return { status: "busy" as const };
+    this.#qualityAuditRunning = true;
+    try {
+      await this.#operationChain;
+      params.signal.throwIfAborted();
+      const store = await this.#getAnalysisStore();
+      params.signal.throwIfAborted();
+      if (this.#closed) return { status: "unavailable" as const };
+      return await auditQualityPage({
+        ...params, db: store.internal.db, curation: this.#getCuration(),
+        sources: [...this.#sources.values()].filter(source =>
+          source.kind !== "skills" && params.corpora.includes(source.corpus)),
+        isActive: () => !this.#closed,
+      });
+    } finally {
+      this.#qualityAuditRunning = false;
+    }
   }
 
   updateMaintenanceTask(params: {

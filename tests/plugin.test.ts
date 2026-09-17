@@ -22,6 +22,33 @@ function parseJsonResult(result: unknown): Record<string, unknown> {
   return JSON.parse(content?.[0]?.text ?? "") as Record<string, unknown>;
 }
 
+test("quality audit is inert when disabled or an explicit key file is absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "quality-key-gate-"));
+  for (const enabled of [false, true]) {
+    let auditFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
+    const api = {
+      pluginConfig: {
+        qualityAudit: { enabled, corpora: ["memory"] },
+        typesafe: { apiKeyFile: join(root, "missing.env") },
+      },
+      registerCli() {},
+      registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
+        Object.defineProperty(capability.runtime, "getMemorySearchManager", {
+          value: () => { assert.fail("credential gate must precede manager access"); },
+        });
+      },
+      registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+        if (options.names.includes("memory_audit_quality")) auditFactory = factory;
+      },
+    } as unknown as OpenClawPluginApi;
+    registerUnblockMemory(api);
+    const tool = auditFactory!({ agentId: "bill", config: {} } as OpenClawPluginToolContext)!;
+    const result = parseJsonResult(await tool.execute("gate", {}));
+    assert.equal(result.status, enabled ? "unavailable" : "disabled");
+    if (enabled) assert.equal(result.reason, "TypeSafe API key not configured");
+  }
+});
+
 test("flush plan honors disable, thresholds, model, and agent timezone", () => {
   const disabled = {
     agents: { defaults: { compaction: { memoryFlush: { enabled: false } } } },
@@ -80,6 +107,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
       "memory_recluster",
       "memory_list_clusters",
       "memory_fetch_cluster",
+      "memory_audit_quality",
       "memory_list_maintenance_tasks",
       "memory_update_maintenance_task",
     ],
@@ -106,6 +134,9 @@ test("registers exactly the clean memory tool contract and validates every tool 
   assert.ok(tool("memory_update_maintenance_task").parameters.properties?.action);
 
   const invalidCalls: Array<[name: string, params: unknown]> = [
+    ["memory_audit_quality", { limit: 21 }],
+    ["memory_audit_quality", { corpora: ["private"] }],
+    ["memory_audit_quality", { after: { documentId: -1, seq: 0 } }],
     ["memory_search", { query: "memory", maxResults: 21 }],
     ["memory_search", { query: "   " }],
     ["memory_search", { query: "memory", corpora: [] }],
