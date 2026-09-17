@@ -485,11 +485,13 @@ test("keeps skills out of QMD while direct skill search watches frontmatter", as
     assert.deepEqual(await manager.searchSkills("deploy", 0.6, 10), [
       {
         name: "deploy-helper",
+        description: "Deploy releases safely.",
         path: join(workspace, "skills", "deploy", "SKILL.md"),
         score: 1,
       },
       {
         name: "global-inspector",
+        description: "Inspect global releases.",
         path: join(workspace, "global-skills", "bundle", "inspect", "SKILL.md"),
         score: 1,
       },
@@ -776,7 +778,7 @@ test("skill-only indexing changes do not invalidate memory analysis", async () =
   }
 });
 
-test("adds manifest metadata to session search results", async () => {
+test("session search retains matched evidence within hint budgets without changing ordinary search", async t => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-search-sessions-"));
   const sessionsDir = join(root, "sessions");
   const documentPath = "slack/channel/workspace/C123/2026-08-25T14-00-00Z--session-1.md";
@@ -805,19 +807,29 @@ test("adds manifest metadata to session search results", async () => {
       },
     },
   }));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  assert.ok(backing.internal.llm);
+  t.mock.method(backing.internal.llm, "countTokens", async (text: string) => text.split(/\s+/u).length);
+  const fact = "Deployment requires approval from the project owner.";
+  let bestChunk = fact;
+  const body = "# Transcript\n\n## User — User — 2026-09-17 10:00:00 UTC\n\n" +
+    "Background discussion. ".repeat(80) +
+    "\n\n## Assistant — Agent — 2026-09-17 10:01:00 UTC\n\n" + fact;
   const store = createManagerStore({
+    internal: backing.internal,
+    async close() { await backing.close(); },
     async vsearch() {
       return [{
         file: `qmd://${source.collection}/${documentPath}`,
         displayPath: `${source.collection}/${documentPath}`,
         title: "Session",
-        body: "session body",
+        body,
         score: 0.8,
         context: null,
         docid: "hash",
-        bestChunk: "session body",
-        chunkPos: 0,
-        chunkLen: 12,
+        bestChunk,
+        chunkPos: body.indexOf(bestChunk),
+        chunkLen: bestChunk.length,
       }];
     },
   });
@@ -849,6 +861,23 @@ test("adds manifest metadata to session search results", async () => {
       conversationId: "C123",
       startedAt: 1,
     });
+    assert.ok(hit.snippet.length > 1200);
+    assert.ok(hit.snippet.includes(fact));
+    const [bounded] = await manager.search("approval", { corpora: ["sessions"], maxSnippetChars: 1200 });
+    assert.ok(bounded.snippet.startsWith("## Assistant"));
+    assert.ok(bounded.snippet.includes(fact));
+    assert.ok(bounded.snippet.length <= 1200);
+    assert.equal(bounded.startLine, 7);
+    assert.equal(bounded.endLine, 9);
+    assert.ok(bounded.citation?.endsWith("#L7-L9"));
+    const [leaf] = await manager.search("approval", { maxSnippetChars: fact.length });
+    assert.equal(leaf.snippet, fact);
+    assert.equal(leaf.startLine, 9);
+    assert.equal(leaf.endLine, 9);
+    assert.ok(leaf.citation?.endsWith("#L9-L9"));
+    bestChunk = body;
+    assert.deepEqual(await manager.search("approval", { maxSnippetChars: 1200 }), []);
+    assert.equal((await manager.search("approval"))[0].snippet, body);
     assert.deepEqual(manager.status().custom?.corpora, [{
       name: "sessions",
       kind: "sessions",
@@ -968,6 +997,14 @@ test("filters session paths without restricting file corpora", async () => {
       sessionFilter: { provider: "teams" },
     });
     assert.deepEqual(receivedFilters[2], { [sessions.collection]: [firstPath] });
+
+    const scoped = await manager.search("decision", { sessionFilter: { sessionId: "second" } });
+    assert.deepEqual(receivedFilters[3], { [sessions.collection]: [secondPath] });
+    assert.deepEqual(scoped.map(result => result.snippet), ["file memory", "second session"]);
+    assert.deepEqual(await manager.search("decision", {
+      corpora: ["sessions"], sessionFilter: { sessionId: "missing" },
+    }), []);
+    assert.deepEqual(receivedFilters[4], { [sessions.collection]: [] });
 
     await assert.rejects(manager.search("decision", {
       sessionFilter: {

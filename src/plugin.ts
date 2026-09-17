@@ -12,6 +12,7 @@ import { PeopleStores } from "./people-store.js";
 import { registerPeopleTools } from "./people-tools.js";
 import { QmdMemoryRuntime } from "./runtime.js";
 import { registerSkillWhisperer } from "./skill-whisperer.js";
+import { registerMemoryWhisperer } from "./memory-whisperer.js";
 
 function getContext(ctx: OpenClawPluginToolContext) {
   const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
@@ -510,7 +511,8 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     registerPeopleTools(api, peopleStores, config.people);
     api.on("gateway_stop", () => peopleStores.closeAll());
   }
-  registerSkillWhisperer(api, runtime, config.skillWhisperer);
+  registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe);
+  registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe);
   api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
   api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
   api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {

@@ -25,6 +25,12 @@ export type UnblockMemoryConfig = {
     analysis: {
         executable?: string;
     };
+    typesafe: {
+        enabled: boolean;
+        apiKey?: string;
+        apiKeyFile?: string;
+        timeoutMs: number;
+    };
     people: {
         enabled: boolean;
         whisperer: {
@@ -40,6 +46,15 @@ export type UnblockMemoryConfig = {
         historyMessages: number;
         minScore: number;
         cooldownTurns: number;
+    };
+    memoryWhisperer: {
+        enabled: boolean;
+        corpora: readonly string[];
+        historyMessages: number;
+        minUsefulness: number;
+        maxHints: number;
+        cooldownTurns: number;
+        timeoutMs: number;
     };
 };
 export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];

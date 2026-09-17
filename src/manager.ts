@@ -80,6 +80,7 @@ export type ManagerSessionConfig = {
 
 export type SkillSearchCandidate = {
   name: string;
+  description: string;
   path: string;
   score: number;
 };
@@ -299,6 +300,7 @@ export async function expandSessionSearchHit(
   result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">,
   maxTokens: number,
   countTokens: (text: string) => Promise<number>,
+  maxChars = Infinity,
 ): Promise<{ text: string; position: number }> {
   const leaf = { text: result.bestChunk, position: result.chunkPos };
   const spans = sessionContextSpans(result.body, result.chunkPos);
@@ -307,6 +309,7 @@ export async function expandSessionSearchHit(
   for (const span of [spans.turn, spans.message]) {
     if (span.start > result.chunkPos || span.end < leafEnd) continue;
     const text = result.body.slice(span.start, span.end).trimEnd();
+    if (text.length > maxChars) continue;
     if (await countTokens(text) <= maxTokens) return { text, position: span.start };
   }
   return leaf;
@@ -353,6 +356,7 @@ function sessionAllowedPaths(
   const accountId = filter.accountId?.trim();
   const conversationId = filter.conversationId?.trim();
   const paths = [...metadataByPath].flatMap(([path, metadata]) =>
+    (filter.sessionId === undefined || metadata.sessionId === filter.sessionId) &&
     (startedFrom === undefined || metadata.startedAt >= startedFrom) &&
     (startedTo === undefined || metadata.startedAt <= startedTo) &&
     (provider === undefined || metadata.provider?.trim().toLowerCase() === provider) &&
@@ -899,6 +903,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     opts?.signal?.throwIfAborted();
     await this.#operationChain;
     const sessions = this.#sessions;
+    opts?.signal?.throwIfAborted();
     if (opts?.sessionFilter && sessions && collections.includes(sessions.collection)) {
       await this.#refreshSessionMetadata();
     }
@@ -906,6 +911,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter)
       : undefined;
     const store = await this.#getStore();
+    opts?.signal?.throwIfAborted();
     if (opts?.lexicalOnly) {
       const hits = await store.searchLex(query, {
         limit: opts.maxResults ?? 5,
@@ -927,9 +933,13 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       allowedPaths,
       expand: false,
     });
+    opts?.signal?.throwIfAborted();
     const tokenizer = (store as Partial<AnalysisStore>).internal?.llm;
     const results: CorpusMemorySearchResult[] = [];
     for (const hit of hits) {
+      // Proactive hints must retain the entire matched chunk, even when expanded
+      // turn/message context exceeds their budget. Ordinary search is unchanged.
+      if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity)) continue;
       const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
       const corpus = collection ? this.#sources.get(collection)?.corpus : undefined;
       if (!corpus) continue;
@@ -944,6 +954,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             hit,
             this.#sessions.maxExpandedTokens,
             (text) => tokenizer.countTokens(text),
+            opts?.maxSnippetChars,
           )
         : { text: hit.bestChunk, position: hit.chunkPos };
       const span = lineSpan(hit.body, selected.position, selected.text);
@@ -988,7 +999,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             const current = metadata.get(key);
             if (!current || order < current.sourceOrder) {
               metadata.set(key, {
-                candidate: { name, path: document.path },
+                candidate: { name, description, path: document.path },
                 description,
                 sourceOrder: order,
               });

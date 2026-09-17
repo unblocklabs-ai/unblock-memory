@@ -35,6 +35,15 @@
     "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
+    "typesafe.enabled": {
+      "label": "TypeSafe Ranking",
+      "help": "Enabled by default when credentials exist. Sends bounded conversation context and skill descriptions or approved memory excerpts to TypeSafe for enabled whisperers."
+    },
+    "typesafe.apiKey": { "label": "TypeSafe API Key", "sensitive": true },
+    "typesafe.apiKeyFile": {
+      "label": "TypeSafe Key File",
+      "help": "Absolute path to a plaintext API key or a dotenv file containing TYPESAFE_API_KEY. Prefer this over storing a key in config."
+    },
     "keepEmbeddingModelWarm": {
       "label": "Keep Embedding Model Warm",
       "help": "Keep the QMD embedding model resident after first use. Disable to unload it after five minutes without model activity."
@@ -46,6 +55,14 @@
     "skillWhisperer.enabled": {
       "label": "Skill Whisperer",
       "help": "Suggest at most one semantically relevant configured skill before a user turn. Requires hook conversation access."
+    },
+    "memoryWhisperer.enabled": {
+      "label": "Memory Whisperer",
+      "help": "Inject up to two TypeSafe-approved historical excerpts before user turns. Requires explicit corpora, a TypeSafe key, and hook conversation access. Disabled by default."
+    },
+    "memoryWhisperer.corpora": {
+      "label": "Approved Hint Corpora",
+      "help": "Explicit non-skill corpus allowlist. Approve file corpora for all audiences using this agent and for transmission to TypeSafe. Session hits are restricted to the exact current session."
     },
     "people.enabled": {
       "label": "PeopleSQL",
@@ -173,6 +190,35 @@
           "enabled": false,
           "whisperer": { "enabled": false, "maxChars": 1200 },
           "todos": { "maxOpen": 1000 }
+        }
+      },
+      "typesafe": {
+        "type": "object",
+        "additionalProperties": false,
+        "not": { "required": ["apiKey", "apiKeyFile"] },
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "apiKey": { "type": "string", "pattern": "\\S" },
+          "apiKeyFile": { "type": "string", "pattern": "\\S" },
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1500 }
+        },
+        "default": { "enabled": true, "timeoutMs": 1500 }
+      },
+      "memoryWhisperer": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
+          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 50, "default": 5 },
+          "minUsefulness": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 },
+          "maxHints": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2 },
+          "cooldownTurns": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 10 },
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 3000 }
+        },
+        "default": {
+          "enabled": false, "corpora": [], "historyMessages": 5, "minUsefulness": 0.9,
+          "maxHints": 2, "cooldownTurns": 10, "timeoutMs": 3000
         }
       },
       "skillWhisperer": {

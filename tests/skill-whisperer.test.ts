@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { buildSkillWhispererQuery, registerSkillWhisperer } from "../src/skill-whisperer.js";
+import type { UnblockMemoryConfig } from "../src/config.js";
+
+const disabledTypeSafe = { enabled: false, timeoutMs: 1500 };
+const activeTypeSafe = { enabled: true, apiKey: "fake-secret", timeoutMs: 100 };
+
+function typeSafeResponse(choice: string) {
+  return Response.json({ answers: { selected: { type: "choice", choice, confidence: 0.9,
+    probabilities: { skill_0: 0.1, skill_1: 0.8, skill_2: 0.05, none: 0.05 } } } });
+}
 
 type HookContext = {
   trigger?: string;
@@ -33,12 +42,17 @@ const enabled = {
   cooldownTurns: 2,
 };
 
-function harness(candidates: Array<{ name: string; path: string; score: number }>) {
+function harness(
+  candidates: Array<{ name: string; path: string; score: number }>,
+  typesafe: UnblockMemoryConfig["typesafe"] = disabledTypeSafe,
+) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
   const queries: string[] = [];
+  const minimumScores: number[] = [];
+  const warnings: string[] = [];
   const api = {
     config: {},
-    logger: { warn() {} },
+    logger: { warn(message: string) { warnings.push(message); } },
     on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, handler); },
   } as unknown as OpenClawPluginApi;
   const runtime = {
@@ -49,13 +63,16 @@ function harness(candidates: Array<{ name: string; path: string; score: number }
       _limit: number,
     ) {
       queries.push(query);
-      return candidates;
+      minimumScores.push(_minScore);
+      return candidates.map(candidate => ({ ...candidate, description: `Use ${candidate.name} for its task.` }));
     },
     resolveSkillPath(_params: unknown, path: string) { return path.startsWith("/skills/") ? path : undefined; },
   };
-  registerSkillWhisperer(api, runtime, enabled);
+  registerSkillWhisperer(api, runtime, enabled, typesafe);
   return {
     queries,
+    minimumScores,
+    warnings,
     before: hooks.get("before_prompt_build") as unknown as BeforePromptBuild,
     after: hooks.get("after_tool_call") as unknown as AfterToolCall,
     end: hooks.get("session_end") as unknown as SessionEnd,
@@ -141,11 +158,11 @@ test("symlinked suggestions and canonical reads share cooldown state", async () 
   const lexicalPath = "/skills-linked/deploy/SKILL.md";
   const canonicalPath = "/skills/deploy/SKILL.md";
   registerSkillWhisperer(api, {
-    async searchSkills() { return [{ name: "deploy", path: lexicalPath, score: 0.9 }]; },
+    async searchSkills() { return [{ name: "deploy", description: "Deploy releases.", path: lexicalPath, score: 0.9 }]; },
     resolveSkillPath(_params, path) {
       return path === lexicalPath || path === canonicalPath ? canonicalPath : undefined;
     },
-  }, enabled);
+  }, enabled, disabledTypeSafe);
   const before = hooks.get("before_prompt_build") as unknown as BeforePromptBuild;
   const after = hooks.get("after_tool_call") as unknown as AfterToolCall;
   const context: HookContext = { trigger: "user", runId: "run-1", agentId: "bill", sessionId: "session" };
@@ -164,7 +181,7 @@ test("disabled whispering registers no hooks", () => {
   registerSkillWhisperer(api, {
     async searchSkills() { return []; },
     resolveSkillPath() { return undefined; },
-  }, { ...enabled, enabled: false });
+  }, { ...enabled, enabled: false }, disabledTypeSafe);
   assert.equal(registrations, 0);
 });
 
@@ -180,9 +197,82 @@ test("retrieval failures do not block the agent turn", async () => {
   registerSkillWhisperer(api, {
     async searchSkills() { throw new Error("index unavailable"); },
     resolveSkillPath() { return undefined; },
-  }, enabled);
+  }, enabled, disabledTypeSafe);
   assert.equal(await before?.(
     { prompt: "task", messages: [] },
     { trigger: "user", runId: "run", agentId: "bill", sessionId: "session" },
   ), undefined);
+});
+
+test("TypeSafe reranks below-threshold candidates and preserves selected-skill cooldown", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    assert.deepEqual(Object.keys(request.questions.selected.criteria), ["skill_0", "skill_1", "skill_2", "none"]);
+    assert.equal(JSON.stringify(request).includes("/skills/"), false);
+    assert.equal(request.state.currentRequest, "new task");
+    assert.deepEqual(request.state.history, [{ role: "user", content: "previous task" }]);
+    return typeSafeResponse("skill_1");
+  });
+  const h = harness([
+    { name: "invalid", path: "/not-allowed/SKILL.md", score: 0.95 },
+    { name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.4 },
+    { name: "beta", path: "/skills/beta/SKILL.md", score: 0.3 },
+    { name: "gamma", path: "/skills/gamma/SKILL.md", score: 0.2 },
+    { name: "delta", path: "/skills/delta/SKILL.md", score: 0.1 },
+  ], activeTypeSafe);
+  const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "run-1" };
+  const event = { prompt: "new task", messages: [{ role: "system", content: "do not send" },
+    { role: "toolResult", content: "do not send" }, { role: "user", content: "previous task" }] };
+  assert.match((await h.before(event, context))?.prependContext ?? "", /beta/);
+  assert.deepEqual(h.minimumScores, [-1]);
+  assert.equal(await h.before(event, context), undefined);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(await h.before(event, { ...context, runId: "run-2" }), undefined);
+  assert.equal(h.warnings.length, 0);
+});
+
+test("missing key keeps original selection and does not call TypeSafe", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected API call"); });
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], {
+    enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-unblock-typesafe-fixture/key",
+  });
+  assert.match((await h.before({ prompt: "task", messages: [] }, {
+    trigger: "user", agentId: "main", sessionId: "session", runId: "run",
+  }))?.prependContext ?? "", /alpha/);
+  assert.deepEqual(h.minimumScores, [enabled.minScore]);
+  assert.equal(h.warnings.length, 0);
+});
+
+test("none and provider failures do not fall back to a strong vector match or consume cooldown", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("none"));
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.99 }], activeTypeSafe);
+  const event = { prompt: "task", messages: [] };
+  const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "none" };
+  assert.equal(await h.before(event, context), undefined);
+  fetch.mock.mockImplementation(async () => new Response("fake-secret", { status: 401 }));
+  assert.equal(await h.before(event, { ...context, runId: "failed" }), undefined);
+  assert.equal(h.warnings.length, 1);
+  assert.equal(h.warnings[0].includes("fake-secret"), false);
+  fetch.mock.mockImplementation(async () => typeSafeResponse("skill_0"));
+  assert.match((await h.before(event, { ...context, runId: "succeeded" }))?.prependContext ?? "", /alpha/);
+});
+
+test("TypeSafe conversation is bounded and pending selections do not survive session end", async (t) => {
+  let resolveRequest!: (value: Response) => void;
+  let requestStarted!: () => void;
+  const started = new Promise<void>(resolve => { requestStarted = resolve; });
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    assert.equal(request.state.currentRequest.length, 12_000);
+    assert.deepEqual(request.state.history, []);
+    requestStarted();
+    return new Promise<Response>(resolve => { resolveRequest = resolve; });
+  });
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], activeTypeSafe);
+  const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "pending" };
+  const pending = h.before({ prompt: "x".repeat(13_000), messages: [{ role: "user", content: "older" }] }, context);
+  await started;
+  await h.end({ sessionId: "session" }, context);
+  resolveRequest(typeSafeResponse("skill_0"));
+  assert.equal(await pending, undefined);
 });

@@ -2,6 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_CORPORA, DEFAULT_PEOPLE_CONFIG, resolveConfig } from "../src/config.js";
 
+test("TypeSafe is enabled by default with optional explicit credentials", () => {
+  assert.deepEqual(resolveConfig(undefined).typesafe, { enabled: true, timeoutMs: 1500 });
+  assert.deepEqual(resolveConfig({}).typesafe, { enabled: true, timeoutMs: 1500 });
+  assert.deepEqual(resolveConfig({ typesafe: { apiKey: " fake-key " } }).typesafe,
+    { enabled: true, timeoutMs: 1500, apiKey: "fake-key" });
+  assert.deepEqual(resolveConfig({ typesafe: { enabled: false, apiKeyFile: " /tmp/typesafe.env ", timeoutMs: 500 } }).typesafe,
+    { enabled: false, timeoutMs: 500, apiKeyFile: "/tmp/typesafe.env" });
+  for (const typesafe of [false, [], { enabled: "yes" }, { apiKey: " " }, { apiKeyFile: "relative" },
+    { apiKey: "fake", apiKeyFile: "/tmp/key" }, { endpoint: "https://other.example" },
+    { timeoutMs: 0 }, { timeoutMs: 10001 }, { timeoutMs: 1.2 }]) {
+    assert.throws(() => resolveConfig({ typesafe }), /typesafe/);
+  }
+});
+
 test("uses the canonical memory corpus when corpora are absent", () => {
   assert.deepEqual(resolveConfig(undefined).corpora, DEFAULT_CORPORA);
   assert.deepEqual(resolveConfig({}).corpora, DEFAULT_CORPORA);

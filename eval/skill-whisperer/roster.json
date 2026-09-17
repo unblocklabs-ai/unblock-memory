@@ -1,0 +1,82 @@
+[
+  {
+    "name": "frontend-design",
+    "description": "Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when the user asks to build web components, pages, or applications. Generates creative, polished code that avoids generic AI aesthetics.",
+    "source": "/Users/bek/.codex/skills/frontend-design/SKILL.md"
+  },
+  {
+    "name": "make-interfaces-feel-better",
+    "description": "Design engineering principles for making interfaces feel polished. Use when building UI components, reviewing frontend code, implementing animations, hover states, shadows, borders, typography, micro-interactions, enter/exit animations, or any visual detail work. Triggers on UI polish, design details, \"make it feel better\", \"feels off\", stagger animations, border radius, optical alignment, font smoothing, tabular numbers, image outlines, box shadows.",
+    "source": "/Users/bek/.codex/skills/make-interfaces-feel-better/SKILL.md"
+  },
+  {
+    "name": "web-perf",
+    "description": "Analyzes web performance using Chrome DevTools MCP. Measures Core Web Vitals (LCP, INP, CLS) and supplementary metrics (FCP, TBT, Speed Index), identifies render-blocking resources, network dependency chains, layout shifts, caching issues, and accessibility gaps. Use when asked to audit, profile, debug, or optimize page load performance, Lighthouse scores, or site speed. Biases towards retrieval from current documentation over pre-trained knowledge.",
+    "source": "/Users/bek/.codex/skills/web-perf/SKILL.md"
+  },
+  {
+    "name": "playwright",
+    "description": "Use when the task requires automating a real browser from the terminal (navigation, form filling, snapshots, screenshots, data extraction, UI-flow debugging) via `playwright-cli` or the bundled wrapper script.",
+    "source": "/Users/bek/.codex/skills/playwright/SKILL.md"
+  },
+  {
+    "name": "screenshot",
+    "description": "Use when the user explicitly asks for a desktop or system screenshot (full screen, specific app or window, or a pixel region), or when tool-specific capture capabilities are unavailable and an OS-level capture is needed.",
+    "source": "/Users/bek/.codex/skills/screenshot/SKILL.md"
+  },
+  {
+    "name": "linear",
+    "description": "Manage issues, projects & team workflows in Linear. Use when the user wants to read, create or updates tickets in Linear.",
+    "source": "/Users/bek/.codex/skills/linear/SKILL.md"
+  },
+  {
+    "name": "imagegen",
+    "description": "Generate or edit raster images when the task benefits from AI-created bitmap visuals such as photos, illustrations, textures, sprites, mockups, or transparent-background cutouts. Use when Codex should create a brand-new image, transform an existing image, or derive visual variants from references, and the output should be a bitmap asset rather than repo-native code or vector. Do not use when the task is better handled by editing existing SVG/vector/code-native assets, extending an established icon or logo system, or building the visual directly in HTML/CSS/canvas.",
+    "source": "/Users/bek/.codex/skills/.system/imagegen/SKILL.md"
+  },
+  {
+    "name": "lego-car-design",
+    "description": "Design or review real-part LEGO cars, select compatible vehicle pieces, and study official car instructions for reusable construction techniques. Use for LEGO car MOCs and car-building workflows, not automotive repair or image-only renders.",
+    "source": "/Users/bek/.codex/skills/lego-car-design/SKILL.md"
+  },
+  {
+    "name": "zig-0-16",
+    "description": "Write, debug, or review Zig 0.16.0 application and systems code using the installed Zig 0.16 standard library as the authority. Use for Zig APIs, ownership, I/O, networking, processes, concurrency, JSON, build files, and macOS/POSIX behavior; do not use remembered pre-0.16 APIs without re-verifying them.",
+    "source": "/Users/bek/.codex/skills/zig-0-16/SKILL.md"
+  },
+  {
+    "name": "skill-creator",
+    "description": "Create or update a Codex skill with appropriately scoped instructions and any needed supporting resources.",
+    "source": "/Users/bek/.codex/skills/.system/skill-creator/SKILL.md"
+  },
+  {
+    "name": "skill-installer",
+    "description": "Install Codex skills into $CODEX_HOME/skills from a curated list or a GitHub repo path. Use when a user asks to list installable skills, install a curated skill, or install a skill from another repo (including private repos).",
+    "source": "/Users/bek/.codex/skills/.system/skill-installer/SKILL.md"
+  },
+  {
+    "name": "fleet-prompt-editing",
+    "description": "Draft, review, and aggressively trim modular fleet-agent prompt sections using agreed policy and source inventories. Use for prose-versus-pseudocode decisions and shared-prompt deduplication, not for performing the browser, execution, or delegation tasks those prompts describe.",
+    "source": "/Users/bek/.codex/skills/fleet-prompt-editing/SKILL.md"
+  },
+  {
+    "name": "memory-curator",
+    "description": "Investigate Unblock Memory clusters and maintain supported, agent-specific knowledge that would otherwise be difficult to reconstruct.",
+    "source": "skills/memory-curator/SKILL.md"
+  },
+  {
+    "name": "people-whisperer",
+    "description": "Maintain useful PeopleSQL dossiers from ordinary memory and session evidence so future conversations start with accurate person context.",
+    "source": "skills/people-whisperer/SKILL.md"
+  },
+  {
+    "name": "pdf",
+    "description": "Read, create, inspect, render, and verify PDF files where visual layout matters, including fillable AcroForms. Use Poppler rendering plus Python tools such as reportlab, pdfplumber, and pypdf for generation and extraction.",
+    "source": "/Users/bek/.codex/plugins/cache/openai-primary-runtime/pdf/26.909.12148/skills/pdf/SKILL.md"
+  },
+  {
+    "name": "Presentations",
+    "description": "Read, create or edit PowerPoint or Google Slides decks. Use for presentation, slide deck, PowerPoint, PPT, PPTX, or Google Slides requests.",
+    "source": "/Users/bek/.codex/plugins/cache/openai-primary-runtime/presentations/26.909.12148/skills/presentations/SKILL.md"
+  }
+]

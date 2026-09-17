@@ -19,6 +19,7 @@ export type ManagerSessionConfig = {
 };
 export type SkillSearchCandidate = {
     name: string;
+    description: string;
     path: string;
     score: number;
 };
@@ -31,7 +32,7 @@ export declare function buildReadResult(params: {
     from?: number;
     lines?: number;
 }): MemoryReadResult;
-export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">, maxTokens: number, countTokens: (text: string) => Promise<number>): Promise<{
+export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">, maxTokens: number, countTokens: (text: string) => Promise<number>, maxChars?: number): Promise<{
     text: string;
     position: number;
 }>;

@@ -19,6 +19,8 @@ export type CorpusMemorySearchResult = MemorySearchResult & {
   session?: SessionMetadata;
 };
 export type SessionSearchFilter = {
+  /** Internal exact-session scope used by proactive hints; not exposed by the search tool. */
+  sessionId?: string;
   startedFrom?: string;
   startedTo?: string;
   provider?: string;
@@ -39,6 +41,8 @@ export type CorpusSearchOptions = NonNullable<
   Parameters<MemorySearchManagerContract["search"]>[1]
 > & {
   corpora?: readonly string[];
+  /** Internal vector-hint budget; oversized matched chunks are omitted, never sliced. */
+  maxSnippetChars?: number;
   sessionFilter?: SessionSearchFilter;
   requestContext?: MemoryRequestContext;
 };

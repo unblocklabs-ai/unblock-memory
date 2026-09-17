@@ -2,3 +2,4 @@ node_modules/
 *.tgz
 .plugin-inspector/
 reports/
+.env

@@ -181,7 +181,7 @@ function lineSpan(body, position, text) {
     const endLine = startLine + Math.max(0, text.split("\n").length - 1);
     return { startLine, endLine };
 }
-export async function expandSessionSearchHit(result, maxTokens, countTokens) {
+export async function expandSessionSearchHit(result, maxTokens, countTokens, maxChars = Infinity) {
     const leaf = { text: result.bestChunk, position: result.chunkPos };
     const spans = sessionContextSpans(result.body, result.chunkPos);
     if (!spans)
@@ -191,6 +191,8 @@ export async function expandSessionSearchHit(result, maxTokens, countTokens) {
         if (span.start > result.chunkPos || span.end < leafEnd)
             continue;
         const text = result.body.slice(span.start, span.end).trimEnd();
+        if (text.length > maxChars)
+            continue;
         if (await countTokens(text) <= maxTokens)
             return { text, position: span.start };
     }
@@ -227,7 +229,8 @@ function sessionAllowedPaths(metadataByPath, collection, filter) {
     const provider = filter.provider?.trim().toLowerCase();
     const accountId = filter.accountId?.trim();
     const conversationId = filter.conversationId?.trim();
-    const paths = [...metadataByPath].flatMap(([path, metadata]) => (startedFrom === undefined || metadata.startedAt >= startedFrom) &&
+    const paths = [...metadataByPath].flatMap(([path, metadata]) => (filter.sessionId === undefined || metadata.sessionId === filter.sessionId) &&
+        (startedFrom === undefined || metadata.startedAt >= startedFrom) &&
         (startedTo === undefined || metadata.startedAt <= startedTo) &&
         (provider === undefined || metadata.provider?.trim().toLowerCase() === provider) &&
         (filter.chatType === undefined || metadata.chatType === filter.chatType) &&
@@ -691,6 +694,7 @@ export class QmdMemoryManager {
         opts?.signal?.throwIfAborted();
         await this.#operationChain;
         const sessions = this.#sessions;
+        opts?.signal?.throwIfAborted();
         if (opts?.sessionFilter && sessions && collections.includes(sessions.collection)) {
             await this.#refreshSessionMetadata();
         }
@@ -698,6 +702,7 @@ export class QmdMemoryManager {
             ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter)
             : undefined;
         const store = await this.#getStore();
+        opts?.signal?.throwIfAborted();
         if (opts?.lexicalOnly) {
             const hits = await store.searchLex(query, {
                 limit: opts.maxResults ?? 5,
@@ -719,9 +724,14 @@ export class QmdMemoryManager {
             allowedPaths,
             expand: false,
         });
+        opts?.signal?.throwIfAborted();
         const tokenizer = store.internal?.llm;
         const results = [];
         for (const hit of hits) {
+            // Proactive hints must retain the entire matched chunk, even when expanded
+            // turn/message context exceeds their budget. Ordinary search is unchanged.
+            if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity))
+                continue;
             const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
             const corpus = collection ? this.#sources.get(collection)?.corpus : undefined;
             if (!corpus)
@@ -733,7 +743,7 @@ export class QmdMemoryManager {
                 ? this.#sessionMetadata.get(relativePath)
                 : undefined;
             const selected = corpus === "sessions" && this.#sessions && tokenizer
-                ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text))
+                ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text), opts?.maxSnippetChars)
                 : { text: hit.bestChunk, position: hit.chunkPos };
             const span = lineSpan(hit.body, selected.position, selected.text);
             results.push({
@@ -775,7 +785,7 @@ export class QmdMemoryManager {
                         const current = metadata.get(key);
                         if (!current || order < current.sourceOrder) {
                             metadata.set(key, {
-                                candidate: { name, path: document.path },
+                                candidate: { name, description, path: document.path },
                                 description,
                                 sourceOrder: order,
                             });

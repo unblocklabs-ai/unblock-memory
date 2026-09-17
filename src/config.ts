@@ -41,6 +41,12 @@ export type UnblockMemoryConfig = {
   corpora: readonly CorpusConfig[];
   keepEmbeddingModelWarm: boolean;
   analysis: { executable?: string };
+  typesafe: {
+    enabled: boolean;
+    apiKey?: string;
+    apiKeyFile?: string;
+    timeoutMs: number;
+  };
   people: {
     enabled: boolean;
     whisperer: { enabled: boolean; maxChars: number };
@@ -52,6 +58,15 @@ export type UnblockMemoryConfig = {
     minScore: number;
     cooldownTurns: number;
   };
+  memoryWhisperer: {
+    enabled: boolean;
+    corpora: readonly string[];
+    historyMessages: number;
+    minUsefulness: number;
+    maxHints: number;
+    cooldownTurns: number;
+    timeoutMs: number;
+  };
 };
 
 export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
@@ -60,12 +75,82 @@ export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
   todos: { maxOpen: 1000 },
 };
 
+const DEFAULT_TYPESAFE_CONFIG: UnblockMemoryConfig["typesafe"] = {
+  enabled: true,
+  timeoutMs: 1500,
+};
+
+function resolveTypeSafe(value: unknown): UnblockMemoryConfig["typesafe"] {
+  if (value === undefined) return { ...DEFAULT_TYPESAFE_CONFIG };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("unblock-memory typesafe must be an object");
+  }
+  const config = value as Record<string, unknown>;
+  assertOnlyKeys(config, ["enabled", "apiKey", "apiKeyFile", "timeoutMs"], "typesafe");
+  const enabled = config.enabled ?? true;
+  if (typeof enabled !== "boolean") throw new Error("unblock-memory typesafe.enabled must be a boolean");
+  for (const key of ["apiKey", "apiKeyFile"] as const) {
+    if (config[key] !== undefined && (typeof config[key] !== "string" || !config[key].trim())) {
+      throw new Error(`unblock-memory typesafe.${key} must be a non-empty string`);
+    }
+  }
+  const apiKey = typeof config.apiKey === "string" ? config.apiKey.trim() : undefined;
+  const apiKeyFile = typeof config.apiKeyFile === "string" ? config.apiKeyFile.trim() : undefined;
+  if (apiKey && apiKeyFile) throw new Error("unblock-memory typesafe accepts apiKey or apiKeyFile, not both");
+  if (apiKeyFile && !isAbsolute(apiKeyFile)) {
+    throw new Error("unblock-memory typesafe.apiKeyFile must be an absolute path");
+  }
+  return {
+    enabled, ...(apiKey ? { apiKey } : {}), ...(apiKeyFile ? { apiKeyFile } : {}),
+    timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_TYPESAFE_CONFIG.timeoutMs, "typesafe.timeoutMs", 10_000),
+  };
+}
+
 const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
   enabled: false,
   historyMessages: 5,
   minScore: 0.5,
   cooldownTurns: 10,
 };
+
+const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
+  enabled: false, corpora: [], historyMessages: 5, minUsefulness: 0.9,
+  maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
+};
+
+function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]): UnblockMemoryConfig["memoryWhisperer"] {
+  if (value === undefined) return { ...DEFAULT_MEMORY_WHISPERER };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("unblock-memory memoryWhisperer must be an object");
+  }
+  const config = value as Record<string, unknown>;
+  assertOnlyKeys(config, Object.keys(DEFAULT_MEMORY_WHISPERER), "memoryWhisperer");
+  const enabled = config.enabled ?? false;
+  if (typeof enabled !== "boolean") throw new Error("unblock-memory memoryWhisperer.enabled must be a boolean");
+  const selected = config.corpora ?? [];
+  if (!Array.isArray(selected) || !selected.every((name): name is string =>
+    typeof name === "string" && corpora.some(corpus => corpus.name === name && corpus.kind !== "skills"))) {
+    throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora");
+  }
+  if (enabled && !selected.length) throw new Error("unblock-memory enabled memoryWhisperer requires explicit corpora");
+  const historyMessages = config.historyMessages ?? 5;
+  const cooldownTurns = config.cooldownTurns ?? 10;
+  if (typeof historyMessages !== "number" || !Number.isInteger(historyMessages) || historyMessages < 0 || historyMessages > 50) {
+    throw new Error("unblock-memory memoryWhisperer.historyMessages must be an integer between 0 and 50");
+  }
+  if (typeof cooldownTurns !== "number" || !Number.isInteger(cooldownTurns) || cooldownTurns < 0 || cooldownTurns > 1000) {
+    throw new Error("unblock-memory memoryWhisperer.cooldownTurns must be an integer between 0 and 1000");
+  }
+  const minUsefulness = config.minUsefulness ?? 0.9;
+  if (typeof minUsefulness !== "number" || !Number.isFinite(minUsefulness) || minUsefulness < 0 || minUsefulness > 1) {
+    throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
+  }
+  return {
+    enabled, corpora: [...new Set(selected)], historyMessages, cooldownTurns, minUsefulness,
+    maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
+    timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
+  };
+}
 
 function assertOnlyKeys(
   value: Record<string, unknown>,
@@ -253,8 +338,10 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       corpora: DEFAULT_CORPORA,
       keepEmbeddingModelWarm: true,
       analysis: {},
+      typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
       people: DEFAULT_PEOPLE_CONFIG,
       skillWhisperer: DEFAULT_SKILL_WHISPERER,
+      memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
     };
   }
   if (typeof value !== "object" || Array.isArray(value)) {
@@ -263,7 +350,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -343,5 +430,6 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       'unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"',
     );
   }
-  return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer };
+  return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer,
+    memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora), typesafe: resolveTypeSafe(config.typesafe) };
 }

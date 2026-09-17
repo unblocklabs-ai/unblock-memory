@@ -80,6 +80,12 @@ directories, or globs into named corpora:
             minScore: 0.5,
             cooldownTurns: 10,
           },
+          typesafe: {
+            enabled: true, // Default; shared by enabled Skill and Memory Whisperers.
+            // Alternatively set TYPESAFE_API_KEY in the Gateway environment.
+            apiKeyFile: "/absolute/path/to/.env",
+            timeoutMs: 1500,
+          },
           people: {
             enabled: false,
             whisperer: { enabled: false, maxChars: 1200 },
@@ -110,6 +116,68 @@ idle unload behavior.
 request all of them explicitly. Search results include their corpus name and
 remain readable by passing the returned `qmd://` path to `memory_get`.
 
+### Memory Whisperer
+
+Memory Whisperer is optional and **off by default**. It proactively retrieves
+historical context before user-triggered turns, without changing `memory_search`
+or `memory_get`. Enable it in the plugin config with an explicit corpus allowlist:
+
+```json5
+memoryWhisperer: {
+  enabled: true,
+  corpora: ["knowledge"], // Must exist in corpora; approve its contents for all agent audiences.
+  historyMessages: 5,
+  minUsefulness: 0.9,
+  maxHints: 2,
+  cooldownTurns: 10,
+  timeoutMs: 3000,
+},
+```
+
+Requires `hooks.allowConversationAccess: true` on the plugin entry, prompt
+injection permission, and the shared TypeSafe credentials described below.
+An empty allowlist is invalid when enabled; `all`, unknown names, and `skills`
+are not accepted. File corpora are approved for **every audience using the agent**:
+do not allowlist private dossiers for an agent that also serves shared channels.
+If `sessions` is allowlisted, only the exact current session is searched, including
+its older indexed messages. Missing session identity excludes that corpus. Other
+sessions, even in the same channel, are excluded before sending excerpts to TypeSafe.
+Session availability still depends on the normal indexing/sync schedule.
+
+QMD searches the current request plus the last N user/assistant messages (at most
+12,000 characters), retrieving up to eight vector candidates without query expansion,
+the local reranker, or a similarity-score cutoff. TypeSafe evaluates one independent
+Noul question per candidate in a single request: does the excerpt add material value
+beyond what the conversation already contains? Merely related, redundant,
+wrong-person/project, and clearly superseded information should be rejected;
+useful contradictory evidence can qualify. `minUsefulness` thresholds the probability
+of yes, not a calibrated guarantee of accuracy. Evaluate it on your own conversations.
+
+**Privacy and budgets:** this feature sends up to 16,000 characters of the available
+user/assistant conversation, prioritizing the current request and recent messages,
+plus up to eight 1,200-character excerpts, corpus names, and session dates to
+`api.typesafe.ai`. Session excerpts retain a complete turn or message when it fits,
+otherwise the complete matched chunk. Chunks exceeding the excerpt budget are
+skipped, never sliced; ordinary `memory_search` is unchanged.
+It does not fetch a complete historical transcript; the host may
+already have compacted the available context. Truncation is marked in the judge's
+input. System messages, thinking blocks, images, and tool-result messages are omitted;
+anything quoted in ordinary user/assistant text can still be transmitted.
+
+At most two qualifying excerpts are injected verbatim with source references and
+historical/untrusted-data framing. Excerpts are deduplicated by normalized content
+and overlapping source lines; recently injected content has a ten-user-turn cooldown
+by default. Cooldown state is in memory and resets on session end or Gateway restart.
+The complete hint payload is capped at 5,000 characters plus a short framing paragraph.
+
+Unlike Skill Whisperer, **disabled TypeSafe, a missing key, no qualifying hits, or any
+failure means no memory hint**—there is no vector-only fallback. The overall process
+has a 3-second deadline, with the shared 1.5-second TypeSafe request deadline inside it;
+neither performs retries. Timed-out or superseded runs cannot inject late hints.
+Already-running local QMD work may finish in the background, but does not keep the
+agent waiting beyond the deadline. No new indexing, clustering, or summarization runs
+are triggered by this feature beyond the memory manager's normal initialization.
+
 ### Skill Whisperer
 
 Skill Whisperer is an optional semantic reminder for user turns. Configure one
@@ -117,13 +185,40 @@ isolated `skills` corpus, set `skillWhisperer.enabled` to `true`, and authorize
 `plugins.entries.unblock-memory.hooks.allowConversationAccess`. The feature
 embeds the current prompt plus the configured number of prior user/assistant
 messages, compares it with each configured skill's frontmatter `name` and
-`description`, and prepends at most one name/path hint when the best match
-reaches `minScore`. Full skill procedures do not influence routing. The plugin
-never opens or invokes a skill automatically.
+`description`. With TypeSafe enabled and a key available, the top three valid
+candidates are sent to TypeSafe, without a vector-score cutoff. TypeSafe chooses
+one skill or none. A "none" decision never falls back to a vector hint. Full skill
+procedures do not influence routing; no skill is invoked automatically.
 
-The defaults use five prior messages, a calibrated score threshold of `0.5`,
+The shared `typesafe` configuration defaults to `enabled: true` and
+`timeoutMs: 1500`. Skill and Memory Whisperers share it. Credentials come from
+`typesafe.apiKey`, an absolute `typesafe.apiKeyFile`, or (when neither is set)
+the Gateway's `TYPESAFE_API_KEY` environment variable. Configure at most one of
+`apiKey` and `apiKeyFile`. A key file may contain just the key or dotenv entries
+including `TYPESAFE_API_KEY`; it is reread each turn to support rotation. A dotenv
+file is not sourced as shell code and does not change the process environment.
+Missing/empty files or dotenv files without that variable count as no key;
+an explicit file never falls back to an unrelated environment key. Protect key
+files with owner-only permissions. Workspace `.env` files are not auto-discovered:
+point `apiKeyFile` at the intended file or load the variable into the Gateway.
+
+If TypeSafe is disabled or no key is found, selection uses the original local
+vector process and `skillWhisperer.minScore`. With a key present, an API error,
+invalid response, or timeout emits no hint and logs a sanitized warning; it does
+not switch to vector-only selection. There are no automatic HTTP retries. Other
+credential-file read errors likewise produce a warning and no hint.
+
+**Privacy:** enabled TypeSafe selection sends up to 12,000 characters of current
+prompt/recent user-assistant text, plus the shortlisted names/descriptions, to
+`api.typesafe.ai`. Source-path fields, full skill procedures, tool-result messages,
+and system messages are excluded; dossiers and ordinary memory files are not read
+for this call. Material already quoted in user/assistant text can still be included.
+Disable `typesafe.enabled` to keep Skill Whisperer entirely local. The pinned model
+is `jev-1.13.0`.
+
+The defaults use five prior messages, a vector-only score threshold of `0.5`,
 and a ten-turn cooldown. A skill is cooling down after either a suggestion or a
-successful direct `read` of its indexed `SKILL.md`. When the best qualifying
+successful direct `read` of its indexed `SKILL.md`. When the selected
 skill is cooling down, no hint is emitted; Skill Whisperer does not fall through
 to a weaker match. Cooldown state is per session and intentionally resets with
 the Gateway. Shell-command reads are not tracked.
