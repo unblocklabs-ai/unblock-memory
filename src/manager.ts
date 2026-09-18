@@ -38,17 +38,23 @@ import {
   CurationStore,
   chunkFingerprint,
   type MaintenanceStatus,
+  type MaintenanceTask,
   type TemporalBasis,
 } from "./curation.js";
 import {
   readSessionManifest,
   sessionMetadataByPath,
   syncSessionProjections,
+  PROJECTOR_VERSION,
   type SessionSyncResult,
 } from "./session-sync.js";
 import { sessionContextSpans, type SessionMetadata } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
 import { auditQualityPage, type QualityCursor } from "./quality-audit.js";
+import { qualityTaskPresence } from "./quality-triage.js";
+import { reviewIndexedClaim } from "./evidence-review.js";
+import { reviewClusterIngestion } from "./cluster-review.js";
+import { abortable } from "./abortable.js";
 
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
@@ -407,6 +413,32 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   #sessionManifestMtimeNs?: bigint;
   #skillIndex?: Promise<SkillIndexEntry[]>;
   #qualityAuditRunning = false;
+  #reviewLifetime = new AbortController();
+  #structuralChunksOmitted = 0;
+  #structuralDiagnosticsAvailable = false;
+
+  #recordEmbedding(result: Awaited<ReturnType<ManagerStore["embed"]>>): void {
+    if ("structuralChunksOmitted" in result && typeof result.structuralChunksOmitted === "number") {
+      this.#structuralDiagnosticsAvailable = true;
+      this.#structuralChunksOmitted += result.structuralChunksOmitted;
+    }
+  }
+
+  async diagnostics() {
+    await this.#operationChain;
+    const store = await this.#getStore();
+    const status = await store.getStatus();
+    const manifest = this.#sessions ? await readSessionManifest(this.#sessions.manifestPath) : undefined;
+    return {
+      projectorVersion: PROJECTOR_VERSION,
+      semanticChunkingVersion: "semanticChunkingVersion" in status ? status.semanticChunkingVersion : null,
+      sessionsNeedingProjection: manifest ? Object.values(manifest.sessions).filter(session => session.projectorVersion !== PROJECTOR_VERSION).length : 0,
+      needsEmbedding: status.needsEmbedding,
+      embeddingReady: status.needsEmbedding === 0 && status.hasVectorIndex,
+      structuralChunksOmitted: this.#structuralDiagnosticsAvailable ? this.#structuralChunksOmitted : null,
+      scope: "Projection count covers previously indexed sessions; omissions count this manager lifetime; null means dependency has not reported counts.",
+    };
+  }
 
   constructor(params: {
     dbPath: string;
@@ -617,6 +649,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
           markAnalysisStale();
         }
         const embed = await store.embed({ force: params?.force, chunkStrategy: "semantic" });
+        this.#recordEmbedding(embed);
         if (completedEmbeddingCount(embed) > 0) markAnalysisStale();
       }
       for (const source of collections) {
@@ -629,6 +662,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
           force: params?.force,
           chunkStrategy: "semantic",
         });
+        this.#recordEmbedding(embed);
         if (completedEmbeddingCount(embed) > 0) markAnalysisStale();
       }
       const status = await store.getStatus();
@@ -667,6 +701,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             chunkStrategy: "semantic",
           });
           const chunksEmbedded = completedEmbeddingCount(embed);
+          this.#recordEmbedding(embed);
           if (!invalidatesAnalysis && chunksEmbedded > 0 && analysisStore.internal) {
             markMemoryAnalysisStale(analysisStore.internal.db);
           }
@@ -716,6 +751,40 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     return this.#enqueue(async () => readClusters((await this.#getAnalysisStore()).internal.db, limit));
   }
 
+  reviewClaim(params: Omit<Parameters<typeof reviewIndexedClaim>[0], "db" | "sources" | "read"> & { corpora: readonly string[] }) {
+    return this.#review(params.signal, context => reviewIndexedClaim({ ...params, ...context,
+      sources: [...this.#sources.values()].filter(source => params.corpora.includes(source.corpus)),
+    }));
+  }
+
+  reviewCluster(params: Omit<Parameters<typeof reviewClusterIngestion>[0], "db" | "sources" | "read"> & { corpora: readonly string[] }) {
+    return this.#review(params.signal, context => reviewClusterIngestion({ ...params, ...context,
+      sources: [...this.#sources.values()].filter(source => params.corpora.includes(source.corpus)),
+    }));
+  }
+
+  async #review<T>(callerSignal: AbortSignal, run: (context: Pick<Parameters<typeof reviewIndexedClaim>[0], "db" | "signal" | "read">) => Promise<T>): Promise<T> {
+    const signal = AbortSignal.any([callerSignal, this.#reviewLifetime.signal]);
+    signal.throwIfAborted();
+    const store = await abortable(this.#enqueue(async () => {
+      signal.throwIfAborted();
+      const store = await this.#getAnalysisStore();
+      signal.throwIfAborted();
+      return store;
+    }), signal);
+    const read = <R>(work: () => R) => {
+      signal.throwIfAborted();
+      return abortable(this.#enqueue(async () => {
+        signal.throwIfAborted();
+        return work();
+      }), signal);
+    };
+    // Only the synchronous evidence snapshot and freshness check enter the queue.
+    // Closing aborts inference and prevents any late response from touching the DB.
+    signal.throwIfAborted();
+    return abortable(run({ db: store.internal.db, signal, read }), signal);
+  }
+
   fetchCluster(params: {
     clusterId: string;
     topK?: number;
@@ -756,8 +825,15 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     });
   }
 
-  listMaintenanceTasks(params: { status?: MaintenanceStatus; limit?: number } = {}) {
-    return this.#getCuration().listTasks(params);
+  async listMaintenanceTasks(params: { status?: MaintenanceStatus; limit?: number } = {}): Promise<(MaintenanceTask & {
+    indexPresence?: ReturnType<typeof qualityTaskPresence>;
+  })[]> {
+    await this.#operationChain;
+    const tasks = this.#getCuration().listTasks(params);
+    if (!tasks.some(task => task.type === "quality_review")) return tasks;
+    const store = await this.#getAnalysisStore();
+    const fingerprints = new Map<string, Set<string>>();
+    return tasks.map(task => ({ ...task, indexPresence: qualityTaskPresence(store.internal.db, task, fingerprints) }));
   }
 
   async auditQuality(params: {
@@ -1140,6 +1216,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#reviewLifetime.abort();
     if (this.#watchTimer) clearTimeout(this.#watchTimer);
     this.#watchTimer = undefined;
     await this.#watcher?.close();

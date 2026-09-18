@@ -15,6 +15,12 @@ export type SessionProjectionInput = SessionMetadata & {
         eventJson: string;
         createdAt: number;
     }[];
+    /** Optional counters for this projection pass; never contains source text. */
+    diagnostics?: {
+        internalMessagesCleaned: number;
+        attachmentsCleaned: number;
+        attachmentBudgetSkipped: number;
+    };
 };
 export type SessionContextSpans = {
     message: {

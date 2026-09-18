@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { projectLoggieMessage } from "./loggie-projection.js";
+import { applyProposal, parseAttachments, parseInternalMessage } from "./session-noise.js";
 const MESSAGE_HEADING = /^## (User|Assistant) — .* — \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S.*$/gmu;
 function record(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -83,6 +84,21 @@ function projectMessage(row, input) {
     }
     if (!text)
         return undefined;
+    if (role === "user" && input.provider?.toLowerCase() !== "loggie") {
+        const provenance = record(message.provenance);
+        const trusted = provenance?.kind === "inter_session" &&
+            (provenance.sourceTool === "subagent_announce" || provenance.sourceTool === "agent_harness_task");
+        const internal = parseInternalMessage(text, trusted);
+        const proposal = internal.edits.length ? internal : parseAttachments(text);
+        if (input.diagnostics) {
+            if (internal.edits.length)
+                input.diagnostics.internalMessagesCleaned++;
+            input.diagnostics.attachmentsCleaned += proposal.edits.filter(edit => edit.reason === "attachment-envelope-prefix").length;
+            if (proposal.budgetSkipped)
+                input.diagnostics.attachmentBudgetSkipped++;
+        }
+        text = applyProposal(text, proposal);
+    }
     const meeting = role === "user" && input.provider?.toLowerCase() === "loggie"
         ? projectLoggieMessage(text, input.accountId) : undefined;
     return {

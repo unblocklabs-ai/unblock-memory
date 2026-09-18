@@ -6,6 +6,7 @@ import type { CorpusMemorySearchResult, CorpusSearchOptions } from "../src/contr
 import { registerMemoryWhisperer } from "../src/memory-whisperer.js";
 import { expandSessionSearchHit } from "../src/manager.js";
 import { memoryConversation } from "../src/whisperer-context.js";
+import { WhispererDiagnostics } from "../src/diagnostics.js";
 
 const config = { ...resolveConfig(undefined).memoryWhisperer, enabled: true, corpora: ["memory", "sessions"], cooldownTurns: 2 };
 const typesafe = { enabled: true, apiKey: "fake-secret", timeoutMs: 100 };
@@ -14,6 +15,76 @@ const event = { prompt: "Deploy this", messages: [{ role: "user", content: "Use 
 type Context = Partial<typeof context>;
 type Before = (event: { prompt: string; messages: unknown[] }, context: Context) => Promise<{ prependContext: string } | void>;
 type End = (event: { sessionId: string; sessionKey?: string }, context: Context) => void;
+
+test("complementary hints skip a confident paraphrase but retain contradictory evidence", async t => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    calls++;
+    const request = JSON.parse(String(init?.body));
+    if (request.questions.memory_0) return response(0.99, 0.98, 0.97);
+    assert.equal(request.state.excerpts.length, 3);
+    assert.match(JSON.stringify(request.questions), /contradiction/);
+    return Response.json({ answers: {
+      pair_0: { type: "noul", noul: 0.99 }, // 0 covers 1
+      pair_1: { type: "noul", noul: 0.01 }, // 0 does not cover 2
+      pair_2: { type: "noul", noul: 0.01 },
+    } });
+  });
+  const h = harness([hit("Staging was approved"), hit("Approval granted for staging"), hit("Approval was revoked")],
+    { config: { complementaryHints: true } });
+  const result = await h.before(event, context);
+  assert.ok(result);
+  assert.match(result.prependContext, /Staging was approved/);
+  assert.match(result.prependContext, /Approval was revoked/);
+  assert.doesNotMatch(result.prependContext, /Approval granted/);
+  assert.equal(calls, 2);
+  assert.equal(h.diagnostics.snapshot("bill").memory.emitted, 1);
+});
+
+test("redundancy uncertainty or failure preserves baseline hints and stays inside the turn deadline", async t => {
+  let mode = "uncertain";
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    if (request.questions.memory_0) return response(0.99, 0.98);
+    if (mode === "failure") throw new Error("secret response");
+    if (mode === "wait") return new Promise<Response>(() => {});
+    return Response.json({ answers: { pair_0: { type: "noul", noul: 0.5 } } });
+  });
+  for (const value of ["uncertain", "failure", "wait"]) {
+    mode = value;
+    const h = harness([hit("first fact"), hit("second fact")], { config: { complementaryHints: true, timeoutMs: 30 } });
+    const result = await h.before(event, context);
+    if (value === "wait") {
+      assert.equal(result, undefined);
+      assert.equal(h.diagnostics.snapshot("bill").memory.timed_out, 1);
+    } else {
+      assert.ok(result);
+      assert.match(result.prependContext, /first fact/);
+      assert.match(result.prependContext, /second fact/);
+    }
+    if (value === "failure") assert.equal(h.diagnostics.snapshot("bill").memory.redundancy_unavailable, 1);
+    assert.equal(JSON.stringify(h.diagnostics.snapshot("bill")).includes("secret"), false);
+    h.stop();
+  }
+});
+
+test("content-free memory diagnostics distinguish no candidates, rejected, missing key and failures", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => response(0.1));
+  const none = harness([]);
+  await none.before(event, context);
+  assert.equal(none.diagnostics.snapshot("bill").memory.no_candidates, 1);
+  const rejected = harness();
+  await rejected.before(event, context);
+  assert.equal(rejected.diagnostics.snapshot("bill").memory.rejected, 1);
+  const missing = harness([], { typesafe: { enabled: true, apiKeyFile: "/nonexistent/unblock-test.env", timeoutMs: 10 } });
+  await missing.before(event, context);
+  assert.equal(missing.diagnostics.snapshot("bill").memory.missing_key, 1);
+  fetch.mock.mockImplementation(async () => { throw new Error("secret-text"); });
+  const failed = harness();
+  await failed.before(event, context);
+  assert.equal(failed.diagnostics.snapshot("bill").memory.failed, 1);
+  assert.equal(JSON.stringify(failed.diagnostics.snapshot("bill")).includes("secret-text"), false);
+});
 
 function hit(excerpt: string, overrides: Partial<CorpusMemorySearchResult> = {}): CorpusMemorySearchResult {
   return { path: `qmd://memory/${excerpt}.md`, startLine: 1, endLine: 3, score: 0.2,
@@ -38,6 +109,7 @@ function harness(
   const hooks = new Map<string, (...args: never[]) => unknown>();
   const warnings: string[] = [];
   const searches: { query: string; options?: CorpusSearchOptions }[] = [];
+  const diagnostics = new WhispererDiagnostics();
   let lookups = 0;
   const api = { config: {}, logger: { warn: (message: string) => warnings.push(message) },
     on: (name: string, handler: (...args: never[]) => unknown) => hooks.set(name, handler),
@@ -50,8 +122,8 @@ function harness(
         return options.search ? options.search() : hits;
       } } };
     },
-  }, { ...config, ...options.config }, options.typesafe ?? typesafe);
-  return { hooks, warnings, searches, lookups: () => lookups,
+  }, { ...config, ...options.config }, options.typesafe ?? typesafe, diagnostics);
+  return { hooks, warnings, searches, diagnostics, lookups: () => lookups,
     before: hooks.get("before_prompt_build") as unknown as Before,
     end: hooks.get("session_end") as unknown as End,
     stop: hooks.get("gateway_stop") as unknown as () => void,
@@ -60,10 +132,11 @@ function harness(
 
 test("memory whisperer requires explicit, known non-skill corpora and bounded controls", () => {
   assert.deepEqual(resolveConfig(undefined).memoryWhisperer, {
-    enabled: false, corpora: [], historyMessages: 5, minUsefulness: 0.9, maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
+    enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.9, maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
   });
   assert.deepEqual(resolveConfig({ memoryWhisperer: { enabled: true, corpora: ["memory", "memory"], historyMessages: 0 } })
     .memoryWhisperer.corpora, ["memory"]);
+  assert.throws(() => resolveConfig({ memoryWhisperer: { complementaryHints: "yes" } }), /complementaryHints/);
   for (const value of [false, [], { enabled: true }, { corpora: ["all"] }, { corpora: ["unknown"] },
     { corpora: ["skills"] }, { corpora: "memory" }, { enabled: 1 }, { extra: true },
     { historyMessages: 51 }, { historyMessages: -1 }, { historyMessages: "5" }, { historyMessages: 0.5 },

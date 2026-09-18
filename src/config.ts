@@ -48,6 +48,7 @@ export type UnblockMemoryConfig = {
     timeoutMs: number;
   };
   qualityAudit: { enabled: boolean; corpora: readonly string[]; minNoise: number };
+  evidenceReview: { enabled: boolean; corpora: readonly string[] };
   people: {
     enabled: boolean;
     whisperer: { enabled: boolean; maxChars: number };
@@ -61,6 +62,7 @@ export type UnblockMemoryConfig = {
   };
   memoryWhisperer: {
     enabled: boolean;
+    complementaryHints: boolean;
     corpora: readonly string[];
     historyMessages: number;
     minUsefulness: number;
@@ -139,7 +141,7 @@ const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
 };
 
 const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
-  enabled: false, corpora: [], historyMessages: 5, minUsefulness: 0.9,
+  enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.9,
   maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
 };
 
@@ -152,6 +154,8 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   assertOnlyKeys(config, Object.keys(DEFAULT_MEMORY_WHISPERER), "memoryWhisperer");
   const enabled = config.enabled ?? false;
   if (typeof enabled !== "boolean") throw new Error("unblock-memory memoryWhisperer.enabled must be a boolean");
+  const complementaryHints = config.complementaryHints ?? false;
+  if (typeof complementaryHints !== "boolean") throw new Error("memoryWhisperer.complementaryHints must be a boolean");
   const selected = config.corpora ?? [];
   if (!Array.isArray(selected) || !selected.every((name): name is string =>
     typeof name === "string" && corpora.some(corpus => corpus.name === name && corpus.kind !== "skills"))) {
@@ -171,7 +175,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
   }
   return {
-    enabled, corpora: [...new Set(selected)], historyMessages, cooldownTurns, minUsefulness,
+    enabled, complementaryHints, corpora: [...new Set(selected)], historyMessages, cooldownTurns, minUsefulness,
     maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
     timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
   };
@@ -365,6 +369,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       analysis: {},
       typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
       qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
+      evidenceReview: { enabled: false, corpora: [] },
       people: DEFAULT_PEOPLE_CONFIG,
       skillWhisperer: DEFAULT_SKILL_WHISPERER,
       memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
@@ -376,11 +381,21 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
   const people = resolvePeople(config.people);
+  let evidenceReview: UnblockMemoryConfig["evidenceReview"] = { enabled: false, corpora: [] };
+  if (config.evidenceReview !== undefined) {
+    const value = config.evidenceReview;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("evidenceReview must be an object");
+    assertOnlyKeys(value as Record<string, unknown>, ["enabled", "corpora"], "evidenceReview");
+    try {
+      const approved = resolveQualityAudit(value, corpora);
+      evidenceReview = { enabled: approved.enabled, corpora: approved.corpora };
+    } catch { throw new Error("evidenceReview requires a boolean enabled and explicit configured non-skill corpora when enabled"); }
+  }
   if (
     config.keepEmbeddingModelWarm !== undefined &&
     typeof config.keepEmbeddingModelWarm !== "boolean"
@@ -458,5 +473,6 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   }
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer,
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
+    evidenceReview,
     memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora), typesafe: resolveTypeSafe(config.typesafe) };
 }

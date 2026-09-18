@@ -1,5 +1,51 @@
 # Unblock Memory
 
+## Review and diagnostics
+
+- `memory_diagnostics` reports credential **availability only**, per-agent process-local
+  whisperer counters, projection version, old indexed-session projection count, and
+  embedding readiness. Counters are bounded to 100 agents and reset on restart.
+  No prompts, excerpts, paths, keys, or provider error bodies enter these counters.
+  Parser cleanup/budget-skip counts are persisted with the latest completed
+  `memory_sync_status`; unchanged sessions are not counted again. QMD structural
+  omission counts cover this manager's embedding passes, not the whole corpus.
+- Quality-audit groups distinguish `preserve_evidence_repair`, `inspect_scaffolding`,
+  and `context_review`, reusing cached noise/evidence judgments without another call.
+  Evidence-preserving repair tasks sort first. Maintenance tasks expose indexed
+  fingerprint presence; `not_present_in_index` is **not** a verified repair and
+  never resolves or deletes the task. Chunk boundaries may simply have changed.
+- `memory_review_cluster` uses the existing `qualityAudit` opt-in/corpus allowlist.
+  It judges up to three representative and three low-membership members, deduplicates
+  the sample, and skips unapproved or >2,000-character chunks whole. Repeated defect
+  labels are investigation leads only. Stale/changed samples are rejected; useful
+  or uncertain members are retained. No tasks or sources are modified.
+- `memory_review_claim` accepts one atomic claim (up to 2,000 characters) and 1–3
+  citations `{path, from, lines}`. It reads approved indexed evidence itself (at
+  most 6,000 characters), returns supports/contradicts/insufficient_evidence with
+  confidence and source hashes, and never writes or authorizes a write. Support
+  below 0.9 confidence is marked for review. This threshold is provisional, not a
+  guarantee of truth; read original evidence and verify current-state claims.
+
+New optional configuration (corpora must already be configured):
+
+```json
+{
+  "evidenceReview": { "enabled": true, "corpora": ["memory", "knowledge", "sessions"] },
+  "memoryWhisperer": {
+    "enabled": true, "corpora": ["memory", "knowledge"], "complementaryHints": true
+  }
+}
+```
+
+Both additions default off. Claim review sends the proposed claim and approved
+source excerpts to TypeSafe; cluster review sends approved sampled excerpts.
+Complementary hints use one extra bounded call over at most four already-useful
+candidates (six directional comparisons). Only redundancy probability >=0.9
+removes a hint; distinct evidence and contradictions should remain. Provider errors
+retain baseline hints, while the existing total turn deadline/cancellation still
+suppresses late results. Missing keys or disabled TypeSafe never enable these calls.
+The retrieval corpus/session boundaries are unchanged.
+
 Workspace-native memory for OpenClaw, powered internally by `@unblocklabs/qmd`.
 It keeps one warm QMD store per agent and exposes the standard `memory_search`
 and `memory_get` tools. Search uses semantic chunking and direct QMD vector
@@ -33,6 +79,27 @@ remain opt-in and should stay outside file-corpus globs (new default:
 `transcripts/loggie-archive`). Memory never follows archive paths embedded in
 messages. Truncated sessions stay explicitly incomplete; enabling archive
 enrichment is not part of this version.
+
+### Conservative ingestion cleanup
+
+Session projections unwrap complete, recognized task/attachment envelopes while
+keeping the actual result, task/status, filename, MIME type, and untrusted-content
+label. Internal task cleanup requires structured inter-session provenance, not
+just matching text. Unknown formats, malformed envelopes, and code examples stay
+intact. Assistant messages and Loggie's separate projection path are unaffected.
+Raw session events and workspace memory files are never rewritten.
+Attachment matching has a fixed work budget; oversized or repeatedly nested/
+incomplete envelopes leave the entire message unchanged rather than blocking sync.
+
+The companion QMD semantic-chunking update skips only source-confirmed standalone
+REM heading/marker spans and orphan closing fences. Reflections and useful text
+remain searchable, with original source offsets. These are deterministic rules,
+not TypeSafe judgments; audit flags never authorize automatic memory deletion.
+
+This release pins QMD 2.9.6. Projector/chunker version changes refresh derived
+projections and embeddings on their next normal sync; the first sync may take
+longer while re-embedding. No manual deletion of source memories or review tasks
+is needed.
 
 ## Installation
 

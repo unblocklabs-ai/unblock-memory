@@ -12,7 +12,7 @@ import {
 } from "./session-projector.js";
 
 const MANIFEST_VERSION = 1;
-const PROJECTOR_VERSION = 5;
+export const PROJECTOR_VERSION = 6;
 const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
 
 const REQUIRED_COLUMNS = {
@@ -55,6 +55,7 @@ export type SessionSyncResult = {
   failed: number;
   embedded: number;
   lastSuccessfulSyncAt: number;
+  diagnostics?: NonNullable<SessionProjectionInput["diagnostics"]>;
 };
 
 type WindowRow = {
@@ -278,6 +279,7 @@ export async function syncSessionProjections(params: {
   });
   const sessions: Record<string, IndexedSession> = {};
   const counts = { unchanged: 0, updated: 0, removed: 0, skipped: 0, failed: 0 };
+  const diagnostics = { internalMessagesCleaned: 0, attachmentsCleaned: 0, attachmentBudgetSkipped: 0 };
   await mkdir(params.outputDir, { recursive: true, mode: 0o700 });
   await chmod(params.outputDir, 0o700);
 
@@ -312,6 +314,7 @@ export async function syncSessionProjections(params: {
         agentName: params.agentName,
         timezone: params.timezone,
         events,
+        diagnostics,
       };
       content = projectSession(input);
     } catch {
@@ -367,6 +370,7 @@ export async function syncSessionProjections(params: {
       ...counts,
       embedded,
       lastSuccessfulSyncAt,
+      diagnostics,
     },
     manifest,
   };

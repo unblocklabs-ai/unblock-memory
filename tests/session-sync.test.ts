@@ -83,7 +83,7 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.match(document, /## User — Bek — .*\n\nHello memory/u);
   assert.doesNotMatch(document, /Private DM/);
   assert.doesNotMatch(document, /Abandoned branch/);
-  assert.equal(session.projectorVersion, 5);
+  assert.equal(session.projectorVersion, 6);
   assert.equal((await stat(outputDir)).mode & 0o777, 0o700);
   assert.equal((await stat(join(outputDir, session.documentPath))).mode & 0o777, 0o600);
   const firstModifiedAt = (await stat(join(outputDir, session.documentPath))).mtimeMs;
@@ -97,11 +97,11 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.equal((await stat(join(outputDir, session.documentPath))).mtimeMs, firstModifiedAt);
 
   const oldProjectorManifest = structuredClone(second.manifest);
-  oldProjectorManifest.sessions["channel-1"]!.projectorVersion = 3;
+  oldProjectorManifest.sessions["channel-1"]!.projectorVersion = 5;
   await writeFile(manifestPath, JSON.stringify(oldProjectorManifest));
   const migrated = await run();
   assert.equal(migrated.result.updated, 1);
-  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 5);
+  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 6);
   assert.equal(indexRuns, 3);
 
   const changed = new DatabaseSync(databasePath);
@@ -131,6 +131,43 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.equal(swept.result.removed, 1);
   assert.equal(Object.keys(swept.manifest.sessions).length, 0);
   assert.equal(indexRuns, 5);
+});
+
+test("upgrading a v5 projection reindexes cleaned content without editing raw events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-noise-migration-"));
+  const databasePath = join(root, "openclaw-agent.sqlite");
+  const outputDir = join(root, "sessions");
+  const manifestPath = join(root, "manifest.json");
+  const body = '<file name="decision.txt" mime="text/plain">\n\n<<<EXTERNAL_UNTRUSTED_CONTENT id="abc123">>>\nSource: External\nDecision: ship Friday.\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="abc123">>>\n</file>';
+  const event = { type: "message", message: { role: "user", content: body } };
+  const db = createAgentDatabase(databasePath);
+  insertSession(db, { sessionId: "upgrade", chatType: "channel", message: event });
+  db.close();
+  const params = { databasePath, outputDir, manifestPath, agentId: "main", agentName: "Pearl",
+    timezone: "UTC", chatTypes: ["channel"] as const, force: false, index: async () => 0 };
+  const first = await syncSessionProjections(params);
+  const entry = first.manifest.sessions.upgrade!;
+  const documentPath = join(outputDir, entry.documentPath);
+  const clean = await readFile(documentPath, "utf8");
+  assert.match(clean, /Attachment \(untrusted\).*decision.txt/);
+  assert.doesNotMatch(clean, /EXTERNAL_UNTRUSTED_CONTENT/);
+  // Model the previous release's projection plus manifest without modifying its source event.
+  const legacy = clean.slice(0, clean.indexOf("Attachment (untrusted)")) + body + "\n";
+  await writeFile(documentPath, legacy);
+  entry.projectorVersion = 5;
+  await writeFile(manifestPath, JSON.stringify(first.manifest));
+  let indexed = false;
+  const upgraded = await syncSessionProjections({ ...params, index: async () => {
+    assert.equal(await readFile(documentPath, "utf8"), clean);
+    indexed = true;
+    return 1;
+  } });
+  assert.equal(upgraded.result.updated, 1);
+  assert.equal(upgraded.manifest.sessions.upgrade!.projectorVersion, 6);
+  assert.ok(indexed);
+  const source = new DatabaseSync(databasePath, { readOnly: true });
+  try { assert.equal(source.prepare("SELECT event_json FROM transcript_events").get()!.event_json, JSON.stringify(event)); }
+  finally { source.close(); }
 });
 
 test("rejects manifest document paths outside the private projection directory", async () => {

@@ -1,6 +1,7 @@
 import type { QMDStore } from "@unblocklabs/qmd";
 import type { CurationStore, MaintenanceTask } from "./curation.js";
 import { type ResolvedSource } from "./sources.js";
+import { qualityTriage } from "./quality-triage.js";
 export type QualityCursor = {
     documentId: number;
     seq: number;
@@ -34,6 +35,7 @@ export declare function auditQualityPage(params: {
         reason: string;
         pending: number;
         examples: MaintenanceTask[];
+        triage: ReturnType<typeof qualityTriage>;
     }[];
     policy: string;
     scope: string;
@@ -54,6 +56,7 @@ export declare function auditQualityPage(params: {
         reason: string;
         pending: number;
         examples: MaintenanceTask[];
+        triage: ReturnType<typeof qualityTriage>;
     }[];
     policy: string;
     scope: string;

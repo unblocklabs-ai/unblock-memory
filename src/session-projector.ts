@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ChatType } from "./config.js";
 import { projectLoggieMessage } from "./loggie-projection.js";
+import { applyProposal, parseAttachments, parseInternalMessage } from "./session-noise.js";
 
 export type SessionMetadata = {
   sessionId: string;
@@ -16,6 +17,8 @@ export type SessionProjectionInput = SessionMetadata & {
   agentName: string;
   timezone: string;
   events: readonly { eventJson: string; createdAt: number }[];
+  /** Optional counters for this projection pass; never contains source text. */
+  diagnostics?: { internalMessagesCleaned: number; attachmentsCleaned: number; attachmentBudgetSkipped: number };
 };
 
 type ProjectedMessage = {
@@ -109,6 +112,19 @@ function projectMessage(row: SessionProjectionInput["events"][number], input: Se
     text = text.replace(/^From:[^\n]*\n/u, "").trim();
   }
   if (!text) return undefined;
+  if (role === "user" && input.provider?.toLowerCase() !== "loggie") {
+    const provenance = record(message.provenance);
+    const trusted = provenance?.kind === "inter_session" &&
+      (provenance.sourceTool === "subagent_announce" || provenance.sourceTool === "agent_harness_task");
+    const internal = parseInternalMessage(text, trusted);
+    const proposal = internal.edits.length ? internal : parseAttachments(text);
+    if (input.diagnostics) {
+      if (internal.edits.length) input.diagnostics.internalMessagesCleaned++;
+      input.diagnostics.attachmentsCleaned += proposal.edits.filter(edit => edit.reason === "attachment-envelope-prefix").length;
+      if (proposal.budgetSkipped) input.diagnostics.attachmentBudgetSkipped++;
+    }
+    text = applyProposal(text, proposal);
+  }
   const meeting = role === "user" && input.provider?.toLowerCase() === "loggie"
     ? projectLoggieMessage(text, input.accountId) : undefined;
   return {

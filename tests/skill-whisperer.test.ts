@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { WhispererDiagnostics } from "../src/diagnostics.js";
 import test from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { buildSkillWhispererQuery, registerSkillWhisperer } from "../src/skill-whisperer.js";
@@ -50,6 +51,7 @@ function harness(
   const queries: string[] = [];
   const minimumScores: number[] = [];
   const warnings: string[] = [];
+  const diagnostics = new WhispererDiagnostics();
   const api = {
     config: {},
     logger: { warn(message: string) { warnings.push(message); } },
@@ -68,11 +70,12 @@ function harness(
     },
     resolveSkillPath(_params: unknown, path: string) { return path.startsWith("/skills/") ? path : undefined; },
   };
-  registerSkillWhisperer(api, runtime, enabled, typesafe);
+  registerSkillWhisperer(api, runtime, enabled, typesafe, diagnostics);
   return {
     queries,
     minimumScores,
     warnings,
+    diagnostics,
     before: hooks.get("before_prompt_build") as unknown as BeforePromptBuild,
     after: hooks.get("after_tool_call") as unknown as AfterToolCall,
     end: hooks.get("session_end") as unknown as SessionEnd,
@@ -241,6 +244,7 @@ test("missing key keeps original selection and does not call TypeSafe", async (t
   }))?.prependContext ?? "", /alpha/);
   assert.deepEqual(h.minimumScores, [enabled.minScore]);
   assert.equal(h.warnings.length, 0);
+  assert.deepEqual(h.diagnostics.snapshot("main").skill, { missing_key: 1, emitted: 1 });
 });
 
 test("none and provider failures do not fall back to a strong vector match or consume cooldown", async (t) => {
@@ -255,6 +259,7 @@ test("none and provider failures do not fall back to a strong vector match or co
   assert.equal(h.warnings[0].includes("fake-secret"), false);
   fetch.mock.mockImplementation(async () => typeSafeResponse("skill_0"));
   assert.match((await h.before(event, { ...context, runId: "succeeded" }))?.prependContext ?? "", /alpha/);
+  assert.deepEqual(h.diagnostics.snapshot("main").skill, { rejected: 1, failed: 1, emitted: 1 });
 });
 
 test("TypeSafe conversation is bounded and pending selections do not survive session end", async (t) => {

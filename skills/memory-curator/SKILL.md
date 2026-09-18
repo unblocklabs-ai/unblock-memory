@@ -26,6 +26,17 @@ knowledge.
 
 ## Investigate
 
+For suspected ingestion defects, `memory_review_cluster` inspects a bounded
+center/edge sample using TypeSafe when quality auditing is enabled. Its findings
+apply only to those members; a shared label is a hypothesis, not permission to
+discard a cluster. Inspect original sources before proposing an ingestion fix.
+
+Before promoting a factual claim into knowledge, use `memory_review_claim` when
+evidence review is enabled: send one atomic claim and exact `qmd://` source ranges.
+Inspect contradictions and uncertainty rather than writing through them. A
+support judgment is advisory, not proof of current truth or authorization to
+write. If the tool is disabled/unavailable, perform source verification yourself.
+
 1. Call `memory_list_clusters`. If analysis is missing or stale, call
    `memory_recluster`, then list again.
 2. Fetch a useful cluster with `memory_fetch_cluster`. Start with

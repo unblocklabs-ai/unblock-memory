@@ -1,5 +1,6 @@
 import type { ChatType } from "./config.js";
-import { type SessionMetadata } from "./session-projector.js";
+import { type SessionMetadata, type SessionProjectionInput } from "./session-projector.js";
+export declare const PROJECTOR_VERSION = 6;
 type IndexedSession = SessionMetadata & {
     sourceGeneration: string;
     maxSeq: number;
@@ -23,6 +24,7 @@ export type SessionSyncResult = {
     failed: number;
     embedded: number;
     lastSuccessfulSyncAt: number;
+    diagnostics?: NonNullable<SessionProjectionInput["diagnostics"]>;
 };
 export declare function readSessionManifest(path: string): Promise<SessionManifest>;
 export declare function sessionMetadataByPath(manifest: SessionManifest): Map<string, SessionMetadata>;

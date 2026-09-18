@@ -36,6 +36,10 @@ export type UnblockMemoryConfig = {
         corpora: readonly string[];
         minNoise: number;
     };
+    evidenceReview: {
+        enabled: boolean;
+        corpora: readonly string[];
+    };
     people: {
         enabled: boolean;
         whisperer: {
@@ -54,6 +58,7 @@ export type UnblockMemoryConfig = {
     };
     memoryWhisperer: {
         enabled: boolean;
+        complementaryHints: boolean;
         corpora: readonly string[];
         historyMessages: number;
         minUsefulness: number;

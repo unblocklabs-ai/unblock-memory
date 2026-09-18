@@ -3,6 +3,7 @@ import type { CurationStore, MaintenanceTask } from "./curation.js";
 import { chunkFingerprint } from "./curation.js";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
 import { judgeTypeSafeQuality, QUALITY_JUDGE_VERSION, type QualityJudgment } from "./typesafe.js";
+import { qualityTriage } from "./quality-triage.js";
 
 export type QualityCursor = { documentId: number; seq: number };
 type ChunkRow = {
@@ -43,12 +44,13 @@ export async function auditQualityPage(params: {
     .map(source => [source.collection, source]));
   const groups = new Map<string, {
     corpus: string; source: string; reason: string; pending: number; examples: MaintenanceTask[];
+    triage: ReturnType<typeof qualityTriage>;
   }>();
   let scanned = 0, judged = 0, cached = 0, skippedOversized = 0, skippedStale = 0, flagged = 0;
   let next = params.after;
   const result = (status: "ok" | "partial", done: boolean) => ({
     status, done, next, scanned, judged, cached, skippedOversized, skippedStale, flagged,
-    groups: [...groups.values()],
+    groups: [...groups.values()].sort((a, b) => Number(b.triage === "preserve_evidence_repair") - Number(a.triage === "preserve_evidence_repair")),
     policy: QUALITY_JUDGE_VERSION,
     scope: "Indexed chunks only; not a whole-source audit. Findings are indicators, not permission to modify data.",
   });
@@ -125,15 +127,17 @@ export async function auditQualityPage(params: {
             indicator: structure === "empty" ? "deterministic_empty" :
               structure === "encoded_message" ? "deterministic_encoding" : "typesafe",
             ...judgment, policy: QUALITY_JUDGE_VERSION,
+            triage: qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message"),
             instruction: "Inspect original source and ingestion before acting. Verify source/index after any authorized repair. Never manually edit generated session projections.",
           }),
         });
         flagged++;
         advance();
         if (task.status !== "pending") continue;
-        const key = JSON.stringify([source.collection, reason]);
+        const triage = qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message");
+        const key = JSON.stringify([source.collection, reason, triage]);
         const group = groups.get(key) ?? {
-          corpus: source.corpus, source: source.configuredPath, reason, pending: 0, examples: [],
+          corpus: source.corpus, source: source.configuredPath, reason, triage, pending: 0, examples: [],
         };
         group.pending++;
         if (group.examples.length < 3) group.examples.push(task);

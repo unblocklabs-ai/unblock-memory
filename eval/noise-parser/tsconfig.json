@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": { "noEmit": false, "declaration": false, "rootDir": ".", "outDir": "../../reports/noise-parser/build" },
+  "include": ["parser.ts"]
+}

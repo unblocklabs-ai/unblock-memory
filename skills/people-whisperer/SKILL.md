@@ -42,6 +42,13 @@ agent to acknowledge what it inspected.
 
 ## Write only when useful
 
+Before adding or materially changing a dossier claim, use `memory_review_claim`
+when evidence review is enabled. Supply one atomic claim naming the person and
+its exact `qmd://` evidence ranges. Resolve wrong-person, date, scope, negation,
+and certainty mismatches before writing. This is advisory, not a mandatory tool
+receipt or proof of truth; disabled/unavailable reviews require your own source
+verification. Do not re-review unchanged claims just to generate activity.
+
 Call `memory_people_update` with `action: "replace_dossier"`, the `personId`, a
 concise `reason` for the change, and a complete dossier. The plugin records the
 reason and exact before/after snapshots transactionally. Keep the complete dossier

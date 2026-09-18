@@ -4,6 +4,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { SkillSearchCandidate } from "./manager.js";
 import { resolveTypeSafeApiKey, selectTypeSafeSkill } from "./typesafe.js";
 import { messageText } from "./whisperer-context.js";
+import type { WhispererDiagnostics } from "./diagnostics.js";
 
 const CANDIDATE_LIMIT = 10;
 const MAX_QUERY_CHARS = 12_000;
@@ -75,6 +76,7 @@ export function registerSkillWhisperer(
   runtime: SkillWhispererRuntime,
   config: UnblockMemoryConfig["skillWhisperer"],
   typesafe: UnblockMemoryConfig["typesafe"],
+  diagnostics?: WhispererDiagnostics,
 ): void {
   if (!config.enabled) return;
   const sessions = new Map<string, SessionState>();
@@ -98,6 +100,7 @@ export function registerSkillWhisperer(
     try {
       const runtimeParams = active(context.agentId);
       const apiKey = await resolveTypeSafeApiKey(typesafe);
+      if (!apiKey) diagnostics?.record(context.agentId, "skill", typesafe.enabled ? "missing_key" : "typesafe_disabled");
       const candidates = await runtime.searchSkills(
         runtimeParams,
         buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages),
@@ -109,6 +112,7 @@ export function registerSkillWhisperer(
         return canonicalPath ? [{ candidate, canonicalPath }] : [];
       });
       let resolved = resolvedCandidates[0];
+      if (!resolved) { diagnostics?.record(context.agentId, "skill", "no_candidates"); return; }
       if (apiKey) {
         const shortlist = resolvedCandidates.slice(0, TYPESAFE_CANDIDATE_LIMIT);
         const selectedIndex = await selectTypeSafeSkill({
@@ -116,27 +120,29 @@ export function registerSkillWhisperer(
           ...typeSafeConversation(event.prompt, event.messages, config.historyMessages),
           candidates: shortlist.map(({ candidate }) => candidate),
         });
-        if (selectedIndex === undefined) return;
+        if (selectedIndex === undefined) { diagnostics?.record(context.agentId, "skill", "rejected"); return; }
         resolved = shortlist[selectedIndex];
-      } else if (resolved && resolved.candidate.score < config.minScore) return;
+      } else if (resolved && resolved.candidate.score < config.minScore) { diagnostics?.record(context.agentId, "skill", "rejected"); return; }
       if (!resolved) return;
       // A selection completing after session teardown must not resurrect its hint.
-      if (sessions.get(scope) !== state || state.lastRunId !== context.runId) return;
+      if (sessions.get(scope) !== state || state.lastRunId !== context.runId) { diagnostics?.record(context.agentId, "skill", "cancelled"); return; }
       const { candidate: selected, canonicalPath } = resolved;
       if (apiKey && runtime.resolveSkillPath(runtimeParams, selected.path) !== canonicalPath) return;
       const previous = state.skills.get(canonicalPath);
       const lastSeen = Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity);
-      if (state.turn - lastSeen <= config.cooldownTurns) return;
+      if (state.turn - lastSeen <= config.cooldownTurns) { diagnostics?.record(context.agentId, "skill", "cooldown"); return; }
       const history = state.skills.get(canonicalPath) ?? {};
       history.suggested = state.turn;
       state.skills.set(canonicalPath, history);
+      diagnostics?.record(context.agentId, "skill", "emitted");
       return {
         prependContext:
           `A potentially relevant skill is available: ${JSON.stringify(selected.name)} ` +
           `at ${JSON.stringify(selected.path)}. Check it before proceeding if applicable.`,
       };
     } catch (error) {
-      api.logger.warn(`unblock-memory skill whisperer search failed: ${String(error)}`);
+      diagnostics?.record(context.agentId, "skill", error instanceof Error && error.message === "TypeSafe selection timed out" ? "timed_out" : "failed");
+      api.logger.warn("unblock-memory skill whisperer failed; no hint emitted");
       return;
     }
   });
@@ -154,8 +160,8 @@ export function registerSkillWhisperer(
       const history = state.skills.get(canonicalPath) ?? {};
       history.opened = state.turn;
       state.skills.set(canonicalPath, history);
-    } catch (error) {
-      api.logger.warn(`unblock-memory skill whisperer read tracking failed: ${String(error)}`);
+    } catch {
+      api.logger.warn("unblock-memory skill whisperer read tracking failed");
     }
   }, { matcher: ["read"] });
 

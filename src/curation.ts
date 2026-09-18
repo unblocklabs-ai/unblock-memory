@@ -251,7 +251,10 @@ export class CurationStore {
     return this.#db.prepare(`
       SELECT * FROM maintenance_tasks
       WHERE status = ?
-      ORDER BY created_at, id
+      ORDER BY CASE WHEN type = 'quality_review' AND json_valid(detail) THEN
+        CASE WHEN json_extract(detail, '$.evidence') >= 0.8 AND
+          (json_extract(detail, '$.noise') >= 0.8 OR reason = 'possible_double_encoded_message') THEN 0 ELSE 1 END
+        ELSE 1 END, created_at, id
       LIMIT ?
     `).all(status, limit).map((row) => task(row as TaskRow));
   }

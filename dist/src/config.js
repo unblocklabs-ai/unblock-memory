@@ -79,7 +79,7 @@ const DEFAULT_SKILL_WHISPERER = {
     cooldownTurns: 10,
 };
 const DEFAULT_MEMORY_WHISPERER = {
-    enabled: false, corpora: [], historyMessages: 5, minUsefulness: 0.9,
+    enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.9,
     maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
 };
 function resolveMemoryWhisperer(value, corpora) {
@@ -93,6 +93,9 @@ function resolveMemoryWhisperer(value, corpora) {
     const enabled = config.enabled ?? false;
     if (typeof enabled !== "boolean")
         throw new Error("unblock-memory memoryWhisperer.enabled must be a boolean");
+    const complementaryHints = config.complementaryHints ?? false;
+    if (typeof complementaryHints !== "boolean")
+        throw new Error("memoryWhisperer.complementaryHints must be a boolean");
     const selected = config.corpora ?? [];
     if (!Array.isArray(selected) || !selected.every((name) => typeof name === "string" && corpora.some(corpus => corpus.name === name && corpus.kind !== "skills"))) {
         throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora");
@@ -112,7 +115,7 @@ function resolveMemoryWhisperer(value, corpora) {
         throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
     }
     return {
-        enabled, corpora: [...new Set(selected)], historyMessages, cooldownTurns, minUsefulness,
+        enabled, complementaryHints, corpora: [...new Set(selected)], historyMessages, cooldownTurns, minUsefulness,
         maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
         timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
     };
@@ -258,6 +261,7 @@ export function resolveConfig(value) {
             analysis: {},
             typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
             qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
+            evidenceReview: { enabled: false, corpora: [] },
             people: DEFAULT_PEOPLE_CONFIG,
             skillWhisperer: DEFAULT_SKILL_WHISPERER,
             memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
@@ -267,9 +271,23 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
+    let evidenceReview = { enabled: false, corpora: [] };
+    if (config.evidenceReview !== undefined) {
+        const value = config.evidenceReview;
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("evidenceReview must be an object");
+        assertOnlyKeys(value, ["enabled", "corpora"], "evidenceReview");
+        try {
+            const approved = resolveQualityAudit(value, corpora);
+            evidenceReview = { enabled: approved.enabled, corpora: approved.corpora };
+        }
+        catch {
+            throw new Error("evidenceReview requires a boolean enabled and explicit configured non-skill corpora when enabled");
+        }
+    }
     if (config.keepEmbeddingModelWarm !== undefined &&
         typeof config.keepEmbeddingModelWarm !== "boolean") {
         throw new Error("unblock-memory keepEmbeddingModelWarm must be a boolean");
@@ -328,5 +346,6 @@ export function resolveConfig(value) {
     }
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer,
         qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
+        evidenceReview,
         memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora), typesafe: resolveTypeSafe(config.typesafe) };
 }

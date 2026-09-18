@@ -16,6 +16,7 @@ import {
 import { clusterReference, ensureMemoryAnalysisSchema } from "../src/analysis.js";
 import { resolveSessionSource, resolveSource, resolveSources } from "../src/sources.js";
 import { createAgentDatabase } from "./helpers/session-database.js";
+import { reviewFixture } from "./helpers/review-store.js";
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -61,6 +62,107 @@ function createManagerStore(
     async close() {},
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+function reviewResponse(kind: "claim" | "cluster") {
+  return Response.json({ answers: kind === "claim"
+    ? { relation: { type: "choice", choice: "supports", confidence: 0.99,
+        probabilities: { supports: 0.99, contradicts: 0.005, insufficient_evidence: 0.005 } } }
+    : { member_0: { type: "choice", choice: "wrapper", confidence: 0.99,
+        probabilities: { wrapper: 0.97, encoding: 0.01, boilerplate: 0.01, none_or_uncertain: 0.01 } } },
+  });
+}
+
+for (const kind of ["claim", "cluster"] as const) {
+  test(`${kind} inference does not block searches; final verification waits for mutations`, { timeout: 5000 }, async t => {
+    const f = await reviewFixture(); t.after(f.close);
+    const note = await f.insert("Ava approved staging.");
+    const mutationStarted = deferred<void>(), finishMutation = deferred<void>();
+    const manager = new QmdMemoryManager({ dbPath: join(f.source.root, "manager.sqlite"), workspaceDir: f.source.root,
+      sources: [f.source], storeFactory: async () => createManagerStore({ internal: f.store.internal,
+        async update() {
+          mutationStarted.resolve(); await finishMutation.promise;
+          f.db.prepare("UPDATE documents SET active = 0").run();
+          return { collections: 1, indexed: 0, updated: 0, unchanged: 0, removed: 1, skipped: 0, needsEmbedding: 0 };
+        },
+      }),
+    });
+    t.after(async () => { finishMutation.resolve(); await manager.close(); });
+    await manager.diagnostics();
+    const clusterId = f.cluster([note.hash]);
+    const fetched = deferred<void>(), response = deferred<Response>();
+    t.after(() => response.resolve(Response.json({})));
+    t.mock.method(globalThis, "fetch", async () => { fetched.resolve(); return response.promise; });
+    const options = { corpora: ["memory"], apiKey: "fake-secret", timeoutMs: 2000, signal: new AbortController().signal };
+    const pending = kind === "claim"
+      ? manager.reviewClaim({ ...options, claim: note.text, citations: [{ path: note.uri, from: 1, lines: 1 }] })
+      : manager.reviewCluster({ ...options, clusterId });
+    await fetched.promise;
+    // These must complete while the provider response is still deliberately held.
+    assert.deepEqual(await manager.search("staging", { lexicalOnly: true }), []);
+    await manager.diagnostics();
+    const mutation = manager.sync();
+    await mutationStarted.promise;
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    response.resolve(reviewResponse(kind));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false, "freshness check must wait for the in-progress mutation");
+    finishMutation.resolve(); await mutation;
+    assert.equal((await pending).status, "unavailable");
+  });
+
+  test(`${kind} review cancels while queued and closes without waiting for the provider`, { timeout: 5000 }, async t => {
+    const f = await reviewFixture(); t.after(f.close);
+    const note = await f.insert("Ava approved staging.");
+    const mutationStarted = deferred<void>(), finishMutation = deferred<void>();
+    const manager = new QmdMemoryManager({ dbPath: join(f.source.root, "manager.sqlite"), workspaceDir: f.source.root,
+      sources: [f.source], storeFactory: async () => createManagerStore({ internal: f.store.internal,
+        async update() { mutationStarted.resolve(); await finishMutation.promise;
+          return { collections: 1, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 }; },
+      }),
+    });
+    t.after(async () => { finishMutation.resolve(); await manager.close(); });
+    await manager.diagnostics();
+    const clusterId = f.cluster([note.hash]);
+    const run = (signal: AbortSignal) => {
+      const options = { corpora: ["memory"], apiKey: "fake-secret", timeoutMs: 2000, signal };
+      return kind === "claim"
+        ? manager.reviewClaim({ ...options, claim: note.text, citations: [{ path: note.uri, from: 1, lines: 1 }] })
+        : manager.reviewCluster({ ...options, clusterId });
+    };
+    const fetched = deferred<void>(), response = deferred<Response>();
+    t.after(() => response.resolve(Response.json({})));
+    let providerSignal: AbortSignal | null | undefined;
+    const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+      providerSignal = init?.signal;
+      fetched.resolve(); return response.promise;
+    });
+    const mutation = manager.sync(); await mutationStarted.promise;
+    const controller = new AbortController();
+    const rejected = assert.rejects(run(controller.signal), { name: "AbortError" });
+    controller.abort(); await rejected;
+    assert.equal(fetch.mock.callCount(), 0);
+    finishMutation.resolve(); await mutation;
+    const closingReview = assert.rejects(run(new AbortController().signal), { name: "AbortError" });
+    await fetched.promise;
+    await manager.close();
+    await closingReview;
+    assert.equal(providerSignal?.aborted, true);
+    await assert.rejects(run(new AbortController().signal), { name: "AbortError" });
+    // A late provider response must not reopen/access the manager's database.
+    const prepare = t.mock.method(f.db, "prepare");
+    response.resolve(reviewResponse(kind));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(prepare.mock.callCount(), 0);
+    assert.equal(fetch.mock.callCount(), 1);
+  });
 }
 
 test("bounds default memory reads and provides continuation", () => {
@@ -1175,7 +1277,7 @@ test("queues ambiguous chronology once and applies a durable agent annotation", 
     const first = await manager.fetchCluster({ clusterId, sort: "date_asc" });
     assert.equal(first.members?.[0]?.eventTime, null);
     await manager.fetchCluster({ clusterId, sort: "date_desc" });
-    const tasks = manager.listMaintenanceTasks();
+    const tasks = await manager.listMaintenanceTasks();
     assert.equal(tasks.length, 1);
 
     manager.updateMaintenanceTask({
@@ -1191,7 +1293,7 @@ test("queues ambiguous chronology once and applies a durable agent annotation", 
     const resolved = await manager.fetchCluster({ clusterId, sort: "representative" });
     assert.equal(resolved.members?.[0]?.eventTime, "2026-07-15T00:00:00.000Z");
     assert.equal(resolved.members?.[0]?.eventTimeBasis, "agent_verified");
-    assert.deepEqual(manager.listMaintenanceTasks(), []);
+    assert.deepEqual(await manager.listMaintenanceTasks(), []);
   } finally {
     await manager.close();
   }
@@ -1252,7 +1354,7 @@ test("queues duplicate proposals only for the fetched page and excludes sessions
     insertDuplicate.run("other", "unrelated", "unrelated-duplicate", 0);
 
     await manager.fetchCluster({ clusterId: clusterReference("run", 1), sort: "representative" });
-    const tasks = manager.listMaintenanceTasks({ limit: 10 });
+    const tasks = await manager.listMaintenanceTasks({ limit: 10 });
     assert.deepEqual(tasks.map((task) => task.path).sort(), ["also-duplicate.md", "duplicate.md"]);
     assert.ok(tasks.every((task) => task.type === "exact_duplicate"));
     assert.match(tasks.find((task) => task.path === "duplicate.md")?.detail ?? "", /^12 exact duplicate occurrences/);

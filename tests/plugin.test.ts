@@ -110,6 +110,9 @@ test("registers exactly the clean memory tool contract and validates every tool 
       "memory_audit_quality",
       "memory_list_maintenance_tasks",
       "memory_update_maintenance_task",
+      "memory_diagnostics",
+      "memory_review_claim",
+      "memory_review_cluster",
     ],
   );
   assert.ok(
@@ -134,6 +137,10 @@ test("registers exactly the clean memory tool contract and validates every tool 
   assert.ok(tool("memory_update_maintenance_task").parameters.properties?.action);
 
   const invalidCalls: Array<[name: string, params: unknown]> = [
+    ["memory_diagnostics", { extra: true }],
+    ["memory_review_claim", { claim: "x", citations: [] }],
+    ["memory_review_claim", { claim: "x", citations: [{ path: "qmd://memory/note.md", from: 0, lines: 1 }] }],
+    ["memory_review_cluster", { clusterId: "unknown" }],
     ["memory_audit_quality", { limit: 21 }],
     ["memory_audit_quality", { corpora: ["private"] }],
     ["memory_audit_quality", { after: { documentId: -1, seq: 0 } }],

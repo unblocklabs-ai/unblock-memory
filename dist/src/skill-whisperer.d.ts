@@ -1,6 +1,7 @@
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { SkillSearchCandidate } from "./manager.js";
+import type { WhispererDiagnostics } from "./diagnostics.js";
 type SkillWhispererRuntime = {
     searchSkills(params: {
         cfg: OpenClawConfig;
@@ -12,5 +13,5 @@ type SkillWhispererRuntime = {
     }, path: string): string | undefined;
 };
 export declare function buildSkillWhispererQuery(prompt: string, messages: readonly unknown[], historyMessages: number): string;
-export declare function registerSkillWhisperer(api: OpenClawPluginApi, runtime: SkillWhispererRuntime, config: UnblockMemoryConfig["skillWhisperer"], typesafe: UnblockMemoryConfig["typesafe"]): void;
+export declare function registerSkillWhisperer(api: OpenClawPluginApi, runtime: SkillWhispererRuntime, config: UnblockMemoryConfig["skillWhisperer"], typesafe: UnblockMemoryConfig["typesafe"], diagnostics?: WhispererDiagnostics): void;
 export {};

@@ -6,10 +6,14 @@ import picomatch from "picomatch";
 import { meetingRevisionAnnotation, meetingSpeakerSpans } from "./loggie-projection.js";
 import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
 import { CurationStore, chunkFingerprint, } from "./curation.js";
-import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, } from "./session-sync.js";
+import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, PROJECTOR_VERSION, } from "./session-sync.js";
 import { sessionContextSpans } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath } from "./sources.js";
 import { auditQualityPage } from "./quality-audit.js";
+import { qualityTaskPresence } from "./quality-triage.js";
+import { reviewIndexedClaim } from "./evidence-review.js";
+import { reviewClusterIngestion } from "./cluster-review.js";
+import { abortable } from "./abortable.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
@@ -279,6 +283,30 @@ export class QmdMemoryManager {
     #sessionManifestMtimeNs;
     #skillIndex;
     #qualityAuditRunning = false;
+    #reviewLifetime = new AbortController();
+    #structuralChunksOmitted = 0;
+    #structuralDiagnosticsAvailable = false;
+    #recordEmbedding(result) {
+        if ("structuralChunksOmitted" in result && typeof result.structuralChunksOmitted === "number") {
+            this.#structuralDiagnosticsAvailable = true;
+            this.#structuralChunksOmitted += result.structuralChunksOmitted;
+        }
+    }
+    async diagnostics() {
+        await this.#operationChain;
+        const store = await this.#getStore();
+        const status = await store.getStatus();
+        const manifest = this.#sessions ? await readSessionManifest(this.#sessions.manifestPath) : undefined;
+        return {
+            projectorVersion: PROJECTOR_VERSION,
+            semanticChunkingVersion: "semanticChunkingVersion" in status ? status.semanticChunkingVersion : null,
+            sessionsNeedingProjection: manifest ? Object.values(manifest.sessions).filter(session => session.projectorVersion !== PROJECTOR_VERSION).length : 0,
+            needsEmbedding: status.needsEmbedding,
+            embeddingReady: status.needsEmbedding === 0 && status.hasVectorIndex,
+            structuralChunksOmitted: this.#structuralDiagnosticsAvailable ? this.#structuralChunksOmitted : null,
+            scope: "Projection count covers previously indexed sessions; omissions count this manager lifetime; null means dependency has not reported counts.",
+        };
+    }
     constructor(params) {
         this.#dbPath = params.dbPath;
         this.#curationPath = params.curationPath ?? `${params.dbPath}.curation.sqlite`;
@@ -474,6 +502,7 @@ export class QmdMemoryManager {
                     markAnalysisStale();
                 }
                 const embed = await store.embed({ force: params?.force, chunkStrategy: "semantic" });
+                this.#recordEmbedding(embed);
                 if (completedEmbeddingCount(embed) > 0)
                     markAnalysisStale();
             }
@@ -488,6 +517,7 @@ export class QmdMemoryManager {
                     force: params?.force,
                     chunkStrategy: "semantic",
                 });
+                this.#recordEmbedding(embed);
                 if (completedEmbeddingCount(embed) > 0)
                     markAnalysisStale();
             }
@@ -523,6 +553,7 @@ export class QmdMemoryManager {
                         chunkStrategy: "semantic",
                     });
                     const chunksEmbedded = completedEmbeddingCount(embed);
+                    this.#recordEmbedding(embed);
                     if (!invalidatesAnalysis && chunksEmbedded > 0 && analysisStore.internal) {
                         markMemoryAnalysisStale(analysisStore.internal.db);
                     }
@@ -567,6 +598,37 @@ export class QmdMemoryManager {
     listClusters(limit) {
         return this.#enqueue(async () => readClusters((await this.#getAnalysisStore()).internal.db, limit));
     }
+    reviewClaim(params) {
+        return this.#review(params.signal, context => reviewIndexedClaim({ ...params, ...context,
+            sources: [...this.#sources.values()].filter(source => params.corpora.includes(source.corpus)),
+        }));
+    }
+    reviewCluster(params) {
+        return this.#review(params.signal, context => reviewClusterIngestion({ ...params, ...context,
+            sources: [...this.#sources.values()].filter(source => params.corpora.includes(source.corpus)),
+        }));
+    }
+    async #review(callerSignal, run) {
+        const signal = AbortSignal.any([callerSignal, this.#reviewLifetime.signal]);
+        signal.throwIfAborted();
+        const store = await abortable(this.#enqueue(async () => {
+            signal.throwIfAborted();
+            const store = await this.#getAnalysisStore();
+            signal.throwIfAborted();
+            return store;
+        }), signal);
+        const read = (work) => {
+            signal.throwIfAborted();
+            return abortable(this.#enqueue(async () => {
+                signal.throwIfAborted();
+                return work();
+            }), signal);
+        };
+        // Only the synchronous evidence snapshot and freshness check enter the queue.
+        // Closing aborts inference and prevents any late response from touching the DB.
+        signal.throwIfAborted();
+        return abortable(run({ db: store.internal.db, signal, read }), signal);
+    }
     fetchCluster(params) {
         return this.#enqueue(async () => {
             const db = (await this.#getAnalysisStore()).internal.db;
@@ -596,8 +658,14 @@ export class QmdMemoryManager {
             return detail;
         });
     }
-    listMaintenanceTasks(params = {}) {
-        return this.#getCuration().listTasks(params);
+    async listMaintenanceTasks(params = {}) {
+        await this.#operationChain;
+        const tasks = this.#getCuration().listTasks(params);
+        if (!tasks.some(task => task.type === "quality_review"))
+            return tasks;
+        const store = await this.#getAnalysisStore();
+        const fingerprints = new Map();
+        return tasks.map(task => ({ ...task, indexPresence: qualityTaskPresence(store.internal.db, task, fingerprints) }));
     }
     async auditQuality(params) {
         if (this.#qualityAuditRunning)
@@ -916,6 +984,7 @@ export class QmdMemoryManager {
     }
     async close() {
         this.#closed = true;
+        this.#reviewLifetime.abort();
         if (this.#watchTimer)
             clearTimeout(this.#watchTimer);
         this.#watchTimer = undefined;

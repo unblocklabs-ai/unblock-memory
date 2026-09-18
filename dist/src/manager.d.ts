@@ -2,10 +2,13 @@ import type { QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadResult, MemoryRequestContext, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
 import type { ChatType } from "./config.js";
-import { type MaintenanceStatus, type TemporalBasis } from "./curation.js";
+import { type MaintenanceStatus, type MaintenanceTask, type TemporalBasis } from "./curation.js";
 import { type SessionSyncResult } from "./session-sync.js";
 import { type ResolvedSource } from "./sources.js";
 import { type QualityCursor } from "./quality-audit.js";
+import { qualityTaskPresence } from "./quality-triage.js";
+import { reviewIndexedClaim } from "./evidence-review.js";
+import { reviewClusterIngestion } from "./cluster-review.js";
 export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "searchLex" | "vsearch" | "get" | "getDocumentBody" | "close">;
 export type ManagerSessionConfig = {
     agentId: string;
@@ -40,6 +43,15 @@ export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, 
 }>;
 export declare class QmdMemoryManager implements MemorySearchManagerContract {
     #private;
+    diagnostics(): Promise<{
+        projectorVersion: number;
+        semanticChunkingVersion: number | null | undefined;
+        sessionsNeedingProjection: number;
+        needsEmbedding: number;
+        embeddingReady: boolean;
+        structuralChunksOmitted: number | null;
+        scope: string;
+    }>;
     constructor(params: {
         dbPath: string;
         curationPath?: string;
@@ -56,6 +68,71 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void): Promise<SessionSyncResult>;
     recluster(options?: MemoryReclusterOptions, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
     listClusters(limit?: number): Promise<MemoryClusterList>;
+    reviewClaim(params: Omit<Parameters<typeof reviewIndexedClaim>[0], "db" | "sources" | "read"> & {
+        corpora: readonly string[];
+    }): Promise<{
+        status: "unavailable";
+        verdict: "insufficient_evidence";
+        needsReview: boolean;
+        reason: string;
+    } | {
+        evidence: {
+            path: string;
+            from: number;
+            lines: number;
+            documentHash: string;
+            excerptHash: string;
+        }[];
+        policy: string;
+        scope: string;
+        verdict: "supports" | "contradicts" | "insufficient_evidence";
+        confidence: number;
+        probabilities: {
+            supports: number;
+            contradicts: number;
+            insufficient_evidence: number;
+        };
+        needsReview: boolean;
+        status: "ok";
+    }>;
+    reviewCluster(params: Omit<Parameters<typeof reviewClusterIngestion>[0], "db" | "sources" | "read"> & {
+        corpora: readonly string[];
+    }): Promise<{
+        status: "unavailable";
+        reason: string;
+        sample?: undefined;
+        considered?: undefined;
+        runId?: undefined;
+        clusterSize?: undefined;
+    } | {
+        status: "ok";
+        runId: string;
+        clusterId: string;
+        members: {
+            flagged: boolean;
+            defect: "encoding" | "wrapper" | "boilerplate" | "none_or_uncertain";
+            confidence: number;
+            path: string;
+            hash: string;
+            seq: number;
+            from: number;
+            fingerprint: string;
+        }[];
+        recurring: {
+            defect: string;
+            examples: {
+                path: string;
+                from: number;
+                fingerprint: string;
+            }[];
+        }[];
+        sampled: number;
+        considered: number;
+        clusterSize: number | undefined;
+        policy: string;
+        scope: string;
+        reason?: undefined;
+    }>;
     fetchCluster(params: {
         clusterId: string;
         topK?: number;
@@ -65,7 +142,9 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     listMaintenanceTasks(params?: {
         status?: MaintenanceStatus;
         limit?: number;
-    }): import("./curation.js").MaintenanceTask[];
+    }): Promise<(MaintenanceTask & {
+        indexPresence?: ReturnType<typeof qualityTaskPresence>;
+    })[]>;
     auditQuality(params: {
         corpora: readonly string[];
         apiKey: string;
@@ -89,7 +168,8 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
             source: string;
             reason: string;
             pending: number;
-            examples: import("./curation.js").MaintenanceTask[];
+            examples: MaintenanceTask[];
+            triage: ReturnType<typeof import("./quality-triage.js").qualityTriage>;
         }[];
         policy: string;
         scope: string;
@@ -108,7 +188,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
             basis: TemporalBasis;
             evidence: string;
         };
-    }): import("./curation.js").MaintenanceTask | undefined;
+    }): MaintenanceTask | undefined;
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
     readFile(params: {

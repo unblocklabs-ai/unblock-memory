@@ -9,23 +9,9 @@ import { registerPeopleTools } from "./people-tools.js";
 import { QmdMemoryRuntime } from "./runtime.js";
 import { registerSkillWhisperer } from "./skill-whisperer.js";
 import { registerMemoryWhisperer } from "./memory-whisperer.js";
-function getContext(ctx) {
-    const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
-    if (!cfg || !ctx.agentId)
-        return undefined;
-    return {
-        cfg,
-        agentId: ctx.agentId,
-        requestContext: {
-            sessionKey: ctx.sessionKey,
-            sessionId: ctx.sessionId,
-            messageChannel: ctx.messageChannel,
-            agentAccountId: ctx.agentAccountId,
-            nativeChannelId: ctx.nativeChannelId,
-            deliveryContext: ctx.deliveryContext,
-        },
-    };
-}
+import { getContext } from "./tool-context.js";
+import { WhispererDiagnostics } from "./diagnostics.js";
+import { registerReviewTools } from "./review-tools.js";
 const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
     corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
@@ -302,7 +288,7 @@ function createListMaintenanceTool(runtime, ctx) {
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
                 return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
-            return jsonResult({ status: "ok", tasks: manager.listMaintenanceTasks(options) });
+            return jsonResult({ status: "ok", tasks: await manager.listMaintenanceTasks(options) });
         },
     };
 }
@@ -460,8 +446,9 @@ export function registerUnblockMemory(api) {
         registerPeopleTools(api, peopleStores, config.people);
         api.on("gateway_stop", () => peopleStores.closeAll());
     }
-    registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe);
-    registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe);
+    const diagnostics = new WhispererDiagnostics();
+    registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics);
+    registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe, diagnostics);
     api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
     api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
@@ -482,4 +469,5 @@ export function registerUnblockMemory(api) {
     api.registerTool((ctx) => createUpdateMaintenanceTool(runtime, ctx), {
         names: ["memory_update_maintenance_task"],
     });
+    registerReviewTools(api, runtime, config, diagnostics);
 }
