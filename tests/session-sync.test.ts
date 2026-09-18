@@ -83,7 +83,7 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.match(document, /## User — Bek — .*\n\nHello memory/u);
   assert.doesNotMatch(document, /Private DM/);
   assert.doesNotMatch(document, /Abandoned branch/);
-  assert.equal(session.projectorVersion, 3);
+  assert.equal(session.projectorVersion, 5);
   assert.equal((await stat(outputDir)).mode & 0o777, 0o700);
   assert.equal((await stat(join(outputDir, session.documentPath))).mode & 0o777, 0o600);
   const firstModifiedAt = (await stat(join(outputDir, session.documentPath))).mtimeMs;
@@ -97,11 +97,11 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.equal((await stat(join(outputDir, session.documentPath))).mtimeMs, firstModifiedAt);
 
   const oldProjectorManifest = structuredClone(second.manifest);
-  oldProjectorManifest.sessions["channel-1"]!.projectorVersion = 1;
+  oldProjectorManifest.sessions["channel-1"]!.projectorVersion = 3;
   await writeFile(manifestPath, JSON.stringify(oldProjectorManifest));
   const migrated = await run();
   assert.equal(migrated.result.updated, 1);
-  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 3);
+  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 5);
   assert.equal(indexRuns, 3);
 
   const changed = new DatabaseSync(databasePath);

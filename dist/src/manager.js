@@ -3,6 +3,7 @@ import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import chokidar from "chokidar";
 import picomatch from "picomatch";
+import { meetingSpeakerSpans } from "./loggie-projection.js";
 import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
 import { CurationStore, chunkFingerprint, } from "./curation.js";
 import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, } from "./session-sync.js";
@@ -184,7 +185,8 @@ function lineSpan(body, position, text) {
 }
 export async function expandSessionSearchHit(result, maxTokens, countTokens, maxChars = Infinity) {
     const leaf = { text: result.bestChunk, position: result.chunkPos };
-    const spans = sessionContextSpans(result.body, result.chunkPos);
+    const speaker = meetingSpeakerSpans(result.body, result.chunkPos, result.chunkPos + result.chunkLen);
+    const spans = speaker ?? sessionContextSpans(result.body, result.chunkPos);
     if (!spans)
         return leaf;
     const leafEnd = result.chunkPos + result.chunkLen;
@@ -196,6 +198,12 @@ export async function expandSessionSearchHit(result, maxTokens, countTokens, max
             continue;
         if (await countTokens(text) <= maxTokens)
             return { text, position: span.start };
+    }
+    if (speaker && speaker.start < result.chunkPos) {
+        const text = `${speaker.header}\n${leaf.text}`;
+        if (text.length <= maxChars && await countTokens(text) <= maxTokens) {
+            return { ...leaf, text, sourceText: leaf.text };
+        }
     }
     return leaf;
 }
@@ -768,7 +776,7 @@ export class QmdMemoryManager {
             const selected = corpus === "sessions" && this.#sessions && tokenizer
                 ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text), opts?.maxSnippetChars)
                 : { text: hit.bestChunk, position: hit.chunkPos };
-            const span = lineSpan(hit.body, selected.position, selected.text);
+            const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
             results.push({
                 path: hit.file,
                 ...span,

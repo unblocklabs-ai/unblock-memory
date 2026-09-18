@@ -4,6 +4,7 @@ import { basename, dirname, relative, resolve, sep } from "node:path";
 import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
 import picomatch from "picomatch";
+import { meetingSpeakerSpans } from "./loggie-projection.js";
 import {
   ensureMemoryAnalysisSchema,
   latestAnalysisCollections,
@@ -302,9 +303,10 @@ export async function expandSessionSearchHit(
   maxTokens: number,
   countTokens: (text: string) => Promise<number>,
   maxChars = Infinity,
-): Promise<{ text: string; position: number }> {
+): Promise<{ text: string; position: number; sourceText?: string }> {
   const leaf = { text: result.bestChunk, position: result.chunkPos };
-  const spans = sessionContextSpans(result.body, result.chunkPos);
+  const speaker = meetingSpeakerSpans(result.body, result.chunkPos, result.chunkPos + result.chunkLen);
+  const spans = speaker ?? sessionContextSpans(result.body, result.chunkPos);
   if (!spans) return leaf;
   const leafEnd = result.chunkPos + result.chunkLen;
   for (const span of [spans.turn, spans.message]) {
@@ -312,6 +314,12 @@ export async function expandSessionSearchHit(
     const text = result.body.slice(span.start, span.end).trimEnd();
     if (text.length > maxChars) continue;
     if (await countTokens(text) <= maxTokens) return { text, position: span.start };
+  }
+  if (speaker && speaker.start < result.chunkPos) {
+    const text = `${speaker.header}\n${leaf.text}`;
+    if (text.length <= maxChars && await countTokens(text) <= maxTokens) {
+      return { ...leaf, text, sourceText: leaf.text };
+    }
   }
   return leaf;
 }
@@ -982,7 +990,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             opts?.maxSnippetChars,
           )
         : { text: hit.bestChunk, position: hit.chunkPos };
-      const span = lineSpan(hit.body, selected.position, selected.text);
+      const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
       results.push({
         path: hit.file,
         ...span,

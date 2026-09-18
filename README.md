@@ -8,6 +8,32 @@ search without query expansion or a reranker, so only the embedding model loads.
 Optional memory analysis uses those same stored vectors in the same SQLite
 index. It does not re-embed memory, copy vectors, or create another database.
 
+### Loggie meeting interoperability
+
+Loggie v0.1.12+ persists versioned, speaker-attributed meeting Markdown separately
+from its workflow prompt. Session projection recognizes that format and also
+normalizes complete legacy Loggie JSON envelopes. Unrecognized, malformed or
+truncated legacy payloads keep their original text; source sessions are never
+rewritten. Summaries remain labeled as generated material, distinct from speech.
+
+QMD groups adjacent speaker blocks rather than forcing one chunk per speaker.
+Search expands around the matching exchange within its existing budget. Long
+monologue excerpts regain the source speaker label while citations still point
+to the exact original source lines. No identity or timestamp is invented.
+
+Within a session, identical replayed transcripts are suppressed; distinct
+complete revisions with ordered source sequence numbers retain their history
+and assistant follow-ups, with older versions marked superseded. Account,
+workspace, meeting and external transcript identifiers scope the comparison.
+Ambiguous/partial revisions are preserved. Separate session windows are not
+globally deduplicated.
+
+Use the session projection as the searchable meeting copy. Loggie raw archives
+remain opt-in and should stay outside file-corpus globs (new default:
+`transcripts/loggie-archive`). Memory never follows archive paths embedded in
+messages. Truncated sessions stay explicitly incomplete; enabling archive
+enrichment is not part of this version.
+
 ## Installation
 
 From npm:

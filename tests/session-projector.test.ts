@@ -161,3 +161,18 @@ test("creates provider-first safe paths and hashes private iMessage identities",
     startedAt: 1,
   }), /(^|\/)\.\.?\//);
 });
+
+test("excludes exact role-specific transport placeholders, not substantive or quoted messages", () => {
+  const project = (role: string, content: string) => projectSession({
+    sessionId: "sentinels", chatType: "group", startedAt: 1, agentName: "Bill", timezone: "UTC",
+    events: [{ createdAt: 1, eventJson: JSON.stringify({ type: "message", message: { role, content } }) }],
+  });
+  assert.equal(project("assistant", "  NO_REPLY\n"), undefined);
+  assert.equal(project("user", "[Queued messages while agent was busy]"), undefined);
+  for (const [role, content] of [
+    ["user", "NO_REPLY"],
+    ["assistant", "Use NO_REPLY for silent completion."],
+    ["user", "[Queued messages while agent was busy]\nPlease review the incident."],
+    ["user", "[Audio attachment: recording.m4a]"],
+  ]) assert.ok(project(role!, content!)?.includes(content!));
+});
