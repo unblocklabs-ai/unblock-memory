@@ -7,9 +7,9 @@ type Meeting = {
     complete: boolean;
 };
 export declare function projectLoggieMessage(text: string, accountId?: string): Meeting | undefined;
+export declare function meetingRevisionAnnotation(content: string, position: number): string | undefined;
 /** Spans stay in source coordinates; headings and assistant replies stop expansion. */
 export declare function meetingSpeakerSpans(content: string, position: number, end?: number): {
-    annotation: string | undefined;
     header: string;
     start: number;
     message: {

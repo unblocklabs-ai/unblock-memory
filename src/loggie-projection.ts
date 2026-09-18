@@ -68,6 +68,13 @@ export function projectLoggieMessage(text: string, accountId?: string): Meeting 
   return { text: `# Meeting: ${title}\n\n${date ? `Meeting date: ${date}\n\n` : ""}${sections.join("\n\n")}`, complete: false };
 }
 
+export function meetingRevisionAnnotation(content: string, position: number): string | undefined {
+  const enclosingMessage = content.lastIndexOf("\n## User — ", position);
+  return /^Transcript revision \d+ \(superseded by revision \d+\)\.$/mu.exec(
+    content.slice(Math.max(0, enclosingMessage), position),
+  )?.[0];
+}
+
 /** Spans stay in source coordinates; headings and assistant replies stop expansion. */
 export function meetingSpeakerSpans(content: string, position: number, end = position) {
   const markers = [...content.matchAll(SPEAKER)].flatMap(match => {
@@ -88,12 +95,7 @@ export function meetingSpeakerSpans(content: string, position: number, end = pos
   if (ranges[last]!.end < end && content.slice(ranges[last]!.end, end).trim()) return undefined;
   const prev = ranges[first - 1];
   const next = ranges[last + 1];
-  const enclosingMessage = content.lastIndexOf("\n## User — ", position);
-  const annotation = /^Transcript revision \d+ \(superseded by revision \d+\)\.$/mu.exec(
-    content.slice(Math.max(0, enclosingMessage), ranges[first]!.start),
-  )?.[0];
   return {
-    annotation,
     header: ranges[first]!.header,
     start: ranges[first]!.start,
     message: { start: ranges[first]!.start, end: Math.max(end, ranges[last]!.end) },
