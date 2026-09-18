@@ -55,3 +55,14 @@ test("long monologue snippets regain their speaker without moving citation offse
   assert.equal(expanded.position, pos);
   assert.equal(expanded.sourceText, "needle tail");
 });
+
+test("superseded speech carries its warning into retrieval, including tightly budgeted callers", async () => {
+  const content = project([wire(1), wire(2, "new")])!;
+  const chunk = '> Ship on Monday.';
+  const position = content.indexOf(chunk);
+  const hit = { body: content, bestChunk: chunk, chunkPos: position, chunkLen: chunk.length };
+  const selected = await expandSessionSearchHit(hit, 500, async text => text.split(/\s+/u).length);
+  assert.match(selected.text, /^Transcript revision 1 \(superseded by revision 2\)/u);
+  assert.ok(selected.sourceText);
+  assert.equal((await expandSessionSearchHit(hit, 500, async () => 1, 10)).text, "");
+});

@@ -311,16 +311,19 @@ export async function expandSessionSearchHit(
   const leafEnd = result.chunkPos + result.chunkLen;
   for (const span of [spans.turn, spans.message]) {
     if (span.start > result.chunkPos || span.end < leafEnd) continue;
-    const text = result.body.slice(span.start, span.end).trimEnd();
+    const sourceText = result.body.slice(span.start, span.end).trimEnd();
+    const text = speaker?.annotation ? `${speaker.annotation}\n${sourceText}` : sourceText;
     if (text.length > maxChars) continue;
-    if (await countTokens(text) <= maxTokens) return { text, position: span.start };
+    if (await countTokens(text) <= maxTokens) return { text, position: span.start, ...(speaker?.annotation ? { sourceText } : {}) };
   }
-  if (speaker && speaker.start < result.chunkPos) {
-    const text = `${speaker.header}\n${leaf.text}`;
+  if (speaker && (speaker.start < result.chunkPos || speaker.annotation)) {
+    const text = [speaker.annotation, speaker.start < result.chunkPos ? speaker.header : undefined, leaf.text].filter(Boolean).join("\n");
     if (text.length <= maxChars && await countTokens(text) <= maxTokens) {
       return { ...leaf, text, sourceText: leaf.text };
     }
   }
+  // Never silently strip supersession when the caller's snippet budget is tiny.
+  if (speaker?.annotation) return { ...leaf, text: "", sourceText: "" };
   return leaf;
 }
 
@@ -990,6 +993,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             opts?.maxSnippetChars,
           )
         : { text: hit.bestChunk, position: hit.chunkPos };
+      if (!selected.text) continue;
       const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
       results.push({
         path: hit.file,
