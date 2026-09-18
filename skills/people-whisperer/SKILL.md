@@ -1,112 +1,119 @@
 ---
 name: people-whisperer
-description: Maintain useful PeopleSQL dossiers from ordinary memory and session evidence so future conversations start with accurate person context.
+description: Maintain brief PeopleSQL background snippets identifying a person and their relationship to the agent, not behavioral profiles or task history.
 ---
 
 # People Whisperer
 
-Improve the agent's durable understanding of people it interacts with. Prefer no
-write over routine, repetitive, weakly inferred, or already captured information.
-The goal is a useful future conversation, not processing every interaction.
+Help the agent recognize whom it is talking to, without telling it what that
+person wants. A dossier is a short background primer, not a personality model.
 
-## Choose and inspect
+## Inspect and research
 
-- For a named or current person, call `memory_people_inspect` with
-  `view: "person"` and their `personId` or exact Slack identity.
-- For autonomous maintenance, call `memory_people_inspect` with
-  `view: "people"` and an optional `limit`. Use the returned identity,
-  `lastSeenAt`, dossier presence, and dossier `reviewedAt` only as context for
-  your judgment. `reviewedAt` is the last dossier write, not a due date.
-- Do not assume every listed person needs work. You may update several people or
-  nobody.
+- Use `memory_people_inspect` with `view: "person"` and an exact `personId` or
+  Slack identity. For maintenance, list `view: "people"` first; not everyone
+  needs an update. `reviewedAt` records the last write, not a due date.
+- Research only three questions: who is this person (explicit role and
+  organization); what enduring organizational context identifies them; and what
+  is their relationship to this agent (e.g. personal assistant or AI counterpart)?
+- When enabled, call `memory_people_prime({ personId, agentName })`. It retrieves
+  approved sources and grades background eligibility, not general relevance.
+  Follow useful source ranges with `memory_get`. Scores are triage, not facts.
+  `unknown` stays unknown; `evidence_found` still needs verification. Inspect
+  uncertain evidence rather than guessing.
+- Use bounded, targeted `memory_search` calls for missing identity/relationship
+  answers and newer contradictory role or affiliation statements. Check available
+  agent identity/user context too, but do not treat the agent's own speculation
+  or an existing dossier as independent evidence. Follow source attribution.
+  Do not send local files to TypeSafe unless they are in approved corpora.
+- Prefer explicit human statements or authoritative directory/identity context.
+  Topics someone discusses do not establish their job, priorities or responsibilities.
+  Old evidence can establish enduring background; unresolved changes in role,
+  organization or relationship must be investigated or omitted, not guessed away.
+- If recent sessions are missing, use `memory_sync_sessions` and check
+  `memory_sync_status` before searching again. Disabled/unavailable primers do
+  not prevent ordinary source research.
 
-## Investigate
+## Draft a recognition snippet
 
-1. Read the current dossier when one exists.
-2. Search for meaningful information with `memory_search`. Use targeted queries,
-   relevant corpora, and session metadata filters rather than treating a fixed
-   recent-message window as the person's history.
-3. Follow useful `qmd://` results with `memory_get`. If recent OpenClaw sessions
-   are not indexed, use `memory_sync_sessions` and check `memory_sync_status`
-   before searching again.
-4. Prefer direct statements, repeated behavior, decisions, feedback, and
-   outcomes. Distinguish observation, reported information, inference, and agent
-   assessment. Do not promote small talk or one ambiguous exchange into a durable
-   claim.
-5. Preserve still-useful existing claims. Dossier replacement is complete, not
-   a patch.
+Write one short paragraph, usually 2–3 sentences and **at most 70 words**. This
+is a ceiling, not a target. Include only useful, explicit identity, role,
+organization, enduring team context and person-agent relationship background.
 
-Ordinary `memory_search` supports multiple targeted calls and up to 20 results
-per call. People Whisperer does not impose its own result window or require the
-agent to acknowledge what it inspected.
+Exclude preferences, working style, priorities, success criteria, feedback,
+permissions, behavioral advice, business missions, goals, projects, commitments and dated anecdotes—even
+when supported. A request for sales copy is not proof of a sales role. A technical
+discussion is not proof of an engineering role. Never fill gaps with activity
+summaries or invent formal titles. Memory is not authorization.
 
-## Write only when useful
+For legacy dossiers, deliberately remove behavioral sections and incident history.
+Do not preserve an old claim merely because it was previously stored. Retain only
+verified background; if no useful background can be established, prefer no dossier.
 
-Before adding or materially changing a dossier claim, use `memory_review_claim`
-when evidence review is enabled. Supply one atomic claim naming the person and
-its exact `qmd://` evidence ranges. Resolve wrong-person, date, scope, negation,
-and certainty mismatches before writing. This is advisory, not a mandatory tool
-receipt or proof of truth; disabled/unavailable reviews require your own source
-verification. Do not re-review unchanged claims just to generate activity.
+## Submit the verified snippet
 
-Call `memory_people_update` with `action: "replace_dossier"`, the `personId`, a
-concise `reason` for the change, and a complete dossier. The plugin records the
-reason and exact before/after snapshots transactionally. Keep the complete dossier
-under the plugin's 64 KiB serialized limit:
+Use `memory_people_update` with `action: "replace_dossier"`, the exact `personId`,
+a concise `reason`, optional `agentName` if no identity name is configured, and
+the complete `dossier` (not a patch):
 
 ```json
 {
-  "action": "replace_dossier",
-  "personId": "PeopleSQL person ID",
-  "reason": "Added a durable preference supported by recent sessions.",
-  "dossier": {
-    "schemaVersion": 1,
-    "blurb": "Concise context worth having before the next conversation.",
-    "sections": [
-      {
-        "category": "preferences",
-        "claims": [
-          {
-            "statement": "A durable, specific claim.",
-            "evidence": [
-              {
-                "source": "session",
-                "locator": "qmd://path-returned-by-memory-search",
-                "observedAt": "2026-08-31T12:00:00Z"
-              }
-            ],
-            "epistemicType": "observed",
-            "confidence": "high"
-          }
-        ]
-      }
-    ]
-  }
+  "schemaVersion": 1,
+  "blurb": "Mira is the founder of ExampleCo.",
+  "sections": [{
+    "category": "role",
+    "claims": [{
+      "statement": "Mira is the founder of ExampleCo.",
+      "evidence": [{ "source": "session", "locator": "qmd://source/path.md#L12-L15" }],
+      "epistemicType": "reported",
+      "confidence": "high"
+    }]
+  }]
 }
 ```
 
-Allowed section categories are `role`, `priorities`, `preferences`,
-`successCriteria`, `workingStyle`, `relationship`, and `openLoops`. Evidence
-sources are `session`, `memory`, `directory`, or `manual`; `observedAt` and
-`confidence` are optional. Epistemic types are `observed`, `reported`,
-`inferred`, or `agent_assessment`.
+Include evidence claims for every assertion in the blurb, including relationship
+claims. New writes allow only `role` and `relationship` sections and `observed`
+or `reported` facts. Evidence sources are `session`, `memory`, `directory` or
+`manual`; optional `observedAt` must be an ISO timestamp. Confidence is optional
+`low`, `medium` or `high`. Keep source references out of the injected blurb.
+The configured character limit and 64 KiB serialized dossier limit also apply.
 
-Make the blurb immediately useful, concise, and honest about uncertainty. Do not
-stuff it with biography or raw evidence. Claim evidence references are
-provenance, not work receipts.
+The write tool automatically reviews the blurb before saving. No separate review
+call is required. Use exact `qmd://path#Lstart-Lend` evidence locators: at most three
+distinct ranges, each at most 120 lines and together 6,000 characters. Only the
+primer's approved corpora can be sent to TypeSafe. The check tests complete support,
+background-only content and explicit rather than activity-inferred facts; it does
+not replace your source verification.
 
-Use `delete_dossier` when the current dossier is too unreliable to inject and
-cannot be responsibly repaired; deletion also requires a concise `reason`. Use
-`memory_people_inspect` with `view: "dossier_changes"`, the `personId`, and
-optional `limit`/`offset` to list small newest-first history summaries. Follow a
-summary with `view: "dossier_change"`, the `personId`, and its `changeId` only
-when you need the exact before/after dossier and blurb. Follow `nextOffset` to page.
-Use `set_injection` to disable or re-enable
-whispers for one person without deleting their dossier. Company, todo, and
-person-status actions are available for the corresponding data changes.
+- `ok`: saved; `verification` distinguishes `typesafe` from `manual`.
+- `needs_review`: failed/uncertain check; existing dossier unchanged. Inspect the
+  evidence, remove unsupported clauses or resolve attribution before resubmitting.
+- `review_unavailable`: disabled review, missing key, non-indexed evidence or
+  provider failure; existing dossier unchanged. Retry or verify manually.
+- `conflict`: the person/dossier changed during review; inspect again before retrying.
 
-## Finish
+For direct human corrections, non-indexed identity context or an unavailable/incorrect
+review, you may add `manualVerification` to the update **only after checking every
+assertion and background eligibility yourself**. This is a source-specific attestation,
+not a retry switch. Explain the original evidence and any override, e.g.:
 
-Report whom you investigated, which memory or sessions informed any write, what
-changed, and why skipped people did not need an update. Do not manufacture a
-write to show activity.
+```json
+{
+  "manualVerification": "Verified against Mira's explicit correction in this conversation on 2026-09-18: she founded ExampleCo. The snippet contains only that identity fact."
+}
+```
+
+Keep accurate manual/directory provenance on the claims. Do not invent indexed
+citations. Manual verification skips TypeSafe and records the explanation in change
+history; it never reports a provider pass or bypasses the word/category limits.
+If you cannot verify the snippet, leave it unchanged and report the limitation.
+
+Only the blurb is injected; evidence stays in storage. Replacements/deletions
+preserve transactional before/after history and a reason. Use `delete_dossier`
+when a misleading legacy profile cannot be responsibly replaced, or `set_injection`
+to pause it without deleting it. Do not erase raw memory or dossier history.
+Inspect history through `dossier_changes` and `dossier_change` views.
+
+Report the resulting snippets, source limitations, changes and intentionally
+unknown answers. More words or more claims are not success metrics.

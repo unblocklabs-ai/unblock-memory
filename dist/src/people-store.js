@@ -7,6 +7,7 @@ import { resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-fou
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
 const BASELINE_DOSSIER_CATEGORIES = [
     "role",
     "priorities",
@@ -47,6 +48,9 @@ export const PERSON_DOSSIER_SCHEMA = Type.Object({
         claims: Type.Array(claimSchema, { minItems: 1, maxItems: 100 }),
     }, { additionalProperties: false }), { maxItems: BASELINE_DOSSIER_CATEGORIES.length }),
 }, { additionalProperties: false });
+export class DossierConflictError extends Error {
+    constructor() { super("Dossier or person changed during review; inspect again before retrying"); }
+}
 const MAX_DOSSIER_JSON_BYTES = 64 * 1024;
 function serializeDossier(dossier) {
     const json = JSON.stringify(dossier);
@@ -150,6 +154,37 @@ export class PeopleStore {
     }
     close() {
         this.#db.close();
+    }
+    // Derived, bounded cache: no source text or credentials. Kept outside the
+    // authoritative dossier schema so older plugin versions can still open it.
+    #ensurePrimerCache() {
+        this.#db.exec(`CREATE TABLE IF NOT EXISTS person_primer_judgments (
+      cache_key TEXT PRIMARY KEY,
+      person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      judgment_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    ) STRICT`);
+    }
+    getPrimerJudgment(key) {
+        this.#ensurePrimerCache();
+        const row = this.#db.prepare("SELECT judgment_json FROM person_primer_judgments WHERE cache_key = ?")
+            .get(key);
+        if (!row)
+            return undefined;
+        try {
+            return JSON.parse(row.judgment_json);
+        }
+        catch {
+            return undefined;
+        }
+    }
+    cachePrimerJudgment(personId, key, judgment) {
+        this.#ensurePrimerCache();
+        this.#db.prepare("INSERT OR REPLACE INTO person_primer_judgments VALUES (?, ?, ?, ?)")
+            .run(key, personId, JSON.stringify(judgment), new Date().toISOString());
+        this.#db.exec(`DELETE FROM person_primer_judgments WHERE cache_key IN (
+      SELECT cache_key FROM person_primer_judgments ORDER BY created_at DESC, cache_key LIMIT -1 OFFSET 2000
+    )`);
     }
     upsertIdentity(input) {
         const provider = required(input.provider, "provider");
@@ -331,17 +366,31 @@ export class PeopleStore {
         const row = this.#db.prepare("SELECT * FROM people WHERE id = ?").get(personId);
         return row ? person(row) : undefined;
     }
-    replaceDossier(personId, reasonInput, input) {
+    validateDossier(input) {
         const dossier = Value.Parse(PERSON_DOSSIER_SCHEMA, input);
         this.#validateDossier(dossier);
+        serializeDossier(dossier);
+        return dossier;
+    }
+    getDossierRevision(personId) {
+        const row = this.#db.prepare("SELECT id FROM person_dossier_changes WHERE person_id = ? ORDER BY rowid DESC LIMIT 1")
+            .get(personId);
+        return row?.id ?? null;
+    }
+    replaceDossier(personId, reasonInput, input, expectedRevision) {
+        const dossier = this.validateDossier(input);
         const dossierJson = serializeDossier(dossier);
         const reason = dossierReason(reasonInput);
         const reviewedAt = new Date().toISOString();
         this.#db.exec("BEGIN IMMEDIATE");
         try {
-            const target = this.#db.prepare("SELECT id FROM people WHERE id = ?").get(personId);
+            const target = this.#db.prepare("SELECT id, status FROM people WHERE id = ?").get(personId);
             if (!target)
                 throw new Error(`person not found: ${personId}`);
+            if (expectedRevision !== undefined &&
+                (target.status !== "active" || this.getDossierRevision(personId) !== expectedRevision)) {
+                throw new DossierConflictError();
+            }
             const existing = this.#db
                 .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
                 .get(personId);
@@ -679,6 +728,15 @@ export class PeopleStore {
         const categories = dossier.sections.map((section) => section.category);
         if (new Set(categories).size !== categories.length) {
             throw new Error("dossier sections must have unique categories");
+        }
+        if (backgroundWordCount(dossier.blurb) > PEOPLE_BACKGROUND_MAX_WORDS) {
+            throw new Error(`dossier blurb must not exceed ${PEOPLE_BACKGROUND_MAX_WORDS} words`);
+        }
+        if (categories.some(category => category !== "role" && category !== "relationship")) {
+            throw new Error("New dossiers support only role and relationship background; rewrite legacy behavioral profiles");
+        }
+        if (dossier.sections.some(section => section.claims.some(claim => claim.epistemicType === "inferred" || claim.epistemicType === "agent_assessment"))) {
+            throw new Error("Background claims must be explicit observed or reported facts, not inferred profiles");
         }
     }
     #migrate() {

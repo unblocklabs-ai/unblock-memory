@@ -13,6 +13,10 @@ export declare function reviewIndexedClaim(params: {
     apiKey: string;
     timeoutMs: number;
     signal: AbortSignal;
+    personBackground?: {
+        name: string;
+        agentName: string;
+    };
     read?: <T>(run: () => T) => Promise<T>;
 }): Promise<{
     status: "unavailable";
@@ -29,6 +33,11 @@ export declare function reviewIndexedClaim(params: {
     }[];
     policy: string;
     scope: string;
+    needsReview: boolean;
+    background?: {
+        backgroundOnly: number;
+        explicitSupport: number;
+    } | undefined;
     verdict: "supports" | "contradicts" | "insufficient_evidence";
     confidence: number;
     probabilities: {
@@ -36,6 +45,5 @@ export declare function reviewIndexedClaim(params: {
         contradicts: number;
         insufficient_evidence: number;
     };
-    needsReview: boolean;
     status: "ok";
 }>;

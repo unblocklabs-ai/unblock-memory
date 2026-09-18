@@ -45,6 +45,7 @@ export async function reviewIndexedClaim(params) {
         }
         return { status: "ok", ...judgment,
             evidence: evidence.map(({ text: _text, ...citation }) => citation),
-            policy: "jev-1.13.0:claim-v1", scope: "Advisory support check against cited indexed excerpts only, not current truth or authorization to write. Verify original sources and identity before promotion." };
+            policy: params.personBackground ? "jev-1.13.0:person-background-v2" : "jev-1.13.0:claim-v1",
+            scope: "Advisory support check against cited indexed excerpts only, not current truth or authorization to write. Verify original sources and identity before promotion." };
     });
 }

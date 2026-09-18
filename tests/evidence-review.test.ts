@@ -82,3 +82,31 @@ test("evidence mutation, invalid answers and cancellation cannot verify a claim"
   await assert.rejects(reviewIndexedClaim(params), /^Error: TypeSafe review unavailable$/);
   await assert.rejects(reviewIndexedClaim({ ...params, signal: AbortSignal.abort() }));
 });
+
+test("background review requires support and background eligibility, with approved indexed provenance", async t => {
+  const f = await reviewFixture(); t.after(f.close);
+  const note = await f.insert("Mira is ExampleCo's founder. Atlas is her AI counterpart.");
+  const params = { ...f.params, claim: note.text, citations: [{ path: note.uri, from: 1, lines: 1 }],
+    personBackground: { name: "Mira", agentName: "Atlas" } };
+  let backgroundOnly = 0.99, explicitSupport = 0.99;
+  const fetchMock = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const body = JSON.parse(String(init?.body));
+    assert.deepEqual(body.state.person, params.personBackground);
+    assert.deepEqual(body.state.evidence, [note.text]);
+    assert.equal(Object.keys(body.questions).length, 3);
+    return Response.json({ answers: { relation: { type: "choice", choice: "supports", confidence: 0.99,
+      probabilities: { supports: 0.99, contradicts: 0.005, insufficient_evidence: 0.005 } },
+      backgroundOnly: { type: "noul", noul: backgroundOnly }, explicitSupport: { type: "noul", noul: explicitSupport } } });
+  });
+  assert.equal((await reviewIndexedClaim(params)).needsReview, false);
+  backgroundOnly = 0.01;
+  assert.equal((await reviewIndexedClaim(params)).needsReview, true, "supported behavioral content still fails");
+  backgroundOnly = 0.99; explicitSupport = 0.3;
+  assert.equal((await reviewIndexedClaim(params)).needsReview, true, "inferred roles fail");
+  const calls = fetchMock.mock.callCount();
+  assert.equal((await reviewIndexedClaim({ ...params, sources: [] })).status, "unavailable");
+  await assert.rejects(reviewIndexedClaim({ ...params, claim: "word ".repeat(71) }), /70 words/);
+  assert.equal(fetchMock.mock.callCount(), calls);
+  fetchMock.mock.mockImplementation(async () => response());
+  await assert.rejects(reviewIndexedClaim(params), /invalid background/);
+});

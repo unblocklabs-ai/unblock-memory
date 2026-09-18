@@ -85,6 +85,11 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         }[];
         policy: string;
         scope: string;
+        needsReview: boolean;
+        background?: {
+            backgroundOnly: number;
+            explicitSupport: number;
+        } | undefined;
         verdict: "supports" | "contradicts" | "insufficient_evidence";
         confidence: number;
         probabilities: {
@@ -92,7 +97,6 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
             contradicts: number;
             insufficient_evidence: number;
         };
-        needsReview: boolean;
         status: "ok";
     }>;
     reviewCluster(params: Omit<Parameters<typeof reviewClusterIngestion>[0], "db" | "sources" | "read"> & {

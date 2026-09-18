@@ -6,6 +6,7 @@ import { resolveTypeSafeApiKey } from "./typesafe.js";
 import { registerPeopleHooks } from "./people-hooks.js";
 import { PeopleStores } from "./people-store.js";
 import { registerPeopleTools } from "./people-tools.js";
+import { registerPeoplePrimerTool } from "./people-primer-tool.js";
 import { QmdMemoryRuntime } from "./runtime.js";
 import { registerSkillWhisperer } from "./skill-whisperer.js";
 import { registerMemoryWhisperer } from "./memory-whisperer.js";
@@ -445,7 +446,8 @@ export function registerUnblockMemory(api) {
             maxBlurbChars: config.people.whisperer.maxChars,
         });
         registerPeopleHooks(api, peopleStores, config.people);
-        registerPeopleTools(api, peopleStores, config.people);
+        registerPeopleTools(api, peopleStores, config, runtime);
+        registerPeoplePrimerTool(api, runtime, peopleStores, config);
         api.on("gateway_stop", () => peopleStores.closeAll());
     }
     const diagnostics = new WhispererDiagnostics();

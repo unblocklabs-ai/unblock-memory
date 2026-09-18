@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.16",
+  "version": "0.3.17",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -23,6 +23,7 @@
       "memory_update_maintenance_task",
       "memory_people_inspect",
       "memory_people_update",
+      "memory_people_prime",
       "memory_people_sync"
     ]
   },
@@ -40,9 +41,12 @@
     "memory_update_maintenance_task": { "sideEffecting": true },
     "memory_people_inspect": { "replaySafe": true },
     "memory_people_update": { "sideEffecting": true },
+    "memory_people_prime": { "sideEffecting": true },
     "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
+    "peoplePrimer.enabled": { "label": "People Background Primer", "help": "Opt in to sending identity, approved excerpts and proposed snippets to TypeSafe. Prepares evidence and checks <=70-word blurbs before replace_dossier saves; disabled/unavailable reviews require explicit manual verification. Existing dossiers are not evidence. Results are accessible to the agent's tool callers." },
+    "peoplePrimer.corpora": { "label": "Primer Approved Corpora", "help": "Explicit non-skill corpus allowlist. Sessions includes all indexed conversations; approve only content suitable for this agent's audiences." },
     "responseAudit.enabled": { "label": "Response Quality Audit", "help": "Opt in to background TypeSafe evaluation of approved Slack humans. Operator-only reports; no prompt or memory writes." },
     "responseAudit.sentimentEnabled": { "label": "Human Sentiment Analysis", "help": "Default on within an enabled, approved response audit. Includes annoyance, frustration and expressed intensity; does not imply agent fault." },
     "responseAudit.intervalMinutes": { "label": "Response Audit Interval (minutes)", "help": "Shared cadence for quality and enabled sentiment analysis. Unchanged successful exchanges are cached. Zero means manual-only." },
@@ -127,6 +131,19 @@
           "minNoise": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 }
         },
         "default": { "enabled": false, "corpora": [], "minNoise": 0.8 }
+      },
+      "peoplePrimer": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "corpora": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [] },
+          "hitsPerQuestion": { "type": "integer", "minimum": 1, "maximum": 40, "default": 30 },
+          "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.35 },
+          "minUsefulness": { "type": "number", "minimum": 0.5, "maximum": 1, "default": 0.8 },
+          "maxEvidencePerQuestion": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 60000, "default": 30000 }
+        },
+        "default": { "enabled": false, "corpora": [], "hitsPerQuestion": 30, "minScore": 0.35, "minUsefulness": 0.8, "maxEvidencePerQuestion": 3, "timeoutMs": 30000 }
       },
       "evidenceReview": {
         "type": "object", "additionalProperties": false,

@@ -2,7 +2,9 @@ import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { renderPeopleWhisper } from "./people-hooks.js";
-import { PERSON_DOSSIER_SCHEMA } from "./people-store.js";
+import { DossierConflictError, PERSON_DOSSIER_SCHEMA } from "./people-store.js";
+import { getContext } from "./tool-context.js";
+import { reviewPersonDossier } from "./people-dossier-review.js";
 import { createOpenClawSlackDirectory, syncSlackDirectory, } from "./slack-directory.js";
 const nonEmpty = Type.String({ pattern: "\\S", maxLength: 1000 });
 const inspectParameters = Type.Union([
@@ -76,7 +78,10 @@ const updateParameters = Type.Union([
         action: Type.Literal("replace_dossier"),
         personId: nonEmpty,
         dossier: PERSON_DOSSIER_SCHEMA,
-        reason: nonEmpty,
+        reason: Type.String({ pattern: "\\S", maxLength: 500 }),
+        agentName: Type.Optional(Type.String({ pattern: "\\S", maxLength: 100 })),
+        manualVerification: Type.Optional(Type.String({ pattern: "\\S", maxLength: 400,
+            description: "Explicit attestation that you verified every blurb assertion and background-only eligibility. Explain the original sources and any correction/override. Skips TypeSafe; recorded as manual, never a provider pass. Do not use merely to bypass a failed check." })),
     }, { additionalProperties: false }),
     Type.Object({
         action: Type.Literal("delete_dossier"),
@@ -186,16 +191,16 @@ function createInspectTool(stores, config, ctx) {
         },
     };
 }
-function createUpdateTool(stores, ctx) {
-    const active = context(ctx);
+function createUpdateTool(stores, config, runtime, ctx) {
+    const active = getContext(ctx);
     if (!active)
         return null;
     return {
         name: "memory_people_update",
         label: "Update People Memory",
-        description: "Update a dossier, one person's injection preference, company, todo, or person status.",
+        description: "Replace a background-only dossier (blurb <=70 words, role/relationship sections, observed/reported facts). Automatically reviews the blurb against claim evidence qmd://path#Lstart-Lend before saving; blocked/unavailable reviews leave it unchanged. Use explicit manualVerification only after verifying original sources yourself. Also deletes dossiers or updates injection, company, todo and person status.",
         parameters: updateParameters,
-        async execute(_toolCallId, raw) {
+        async execute(_toolCallId, raw, signal) {
             const input = Value.Parse(updateParameters, raw);
             const store = stores.get(active.agentId);
             if (input.action === "set_injection") {
@@ -203,11 +208,30 @@ function createUpdateTool(stores, ctx) {
                 return jsonResult(person ? { status: "ok", person } : { status: "not_found" });
             }
             if (input.action === "replace_dossier") {
+                const person = store.getPerson(input.personId);
+                if (!person || person.status !== "active")
+                    return jsonResult({ status: "not_found" });
+                const proposed = store.validateDossier(input.dossier);
+                const revision = store.getDossierRevision(input.personId);
+                if (signal?.aborted)
+                    return jsonResult({ status: "review_unavailable", needsReview: true, reason: "Cancelled; no dossier written" });
+                const review = input.manualVerification
+                    ? { status: "manual", needsReview: false, note: input.manualVerification }
+                    : await reviewPersonDossier({ config, runtime, active, person, dossier: proposed, agentName: input.agentName, signal });
+                if (review.needsReview || signal?.aborted) {
+                    return jsonResult({ status: review.status === "ok" && !signal?.aborted ? "needs_review" : "review_unavailable",
+                        needsReview: true, saved: false, review });
+                }
+                const audit = review.status === "manual"
+                    ? `Manual verification: ${review.note}`
+                    : "TypeSafe background review passed (person-background-v2)";
                 try {
-                    const dossier = store.replaceDossier(input.personId, input.reason, input.dossier);
-                    return jsonResult({ status: "ok", dossier });
+                    const dossier = store.replaceDossier(input.personId, `${input.reason}\n${audit}`, proposed, revision);
+                    return jsonResult({ status: "ok", saved: true, verification: review.status === "manual" ? "manual" : "typesafe", dossier, review });
                 }
                 catch (error) {
+                    if (error instanceof DossierConflictError)
+                        return jsonResult({ status: "conflict", saved: false, reason: error.message });
                     if (error instanceof Error && error.message.startsWith("person not found:")) {
                         return jsonResult({ status: "not_found" });
                     }
@@ -268,11 +292,11 @@ function createSyncTool(stores, reader, ctx) {
         },
     };
 }
-export function registerPeopleTools(api, stores, config, directoryReader) {
-    api.registerTool((ctx) => createInspectTool(stores, config, ctx), {
+export function registerPeopleTools(api, stores, config, runtime, directoryReader) {
+    api.registerTool((ctx) => createInspectTool(stores, config.people, ctx), {
         names: ["memory_people_inspect"],
     });
-    api.registerTool((ctx) => createUpdateTool(stores, ctx), {
+    api.registerTool((ctx) => createUpdateTool(stores, config, runtime, ctx), {
         names: ["memory_people_update"],
     });
     api.registerTool((ctx) => createSyncTool(stores, directoryReader ??

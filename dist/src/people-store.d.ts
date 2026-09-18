@@ -17,6 +17,9 @@ export declare const PERSON_DOSSIER_SCHEMA: Type.TObject<{
     }>>;
 }>;
 export type PersonDossier = Static<typeof PERSON_DOSSIER_SCHEMA>;
+export declare class DossierConflictError extends Error {
+    constructor();
+}
 export type PersonDossierChange = {
     id: string;
     personId: string;
@@ -84,6 +87,8 @@ export declare class PeopleStore {
         maxBlurbChars: number;
     });
     close(): void;
+    getPrimerJudgment(key: string): unknown;
+    cachePrimerJudgment(personId: string, key: string, judgment: unknown): void;
     upsertIdentity(input: {
         provider: string;
         accountScope: string;
@@ -113,7 +118,9 @@ export declare class PeopleStore {
     listActivePeople(limit?: number, offset?: number): Person[];
     findIdentity(provider: string, accountScope: string, externalId: string): PersonIdentity | undefined;
     setInjection(personId: string, enabled: boolean): Person | undefined;
-    replaceDossier(personId: string, reasonInput: string, input: unknown): PersonDossier;
+    validateDossier(input: unknown): PersonDossier;
+    getDossierRevision(personId: string): string | null;
+    replaceDossier(personId: string, reasonInput: string, input: unknown, expectedRevision?: string | null): PersonDossier;
     deleteDossier(personId: string, reasonInput: string): boolean;
     getWhisperReceipt(threadKey: string, personId: string): {
         runId: string;

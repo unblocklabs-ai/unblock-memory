@@ -296,13 +296,13 @@ test("validates and replaces one bounded baseline dossier", async () => {
     });
     const dossier = {
       schemaVersion: 1,
-      blurb: "Prefers decisions.",
+      blurb: "Mira is CEO.",
       sections: [
         {
-          category: "preferences",
+          category: "role",
           claims: [
             {
-              statement: "Prefers the decision first.",
+              statement: "Mira is CEO.",
               evidence: [{ source: "session", locator: "session-1#message-4" }],
               epistemicType: "observed",
               confidence: "high",
@@ -342,7 +342,7 @@ test("validates and replaces one bounded baseline dossier", async () => {
           ...dossier,
           sections: [
             {
-              category: "preferences",
+              category: "role",
               claims: Array.from({ length: 70 }, (_, index) => ({
                 statement: `Claim ${index}`,
                 evidence: [{ source: "manual", locator: "x".repeat(1000) }],
@@ -357,6 +357,22 @@ test("validates and replaces one bounded baseline dossier", async () => {
   } finally {
     store.close();
   }
+});
+
+test("new background writes reject long blurbs, legacy categories and inferred profiles", async () => {
+  const store = new PeopleStore(await temporaryPath(), { ...options, maxBlurbChars: 1200 });
+  try {
+    const { person } = store.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U123" });
+    const claim = { statement: "Mira is CEO.", evidence: [{ source: "manual", locator: "human correction" }], epistemicType: "reported" };
+    const dossier = { schemaVersion: 1, blurb: "Mira is CEO.", sections: [{ category: "role", claims: [claim] }] };
+    assert.throws(() => store.replaceDossier(person.id, "test", { ...dossier, blurb: "word ".repeat(71) }), /70 words/);
+    assert.throws(() => store.replaceDossier(person.id, "test", { ...dossier, sections: [{ category: "priorities", claims: [claim] }] }), /role and relationship/);
+    assert.throws(() => store.replaceDossier(person.id, "test", { ...dossier,
+      sections: [{ category: "role", claims: [{ ...claim, epistemicType: "inferred" }] }] }), /not inferred/);
+    assert.equal(store.getDossier(person.id), undefined);
+    assert.equal(store.listDossierChanges(person.id).length, 0);
+    assert.equal(store.replaceDossier(person.id, "test", { ...dossier, blurb: "word ".repeat(70).trim() }).blurb.split(" ").length, 70);
+  } finally { store.close(); }
 });
 
 test("records authoritative create, replace, and delete dossier snapshots newest first", async () => {

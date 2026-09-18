@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { resolveResponseAudit } from "./response-config.js";
+import { resolvePeoplePrimer } from "./people-primer-config.js";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
@@ -264,6 +265,7 @@ export function resolveConfig(value) {
             qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
             evidenceReview: { enabled: false, corpora: [] },
             responseAudit: resolveResponseAudit(undefined, DEFAULT_CORPORA),
+            peoplePrimer: resolvePeoplePrimer(undefined, DEFAULT_CORPORA, false),
             people: DEFAULT_PEOPLE_CONFIG,
             skillWhisperer: DEFAULT_SKILL_WHISPERER,
             memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
@@ -273,9 +275,10 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
+    const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
     let evidenceReview = { enabled: false, corpora: [] };
     if (config.evidenceReview !== undefined) {
         const value = config.evidenceReview;
@@ -346,7 +349,7 @@ export function resolveConfig(value) {
     if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
         throw new Error('unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"');
     }
-    return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer,
+    return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
         qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
         evidenceReview,
         responseAudit: resolveResponseAudit(config.responseAudit, corpora),

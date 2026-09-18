@@ -1,7 +1,7 @@
 # People Whisperer: Agent-Owned Dossiers
 
 Status: implemented direction
-Date: 2026-08-31
+Updated: 2026-09-18
 
 ## Goal
 
@@ -17,7 +17,15 @@ People Whisperer has one small boundary:
 - Exact Slack identity matching injects `dossier.blurb` at most once per person
   per Slack thread.
 
-The plugin is a store, matcher, and injector. It is not a dossier workflow engine.
+The plugin is a store, matcher, and injector with an optional TypeSafe evidence
+primer/reviewer. It is not a dossier workflow engine.
+
+The snippet is a recognition aid: at most 70 words of explicit identity,
+organization and person-agent relationship background. It is not a behavioral
+profile. New writes allow only `role`/`relationship` evidence sections and
+`observed`/`reported` claims. Preferences, working styles, priorities, success
+criteria, permissions and task history must be removed from legacy profiles on
+rewrite. Existing records and their before/after history remain readable.
 
 ## Product rules
 
@@ -62,9 +70,11 @@ When `people.enabled` is true, the normal tool surface includes:
 `replace_dossier` writes a complete validated replacement and `delete_dossier`
 removes one. Both require a short reason. Each mutation and its audit entry commit
 in one transaction; the stored before/after dossier snapshots include the injected
-`blurb`. Serialized dossiers are capped at 64 KiB. The last successful agent write
-wins. `reviewedAt` is generated write metadata, not a cursor, due date, or freshness
-policy.
+`blurb`. Serialized dossiers are capped at 64 KiB. Replacement requires a passing
+TypeSafe background check or explicit, source-specific `manualVerification`.
+Unavailable/uncertain checks do not write. The save transaction checks the dossier
+revision so an in-flight review cannot overwrite a concurrent edit or deletion.
+`reviewedAt` is generated write metadata, not a cursor, due date, or freshness policy.
 
 ## Agent-owned maintenance
 
@@ -73,9 +83,12 @@ The agent chooses people and evidence using the tools it already has:
 1. List or inspect people when useful.
 2. Search configured memory and sessions with `memory_search`.
 3. Follow useful `qmd://` results with `memory_get`.
-4. Compare the evidence with the current dossier.
-5. Replace the dossier only when the new version would materially improve a
-   future conversation. It is valid to update several people or nobody.
+4. Investigate identity/relationship gaps and conflicting role changes; the
+   optional `memory_people_prime` grades evidence from approved corpora. Existing dossiers are not
+   evidence. Keep unknown answers unknown rather than inferring roles from tasks.
+5. Submit a replacement only when it would improve recognition. The write tool
+   checks the complete blurb against exact indexed claim references; handle its
+   result as documented in the packaged skill. It is valid to update nobody.
 
 The dossier may retain claim-level evidence references and provenance. Those
 references explain claims; they are not processed-event receipts and do not
@@ -86,12 +99,9 @@ acknowledgement. It also does not create or schedule cron jobs. An operator may
 give an isolated cron agent this goal:
 
 ```text
-Use $people-whisperer to improve your understanding of people you interact with.
-
-Search recent sessions and memory for meaningful information about people. Inspect
-their existing PeopleSQL dossiers when useful. Update a dossier only when doing so
-would make future conversations meaningfully better. Ignore routine conversation,
-repetition, and weak inference. You may update several people or nobody.
+Use $people-whisperer to maintain brief background snippets for people you interact
+with. Follow the packaged skill, including source verification and write results.
+Update only when useful; several people or nobody is fine. Report changes and gaps.
 ```
 
 No deterministic coverage guarantee is required. Dossiers are maintained
@@ -99,7 +109,7 @@ understanding, not an event-processing ledger.
 
 ## Out of scope
 
-- plugin-owned scheduling or model execution;
+- plugin-owned scheduling or dossier generation;
 - QMD person attribution;
 - per-person clusters or graph storage;
 - automatic claim arbitration or confidence math; and

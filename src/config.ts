@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { resolveResponseAudit, type ResponseAuditConfig } from "./response-config.js";
+import { resolvePeoplePrimer, type PeoplePrimerConfig } from "./people-primer-config.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -51,6 +52,7 @@ export type UnblockMemoryConfig = {
   qualityAudit: { enabled: boolean; corpora: readonly string[]; minNoise: number };
   evidenceReview: { enabled: boolean; corpora: readonly string[] };
   responseAudit: ResponseAuditConfig;
+  peoplePrimer: PeoplePrimerConfig;
   people: {
     enabled: boolean;
     whisperer: { enabled: boolean; maxChars: number };
@@ -373,6 +375,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
       evidenceReview: { enabled: false, corpora: [] },
       responseAudit: resolveResponseAudit(undefined, DEFAULT_CORPORA),
+      peoplePrimer: resolvePeoplePrimer(undefined, DEFAULT_CORPORA, false),
       people: DEFAULT_PEOPLE_CONFIG,
       skillWhisperer: DEFAULT_SKILL_WHISPERER,
       memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
@@ -384,11 +387,12 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
   const people = resolvePeople(config.people);
+  const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
   let evidenceReview: UnblockMemoryConfig["evidenceReview"] = { enabled: false, corpora: [] };
   if (config.evidenceReview !== undefined) {
     const value = config.evidenceReview;
@@ -474,7 +478,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       'unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"',
     );
   }
-  return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer,
+  return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,
     responseAudit: resolveResponseAudit(config.responseAudit, corpora),

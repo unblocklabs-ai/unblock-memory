@@ -1,4 +1,5 @@
 import { type ResponseAuditConfig } from "./response-config.js";
+import { type PeoplePrimerConfig } from "./people-primer-config.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -42,6 +43,7 @@ export type UnblockMemoryConfig = {
         corpora: readonly string[];
     };
     responseAudit: ResponseAuditConfig;
+    peoplePrimer: PeoplePrimerConfig;
     people: {
         enabled: boolean;
         whisperer: {

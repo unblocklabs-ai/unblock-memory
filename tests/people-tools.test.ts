@@ -10,10 +10,13 @@ import type {
   OpenClawPluginToolContext,
   OpenClawPluginToolFactory,
 } from "openclaw/plugin-sdk/plugin-entry";
-import type { UnblockMemoryConfig } from "../src/config.js";
+import { resolveConfig, type UnblockMemoryConfig } from "../src/config.js";
+import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { registerPeopleTools } from "../src/people-tools.js";
 import { PeopleStores } from "../src/people-store.js";
 import type { SlackDirectoryReader } from "../src/slack-directory.js";
+import { reviewIndexedClaim } from "../src/evidence-review.js";
+import { reviewFixture } from "./helpers/review-store.js";
 
 const peopleConfig: UnblockMemoryConfig["people"] = {
   enabled: true,
@@ -26,6 +29,7 @@ type Tool = {
   execute(
     toolCallId: string,
     params: unknown,
+    signal?: AbortSignal,
   ): Promise<{ content: Array<{ type: string; text: string }> }>;
 };
 
@@ -49,6 +53,7 @@ async function harness(
       return [];
     },
   },
+  optionsOverride: { config?: UnblockMemoryConfig; runtime?: QmdMemoryRuntime } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-people-tools-"));
   const cfg = {} as OpenClawConfig;
@@ -66,7 +71,8 @@ async function harness(
       }
     },
   } as unknown as OpenClawPluginApi;
-  registerPeopleTools(api, stores, peopleConfig, reader);
+  registerPeopleTools(api, stores, optionsOverride.config ?? resolveConfig({ people: peopleConfig }),
+    optionsOverride.runtime ?? { async getMemorySearchManager() { throw new Error("Unexpected memory access"); } } as unknown as QmdMemoryRuntime, reader);
   const maybeTool = (name: string, owner?: boolean) => {
     const factory = factories.get(name);
     assert.ok(factory);
@@ -86,13 +92,13 @@ async function harness(
 
 const dossier = {
   schemaVersion: 1 as const,
-  blurb: "Prefers concise decisions with explicit owners.",
+  blurb: "Mira is the founder of ExampleCo.",
   sections: [
     {
-      category: "preferences" as const,
+      category: "role" as const,
       claims: [
         {
-          statement: "Prefers concise decisions.",
+          statement: "Mira is the founder of ExampleCo.",
           evidence: [{ source: "manual" as const, locator: "operator note" }],
           epistemicType: "reported" as const,
         },
@@ -100,6 +106,152 @@ const dossier = {
     },
   ],
 };
+
+const manualVerification = "Verified every assertion and background-only eligibility against Mira's explicit original operator note.";
+
+async function writeHarness(t: test.TestContext) {
+  const f = await reviewFixture(); t.after(f.close);
+  const note = await f.insert("# Mira\nMira is the founder of ExampleCo.");
+  const config = resolveConfig({ people: peopleConfig, typesafe: { apiKey: "test-key" },
+    peoplePrimer: { enabled: true, corpora: ["memory"] } });
+  const calls: Array<Parameters<typeof reviewIndexedClaim>[0]> = [];
+  const runtime = { async getMemorySearchManager() { return { manager: {
+    async reviewClaim(params: Parameters<typeof reviewIndexedClaim>[0]) {
+      calls.push(params);
+      return reviewIndexedClaim({ ...f.params, ...params });
+    },
+  } }; } } as unknown as QmdMemoryRuntime;
+  const h = await harness(undefined, { config, runtime }); t.after(() => h.stores.closeAll());
+  const store = h.stores.get("bill");
+  const person = store.upsertIdentity({ provider: "slack", accountScope: "workspace", externalId: "U123", displayName: "Mira" }).person;
+  store.replaceDossier(person.id, "Original", dossier);
+  const proposed = structuredClone(dossier);
+  proposed.sections[0]!.claims[0]!.evidence[0]!.locator = `${note.uri}#L2-L2`;
+  const input = { action: "replace_dossier", personId: person.id, reason: "Verified identity", agentName: "Bill", dossier: proposed };
+  const update = h.tool("memory_people_update");
+  return { ...h, store, person, config, calls, input,
+    write: (overrides: Record<string, unknown> = {}, signal?: AbortSignal) => update.execute("write", { ...input, ...overrides }, signal).then(resultJson) };
+}
+
+function backgroundResponse(needsReview = false) {
+  return Response.json({ answers: {
+    relation: { type: "choice", choice: "supports", confidence: 0.99,
+      probabilities: { supports: 0.99, contradicts: 0.005, insufficient_evidence: 0.005 } },
+    backgroundOnly: { type: "noul", noul: needsReview ? 0.05 : 0.99 },
+    explicitSupport: { type: "noul", noul: 0.99 },
+  } });
+}
+
+test("dossier update reviews indexed blurb and saves once only on a passing judgment", async t => {
+  const h = await writeHarness(t);
+  const requests: unknown[] = [];
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return backgroundResponse();
+  });
+  const result = await h.write();
+  assert.equal(result.status, "ok");
+  assert.equal(result.verification, "typesafe");
+  assert.equal(requests.length, 1);
+  assert.deepEqual(h.calls[0]?.personBackground, { name: "Mira", agentName: "Bill" });
+  assert.deepEqual(h.calls[0]?.citations, [{ path: h.calls[0]!.citations[0]!.path, from: 2, lines: 1 }]);
+  assert.equal(h.store.listDossierChanges(h.person.id).length, 2);
+  assert.match(h.store.listDossierChanges(h.person.id)[0]!.reason, /TypeSafe background review passed/);
+});
+
+test("rejected, failed and unapproved reviews preserve dossier and history", async t => {
+  const h = await writeHarness(t);
+  const before = h.store.getDossier(h.person.id), history = h.store.listDossierChanges(h.person.id);
+  let mode = "reject", requests = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    requests++;
+    if (mode === "error") throw new Error("sensitive-provider-diagnostic");
+    if (mode === "invalid") return Response.json({ unexpected: true });
+    return backgroundResponse(true);
+  });
+  assert.equal((await h.write()).status, "needs_review");
+  for (mode of ["error", "invalid"]) {
+    const result = await h.write();
+    assert.equal(result.status, "review_unavailable");
+    assert.equal(JSON.stringify(result).includes("sensitive-provider-diagnostic"), false);
+  }
+  const bad = structuredClone(h.input.dossier);
+  bad.sections[0]!.claims[0]!.evidence[0]!.locator = "qmd://unapproved/private.md#L1-L2";
+  assert.equal((await h.write({ dossier: bad })).status, "review_unavailable");
+  assert.equal(requests, 3, "unapproved evidence must never reach the provider");
+  assert.deepEqual(h.store.getDossier(h.person.id), before);
+  assert.deepEqual(h.store.listDossierChanges(h.person.id), history);
+});
+
+test("disabled or missing-key review requires explicit manual verification without provider calls", async t => {
+  const h = await writeHarness(t);
+  t.mock.method(globalThis, "fetch", () => { throw new Error("Unexpected provider call"); });
+  h.config.peoplePrimer.enabled = false;
+  assert.equal((await h.write()).status, "review_unavailable");
+  h.config.peoplePrimer.enabled = true;
+  h.config.typesafe.enabled = false;
+  assert.equal((await h.write()).status, "review_unavailable");
+  h.config.typesafe.enabled = true;
+  h.config.typesafe.apiKey = undefined;
+  h.config.typesafe.apiKeyFile = "/nonexistent/people-review-key";
+  assert.equal((await h.write()).status, "review_unavailable");
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.store.listDossierChanges(h.person.id).length, 1);
+  const result = await h.write({ dossier, manualVerification });
+  assert.equal(result.status, "ok");
+  assert.equal(result.verification, "manual");
+  assert.match(h.store.listDossierChanges(h.person.id)[0]!.reason, /Manual verification: Verified every assertion/);
+  assert.equal(h.calls.length, 0);
+});
+
+test("manual verification cannot bypass shape limits, and invalid inputs do not spend provider calls", async t => {
+  const h = await writeHarness(t);
+  for (const manual of [undefined, manualVerification]) {
+    await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, blurb: "word ".repeat(71) } }), /70 words/);
+    await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, sections: [{ ...dossier.sections[0], category: "preferences" }] } }), /only role and relationship/);
+  }
+  await assert.rejects(h.write({ manualVerification: " " }));
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.store.listDossierChanges(h.person.id).length, 1);
+});
+
+test("malformed, missing and excessive citation ranges fail closed before review", async t => {
+  const h = await writeHarness(t);
+  const reference = h.input.dossier.sections[0]!.claims[0]!.evidence[0]!;
+  for (const locators of [["operator note"], ["qmd://memory/mira.md#L8-L2"],
+    ["qmd://memory/mira.md#L1-L121"], ["qmd://memory/mira.md#L9007199254740992"],
+    [1, 2, 3, 4].map(n => `qmd://memory/mira.md#L${n}`)]) {
+    const bad = structuredClone(h.input.dossier);
+    bad.sections[0]!.claims[0]!.evidence = locators.map(locator => ({ ...reference, locator }));
+    assert.equal((await h.write({ dossier: bad })).status, "review_unavailable");
+  }
+  assert.equal((await h.write({ dossier: { ...dossier, sections: [] } })).status, "review_unavailable");
+  assert.equal(h.calls.length, 0);
+});
+
+test("in-flight review cannot overwrite concurrent writes, deletions or archived people", async t => {
+  for (const mutation of ["replace", "delete", "replace_then_delete", "archive"]) {
+    const h = await writeHarness(t);
+    t.mock.method(globalThis, "fetch", async () => {
+      if (mutation === "replace" || mutation === "replace_then_delete") h.store.replaceDossier(h.person.id, "Newer correction", dossier);
+      if (mutation === "delete" || mutation === "replace_then_delete") h.store.deleteDossier(h.person.id, "Newer deletion");
+      if (mutation === "archive") h.store.softDeletePerson(h.person.id);
+      return backgroundResponse();
+    });
+    assert.equal((await h.write()).status, "conflict", mutation);
+    assert.equal(h.store.listDossierChanges(h.person.id).some(change => change.reason.startsWith("Verified identity")), false);
+    t.mock.restoreAll();
+  }
+});
+
+test("cancelled reviews never save, including explicit manual writes", async t => {
+  const h = await writeHarness(t);
+  const controller = new AbortController();
+  t.mock.method(globalThis, "fetch", async () => { controller.abort(); return backgroundResponse(); });
+  assert.equal((await h.write({}, controller.signal)).status, "review_unavailable");
+  assert.equal((await h.write({ manualVerification }, controller.signal)).status, "review_unavailable");
+  assert.equal(h.store.listDossierChanges(h.person.id).length, 1);
+});
 
 test("people tools let the agent inspect and update dossiers without owner gating", async () => {
   const testHarness = await harness();
@@ -149,7 +301,8 @@ test("people tools let the agent inspect and update dossiers without owner gatin
           action: "replace_dossier",
           personId: person.id,
           dossier,
-          reason: "Captured a durable preference",
+          reason: "Captured explicit background",
+          manualVerification: "Verified the founder role in the original operator note.",
         }),
       ).status,
       "ok",
@@ -204,7 +357,7 @@ test("people tools let the agent inspect and update dossiers without owner gatin
       ),
       [
         { action: "delete", reason: "The dossier became unreliable" },
-        { action: "replace", reason: "Captured a durable preference" },
+        { action: "replace", reason: "Captured explicit background\nManual verification: Verified the founder role in the original operator note." },
       ],
     );
     const firstChange = (history.changes as Array<{ id: string }>)[0]!;

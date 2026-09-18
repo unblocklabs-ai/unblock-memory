@@ -12,7 +12,16 @@ export declare function askTypeSafeReview(params: RequestOptions, state: Json, q
 export declare function reviewTypeSafeClaim(params: RequestOptions & {
     claim: string;
     evidence: readonly string[];
+    personBackground?: {
+        name: string;
+        agentName: string;
+    };
 }): Promise<{
+    needsReview: boolean;
+    background?: {
+        backgroundOnly: number;
+        explicitSupport: number;
+    } | undefined;
     verdict: "supports" | "contradicts" | "insufficient_evidence";
     confidence: number;
     probabilities: {
@@ -20,7 +29,6 @@ export declare function reviewTypeSafeClaim(params: RequestOptions & {
         contradicts: number;
         insufficient_evidence: number;
     };
-    needsReview: boolean;
 }>;
 /** Directional coverage, not topic similarity. Bounded at six comparisons of four ranked candidates. */
 export declare function reviewMemoryRedundancy(params: RequestOptions & {
