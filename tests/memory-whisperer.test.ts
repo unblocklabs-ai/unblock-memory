@@ -93,7 +93,7 @@ test("one batched judge ranks useful hits, enforces threshold, deduplicates and 
     assert.equal(request.state.candidates.length, 3);
     assert.equal(JSON.stringify(request).includes("qmd://"), false);
     assert.equal(Object.keys(request.questions).length, 3);
-    assert.match(request.questions.memory_1.instructions, /candidates\[1\]/);
+    assert.match(request.questions.memory_1.instructions.question, /candidates\[1\]/);
     return response(0.9, 0.99, 0.89);
   });
   const h = harness([hit("first"), hit("first"), hit("overlap", { path: "qmd://memory/first.md", startLine: 2 }), hit("second"), hit("third")],

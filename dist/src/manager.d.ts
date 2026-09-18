@@ -36,6 +36,7 @@ export declare function buildReadResult(params: {
 export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">, maxTokens: number, countTokens: (text: string) => Promise<number>, maxChars?: number): Promise<{
     text: string;
     position: number;
+    sourceText?: string;
 }>;
 export declare class QmdMemoryManager implements MemorySearchManagerContract {
     #private;

@@ -4,6 +4,7 @@ import { basename, dirname, relative, resolve, sep } from "node:path";
 import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
 import picomatch from "picomatch";
+import { meetingRevisionAnnotation, meetingSpeakerSpans } from "./loggie-projection.js";
 import {
   ensureMemoryAnalysisSchema,
   latestAnalysisCollections,
@@ -302,17 +303,28 @@ export async function expandSessionSearchHit(
   maxTokens: number,
   countTokens: (text: string) => Promise<number>,
   maxChars = Infinity,
-): Promise<{ text: string; position: number }> {
+): Promise<{ text: string; position: number; sourceText?: string }> {
   const leaf = { text: result.bestChunk, position: result.chunkPos };
-  const spans = sessionContextSpans(result.body, result.chunkPos);
-  if (!spans) return leaf;
+  const speaker = meetingSpeakerSpans(result.body, result.chunkPos, result.chunkPos + result.chunkLen);
+  const annotation = meetingRevisionAnnotation(result.body, result.chunkPos);
+  const spans = speaker ?? sessionContextSpans(result.body, result.chunkPos);
+  if (!spans && !annotation) return leaf;
   const leafEnd = result.chunkPos + result.chunkLen;
-  for (const span of [spans.turn, spans.message]) {
+  for (const span of spans ? [spans.turn, spans.message] : []) {
     if (span.start > result.chunkPos || span.end < leafEnd) continue;
-    const text = result.body.slice(span.start, span.end).trimEnd();
+    const sourceText = result.body.slice(span.start, span.end).trimEnd();
+    const text = annotation ? `${annotation}\n${sourceText}` : sourceText;
     if (text.length > maxChars) continue;
-    if (await countTokens(text) <= maxTokens) return { text, position: span.start };
+    if (await countTokens(text) <= maxTokens) return { text, position: span.start, ...(annotation ? { sourceText } : {}) };
   }
+  if ((speaker && speaker.start < result.chunkPos) || annotation) {
+    const text = [annotation, speaker && speaker.start < result.chunkPos ? speaker.header : undefined, leaf.text].filter(Boolean).join("\n");
+    if (text.length <= maxChars && await countTokens(text) <= maxTokens) {
+      return { ...leaf, text, sourceText: leaf.text };
+    }
+  }
+  // Never silently strip supersession when the caller's snippet budget is tiny.
+  if (annotation) return { ...leaf, text: "", sourceText: "" };
   return leaf;
 }
 
@@ -982,7 +994,8 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             opts?.maxSnippetChars,
           )
         : { text: hit.bestChunk, position: hit.chunkPos };
-      const span = lineSpan(hit.body, selected.position, selected.text);
+      if (!selected.text) continue;
+      const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
       results.push({
         path: hit.file,
         ...span,

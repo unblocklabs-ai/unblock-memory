@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { projectLoggieMessage } from "./loggie-projection.js";
 const MESSAGE_HEADING = /^## (User|Assistant) — .* — \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S.*$/gmu;
 function record(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -60,7 +61,10 @@ function projectMessage(row, input) {
         return undefined;
     if (text === "HEARTBEAT_OK")
         return undefined;
+    if (role === "assistant" && text === "NO_REPLY")
+        return undefined;
     if (role === "user" && (text === "[OpenClaw heartbeat poll]" ||
+        text === "[Queued messages while agent was busy]" ||
         text.startsWith("[Subagent Context]") ||
         text.startsWith("<relevant-memories>")))
         return undefined;
@@ -79,10 +83,13 @@ function projectMessage(row, input) {
     }
     if (!text)
         return undefined;
+    const meeting = role === "user" && input.provider?.toLowerCase() === "loggie"
+        ? projectLoggieMessage(text, input.accountId) : undefined;
     return {
         role,
         speaker: speaker.replace(/[\r\n]+/gu, " "),
-        text,
+        text: meeting?.text ?? text,
+        meeting,
         timestamp: timestamp(eventRecord.timestamp) ?? row.createdAt ?? timestamp(message.timestamp) ?? input.startedAt,
     };
 }
@@ -109,7 +116,39 @@ export function projectSession(input) {
     });
     if (messages.length === 0)
         return undefined;
-    const transcript = messages.map((message) => `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ` +
+    // Retry copies disappear only in the derived index. Source history is untouched.
+    const latest = new Map();
+    const hidden = new Set();
+    for (const message of messages) {
+        const meeting = message.meeting;
+        if (!meeting?.key)
+            continue;
+        const previous = latest.get(meeting.key);
+        if (previous?.meeting && previous.meeting.hash === meeting.hash &&
+            (meeting.complete || previous.meeting.complete || previous.text === message.text)) {
+            if (meeting.complete && !previous.meeting.complete) {
+                hidden.add(previous);
+                latest.set(meeting.key, message);
+            }
+            else
+                hidden.add(message);
+        }
+        else if (previous?.meeting?.complete && meeting.complete &&
+            previous.meeting.sequence !== undefined && meeting.sequence !== undefined) {
+            // Keep historical revisions alongside their assistant follow-ups, but label
+            // supersession explicitly rather than silently presenting both as current.
+            if (meeting.sequence > previous.meeting.sequence) {
+                previous.text = `Transcript revision ${previous.meeting.sequence} (superseded by revision ${meeting.sequence}).\n\n${previous.text}`;
+                latest.set(meeting.key, message);
+            }
+            else if (meeting.sequence < previous.meeting.sequence) {
+                message.text = `Transcript revision ${meeting.sequence} (superseded by revision ${previous.meeting.sequence}).\n\n${message.text}`;
+            }
+        }
+        else if (!previous || (!previous.meeting?.complete && meeting.complete))
+            latest.set(meeting.key, message);
+    }
+    const transcript = messages.filter(message => !hidden.has(message)).map((message) => `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ` +
         `${formatTimestamp(message.timestamp, input.timezone)}\n\n${message.text}`);
     return `# Transcript\n\n${transcript.join("\n\n")}\n`;
 }

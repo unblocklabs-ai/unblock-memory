@@ -17,7 +17,7 @@ export declare function selectTypeSafeSkill(params: {
         description: string;
     }[];
 }): Promise<number | undefined>;
-export declare const QUALITY_JUDGE_VERSION = "jev-1.13.0:quality-v1";
+export declare const QUALITY_JUDGE_VERSION = "jev-1.13.0:quality-v2-json";
 export type QualityJudgment = {
     noise: number;
     evidence: number;

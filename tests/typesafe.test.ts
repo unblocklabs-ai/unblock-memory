@@ -13,8 +13,10 @@ test("quality judgments keep evidence and noise independent and validate exact a
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     assert.equal(init?.redirect, "error");
-    assert.match(request.questions.noise_0.instructions, /chunks\[0\]/);
-    assert.match(request.questions.evidence_0.instructions, /chunks\[0\]/);
+    assert.match(request.questions.noise_0.instructions.scope, /chunks\[0\]/);
+    assert.match(request.questions.evidence_0.instructions.scope, /chunks\[0\]/);
+    assert.equal(typeof request.questions.noise_0.criteria.true.definition, "string");
+    assert.ok(Array.isArray(request.questions.noise_0.criteria.false.exclusions));
     assert.deepEqual(Object.keys(request.state), ["chunks"]);
     return Response.json({ answers: { noise_0: { type: "noul", noul: 0.96 }, evidence_0: { type: "noul", noul: 0.97 } } });
   });
@@ -74,7 +76,8 @@ test("selection uses opaque IDs, fixed endpoint, model, no redirects, and explic
     const request = JSON.parse(String(init?.body));
     assert.equal(request.model, "jev-1.13.0");
     assert.equal(request.state.currentRequest, "Deploy this project");
-    assert.equal(request.questions.selected.criteria.skill_0, "none: Deploy software releases.");
+    assert.deepEqual(request.questions.selected.criteria.skill_0, { name: "none", description: "Deploy software releases." });
+    assert.equal(typeof request.questions.selected.instructions.question, "string");
     assert.ok(request.questions.selected.criteria.none);
     return response(calls === 1 ? "skill_0" : "none");
   });
@@ -120,6 +123,8 @@ test("memory judgments use Noul probabilities and reject missing, extra, mistype
     const request = JSON.parse(String(init?.body));
     assert.equal(request.model, "jev-1.13.0");
     assert.equal(request.questions.memory_0.type, "noul");
+    assert.equal(typeof request.questions.memory_0.instructions.question, "string");
+    assert.equal(typeof request.questions.memory_0.criteria.true.definition, "string");
     assert.equal(request.state.candidates[0].excerpt, "Alpha requires approval");
     return Response.json({ answers: { memory_0: { type: "noul", noul: 0.97 } } });
   });
