@@ -90,7 +90,7 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.equal(Math.round(firstModifiedAt), session.startedAt);
 
   const second = await run();
-  assert.equal(second.result.unchanged, 1);
+  assert.equal(second.result.unchanged, 2); // Includes the checkpointed empty session.
   assert.equal(second.result.updated, 0);
   assert.equal(second.result.embedded, 3);
   assert.equal(indexRuns, 2);

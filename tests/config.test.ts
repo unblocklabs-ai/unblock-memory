@@ -152,7 +152,7 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
         kind: "sessions",
         chatTypes: ["channel", "group"],
         maxExpandedTokens: 500,
-        syncIntervalMinutes: 15,
+        syncIntervalMinutes: 60,
       },
     ],
   );
@@ -172,7 +172,7 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
       kind: "sessions",
       chatTypes: ["direct"],
       maxExpandedTokens: 500,
-      syncIntervalMinutes: 15,
+      syncIntervalMinutes: 60,
     },
   );
   assert.deepEqual(resolveConfig({
@@ -186,7 +186,7 @@ test("validates the optional sessions corpus and defaults its chat types", () =>
     kind: "sessions",
     chatTypes: ["channel", "group"],
     maxExpandedTokens: 800,
-    syncIntervalMinutes: 15,
+    syncIntervalMinutes: 60,
   });
   assert.throws(() => resolveConfig({
     corpora: [memory, {

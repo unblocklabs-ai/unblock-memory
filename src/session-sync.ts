@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,6 +14,12 @@ import {
 const MANIFEST_VERSION = 1;
 export const PROJECTOR_VERSION = 6;
 const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
+// Source lives in src/, published code in dist/src/. Read our own pinned dependency
+// metadata, not QMD internals (which may also be substituted by runtime inspectors).
+const sourcePackage = new URL("../package.json", import.meta.url);
+const packageMetadata = JSON.parse(readFileSync(existsSync(sourcePackage)
+  ? sourcePackage : new URL("../../package.json", import.meta.url), "utf8"));
+const indexVersion: unknown[] = [packageMetadata.version, packageMetadata.dependencies["@unblocklabs/qmd"]];
 
 const REQUIRED_COLUMNS = {
   schema_meta: ["meta_key", "role", "schema_version", "agent_id", "app_version"],
@@ -38,11 +44,16 @@ type IndexedSession = SessionMetadata & {
   projectionHash: string;
   documentPath: string;
   projectorVersion: number;
+  sourceFingerprint?: string;
 };
 
 export type SessionManifest = {
   version: number;
   lastSuccessfulSyncAt?: number;
+  lastIndexedAt?: number;
+  projectionKey?: string;
+  indexSignature?: string;
+  ignoredSessions?: Record<string, string>;
   sessions: Record<string, IndexedSession>;
 };
 
@@ -55,6 +66,9 @@ export type SessionSyncResult = {
   failed: number;
   embedded: number;
   lastSuccessfulSyncAt: number;
+  lastCheckedAt?: number;
+  lastIndexedAt?: number;
+  skipReason?: "no_changes" | "no_indexable_changes";
   diagnostics?: NonNullable<SessionProjectionInput["diagnostics"]>;
 };
 
@@ -72,6 +86,36 @@ type WindowRow = {
 };
 
 type EventRow = { sessionId: string; eventJson: string; createdAt: number };
+
+type ProjectionOptions = {
+  databasePath: string;
+  outputDir: string;
+  manifestPath: string;
+  agentId: string;
+  agentName: string;
+  timezone: string;
+  chatTypes: readonly ChatType[];
+};
+
+function projectionKey(params: ProjectionOptions): string {
+  return JSON.stringify([PROJECTOR_VERSION, params.databasePath, params.agentId,
+    params.agentName, params.timezone, [...params.chatTypes].sort()]);
+}
+
+// Conservative proof: any index/WAL write, replacement or QMD upgrade invalidates it.
+// This avoids depending on QMD's private embedding schema or opening/loading its store.
+function sessionIndexSignature(databasePath: string): string | undefined {
+  try {
+    const fingerprint = (path: string) => {
+      const stat = statSync(path, { bigint: true });
+      return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String);
+    };
+    let wal: string[] | null = null;
+    try { wal = fingerprint(`${databasePath}-wal`); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    return JSON.stringify([indexVersion, fingerprint(databasePath), wal]);
+  } catch { return undefined; }
+}
 
 function projectionPath(outputDir: string, documentPath: string): string {
   const root = resolve(outputDir);
@@ -128,7 +172,8 @@ function readSnapshot(params: {
   force: boolean;
   outputDir: string;
   previousManifest: SessionManifest;
-}): { windows: WindowRow[]; events: Map<string, EventRow[]> } {
+  metadataOnly?: boolean;
+}): { windows: WindowRow[]; events: Map<string, EventRow[]>; changed: Set<string> } {
   const db = new DatabaseSync(params.databasePath, { readOnly: true });
   try {
     db.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; BEGIN");
@@ -168,6 +213,7 @@ function readSnapshot(params: {
       ORDER BY active.active_position
     `);
     const events = new Map<string, EventRow[]>();
+    const changed = new Set<string>();
     for (const window of windows) {
       const metadata: SessionMetadata = {
         sessionId: window.sessionId,
@@ -179,24 +225,42 @@ function readSnapshot(params: {
       };
       const previous = params.previousManifest.sessions[window.sessionId];
       const documentPath = sessionDocumentPath(metadata);
+      const sourceFingerprint = JSON.stringify(window);
       const unchanged = !params.force &&
-        previous?.sourceGeneration === window.sourceGeneration &&
-        previous.maxSeq === (window.maxSeq ?? 0) &&
-        previous.projectorVersion === PROJECTOR_VERSION &&
-        previous.documentPath === documentPath &&
-        existsSync(projectionPath(params.outputDir, documentPath));
+        (previous ? previous.sourceFingerprint === sourceFingerprint &&
+          previous.projectorVersion === PROJECTOR_VERSION &&
+          previous.documentPath === documentPath &&
+          existsSync(projectionPath(params.outputDir, documentPath)) :
+          params.previousManifest.ignoredSessions?.[window.sessionId] === sourceFingerprint);
       if (!unchanged) {
-        events.set(window.sessionId, readEvents.all(window.sessionId) as EventRow[]);
+        changed.add(window.sessionId);
+        if (!params.metadataOnly) events.set(window.sessionId, readEvents.all(window.sessionId) as EventRow[]);
       }
     }
     db.exec("COMMIT");
-    return { windows, events };
+    return { windows, events, changed };
   } catch (error) {
     try { db.exec("ROLLBACK"); } catch { /* transaction may not have started */ }
     throw error;
   } finally {
     db.close();
   }
+}
+
+export async function unchangedSessionSync(
+  params: ProjectionOptions,
+  indexPath: string,
+): Promise<SessionSyncResult | undefined> {
+  const manifest = await readSessionManifest(params.manifestPath);
+  if (!manifest.lastSuccessfulSyncAt || manifest.projectionKey !== projectionKey(params) ||
+    !manifest.indexSignature || manifest.indexSignature !== sessionIndexSignature(indexPath)) return;
+  const snapshot = readSnapshot({ ...params, previousManifest: manifest, force: false, metadataOnly: true });
+  const ids = new Set(snapshot.windows.map(window => window.sessionId));
+  if (snapshot.changed.size || Object.keys(manifest.sessions).some(id => !ids.has(id)) ||
+    Object.keys(manifest.ignoredSessions ?? {}).some(id => !ids.has(id))) return;
+  return { scanned: ids.size, unchanged: ids.size, updated: 0, removed: 0,
+    skipped: 0, failed: 0, embedded: 0, lastSuccessfulSyncAt: manifest.lastSuccessfulSyncAt,
+    lastCheckedAt: Date.now(), lastIndexedAt: manifest.lastIndexedAt, skipReason: "no_changes" };
 }
 
 function emptyManifest(): SessionManifest {
@@ -260,24 +324,20 @@ export function sessionMetadataByPath(manifest: SessionManifest): Map<string, Se
   }]));
 }
 
-export async function syncSessionProjections(params: {
-  databasePath: string;
-  outputDir: string;
-  manifestPath: string;
-  agentId: string;
-  agentName: string;
-  timezone: string;
-  chatTypes: readonly ChatType[];
+export async function syncSessionProjections(params: ProjectionOptions & {
   force?: boolean;
+  indexPath?: string;
+  indexReady?: () => Promise<boolean>;
   index?: () => Promise<number>;
 }): Promise<{ result: SessionSyncResult; manifest: SessionManifest }> {
   const previousManifest = await readSessionManifest(params.manifestPath);
   const snapshot = readSnapshot({
     ...params,
-    force: params.force === true,
+    force: params.force === true || previousManifest.projectionKey !== projectionKey(params),
     previousManifest,
   });
   const sessions: Record<string, IndexedSession> = {};
+  const ignoredSessions: Record<string, string> = {};
   const counts = { unchanged: 0, updated: 0, removed: 0, skipped: 0, failed: 0 };
   const diagnostics = { internalMessagesCleaned: 0, attachmentsCleaned: 0, attachmentBudgetSkipped: 0 };
   await mkdir(params.outputDir, { recursive: true, mode: 0o700 });
@@ -296,7 +356,8 @@ export async function syncSessionProjections(params: {
     };
     const documentPath = sessionDocumentPath(metadata);
     if (events === undefined) {
-      sessions[window.sessionId] = previous!;
+      if (previous) sessions[window.sessionId] = previous;
+      else ignoredSessions[window.sessionId] = JSON.stringify(window);
       counts.unchanged += 1;
       continue;
     }
@@ -323,6 +384,7 @@ export async function syncSessionProjections(params: {
       continue;
     }
     if (!content) {
+      ignoredSessions[window.sessionId] = JSON.stringify(window);
       counts.skipped += 1;
       if (previous) {
         await remove(projectionPath(params.outputDir, previous.documentPath));
@@ -332,8 +394,13 @@ export async function syncSessionProjections(params: {
     }
 
     const target = projectionPath(params.outputDir, documentPath);
-    await atomicWrite(target, content, 0o600);
-    await utimes(target, new Date(), new Date(metadata.startedAt));
+    const hash = projectionHash(content);
+    const contentChanged = params.force === true || previous?.projectorVersion !== PROJECTOR_VERSION ||
+      previous.projectionHash !== hash || previous.documentPath !== documentPath || !existsSync(target);
+    if (contentChanged) {
+      await atomicWrite(target, content, 0o600);
+      await utimes(target, new Date(), new Date(metadata.startedAt));
+    }
     if (previous?.documentPath && previous.documentPath !== documentPath) {
       await remove(projectionPath(params.outputDir, previous.documentPath));
     }
@@ -343,11 +410,13 @@ export async function syncSessionProjections(params: {
       maxSeq: window.maxSeq!,
       activeEventCount: window.activeEventCount,
       sizeBytes: Buffer.byteLength(content),
-      projectionHash: projectionHash(content),
+      projectionHash: hash,
       documentPath,
       projectorVersion: PROJECTOR_VERSION,
+      sourceFingerprint: JSON.stringify(window),
     };
-    counts.updated += 1;
+    if (contentChanged) counts.updated += 1;
+    else counts.unchanged += 1;
   }
 
   for (const [sessionId, session] of Object.entries(previousManifest.sessions)) {
@@ -356,11 +425,25 @@ export async function syncSessionProjections(params: {
     counts.removed += 1;
   }
 
-  const embedded = await params.index?.() ?? 0;
+  const needsIndex = params.force === true || counts.updated > 0 || counts.removed > 0 ||
+    previousManifest.projectionKey !== projectionKey(params) ||
+    !previousManifest.indexSignature || !params.indexPath ||
+    previousManifest.indexSignature !== sessionIndexSignature(params.indexPath);
+  const embedded = needsIndex ? await params.index?.() ?? 0 : 0;
   const lastSuccessfulSyncAt = Date.now();
+  const indexed = needsIndex && params.index !== undefined;
+  const signature = params.indexPath ? sessionIndexSignature(params.indexPath) : undefined;
+  const indexReady = indexed && (await params.indexReady?.() ?? false);
+  const lastIndexedAt = indexed ? lastSuccessfulSyncAt : previousManifest.lastIndexedAt;
   const manifest: SessionManifest = {
     version: MANIFEST_VERSION,
     lastSuccessfulSyncAt,
+    lastIndexedAt,
+    projectionKey: projectionKey(params),
+    // Never certify an index mutation that happened during a skipped run or readiness check.
+    indexSignature: counts.failed > 0 ? undefined : !needsIndex ? previousManifest.indexSignature :
+      indexReady && params.indexPath && signature === sessionIndexSignature(params.indexPath) ? signature : undefined,
+    ignoredSessions,
     sessions,
   };
   await atomicWrite(params.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
@@ -370,6 +453,9 @@ export async function syncSessionProjections(params: {
       ...counts,
       embedded,
       lastSuccessfulSyncAt,
+      lastCheckedAt: lastSuccessfulSyncAt,
+      lastIndexedAt,
+      ...(!needsIndex ? { skipReason: "no_indexable_changes" as const } : {}),
       diagnostics,
     },
     manifest,

@@ -534,12 +534,14 @@ export class QmdMemoryManager {
             if (!sessions)
                 throw new Error('memory session sync requires a configured "sessions" corpus');
             onPhase?.("projecting");
-            const store = await this.#getStore();
             const synced = await syncSessionProjections({
                 ...sessions,
                 force,
+                indexPath: this.#dbPath,
+                indexReady: async () => (await (await this.#getStore()).getStatus()).needsEmbedding === 0,
                 index: async () => {
                     onPhase?.("indexing");
+                    const store = await this.#getStore();
                     const update = await store.update({ collections: [sessions.collection] });
                     this.#cleanupRemovedDocuments?.(update.updated + update.removed);
                     const analysisStore = store;
@@ -561,6 +563,9 @@ export class QmdMemoryManager {
                 },
             });
             this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
+            if (synced.result.skipReason)
+                return synced.result;
+            const store = await this.#getStore();
             const status = await store.getStatus();
             const collections = await store.listCollections();
             this.#files = collections.reduce((total, collection) => total + collection.active_count, 0);

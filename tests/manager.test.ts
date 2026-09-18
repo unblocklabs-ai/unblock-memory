@@ -1126,12 +1126,22 @@ test("keeps analysis fresh for a no-op manual session sync", async () => {
   const source = resolveSessionSource(sessionsDir, ["channel", "group"]);
   createAgentDatabase(databasePath).close();
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  let updates = 0;
+  let embeddings = 0;
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,
     sources: [source],
     storeFactory: async () => createManagerStore({
       internal: backing.internal,
+      async update() {
+        updates++;
+        return { collections: 0, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 };
+      },
+      async embed() {
+        embeddings++;
+        return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+      },
       async close() { await backing.close(); },
     }),
     sessions: {
@@ -1153,6 +1163,11 @@ test("keeps analysis fresh for a no-op manual session sync", async () => {
       VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
     await manager.syncSessions();
     assert.equal((await manager.listClusters()).stale, false);
+    updates = 0;
+    embeddings = 0;
+    assert.equal((await manager.syncSessions()).skipReason, "no_indexable_changes");
+    assert.equal(updates, 0);
+    assert.equal(embeddings, 0);
   } finally {
     await manager.close();
   }

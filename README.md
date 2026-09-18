@@ -731,12 +731,12 @@ session manifest. The projected file modification time matches the session
 start time for meaningful chronological cluster reads. Session results include
 provider, chat type, conversation identity, and start time as an ISO 8601 timestamp. They
 participate in the same search and clustering index as file memory. The plugin
-automatically refreshes each configured agent's sessions every 15 minutes while
+automatically checks each configured agent's sessions every 60 minutes while
 the Gateway runs. Set `syncIntervalMinutes` on the `sessions` corpus to an integer
 from `1` to `1440`, or `0` for manual-only syncing. For example:
 
 ```json
-{ "name": "sessions", "kind": "sessions", "syncIntervalMinutes": 15 }
+{ "name": "sessions", "kind": "sessions", "syncIntervalMinutes": 60 }
 ```
 
 The first refresh runs after one interval, not during startup. Restart the
@@ -744,6 +744,17 @@ Gateway after changing the interval. Refreshes are incremental; an already-runni
 sync is skipped, and failures are visible through `memory_sync_status` and retried
 at the next interval. `memory_sync_sessions` still provides an immediate manual
 refresh. Syncing and embedding run inside the Gateway process, without an LLM turn.
+
+Quiet checks compare source metadata and the last successful index checkpoint
+before initializing the memory manager. Unchanged sessions skip QMD updates and
+embedding. New assistant answers count too, not just human messages. Changed
+transcripts are projected and content-hashed; tool-only or filtered additions
+that leave the indexed text unchanged also skip indexing. Empty/filtered sessions
+are remembered. Index changes, missing projections, changed projection settings,
+QMD upgrades and incomplete runs invalidate the skip checkpoint; `force: true`
+bypasses both gates. `memory_sync_status` reports `lastCheckedAt`, `lastIndexedAt`
+and `skipReason` (`no_changes` or `no_indexable_changes`) separately. Existing
+explicit intervals remain unchanged on upgrade; set them to `60` for hourly checks.
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
 equivalent configured OpenClaw state directory). Durable agent-supplied event

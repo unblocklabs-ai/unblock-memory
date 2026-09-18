@@ -2,7 +2,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager } from "./manager.js";
-import type { SessionSyncResult } from "./session-sync.js";
+import { type SessionSyncResult } from "./session-sync.js";
 export type SessionSyncStatus = {
     status: "idle";
 } | {

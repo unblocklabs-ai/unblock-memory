@@ -5,6 +5,7 @@ import { resolveAgentDir, resolveAgentWorkspaceDir, resolveStateDir, } from "ope
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { QmdMemoryManager } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
+import { unchangedSessionSync } from "./session-sync.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
 import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
 const activeSessionSyncs = new Map();
@@ -149,10 +150,15 @@ export class QmdMemoryRuntime {
                 }));
             };
             try {
-                const { manager, error } = await this.getMemorySearchManager(params);
-                if (!manager)
-                    throw new Error(error ?? "memory unavailable");
-                const result = await manager.syncSessions(force, writePhase);
+                const sessions = this.#sessionConfig(params.cfg, params.agentId);
+                let result = !force && sessions
+                    ? await unchangedSessionSync(sessions, join(directory, "index.sqlite")) : undefined;
+                if (!result) {
+                    const { manager, error } = await this.getMemorySearchManager(params);
+                    if (!manager)
+                        throw new Error(error ?? "memory unavailable");
+                    result = await manager.syncSessions(force, writePhase);
+                }
                 await statusWrites;
                 await atomicWriteJson(statusPath, {
                     status: "completed",
@@ -224,10 +230,10 @@ export class QmdMemoryRuntime {
         const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
         const stateDir = join(this.#stateRoot, "agents", agentId, "unblock-memory");
         const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files" || corpus.kind === "skills");
-        const sessionCorpus = this.#corpora.find((corpus) => corpus.kind === "sessions");
+        const sessions = this.#sessionConfig(cfg, agentId);
         const sources = resolveSources(workspaceDir, fileCorpora);
-        const sessionSource = sessionCorpus
-            ? resolveSessionSource(join(stateDir, "sessions"), sessionCorpus.chatTypes)
+        const sessionSource = sessions
+            ? resolveSessionSource(sessions.outputDir, sessions.chatTypes)
             : undefined;
         if (sessionSource)
             sources.push(sessionSource);
@@ -238,22 +244,25 @@ export class QmdMemoryRuntime {
             sources,
             keepModelsWarm: this.#keepEmbeddingModelWarm,
             analysisExecutable: this.#analysisExecutable,
-            ...(sessionCorpus && sessionSource ? {
-                sessions: {
-                    agentId,
-                    agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
-                    chatTypes: sessionCorpus.chatTypes,
-                    maxExpandedTokens: sessionCorpus.maxExpandedTokens,
-                    collection: sessionSource.collection,
-                    databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
-                    manifestPath: join(stateDir, "sessions-manifest.json"),
-                    outputDir: sessionSource.root,
-                    timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
-                },
-            } : {}),
+            sessions,
         });
         await manager.start();
         return manager;
+    }
+    #sessionConfig(cfg, agentId) {
+        const corpus = this.#corpora.find(corpus => corpus.kind === "sessions");
+        if (!corpus)
+            return;
+        const stateDir = this.#sessionSyncDirectory(agentId);
+        const source = resolveSessionSource(join(stateDir, "sessions"), corpus.chatTypes);
+        return {
+            agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
+            chatTypes: corpus.chatTypes, maxExpandedTokens: corpus.maxExpandedTokens,
+            collection: source.collection, outputDir: source.root,
+            databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
+            manifestPath: join(stateDir, "sessions-manifest.json"),
+            timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
+        };
     }
     #sessionSyncDirectory(agentId) {
         return join(this.#stateRoot, "agents", agentId, "unblock-memory");
