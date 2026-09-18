@@ -1,3 +1,4 @@
+import { type ResponseAuditConfig } from "./response-config.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -40,6 +41,7 @@ export type UnblockMemoryConfig = {
         enabled: boolean;
         corpora: readonly string[];
     };
+    responseAudit: ResponseAuditConfig;
     people: {
         enabled: boolean;
         whisperer: {

@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.15",
+  "version": "0.3.16",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -43,6 +43,11 @@
     "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
+    "responseAudit.enabled": { "label": "Response Quality Audit", "help": "Opt in to background TypeSafe evaluation of approved Slack humans. Operator-only reports; no prompt or memory writes." },
+    "responseAudit.sentimentEnabled": { "label": "Human Sentiment Analysis", "help": "Default on within an enabled, approved response audit. Includes annoyance, frustration and expressed intensity; does not imply agent fault." },
+    "responseAudit.intervalMinutes": { "label": "Response Audit Interval (minutes)", "help": "Shared cadence for quality and enabled sentiment analysis. Unchanged successful exchanges are cached. Zero means manual-only." },
+    "responseAudit.senderIds": { "label": "Approved Human Sender IDs", "help": "Explicit human Slack user IDs whose exchanges may be sent to TypeSafe. Also requires trusted human identity or owner metadata; explicit bots are always excluded." },
+    "responseAudit.memoryCorpora": { "label": "Response Audit Memory Evidence", "help": "Optional configured file corpora approved for current-index memory-gap investigation. Does not prove historical availability." },
     "qualityAudit.enabled": {
       "label": "Memory Quality Audit",
       "help": "Enable an on-demand TypeSafe audit. Records review indicators only; never edits or suppresses data."
@@ -99,6 +104,20 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "responseAudit": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "sentimentEnabled": { "type": "boolean", "default": true },
+          "senderIds": { "type": "array", "maxItems": 50, "items": { "type": "string", "pattern": "\\S" }, "default": [] },
+          "chatTypes": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "string", "enum": ["direct", "group", "channel"] }, "default": ["direct"] },
+          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20, "default": 6 },
+          "lookbackDays": { "type": "integer", "minimum": 1, "maximum": 90, "default": 30 },
+          "maxEpisodes": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+          "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 1440, "default": 60 },
+          "memoryCorpora": { "type": "array", "maxItems": 50, "items": { "type": "string", "pattern": "\\S" }, "default": [] }
+        }
+      },
       "qualityAudit": {
         "type": "object",
         "additionalProperties": false,

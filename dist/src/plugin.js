@@ -12,6 +12,7 @@ import { registerMemoryWhisperer } from "./memory-whisperer.js";
 import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
+import { registerResponseAudit } from "./response-runtime.js";
 const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
     corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
@@ -413,6 +414,7 @@ export function resolveFlushPlan(params = {}) {
 }
 export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
+    registerResponseAudit(api, config);
     if (api.registrationMode === "cli-metadata")
         return;
     const runtime = new QmdMemoryRuntime(config.corpora, {

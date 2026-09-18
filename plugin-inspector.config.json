@@ -15,7 +15,7 @@
         "gateway_stop",
         "gateway_start"
       ],
-      "registrations": ["registerMemoryCapability", "registerTool"],
+      "registrations": ["registerMemoryCapability", "registerTool", "registerCli"],
       "manifestContracts": ["tools"]
     }
   },

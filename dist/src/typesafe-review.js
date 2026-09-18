@@ -1,13 +1,14 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-async function ask(params, state, questions) {
+export const TYPESAFE_REVIEW_MODEL = "jev-1.13.0";
+export async function askTypeSafeReview(params, state, questions) {
     const signal = AbortSignal.any([params.signal, AbortSignal.timeout(params.timeoutMs)]);
     try {
         signal.throwIfAborted();
         const response = await fetch("https://api.typesafe.ai/v1/systemone", {
             method: "POST", redirect: "error", signal,
             headers: { Authorization: `Bearer ${params.apiKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ model: "jev-1.13.0", state, questions }),
+            body: JSON.stringify({ model: TYPESAFE_REVIEW_MODEL, state, questions }),
         });
         if (!response.ok) {
             await response.body?.cancel();
@@ -31,7 +32,7 @@ const relationSchema = Type.Object({ answers: Type.Object({ relation: Type.Objec
         }) }) });
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
 export async function reviewTypeSafeClaim(params) {
-    const payload = await ask(params, { claim: params.claim, evidence: [...params.evidence] }, { relation: {
+    const payload = await askTypeSafeReview(params, { claim: params.claim, evidence: [...params.evidence] }, { relation: {
             type: "choice",
             instructions: {
                 question: "Does `evidence` support the exact atomic claim in `claim`?",
@@ -81,7 +82,7 @@ export async function reviewMemoryRedundancy(params) {
                 },
             },
         }]));
-    const payload = await ask(params, { excerpts: [...params.excerpts] }, questions);
+    const payload = await askTypeSafeReview(params, { excerpts: [...params.excerpts] }, questions);
     if (!Value.Check(nouls, payload) || Object.keys(payload.answers).length !== pairs.length ||
         pairs.some((_pair, i) => !Object.hasOwn(payload.answers, `pair_${i}`)))
         throw new Error("TypeSafe returned invalid redundancy judgments");
@@ -125,7 +126,7 @@ export async function reviewClusterDefects(params) {
                 none_or_uncertain: { definition: "Meaningful source content or insufficient evidence of the specific ingestion defects above.", examples: ["A useful JSON configuration", "A concrete deployment decision", "A quoted notification discussed as the subject of a technical explanation"] },
             },
         }]));
-    const payload = await ask(params, { excerpts: [...params.excerpts] }, questions);
+    const payload = await askTypeSafeReview(params, { excerpts: [...params.excerpts] }, questions);
     if (!Value.Check(schema, payload) || Object.keys(payload.answers).length !== params.excerpts.length ||
         params.excerpts.some((_text, i) => !Object.hasOwn(payload.answers, `member_${i}`)))
         throw new Error("TypeSafe returned invalid cluster judgments");

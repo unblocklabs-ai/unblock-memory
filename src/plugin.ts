@@ -17,6 +17,7 @@ import { registerMemoryWhisperer } from "./memory-whisperer.js";
 import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
+import { registerResponseAudit } from "./response-runtime.js";
 
 const searchParameters = Type.Object(
   {
@@ -502,6 +503,7 @@ export function resolveFlushPlan(params: { cfg?: OpenClawConfig; nowMs?: number 
 
 export function registerUnblockMemory(api: OpenClawPluginApi): void {
   const config = resolveConfig(api.pluginConfig);
+  registerResponseAudit(api, config);
   if (api.registrationMode === "cli-metadata") return;
   const runtime = new QmdMemoryRuntime(config.corpora, {
     analysisExecutable: config.analysis.executable,

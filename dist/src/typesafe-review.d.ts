@@ -3,6 +3,11 @@ type RequestOptions = {
     timeoutMs: number;
     signal: AbortSignal;
 };
+type Json = string | number | boolean | null | Json[] | {
+    [key: string]: Json;
+};
+export declare const TYPESAFE_REVIEW_MODEL = "jev-1.13.0";
+export declare function askTypeSafeReview(params: RequestOptions, state: Json, questions: Json): Promise<unknown>;
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
 export declare function reviewTypeSafeClaim(params: RequestOptions & {
     claim: string;

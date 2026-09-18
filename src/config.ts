@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { resolveResponseAudit, type ResponseAuditConfig } from "./response-config.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -49,6 +50,7 @@ export type UnblockMemoryConfig = {
   };
   qualityAudit: { enabled: boolean; corpora: readonly string[]; minNoise: number };
   evidenceReview: { enabled: boolean; corpora: readonly string[] };
+  responseAudit: ResponseAuditConfig;
   people: {
     enabled: boolean;
     whisperer: { enabled: boolean; maxChars: number };
@@ -370,6 +372,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
       qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
       evidenceReview: { enabled: false, corpora: [] },
+      responseAudit: resolveResponseAudit(undefined, DEFAULT_CORPORA),
       people: DEFAULT_PEOPLE_CONFIG,
       skillWhisperer: DEFAULT_SKILL_WHISPERER,
       memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
@@ -381,7 +384,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -474,5 +477,6 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, skillWhisperer,
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,
+    responseAudit: resolveResponseAudit(config.responseAudit, corpora),
     memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora), typesafe: resolveTypeSafe(config.typesafe) };
 }
