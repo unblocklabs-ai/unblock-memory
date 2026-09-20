@@ -1,5 +1,7 @@
 import { existsSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { MEMORY_DATABASE } from "./memory-database.js";
 import type { ResponseEpisode } from "./response-episodes.js";
 
 export type ResponseHuman = { key: string; provider: "slack"; accountScope: string; senderId: string; personId: string | null };
@@ -8,6 +10,8 @@ export type ResponseHuman = { key: string; provider: "slack"; accountScope: stri
 export class ResponsePeople {
   #db: DatabaseSync | undefined;
   constructor(path?: string) {
+    // Dry-run audits must not migrate or create stores just to resolve identities.
+    if (path && basename(path) === MEMORY_DATABASE && !existsSync(path)) path = join(dirname(path), "people.sqlite");
     if (!path || !existsSync(path)) return;
     try {
       this.#db = new DatabaseSync(path, { readOnly: true });

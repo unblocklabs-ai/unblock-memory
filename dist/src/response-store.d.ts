@@ -31,7 +31,7 @@ export type ResponseReportOptions = {
     taskType?: string;
     agentModel?: string;
 };
-/** Separate operator-only database: not a memory corpus and never injected into agent prompts. */
+/** Operator-only tables: not a memory corpus and never injected into agent prompts. */
 export declare class ResponseAuditStore {
     #private;
     readonly reviews: ResponseReviews;

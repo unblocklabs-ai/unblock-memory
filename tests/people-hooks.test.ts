@@ -147,7 +147,7 @@ test("observes exact Slack identities under the canonical session owner", async 
 
 test("ignores non-Slack and noncanonical sessions without opening a store", async () => {
   const testHarness = await harness();
-  const path = join(testHarness.stateRoot, "agents", "bill", "unblock-memory", "people.sqlite");
+  const path = join(testHarness.stateRoot, "agents", "bill", "unblock-memory", "unblock-memory.sqlite");
   testHarness.received(
     { from: "discord:user", content: "ignored" },
     { ...slackContext, channelId: "discord" },

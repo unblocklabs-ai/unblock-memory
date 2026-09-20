@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import { resolveAgentDir, resolveAgentWorkspaceDir, resolveStateDir, } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
@@ -240,7 +241,7 @@ export class QmdMemoryRuntime {
         const manager = new QmdMemoryManager({
             workspaceDir,
             dbPath: join(stateDir, "index.sqlite"),
-            curationPath: join(stateDir, "curation.sqlite"),
+            curationPath: join(stateDir, MEMORY_DATABASE),
             sources,
             keepModelsWarm: this.#keepEmbeddingModelWarm,
             analysisExecutable: this.#analysisExecutable,

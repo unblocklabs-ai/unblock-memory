@@ -13,7 +13,7 @@ async function temporaryPath(name = "people.sqlite"): Promise<string> {
   return join(root, name);
 }
 
-test("creates only the seven version-4 tables with secure SQLite settings", async () => {
+test("creates version-4 people tables with component metadata and secure SQLite settings", async () => {
   const path = await temporaryPath();
   const store = new PeopleStore(path, options);
   store.close();
@@ -31,6 +31,7 @@ test("creates only the seven version-4 tables with secure SQLite settings", asyn
       .map((row) => (row as { name: string }).name);
     assert.deepEqual(tables, [
       "companies",
+      "memory_schema",
       "people",
       "people_todos",
       "person_dossier_changes",
@@ -39,7 +40,7 @@ test("creates only the seven version-4 tables with secure SQLite settings", asyn
       "person_whisper_receipts",
     ]);
     assert.equal(
-      (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+      db.prepare("SELECT version FROM memory_schema WHERE component='people'").get()?.version,
       4,
     );
     assert.equal(
@@ -56,7 +57,7 @@ test("creates only the seven version-4 tables with secure SQLite settings", asyn
 
 test("opens one store lazily per agent and preserves it across reopen", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-people-owner-"));
-  const path = join(stateRoot, "agents", "bill", "unblock-memory", "people.sqlite");
+  const path = join(stateRoot, "agents", "bill", "unblock-memory", "unblock-memory.sqlite");
   const stores = new PeopleStores({ stateRoot, ...options });
   await assert.rejects(access(path));
 
@@ -652,7 +653,7 @@ test("migrates version 1 people directly to version 4 agent-owned semantics", as
         .map((row) => (row as { name: string }).name);
       assert.equal(columns.includes("refinement_enabled"), false);
       assert.equal(
-        (migrated.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+        migrated.prepare("SELECT version FROM memory_schema WHERE component='people'").get()?.version,
         4,
       );
     } finally {
@@ -700,7 +701,7 @@ test("migrates version 2 by dropping only obsolete evidence receipts", async () 
   version2
     .prepare("INSERT INTO person_evidence_receipts VALUES (?, 'session', ?, 'now')")
     .run(person.id, "session:one:event:1");
-  version2.exec("PRAGMA user_version = 2");
+  version2.exec("DROP TABLE memory_schema; PRAGMA user_version = 2");
   version2.close();
 
   const migrated = new PeopleStore(path, options);
@@ -719,7 +720,7 @@ test("migrates version 2 by dropping only obsolete evidence receipts", async () 
         undefined,
       );
       assert.equal(
-        (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+        db.prepare("SELECT version FROM memory_schema WHERE component='people'").get()?.version,
         4,
       );
     } finally {
@@ -748,7 +749,7 @@ test("migrates version 3 to version 4 without changing existing people data", as
   initial.close();
 
   const version3 = new DatabaseSync(path);
-  version3.exec("DROP TABLE person_dossier_changes; PRAGMA user_version = 3;");
+  version3.exec("DROP TABLE person_dossier_changes; DROP TABLE memory_schema; PRAGMA user_version = 3;");
   version3.close();
 
   const migrated = new PeopleStore(path, options);
@@ -761,7 +762,7 @@ test("migrates version 3 to version 4 without changing existing people data", as
     const db = new DatabaseSync(path, { readOnly: true });
     try {
       assert.equal(
-        (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+        db.prepare("SELECT version FROM memory_schema WHERE component='people'").get()?.version,
         4,
       );
     } finally {

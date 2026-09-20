@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { hasMemoryTable, MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveAgentDir, resolveAgentWorkspaceDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
@@ -25,8 +25,8 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
     const agentId = normalized.value;
     const state = join(resolveStateDir(), "agents", agentId, "unblock-memory");
     return { agentId, config, databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
-      storePath: join(state, "response-audit.sqlite"), indexPath: join(state, "index.sqlite"),
-      peoplePath: join(state, "people.sqlite"),
+      storePath: join(state, MEMORY_DATABASE), indexPath: join(state, "index.sqlite"),
+      peoplePath: join(state, MEMORY_DATABASE),
       sources: resolveSources(resolveAgentWorkspaceDir(cfg, agentId), config.corpora.filter(c => c.kind === "files")
         .filter(c => config.responseAudit.memoryCorpora.includes(c.name))) };
   };
@@ -46,7 +46,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
       .action((opts: { agent: string; episode?: string; since?: string; until?: string; bucket: string; sender?: string; account?: string; person?: string; taskType?: string; model?: string }) => {
         if (!config.responseAudit.enabled) { console.log(JSON.stringify({ status: "disabled" })); return; }
         const { storePath } = options(cfg, opts.agent);
-        if (!existsSync(storePath)) { console.log(JSON.stringify({ status: "not_run" })); return; }
+        if (!hasMemoryTable(storePath, "response_results")) { console.log(JSON.stringify({ status: "not_run" })); return; }
         const store = new ResponseAuditStore(storePath);
         if (opts.bucket !== "day" && opts.bucket !== "week") { store.close(); throw new Error("Bucket must be day or week"); }
         try { console.log(JSON.stringify(store.report(responseCohort(config.responseAudit), dateOption(opts.since, Date.now() - config.responseAudit.lookbackDays * 86400_000), opts.episode,
@@ -57,7 +57,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
     const withStore = (agent: string, fn: (store: ResponseAuditStore, cohort: string) => unknown) => {
       if (!config.responseAudit.enabled) throw new Error("Response audit is disabled");
       const { storePath } = options(cfg, agent);
-      if (!existsSync(storePath)) throw new Error("Response audit has not run");
+      if (!hasMemoryTable(storePath, "response_results")) throw new Error("Response audit has not run");
       const store = new ResponseAuditStore(storePath);
       try { console.log(JSON.stringify(fn(store, responseCohort(config.responseAudit)), null, 2)); }
       finally { store.close(); }

@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { hasMemoryTable, MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import { resolveAgentDir, resolveAgentWorkspaceDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
@@ -22,8 +22,8 @@ export function registerResponseAudit(api, config) {
         const agentId = normalized.value;
         const state = join(resolveStateDir(), "agents", agentId, "unblock-memory");
         return { agentId, config, databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
-            storePath: join(state, "response-audit.sqlite"), indexPath: join(state, "index.sqlite"),
-            peoplePath: join(state, "people.sqlite"),
+            storePath: join(state, MEMORY_DATABASE), indexPath: join(state, "index.sqlite"),
+            peoplePath: join(state, MEMORY_DATABASE),
             sources: resolveSources(resolveAgentWorkspaceDir(cfg, agentId), config.corpora.filter(c => c.kind === "files")
                 .filter(c => config.responseAudit.memoryCorpora.includes(c.name))) };
     };
@@ -47,7 +47,7 @@ export function registerResponseAudit(api, config) {
                 return;
             }
             const { storePath } = options(cfg, opts.agent);
-            if (!existsSync(storePath)) {
+            if (!hasMemoryTable(storePath, "response_results")) {
                 console.log(JSON.stringify({ status: "not_run" }));
                 return;
             }
@@ -68,7 +68,7 @@ export function registerResponseAudit(api, config) {
             if (!config.responseAudit.enabled)
                 throw new Error("Response audit is disabled");
             const { storePath } = options(cfg, agent);
-            if (!existsSync(storePath))
+            if (!hasMemoryTable(storePath, "response_results"))
                 throw new Error("Response audit has not run");
             const store = new ResponseAuditStore(storePath);
             try {

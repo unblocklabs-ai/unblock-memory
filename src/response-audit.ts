@@ -40,7 +40,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
     if (!key) return { status: "unavailable" as const, reason: "TypeSafe API key not configured" };
   }
   let reader: ResponseTranscriptReader | undefined, store: ResponseAuditStore | undefined, lease: string | undefined;
-  const people = new ResponsePeople(options.peoplePath);
+  let people: ResponsePeople | undefined;
   const now = Date.now();
   const coverage = { sessions: 0, sessionLimitReached: false, sessionsOverBudget: 0, completedResponses: 0,
     reconciledSessions: 0, reconciliationDeferred: 0,
@@ -55,6 +55,8 @@ export async function auditResponses(options: ResponseAuditOptions) {
       lease = store.acquire(now);
       if (!lease) return { status: "already_running" as const };
     }
+    // The first store open may have imported people into the shared database.
+    people = new ResponsePeople(options.peoplePath);
     reader = new ResponseTranscriptReader(options.databasePath, agentId);
     const since = now - config.responseAudit.lookbackDays * 86400_000;
     store?.reviews.refresh(cohort, since);
@@ -155,7 +157,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
     reader?.close();
     if (lease) store?.release(lease);
     store?.close();
-    people.close();
+    people?.close();
   }
 }
 

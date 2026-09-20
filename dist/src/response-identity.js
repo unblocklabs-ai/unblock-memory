@@ -1,9 +1,14 @@
 import { existsSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { MEMORY_DATABASE } from "./memory-database.js";
 /** Identity is trusted metadata, never inferred from names or transcript text. */
 export class ResponsePeople {
     #db;
     constructor(path) {
+        // Dry-run audits must not migrate or create stores just to resolve identities.
+        if (path && basename(path) === MEMORY_DATABASE && !existsSync(path))
+            path = join(dirname(path), "people.sqlite");
         if (!path || !existsSync(path))
             return;
         try {

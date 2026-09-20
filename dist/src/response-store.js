@@ -1,40 +1,47 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { openMemoryDatabase } from "./memory-database.js";
 import { responseOutcome, RESPONSE_REPORT_VERSION } from "./response-outcome.js";
 import { ResponsePeople } from "./response-identity.js";
 import { ResponseReviews, RESPONSE_REVIEW_POLICY } from "./response-reviews.js";
-/** Separate operator-only database: not a memory corpus and never injected into agent prompts. */
+/** Operator-only tables: not a memory corpus and never injected into agent prompts. */
 export class ResponseAuditStore {
     #db;
     reviews;
     constructor(path) {
-        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-        this.#db = new DatabaseSync(path);
-        chmodSync(path, 0o600);
-        this.#db.exec(`PRAGMA busy_timeout=1000;
-      CREATE TABLE IF NOT EXISTS response_lease (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, expires INTEGER);
-      CREATE TABLE IF NOT EXISTS response_results (
-        cohort TEXT, id TEXT, session_id TEXT NOT NULL, input_hash TEXT NOT NULL,
-        episode_at INTEGER NOT NULL, active INTEGER NOT NULL, status TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT,
-        PRIMARY KEY(cohort,id));
-      CREATE TABLE IF NOT EXISTS response_scans (cohort TEXT PRIMARY KEY, observed_at INTEGER, coverage TEXT);
-      CREATE INDEX IF NOT EXISTS response_results_time ON response_results(cohort,episode_at);`);
-        this.#db.exec(`CREATE TABLE IF NOT EXISTS response_checkpoints (
-      cohort TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, coverage TEXT NOT NULL,
-      PRIMARY KEY(cohort,session_id));
-      CREATE TABLE IF NOT EXISTS response_cursors (cohort TEXT PRIMARY KEY,cursor TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS response_schedule (
-        id INTEGER PRIMARY KEY CHECK(id=1), interval_ms INTEGER NOT NULL, next_due INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS response_stages (
-        key TEXT PRIMARY KEY, stage TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-        attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT);
-      CREATE TABLE IF NOT EXISTS response_stage_links (
-        cohort TEXT NOT NULL, episode_id TEXT NOT NULL, input_hash TEXT NOT NULL, stage TEXT NOT NULL, key TEXT NOT NULL,
-        PRIMARY KEY(cohort,episode_id,stage));`);
-        this.reviews = new ResponseReviews(this.#db);
+        this.#db = openMemoryDatabase(path);
+        try {
+            this.#db.exec("BEGIN IMMEDIATE");
+            const version = this.#db.prepare("SELECT version FROM memory_schema WHERE component='responses'").get()?.version;
+            if (version !== undefined && version !== 1)
+                throw new Error("Unsupported response audit schema version");
+            this.#db.exec(`
+        CREATE TABLE IF NOT EXISTS response_lease (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, expires INTEGER);
+        CREATE TABLE IF NOT EXISTS response_results (
+          cohort TEXT, id TEXT, session_id TEXT NOT NULL, input_hash TEXT NOT NULL,
+          episode_at INTEGER NOT NULL, active INTEGER NOT NULL, status TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT,
+          PRIMARY KEY(cohort,id));
+        CREATE TABLE IF NOT EXISTS response_scans (cohort TEXT PRIMARY KEY, observed_at INTEGER, coverage TEXT);
+        CREATE INDEX IF NOT EXISTS response_results_time ON response_results(cohort,episode_at);`);
+            this.#db.exec(`CREATE TABLE IF NOT EXISTS response_checkpoints (
+        cohort TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, coverage TEXT NOT NULL,
+        PRIMARY KEY(cohort,session_id));
+        CREATE TABLE IF NOT EXISTS response_cursors (cohort TEXT PRIMARY KEY,cursor TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS response_schedule (
+          id INTEGER PRIMARY KEY CHECK(id=1), interval_ms INTEGER NOT NULL, next_due INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS response_stages (
+          key TEXT PRIMARY KEY, stage TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT);
+        CREATE TABLE IF NOT EXISTS response_stage_links (
+          cohort TEXT NOT NULL, episode_id TEXT NOT NULL, input_hash TEXT NOT NULL, stage TEXT NOT NULL, key TEXT NOT NULL,
+          PRIMARY KEY(cohort,episode_id,stage));`);
+            this.reviews = new ResponseReviews(this.#db);
+            this.#db.exec("INSERT OR IGNORE INTO memory_schema VALUES ('responses',1); COMMIT");
+        }
+        catch (error) {
+            this.#db.close();
+            throw error;
+        }
     }
     /** Claim one bounded scheduled attempt, never replay every missed interval. */
     claimScheduled(now, intervalMs) {

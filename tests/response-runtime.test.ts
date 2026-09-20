@@ -104,7 +104,7 @@ test("Gateway restart catches up safely without credentials; absent, empty and u
   const interval = 12 * 60 * 60_000;
   for (const [index, apiKeyFile] of [undefined, join(root, "missing.env"), empty, root].entries()) {
     const id = `agent${index}`;
-    const path = join(root, "agents", id, "unblock-memory/response-audit.sqlite");
+    const path = join(root, "agents", id, "unblock-memory/unblock-memory.sqlite");
     const hooks = new Map<string, () => void | Promise<void>>();
     let warnings = 0;
     let warned!: () => void;
@@ -156,7 +156,7 @@ test("an unwritable audit store cannot fail Gateway start/stop or starve other a
   await hooks.get("gateway_start")!();
   await hooks.get("gateway_stop")!();
   assert.equal(warnings, 1);
-  const db = new DatabaseSync(join(root, "agents/healthy/unblock-memory/response-audit.sqlite"));
+  const db = new DatabaseSync(join(root, "agents/healthy/unblock-memory/unblock-memory.sqlite"));
   try { assert.equal(db.prepare("SELECT COUNT(*) n FROM response_schedule").get()!.n, 1); }
   finally { db.close(); }
 });

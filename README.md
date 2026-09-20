@@ -154,8 +154,9 @@ Choice confidence from Noul yes-probability. Multiple supported reasons can coex
 `reportVersion` identifies composition/reporting semantics independently of the
 judge rubric, allowing cached judgments to be re-reported without re-inference.
 
-Results live in the agent's private `unblock-memory/response-audit.sqlite`, outside
-the memory index. It stores judgments and source event references/hashes, not copies
+Results live in operator-only tables in the agent's private
+`unblock-memory/unblock-memory.sqlite`, outside the memory index. These tables
+are not searched or injected into agent prompts. They store judgments and source event references/hashes, not copies
 of conversations. Identical successful inputs are cached; source rewrites invalidate
 in-scope results on the next scan. Reports partition by fixed judge/rubric/context
 configuration, UTC week, task type and agent model. They expose eligible/assessed
@@ -599,7 +600,7 @@ For optional read-only diagnostics, `memory_people_prime({ personId, agentName?,
 draft: { blurb, citations: [{ path, from, lines }] } })` still reviews a snippet
 without writing. Agents do not need this extra call in the normal update workflow.
 
-Judgments are cached privately in `people.sqlite` (maximum 2,000 entries), keyed
+Judgments are cached privately in `unblock-memory.sqlite` (maximum 2,000 entries), keyed
 by person, agent, exact evidence/context, questions,
 and judge version. No source text or credentials are stored in the cache.
 Retrieval reruns against the current index; unchanged judgments are reused.
@@ -758,9 +759,37 @@ explicit intervals remain unchanged on upgrade; set them to `60` for hourly chec
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
 equivalent configured OpenClaw state directory). Durable agent-supplied event
-dates and maintenance proposals live separately in `curation.sqlite`, so a QMD
+dates, maintenance proposals, people/dossiers and response audits live separately
+in `unblock-memory.sqlite`, so a QMD
 index rebuild does not discard them. The first lookup builds the index;
 Markdown filesystem changes queue a debounced, serialized background refresh.
+
+### Durable database migration (v0.3.20)
+
+Each agent has two active plugin databases: rebuildable `index.sqlite` and durable
+`unblock-memory.sqlite`. The latter uses WAL, private permissions and component
+schema versions. Store modules and tool access remain separate: consolidating files
+does not expose operator response audits to memory searches or whisperers.
+
+**Stop the Gateway and any plugin CLI writers before upgrading.** On first
+durable-store access, the plugin imports existing `curation.sqlite`, `people.sqlite`
+and `response-audit.sqlite` files, including disabled features, in one transaction.
+It includes committed WAL data, verifies row counts/values, integrity and foreign
+keys, and records completion. Missing stores are normal. Unsupported or invalid
+data aborts the import without a partial cutover; the next access retries.
+QMD and transcript databases are not migrated.
+
+Old files remain untouched as **inert recovery copies**, not active stores.
+Completed migration never reimports or writes to them. Do not run old and new
+plugin versions together: old writers can keep changing their separate files.
+Back up the new database with SQLite's online backup API, or stop all writers
+and safely checkpoint WAL first. Copying only a live `.sqlite` file is unsafe.
+
+To roll back before any new writes, stop all writers, preserve the new database
+and its WAL/SHM sidecars, and restore the old plugin against the retained files.
+**After new writes, the legacy files are stale:** rollback requires an explicit
+reverse data migration or accepting the loss of post-upgrade changes.
+Retain recovery files until the upgrade is verified; cleanup is a separate step.
 
 ## Memory quality audit
 

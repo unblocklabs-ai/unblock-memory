@@ -1,8 +1,8 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { MEMORY_DATABASE, openMemoryDatabase } from "./memory-database.js";
 import { resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { Type, type Static } from "typebox";
@@ -316,15 +316,10 @@ export class PeopleStore {
   readonly #maxBlurbChars: number;
 
   constructor(path: string, options: { maxOpenTodos: number; maxBlurbChars: number }) {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.#db = new DatabaseSync(path);
+    this.#db = openMemoryDatabase(path);
     this.#maxOpenTodos = options.maxOpenTodos;
     this.#maxBlurbChars = options.maxBlurbChars;
     try {
-      chmodSync(path, 0o600);
-      this.#db.exec(
-        "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON",
-      );
       this.#migrate();
     } catch (error) {
       this.#db.close();
@@ -1034,23 +1029,22 @@ export class PeopleStore {
   }
 
   #migrate(): void {
-    const current = this.#db.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (current.user_version === 4) return;
-    if (
-      current.user_version !== 0 &&
-      current.user_version !== 1 &&
-      current.user_version !== 2 &&
-      current.user_version !== 3
-    ) {
-      throw new Error(`unsupported PeopleSQL schema version: ${current.user_version}`);
-    }
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      if (current.user_version === 2) {
+      // Re-read under the write lock so concurrent first opens cannot both migrate.
+      const version = this.#db.prepare("SELECT version FROM memory_schema WHERE component='people'").get()?.version
+        ?? this.#db.prepare("PRAGMA user_version").get()?.user_version ?? 0;
+      if (![0, 1, 2, 3, 4].includes(Number(version))) throw new Error(`unsupported PeopleSQL schema version: ${version}`);
+      if (version === 4) {
+        this.#db.prepare("INSERT OR IGNORE INTO memory_schema VALUES ('people',4)").run();
+        this.#db.exec("COMMIT");
+        return;
+      }
+      if (version === 2) {
         this.#db.exec(`
           DROP TABLE person_evidence_receipts;
         `);
-      } else if (current.user_version === 1) {
+      } else if (version === 1) {
         this.#db.exec(`
           DROP INDEX people_policy_seen;
           ALTER TABLE people DROP COLUMN refinement_enabled;
@@ -1065,7 +1059,7 @@ export class PeopleStore {
             PRIMARY KEY (thread_key, person_id)
           ) STRICT;
         `);
-      } else if (current.user_version === 0) {
+      } else if (version === 0) {
         this.#db.exec(`
         CREATE TABLE companies (
           id TEXT PRIMARY KEY,
@@ -1152,7 +1146,8 @@ export class PeopleStore {
 
         CREATE INDEX person_dossier_changes_person_changed
           ON person_dossier_changes(person_id, changed_at DESC);
-        PRAGMA user_version = 4;
+        INSERT INTO memory_schema VALUES ('people',4)
+          ON CONFLICT(component) DO UPDATE SET version=excluded.version;
       `);
       this.#db.exec("COMMIT");
     } catch (error) {
@@ -1180,7 +1175,7 @@ export class PeopleStores {
     let store = this.#stores.get(canonicalAgentId);
     if (!store) {
       store = new PeopleStore(
-        join(this.#stateRoot, "agents", canonicalAgentId, "unblock-memory", "people.sqlite"),
+        join(this.#stateRoot, "agents", canonicalAgentId, "unblock-memory", MEMORY_DATABASE),
         this.#options,
       );
       this.#stores.set(canonicalAgentId, store);

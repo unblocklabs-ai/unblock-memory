@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { openMemoryDatabase } from "./memory-database.js";
 import type { QualityJudgment } from "./typesafe.js";
 
 const TEMPORAL_BASES = ["path", "frontmatter", "session", "agent_verified"] as const;
@@ -112,35 +111,36 @@ export class CurationStore {
   readonly #db: DatabaseSync;
 
   constructor(path: string) {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.#db = new DatabaseSync(path);
-    chmodSync(path, 0o600);
-    this.#db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA busy_timeout = 5000;
+    this.#db = openMemoryDatabase(path);
+    try {
+      this.#db.exec("BEGIN IMMEDIATE");
+      const version = this.#db.prepare("SELECT version FROM memory_schema WHERE component='curation'").get()?.version;
+      if (version !== undefined && version !== 1) throw new Error("Unsupported curation schema version");
+      this.#db.exec(`
+        CREATE TABLE IF NOT EXISTS temporal_annotations (
+          corpus TEXT NOT NULL,
+          collection TEXT NOT NULL,
+          path TEXT NOT NULL,
+          content_fingerprint TEXT NOT NULL DEFAULT '',
+          event_time TEXT NOT NULL,
+          basis TEXT NOT NULL CHECK (basis IN ('path', 'frontmatter', 'session', 'agent_verified')),
+          evidence TEXT NOT NULL,
+          qmd_hash TEXT,
+          qmd_seq INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (corpus, collection, path, content_fingerprint)
+        );
 
-      CREATE TABLE IF NOT EXISTS temporal_annotations (
-        corpus TEXT NOT NULL,
-        collection TEXT NOT NULL,
-        path TEXT NOT NULL,
-        content_fingerprint TEXT NOT NULL DEFAULT '',
-        event_time TEXT NOT NULL,
-        basis TEXT NOT NULL CHECK (basis IN ('path', 'frontmatter', 'session', 'agent_verified')),
-        evidence TEXT NOT NULL,
-        qmd_hash TEXT,
-        qmd_seq INTEGER,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (corpus, collection, path, content_fingerprint)
-      );
-
-    `);
-    this.#ensureMaintenanceSchema();
-    this.#db.exec(`CREATE TABLE IF NOT EXISTS quality_judgments (
-      cache_key TEXT PRIMARY KEY,
-      noise REAL NOT NULL CHECK (noise BETWEEN 0 AND 1),
-      evidence REAL NOT NULL CHECK (evidence BETWEEN 0 AND 1)
-    )`);
+      `);
+      this.#ensureMaintenanceSchema();
+      this.#db.exec(`CREATE TABLE IF NOT EXISTS quality_judgments (
+        cache_key TEXT PRIMARY KEY,
+        noise REAL NOT NULL CHECK (noise BETWEEN 0 AND 1),
+        evidence REAL NOT NULL CHECK (evidence BETWEEN 0 AND 1)
+      )`);
+      this.#db.exec("INSERT OR IGNORE INTO memory_schema VALUES ('curation',1); COMMIT");
+    } catch (error) { this.#db.close(); throw error; }
   }
 
   #ensureMaintenanceSchema(): void {
@@ -164,18 +164,11 @@ export class CurationStore {
     const schema = this.#db.prepare("SELECT sql FROM sqlite_master WHERE name = 'maintenance_tasks'")
       .get() as { sql: string };
     if (!schema.sql.includes("'quality_review'")) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
-        this.#db.exec(schema.sql.replace("maintenance_tasks", "maintenance_tasks_quality")
-          .replace("'exact_duplicate'", "'exact_duplicate', 'quality_review'"));
-        this.#db.exec(`INSERT INTO maintenance_tasks_quality SELECT * FROM maintenance_tasks;
-          DROP TABLE maintenance_tasks;
-          ALTER TABLE maintenance_tasks_quality RENAME TO maintenance_tasks;`);
-        this.#db.exec("COMMIT");
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      this.#db.exec(schema.sql.replace("maintenance_tasks", "maintenance_tasks_quality")
+        .replace("'exact_duplicate'", "'exact_duplicate', 'quality_review'"));
+      this.#db.exec(`INSERT INTO maintenance_tasks_quality SELECT * FROM maintenance_tasks;
+        DROP TABLE maintenance_tasks;
+        ALTER TABLE maintenance_tasks_quality RENAME TO maintenance_tasks;`);
     }
     this.#db.exec(`
       CREATE INDEX IF NOT EXISTS maintenance_tasks_status_created
