@@ -23,6 +23,7 @@ import { registerResponseAudit } from "./response-runtime.js";
 import { registerInsideOut } from "./inside-out-runtime.js";
 import { registerMemoryTraining } from "./training-runtime.js";
 import { resolveTimezone } from "./session-projector.js";
+import { registerExtraction } from "./extraction-runtime.js";
 
 const searchParameters = Type.Object(
   {
@@ -504,11 +505,13 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   registerResponseAudit(api, config);
   registerInsideOut(api, config);
   registerMemoryTraining(api, config);
-  if (api.registrationMode === "cli-metadata") return;
+  if (api.registrationMode === "cli-metadata") { registerExtraction(api, config); return; }
   const runtime = new QmdMemoryRuntime(config.corpora, {
     analysisExecutable: config.analysis.executable,
     keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
+    extraction: config.extraction,
   });
+  registerExtraction(api, config, runtime);
   const capability = {
     deterministicRecallToolName: "memory_search",
     supportsPrivateTranscriptRecall: false,

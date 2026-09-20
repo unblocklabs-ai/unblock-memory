@@ -1,5 +1,6 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
+import type { ExtractionConfig } from "./extraction-config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager } from "./manager.js";
 import { type SessionSyncResult } from "./session-sync.js";
@@ -46,6 +47,7 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         analysisExecutable?: string;
         keepEmbeddingModelWarm?: boolean;
         stateRoot?: string;
+        extraction?: ExtractionConfig;
     });
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;

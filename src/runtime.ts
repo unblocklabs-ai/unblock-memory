@@ -10,6 +10,7 @@ import {
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
+import type { ExtractionConfig } from "./extraction-config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager, type ManagerSessionConfig } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
@@ -91,6 +92,7 @@ export async function recoverInterruptedSessionSync(
 
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #corpora: readonly CorpusConfig[];
+  readonly #extraction?: ExtractionConfig;
   readonly #analysisExecutable?: string;
   readonly #keepEmbeddingModelWarm: boolean;
   readonly #stateRoot: string;
@@ -120,9 +122,11 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       analysisExecutable?: string;
       keepEmbeddingModelWarm?: boolean;
       stateRoot?: string;
+      extraction?: ExtractionConfig;
     } = {},
   ) {
     this.#corpora = corpora;
+    this.#extraction = options.extraction;
     this.#analysisExecutable = options.analysisExecutable;
     this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
     this.#stateRoot = options.stateRoot ?? resolveStateDir();
@@ -282,6 +286,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       workspaceDir,
       dbPath: join(stateDir, "index.sqlite"),
       curationPath: join(stateDir, MEMORY_DATABASE),
+      extraction: this.#extraction,
       sources,
       keepModelsWarm: this.#keepEmbeddingModelWarm,
       analysisExecutable: this.#analysisExecutable,

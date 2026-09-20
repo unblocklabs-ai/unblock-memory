@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
+import { EXTRACTED_COLLECTION, extractedRecords, extractedPath, extractedHit, syncExtractedIndex } from "./extraction-index.js";
 import chokidar from "chokidar";
 import picomatch from "picomatch";
 import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
@@ -236,6 +237,7 @@ export class QmdMemoryManager {
     #dbPath;
     #workspaceDir;
     #curationPath;
+    #extraction;
     #sources;
     #storeFactory;
     #keepModelsWarm;
@@ -287,6 +289,7 @@ export class QmdMemoryManager {
     constructor(params) {
         this.#dbPath = params.dbPath;
         this.#curationPath = params.curationPath ?? `${params.dbPath}.curation.sqlite`;
+        this.#extraction = params.extraction;
         this.#workspaceDir = params.workspaceDir;
         this.#sources = new Map(params.sources.map((source) => [source.collection, source]));
         this.#storeFactory = params.storeFactory;
@@ -384,10 +387,11 @@ export class QmdMemoryManager {
             dbPath: this.#dbPath,
             keepModelsWarm: this.#keepModelsWarm,
             config: {
-                collections: Object.fromEntries(this.#qmdSources().map((source) => [
-                    source.collection,
-                    { path: source.root, pattern: source.pattern },
-                ])),
+                collections: Object.fromEntries([...this.#qmdSources().map((source) => [
+                        source.collection,
+                        { path: source.root, pattern: source.pattern },
+                    ]), ...(this.#extraction?.enabled && this.#extraction.publish
+                        ? [[EXTRACTED_COLLECTION, { path: dirname(this.#dbPath), pattern: ".no-extracted-files", includeByDefault: false }]] : [])]),
             },
         });
         try {
@@ -395,6 +399,8 @@ export class QmdMemoryManager {
             ensureMemoryAnalysisSchema(store.internal.db);
             markStaleForAnalysisCollectionChange(store.internal.db, this.#analysisCollectionNames(), this.#skillCollectionNames().length > 0);
             const configuredCollections = new Set(this.#qmdSources().map((source) => source.collection));
+            if (this.#extraction?.enabled && this.#extraction.publish)
+                configuredCollections.add(EXTRACTED_COLLECTION);
             const staleCollections = (await store.getStatus()).collections
                 .map((collection) => collection.name)
                 .filter((collection) => !configuredCollections.has(collection));
@@ -441,26 +447,51 @@ export class QmdMemoryManager {
     }
     #collectionNames(corpora) {
         const publicSources = [...this.#sources.values()].filter((source) => source.kind !== "skills");
+        const extracted = this.#extraction?.enabled && this.#extraction.publish ? [EXTRACTED_COLLECTION] : [];
         if (corpora === undefined)
-            return publicSources.map((source) => source.collection);
+            return [...publicSources.map((source) => source.collection), ...extracted];
         if (corpora.length === 0)
             throw new Error("memory_search corpora must not be empty");
         const selected = new Set(corpora);
         if (selected.has("all")) {
             if (selected.size > 1)
                 throw new Error('memory_search corpus "all" must be used alone');
-            return publicSources.map((source) => source.collection);
+            return [...publicSources.map((source) => source.collection), ...extracted];
         }
         const known = new Set(publicSources.map((source) => source.corpus));
+        if (extracted.length)
+            known.add("extracted");
         const unknown = [...selected].find((corpus) => !known.has(corpus));
         if (unknown)
             throw new Error(`memory_search unknown corpus: ${unknown}`);
-        return publicSources
-            .filter((source) => selected.has(source.corpus))
-            .map((source) => source.collection);
+        return [...publicSources
+                .filter((source) => selected.has(source.corpus))
+                .map((source) => source.collection), ...(selected.has("extracted") ? extracted : [])];
+    }
+    syncExtracted() {
+        return this.#enqueue(async () => {
+            if (!this.#extraction?.enabled || !this.#extraction.publish)
+                return;
+            const store = await this.#getAnalysisStore();
+            const records = extractedRecords(this.#curationPath).filter(r => this.#extraction.chatTypes.includes(r.metadata.chatType));
+            await syncExtractedIndex(store, records);
+            await this.#refreshIndexStatus(store);
+        });
+    }
+    #currentExtracted(paths, filter) {
+        if (!this.#extraction?.enabled || !this.#extraction.publish)
+            return [];
+        const records = extractedRecords(this.#curationPath, paths?.filter(path => path.startsWith(`qmd://${EXTRACTED_COLLECTION}/`))
+            .map(path => path.slice(`qmd://${EXTRACTED_COLLECTION}/`.length)))
+            .filter(r => this.#extraction.chatTypes.includes(r.metadata.chatType));
+        if (!filter)
+            return records;
+        const allowed = new Set(sessionAllowedPaths(new Map(records.map(r => [extractedPath(r), r.metadata])), EXTRACTED_COLLECTION, filter)[EXTRACTED_COLLECTION]);
+        return records.filter(r => allowed.has(extractedPath(r)));
     }
     async #updateAndEmbed(store, collection, force) {
-        const update = await store.update({ collections: collection ? [collection] : [] });
+        // Extracted facts are DB projections, not files: never run filesystem sync on them.
+        const update = await store.update({ collections: collection ? [collection] : this.#qmdSources().map(source => source.collection) });
         this.#cleanupRemovedDocuments?.(update.updated + update.removed);
         const analysisStore = store;
         const changed = update.indexed + update.updated + update.removed > 0 || update.needsEmbedding > 0;
@@ -776,17 +807,30 @@ export class QmdMemoryManager {
         if (sessions && collections.includes(sessions.collection)) {
             await this.#refreshSessionMetadata();
         }
-        const allowedPaths = opts?.sessionFilter && sessions && collections.includes(sessions.collection)
+        let allowedPaths = opts?.sessionFilter && sessions && collections.includes(sessions.collection)
             ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter)
             : undefined;
         const store = await this.#getStore();
         opts?.signal?.throwIfAborted();
+        const currentRecords = (paths) => {
+            if (!collections.includes(EXTRACTED_COLLECTION))
+                return [];
+            return this.#currentExtracted(paths, opts?.sessionFilter);
+        };
+        if (collections.includes(EXTRACTED_COLLECTION)) {
+            allowedPaths = { ...allowedPaths, [EXTRACTED_COLLECTION]: currentRecords().map(extractedPath) };
+        }
         if (opts?.lexicalOnly) {
             const hits = await store.searchLex(query, {
                 limit: opts.maxResults ?? 5,
                 collection: collections,
             });
+            const current = new Map(currentRecords(hits.map(hit => hit.filepath)).map(r => [`qmd://${EXTRACTED_COLLECTION}/${extractedPath(r)}`, r]));
             return hits.flatMap((hit) => {
+                if (hit.collectionName === EXTRACTED_COLLECTION) {
+                    const record = current.get(hit.filepath);
+                    return record && hit.score >= (opts.minScore ?? 0) ? [extractedHit(record, hit.score)] : [];
+                }
                 const corpus = this.#sources.get(hit.collectionName)?.corpus;
                 const prefix = `qmd://${hit.collectionName}/`;
                 const session = corpus === "sessions" && hit.filepath.startsWith(prefix)
@@ -833,6 +877,7 @@ export class QmdMemoryManager {
     async #renderSearchHits(hits, store, opts, whisperer = false) {
         const tokenizer = store.internal?.llm;
         const results = [];
+        const current = new Map(this.#currentExtracted(hits.map(hit => hit.file), opts?.sessionFilter).map(r => [`qmd://${EXTRACTED_COLLECTION}/${extractedPath(r)}`, r]));
         for (const hit of hits) {
             opts?.signal?.throwIfAborted();
             // Proactive hints must retain the entire matched chunk, even when expanded
@@ -840,6 +885,12 @@ export class QmdMemoryManager {
             if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity))
                 continue;
             const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
+            if (collection === EXTRACTED_COLLECTION) {
+                const record = current.get(hit.file);
+                if (record && record.text.length <= (opts?.maxSnippetChars ?? Infinity))
+                    results.push(extractedHit(record, hit.score));
+                continue;
+            }
             const corpus = collection ? this.#sources.get(collection)?.corpus : undefined;
             if (!corpus)
                 continue;
@@ -880,7 +931,9 @@ export class QmdMemoryManager {
                 citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
             });
         }
-        return results;
+        // Expansion above can yield; recheck only derived hits once more before returning.
+        const finalPaths = new Set(this.#currentExtracted(results.map(hit => hit.path), opts?.sessionFilter).map(r => `qmd://${EXTRACTED_COLLECTION}/${extractedPath(r)}`));
+        return results.filter(hit => !hit.path.startsWith(`qmd://${EXTRACTED_COLLECTION}/`) || finalPaths.has(hit.path));
     }
     async searchSkills(query, minScore, limit) {
         const collections = this.#skillCollectionNames();
@@ -942,6 +995,13 @@ export class QmdMemoryManager {
             .slice(0, limit);
     }
     async readFile(params) {
+        if (params.relPath.startsWith(`qmd://${EXTRACTED_COLLECTION}/`)) {
+            const record = this.#extraction?.enabled && this.#extraction.publish
+                ? extractedRecords(this.#curationPath, [params.relPath.slice(`qmd://${EXTRACTED_COLLECTION}/`.length)]).find(r => this.#extraction.chatTypes.includes(r.metadata.chatType) &&
+                    params.relPath === `qmd://${EXTRACTED_COLLECTION}/${extractedPath(r)}`) : undefined;
+            return record ? buildReadResult({ content: `${record.text}\nObserved: ${new Date(record.observedAt).toISOString()}\nSource: ${extractedHit(record, 1).citation}`,
+                path: params.relPath, from: params.from, lines: params.lines }) : { status: "not_found", text: "", path: params.relPath };
+        }
         const safe = parseSafeVirtualPath(params.relPath, this.#sources);
         if (!safe || safe.source.kind === "skills") {
             return { status: "not_found", text: "", path: params.relPath };

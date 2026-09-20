@@ -70,7 +70,7 @@ declare const qualitySchema: Type.TObject<{
         }>;
         consistency: Type.TObject<{
             type: Type.TLiteral<"choice">;
-            choice: Type.TEnum<("not_assessable" | "consistent" | "contradicted")[]>;
+            choice: Type.TEnum<("contradicted" | "not_assessable" | "consistent")[]>;
             confidence: Type.TNumber;
             probabilities: Type.TObject<{
                 [k: string]: Type.TNumber;

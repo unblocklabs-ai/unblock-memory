@@ -89,7 +89,7 @@ function textContent(value: unknown): string | undefined {
   return text || undefined;
 }
 
-function projectMessage(row: SessionProjectionInput["events"][number], input: SessionProjectionInput): ProjectedMessage | undefined {
+export function projectMessage(row: SessionProjectionInput["events"][number], input: SessionProjectionInput): ProjectedMessage | undefined {
   let event: unknown;
   try {
     event = JSON.parse(row.eventJson);

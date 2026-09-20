@@ -1,3 +1,4 @@
+import type { ExtractionConfig } from "./extraction-config.js";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadResult, MemoryRequestContext, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
@@ -77,6 +78,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     constructor(params: {
         dbPath: string;
         curationPath?: string;
+        extraction?: ExtractionConfig;
         workspaceDir: string;
         sources: readonly ResolvedSource[];
         storeFactory?: () => Promise<ManagerStore>;
@@ -86,6 +88,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         sessions?: ManagerSessionConfig;
     });
     start(): Promise<void>;
+    syncExtracted(): Promise<void>;
     sync(params?: MemorySyncParams): Promise<void>;
     syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void): Promise<SessionSyncResult>;
     recluster(options?: MemoryReclusterOptions, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;

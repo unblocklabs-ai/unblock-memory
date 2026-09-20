@@ -37,7 +37,7 @@ function textContent(value) {
     }).join("\n").trim();
     return text || undefined;
 }
-function projectMessage(row, input) {
+export function projectMessage(row, input) {
     let event;
     try {
         event = JSON.parse(row.eventJson);

@@ -1,4 +1,5 @@
 import type { ChatType } from "./config.js";
+import { projectLoggieMessage } from "./loggie-projection.js";
 export type SessionMetadata = {
     sessionId: string;
     provider?: string;
@@ -21,6 +22,13 @@ export type SessionProjectionInput = SessionMetadata & {
         attachmentsCleaned: number;
         attachmentBudgetSkipped: number;
     };
+};
+type ProjectedMessage = {
+    role: "user" | "assistant";
+    speaker: string;
+    text: string;
+    timestamp: number;
+    meeting?: ReturnType<typeof projectLoggieMessage>;
 };
 export type SessionSnippetMessage = {
     type?: "user" | "assistant";
@@ -49,6 +57,7 @@ export type SessionContextSpans = {
         end: number;
     };
 };
+export declare function projectMessage(row: SessionProjectionInput["events"][number], input: SessionProjectionInput): ProjectedMessage | undefined;
 export declare function projectSession(input: SessionProjectionInput): string | undefined;
 export declare function projectSessionDocument(input: SessionProjectionInput): {
     content: string;
@@ -67,3 +76,4 @@ export declare function sessionSnippetMessages(content: string, selected: {
 }): SessionSnippetMessage[];
 export declare function sessionDocumentPath(metadata: SessionMetadata): string;
 export declare function resolveTimezone(configured?: string): string;
+export {};

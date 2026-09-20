@@ -14,6 +14,11 @@ export type CorpusMemorySearchResult = MemorySearchResult & {
     messageTimestamp?: string;
     /** Structured tool output; snippet stays a string for the host and internal consumers. */
     sessionMessages?: SessionSnippetMessage[];
+    extracted?: {
+        id: string;
+        revision: number;
+        observedAt: string;
+    };
 };
 export type SessionSearchFilter = {
     startedFrom?: string;

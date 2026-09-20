@@ -66,6 +66,7 @@ export async function recoverInterruptedSessionSync(directory, statusPath, stale
 }
 export class QmdMemoryRuntime {
     #corpora;
+    #extraction;
     #analysisExecutable;
     #keepEmbeddingModelWarm;
     #stateRoot;
@@ -90,6 +91,7 @@ export class QmdMemoryRuntime {
     }
     constructor(corpora, options = {}) {
         this.#corpora = corpora;
+        this.#extraction = options.extraction;
         this.#analysisExecutable = options.analysisExecutable;
         this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
         this.#stateRoot = options.stateRoot ?? resolveStateDir();
@@ -242,6 +244,7 @@ export class QmdMemoryRuntime {
             workspaceDir,
             dbPath: join(stateDir, "index.sqlite"),
             curationPath: join(stateDir, MEMORY_DATABASE),
+            extraction: this.#extraction,
             sources,
             keepModelsWarm: this.#keepEmbeddingModelWarm,
             analysisExecutable: this.#analysisExecutable,

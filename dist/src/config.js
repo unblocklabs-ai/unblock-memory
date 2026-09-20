@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { resolveExtraction } from "./extraction-config.js";
 import { resolveResponseAudit } from "./response-config.js";
 import { resolvePeoplePrimer } from "./people-primer-config.js";
 import { resolveInsideOut } from "./inside-out.js";
@@ -293,6 +294,7 @@ export function resolveConfig(value) {
     if (value === undefined || value === null) {
         return {
             corpora: DEFAULT_CORPORA,
+            extraction: resolveExtraction(undefined, DEFAULT_CORPORA),
             keepEmbeddingModelWarm: true,
             analysis: {},
             typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
@@ -310,7 +312,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -385,6 +387,7 @@ export function resolveConfig(value) {
         throw new Error('unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"');
     }
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
+        extraction: resolveExtraction(config.extraction, corpora),
         qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
         evidenceReview,
         responseAudit: resolveResponseAudit(config.responseAudit, corpora),

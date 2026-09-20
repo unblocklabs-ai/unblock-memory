@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { resolveExtraction, type ExtractionConfig } from "./extraction-config.js";
 import { resolveResponseAudit, type ResponseAuditConfig } from "./response-config.js";
 import { resolvePeoplePrimer, type PeoplePrimerConfig } from "./people-primer-config.js";
 import { resolveInsideOut, type InsideOutConfig } from "./inside-out.js";
@@ -41,6 +42,7 @@ export const DEFAULT_CORPORA: readonly FileCorpusConfig[] = [
 ];
 
 export type UnblockMemoryConfig = {
+  extraction: ExtractionConfig;
   corpora: readonly CorpusConfig[];
   keepEmbeddingModelWarm: boolean;
   analysis: { executable?: string };
@@ -398,6 +400,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   if (value === undefined || value === null) {
     return {
       corpora: DEFAULT_CORPORA,
+      extraction: resolveExtraction(undefined, DEFAULT_CORPORA),
       keepEmbeddingModelWarm: true,
       analysis: {},
       typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
@@ -417,7 +420,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -509,6 +512,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     );
   }
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
+    extraction: resolveExtraction(config.extraction, corpora),
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,
     responseAudit: resolveResponseAudit(config.responseAudit, corpora),
