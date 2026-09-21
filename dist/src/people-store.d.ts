@@ -1,9 +1,9 @@
 import { Type, type Static } from "typebox";
-export declare const PERSON_DOSSIER_SCHEMA: Type.TObject<{
+declare const PERSON_DOSSIER_SCHEMA: Type.TObject<{
     schemaVersion: Type.TLiteral<1>;
     blurb: Type.TString;
     sections: Type.TArray<Type.TObject<{
-        category: Type.TUnion<Type.TLiteral<"role" | "priorities" | "preferences" | "successCriteria" | "workingStyle" | "relationship" | "openLoops">[]>;
+        category: Type.TEnum<["role", "priorities", "preferences", "successCriteria", "workingStyle", "relationship", "openLoops"]>;
         claims: Type.TArray<Type.TObject<{
             statement: Type.TString;
             evidence: Type.TArray<Type.TObject<{
@@ -15,6 +15,23 @@ export declare const PERSON_DOSSIER_SCHEMA: Type.TObject<{
             confidence: Type.TOptional<Type.TUnion<[Type.TLiteral<"low">, Type.TLiteral<"medium">, Type.TLiteral<"high">]>>;
         }>>;
     }>>;
+}>;
+export declare const PERSON_DOSSIER_WRITE_SCHEMA: Type.TObject<{
+    sections: Type.TArray<Type.TObject<{
+        category: Type.TEnum<["role", "relationship"]>;
+        claims: Type.TArray<Type.TObject<{
+            epistemicType: Type.TEnum<["observed", "reported"]>;
+            statement: Type.TString;
+            evidence: Type.TArray<Type.TObject<{
+                source: Type.TUnion<[Type.TLiteral<"session">, Type.TLiteral<"memory">, Type.TLiteral<"directory">, Type.TLiteral<"manual">]>;
+                locator: Type.TString;
+                observedAt: Type.TOptional<Type.TString>;
+            }>>;
+            confidence: Type.TOptional<Type.TUnion<[Type.TLiteral<"low">, Type.TLiteral<"medium">, Type.TLiteral<"high">]>>;
+        }>>;
+    }>>;
+    schemaVersion: Type.TLiteral<1>;
+    blurb: Type.TString;
 }>;
 export type PersonDossier = Static<typeof PERSON_DOSSIER_SCHEMA>;
 export declare class DossierConflictError extends Error {
@@ -118,7 +135,23 @@ export declare class PeopleStore {
     listActivePeople(limit?: number, offset?: number): Person[];
     findIdentity(provider: string, accountScope: string, externalId: string): PersonIdentity | undefined;
     setInjection(personId: string, enabled: boolean): Person | undefined;
-    validateDossier(input: unknown): PersonDossier;
+    validateDossier(input: unknown): {
+        schemaVersion: 1;
+        blurb: string;
+        sections: {
+            category: "role" | "relationship";
+            claims: {
+                confidence?: "low" | "medium" | "high" | undefined;
+                statement: string;
+                evidence: {
+                    observedAt?: string | undefined;
+                    source: "memory" | "manual" | "session" | "directory";
+                    locator: string;
+                }[];
+                epistemicType: "observed" | "reported";
+            }[];
+        }[];
+    };
     getDossierRevision(personId: string): string | null;
     replaceDossier(personId: string, reasonInput: string, input: unknown, expectedRevision?: string | null): PersonDossier;
     deleteDossier(personId: string, reasonInput: string): boolean;
@@ -165,3 +198,4 @@ export declare class PeopleStores {
     get(agentId: string): PeopleStore;
     closeAll(): void;
 }
+export {};

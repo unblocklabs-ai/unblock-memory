@@ -56,5 +56,5 @@ corpora. All on-host reports remain private; stdout contains counts/stages only.
 
 If a check fails, inspect the failing state rather than relaxing preservation or
 freshness checks. Do not promote a synthetic fixture result into a claim about
-production behavior. Record exact outcomes and release prerequisites in
-`RELEASE-ENHANCEMENTS.md`.
+production behavior. Keep run-specific outcomes in private evaluation reports;
+follow `docs/RELEASE.md` for release prerequisites.

@@ -10,6 +10,11 @@ understanding of its world. A cluster shows similarity, not a complete timeline,
 truth, or consensus. Do not write from a cluster alone, and prefer no write over
 weak, duplicative, or easily looked-up knowledge.
 
+For tool limits, session freshness and source-read continuation, see the packaged
+[retrieval reference](../../docs/retrieval.md). Configuration and provider approval
+are documented [separately](../../docs/configuration.md); this skill does not grant them.
+When loaded through a `plugin-skills` symlink, resolve these links from the skill's real installed path.
+
 ## Clusters and the knowledge corpus
 
 Clustering and knowledge are separate. `memory_recluster` analyzes every

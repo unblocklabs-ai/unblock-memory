@@ -83,6 +83,34 @@ test("paginates Slack users and rejects repeated cursors", async () => {
   assert.equal(calls, 2);
 });
 
+test("directory sync repairs already-enriched ID names and primer searches the human name", async t => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-slack-name-"));
+  const path = join(root, "people.sqlite");
+  const store = new PeopleStore(path, { maxOpenTodos: 10, maxBlurbChars: 1200 });
+  t.after(() => store.close());
+  const identity = { provider: "slack", accountScope: "workspace", externalId: "U123" };
+  const person = store.upsertIdentity(identity).person;
+  // Reproduce an old record whose identity was enriched but canonical name was not.
+  const db = new DatabaseSync(path);
+  try {
+    db.prepare("UPDATE person_identities SET display_name = ? WHERE person_id = ?").run("Mira Example", person.id);
+  } finally { db.close(); }
+  const reader = { listUsers: async () => [{ id: "U123", name: "Mira Example" }] };
+  const result = await syncSlackDirectory({ store, reader, accountId: "workspace", limit: 10 });
+  assert.equal(result.updated, 1);
+  assert.equal(result.unchanged, 0);
+  assert.equal(store.getPerson(person.id)?.displayName, "Mira Example");
+  const queries: string[] = [];
+  const config = resolveConfig({ people: { enabled: true }, peoplePrimer: { enabled: true, corpora: ["memory"] } });
+  await primePersonDossier({ store, personId: person.id, agentName: "Bill", config: config.peoplePrimer,
+    apiKey: "unused", signal: new AbortController().signal,
+    search: async query => { queries.push(query); return []; },
+  });
+  assert.equal(queries.length, 3);
+  assert.ok(queries.every(query => query.includes("Mira Example") && !query.includes("U123")));
+  assert.equal((await syncSlackDirectory({ store, reader, accountId: "workspace", limit: 10 })).unchanged, 1);
+});
+
 test("preserves Slack flags through ingestion and excludes bots and deactivated people from primer", async t => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-slack-flags-"));
   const store = new PeopleStore(join(root, "people.sqlite"), { maxOpenTodos: 10, maxBlurbChars: 1200 });

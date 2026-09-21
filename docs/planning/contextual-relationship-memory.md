@@ -2,10 +2,11 @@
 
 ## Status
 
-Vision and planning document. The current `unblock-memory` plugin indexes configured
-Markdown with semantic chunking and exposes `memory_search` and `memory_get`. It does
-not currently maintain CRM records, ingest conversations, resolve cross-channel
-identities, summarize channels, or inject per-person context.
+Historical vision and planning document, not the current runtime contract. Its
+baseline predates shipped session indexing and People Whisperer. For implemented
+behavior, use the [README](../../README.md), [retrieval guide](../retrieval.md) and
+[people reference](../peoplesql.md); capabilities proposed below are not installation
+instructions or a claim that every planned feature has shipped.
 
 This document captures the desired end state and a lean Slack-first path toward it. It
 connects with [Unblock Memory Consolidation and Reflection Cycles](./memory-consolidation-and-reflection.md), where

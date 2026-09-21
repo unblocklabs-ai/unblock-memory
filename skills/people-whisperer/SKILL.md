@@ -115,5 +115,15 @@ when a misleading legacy profile cannot be responsibly replaced, or `set_injecti
 to pause it without deleting it. Do not erase raw memory or dossier history.
 Inspect history through `dossier_changes` and `dossier_change` views.
 
+`soft_delete_person` marks a person unavailable and disables injection without
+erasing the dossier/history. `restore_person` leaves injection off: inspect first,
+then explicitly re-enable if appropriate. Slack deactivation also disables the
+whole linked person; directory sync does not restore unavailable people.
+`injectionEligible` is only a record preview. Global hooks and durable once-per-thread
+receipts still apply; dossier edits/restarts do not refresh an already-served thread.
+See the [people operator reference](../../docs/peoplesql.md) for state operations
+and the [retrieval guide](../../docs/retrieval.md) for search/sync limits.
+When loaded through a `plugin-skills` symlink, resolve these links from the skill's real installed path.
+
 Report the resulting snippets, source limitations, changes and intentionally
 unknown answers. More words or more claims are not success metrics.

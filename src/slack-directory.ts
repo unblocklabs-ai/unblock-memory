@@ -135,7 +135,8 @@ export async function syncSlackDirectory(params: {
     }
     try {
       const existing = params.store.findIdentity("slack", params.accountId, externalId);
-      if (existing && params.store.getPerson(existing.personId)?.status !== "active") {
+      const existingPerson = existing ? params.store.getPerson(existing.personId) : undefined;
+      if (existing && existingPerson?.status !== "active") {
         counts.skipped += 1;
         continue;
       }
@@ -158,7 +159,7 @@ export async function syncSlackDirectory(params: {
         syncedAt,
       });
       if (result.created) counts.created += 1;
-      else if (changed) counts.updated += 1;
+      else if (changed || result.person.displayName !== existingPerson?.displayName) counts.updated += 1;
       else counts.unchanged += 1;
     } catch {
       counts.failed += 1;

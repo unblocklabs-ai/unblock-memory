@@ -39,13 +39,24 @@ const claimSchema = Type.Object({
     ]),
     confidence: Type.Optional(Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])),
 }, { additionalProperties: false });
-export const PERSON_DOSSIER_SCHEMA = Type.Object({
+// Keep the broad schema for legacy dossier and history reads only.
+const PERSON_DOSSIER_SCHEMA = Type.Object({
     schemaVersion: Type.Literal(1),
     blurb: Type.String({ minLength: 1, pattern: "\\S" }),
     sections: Type.Array(Type.Object({
-        category: Type.Union(BASELINE_DOSSIER_CATEGORIES.map((category) => Type.Literal(category))),
+        category: Type.Enum(BASELINE_DOSSIER_CATEGORIES),
         claims: Type.Array(claimSchema, { minItems: 1, maxItems: 100 }),
     }, { additionalProperties: false }), { maxItems: BASELINE_DOSSIER_CATEGORIES.length }),
+}, { additionalProperties: false });
+export const PERSON_DOSSIER_WRITE_SCHEMA = Type.Object({
+    ...PERSON_DOSSIER_SCHEMA.properties,
+    sections: Type.Array(Type.Object({
+        category: Type.Enum(["role", "relationship"]),
+        claims: Type.Array(Type.Object({
+            ...claimSchema.properties,
+            epistemicType: Type.Enum(["observed", "reported"]),
+        }, { additionalProperties: false }), { minItems: 1, maxItems: 100 }),
+    }, { additionalProperties: false }), { maxItems: 2 }),
 }, { additionalProperties: false });
 export class DossierConflictError extends Error {
     constructor() { super("Dossier or person changed during review; inspect again before retrying"); }
@@ -243,6 +254,15 @@ export class PeopleStore {
           WHERE provider = ? AND account_scope = ? AND external_id = ?
         `)
                     .run(optional(input.displayName), optional(input.realName), optional(input.handle), optional(input.avatarUrl), optional(input.title), input.isBot === undefined ? null : Number(input.isBot), input.isDeactivated === undefined ? null : Number(input.isDeactivated), now, input.syncedAt ?? null, provider, accountScope, externalId);
+                const displayName = [optional(input.displayName), optional(input.realName)]
+                    .find(name => name !== null && name !== externalId);
+                if (displayName) {
+                    // Repair generated ID placeholders without renaming an established person.
+                    this.#db.prepare(`
+            UPDATE people SET display_name = ?, updated_at = ?
+            WHERE id = ? AND display_name = ? AND preferred_name IS NULL
+          `).run(displayName, now, personId, externalId);
+                }
                 if (!directorySync) {
                     this.#db
                         .prepare("UPDATE people SET last_seen_at = ?, updated_at = ? WHERE id = ?")
@@ -363,7 +383,7 @@ export class PeopleStore {
         return row ? person(row) : undefined;
     }
     validateDossier(input) {
-        const dossier = Value.Parse(PERSON_DOSSIER_SCHEMA, input);
+        const dossier = Value.Parse(PERSON_DOSSIER_WRITE_SCHEMA, input);
         this.#validateDossier(dossier);
         serializeDossier(dossier);
         return dossier;
@@ -727,12 +747,6 @@ export class PeopleStore {
         }
         if (backgroundWordCount(dossier.blurb) > PEOPLE_BACKGROUND_MAX_WORDS) {
             throw new Error(`dossier blurb must not exceed ${PEOPLE_BACKGROUND_MAX_WORDS} words`);
-        }
-        if (categories.some(category => category !== "role" && category !== "relationship")) {
-            throw new Error("New dossiers support only role and relationship background; rewrite legacy behavioral profiles");
-        }
-        if (dossier.sections.some(section => section.claims.some(claim => claim.epistemicType === "inferred" || claim.epistemicType === "agent_assessment"))) {
-            throw new Error("Background claims must be explicit observed or reported facts, not inferred profiles");
         }
     }
     #migrate() {

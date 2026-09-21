@@ -126,15 +126,15 @@ test("deduplicates exact identities and enables injection for new people", async
   }
 });
 
-test("directory sync leaves needs-enrichment todos open until explicitly resolved", async () => {
+test("directory enrichment repairs an ID placeholder but leaves its todo open", async () => {
   const store = new PeopleStore(await temporaryPath(), options);
   try {
-    store.upsertIdentity({
+    const initial = store.upsertIdentity({
       provider: "slack",
       accountScope: "workspace-a",
       externalId: "U123",
     });
-    store.upsertIdentity({
+    const enriched = store.upsertIdentity({
       provider: "slack",
       accountScope: "workspace-a",
       externalId: "U123",
@@ -142,12 +142,51 @@ test("directory sync leaves needs-enrichment todos open until explicitly resolve
       syncedAt: "2026-08-28T12:00:00.000Z",
     });
 
+    assert.equal(enriched.person.displayName, "Directory Name");
+    assert.equal(enriched.person.id, initial.person.id);
+    assert.equal(enriched.person.lastSeenAt, initial.person.lastSeenAt);
     const key = "needs-enrichment:slack:workspace-a:U123";
     assert.equal(store.listTodos().find((todo) => todo.deduplicationKey === key)?.status, "open");
     assert.equal(store.resolveTodoByKey(key)?.status, "resolved");
   } finally {
     store.close();
   }
+});
+
+test("observation repairs only unpreferred active placeholders with a non-placeholder name", async t => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  t.after(() => store.close());
+  const identity = { provider: "slack", accountScope: "default", externalId: "U123" };
+  const initial = store.upsertIdentity(identity).person;
+  store.setInjection(initial.id, false);
+  const dossier = { schemaVersion: 1, blurb: "Mira is a founder.", sections: [] };
+  store.replaceDossier(initial.id, "Verified background", dossier);
+  const history = store.listDossierChanges(initial.id);
+  for (const metadata of [{}, { displayName: " " }, { displayName: "U123", realName: "U123" }]) {
+    assert.equal(store.upsertIdentity({ ...identity, ...metadata }).person.displayName, "U123");
+  }
+  const repaired = store.upsertIdentity({ ...identity, displayName: "U123", realName: " Mira Example " }).person;
+  assert.equal(repaired.displayName, "Mira Example");
+  assert.equal(repaired.id, initial.id);
+  assert.equal(repaired.injectionEnabled, false);
+  assert.deepEqual(store.getDossier(initial.id)?.dossier, dossier);
+  assert.deepEqual(store.listDossierChanges(initial.id), history);
+
+  const preferred = store.upsertIdentity({ ...identity, externalId: "U456" }).person;
+  const db = new DatabaseSync(path);
+  try {
+    db.prepare("UPDATE people SET preferred_name = ? WHERE id = ?").run("Chosen Name", preferred.id);
+  } finally { db.close(); }
+  const unchanged = store.upsertIdentity({ ...identity, externalId: "U456", displayName: "Directory Name" }).person;
+  assert.equal(unchanged.preferredName, "Chosen Name");
+  assert.equal(unchanged.displayName, "U456");
+
+  const unavailable = store.upsertIdentity({ ...identity, externalId: "U789" }).person;
+  store.softDeletePerson(unavailable.id);
+  const skipped = store.upsertIdentity({ ...identity, externalId: "U789", displayName: "Directory Name" }).person;
+  assert.equal(skipped.status, "unavailable");
+  assert.equal(skipped.displayName, "U789");
 });
 
 test("does not update identities after a person becomes unavailable", async () => {
@@ -367,9 +406,9 @@ test("new background writes reject long blurbs, legacy categories and inferred p
     const claim = { statement: "Mira is CEO.", evidence: [{ source: "manual", locator: "human correction" }], epistemicType: "reported" };
     const dossier = { schemaVersion: 1, blurb: "Mira is CEO.", sections: [{ category: "role", claims: [claim] }] };
     assert.throws(() => store.replaceDossier(person.id, "test", { ...dossier, blurb: "word ".repeat(71) }), /70 words/);
-    assert.throws(() => store.replaceDossier(person.id, "test", { ...dossier, sections: [{ category: "priorities", claims: [claim] }] }), /role and relationship/);
+    assert.throws(() => store.replaceDossier(person.id, "test", { ...dossier, sections: [{ category: "priorities", claims: [claim] }] }));
     assert.throws(() => store.replaceDossier(person.id, "test", { ...dossier,
-      sections: [{ category: "role", claims: [{ ...claim, epistemicType: "inferred" }] }] }), /not inferred/);
+      sections: [{ category: "role", claims: [{ ...claim, epistemicType: "inferred" }] }] }));
     assert.equal(store.getDossier(person.id), undefined);
     assert.equal(store.listDossierChanges(person.id).length, 0);
     assert.equal(store.replaceDossier(person.id, "test", { ...dossier, blurb: "word ".repeat(70).trim() }).blurb.split(" ").length, 70);
@@ -464,7 +503,7 @@ test("can read, replace, audit, and delete dossiers written before the byte limi
           claims: Array.from({ length: 70 }, (_, index) => ({
             statement: `Legacy claim ${index}`,
             evidence: [{ source: "manual", locator: "x".repeat(1000) }],
-            epistemicType: "observed",
+            epistemicType: "inferred",
           })),
         },
       ],

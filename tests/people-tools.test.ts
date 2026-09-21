@@ -36,7 +36,9 @@ type Tool = {
 type ObjectSchema = {
   type?: string;
   required?: string[];
-  properties?: Record<string, unknown>;
+  properties?: Record<string, ObjectSchema>;
+  items?: ObjectSchema;
+  enum?: string[];
 };
 
 function resultJson(result: {
@@ -208,7 +210,7 @@ test("manual verification cannot bypass shape limits, and invalid inputs do not 
   const h = await writeHarness(t);
   for (const manual of [undefined, manualVerification]) {
     await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, blurb: "word ".repeat(71) } }), /70 words/);
-    await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, sections: [{ ...dossier.sections[0], category: "preferences" }] } }), /only role and relationship/);
+    await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, sections: [{ ...dossier.sections[0], category: "preferences" }] } }));
   }
   await assert.rejects(h.write({ manualVerification: " " }));
   assert.equal(h.calls.length, 0);
@@ -416,6 +418,10 @@ test("person selectors survive OpenClaw model schema normalization", async () =>
         "restore_person",
       ],
     );
+
+    const section = update.properties?.dossier?.properties?.sections?.items;
+    assert.deepEqual(section?.properties?.category?.enum, ["role", "relationship"]);
+    assert.deepEqual(section?.properties?.claims?.items?.properties?.epistemicType?.enum, ["observed", "reported"]);
 
     await assert.rejects(
       inspect.execute("call", {

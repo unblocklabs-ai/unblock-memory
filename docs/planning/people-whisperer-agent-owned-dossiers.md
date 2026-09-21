@@ -1,119 +1,24 @@
 # People Whisperer: Agent-Owned Dossiers
 
-Status: implemented direction
-Updated: 2026-09-18
+Status: implemented direction, recorded 2026-09-18. The living documentation is
+[People dossiers and whispering](../peoplesql.md), with the canonical agent
+procedure in the [packaged People Whisperer skill](../../skills/people-whisperer/SKILL.md).
 
-## Goal
+## Decision
 
-Give an OpenClaw agent useful context about the person speaking before it has to
-search memory, while keeping maintenance on autopilot and outside the interactive
-path.
+The agent owns dossier research, writing and maintenance. The plugin stores people,
+exact identities, background-only dossiers and durable injection receipts; it
+matches the Slack speaker and injects the saved blurb. The optional TypeSafe
+primer/reviewer assists evidence selection and checks, not dossier generation.
 
-People Whisperer has one small boundary:
+Recognition snippets describe explicit identity, organization and person-agent
+relationship—not behavioral profiles or task history. Unknown background may stay
+unknown, and a maintenance cycle may correctly update nobody.
 
-- PeopleSQL stores people, exact identities, dossiers, and injection receipts.
-- The agent decides whom to investigate, what evidence matters, and whether to
-  replace a dossier.
-- Exact Slack identity matching injects `dossier.blurb` at most once per person
-  per Slack thread.
+The plugin does not own a dossier refresh schedule, cursor, dirty queue, evidence
+packet or refinement workflow. An operator can invoke the packaged skill manually
+or through an existing agent automation. Current limits, tool contracts, save-review
+gates, privacy approvals and state operations belong in the linked living references,
+rather than duplicated in this historical decision record.
 
-The plugin is a store, matcher, and injector with an optional TypeSafe evidence
-primer/reviewer. It is not a dossier workflow engine.
-
-The snippet is a recognition aid: at most 70 words of explicit identity,
-organization and person-agent relationship background. It is not a behavioral
-profile. New writes allow only `role`/`relationship` evidence sections and
-`observed`/`reported` claims. Preferences, working styles, priorities, success
-criteria, permissions and task history must be removed from legacy profiles on
-rewrite. Existing records and their before/after history remain readable.
-
-## Product rules
-
-1. `(Slack account ID, Slack sender ID)` must resolve exactly to one person.
-2. `dossier.blurb` is the only injected person snippet.
-3. Injection is deduplicated by `(Slack thread, person)`. Three distinct people
-   speaking in one thread may therefore produce three whispers.
-4. The same person may be injected again in a different thread.
-5. Unthreaded Slack DMs use their OpenClaw session as the conversational scope.
-6. Receipts are durable across retries and Gateway restarts. A retry of the same
-   run receives the same contribution; a later run in the same thread does not.
-7. Unknown, unavailable, archived, injection-disabled, or dossierless people do
-   not produce a whisper.
-8. New people are injection-enabled by default. The agent can disable injection
-   for one person without disabling the plugin.
-9. Dossier creation and maintenance are ordinary agent actions. They do not
-   depend on owner authorization or a plugin-owned model runner.
-
-The inbound hook records available Slack identity and thread information. Prompt
-construction uses the matching run/session context supplied by OpenClaw. This
-design does not assume that `message_received` always supplies a run ID.
-
-## Agent-facing surface
-
-When `people.enabled` is true, the normal tool surface includes:
-
-- `memory_people_inspect({ view: "people", limit? })` to list active people with
-  identities, `lastSeenAt`, dossier presence, and optional dossier `reviewedAt`;
-- `memory_people_inspect({ view: "person", personId })` or exact Slack identity
-  to read one person and current dossier;
-- `memory_people_inspect({ view: "dossier_changes", personId, limit?, offset? })`
-  to page through small newest-first change summaries, and `view: "dossier_change"`
-  with a `changeId` to read one exact before/after snapshot and reason;
-- `memory_people_inspect({ view: "todos", limit? })` for actionable data-quality
-  todos;
-- `memory_people_update` actions `replace_dossier`, `delete_dossier`,
-  `set_injection`, `set_company`, `resolve_todo`, `soft_delete_person`, and
-  `restore_person`; and
-- optional `memory_people_sync` to enrich people from one configured Slack
-  directory account.
-
-`replace_dossier` writes a complete validated replacement and `delete_dossier`
-removes one. Both require a short reason. Each mutation and its audit entry commit
-in one transaction; the stored before/after dossier snapshots include the injected
-`blurb`. Serialized dossiers are capped at 64 KiB. Replacement requires a passing
-TypeSafe background check or explicit, source-specific `manualVerification`.
-Unavailable/uncertain checks do not write. The save transaction checks the dossier
-revision so an in-flight review cannot overwrite a concurrent edit or deletion.
-`reviewedAt` is generated write metadata, not a cursor, due date, or freshness policy.
-
-## Agent-owned maintenance
-
-The agent chooses people and evidence using the tools it already has:
-
-1. List or inspect people when useful.
-2. Search configured memory and sessions with `memory_search`.
-3. Follow useful `qmd://` results with `memory_get`.
-4. Investigate identity/relationship gaps and conflicting role changes; the
-   optional `memory_people_prime` grades evidence from approved corpora. Existing dossiers are not
-   evidence. Keep unknown answers unknown rather than inferring roles from tasks.
-5. Submit a replacement only when it would improve recognition. The write tool
-   checks the complete blurb against exact indexed claim references; handle its
-   result as documented in the packaged skill. It is valid to update nobody.
-
-The dossier may retain claim-level evidence references and provenance. Those
-references explain claims; they are not processed-event receipts and do not
-control future work.
-
-The plugin deliberately has no maintenance ledger, scheduling state, or review
-acknowledgement. It also does not create or schedule cron jobs. An operator may
-give an isolated cron agent this goal:
-
-```text
-Use $people-whisperer to maintain brief background snippets for people you interact
-with. Follow the packaged skill, including source verification and write results.
-Update only when useful; several people or nobody is fine. Report changes and gaps.
-```
-
-No deterministic coverage guarantee is required. Dossiers are maintained
-understanding, not an event-processing ledger.
-
-## Out of scope
-
-- plugin-owned scheduling or dossier generation;
-- QMD person attribution;
-- per-person clusters or graph storage;
-- automatic claim arbitration or confidence math; and
-- owner approvals, leases, or scheduled-run authorization wrappers.
-
-The intended end state is deliberately small: **the agent owns PeopleSQL; the
-plugin stores, matches, and injects.**
+Broader entity whispering and consolidation designs remain planning material.

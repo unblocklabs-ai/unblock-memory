@@ -16,26 +16,30 @@ import { registerReviewTools } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
 const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
-    corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1 })),
+    corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), {
+        minItems: 1, description: 'Configured corpus names; default is all non-skill corpora. Use ["all"] alone for explicit all-corpora recall.',
+    })),
     sessionFilter: Type.Optional(Type.Object({
         startedFrom: Type.Optional(Type.String({
+            description: "Inclusive lower bound on session start time, not message or claim dates (ISO 8601).",
             pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
         })),
         startedTo: Type.Optional(Type.String({
+            description: "Inclusive upper bound on session start time, not message or claim dates (ISO 8601).",
             pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
         })),
         provider: Type.Optional(Type.String({ pattern: "\\S" })),
         chatType: Type.Optional(Type.Union([Type.Literal("channel"), Type.Literal("group"), Type.Literal("direct")])),
         accountId: Type.Optional(Type.String({ pattern: "\\S" })),
         conversationId: Type.Optional(Type.String({ pattern: "\\S" })),
-    }, { additionalProperties: false })),
-    maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
-    minScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+    }, { additionalProperties: false, description: "Restricts session documents only; selected file corpora remain eligible. Not an audience access control." })),
+    maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum hits; default 5." })),
+    minScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Minimum vector similarity; default 0.3. Not confidence in factual truth." })),
 }, { additionalProperties: false });
 const getParameters = Type.Object({
     path: Type.String({ pattern: "\\S" }),
-    from: Type.Optional(Type.Integer({ minimum: 1 })),
-    lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+    from: Type.Optional(Type.Integer({ minimum: 1, description: "First source line, 1-based; default 1. Use nextFrom from a truncated read to continue." })),
+    lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "Requested lines; default 120, also bounded by 12,000 content characters." })),
 }, { additionalProperties: false });
 const syncSessionsParameters = Type.Object({
     force: Type.Optional(Type.Boolean()),
@@ -48,7 +52,7 @@ function createSearchTool(runtime, ctx) {
     return {
         name: "memory_search",
         label: "Memory Search",
-        description: "Search configured memory corpora with semantic vector retrieval. The isolated skills corpus is never included.",
+        description: "Search this agent's configured memory corpora with local vector retrieval, not QMD's hybrid query. Skills are excluded. Results are evidence leads; inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
         parameters: searchParameters,
         async execute(_toolCallId, params, signal) {
             const { query: untrimmedQuery, corpora, sessionFilter, maxResults, minScore, } = Value.Parse(searchParameters, params);
@@ -86,7 +90,7 @@ function createGetTool(runtime, ctx) {
     return {
         name: "memory_get",
         label: "Memory Get",
-        description: "Read an exact qmd:// path returned by memory_search.",
+        description: "Read an exact indexed qmd:// source path returned by memory tools. Defaults to 120 lines, bounded to 12,000 content characters. Check truncated/nextFrom and continue when present; not_found or unavailable is not a successful empty read.",
         parameters: getParameters,
         async execute(_toolCallId, params) {
             const { path: untrimmedPath, from, lines } = Value.Parse(getParameters, params);
@@ -427,7 +431,7 @@ export function registerUnblockMemory(api) {
         supportsPrivateTranscriptRecall: false,
         promptBuilder: ({ availableTools }) => availableTools.has("memory_search")
             ? [
-                "Use memory_search for relevant past facts, then memory_get when more surrounding context is needed.",
+                "Use memory_search for relevant past facts, then memory_get to verify source context, attribution and dates. Follow read continuation when present. Empty search is not proof of absence; historical memory is not current authorization.",
             ]
             : [],
         flushPlanResolver: resolveFlushPlan,

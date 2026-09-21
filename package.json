@@ -22,13 +22,17 @@
     "dist",
     "skills",
     "README.md",
+    "docs/configuration.md",
+    "docs/retrieval.md",
+    "docs/peoplesql.md",
+    "docs/response-audit.md",
     "openclaw.plugin.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "knip": "knip --reporter compact",
-    "test": "node --import tsx --test --test-concurrency=1 tests/**/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 tests/**/*.test.ts tests/**/*.test.mjs",
     "plugin:inspect": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw",
     "plugin:inspect:runtime": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw --runtime --mock-sdk --allow-execute",
     "release:check": "node scripts/check-release-version.mjs",

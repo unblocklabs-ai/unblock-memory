@@ -63,10 +63,11 @@
       "help": "Explicit non-skill corpora approved for external TypeSafe processing and maintenance results visible to every audience using this agent. Sessions means ALL indexed sessions, not only the current conversation."
     },
     "typesafe.enabled": {
-      "label": "TypeSafe Ranking",
-      "help": "Enabled by default when credentials exist. Sends bounded conversation context and skill descriptions or approved memory excerpts to TypeSafe for enabled whisperers."
+      "label": "TypeSafe Judgments",
+      "help": "Shared provider gate for opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Ordinary search and People Whisperer injection stay local."
     },
     "typesafe.apiKey": { "label": "TypeSafe API Key", "sensitive": true },
+    "typesafe.timeoutMs": { "label": "TypeSafe Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer also has its own total deadline." },
     "typesafe.apiKeyFile": {
       "label": "TypeSafe Key File",
       "help": "Absolute path to a plaintext API key or a dotenv file containing TYPESAFE_API_KEY. Prefer this over storing a key in config."
@@ -93,12 +94,13 @@
     },
     "people.enabled": {
       "label": "PeopleSQL",
-      "help": "Maintain an agent-local people store. Disabled by default."
+      "help": "Enable the agent-local people store, Slack identity observation and people tools. Disabled by default; whispering and TypeSafe primer/review are separate opt-ins."
     },
     "people.whisperer.enabled": {
       "label": "People Whisperer",
-      "help": "Inject an enabled person's bounded dossier blurb after exact identity matching. Requires hook conversation access."
+      "help": "Inject an active, injection-enabled person's saved blurb once per Slack thread/person, with durable receipts. Requires people.enabled and host hook permissions; no model call."
     },
+    "people.whisperer.maxChars": { "label": "People Blurb Character Limit", "help": "Also limits newly saved dossier blurbs when injection is off. The separate 70-word ceiling still applies." },
     "analysis.executable": {
       "label": "Memory Analysis Worker",
       "help": "Optional absolute path to the locally installed unblock-memory-analysis executable."

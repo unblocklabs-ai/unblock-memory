@@ -2,7 +2,7 @@ import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { renderPeopleWhisper } from "./people-hooks.js";
-import { DossierConflictError, PERSON_DOSSIER_SCHEMA } from "./people-store.js";
+import { DossierConflictError, PERSON_DOSSIER_WRITE_SCHEMA } from "./people-store.js";
 import { getContext } from "./tool-context.js";
 import { reviewPersonDossier } from "./people-dossier-review.js";
 import { createOpenClawSlackDirectory, syncSlackDirectory, } from "./slack-directory.js";
@@ -77,7 +77,7 @@ const updateParameters = Type.Union([
     Type.Object({
         action: Type.Literal("replace_dossier"),
         personId: nonEmpty,
-        dossier: PERSON_DOSSIER_SCHEMA,
+        dossier: PERSON_DOSSIER_WRITE_SCHEMA,
         reason: Type.String({ pattern: "\\S", maxLength: 500 }),
         agentName: Type.Optional(Type.String({ pattern: "\\S", maxLength: 100 })),
         manualVerification: Type.Optional(Type.String({ pattern: "\\S", maxLength: 400,
@@ -144,7 +144,7 @@ function createInspectTool(stores, config, ctx) {
     return {
         name: "memory_people_inspect",
         label: "Inspect People Memory",
-        description: "List active people, inspect one person, read dossier change history, or list actionable people todos.",
+        description: "List active people, inspect one person, read dossier change history, or list actionable people todos. injectionEligible is a record-level preview, not proof that global hooks or an already-served thread will inject.",
         parameters: inspectParameters,
         async execute(_toolCallId, raw) {
             const input = Value.Parse(inspectParameters, raw);
@@ -198,7 +198,7 @@ function createUpdateTool(stores, config, runtime, ctx) {
     return {
         name: "memory_people_update",
         label: "Update People Memory",
-        description: "Replace a background-only dossier (blurb <=70 words, role/relationship sections, observed/reported facts). Automatically reviews the blurb against claim evidence qmd://path#Lstart-Lend before saving; blocked/unavailable reviews leave it unchanged. Use explicit manualVerification only after verifying original sources yourself. Also deletes dossiers or updates injection, company, todo and person status.",
+        description: "Replace a background-only dossier (blurb <=70 words, role/relationship sections, observed/reported facts). Uses peoplePrimer approval to review the blurb against claim evidence qmd://path#Lstart-Lend before saving; blocked/unavailable reviews leave it unchanged. Use explicit manualVerification only after verifying original sources yourself. Also deletes dossiers or updates injection, company, todo and person status. Restoring a person leaves injection off; dossier changes do not reset thread receipts.",
         parameters: updateParameters,
         async execute(_toolCallId, raw, signal) {
             const input = Value.Parse(updateParameters, raw);
@@ -271,7 +271,7 @@ function createSyncTool(stores, reader, ctx) {
     return {
         name: "memory_people_sync",
         label: "Sync Slack People",
-        description: "Manually enrich this agent's people store from one OpenClaw-authenticated Slack directory account.",
+        description: "Manually enrich this agent's people store from one OpenClaw-authenticated Slack directory account (users:read). At most 200 entries from the directory start, without a continuation cursor. Skips unavailable people; deactivation disables the linked person and injection.",
         parameters: syncParameters,
         async execute(_toolCallId, raw) {
             const input = Value.Parse(syncParameters, raw);
