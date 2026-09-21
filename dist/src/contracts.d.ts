@@ -24,7 +24,7 @@ export type SessionSearchFilter = {
 export type MemoryRequestContext = Pick<OpenClawPluginToolContext, "sessionKey" | "sessionId" | "messageChannel" | "agentAccountId" | "nativeChannelId" | "deliveryContext">;
 export type CorpusSearchOptions = NonNullable<Parameters<MemorySearchManagerContract["search"]>[1]> & {
     corpora?: readonly string[];
-    /** Internal hint/reranking budget; oversized matched chunks are omitted, never sliced. */
+    /** Internal vector-hint budget; oversized matched chunks are omitted, never sliced. */
     maxSnippetChars?: number;
     sessionFilter?: SessionSearchFilter;
     requestContext?: MemoryRequestContext;

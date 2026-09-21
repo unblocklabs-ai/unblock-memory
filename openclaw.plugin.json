@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.21",
+  "version": "0.3.22",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -9,7 +9,6 @@
   "contracts": {
     "tools": [
       "memory_search",
-      "memory_xsearch",
       "memory_get",
       "memory_sync_sessions",
       "memory_sync_status",
@@ -46,14 +45,6 @@
     "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
-    "xsearch.enabled": {
-      "label": "Hybrid search with TypeSafe",
-      "help": "Opt in to vector + BM25 retrieval and independent usefulness reranking. Sends queries and approved corpus excerpts to TypeSafe."
-    },
-    "xsearch.corpora": {
-      "label": "Hybrid search approved corpora",
-      "help": "Explicit non-skill corpora allowed for TypeSafe reranking. Required when enabled."
-    },
     "peoplePrimer.enabled": { "label": "People Background Primer", "help": "Opt in to sending identity, approved excerpts and proposed snippets to TypeSafe. Prepares evidence and checks <=70-word blurbs before replace_dossier saves; disabled/unavailable reviews require explicit manual verification. Existing dossiers are not evidence. Results are accessible to the agent's tool callers." },
     "peoplePrimer.corpora": { "label": "Primer Approved Corpora", "help": "Explicit non-skill corpus allowlist. Sessions includes all indexed conversations; approve only content suitable for this agent's audiences." },
     "responseAudit.enabled": { "label": "Response Quality Audit", "help": "Opt in to background TypeSafe evaluation of approved Slack humans. Operator-only reports; no prompt or memory writes." },
@@ -129,15 +120,6 @@
           "maxEpisodes": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
           "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 1440, "default": 60 },
           "memoryCorpora": { "type": "array", "maxItems": 50, "items": { "type": "string", "pattern": "\\S" }, "default": [] }
-        }
-      },
-      "xsearch": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": { "type": "boolean", "default": false },
-          "corpora": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [] },
-          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 30000, "default": 10000 }
         }
       },
       "qualityAudit": {

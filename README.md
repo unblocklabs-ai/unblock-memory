@@ -1,28 +1,5 @@
 # Unblock Memory
 
-## Hybrid search (`memory_xsearch`, opt-in)
-
-`memory_search` remains vector-only. Enable `memory_xsearch` to combine vector
-and BM25 retrieval, then independently score complete source excerpts with
-TypeSafe. It is disabled by default and requires shared TypeSafe credentials
-plus an explicit approved corpus list:
-
-```json
-{
-  "xsearch": {
-    "enabled": true,
-    "corpora": ["memory"],
-    "timeoutMs": 10000
-  }
-}
-```
-
-Place this under `plugins.entries.unblock-memory.config`. Enabling it approves
-sending the query and selected excerpts from those corpora to TypeSafe. Skills
-are excluded. Unapproved corpora are rejected; session filters apply to both
-retrieval methods. `minScore` is final usefulness (0–1), not vector similarity.
-The tool returns existing source spans with normal `memory_get` citations.
-
 ## Response quality tracking (opt-in)
 
 `responseAudit` evaluates bounded human-agent exchanges in the background. It is

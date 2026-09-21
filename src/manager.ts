@@ -55,7 +55,6 @@ import { qualityTaskPresence } from "./quality-triage.js";
 import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
 import { abortable } from "./abortable.js";
-import { xsearchBm25 } from "./xsearch-bm25.js";
 
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
@@ -1052,15 +1051,10 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       expand: false,
     });
     opts?.signal?.throwIfAborted();
-    return this.#searchResults(hits, store, opts);
-  }
-
-  async #searchResults(hits: VectorSearchResult[], store: ManagerStore, opts?: CorpusSearchOptions,
-    method: "vector" | "bm25" = "vector"): Promise<CorpusMemorySearchResult[]> {
     const tokenizer = (store as Partial<AnalysisStore>).internal?.llm;
     const results: CorpusMemorySearchResult[] = [];
     for (const hit of hits) {
-      // Hints and reranking must retain the entire matched chunk, even when expanded
+      // Proactive hints must retain the entire matched chunk, even when expanded
       // turn/message context exceeds their budget. Ordinary search is unchanged.
       if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity)) continue;
       const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
@@ -1086,7 +1080,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
         path: hit.file,
         ...span,
         score: hit.score,
-        ...(method === "vector" ? { vectorScore: hit.score } : { textScore: hit.score }),
+        vectorScore: hit.score,
         snippet: selected.text,
         source: "memory",
         corpus,
@@ -1095,21 +1089,6 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       });
     }
     return results;
-  }
-
-  async searchBm25(query: string, opts: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]> {
-    if (opts.sources && !opts.sources.includes("memory")) return [];
-    const collections = this.#collectionNames(opts.corpora);
-    opts.signal?.throwIfAborted();
-    await abortable(this.#operationChain ?? Promise.resolve(), opts.signal);
-    const sessions = this.#sessions;
-    if (opts.sessionFilter && sessions && collections.includes(sessions.collection)) await this.#refreshSessionMetadata();
-    const allowedPaths = opts.sessionFilter && sessions && collections.includes(sessions.collection)
-      ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter) : undefined;
-    const store = await this.#getAnalysisStore();
-    opts.signal?.throwIfAborted();
-    const hits = xsearchBm25(store.internal.db, query, collections, opts.maxResults ?? 5, allowedPaths);
-    return this.#searchResults(hits, store, opts, "bm25");
   }
 
   async searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]> {

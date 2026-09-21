@@ -42,11 +42,6 @@ export type UnblockMemoryConfig = {
         enabled: boolean;
         corpora: readonly string[];
     };
-    xsearch: {
-        enabled: boolean;
-        corpora: readonly string[];
-        timeoutMs: number;
-    };
     responseAudit: ResponseAuditConfig;
     peoplePrimer: PeoplePrimerConfig;
     people: {

@@ -79,61 +79,6 @@ test("flush plan honors disable, thresholds, model, and agent timezone", () => {
   assert.equal(plan?.model, "local/fast");
 });
 
-test("xsearch gates egress before manager access and forwards matching retrieval controls", async t => {
-  const asOf = "2026-09-18T12:00:00.000Z";
-  t.mock.timers.enable({ apis: ["Date"], now: Date.parse(asOf) });
-  const sessionFilter = { provider: "slack", startedFrom: "2026-09-01T00:00:00Z", startedTo: "2026-09-18T23:59:59Z" };
-  const requests: unknown[] = [];
-  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body));
-    requests.push(body);
-    assert.deepEqual(body.state.timeContext, { asOf,
-      sessionStartedFrom: sessionFilter.startedFrom, sessionStartedTo: sessionFilter.startedTo });
-    return Response.json({ answers: { usefulness: { type: "score", score: 3, confidence: 1,
-      probabilities: { "0": 0, "1": 0, "2": 0, "3": 1 } } } });
-  });
-  for (const mode of ["disabled", "keyless", "unapproved", "ready"] as const) {
-    let factory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
-    const calls: Array<{ method: string; options: Record<string, unknown> }> = [];
-    const api = {
-      pluginConfig: { xsearch: { enabled: mode !== "disabled", corpora: ["memory"] },
-        typesafe: mode === "keyless" ? { apiKeyFile: "/nonexistent/xsearch-test-key" } : { apiKey: "test-only-key" } },
-      registerCli() {},
-      registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
-        Object.defineProperty(capability.runtime, "getMemorySearchManager", { value: async () => {
-          assert.equal(mode, "ready", "gates must precede retrieval");
-          const retrieve = (method: string) => async (_query: string, options: Record<string, unknown>) => {
-            calls.push({ method, options });
-            return [{ path: "qmd://memory/note.md", startLine: 1, endLine: 1, score: 0.1,
-              snippet: "Mira approved staging", source: "memory", corpus: "memory" }];
-          };
-          return { manager: { search: retrieve("vector"), searchBm25: retrieve("bm25") } };
-        } });
-      },
-      registerTool(f: typeof factory, options: { names: string[] }) {
-        if (options.names.includes("memory_xsearch")) factory = f;
-      },
-    } as unknown as OpenClawPluginApi;
-    registerUnblockMemory(api);
-    const tool = factory!({ agentId: "bill", config: {}, sessionId: "current-session" } as OpenClawPluginToolContext)!;
-    const result = parseJsonResult(await tool.execute("call", { query: "  staging approval  ", maxResults: 10,
-      minScore: 0.5, corpora: mode === "unapproved" ? ["sessions"] : ["memory"], sessionFilter }));
-    assert.equal(result.status, mode === "ready" ? "ok" : mode === "disabled" ? "disabled" : "unavailable");
-    if (mode === "ready") {
-      assert.deepEqual(calls.map(c => c.method), ["vector", "bm25"]);
-      for (const call of calls) {
-        assert.equal(call.options.maxResults, 15);
-        assert.equal(call.options.minScore, 0);
-        assert.deepEqual(call.options.sessionFilter, sessionFilter);
-        assert.equal((call.options.requestContext as { sessionId: string }).sessionId, "current-session");
-      }
-      assert.equal((result.results as unknown[]).length, 1);
-      assert.equal(result.asOf, asOf);
-    }
-  }
-  assert.equal(requests.length, 1);
-});
-
 test("registers exactly the clean memory tool contract and validates every tool at execution", async () => {
   const registrations: Array<{
     names: string[];
@@ -156,7 +101,6 @@ test("registers exactly the clean memory tool contract and validates every tool 
     registrations.flatMap((registration) => registration.names),
     [
       "memory_search",
-      "memory_xsearch",
       "memory_get",
       "memory_sync_sessions",
       "memory_sync_status",
