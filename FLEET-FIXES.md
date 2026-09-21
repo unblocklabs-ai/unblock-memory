@@ -1,5 +1,10 @@
 # Fleet fixes
 
+**Checkout reconciliation (2026-09-21):** the original local checkout now includes
+released main plus the retained documentation, fleet tooling and People fixes.
+Its QMD pin and installed dependency are 2.10.1. References below to the original
+dirty checkout's 2.9.6 pin describe the earlier release-time state, not the current checkout.
+
 Reviewed, fixed, released, and verified on **billsmacmini 2026-09-20**. This is the actionable backlog for Bek's controlled fleet, not the full QMD audit. The five recorded fixes were delivered in **Memory 0.3.21 / QMD 2.10.1**. The issue descriptions below record the original defects; the follow-up below supersedes M2 as a remediation requirement.
 
 ## Follow-up: query replaces the xsearch prototype
