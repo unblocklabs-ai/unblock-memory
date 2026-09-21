@@ -22,6 +22,21 @@ function requireRegularFile(path) {
     if (file && !file.isFile())
         throw new Error("Memory database must be a regular file, not a symlink");
 }
+function enableWal(db) {
+    // Switching journal modes can return SQLITE_BUSY without invoking busy_timeout.
+    const deadline = Date.now() + 5000;
+    for (;;) {
+        try {
+            db.exec("PRAGMA journal_mode=WAL");
+            return;
+        }
+        catch (error) {
+            if (!(error instanceof Error) || !("errcode" in error) || error.errcode !== 5 || Date.now() >= deadline)
+                throw error;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(25, Math.max(0, deadline - Date.now())));
+        }
+    }
+}
 /** Separate domain stores share settings, not a monolithic data-access API. */
 export function openMemoryDatabase(path) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -35,7 +50,9 @@ export function openMemoryDatabase(path) {
     }
     const db = new DatabaseSync(path);
     try {
-        db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+        db.exec("PRAGMA busy_timeout=5000");
+        enableWal(db);
+        db.exec(`PRAGMA foreign_keys=ON;
       PRAGMA trusted_schema=OFF;
       CREATE TABLE IF NOT EXISTS memory_schema (component TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT;`);
         // Explicit standalone store paths remain useful to tests and offline tools.

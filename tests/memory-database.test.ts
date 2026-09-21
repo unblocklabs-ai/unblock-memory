@@ -178,6 +178,25 @@ test("consolidates PeopleSQL versions 1–3 before applying their existing upgra
   }
 });
 
+test("retries busy WAL transitions but preserves other SQLite errors", async t => {
+  const root = await temp();
+  const originalExec = DatabaseSync.prototype.exec;
+  let attempts = 0;
+  let fault = Object.assign(new Error("database is locked"), { errcode: 5 });
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "PRAGMA journal_mode=WAL" && ++attempts <= 2) throw fault;
+    return originalExec.call(this, sql);
+  });
+  const db = openMemoryDatabase(join(root, "retry.sqlite"));
+  assert.equal(attempts, 3);
+  assert.equal(db.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
+  db.close();
+  attempts = 0;
+  fault = Object.assign(new Error("malformed database"), { errcode: 11 });
+  assert.throws(() => openMemoryDatabase(join(root, "error.sqlite")), error => error === fault);
+  assert.equal(attempts, 1);
+});
+
 test("simultaneous first opens import only once, then independent stores write safely", async () => {
   const root = await temp(); await legacyFixture(root);
   const path = join(root, MEMORY_DATABASE), module = new URL("../src/memory-database.ts", import.meta.url).href;

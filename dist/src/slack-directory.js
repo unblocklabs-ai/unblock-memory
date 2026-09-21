@@ -26,6 +26,8 @@ function slackEntry(value) {
         avatarUrl: text(profile?.image_512, 2_000) ??
             text(profile?.image_192, 2_000) ??
             text(profile?.image_72, 2_000),
+        isBot: typeof member?.is_bot === "boolean" ? member.is_bot : undefined,
+        isDeactivated: typeof member?.deleted === "boolean" ? member.deleted : undefined,
     };
 }
 export function createOpenClawSlackDirectory(params) {
@@ -100,7 +102,9 @@ export async function syncSlackDirectory(params) {
             const changed = existing !== undefined &&
                 ((entry.name !== undefined && entry.name !== existing.displayName) ||
                     (entry.handle !== undefined && entry.handle !== existing.handle) ||
-                    (entry.avatarUrl !== undefined && entry.avatarUrl !== existing.avatarUrl));
+                    (entry.avatarUrl !== undefined && entry.avatarUrl !== existing.avatarUrl) ||
+                    (entry.isBot !== undefined && entry.isBot !== existing.isBot) ||
+                    (entry.isDeactivated !== undefined && entry.isDeactivated !== existing.isDeactivated));
             const result = params.store.upsertIdentity({
                 provider: "slack",
                 accountScope: params.accountId,
@@ -108,6 +112,8 @@ export async function syncSlackDirectory(params) {
                 displayName: entry.name,
                 handle: entry.handle,
                 avatarUrl: entry.avatarUrl,
+                isBot: entry.isBot,
+                isDeactivated: entry.isDeactivated,
                 syncedAt,
             });
             if (result.created)

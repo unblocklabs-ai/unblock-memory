@@ -5,6 +5,8 @@ type SlackDirectoryEntry = {
     name?: string;
     handle?: string;
     avatarUrl?: string;
+    isBot?: boolean;
+    isDeactivated?: boolean;
 };
 export type SlackDirectoryReader = {
     listUsers(params: {

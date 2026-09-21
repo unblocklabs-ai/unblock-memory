@@ -247,7 +247,14 @@ export class QmdMemoryRuntime {
             analysisExecutable: this.#analysisExecutable,
             sessions,
         });
-        await manager.start();
+        try {
+            await manager.start();
+        }
+        catch (error) {
+            // The manager is not in the runtime's resolved cache yet, so we own cleanup.
+            await manager.close().catch(() => undefined);
+            throw error;
+        }
         return manager;
     }
     #sessionConfig(cfg, agentId) {

@@ -3,7 +3,9 @@ import { mkdir, mkdtemp, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { FSWatcher } from "chokidar";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
+import { QmdMemoryManager } from "../src/manager.js";
 import { QmdMemoryRuntime, recoverInterruptedSessionSync } from "../src/runtime.js";
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -24,6 +26,40 @@ const sessionCorpora = [{
   maxExpandedTokens: 500,
   syncIntervalMinutes: 15,
 }] as const;
+
+test("closes failed startup attempts before retrying and preserves the startup error", async t => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-startup-"));
+  const runtime = new QmdMemoryRuntime([
+    { name: "memory", kind: "files", paths: ["memory/**/*.md"] },
+  ], { stateRoot: root });
+  const params = { cfg: { agents: { defaults: { workspace: root } } }, agentId: "main" };
+  const originalClose = QmdMemoryManager.prototype.close;
+  const watcherClose = t.mock.method(FSWatcher.prototype, "close");
+  const closed: QmdMemoryManager[] = [];
+  let attempts = 0;
+  t.mock.method(QmdMemoryManager.prototype, "sync", async () => {
+    if (++attempts <= 2) throw new Error("initial sync failed");
+  });
+  t.mock.method(QmdMemoryManager.prototype, "close", async function (this: QmdMemoryManager) {
+    closed.push(this);
+    await originalClose.call(this);
+    if (closed.length === 1) throw new Error("cleanup failed too");
+  });
+  t.after(() => runtime.closeAllMemorySearchManagers());
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    assert.deepEqual(await runtime.getMemorySearchManager(params), { manager: null, error: "initial sync failed" });
+    assert.equal(closed.length, attempt);
+    assert.equal(watcherClose.mock.callCount(), attempt);
+  }
+  const { manager } = await runtime.getMemorySearchManager(params);
+  assert.ok(manager);
+  assert.equal((await runtime.getMemorySearchManager(params)).manager, manager);
+  await runtime.closeAllMemorySearchManagers();
+  assert.equal(new Set(closed).size, 3);
+  assert.equal(closed.length, 3);
+  assert.equal(watcherClose.mock.callCount(), 3);
+});
 
 test("schedules configured agents after the interval, retries failures, and stops cleanly", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });

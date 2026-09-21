@@ -51,6 +51,7 @@ export type UnblockMemoryConfig = {
   };
   qualityAudit: { enabled: boolean; corpora: readonly string[]; minNoise: number };
   evidenceReview: { enabled: boolean; corpora: readonly string[] };
+  xsearch: { enabled: boolean; corpora: readonly string[]; timeoutMs: number };
   responseAudit: ResponseAuditConfig;
   peoplePrimer: PeoplePrimerConfig;
   people: {
@@ -374,6 +375,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
       qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
       evidenceReview: { enabled: false, corpora: [] },
+      xsearch: { enabled: false, corpora: [], timeoutMs: 10000 },
       responseAudit: resolveResponseAudit(undefined, DEFAULT_CORPORA),
       peoplePrimer: resolvePeoplePrimer(undefined, DEFAULT_CORPORA, false),
       people: DEFAULT_PEOPLE_CONFIG,
@@ -387,12 +389,27 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "xsearch"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
   const people = resolvePeople(config.people);
   const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
+  let xsearch: UnblockMemoryConfig["xsearch"] = { enabled: false, corpora: [], timeoutMs: 10000 };
+  if (config.xsearch !== undefined) {
+    const value = config.xsearch;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("xsearch must be an object");
+    const options = value as Record<string, unknown>;
+    assertOnlyKeys(options, ["enabled", "corpora", "timeoutMs"], "xsearch");
+    try {
+      const approved = resolveQualityAudit({ enabled: options.enabled, corpora: options.corpora }, corpora);
+      xsearch = { enabled: approved.enabled, corpora: approved.corpora,
+        timeoutMs: positiveInteger(options.timeoutMs, 10000, "xsearch.timeoutMs", 30000) };
+    } catch (error) {
+      if (error instanceof Error) throw new Error(error.message.replaceAll("qualityAudit", "xsearch"));
+      throw error;
+    }
+  }
   let evidenceReview: UnblockMemoryConfig["evidenceReview"] = { enabled: false, corpora: [] };
   if (config.evidenceReview !== undefined) {
     const value = config.evidenceReview;
@@ -478,7 +495,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       'unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"',
     );
   }
-  return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
+  return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer, xsearch,
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,
     responseAudit: resolveResponseAudit(config.responseAudit, corpora),

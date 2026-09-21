@@ -70,6 +70,29 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("closes an unassigned QMD store when early schema setup fails", async t => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-store-init-"));
+  const dbPath = join(root, "index.sqlite");
+  const seed = await createStore({ dbPath, config: { collections: {} } });
+  seed.internal.db.exec("CREATE TABLE memory_analysis_memberships (broken TEXT)");
+  const prototype = Object.getPrototypeOf(seed.internal.db);
+  const close = seed.internal.db.close;
+  await seed.close();
+  const closed: QMDStore["internal"]["db"][] = [];
+  t.mock.method(prototype, "close", function (this: QMDStore["internal"]["db"]) {
+    closed.push(this);
+    close.call(this);
+    throw new Error("cleanup failed too");
+  });
+  const manager = new QmdMemoryManager({ dbPath, workspaceDir: root, sources: [] });
+  t.after(() => manager.close());
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await assert.rejects(manager.sync(), /no such column: run_id/);
+    assert.equal(closed.length, attempt);
+  }
+  assert.equal(new Set(closed).size, 2, "retry must create a new store rather than retain a failed one");
+});
+
 function reviewResponse(kind: "claim" | "cluster") {
   return Response.json({ answers: kind === "claim"
     ? { relation: { type: "choice", choice: "supports", confidence: 0.99,
@@ -988,6 +1011,43 @@ test("session search retains matched evidence within hint budgets without changi
   } finally {
     await manager.close();
   }
+});
+
+test("BM25 manager enforces session filters and shares speaker-safe citation expansion", async t => {
+  const f = await reviewFixture(); t.after(f.close);
+  const sessions = resolveSessionSource(join(f.source.root, "sessions"), ["channel", "direct"]);
+  const body = "# Transcript\n\n## User — Bek — 2026-09-18 10:00:00 UTC\n\nWho approved staging?\n\n## Assistant — Bill — 2026-09-18 10:01:00 UTC\n\nMira approved staging.";
+  const accepted = await f.insert(body, sessions.collection);
+  const denied = await f.insert("staging staging staging private", sessions.collection);
+  const memory = await f.insert("staging in workspace memory");
+  f.db.prepare("UPDATE content_vectors SET pos=?,chunk_len=? WHERE hash=?")
+    .run(body.indexOf("Mira"), "Mira approved staging.".length, accepted.hash);
+  const manifestPath = join(f.source.root, "sessions-manifest.json");
+  await writeFile(manifestPath, JSON.stringify({ version: 1, sessions: {
+    accepted: { sessionId: "accepted", provider: "slack", chatType: "channel", accountId: "work",
+      conversationId: "C1", startedAt: Date.parse("2026-09-18T10:00:00Z"), documentPath: accepted.path },
+    denied: { sessionId: "denied", provider: "slack", chatType: "direct", accountId: "work",
+      conversationId: "D1", startedAt: Date.parse("2026-09-17T10:00:00Z"), documentPath: denied.path },
+  } }));
+  assert.ok(f.store.internal.llm);
+  t.mock.method(f.store.internal.llm, "countTokens", async (text: string) => text.split(/\s+/).length);
+  const manager = new QmdMemoryManager({ dbPath: join(f.source.root, "manager.sqlite"), workspaceDir: f.source.root,
+    sources: [f.source, sessions], storeFactory: async () => createManagerStore({ internal: f.store.internal }),
+    sessions: { agentId: "test", agentName: "Test", collection: sessions.collection, chatTypes: ["channel", "direct"],
+      outputDir: sessions.root, databasePath: "unused.sqlite", manifestPath, maxExpandedTokens: 500, timezone: "UTC" } });
+  t.after(() => manager.close());
+  const [result] = await manager.searchBm25("staging", { corpora: ["sessions"], maxResults: 1,
+    sessionFilter: { provider: "slack", chatType: "channel", accountId: "work", conversationId: "C1",
+      startedFrom: "2026-09-18T00:00:00Z", startedTo: "2026-09-19T00:00:00Z" } });
+  assert.equal(result.path, accepted.uri);
+  assert.ok(result.snippet.includes("## Assistant — Bill — 2026-09-18 10:01:00 UTC\n\nMira approved staging."));
+  assert.equal(result.snippet, body.split("\n").slice(result.startLine - 1, result.endLine).join("\n"));
+  assert.equal(result.session?.sessionId, "accepted");
+  assert.ok(result.textScore);
+  assert.equal(result.vectorScore, undefined);
+  const onlyFiles = await manager.searchBm25("staging", { sessionFilter: { provider: "teams" } });
+  assert.deepEqual(onlyFiles.map(r => r.path), [memory.uri]);
+  assert.deepEqual(await manager.searchBm25("staging", { corpora: ["sessions"], sessionFilter: { provider: "teams" } }), []);
 });
 
 test("filters session paths without restricting file corpora", async () => {

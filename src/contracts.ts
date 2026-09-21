@@ -41,7 +41,7 @@ export type CorpusSearchOptions = NonNullable<
   Parameters<MemorySearchManagerContract["search"]>[1]
 > & {
   corpora?: readonly string[];
-  /** Internal vector-hint budget; oversized matched chunks are omitted, never sliced. */
+  /** Internal hint/reranking budget; oversized matched chunks are omitted, never sliced. */
   maxSnippetChars?: number;
   sessionFilter?: SessionSearchFilter;
   requestContext?: MemoryRequestContext;

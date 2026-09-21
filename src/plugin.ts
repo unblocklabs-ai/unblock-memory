@@ -19,6 +19,8 @@ import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
+import { rerankXsearch, XSEARCH_MAX_EXCERPT_CHARS } from "./xsearch.js";
+import { abortable } from "./abortable.js";
 
 const searchParameters = Type.Object(
   {
@@ -119,13 +121,59 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
   };
 }
 
+function createXsearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext, config: UnblockMemoryConfig) {
+  const active = getContext(ctx);
+  if (!active) return null;
+  return {
+    name: "memory_xsearch", label: "Hybrid Memory Search",
+    description: "Search approved memory corpora with vector + BM25 retrieval, deduplicate excerpts, then independently rerank with TypeSafe usefulness scores. Slower than memory_search; use for higher-precision recall. Same session filters; minScore filters final usefulness (0–1), not vector similarity. Requires xsearch opt-in and a TypeSafe key; sends query and approved excerpts to TypeSafe. Skills excluded.",
+    parameters: searchParameters,
+    async execute(_id: string, params: unknown, signal?: AbortSignal) {
+      const parsed = Value.Parse(searchParameters, params);
+      const query = parsed.query.trim();
+      if (!config.xsearch.enabled || !config.typesafe.enabled) return jsonResult({ status: "disabled", results: [], reason: "Use memory_search instead" });
+      const requested = parsed.corpora?.map(corpus => corpus.trim());
+      const corpora = !requested || (requested.length === 1 && requested[0] === "all")
+        ? [...config.xsearch.corpora] : requested;
+      if (corpora.some(corpus => !config.xsearch.corpora.includes(corpus))) {
+        return jsonResult({ status: "unavailable", results: [], reason: "Requested corpus is not approved in xsearch.corpora" });
+      }
+      if (query.length > XSEARCH_MAX_EXCERPT_CHARS) return jsonResult({ status: "unavailable", results: [], reason: "Query exceeds 12000 characters" });
+      const start = performance.now();
+      const deadline = AbortSignal.timeout(60_000);
+      const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+      try {
+        combined.throwIfAborted();
+        const apiKey = await abortable(resolveTypeSafeApiKey(config.typesafe), combined);
+        if (!apiKey) return jsonResult({ status: "unavailable", results: [], reason: "TypeSafe API key not configured; use memory_search" });
+        const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
+        if (!manager) return jsonResult({ status: "unavailable", results: [], reason: "Memory unavailable" });
+        const maxResults = parsed.maxResults ?? 5;
+        const options = { corpora, sessionFilter: parsed.sessionFilter, maxResults: Math.ceil(maxResults * 1.5),
+          minScore: 0, maxSnippetChars: XSEARCH_MAX_EXCERPT_CHARS, signal: combined, requestContext: active.requestContext };
+        const [vector, lexical] = await abortable(Promise.all([
+          manager.search(query, options), manager.searchBm25(query, options),
+        ]), combined);
+        const retrievalMs = Math.round(performance.now() - start);
+        const ranked = await rerankXsearch({ query, sessionFilter: parsed.sessionFilter, vector, lexical, maxResults, minScore: parsed.minScore ?? 0,
+          apiKey, timeoutMs: config.xsearch.timeoutMs, signal: combined });
+        return jsonResult({ ...ranked, provider: "unblock-memory", retrievalMs, totalMs: Math.round(performance.now() - start),
+          results: ranked.results.map(result => result.session ? { ...result,
+            session: { ...result.session, startedAt: new Date(result.session.startedAt).toISOString() } } : result) });
+      } catch {
+        return jsonResult({ status: "unavailable", results: [], reason: "Hybrid search failed or was cancelled; use memory_search" });
+      }
+    },
+  };
+}
+
 function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
   const active = getContext(ctx);
   if (!active) return null;
   return {
     name: "memory_get",
     label: "Memory Get",
-    description: "Read an exact qmd:// path returned by memory_search.",
+    description: "Read an exact qmd:// path returned by memory_search or memory_xsearch.",
     parameters: getParameters,
     async execute(_toolCallId: string, params: unknown) {
       const { path: untrimmedPath, from, lines } = Value.Parse(getParameters, params);
@@ -543,6 +591,7 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics);
   registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe, diagnostics);
   api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
+  api.registerTool((ctx) => createXsearchTool(runtime, ctx, config), { names: ["memory_xsearch"] });
   api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
   api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
     names: ["memory_sync_sessions"],

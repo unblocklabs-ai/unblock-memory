@@ -14,7 +14,7 @@ export declare function responseOutcome(result: ResponseJudgment & {
         measure: "choice_confidence" | "yes_probability";
         source: string;
     }[];
-    reasonStatus: "classified" | "uncertain";
+    reasonStatus: "uncertain" | "classified";
 } | {
     status: "acknowledged_success";
     basis: string[];

@@ -194,6 +194,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         };
     }): MaintenanceTask | undefined;
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
+    searchBm25(query: string, opts: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
     readFile(params: {
         relPath: string;
