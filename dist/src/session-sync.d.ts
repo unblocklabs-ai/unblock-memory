@@ -1,6 +1,6 @@
 import type { ChatType } from "./config.js";
-import { type SessionMetadata, type SessionProjectionInput } from "./session-projector.js";
-export declare const PROJECTOR_VERSION = 6;
+import { type SessionMetadata, type SessionProjectionInput, type SessionMessageSpan } from "./session-projector.js";
+export declare const PROJECTOR_VERSION = 7;
 type IndexedSession = SessionMetadata & {
     sourceGeneration: string;
     maxSeq: number;
@@ -10,6 +10,7 @@ type IndexedSession = SessionMetadata & {
     documentPath: string;
     projectorVersion: number;
     sourceFingerprint?: string;
+    messages?: SessionMessageSpan[];
 };
 export type SessionManifest = {
     version: number;

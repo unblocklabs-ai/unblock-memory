@@ -95,6 +95,11 @@ test("finds the complete message and user-assistant turn around a projected posi
   ].join("");
   const position = projected.indexOf("index is healthy");
   const spans = sessionContextSpans(projected, position);
+  assert.equal(spans?.message.timestamp, "2026-08-25 14:34:02 UTC");
+  assert.equal(sessionContextSpans(projected, 0), undefined);
+  const offsetTranscript = projected.replaceAll(" UTC", " GMT+5:30");
+  assert.equal(sessionContextSpans(offsetTranscript, offsetTranscript.indexOf("index is healthy"))?.message.timestamp,
+    "2026-08-25 14:34:02 GMT+5:30");
 
   assert.equal(projected.slice(spans?.message.start, spans?.message.end).trim(), [
     "## Assistant — Bill — 2026-08-25 14:34:02 UTC",

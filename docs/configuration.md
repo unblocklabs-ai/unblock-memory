@@ -128,10 +128,11 @@ Select only desired skill locations. To use TypeSafe selection instead, enable
 }
 ```
 
-Create the private key file first. Approve only knowledge suitable for every
-audience of this agent. For exact-current-session hints, configure a sessions
-corpus and add `sessions` to `memoryWhisperer.corpora`; missing session identity
-excludes that corpus. This does not make ordinary search current-session-only.
+Create the private key file first. To recall conversation history, configure a
+sessions corpus and add `sessions` to `memoryWhisperer.corpora`. Automatic recall
+can then retrieve across this agent's indexed sessions. The sessions corpus's
+`chatTypes` setting controls whether direct messages are included. Selected
+excerpts are sent to TypeSafe and may be injected into any conversation using this agent.
 
 ### People storage, without injection
 
@@ -152,7 +153,7 @@ excludes that corpus. This does not make ordinary search current-session-only.
 The default memory corpus exists. This separately approves its evidence for
 TypeSafe; it does not create a dossier or schedule maintenance. Use the
 [people workflow](peoplesql.md). Adding `sessions` to primer approval, after
-configuring that corpus, approves **all indexed sessions**, unlike Memory Whisperer.
+configuring that corpus, approves **all indexed sessions**, as with Memory Whisperer.
 
 ### Optional analysis worker
 
@@ -200,7 +201,7 @@ contract; these tables explain their effects.
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, TypeSafe key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
 | `memoryWhisperer.historyMessages` | `5` | 0–50, retrieval history count, not judge-history limit |
-| `memoryWhisperer.minUsefulness` | `0.9` | 0–1, minimum Noul yes-probability per candidate |
+| `memoryWhisperer.minUsefulness` | `0.7` | 0–1, minimum Noul yes-probability per candidate; explicit overrides are preserved |
 | `memoryWhisperer.maxHints` | `2` | 1–2 |
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
 | `memoryWhisperer.timeoutMs` | `3000` | 1–10,000 total whisper deadline, not just the provider timeout |
@@ -330,7 +331,7 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Feature | Evidence sent when explicitly enabled/approved |
 | --- | --- |
 | Skill selection | Bounded visible current/recent conversation + shortlisted skill names/descriptions; not skill procedures or source-path fields |
-| Memory hints | Bounded visible conversation + up to 8 complete excerpts, corpus names and relevant session dates; exact current session only for session hits |
+| Memory hints | Bounded visible conversation + up to 8 complete excerpts, corpus names and matched-message timestamps when available; all indexed sessions in the selected corpora are eligible, with DM inclusion controlled by `chatTypes` |
 | Complementarity | Up to 4 already-qualified excerpts for pairwise redundancy checks |
 | People primer | Person identity, agent name, approved retrieved excerpts and source/session metadata; all indexed sessions eligible if approved, not just the current chat |
 | Dossier save/draft review | Proposed blurb, person/agent names and 1–3 exact approved indexed evidence ranges, at most 6,000 characters total; existing dossier is not evidence |

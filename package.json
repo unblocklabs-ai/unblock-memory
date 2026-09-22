@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.3.23",
+  "version": "0.3.24",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",

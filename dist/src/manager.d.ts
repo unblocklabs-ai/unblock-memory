@@ -4,6 +4,7 @@ import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProb
 import type { ChatType } from "./config.js";
 import { type MaintenanceStatus, type MaintenanceTask, type TemporalBasis } from "./curation.js";
 import { type SessionSyncResult } from "./session-sync.js";
+import { type SessionMessageSpan } from "./session-projector.js";
 import { type ResolvedSource } from "./sources.js";
 import { type QualityCursor } from "./quality-audit.js";
 import { qualityTaskPresence } from "./quality-triage.js";
@@ -36,7 +37,7 @@ export declare function buildReadResult(params: {
     from?: number;
     lines?: number;
 }): MemoryReadResult;
-export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">, maxTokens: number, countTokens: (text: string) => Promise<number>, maxChars?: number): Promise<{
+export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">, maxTokens: number, countTokens: (text: string) => Promise<number>, maxChars?: number, messages?: SessionMessageSpan[]): Promise<{
     text: string;
     position: number;
     sourceText?: string;

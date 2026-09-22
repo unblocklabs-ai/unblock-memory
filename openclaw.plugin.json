@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.23",
+  "version": "0.3.24",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -90,7 +90,7 @@
     },
     "memoryWhisperer.corpora": {
       "label": "Approved Hint Corpora",
-      "help": "Explicit non-skill corpus allowlist. Approve file corpora for all audiences using this agent and for transmission to TypeSafe. Session hits are restricted to the exact current session."
+      "help": "Explicit non-skill corpus allowlist for automatic recall and TypeSafe processing. Session recall spans this agent's indexed sessions; the sessions corpus chatTypes setting controls direct-message inclusion."
     },
     "people.enabled": {
       "label": "PeopleSQL",
@@ -285,13 +285,13 @@
           "enabled": { "type": "boolean", "default": false },
           "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
           "historyMessages": { "type": "integer", "minimum": 0, "maximum": 50, "default": 5 },
-          "minUsefulness": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 },
+          "minUsefulness": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
           "maxHints": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2 },
           "cooldownTurns": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 10 },
           "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 3000 }
         },
         "default": {
-          "enabled": false, "corpora": [], "historyMessages": 5, "minUsefulness": 0.9,
+          "enabled": false, "corpora": [], "historyMessages": 5, "minUsefulness": 0.7,
           "maxHints": 2, "cooldownTurns": 10, "timeoutMs": 3000
         }
       },

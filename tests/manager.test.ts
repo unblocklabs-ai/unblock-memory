@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +18,8 @@ import { clusterReference, ensureMemoryAnalysisSchema } from "../src/analysis.js
 import { resolveSessionSource, resolveSource, resolveSources } from "../src/sources.js";
 import { createAgentDatabase } from "./helpers/session-database.js";
 import { reviewFixture } from "./helpers/review-store.js";
+import { projectSessionDocument } from "../src/session-projector.js";
+import { readSessionManifest } from "../src/session-sync.js";
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -937,7 +940,7 @@ test("session search retains matched evidence within hint budgets without changi
   t.mock.method(backing.internal.llm, "countTokens", async (text: string) => text.split(/\s+/u).length);
   const fact = "Deployment requires approval from the project owner.";
   let bestChunk = fact;
-  const body = "# Transcript\n\n## User — User — 2026-09-17 10:00:00 UTC\n\n" +
+  let body = "# Transcript\n\n## User — User — 2026-09-17 10:00:00 UTC\n\n" +
     "Background discussion. ".repeat(80) +
     "\n\n## Assistant — Agent — 2026-09-17 10:01:00 UTC\n\n" + fact;
   const store = createManagerStore({
@@ -987,7 +990,13 @@ test("session search retains matched evidence within hint budgets without changi
       startedAt: 1,
     });
     assert.ok(hit.snippet.length > 1200);
+    assert.ok(hit.snippet.startsWith("## User"));
+    assert.equal(hit.messageTimestamp, "2026-09-17 10:01:00 UTC");
     assert.ok(hit.snippet.includes(fact));
+    assert.equal(hit.sessionMessages?.length, 2);
+    assert.deepEqual(hit.sessionMessages?.[1], {
+      type: "assistant", name: "Agent", timestamp: "2026-09-17 10:01:00 UTC", body: fact,
+    });
     const [bounded] = await manager.search("approval", { corpora: ["sessions"], maxSnippetChars: 1200 });
     assert.ok(bounded.snippet.startsWith("## Assistant"));
     assert.ok(bounded.snippet.includes(fact));
@@ -995,14 +1004,43 @@ test("session search retains matched evidence within hint budgets without changi
     assert.equal(bounded.startLine, 7);
     assert.equal(bounded.endLine, 9);
     assert.ok(bounded.citation?.endsWith("#L7-L9"));
+    assert.equal(bounded.messageTimestamp, hit.messageTimestamp);
     const [leaf] = await manager.search("approval", { maxSnippetChars: fact.length });
     assert.equal(leaf.snippet, fact);
     assert.equal(leaf.startLine, 9);
     assert.equal(leaf.endLine, 9);
     assert.ok(leaf.citation?.endsWith("#L9-L9"));
+    assert.equal(leaf.messageTimestamp, hit.messageTimestamp);
+    assert.deepEqual(leaf.sessionMessages, hit.sessionMessages?.slice(1));
     bestChunk = body;
     assert.deepEqual(await manager.search("approval", { maxSnippetChars: 1200 }), []);
-    assert.equal((await manager.search("approval"))[0].snippet, body);
+    const [unattributed] = await manager.search("approval");
+    assert.equal(unattributed.snippet, body);
+    assert.equal(unattributed.messageTimestamp, undefined);
+
+    // Real projected offsets override heading-shaped text inside a message body.
+    const literal = `Quoted example:\n\n## User — Fake — 2020-01-01 00:00:00 UTC\n\n${fact}`;
+    const projection = projectSessionDocument({ sessionId: "session-1", chatType: "channel", startedAt: 1,
+      agentName: "main", timezone: "UTC", events: [{ createdAt: Date.parse("2026-09-22T12:00:00Z"),
+        eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: literal } }),
+      }] })!;
+    body = projection.content;
+    bestChunk = fact;
+    const manifest = await readSessionManifest(manifestPath);
+    manifest.sessions["session-1"]!.messages = projection.messages;
+    manifest.sessions["session-1"]!.projectionHash = createHash("sha256").update(body).digest("hex");
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const [structured] = await manager.search("approval");
+    assert.deepEqual(structured.sessionMessages, [{ type: "assistant", name: "Agent",
+      timestamp: "2026-09-22 12:00:00 UTC", body: literal }]);
+    assert.equal(structured.messageTimestamp, "2026-09-22 12:00:00 UTC");
+
+    // A manifest/index race must not attach the other snapshot's offsets or attribution.
+    body = `# Transcript\n\n## User — Bek — 2026-08-01 10:00:00 UTC\n\n${fact}\n`;
+    const [olderSnapshot] = await manager.search("approval");
+    assert.deepEqual(olderSnapshot.sessionMessages, [{ type: "user", name: "Bek",
+      timestamp: "2026-08-01 10:00:00 UTC", body: fact }]);
+    assert.equal(olderSnapshot.messageTimestamp, "2026-08-01 10:00:00 UTC");
     assert.deepEqual(manager.status().custom?.corpora, [{
       name: "sessions",
       kind: "sessions",
@@ -1122,14 +1160,6 @@ test("filters session paths without restricting file corpora", async () => {
       sessionFilter: { provider: "teams" },
     });
     assert.deepEqual(receivedFilters[2], { [sessions.collection]: [firstPath] });
-
-    const scoped = await manager.search("decision", { sessionFilter: { sessionId: "second" } });
-    assert.deepEqual(receivedFilters[3], { [sessions.collection]: [secondPath] });
-    assert.deepEqual(scoped.map(result => result.snippet), ["file memory", "second session"]);
-    assert.deepEqual(await manager.search("decision", {
-      corpora: ["sessions"], sessionFilter: { sessionId: "missing" },
-    }), []);
-    assert.deepEqual(receivedFilters[4], { [sessions.collection]: [] });
 
     await assert.rejects(manager.search("decision", {
       sessionFilter: {

@@ -5,14 +5,15 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ChatType } from "./config.js";
 import {
-  projectSession,
+  projectSessionDocument,
   sessionDocumentPath,
   type SessionMetadata,
   type SessionProjectionInput,
+  type SessionMessageSpan,
 } from "./session-projector.js";
 
 const MANIFEST_VERSION = 1;
-export const PROJECTOR_VERSION = 6;
+export const PROJECTOR_VERSION = 7;
 const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
 // Source lives in src/, published code in dist/src/. Read our own pinned dependency
 // metadata, not QMD internals (which may also be substituted by runtime inspectors).
@@ -45,6 +46,7 @@ type IndexedSession = SessionMetadata & {
   documentPath: string;
   projectorVersion: number;
   sourceFingerprint?: string;
+  messages?: SessionMessageSpan[];
 };
 
 export type SessionManifest = {
@@ -367,7 +369,7 @@ export async function syncSessionProjections(params: ProjectionOptions & {
       continue;
     }
 
-    let content: string | undefined;
+    let projection: ReturnType<typeof projectSessionDocument>;
     try {
       const input: SessionProjectionInput = {
         ...metadata,
@@ -377,13 +379,13 @@ export async function syncSessionProjections(params: ProjectionOptions & {
         events,
         diagnostics,
       };
-      content = projectSession(input);
+      projection = projectSessionDocument(input);
     } catch {
       counts.failed += 1;
       if (previous) sessions[window.sessionId] = previous;
       continue;
     }
-    if (!content) {
+    if (!projection) {
       ignoredSessions[window.sessionId] = JSON.stringify(window);
       counts.skipped += 1;
       if (previous) {
@@ -393,6 +395,7 @@ export async function syncSessionProjections(params: ProjectionOptions & {
       continue;
     }
 
+    const { content, messages } = projection;
     const target = projectionPath(params.outputDir, documentPath);
     const hash = projectionHash(content);
     const contentChanged = params.force === true || previous?.projectorVersion !== PROJECTOR_VERSION ||
@@ -414,6 +417,7 @@ export async function syncSessionProjections(params: ProjectionOptions & {
       documentPath,
       projectorVersion: PROJECTOR_VERSION,
       sourceFingerprint: JSON.stringify(window),
+      messages,
     };
     if (contentChanged) counts.updated += 1;
     else counts.unchanged += 1;

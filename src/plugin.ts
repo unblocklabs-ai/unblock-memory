@@ -85,7 +85,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
     name: "memory_search",
     label: "Memory Search",
     description:
-      "Search this agent's configured memory corpora with local vector retrieval, not QMD's hybrid query. Skills are excluded. Results are evidence leads; inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
+      "Search this agent's configured memory corpora with local vector retrieval, not QMD's hybrid query. Skills are excluded. Session snippets are arrays of messages (type, name, timestamp, body; partial when incomplete); file snippets are strings. Results are evidence leads; inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
     parameters: searchParameters,
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
       const {
@@ -106,20 +106,22 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
         signal,
         requestContext: active.requestContext,
       });
-      return jsonResult({
-        results: results.map((result) =>
-          result.session
-            ? {
-                ...result,
-                session: {
-                  ...result.session,
-                  startedAt: new Date(result.session.startedAt).toISOString(),
-                },
-              }
-            : result,
-        ),
-        provider: "unblock-memory",
-      });
+      // Compact only the public tool response; internal ranking and consumers keep
+      // full-precision scores and the host's source/citation compatibility fields.
+      const payload = {
+        results: results.map(({ source: _source, citation: _citation, session, sessionMessages, ...result }) => ({
+          ...result,
+          snippet: result.corpus === "sessions" ? sessionMessages ?? [{ body: result.snippet, partial: true }] : result.snippet,
+          score: Number(result.score.toFixed(2)),
+          ...(result.vectorScore !== undefined ? { vectorScore: Number(result.vectorScore.toFixed(2)) } : {}),
+          ...(result.textScore !== undefined ? { textScore: Number(result.textScore.toFixed(2)) } : {}),
+          ...(session ? { session: { ...session, startedAt: new Date(session.startedAt).toISOString() } } : {}),
+        })),
+      };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+        details: payload,
+      };
     },
   };
 }

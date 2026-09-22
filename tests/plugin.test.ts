@@ -188,7 +188,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
   }
 });
 
-test("memory tools preserve request context and expose session start time as ISO 8601", async () => {
+test("memory search compacts public results without changing evidence, precision or request context internally", async () => {
   let runtime: QmdMemoryRuntime | undefined;
   let searchFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   let getFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
@@ -216,11 +216,17 @@ test("memory tools preserve request context and expose session start time as ISO
     path: "qmd://sessions/session.md",
     startLine: 1,
     endLine: 2,
-    score: 0.8,
+    score: 0.87654321,
+    vectorScore: 0.87654321,
     snippet: "session body",
     source: "memory" as const,
     corpus: "sessions",
     citation: "sessions/session.md#L1-L2",
+    messageTimestamp: "2026-08-25 14:33:02 UTC",
+    sessionMessages: [
+      { type: "user", name: "Bek", timestamp: "2026-08-25 14:32:09 UTC", body: "Why?\n\n&gt; Quoted text." },
+      { type: "assistant", name: "Bill", timestamp: "2026-08-25 14:33:02 UTC", body: "**Original** `body`", partial: true },
+    ],
     session: {
       sessionId: "session-1",
       provider: "slack",
@@ -230,6 +236,23 @@ test("memory tools preserve request context and expose session start time as ISO
       startedAt,
     },
   };
+  const fileResult = {
+    path: "qmd://memory/MEMORY.md",
+    startLine: 3,
+    endLine: 4,
+    score: 0.304999,
+    snippet: "source text\nwith original formatting",
+    source: "memory" as const,
+    corpus: "memory",
+    citation: "memory/MEMORY.md#L3-L4",
+  };
+  const unknownSessionResult = {
+    path: internalResult.path, startLine: 1, endLine: 2,
+    score: internalResult.score, vectorScore: internalResult.vectorScore,
+    source: "memory", corpus: "sessions", session: internalResult.session,
+    snippet: "Unattributed legacy text",
+  };
+  const originalResults = structuredClone([internalResult, fileResult]);
   let searchContext: unknown;
   let readContext: unknown;
   Object.defineProperty(runtime, "getMemorySearchManager", {
@@ -237,7 +260,7 @@ test("memory tools preserve request context and expose session start time as ISO
       manager: {
         search: async (_query: string, options: { requestContext?: unknown }) => {
           searchContext = options.requestContext;
-          return [internalResult];
+          return [internalResult, fileResult, unknownSessionResult];
         },
         readFile: async (params: { requestContext?: unknown }) => {
           readContext = params.requestContext;
@@ -258,21 +281,46 @@ test("memory tools preserve request context and expose session start time as ISO
     deliveryContext: { channel: "slack", accountId: "workspace-1", to: "channel:C123" },
   } satisfies OpenClawPluginToolContext;
   const tool = searchFactory(context)!;
-  const result = parseJsonResult(await tool.execute("search", { query: "session" }));
+  const response = await tool.execute("search", { query: "session" }) as {
+    content: Array<{ type: string; text: string }>;
+    details: unknown;
+  };
+  const result = parseJsonResult(response);
   await getFactory(context)!.execute("get", { path: "qmd://memory/missing.md" });
   assert.deepEqual(result, {
     results: [
       {
-        ...internalResult,
+        path: internalResult.path,
+        startLine: 1,
+        endLine: 2,
+        score: 0.88,
+        vectorScore: 0.88,
+        snippet: internalResult.sessionMessages,
+        corpus: "sessions",
+        messageTimestamp: internalResult.messageTimestamp,
         session: {
           ...internalResult.session,
           startedAt: "2026-08-25T14:00:00.000Z",
         },
       },
+      {
+        path: fileResult.path,
+        startLine: 3,
+        endLine: 4,
+        score: 0.3,
+        snippet: fileResult.snippet,
+        corpus: "memory",
+      },
+      {
+        path: internalResult.path, startLine: 1, endLine: 2, score: 0.88, vectorScore: 0.88,
+        snippet: [{ body: unknownSessionResult.snippet, partial: true }], corpus: "sessions",
+        session: { ...internalResult.session, startedAt: "2026-08-25T14:00:00.000Z" },
+      },
     ],
-    provider: "unblock-memory",
   });
-  assert.equal(internalResult.session.startedAt, startedAt);
+  assert.deepEqual(response.details, result);
+  assert.deepEqual(response.content, [{ type: "text", text: JSON.stringify(result) }]);
+  assert.deepEqual([internalResult, fileResult], originalResults);
   const expected = {
     sessionKey: context.sessionKey,
     sessionId: context.sessionId,

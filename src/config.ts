@@ -145,7 +145,7 @@ const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
 };
 
 const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
-  enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.9,
+  enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.7,
   maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
 };
 
@@ -174,7 +174,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   if (typeof cooldownTurns !== "number" || !Number.isInteger(cooldownTurns) || cooldownTurns < 0 || cooldownTurns > 1000) {
     throw new Error("unblock-memory memoryWhisperer.cooldownTurns must be an integer between 0 and 1000");
   }
-  const minUsefulness = config.minUsefulness ?? 0.9;
+  const minUsefulness = config.minUsefulness ?? DEFAULT_MEMORY_WHISPERER.minUsefulness;
   if (typeof minUsefulness !== "number" || !Number.isFinite(minUsefulness) || minUsefulness < 0 || minUsefulness > 1) {
     throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
   }

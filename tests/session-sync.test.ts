@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { syncSessionProjections } from "../src/session-sync.js";
+import { PROJECTOR_VERSION, syncSessionProjections } from "../src/session-sync.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 function writeStaleManifest(path: string, documentPath: string): Promise<void> {
@@ -83,7 +83,9 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.match(document, /## User — Bek — .*\n\nHello memory/u);
   assert.doesNotMatch(document, /Private DM/);
   assert.doesNotMatch(document, /Abandoned branch/);
-  assert.equal(session.projectorVersion, 6);
+  assert.equal(session.projectorVersion, PROJECTOR_VERSION);
+  assert.deepEqual(session.messages, [{ type: "user", name: "Bek", timestamp: "2026-08-25 14:32:09 UTC",
+    start: document.indexOf("## User"), bodyStart: document.indexOf("Hello memory"), end: document.length - 1 }]);
   assert.equal((await stat(outputDir)).mode & 0o777, 0o700);
   assert.equal((await stat(join(outputDir, session.documentPath))).mode & 0o777, 0o600);
   const firstModifiedAt = (await stat(join(outputDir, session.documentPath))).mtimeMs;
@@ -97,11 +99,14 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.equal((await stat(join(outputDir, session.documentPath))).mtimeMs, firstModifiedAt);
 
   const oldProjectorManifest = structuredClone(second.manifest);
-  oldProjectorManifest.sessions["channel-1"]!.projectorVersion = 5;
+  oldProjectorManifest.sessions["channel-1"]!.projectorVersion = PROJECTOR_VERSION - 1;
+  delete oldProjectorManifest.sessions["channel-1"]!.messages;
   await writeFile(manifestPath, JSON.stringify(oldProjectorManifest));
   const migrated = await run();
   assert.equal(migrated.result.updated, 1);
-  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, 6);
+  assert.equal(migrated.manifest.sessions["channel-1"]!.projectorVersion, PROJECTOR_VERSION);
+  assert.deepEqual(migrated.manifest.sessions["channel-1"]!.messages, session.messages);
+  assert.equal(await readFile(join(outputDir, session.documentPath), "utf8"), document);
   assert.equal(indexRuns, 3);
 
   const changed = new DatabaseSync(databasePath);
@@ -163,7 +168,7 @@ test("upgrading a v5 projection reindexes cleaned content without editing raw ev
     return 1;
   } });
   assert.equal(upgraded.result.updated, 1);
-  assert.equal(upgraded.manifest.sessions.upgrade!.projectorVersion, 6);
+  assert.equal(upgraded.manifest.sessions.upgrade!.projectorVersion, PROJECTOR_VERSION);
   assert.ok(indexed);
   const source = new DatabaseSync(databasePath, { readOnly: true });
   try { assert.equal(source.prepare("SELECT event_json FROM transcript_events").get()!.event_json, JSON.stringify(event)); }

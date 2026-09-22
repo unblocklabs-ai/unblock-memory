@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
@@ -47,8 +48,10 @@ import {
   syncSessionProjections,
   PROJECTOR_VERSION,
   type SessionSyncResult,
+  type SessionManifest,
 } from "./session-sync.js";
-import { sessionContextSpans, type SessionMetadata } from "./session-projector.js";
+import { parseSessionMessageSpans, sessionContextSpans, sessionSnippetMessages,
+  type SessionMessageSpan, type SessionMetadata } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
 import { auditQualityPage, type QualityCursor } from "./quality-audit.js";
 import { qualityTaskPresence } from "./quality-triage.js";
@@ -310,11 +313,12 @@ export async function expandSessionSearchHit(
   maxTokens: number,
   countTokens: (text: string) => Promise<number>,
   maxChars = Infinity,
+  messages?: SessionMessageSpan[],
 ): Promise<{ text: string; position: number; sourceText?: string }> {
   const leaf = { text: result.bestChunk, position: result.chunkPos };
   const speaker = meetingSpeakerSpans(result.body, result.chunkPos, result.chunkPos + result.chunkLen);
   const annotation = meetingRevisionAnnotation(result.body, result.chunkPos);
-  const spans = speaker ?? sessionContextSpans(result.body, result.chunkPos);
+  const spans = speaker ?? sessionContextSpans(result.body, result.chunkPos, messages);
   if (!spans && !annotation) return leaf;
   const leafEnd = result.chunkPos + result.chunkLen;
   for (const span of spans ? [spans.turn, spans.message] : []) {
@@ -376,7 +380,6 @@ function sessionAllowedPaths(
   const accountId = filter.accountId?.trim();
   const conversationId = filter.conversationId?.trim();
   const paths = [...metadataByPath].flatMap(([path, metadata]) =>
-    (filter.sessionId === undefined || metadata.sessionId === filter.sessionId) &&
     (startedFrom === undefined || metadata.startedAt >= startedFrom) &&
     (startedTo === undefined || metadata.startedAt <= startedTo) &&
     (provider === undefined || metadata.provider?.trim().toLowerCase() === provider) &&
@@ -411,6 +414,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   #files = 0;
   #dirty = true;
   #sessionMetadata = new Map<string, SessionMetadata>();
+  #sessionManifest?: SessionManifest;
   #sessionManifestMtimeNs?: bigint;
   #skillIndex?: Promise<SkillIndexEntry[]>;
   #qualityAuditRunning = false;
@@ -489,6 +493,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const mtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
     const manifest = await readSessionManifest(sessions.manifestPath);
     this.#sessionMetadata = sessionMetadataByPath(manifest);
+    this.#sessionManifest = manifest;
     this.#sessionManifestMtimeNs = mtimeNs;
   }
 
@@ -714,6 +719,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
         },
       });
       this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
+      this.#sessionManifest = synced.manifest;
       if (synced.result.skipReason) return synced.result;
       const store = await this.#getStore();
       const status = await store.getStatus();
@@ -1041,7 +1047,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     await this.#operationChain;
     const sessions = this.#sessions;
     opts?.signal?.throwIfAborted();
-    if (opts?.sessionFilter && sessions && collections.includes(sessions.collection)) {
+    if (sessions && collections.includes(sessions.collection)) {
       await this.#refreshSessionMetadata();
     }
     const allowedPaths = opts?.sessionFilter && sessions && collections.includes(sessions.collection)
@@ -1086,12 +1092,23 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       const session = corpus === "sessions" && relativePath
         ? this.#sessionMetadata.get(relativePath)
         : undefined;
+      const projection = session ? this.#sessionManifest?.sessions[session.sessionId] : undefined;
+      // Never apply offsets from a newer projection to an older indexed snapshot.
+      const messages = corpus === "sessions"
+        ? projection?.messages && projection.documentPath === relativePath &&
+          projection.projectionHash === createHash("sha256").update(hit.body).digest("hex")
+          ? projection.messages : parseSessionMessageSpans(hit.body)
+        : undefined;
+      const messageTimestamp = messages
+        ? sessionContextSpans(hit.body, hit.chunkPos, messages)?.message.timestamp
+        : undefined;
       const selected = corpus === "sessions" && this.#sessions && tokenizer
         ? await expandSessionSearchHit(
             hit,
             this.#sessions.maxExpandedTokens,
             (text) => tokenizer.countTokens(text),
             opts?.maxSnippetChars,
+            messages,
           )
         : { text: hit.bestChunk, position: hit.chunkPos };
       if (!selected.text) continue;
@@ -1102,9 +1119,11 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
         score: hit.score,
         vectorScore: hit.score,
         snippet: selected.text,
+        ...(messages ? { sessionMessages: sessionSnippetMessages(hit.body, selected, messages, this.#sessions) } : {}),
         source: "memory",
         corpus,
         ...(session ? { session } : {}),
+        ...(messageTimestamp ? { messageTimestamp } : {}),
         citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
       });
     }

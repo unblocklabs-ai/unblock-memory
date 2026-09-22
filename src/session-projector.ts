@@ -29,13 +29,31 @@ type ProjectedMessage = {
   meeting?: ReturnType<typeof projectLoggieMessage>;
 };
 
+export type SessionSnippetMessage = {
+  type?: "user" | "assistant";
+  name?: string;
+  timestamp?: string;
+  body: string;
+  partial?: true;
+};
+
+/** Character offsets in the exact indexed projection; end excludes message separators. */
+export type SessionMessageSpan = {
+  type: "user" | "assistant";
+  name: string;
+  timestamp: string;
+  start: number;
+  bodyStart: number;
+  end: number;
+};
+
 export type SessionContextSpans = {
-  message: { start: number; end: number };
+  message: { start: number; end: number; timestamp: string };
   turn: { start: number; end: number };
 };
 
 const MESSAGE_HEADING =
-  /^## (User|Assistant) — .* — \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S.*$/gmu;
+  /^## (User|Assistant) — (.+) — (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S.*)$/u;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -155,6 +173,13 @@ function formatTimestamp(value: number, timezone: string): string {
 }
 
 export function projectSession(input: SessionProjectionInput): string | undefined {
+  return projectSessionDocument(input)?.content;
+}
+
+export function projectSessionDocument(input: SessionProjectionInput): {
+  content: string;
+  messages: SessionMessageSpan[];
+} | undefined {
   const messages = input.events.flatMap((event) => {
     const projected = projectMessage(event, input);
     return projected ? [projected] : [];
@@ -184,29 +209,65 @@ export function projectSession(input: SessionProjectionInput): string | undefine
       }
     } else if (!previous || (!previous.meeting?.complete && meeting.complete)) latest.set(meeting.key, message);
   }
-  const transcript = messages.filter(message => !hidden.has(message)).map((message) =>
-    `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ` +
-    `${formatTimestamp(message.timestamp, input.timezone)}\n\n${message.text}`);
-  return `# Transcript\n\n${transcript.join("\n\n")}\n`;
+  let content = "# Transcript\n\n";
+  const spans: SessionMessageSpan[] = [];
+  for (const message of messages.filter(message => !hidden.has(message))) {
+    if (spans.length) content += "\n\n";
+    const start = content.length;
+    const timestamp = formatTimestamp(message.timestamp, input.timezone);
+    content += `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ${timestamp}\n\n`;
+    const bodyStart = content.length;
+    content += message.text;
+    spans.push({ type: message.role, name: message.speaker, timestamp, start, bodyStart, end: content.length });
+  }
+  return { content: `${content}\n`, messages: spans };
 }
 
-export function sessionContextSpans(content: string, position: number): SessionContextSpans | undefined {
-  const markers = [...content.matchAll(MESSAGE_HEADING)].map((match) => ({
-    start: match.index,
-    role: match[1] === "User" ? "user" as const : "assistant" as const,
-  }));
+/** Legacy fallback only. New projections retain exact boundaries before rendering Markdown. */
+export function parseSessionMessageSpans(content: string): SessionMessageSpan[] {
+  const messages: SessionMessageSpan[] = [];
+  let fence: { char: string; length: number } | undefined;
+  for (const line of content.matchAll(/[^\n]*(?:\n|$)/gu)) {
+    const text = line[0].replace(/\n$/u, "");
+    const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(text);
+    if (fence) {
+      if (delimiter?.[1]?.[0] === fence.char && delimiter[1].length >= fence.length && !delimiter[2]?.trim()) fence = undefined;
+      continue;
+    }
+    if (delimiter) {
+      fence = { char: delimiter[1]![0]!, length: delimiter[1]!.length };
+      continue;
+    }
+    const match = MESSAGE_HEADING.exec(text);
+    // Only the projector's complete heading + blank-line form is recognized.
+    if (!match || !content.startsWith("\n\n", line.index + text.length)) continue;
+    const previous = messages.at(-1);
+    if (previous) previous.end = content.startsWith("\n\n", line.index - 2) ? line.index - 2 : line.index;
+    messages.push({ type: match[1] === "User" ? "user" : "assistant", name: match[2]!, timestamp: match[3]!,
+      start: line.index, bodyStart: line.index + text.length + 2,
+      end: content.endsWith("\n") ? content.length - 1 : content.length });
+  }
+  return messages;
+}
+
+export function sessionContextSpans(
+  content: string,
+  position: number,
+  markers = parseSessionMessageSpans(content),
+): SessionContextSpans | undefined {
   const containing = markers.findLastIndex((marker) => marker.start <= position);
   if (containing < 0) return undefined;
 
   const message = {
     start: markers[containing]!.start,
     end: markers[containing + 1]?.start ?? content.length,
+    timestamp: markers[containing]!.timestamp,
   };
   let turnStart = containing;
-  while (turnStart > 0 && markers[turnStart]!.role !== "user") turnStart -= 1;
-  if (markers[turnStart]!.role !== "user") turnStart = containing;
+  while (turnStart > 0 && markers[turnStart]!.type !== "user") turnStart -= 1;
+  if (markers[turnStart]!.type !== "user") turnStart = containing;
   const nextUser = markers.findIndex(
-    (marker, index) => index > turnStart && marker.role === "user",
+    (marker, index) => index > turnStart && marker.type === "user",
   );
   return {
     message,
@@ -215,6 +276,40 @@ export function sessionContextSpans(content: string, position: number): SessionC
       end: nextUser < 0 ? content.length : markers[nextUser]!.start,
     },
   };
+}
+
+export function sessionSnippetMessages(
+  content: string,
+  selected: { text: string; position: number; sourceText?: string },
+  spans: readonly SessionMessageSpan[],
+  identity?: { agentId: string; agentName: string },
+): SessionSnippetMessage[] {
+  const sourceText = selected.sourceText ?? selected.text;
+  const end = selected.position + sourceText.length;
+  // Added meeting speaker/revision context is evidence too; retain it in the first body.
+  const prefix = selected.text.endsWith(sourceText) ? selected.text.slice(0, selected.text.length - sourceText.length) : "";
+  const messages: SessionSnippetMessage[] = [];
+  let cursor = selected.position;
+  const keepUnattributed = (from: number, to: number) => {
+    const body = content.slice(from, to);
+    if (body.trim() && !(from === 0 && body === "# Transcript\n\n")) messages.push({ body, partial: true });
+  };
+  for (const span of spans) {
+    if (span.start >= end || span.end <= selected.position) continue;
+    if (span.start > cursor) keepUnattributed(cursor, span.start);
+    const from = Math.max(span.bodyStart, selected.position);
+    const to = Math.min(span.end, end);
+    messages.push({ type: span.type,
+      name: span.type === "assistant" && span.name === identity?.agentId ? identity.agentName : span.name,
+      timestamp: span.timestamp, body: content.slice(from, Math.max(from, to)),
+      ...(from > span.bodyStart || to < span.end ? { partial: true as const } : {}),
+    });
+    cursor = Math.min(span.end, end);
+  }
+  if (cursor < end) keepUnattributed(cursor, end);
+  if (!messages.length) return [{ body: selected.text, partial: true }];
+  messages[0]!.body = prefix + messages[0]!.body;
+  return messages;
 }
 
 function hash(value: string): string {

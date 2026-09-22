@@ -16,9 +16,32 @@ Example tool input (the `memory` corpus exists by default):
 { "query": "Who approved the staging rollout?", "corpora": ["memory"], "maxResults": 5 }
 ```
 
-Results carry `path`, `startLine`, `endLine`, `snippet`, `score`, `corpus`
-and citation data; session hits also carry session metadata. Vector similarity
-is a retrieval signal, not confidence in the truth of a claim.
+Results use compact JSON and carry `path`, `startLine`, `endLine`, `snippet`,
+`corpus`, and `score`/`vectorScore` rounded to hundredths. Ranking and threshold
+filtering still use full precision. The constant `source` and top-level `provider`
+fields are omitted; `path` plus line numbers replace the redundant `citation`.
+Session hits also carry session metadata and, when available,
+`messageTimestamp`: the original timestamp text (including timezone) of the message
+containing the matched chunk. It stays tied to that message even when the excerpt
+expands to the surrounding turn. Missing timestamps are omitted, not replaced by
+session start time. Vector similarity is a retrieval signal, not confidence in
+the truth of a claim.
+
+Session `snippet` values are arrays of messages, in source order:
+
+```json
+[{ "type": "assistant", "name": "Bill", "timestamp": "2026-08-17 15:40:09 EDT", "body": "**Original message text**, including Markdown." }]
+```
+
+Each message has its own timestamp. Only generated transcript headings are removed;
+body formatting, code, mentions and HTML entities are preserved. `partial: true`
+means the returned body is an excerpt, not the complete message. Metadata is resolved
+from the full indexed document even when a chunk starts mid-message. Assistant agent
+IDs are mapped to the configured identity name when available; other names are kept.
+Unattributable legacy text is retained as `{ "body": "…", "partial": true }`, without
+inventing a role, name or timestamp. File-backed snippets remain strings.
+`memory_get` still returns indexed Markdown, and internal search/Whisperer contracts
+still use strings. This changes output structure, not retrieval ranking.
 
 Read the **returned** path, substituting its actual source/line values:
 
@@ -119,8 +142,8 @@ and matched exactly. When only `sessions` is selected and no sessions match,
 search returns no results. With other corpora selected, their results remain
 eligible.
 
-The date bounds are inclusive **session start times**, not dates of messages or
-claims. A matching session may contain much older facts. These metadata filters
+The date bounds remain inclusive **session start times**; `messageTimestamp`
+dates the matched message but is not a search filter. These metadata filters
 do not change the selected file corpora or authorize disclosure to another audience.
 
 The optional `sessions` corpus reads the current agent's normal OpenClaw SQLite
@@ -138,7 +161,12 @@ reading. Projections are private derived Markdown under the
 agent's `unblock-memory/sessions` state directory and can be rebuilt from
 OpenClaw at any time. Their embedded text contains only `# Transcript` and
 role-labeled, timestamped speaker messages; filtering metadata remains in the
-session manifest. The projected file modification time matches the session
+session manifest. Projection v7 also retains message metadata and exact character
+boundaries there, without duplicating message bodies. Readers use those boundaries
+only when the projection hash matches the indexed document. Older/mismatched snapshots
+use a conservative heading parser that skips code fences and blockquotes; an unfenced
+literal heading can still be ambiguous until the next session refresh rebuilds the
+metadata. The projected file modification time matches the session
 start time for meaningful chronological cluster reads. Session results include
 provider, chat type, conversation identity, and start time as an ISO 8601 timestamp. They
 participate in the same search and clustering index as file memory. The plugin
@@ -234,7 +262,7 @@ or `memory_get`. Enable it in the plugin config with an explicit corpus allowlis
     "enabled": true,
     "corpora": ["knowledge"],
     "historyMessages": 5,
-    "minUsefulness": 0.9,
+    "minUsefulness": 0.7,
     "maxHints": 2,
     "cooldownTurns": 10,
     "timeoutMs": 3000
@@ -245,12 +273,12 @@ or `memory_get`. Enable it in the plugin config with an explicit corpus allowlis
 Requires `hooks.allowConversationAccess: true` on the plugin entry, prompt
 injection permission, and [shared TypeSafe credentials](configuration.md#shared-typesafe-credentials).
 An empty allowlist is invalid when enabled; `all`, unknown names, and `skills`
-are not accepted. File corpora are approved for **every audience using the agent**:
-do not allowlist private dossiers for an agent that also serves shared channels.
-If `sessions` is allowlisted, only the exact current session is searched, including
-its older indexed messages. Missing session identity excludes that corpus. Other
-sessions, even in the same channel, are excluded before sending excerpts to TypeSafe.
-Session availability still depends on the normal indexing/sync schedule.
+are not accepted. When `sessions` is enabled for Memory Whisperer, automatic recall
+can retrieve across this agent's indexed sessions. The sessions corpus's `chatTypes`
+setting controls whether direct messages are included; no additional session-scope
+toggle is required. Selected excerpts are sent to TypeSafe and may be injected into
+any conversation using this agent. Session availability still depends on the normal
+indexing/sync schedule.
 
 The example is a plugin config fragment; `knowledge` must already be configured.
 For a complete corpus example, use the [configuration profiles](configuration.md#example-profiles).
@@ -261,13 +289,16 @@ the local reranker, or a similarity-score cutoff. TypeSafe evaluates one indepen
 Noul question per candidate in a single request: does the excerpt add material value
 beyond what the conversation already contains? Merely related, redundant,
 wrong-person/project, and clearly superseded information should be rejected;
-useful contradictory evidence can qualify. `minUsefulness` thresholds the probability
-of yes, not a calibrated guarantee of accuracy. Evaluate it on your own conversations.
+useful contradictory evidence can qualify. `minUsefulness` defaults to `0.7` and
+thresholds the probability of yes, not a calibrated guarantee of accuracy.
+Explicit configured thresholds are preserved. Evaluate it on your own conversations.
 
 **Privacy and budgets:** this feature sends up to 16,000 characters of the available
 user/assistant conversation, prioritizing the current request and recent messages,
-plus up to eight 1,200-character excerpts, corpus names, and session dates to
-`api.typesafe.ai`. Session excerpts retain a complete turn or message when it fits,
+plus up to eight 1,200-character excerpts, corpus names, and matched-message timestamps
+when available to `api.typesafe.ai`. The same `messageTimestamp` accompanies the
+injected hint: it records when something was said, without inferring event dates.
+Session excerpts retain a complete turn or message when it fits,
 otherwise the complete matched chunk. Chunks exceeding the excerpt budget are
 skipped, never sliced; ordinary `memory_search` is unchanged.
 It does not fetch a complete historical transcript; the host may

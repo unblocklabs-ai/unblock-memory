@@ -1,6 +1,6 @@
 import type { MemoryPluginCapability } from "openclaw/plugin-sdk/memory-host-core";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
-import type { SessionMetadata } from "./session-projector.js";
+import type { SessionMetadata, SessionSnippetMessage } from "./session-projector.js";
 import type { ChatType } from "./config.js";
 
 export type MemoryPluginRuntimeContract = NonNullable<MemoryPluginCapability["runtime"]>;
@@ -17,10 +17,12 @@ export type MemorySearchResult = Awaited<
 export type CorpusMemorySearchResult = MemorySearchResult & {
   corpus: string;
   session?: SessionMetadata;
+  /** Timestamp text, including timezone, of the message containing the matched session chunk. */
+  messageTimestamp?: string;
+  /** Structured tool output; snippet stays a string for the host and internal consumers. */
+  sessionMessages?: SessionSnippetMessage[];
 };
 export type SessionSearchFilter = {
-  /** Internal exact-session scope used by proactive hints; not exposed by the search tool. */
-  sessionId?: string;
   startedFrom?: string;
   startedTo?: string;
   provider?: string;

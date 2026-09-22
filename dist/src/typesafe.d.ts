@@ -41,7 +41,7 @@ export declare function judgeTypeSafeMemories(params: {
     candidates: readonly {
         excerpt: string;
         corpus: string;
-        startedAt?: number;
+        messageTimestamp?: string;
     }[];
 }): Promise<number[]>;
 export {};

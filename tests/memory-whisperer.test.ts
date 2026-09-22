@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "../src/config.js";
+import manifest from "../openclaw.plugin.json" with { type: "json" };
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "../src/contracts.js";
 import { registerMemoryWhisperer } from "../src/memory-whisperer.js";
 import { expandSessionSearchHit } from "../src/manager.js";
@@ -132,8 +133,12 @@ function harness(
 
 test("memory whisperer requires explicit, known non-skill corpora and bounded controls", () => {
   assert.deepEqual(resolveConfig(undefined).memoryWhisperer, {
-    enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.9, maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
+    enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.7, maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
   });
+  assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.7);
+  assert.equal(resolveConfig({ memoryWhisperer: { minUsefulness: 0.9 } }).memoryWhisperer.minUsefulness, 0.9);
+  assert.equal(manifest.configSchema.properties.memoryWhisperer.properties.minUsefulness.default, 0.7);
+  assert.equal(manifest.configSchema.properties.memoryWhisperer.default.minUsefulness, 0.7);
   assert.deepEqual(resolveConfig({ memoryWhisperer: { enabled: true, corpora: ["memory", "memory"], historyMessages: 0 } })
     .memoryWhisperer.corpora, ["memory"]);
   assert.throws(() => resolveConfig({ memoryWhisperer: { complementaryHints: "yes" } }), /complementaryHints/);
@@ -167,7 +172,7 @@ test("one batched judge ranks useful hits, enforces threshold, deduplicates and 
     assert.equal(JSON.stringify(request).includes("qmd://"), false);
     assert.equal(Object.keys(request.questions).length, 3);
     assert.match(request.questions.memory_1.instructions.question, /candidates\[1\]/);
-    return response(0.9, 0.99, 0.89);
+    return response(0.7, 0.99, 0.69);
   });
   const h = harness([hit("first"), hit("first"), hit("overlap", { path: "qmd://memory/first.md", startLine: 2 }), hit("second"), hit("third")],
     { config: { historyMessages: 1 } });
@@ -185,27 +190,41 @@ test("one batched judge ranks useful hits, enforces threshold, deduplicates and 
   assert.equal(h.searches[0].options?.minScore, -1);
   assert.equal(h.searches[0].options?.maxResults, 8);
   assert.equal(h.searches[0].options?.maxSnippetChars, 1200);
-  assert.deepEqual(h.searches[0].options?.sessionFilter, { sessionId: "current" });
+  assert.equal(h.searches[0].options?.sessionFilter, undefined);
+  assert.equal(entries[0].messageTimestamp, undefined);
+  const belowThreshold = harness([hit("third")]);
+  fetch.mock.mockImplementation(async () => response(0.69));
+  assert.equal(await belowThreshold.before(event, context), undefined);
 });
 
-test("unapproved corpora and other sessions never reach TypeSafe; absent session identity excludes sessions", async t => {
+test("recalls other sessions with a session ID or only a key, while excluding unapproved corpora", async t => {
+  const session = { sessionId: "other", chatType: "channel" as const, startedAt: 1000 };
+  const messageTimestamp = "2026-09-17 10:01:00 EDT";
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.deepEqual(request.state.candidates.map((item: { excerpt: string }) => item.excerpt), ["safe", "current session"]);
+    assert.deepEqual(request.state.candidates, [
+      { excerpt: "safe", corpus: "memory" },
+      { excerpt: "other session", corpus: "sessions", messageTimestamp },
+    ]);
     return response(0.1, 0.99);
   });
-  const session = { sessionId: "current", chatType: "channel" as const, startedAt: 1000 };
-  const h = harness([hit("private", { corpus: "private" }), hit("safe"),
-    hit("other session", { corpus: "sessions", session: { ...session, sessionId: "other" } }),
-    hit("unknown session", { corpus: "sessions" }), hit("current session", { corpus: "sessions", session })]);
-  assert.match((await h.before(event, context))?.prependContext ?? "", /current session/);
-  const missing = harness([], { config: { corpora: ["sessions"] } });
-  assert.equal(await missing.before(event, { ...context, sessionId: undefined }), undefined);
-  assert.equal(missing.lookups(), 0);
-  const files = harness([hit("unsafe session", { corpus: "sessions", session })]);
+  for (const sessionId of [context.sessionId, undefined]) {
+    const h = harness([hit("private", { corpus: "private" }), hit("safe"),
+      hit("other session", { corpus: "sessions", session, messageTimestamp })]);
+    const result = await h.before(event, { ...context, sessionId });
+    assert.ok(result);
+    const entries = JSON.parse(result.prependContext.slice(result.prependContext.indexOf("\n") + 1));
+    assert.equal(entries[0].excerpt, "other session");
+    assert.equal(entries[0].messageTimestamp, messageTimestamp);
+    assert.equal(entries[0].sessionStartedAt, undefined);
+    assert.equal(h.searches[0].options?.sessionFilter, undefined);
+    assert.deepEqual(h.searches[0].options?.corpora, ["memory", "sessions"]);
+    h.stop();
+  }
+  const files = harness([hit("excluded session", { corpus: "sessions", session })], { config: { corpora: ["memory"] } });
   assert.equal(await files.before(event, { ...context, sessionId: undefined }), undefined);
   assert.deepEqual(files.searches[0].options?.corpora, ["memory"]);
-  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(fetch.mock.callCount(), 2);
 });
 
 test("disabled features and missing credentials cause no retrieval or provider calls", async t => {
@@ -309,6 +328,8 @@ test("late matched evidence reaches both the judge and hint intact", async t => 
     const request = JSON.parse(String(init?.body));
     assert.equal(request.state.candidates[0].excerpt, selected.text);
     assert.ok(request.state.candidates[0].excerpt.includes(fact));
+    assert.equal(request.state.candidates[0].messageTimestamp, undefined);
+    assert.equal(request.state.candidates[0].startedAt, undefined);
     return response(0.99);
   });
   const h = harness([hit(selected.text, { path: "qmd://sessions/current.md", corpus: "sessions",
@@ -318,4 +339,6 @@ test("late matched evidence reaches both the judge and hint intact", async t => 
   const entries = JSON.parse(result.prependContext.slice(result.prependContext.indexOf("\n") + 1));
   assert.equal(entries[0].excerpt, selected.text);
   assert.ok(entries[0].excerpt.includes(fact));
+  assert.equal(entries[0].messageTimestamp, undefined);
+  assert.equal(entries[0].sessionStartedAt, undefined);
 });

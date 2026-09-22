@@ -16,7 +16,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         const scope = sessionId || sessionKey;
         if (context.trigger !== "user" || !agentId || !runId || !scope || !event.prompt.trim())
             return;
-        const corpora = config.corpora.filter(name => name !== "sessions" || sessionId);
+        const corpora = config.corpora;
         if (!corpora.length)
             return;
         const key = JSON.stringify([agentId, scope]);
@@ -59,8 +59,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 return;
             }
             const retrievalStarted = performance.now();
-            const hits = await manager.search(buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), { corpora, maxResults: 8, minScore: -1, signal, maxSnippetChars: MAX_EXCERPT_CHARS,
-                ...(sessionId ? { sessionFilter: { sessionId } } : {}) });
+            const hits = await manager.search(buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), { corpora, maxResults: 8, minScore: -1, signal, maxSnippetChars: MAX_EXCERPT_CHARS });
             if (signal.aborted)
                 return;
             measurement.retrievalMs = performance.now() - retrievalStarted;
@@ -68,8 +67,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
             const candidates = [];
             for (const hit of hits) {
                 // Enforce scope again before sending anything to the external judge.
-                if (!corpora.includes(hit.corpus) ||
-                    (hit.corpus === "sessions" && (!sessionId || hit.session?.sessionId !== sessionId)))
+                if (!corpora.includes(hit.corpus))
                     continue;
                 const excerpt = hit.snippet.trim();
                 // Retrieval bounds context around a complete match. Never replace it
@@ -96,7 +94,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 apiKey, timeoutMs: typesafe.timeoutMs, signal,
                 conversation: memoryConversation(event.prompt, event.messages),
                 candidates: candidates.map(({ hit, excerpt }) => ({
-                    excerpt, corpus: hit.corpus, ...(hit.session ? { startedAt: hit.session.startedAt } : {}),
+                    excerpt, corpus: hit.corpus, ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
                 })),
             });
             if (signal.aborted || sessions.get(key) !== state)
@@ -127,7 +125,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 return;
             const hints = selected.map(({ hit, excerpt }) => ({
                 path: hit.path, citation: hit.citation, from: hit.startLine, to: hit.endLine,
-                ...(hit.session ? { sessionStartedAt: hit.session.startedAt } : {}),
+                ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
                 excerpt, excerptTruncated: hit.snippet.trim().length > excerpt.length,
             }));
             // Bound the complete injected payload, including source metadata.
