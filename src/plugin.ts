@@ -19,6 +19,7 @@ import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
+import { resolveTimezone } from "./session-projector.js";
 
 const searchParameters = Type.Object(
   {
@@ -474,25 +475,12 @@ function parseByteSize(value: unknown): number | undefined {
   return Number.isSafeInteger(bytes) ? bytes : undefined;
 }
 
-function resolveTimezone(cfg: OpenClawConfig | undefined): string {
-  const configured = cfg?.agents?.defaults?.userTimezone?.trim();
-  if (configured) {
-    try {
-      new Intl.DateTimeFormat("en-US", { timeZone: configured }).format();
-      return configured;
-    } catch {
-      // Host validation normally prevents this; fall through defensively.
-    }
-  }
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-}
-
 export function resolveFlushPlan(params: { cfg?: OpenClawConfig; nowMs?: number } = {}) {
   const configured = params.cfg?.agents?.defaults?.compaction?.memoryFlush;
   if (configured?.enabled === false) return null;
 
   const nowMs = params.nowMs ?? Date.now();
-  const date = formatDateInTimezone(nowMs, resolveTimezone(params.cfg));
+  const date = formatDateInTimezone(nowMs, resolveTimezone(params.cfg?.agents?.defaults?.userTimezone?.trim()));
   const target = `memory/${date}.md`;
   return {
     softThresholdTokens: nonNegativeInteger(configured?.softThresholdTokens, 4000),

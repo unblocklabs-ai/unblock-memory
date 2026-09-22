@@ -55,6 +55,7 @@ import { qualityTaskPresence } from "./quality-triage.js";
 import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
 import { abortable } from "./abortable.js";
+import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
@@ -416,6 +417,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   #reviewLifetime = new AbortController();
   #structuralChunksOmitted = 0;
   #structuralDiagnosticsAvailable = false;
+  readonly #retrievalTelemetry = new RetrievalTelemetry();
 
   #recordEmbedding(result: Awaited<ReturnType<ManagerStore["embed"]>>): void {
     if ("structuralChunksOmitted" in result && typeof result.structuralChunksOmitted === "number") {
@@ -436,6 +438,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       needsEmbedding: status.needsEmbedding,
       embeddingReady: status.needsEmbedding === 0 && status.hasVectorIndex,
       structuralChunksOmitted: this.#structuralDiagnosticsAvailable ? this.#structuralChunksOmitted : null,
+      retrieval: this.#retrievalTelemetry.snapshot(),
       scope: "Projection count covers previously indexed sessions; omissions count this manager lifetime; null means dependency has not reported counts.",
     };
   }
@@ -1014,6 +1017,23 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     query: string,
     opts?: CorpusSearchOptions,
   ): Promise<CorpusMemorySearchResult[]> {
+    const started = performance.now();
+    const operation = opts?.lexicalOnly ? "lexical" : "vector";
+    let results: CorpusMemorySearchResult[];
+    try {
+      results = await this.#search(query, opts);
+    } catch (error) {
+      this.#retrievalTelemetry.record(operation, { elapsedMs: performance.now() - started,
+        outcome: opts?.signal?.aborted ? "cancelled" : "failed" });
+      throw error;
+    }
+    this.#retrievalTelemetry.record(operation, { elapsedMs: performance.now() - started,
+      outcome: results.length ? "ok" : "empty", results: results.length,
+      contextChars: results.reduce((sum, hit) => sum + hit.snippet.length, 0) });
+    return results;
+  }
+
+  async #search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]> {
     if (opts?.sources && !opts.sources.includes("memory")) return [];
     if (this.#sources.size === 0) return [];
     const collections = this.#collectionNames(opts?.corpora);

@@ -1,21 +1,23 @@
+import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 type Whisperer = "skill" | "memory";
 type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable";
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export declare class WhispererDiagnostics {
     #private;
     record(agentId: string, whisperer: Whisperer, outcome: Outcome): void;
+    measureMemory(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void;
     snapshot(agentId: string): {
         skill: {
             unavailable?: number | undefined;
             rejected?: number | undefined;
             failed?: number | undefined;
+            cancelled?: number | undefined;
+            timed_out?: number | undefined;
             missing_key?: number | undefined;
             typesafe_disabled?: number | undefined;
             no_candidates?: number | undefined;
             cooldown?: number | undefined;
             emitted?: number | undefined;
-            timed_out?: number | undefined;
-            cancelled?: number | undefined;
             payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
         };
@@ -23,15 +25,40 @@ export declare class WhispererDiagnostics {
             unavailable?: number | undefined;
             rejected?: number | undefined;
             failed?: number | undefined;
+            cancelled?: number | undefined;
+            timed_out?: number | undefined;
             missing_key?: number | undefined;
             typesafe_disabled?: number | undefined;
             no_candidates?: number | undefined;
             cooldown?: number | undefined;
             emitted?: number | undefined;
-            timed_out?: number | undefined;
-            cancelled?: number | undefined;
             payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
+        };
+        telemetry: {
+            scope: string;
+            operations: {
+                [k: string]: {
+                    calls: number;
+                    outcomes: {
+                        ok?: number | undefined;
+                        skipped?: number | undefined;
+                        failed?: number | undefined;
+                        empty?: number | undefined;
+                        cancelled?: number | undefined;
+                        timed_out?: number | undefined;
+                    };
+                    measurements: {
+                        [k: string]: {
+                            total: number;
+                            samples: number;
+                            recentSamples: number;
+                            p50: number | null;
+                            p95: number | null;
+                        };
+                    };
+                };
+            };
         };
         scope: string;
     };

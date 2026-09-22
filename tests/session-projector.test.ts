@@ -2,9 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   projectSession,
+  resolveTimezone,
   sessionContextSpans,
   sessionDocumentPath,
 } from "../src/session-projector.js";
+
+test("timezone resolution accepts IANA names and falls back for invalid or missing config", () => {
+  assert.equal(resolveTimezone("America/Los_Angeles"), "America/Los_Angeles");
+  const fallback = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  for (const configured of ["invalid/timezone", "", undefined]) {
+    assert.equal(resolveTimezone(configured), fallback);
+  }
+});
 
 test("projects timestamped user and assistant text while excluding internal blocks", () => {
   const projected = projectSession({

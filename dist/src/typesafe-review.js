@@ -1,21 +1,13 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
-export const TYPESAFE_REVIEW_MODEL = "jev-1.13.0";
+import { postTypeSafe } from "./typesafe-transport.js";
+export { TYPESAFE_MODEL as TYPESAFE_REVIEW_MODEL } from "./typesafe-transport.js";
 export async function askTypeSafeReview(params, state, questions) {
     const signal = AbortSignal.any([params.signal, AbortSignal.timeout(params.timeoutMs)]);
     try {
         signal.throwIfAborted();
-        const response = await fetch("https://api.typesafe.ai/v1/systemone", {
-            method: "POST", redirect: "error", signal,
-            headers: { Authorization: `Bearer ${params.apiKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ model: TYPESAFE_REVIEW_MODEL, state, questions }),
-        });
-        if (!response.ok) {
-            await response.body?.cancel();
-            throw new Error("HTTP failure");
-        }
-        return await response.json();
+        return await postTypeSafe({ apiKey: params.apiKey, signal }, state, questions);
     }
     catch {
         throw new Error(signal.aborted ? "TypeSafe review aborted" : "TypeSafe review unavailable");

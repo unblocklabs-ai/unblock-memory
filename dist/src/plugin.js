@@ -14,6 +14,7 @@ import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
+import { resolveTimezone } from "./session-projector.js";
 const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
     corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), {
@@ -387,25 +388,12 @@ function parseByteSize(value) {
     const bytes = Math.round(Number(match[1]) * 1024 ** powers[unit]);
     return Number.isSafeInteger(bytes) ? bytes : undefined;
 }
-function resolveTimezone(cfg) {
-    const configured = cfg?.agents?.defaults?.userTimezone?.trim();
-    if (configured) {
-        try {
-            new Intl.DateTimeFormat("en-US", { timeZone: configured }).format();
-            return configured;
-        }
-        catch {
-            // Host validation normally prevents this; fall through defensively.
-        }
-    }
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-}
 export function resolveFlushPlan(params = {}) {
     const configured = params.cfg?.agents?.defaults?.compaction?.memoryFlush;
     if (configured?.enabled === false)
         return null;
     const nowMs = params.nowMs ?? Date.now();
-    const date = formatDateInTimezone(nowMs, resolveTimezone(params.cfg));
+    const date = formatDateInTimezone(nowMs, resolveTimezone(params.cfg?.agents?.defaults?.userTimezone?.trim()));
     const target = `memory/${date}.md`;
     return {
         softThresholdTokens: nonNegativeInteger(configured?.softThresholdTokens, 4000),

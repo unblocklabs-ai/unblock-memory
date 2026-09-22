@@ -58,7 +58,7 @@ test("flush plan honors disable, thresholds, model, and agent timezone", () => {
   const configured = {
     agents: {
       defaults: {
-        userTimezone: "America/Los_Angeles",
+        userTimezone: " America/Los_Angeles ",
         compaction: {
           memoryFlush: {
             softThresholdTokens: 1234,

@@ -6,7 +6,7 @@ type RequestOptions = {
 type Json = string | number | boolean | null | Json[] | {
     [key: string]: Json;
 };
-export declare const TYPESAFE_REVIEW_MODEL = "jev-1.13.0";
+export { TYPESAFE_MODEL as TYPESAFE_REVIEW_MODEL } from "./typesafe-transport.js";
 export declare function askTypeSafeReview(params: RequestOptions, state: Json, questions: Json): Promise<unknown>;
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
 export declare function reviewTypeSafeClaim(params: RequestOptions & {
@@ -50,4 +50,3 @@ export declare function reviewClusterDefects(params: RequestOptions & {
     defect: "encoding" | "wrapper" | "boilerplate" | "none_or_uncertain";
     confidence: number;
 }[]>;
-export {};

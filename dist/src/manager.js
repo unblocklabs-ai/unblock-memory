@@ -14,6 +14,7 @@ import { qualityTaskPresence } from "./quality-triage.js";
 import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
 import { abortable } from "./abortable.js";
+import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
@@ -286,6 +287,7 @@ export class QmdMemoryManager {
     #reviewLifetime = new AbortController();
     #structuralChunksOmitted = 0;
     #structuralDiagnosticsAvailable = false;
+    #retrievalTelemetry = new RetrievalTelemetry();
     #recordEmbedding(result) {
         if ("structuralChunksOmitted" in result && typeof result.structuralChunksOmitted === "number") {
             this.#structuralDiagnosticsAvailable = true;
@@ -304,6 +306,7 @@ export class QmdMemoryManager {
             needsEmbedding: status.needsEmbedding,
             embeddingReady: status.needsEmbedding === 0 && status.hasVectorIndex,
             structuralChunksOmitted: this.#structuralDiagnosticsAvailable ? this.#structuralChunksOmitted : null,
+            retrieval: this.#retrievalTelemetry.snapshot(),
             scope: "Projection count covers previously indexed sessions; omissions count this manager lifetime; null means dependency has not reported counts.",
         };
     }
@@ -795,6 +798,23 @@ export class QmdMemoryManager {
         return result;
     }
     async search(query, opts) {
+        const started = performance.now();
+        const operation = opts?.lexicalOnly ? "lexical" : "vector";
+        let results;
+        try {
+            results = await this.#search(query, opts);
+        }
+        catch (error) {
+            this.#retrievalTelemetry.record(operation, { elapsedMs: performance.now() - started,
+                outcome: opts?.signal?.aborted ? "cancelled" : "failed" });
+            throw error;
+        }
+        this.#retrievalTelemetry.record(operation, { elapsedMs: performance.now() - started,
+            outcome: results.length ? "ok" : "empty", results: results.length,
+            contextChars: results.reduce((sum, hit) => sum + hit.snippet.length, 0) });
+        return results;
+    }
+    async #search(query, opts) {
         if (opts?.sources && !opts.sources.includes("memory"))
             return [];
         if (this.#sources.size === 0)

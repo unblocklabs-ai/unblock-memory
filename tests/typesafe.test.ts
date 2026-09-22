@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { judgeTypeSafeMemories, judgeTypeSafeQuality, resolveTypeSafeApiKey, selectTypeSafeSkill } from "../src/typesafe.js";
+import { askTypeSafeReview } from "../src/typesafe-review.js";
 
 const config = { enabled: true, timeoutMs: 100 };
 
@@ -71,6 +72,8 @@ test("selection uses opaque IDs, fixed endpoint, model, no redirects, and explic
   t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof globalThis.fetch>) => {
     calls++;
     assert.equal(url, "https://api.typesafe.ai/v1/systemone");
+    assert.equal(init?.method, "POST");
+    assert.deepEqual(init?.headers, { Authorization: "Bearer test-secret", "Content-Type": "application/json" });
     assert.equal(init?.redirect, "error");
     assert.ok(init?.signal);
     const request = JSON.parse(String(init?.body));
@@ -152,4 +155,47 @@ test("memory requests sanitize failures, do not retry, and honor the provider de
     }, { once: true });
   }));
   await assert.rejects(judgeTypeSafeMemories({ ...memoryJudgment, timeoutMs: 20 }), { message: "TypeSafe memory judgment aborted" });
+});
+
+test("shared transport preserves caller errors for HTTP, cancellation and invalid JSON failures", async t => {
+  const params = { apiKey: "test-secret", timeoutMs: 100, signal: new AbortController().signal };
+  const callers = [
+    { request: () => selectTypeSafeSkill(selection), error: "TypeSafe selection request failed", status: true },
+    { request: () => judgeTypeSafeMemories(memoryJudgment), error: "TypeSafe memory request failed", status: true },
+    { request: () => judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
+      error: "TypeSafe quality request failed", status: false },
+    { request: () => askTypeSafeReview(params, {}, {}), error: "TypeSafe review unavailable", status: false },
+  ];
+  const fetch = t.mock.method(globalThis, "fetch");
+  for (const caller of callers) {
+    for (const cancellationFails of [false, true]) {
+      let cancelled = false;
+      fetch.mock.mockImplementation(async () => new Response(new ReadableStream({
+        cancel() {
+          cancelled = true;
+          if (cancellationFails) throw new Error("test-secret cancellation detail");
+        },
+      }), { status: 529 }));
+      await assert.rejects(caller.request(), { message: caller.error + (caller.status ? " (HTTP 529)" : "") });
+      assert.equal(cancelled, true);
+    }
+    fetch.mock.mockImplementation(async () => new Response("test-secret invalid JSON"));
+    await assert.rejects(caller.request(), { message: caller.error });
+  }
+  assert.equal(fetch.mock.callCount(), callers.length * 3);
+});
+
+test("caller cancellation preserves quality, memory and review abort errors", async t => {
+  const params = { apiKey: "test-secret", timeoutMs: 100, signal: AbortSignal.abort("private reason") };
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    init?.signal?.throwIfAborted();
+    throw new Error("caller signal was not propagated");
+  });
+  await assert.rejects(judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
+    { message: "TypeSafe quality audit aborted" });
+  await assert.rejects(judgeTypeSafeMemories({ ...memoryJudgment, signal: params.signal }),
+    { message: "TypeSafe memory judgment aborted" });
+  assert.equal(fetch.mock.callCount(), 2);
+  await assert.rejects(askTypeSafeReview(params, {}, {}), { message: "TypeSafe review aborted" });
+  assert.equal(fetch.mock.callCount(), 2, "review must abort before fetch");
 });

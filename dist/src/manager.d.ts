@@ -50,6 +50,31 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         needsEmbedding: number;
         embeddingReady: boolean;
         structuralChunksOmitted: number | null;
+        retrieval: {
+            scope: string;
+            operations: {
+                [k: string]: {
+                    calls: number;
+                    outcomes: {
+                        ok?: number | undefined;
+                        skipped?: number | undefined;
+                        failed?: number | undefined;
+                        empty?: number | undefined;
+                        cancelled?: number | undefined;
+                        timed_out?: number | undefined;
+                    };
+                    measurements: {
+                        [k: string]: {
+                            total: number;
+                            samples: number;
+                            recentSamples: number;
+                            p50: number | null;
+                            p95: number | null;
+                        };
+                    };
+                };
+            };
+        };
         scope: string;
     }>;
     constructor(params: {
