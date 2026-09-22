@@ -116,10 +116,87 @@ No representative real snapshot, mock/recorded semantic judgments, live TypeSafe
 comparison, answerability/conflict decision, or downstream answer evaluation has
 been completed. These remain requirements for workstreams 1–2, not implied wins.
 
-The next evidence step is an authorized/sanitized frozen snapshot meeting the SMART
-roadmap's case/split gates, with minimal loading/rescoring support. Measure existing
-QMD hybrid before proposing another lane. Only a documented missing-evidence case
-justifies new discovery code. Preserve independent no-answer/conflict judgments as
-an experiment goal; do not confuse QMD's existing usefulness reranker with that goal.
-Apply the roadmap's holdout gates; retain the simpler production path if it does not
-improve. Passing a lab check never authorizes deployment or private provider egress.
+## Next steps: real-agent retrieval comparison
+
+### OODA decision (2026-09-22, code checkpoint `cf16d9e`)
+
+- **Observe:** retrieval, indexed reads, session-context expansion, exact People
+  recognition and bounded judgments already work. The synthetic lab has not
+  established a real-memory quality improvement. Telemetry measures execution,
+  not whether recalled evidence helped an answer.
+- **Orient:** the goal is the right evidence at the right moment. Reuse QMD's
+  hybrid discovery, existing source/expansion/read APIs, PeopleStore, TypeSafe
+  transport and feature-specific judges, and the current runner/scorer. A better
+  judge cannot rescue evidence absent from its shortlist.
+- **Decide:** stop adding abstractions. Compare existing retrieval on actual
+  memory questions before building more lanes, another judge, a subject framework
+  or dreaming. Consolidate further only for a concrete duplication cost.
+
+### Act: one bounded, real-data run
+
+**Status:** planned, not executed. **Owner:** coding agent; Bek approves the source
+scope and accepts claimed recoveries. Within **two working days of approving one
+agent's corpus**, finish the comparison below; target the roadmap's **2026-10-05**
+baseline deadline. If genuine cases or approved data are unavailable, report the
+blocker rather than manufacture examples or silently extend the scope.
+
+Add only validated external-dataset input and offline rescoring to the existing
+lab. Reuse its types, runner, scorer, reports and installed QMD. Snapshot only
+approved indexed documents and necessary source/session metadata with read-only
+consistent reads. The older `eval/enhancements/prepare-corpus.mjs` assumes `main`
+and legacy `curation.sqlite`; reuse its approach, not that script unchanged.
+
+No new service, dependency, index engine, dashboard, provider call or production
+retrieval switch. Keep private snapshots/results on the approved host, outside
+live corpus roots; do not copy credentials or alter live indexes/configuration.
+
+### Execution success criteria
+
+1. **Real questions:** freeze 40 genuinely answerable requests and 10 with no
+   adequate evidence in the approved snapshot. Split disjoint topics/sessions
+   into 20 answerable + 5 unsupported dev cases and the same counts for holdout.
+   Include actual identifiers, decisions, corrections and multi-source questions.
+   Keep whole eligible documents and distractors, not only answer snippets.
+2. **Independent labels:** fix source-linked labels before predictions and do not
+   tune on holdout. Identify agent-only labels; independently human-review claimed
+   recoveries. Record the evidence cutoff and prevent later answers, feedback or
+   revisions from leaking into historical as-of questions.
+3. **Real execution:** run actual QMD indexing, embeddings and retrieval through
+   vector@5, vector@20, lexical and existing hybrid@20 with `rerank:false`.
+   No mocking, canned results or placeholders count as completion. All arms use
+   the same permitted sources, identity/time boundaries, complete-unit context
+   policy and 4,000-character excerpt budget. Reuse session expansion where needed;
+   do not compare expanded vector context with unexpanded hybrid chunks.
+4. **Reproducible evidence:** retain actual predictions, source hashes/lines,
+   code/dependency/model identity, errors and timings. Offline rescoring must
+   reproduce quality counts without inference; never synthesize timings. Run at
+   least three real trials per case, report cold setup separately, and avoid
+   competing model/CPU workloads. Errors are not abstentions or hidden exclusions.
+5. **Tangible result:** deliver a question-by-question report of baseline misses,
+   recovered and lost evidence, forbidden evidence, latency and context. Verify
+   citations through the existing indexed-read path. Nonempty/empty retrieval
+   does not itself establish an answerability judgment.
+
+### Adoption gate and stop condition
+
+- Hybrid must improve held-out complete evidence coverage by **>=10 percentage
+  points over vector@5**: at least two net additional completely covered cases
+  among 20 answerable holdout questions. Show those real questions and verified
+  source passages, not only an aggregate score.
+- Compare against vector@20 too. Hybrid must beat it on quality or demonstrate a
+  measured efficiency advantage; prefer a larger vector shortlist if it achieves
+  the same benefit more simply.
+- Require **zero wrong-scope outputs**, **100% citation validity in this run**,
+  **no additional labeled forbidden-evidence cases**, and **<=150 ms added p95
+  retrieval latency** over vector@5, with the same context budget. At this sample
+  size the roadmap's +1-point forbidden-evidence allowance permits no extra case.
+- Any failed case blocks a win claim until resolved or a new predeclared run is
+  made. If the candidate loses or ties without an efficiency advantage, keep
+  current retrieval and select only the smallest correction justified by the
+  observed failures.
+
+A valid negative result completes the experiment, not a product improvement.
+Passing this gate permits consideration of integration, not automatic deployment.
+It does not solve no-answer/conflict judgments, prove downstream agent improvement,
+or unlock later roadmap stages. Saving this plan authorizes neither private-data
+egress nor a production change.
