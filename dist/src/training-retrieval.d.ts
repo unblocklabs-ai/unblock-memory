@@ -20,7 +20,7 @@ export declare function historicalPrefix(body: string, spans: readonly SessionMe
     body: string;
     spans: SessionMessageSpan[];
 } | undefined;
-/** A read-only source snapshot, copied into a disposable in-memory QMD index.
+/** Fingerprint a read-only source snapshot; build its search index only on demand.
  * No filesystem projection, live-index mutation, model re-embedding or dependency patch. */
 export declare function historicalTrainingSearch(stateDir: string, chatTypes: readonly ChatType[], cutoff: number, openStore?: typeof import("@unblocklabs/qmd")["createStore"]): Promise<{
     corpusHash: string;

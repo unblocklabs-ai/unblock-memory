@@ -166,33 +166,38 @@ test("real QMD snapshot removes future FTS text and crossing vectors before eith
   } } }));
   await original.close();
   const before = readFileSync(join(root, "index.sqlite"));
-  let captured: QMDStore | undefined;
-  const snapshot = await historicalTrainingSearch(root, ["direct"], Date.parse("2026-09-22T12:00:00Z"), async opts => (captured = await createStore(opts)));
+  let captured: QMDStore | undefined, creates = 0, embeddings = 0, peakEmbeddings = 0;
+  const snapshot = await historicalTrainingSearch(root, ["direct"], Date.parse("2026-09-22T12:00:00Z"), async opts => {
+    creates++;
+    captured = await createStore(opts);
+    t.mock.method(captured.internal.llm!, "embed", async () => {
+      peakEmbeddings = Math.max(peakEmbeddings, ++embeddings);
+      await delay(1); embeddings--;
+      return { embedding: [1, 0], model: embedModel };
+    });
+    return captured;
+  });
   try {
     assert.equal(snapshot.report.sessions, 1);
     assert.equal(snapshot.report.chunks, 1);
     assert.equal(snapshot.report.excludedChunks, 1);
     assert.equal(snapshot.report.truncated, 1);
+    assert.equal(creates, 0); // Fingerprint/cache checks never materialize a search index.
+    t.mock.method(globalThis, "fetch", async () => { assert.fail("Discovery must not call TypeSafe"); });
+    const parallel = await Promise.all(queries.map(query => snapshot.search(query)));
+    assert.equal(creates, 1); // Concurrent first searches share one lazy index.
+    assert.equal(peakEmbeddings, 1); // Native context is never entered concurrently.
+    assert.ok(parallel.every(results => results.length === 1 && results[0]!.score === 1));
     assert.ok((await captured!.searchLex("PASTSEARCH")).length);
     assert.equal((await captured!.searchLex("FUTURESEARCH")).length, 0);
     assert.equal((await captured!.searchLex("FUTUREFILE")).length, 0);
     assert.doesNotMatch(JSON.stringify(captured!.internal.db.prepare("SELECT doc FROM content").all()), /FUTURE/);
     assert.equal(captured!.internal.db.prepare("SELECT COUNT(*) n FROM content_vectors").get<{ n: number }>()!.n, 1);
-    let embeddings = 0, peakEmbeddings = 0;
-    t.mock.method(captured!.internal.llm!, "embed", async () => {
-      peakEmbeddings = Math.max(peakEmbeddings, ++embeddings);
-      await delay(1); embeddings--;
-      return { embedding: [1, 0], model: embedModel };
-    });
-    t.mock.method(globalThis, "fetch", async () => { assert.fail("Discovery must not call TypeSafe"); });
     const hits = await snapshot.search("PASTSEARCH");
     assert.equal(hits.length, 1);
     assert.deepEqual(hits[0]!.methods.toSorted(), ["bm25", "vector"]);
     assert.equal(hits[0]!.score, 1);
     assert.deepEqual(hits[0]!.dates, ["2026-09-22 11:00:00 UTC"]);
-    const parallel = await Promise.all(queries.map(query => snapshot.search(query)));
-    assert.equal(peakEmbeddings, 1); // Native context is never entered concurrently.
-    assert.ok(parallel.every(results => results.length === 1 && results[0]!.score === 1));
   } finally { await snapshot.close(); }
   assert.deepEqual(readFileSync(join(root, "index.sqlite")), before);
 });
@@ -219,8 +224,10 @@ test("snapshot copying yields between documents and vectors without changing his
   ) }));
   await original.close();
   const before = readFileSync(join(root, "index.sqlite"));
-  const baseline = await historicalTrainingSearch(root, ["direct"], 100_000);
+  const baseline = await historicalTrainingSearch(root, ["direct"], 100_000, async () => { assert.fail("Cache-only snapshot must not open QMD"); });
   await baseline.close();
+  await baseline.close();
+  await assert.rejects(baseline.search("Past evidence"), /closed/);
   let elapsed = 0, pendingCallback = false, callbacks = 0;
   t.mock.method(performance, "now", () => elapsed);
   const markWork = () => {
@@ -234,9 +241,12 @@ test("snapshot copying yields between documents and vectors without changing his
     const insertDocument = qmd.internal.insertDocument, insertEmbedding = qmd.internal.insertEmbedding;
     t.mock.method(qmd.internal, "insertDocument", (...args: Parameters<typeof insertDocument>) => { markWork(); return insertDocument(...args); });
     t.mock.method(qmd.internal, "insertEmbedding", (...args: Parameters<typeof insertEmbedding>) => { markWork(); return insertEmbedding(...args); });
+    t.mock.method(qmd.internal.llm!, "embed", async () => ({ embedding: [1, 0], model: qmd.internal.llm!.embedModelName }));
     return qmd;
   });
   try {
+    assert.equal(callbacks, 0);
+    await snapshot.search("Past evidence");
     await yieldToEventLoop();
     assert.equal(callbacks, 8); // Two documents and their three vectors each.
     assert.deepEqual(snapshot.report, baseline.report);
@@ -244,6 +254,65 @@ test("snapshot copying yields between documents and vectors without changing his
     assert.equal(snapshot.maxDate, baseline.maxDate);
     assert.deepEqual(readFileSync(join(root, "index.sqlite")), before);
   } finally { await snapshot.close(); }
+});
+
+test("lazy indexes retain the fingerprinted source transaction and release failed initializations", async t => {
+  const root = mkdtempSync(join(tmpdir(), "training-lazy-qmd-"));
+  const source = resolveSessionSource(join(root, "sessions"), ["direct"]);
+  const original = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {
+    [source.collection]: { path: source.root, pattern: "**/*.md" },
+  } } });
+  t.after(() => original.close());
+  const projection = projectSessionDocument({ sessionId: "s", chatType: "direct", agentName: "Bill", timezone: "UTC", startedAt: 0,
+    events: [{ createdAt: 1000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "Past evidence" } }) }],
+  })!;
+  const hash = createHash("sha256").update(projection.content).digest("hex"), span = projection.messages[0]!;
+  original.internal.insertContent(hash, projection.content, "now");
+  original.internal.insertDocument(source.collection, "s.md", "Transcript", hash, "now", "now");
+  original.internal.ensureVecTable(2);
+  const updateVector = (values: number[]) => original.internal.insertEmbedding(hash, 0, span.start, new Float32Array(values),
+    original.internal.llm!.embedModelName, "now", 1, undefined, span.end - span.start);
+  updateVector([1, 0]);
+  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: { s: {
+    sessionId: "s", provider: "slack", chatType: "direct", startedAt: 0, projectionHash: hash, documentPath: "s.md", messages: projection.messages,
+  } } }));
+  let captured: QMDStore | undefined;
+  const snapshot = await historicalTrainingSearch(root, ["direct"], 100_000, async opts => {
+    captured = await createStore(opts);
+    t.mock.method(captured.internal.llm!, "embed", async () => ({ embedding: [1, 0], model: captured!.internal.llm!.embedModelName }));
+    return captured;
+  });
+  try {
+    updateVector([0, 1]); // A live index write after fingerprinting must not leak into this snapshot.
+    const changed = await historicalTrainingSearch(root, ["direct"], 100_000);
+    assert.notEqual(changed.corpusHash, snapshot.corpusHash);
+    await changed.close();
+    assert.equal(captured, undefined);
+    const hits = await snapshot.search("Past evidence");
+    assert.deepEqual(hits[0]!.methods.toSorted(), ["bm25", "vector"]);
+    const row = captured!.internal.db.prepare("SELECT embedding FROM vectors_vec WHERE hash_seq=?")
+      .get<{ embedding: Uint8Array }>(hash + "_0")!;
+    const bytes = Buffer.from(row.embedding);
+    assert.deepEqual([bytes.readFloatLE(0), bytes.readFloatLE(4)], [1, 0]);
+  } finally { await snapshot.close(); }
+  let creates = 0, closes = 0;
+  const failed = await historicalTrainingSearch(root, ["direct"], 100_000, async opts => {
+    creates++;
+    const qmd = await createStore(opts), close = qmd.close.bind(qmd);
+    t.mock.method(qmd.internal, "insertEmbedding", () => { throw new Error("Synthetic copy failure"); });
+    t.mock.method(qmd, "close", async () => { closes++; await close(); });
+    return qmd;
+  });
+  try {
+    const searches = await Promise.allSettled([failed.search("one"), failed.search("two")]);
+    assert.ok(searches.every(result => result.status === "rejected" && /Synthetic copy failure/.test(String(result.reason))));
+    await assert.rejects(failed.search("three"), /Synthetic copy failure/);
+    assert.equal(creates, 1); // A failed lazy initializer is not silently retried.
+    assert.equal(closes, 1);
+    original.internal.db.exec("PRAGMA busy_timeout=0");
+    assert.equal(original.internal.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get<{ busy: number }>()!.busy, 0);
+  } finally { await failed.close(); }
+  assert.equal(closes, 1);
 });
 
 test("generation and blind passage judgments resume independently; repeat costs zero", async t => {

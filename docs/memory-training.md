@@ -56,6 +56,11 @@ Native vector work is serialized per snapshot. Raise concurrency within machine
 and provider capacity. Failures stop new dispatch; in-flight operations drain
 and persist before snapshots close. Dry runs make no inference calls.
 
+Cached evaluations still validate the exact historical text and vector fingerprint,
+but do not rebuild a QMD index. The index is built only on the first uncached search,
+from the same read-only SQLite transaction used to compute that fingerprint.
+Concurrent queries share that index; changed corpus content still invalidates caches.
+
 ## Input and historical boundaries
 
 Read original agent SQLite active-branch conversations (schema 17–19), including
