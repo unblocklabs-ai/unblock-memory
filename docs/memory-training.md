@@ -128,8 +128,13 @@ No blanket failure skipping.
 
 The host must support isolated completion and grant
 `plugins.entries.unblock-memory.llm.allowModelOverride: true` with
-`allowedModels: ["openai/gpt-6-luna"]`. Preserve other grants. The plugin does not
-change its own permissions. Credentials stay with the host, never in provenance.
+`allowedModels: ["openai/gpt-6-luna"]`. The operator CLI explicitly selects an
+agent, so an unbound CLI runtime also requires
+`plugins.entries.unblock-memory.llm.allowAgentIdOverride: true`. Preserve other
+grants. The host's model catalog and selected runtime must support that exact
+model with usable host-managed authentication; a model permission grant alone
+does not establish model availability. The plugin does not change its own
+permissions. Credentials stay with the host, never in provenance.
 
 ## Export and consolidation
 
