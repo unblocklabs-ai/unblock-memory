@@ -145,3 +145,16 @@ identical-input groups together across nodes for train/validation. Use the actua
 **LFM2.5-230M-Base** tokenizer and an explicit causal-LM input/target format before
 fine-tuning; the interim byte limit is not a token count. Runtime abstention remains
 a separate TypeSafe gate; positive-only query training does not teach abstention.
+
+The repository helper uses a pinned official tokenizer revision and chat template,
+with assistant-only loss labels, a conservative 32,768-token training ceiling
+(the model config supports 128,000 positions), and deterministic grouped splits:
+
+```sh
+python scripts/prepare-query-training.py /private/node1-queries.jsonl /private/node2-queries.jsonl \
+  --output /private/new-prepared-directory --cache-dir /private/tokenizer-cache
+```
+
+Install `transformers` and `jinja2` in a separate environment first. It downloads
+tokenizer files only, never model weights. Regex secret screening is not an
+exhaustive privacy audit; inspect quarantine references before including those rows.
