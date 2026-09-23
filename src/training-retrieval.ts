@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { QMDStore } from "@unblocklabs/qmd";
 import type { ChatType } from "./config.js";
 import { readSessionManifest } from "./session-sync.js";
@@ -94,7 +95,12 @@ export async function historicalTrainingSearch(stateDir: string, chatTypes: read
         FROM content_vectors cv JOIN vectors_vec v ON v.hash_seq=cv.hash||'_'||cv.seq
         WHERE cv.hash=? ORDER BY cv.seq`);
       let dimensions: number | undefined;
+      // Copy cooperatively: concurrent snapshots must not starve lease timers,
+      // provider responses or native-model disposal. Keep the source transaction
+      // open across yields so every row still comes from the same read snapshot.
+      let yieldAt = performance.now() + 25;
       for (const session of Object.values(manifest.sessions).sort((a, b) => a.documentPath.localeCompare(b.documentPath))) {
+        if (performance.now() >= yieldAt) { await yieldToEventLoop(); yieldAt = performance.now() + 25; }
         // Loggie projections can retroactively annotate old text using later revisions.
         // Workspace files and meetings lack immutable historical content proof here.
         if (!chatTypes.includes(session.chatType) || session.provider === "loggie" || session.startedAt >= cutoff) { report.excluded++; continue; }
@@ -109,7 +115,8 @@ export async function historicalTrainingSearch(stateDir: string, chatTypes: read
         fingerprint.update(JSON.stringify([session.documentPath, hash]));
         report.sessions++;
         if (prefix.spans.length < (session.messages?.length ?? 0)) report.truncated++;
-        for (const chunk of chunks.all<ChunkRow>(row.hash)) {
+        for (const chunk of chunks.iterate<ChunkRow>(row.hash)) {
+          if (performance.now() >= yieldAt) { await yieldToEventLoop(); yieldAt = performance.now() + 25; }
           if (!Number.isSafeInteger(chunk.pos) || !Number.isSafeInteger(chunk.chunk_len) || chunk.pos < 0 || chunk.chunk_len <= 0 ||
               chunk.pos + chunk.chunk_len > prefix.body.length) { report.excludedChunks++; continue; }
           const bytes = Buffer.from(chunk.embedding);

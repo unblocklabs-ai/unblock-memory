@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
+import { setTimeout as delay, setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import { trainingTeacher, trainingTeacherMessage, TRAINING_TEACHER_PROMPT, TRAINING_TEACHER_PROMPT_VERSION, TRAINING_TEACHER_MODEL, TRAINING_TEACHER_VERSION } from "../src/training-models.js";
 import { TrainingStore } from "../src/training-store.js";
@@ -195,6 +195,55 @@ test("real QMD snapshot removes future FTS text and crossing vectors before eith
     assert.ok(parallel.every(results => results.length === 1 && results[0]!.score === 1));
   } finally { await snapshot.close(); }
   assert.deepEqual(readFileSync(join(root, "index.sqlite")), before);
+});
+
+test("snapshot copying yields between documents and vectors without changing historical evidence", async t => {
+  const root = mkdtempSync(join(tmpdir(), "training-cooperative-qmd-"));
+  const source = resolveSessionSource(join(root, "sessions"), ["direct"]);
+  const original = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {
+    [source.collection]: { path: source.root, pattern: "**/*.md" },
+  } } });
+  const projection = projectSessionDocument({ sessionId: "s", chatType: "direct", agentName: "Bill", timezone: "UTC", startedAt: 0,
+    events: Array.from({ length: 3 }, (_, i) => ({ createdAt: (i + 1) * 1000,
+      eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: `Past evidence ${i}` } }) })),
+  })!;
+  const hash = createHash("sha256").update(projection.content).digest("hex");
+  original.internal.insertContent(hash, projection.content, "now");
+  for (const path of ["a.md", "b.md"]) original.internal.insertDocument(source.collection, path, "Transcript", hash, "now", "now");
+  original.internal.ensureVecTable(2);
+  for (const [i, span] of projection.messages.entries()) original.internal.insertEmbedding(hash, i, span.start,
+    new Float32Array([1, i]), original.internal.llm!.embedModelName, "now", 3, undefined, span.end - span.start);
+  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: Object.fromEntries(
+    ["a", "b"].map(id => [id, { sessionId: id, provider: "slack", chatType: "direct", startedAt: 0,
+      projectionHash: hash, documentPath: `${id}.md`, messages: projection.messages }]),
+  ) }));
+  await original.close();
+  const before = readFileSync(join(root, "index.sqlite"));
+  const baseline = await historicalTrainingSearch(root, ["direct"], 100_000);
+  await baseline.close();
+  let elapsed = 0, pendingCallback = false, callbacks = 0;
+  t.mock.method(performance, "now", () => elapsed);
+  const markWork = () => {
+    assert.equal(pendingCallback, false, "native callbacks must run before the next copy slice");
+    pendingCallback = true;
+    elapsed += 30; // Model one expensive copy operation without sleeping or spinning.
+    setImmediate(() => { pendingCallback = false; callbacks++; });
+  };
+  const snapshot = await historicalTrainingSearch(root, ["direct"], 100_000, async opts => {
+    const qmd = await createStore(opts);
+    const insertDocument = qmd.internal.insertDocument, insertEmbedding = qmd.internal.insertEmbedding;
+    t.mock.method(qmd.internal, "insertDocument", (...args: Parameters<typeof insertDocument>) => { markWork(); return insertDocument(...args); });
+    t.mock.method(qmd.internal, "insertEmbedding", (...args: Parameters<typeof insertEmbedding>) => { markWork(); return insertEmbedding(...args); });
+    return qmd;
+  });
+  try {
+    await yieldToEventLoop();
+    assert.equal(callbacks, 8); // Two documents and their three vectors each.
+    assert.deepEqual(snapshot.report, baseline.report);
+    assert.equal(snapshot.corpusHash, baseline.corpusHash);
+    assert.equal(snapshot.maxDate, baseline.maxDate);
+    assert.deepEqual(readFileSync(join(root, "index.sqlite")), before);
+  } finally { await snapshot.close(); }
 });
 
 test("generation and blind passage judgments resume independently; repeat costs zero", async t => {

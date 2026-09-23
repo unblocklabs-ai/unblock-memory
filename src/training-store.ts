@@ -61,6 +61,8 @@ export class TrainingStore {
           status TEXT NOT NULL CHECK(status IN ('pending','attempted','complete','failed','ambiguous')),
           result_json TEXT, error TEXT, completed_at INTEGER
         ) STRICT;
+        CREATE INDEX IF NOT EXISTS training_judgment_exclusions ON training_steps(json_extract(request_json,'$.identity'))
+          WHERE stage='judge' AND status='complete' AND json_extract(result_json,'$.excluded')=1;
         CREATE TABLE IF NOT EXISTS training_step_attempts (
           id INTEGER PRIMARY KEY, step_id TEXT NOT NULL REFERENCES training_steps(id), started_at INTEGER NOT NULL,
           finished_at INTEGER, status TEXT NOT NULL, error TEXT, result_json TEXT

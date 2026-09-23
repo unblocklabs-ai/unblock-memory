@@ -361,3 +361,35 @@ test("expired leases fence old writers and preserve interrupted attempts for exp
     assert.throws(() => f.store.renew(), /lease lost/);
   });
 });
+
+test("existing training databases gain indexed, live exclusion lookups without changing checkpoints", async t => {
+  const f = fixture(t), db = new DatabaseSync(f.storePath);
+  t.after(() => db.close());
+  // Simulate a pre-index database, including non-exclusions with similar JSON.
+  db.exec("DROP INDEX training_judgment_exclusions");
+  const insert = db.prepare("INSERT INTO training_steps (id,stage,status,request_json,result_json) VALUES (?,?,?,?,?)");
+  for (const [id, stage, status, result] of [
+    ["old", "judge", "complete", { excluded: true, reason: "operator-exclusion" }],
+    ["failed", "judge", "failed", { excluded: true }],
+    ["ordinary", "judge", "complete", { usefulness: 1 }],
+    ["other-stage", "generate", "complete", { excluded: true }],
+  ] as const) insert.run(id, stage, status, JSON.stringify({ identity: id }), JSON.stringify(result));
+  const before = db.prepare("SELECT * FROM training_steps ORDER BY id").all();
+  const reopened = new TrainingStore(f.storePath, "main");
+  t.after(() => reopened.close());
+  assert.deepEqual(db.prepare("SELECT * FROM training_steps ORDER BY id").all(), before);
+  assert.equal(reopened.judgmentExcluded("old"), true);
+  for (const identity of ["failed", "ordinary", "other-stage", "missing"]) assert.equal(reopened.judgmentExcluded(identity), false);
+  const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM training_steps WHERE stage='judge' AND status='complete'
+    AND json_extract(request_json,'$.identity')=? AND json_extract(result_json,'$.excluded')=1 LIMIT 1`).all("old");
+  assert.match(plan.map(row => row.detail).join("\n"), /SEARCH training_steps USING INDEX training_judgment_exclusions/);
+  await reopened.locked(() => {
+    const request = { identity: "new", excluded: true }, step = reopened.step("judge", request);
+    const attempt = reopened.startStep("judge", step.id, request);
+    assert.equal(reopened.judgmentExcluded("new"), false);
+    reopened.finishStep("judge", step.id, attempt, { result: { excluded: true, reason: "operator-exclusion" } });
+    assert.equal(reopened.judgmentExcluded("new"), true);
+    // An already-open store sees the new exclusion too; there is no stale cache.
+    assert.equal(f.store.judgmentExcluded("new"), true);
+  });
+});
