@@ -65,6 +65,9 @@ They have separate configuration/index boundaries. See
   pause/delete/restore semantics.
 - [Response audit](docs/response-audit.md): operator commands, cadence, sentiment,
   evidence-linked reports and their limits.
+- [Memory training](docs/memory-training.md): resumable, operator-only conversation
+  collection, TypeSafe recall gating, xhigh Luna queries and conversation-only grading of historical QMD hits
+  for the LFM query-generator project.
 
 The shared TypeSafe integration defaults on, but its features are opt-in.
 A key activates only features already enabled. Ordinary search and People

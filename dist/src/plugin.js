@@ -14,6 +14,7 @@ import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
+import { registerMemoryTraining } from "./training-runtime.js";
 import { resolveTimezone } from "./session-projector.js";
 const searchParameters = Type.Object({
     query: Type.String({ pattern: "\\S" }),
@@ -412,6 +413,7 @@ export function resolveFlushPlan(params = {}) {
 export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
     registerResponseAudit(api, config);
+    registerMemoryTraining(api, config);
     if (api.registrationMode === "cli-metadata")
         return;
     const runtime = new QmdMemoryRuntime(config.corpora, {
