@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.3.27",
+  "version": "0.3.28",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",
@@ -20,6 +20,7 @@
   },
   "files": [
     "dist",
+    "src/mlx-query-worker.py",
     "skills",
     "README.md",
     "docs/configuration.md",

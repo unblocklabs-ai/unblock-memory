@@ -46,14 +46,16 @@ The key is that **retrieval results determine the labels**, rather than assuming
 When a user message arrives, start two branches concurrently:
 
 - **TypeSafe:** “Would additional memory help?”
-- **Small model:** generate 3–5 queries → run QMD retrieval → TypeSafe reranks results.
+- **Small model:** request 3 queries, keep usable strings and drop exact duplicates → retrieve 10 vector + 10 BM25 matches per query and approved collection → deduplicate passages → TypeSafe judges their usefulness against the original conversation. Generated queries and retrieval scores are never sent to the judge.
 
 If the first judgment says **yes**, inject the retrieved context through the existing Memory Whisperer mechanism once results are ready. If **no**, discard the speculative retrieval results.
 
 This runtime injection decision is separate from the training-data gate. Positive-only
 query training does not teach the small model when to abstain; keep the runtime
-TypeSafe decision before using its results. This is a proposed runtime design,
-not a change to the current Memory Whisperer implementation.
+TypeSafe decision before using its results. This flow is opt-in through
+`memoryWhisperer.mlx`; without it the existing vector-only Whisperer is unchanged.
+Negative recall cancels/discards speculative work immediately without waiting for
+retrieval or injecting late results. Gate failure/timeout also emits no hint.
 
 You’re aiming to overlap the work to reduce latency; which branch finishes first remains something to measure.
 

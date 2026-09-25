@@ -2,10 +2,16 @@ import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 
 type Whisperer = "skill" | "memory";
 type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" |
-  "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable";
+  "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" |
+  "recall_not_needed" | "queries_generated" | "query_fallback" | "judge_candidate_failed";
 
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export class WhispererDiagnostics {
+  static shared(): WhispererDiagnostics {
+    const scope = globalThis as typeof globalThis & { [key: symbol]: unknown };
+    const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v1");
+    return (scope[symbol] ??= new WhispererDiagnostics()) as WhispererDiagnostics;
+  }
   #agents = new Map<string, { counts: Record<Whisperer, Partial<Record<Outcome, number>>>; telemetry: RetrievalTelemetry }>();
 
   #entry(agentId: string) {

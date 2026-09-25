@@ -4,7 +4,7 @@ import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const [plugin, keyFile, output] = process.argv.slice(2);
 assert.ok(plugin && keyFile && output);
-const { resolveTypeSafeApiKey } = await import(pathToFileURL(`${plugin}/dist/src/typesafe.js`));
+const { resolveTypeSafeApiKey } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
 const { judgeResponse, judgeResponseFollowup, RESPONSE_RUBRIC_VERSION } = await import(pathToFileURL(`${plugin}/dist/src/response-judge.js`));
 const { responseOutcome } = await import(pathToFileURL(`${plugin}/dist/src/response-outcome.js`));
 const apiKey = await resolveTypeSafeApiKey({ enabled: true, apiKeyFile: keyFile, timeoutMs: 10000 });

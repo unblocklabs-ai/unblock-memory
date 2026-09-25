@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { mkdir, writeFile } from "node:fs/promises";
 const [pluginRoot, keyFile, output] = process.argv.slice(2);
 assert.ok(pluginRoot && keyFile && output, "PLUGIN_ROOT KEY_FILE NEW_OUTPUT_DIRECTORY");
-const { resolveTypeSafeApiKey } = await import(pathToFileURL(`${pluginRoot}/dist/src/typesafe.js`));
+const { resolveTypeSafeApiKey } = await import(pathToFileURL(`${pluginRoot}/dist/src/typesafe-client.js`));
 const { reviewTypeSafeClaim, reviewMemoryRedundancy, complementaryIndices, reviewClusterDefects } = await import(pathToFileURL(`${pluginRoot}/dist/src/typesafe-review.js`));
 const apiKey = await resolveTypeSafeApiKey({ enabled: true, apiKeyFile: keyFile, timeoutMs: 10000 });
 assert.ok(apiKey, "TypeSafe key not configured");

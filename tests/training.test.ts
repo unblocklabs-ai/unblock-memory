@@ -88,7 +88,8 @@ test("ordinary users need no identity enrichment; each reply or tool action yiel
 test("legacy envelopes are normalized and real mirrors qualify without admitting silent or suppressed replies", () => {
   const envelope = 'Conversation info: ⟦openclaw:ctx⟧\n```json\n{"sender":{"id":"legacy","name":"Bek"}}\n```\n' +
     'System: [date] Slack message in channel from Bek\n\nActual request';
-  for (const raw of ["From: Bek (legacy)\nActual request", envelope]) {
+  const dmEnvelope = envelope.replace("Slack message in channel", "Slack DM");
+  for (const raw of ["From: Bek (legacy)\nActual request", envelope, dmEnvelope]) {
     const result = trainingExamples(rows([user(raw, { __openclaw: {} }),
       assistant("Delivered", { provider: "openclaw", model: "delivery-mirror" }), assistant("Delivered"),
       user("Next"), assistant("Answer")]));

@@ -9,8 +9,9 @@ type MemoryWhispererRuntime = {
     }): Promise<{
         manager: {
             search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
+            searchWhisperer?(queries: readonly string[], opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
         } | null;
     }>;
 };
-export declare function registerMemoryWhisperer(api: OpenClawPluginApi, runtime: MemoryWhispererRuntime, config: UnblockMemoryConfig["memoryWhisperer"], typesafe: UnblockMemoryConfig["typesafe"], diagnostics?: WhispererDiagnostics): void;
+export declare function registerMemoryWhisperer(api: OpenClawPluginApi, runtime: MemoryWhispererRuntime, config: UnblockMemoryConfig["memoryWhisperer"], typesafe: UnblockMemoryConfig["typesafe"], diagnostics?: WhispererDiagnostics): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined;
 export {};

@@ -1,8 +1,4 @@
-import type { UnblockMemoryConfig } from "./config.js";
 import type { memoryConversation } from "./whisperer-context.js";
-type TypeSafeConfig = UnblockMemoryConfig["typesafe"];
-/** Explicit credentials take precedence; a missing explicit file never selects another key. */
-export declare function resolveTypeSafeApiKey(config: TypeSafeConfig): Promise<string | undefined>;
 /** Select from trusted candidates; never accept a provider-generated path or skill name. */
 export declare function selectTypeSafeSkill(params: {
     apiKey: string;
@@ -16,8 +12,9 @@ export declare function selectTypeSafeSkill(params: {
         name: string;
         description: string;
     }[];
+    onCandidateFailure?: (index: number, error: unknown) => void;
 }): Promise<number | undefined>;
-export declare const QUALITY_JUDGE_VERSION = "jev-1.13.0:quality-v2-json";
+export declare const QUALITY_JUDGE_VERSION = "jev-1.13.0:quality-v3-isolated";
 export type QualityJudgment = {
     noise: number;
     evidence: number;
@@ -32,7 +29,7 @@ export declare function judgeTypeSafeQuality(params: {
         sourceKind: "files" | "sessions";
     }[];
 }): Promise<QualityJudgment[]>;
-/** Independent usefulness judgments in one request, indexed only by caller-owned IDs. */
+/** One HTTP request per candidate, all launched together; result order matches input order. */
 export declare function judgeTypeSafeMemories(params: {
     apiKey: string;
     timeoutMs: number;
@@ -44,4 +41,3 @@ export declare function judgeTypeSafeMemories(params: {
         messageTimestamp?: string;
     }[];
 }): Promise<number[]>;
-export {};

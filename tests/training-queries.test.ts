@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay, setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import { trainingTeacher, trainingTeacherMessage, TRAINING_TEACHER_PROMPT, TRAINING_TEACHER_PROMPT_VERSION, TRAINING_TEACHER_MODEL, TRAINING_TEACHER_VERSION } from "../src/training-models.js";
@@ -384,6 +385,37 @@ test("ambiguous teacher attempts are never automatically repeated; dry-run makes
     assert.equal(f.store.retry(true), 1);
     assert.equal((await generateTrainingQueries(f.source, f.store, { llm: { complete: async () => teacherResponse() } }, options)).completed, 1);
   });
+});
+
+test("passage HTTP checkpoints keep 4xx failed and 5xx ambiguous without automatic retries", async t => {
+  for (const [httpStatus, expected] of [[403, "failed"], [529, "ambiguous"]] as const) {
+    const f = fixture(t);
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => { calls++; return new Response("private provider body", { status: httpStatus }); });
+    const search: typeof historicalTrainingSearch = async (_root, _types, cutoff) => ({
+      maxDate: new Date(cutoff).toISOString(), corpusHash: `http-${httpStatus}`,
+      report: { sessions: 1, chunks: 1, excluded: 0, truncated: 0, excludedChunks: 0 },
+      search: async () => [{ path: "qmd://sessions/source", position: 0, text: "Historical evidence",
+        dates: ["1970-01-01 00:00:01 UTC"], score: 1, methods: ["bm25"] }],
+      close: async () => {},
+    });
+    await f.store.locked(async () => {
+      f.initialize();
+      await generateTrainingQueries(f.source, f.store, { llm: { complete: async () => teacherResponse() } }, options);
+      const result = await evaluateTrainingQueries(f.source, f.store, config, { concurrency: 1 }, search);
+      assert.equal(result[expected], 1);
+      const db = new DatabaseSync(join(f.source.stateDir, "training.sqlite"), { readOnly: true });
+      try {
+        const row = db.prepare("SELECT status, error FROM training_steps WHERE stage='judge'").get() as
+          { status: string; error: string };
+        assert.deepEqual({ ...row }, { status: expected, error: `http_${httpStatus}` });
+      } finally { db.close(); }
+      const priorCalls = calls;
+      const rerun = await evaluateTrainingQueries(f.source, f.store, config, { concurrency: 1 }, search);
+      assert.equal(rerun.calls, 0);
+      assert.equal(calls, priorCalls);
+    });
+  }
 });
 
 test("empty retrieval retains query targets with zero scores and stable teacher-order ties", async t => {

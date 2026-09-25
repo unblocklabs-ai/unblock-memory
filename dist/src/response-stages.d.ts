@@ -50,8 +50,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
     quality: {
         taskType: {
             type: "choice";
-            choice: "action" | "question" | "artifact" | "discussion" | "other";
             confidence: number;
+            choice: "action" | "question" | "artifact" | "discussion" | "other";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -59,8 +59,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         assessability: {
             type: "choice";
-            choice: "assessable" | "not_assessable";
             confidence: number;
+            choice: "assessable" | "not_assessable";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -68,8 +68,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         fitAssessability: {
             type: "choice";
-            choice: "assessable" | "not_assessable";
             confidence: number;
+            choice: "assessable" | "not_assessable";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -81,8 +81,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         failureReason: {
             type: "choice";
-            choice: "none_or_unclear" | "missing_requested_work" | "wrong_deliverable" | "missed_constraint" | "insufficient_answer_depth" | "unnecessary_deferral";
             confidence: number;
+            choice: "none_or_unclear" | "missing_requested_work" | "wrong_deliverable" | "missed_constraint" | "insufficient_answer_depth" | "unnecessary_deferral";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -112,8 +112,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         consistency: {
             type: "choice";
-            choice: "not_assessable" | "consistent" | "contradicted";
             confidence: number;
+            choice: "not_assessable" | "consistent" | "contradicted";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -123,8 +123,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
     feedback: {
         feedbackType: {
             type: "choice";
-            choice: "mixed" | "unrelated" | "unclear" | "acceptance" | "correction" | "continuation";
             confidence: number;
+            choice: "mixed" | "unrelated" | "unclear" | "acceptance" | "correction" | "continuation";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -132,8 +132,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         target: {
             type: "choice";
-            choice: "delivery" | "mixed" | "unclear" | "current_answer" | "earlier_behavior" | "proactive_action" | "external" | "new_work";
             confidence: number;
+            choice: "delivery" | "mixed" | "unclear" | "current_answer" | "earlier_behavior" | "proactive_action" | "external" | "new_work";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -154,8 +154,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
     } & Partial<{
         sentiment: {
             type: "choice";
-            choice: "satisfied" | "dissatisfied" | "mixed" | "neutral" | "unrelated" | "unclear";
             confidence: number;
+            choice: "satisfied" | "dissatisfied" | "mixed" | "neutral" | "unrelated" | "unclear";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;

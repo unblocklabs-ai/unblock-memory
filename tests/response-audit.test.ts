@@ -65,10 +65,13 @@ test("response audit config is separately opted in and explicitly scopes humans 
 
 test("recognized envelopes expose only current human text and preserve ordinary Markdown/JSON", () => {
   assert.deepEqual(responseUserText(wrapped("Current request"), "owner"), { text: "Current request", contextLimited: true });
+  const dmWrapped = wrapped("Current request").replace("Slack message in #test", "Slack DM");
+  assert.deepEqual(responseUserText(dmWrapped, "owner"), { text: "Current request", contextLimited: true });
   assert.equal(responseUserText(wrapped("Current request"), "stranger"), undefined);
   assert.equal(responseUserText(wrapped("Current request").replace("from Bek", "from Other"), "owner"), undefined);
   assert.equal(responseUserText(wrapped("Current request").replace("```json", "```broken"), "owner"), undefined);
   assert.equal(responseUserText(wrapped("Current request") + "\nSystem: [later] Slack message in #test from Bek\n\nAmbiguous", "owner"), undefined);
+  assert.equal(responseUserText(dmWrapped + "\nSystem: [later] Slack message in #test from Bek\n\nAmbiguous", "owner"), undefined);
   const normal = 'Please explain this JSON:\n```json\n{"history_truncated":true}\n```\nDo not delete it.';
   assert.deepEqual(responseUserText(normal, "owner"), { text: normal, contextLimited: false });
   const meta = user("x").__openclaw;
@@ -77,6 +80,8 @@ test("recognized envelopes expose only current human text and preserve ordinary 
   const e = responseEpisodes(session, input, config.responseAudit).episodes[0]!;
   assert.equal(e.request[0]!.text, "Question"); assert.equal(e.feedback[0]!.text, "Thanks");
   assert.equal(e.contextLimited, true); assert.equal(JSON.stringify(e).includes("PRIVATE EMBEDDED"), false);
+  const dmEpisode = responseEpisodes(session, rows([user(dmWrapped), answer("Answer"), user("Thanks"), answer("Welcome")]), config.responseAudit).episodes[0]!;
+  assert.equal(dmEpisode.request[0]!.text, "Current request");
 });
 
 test("bounded later evidence preserves original inputs, rejects unsafe boundaries and expires incomplete turns", async t => {
@@ -183,7 +188,8 @@ test("quality request cannot see later feedback; schema errors and provider erro
   t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {} }));
   await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), /Invalid/);
   t.mock.method(globalThis, "fetch", async () => { throw new Error("PRIVATE PROVIDER DETAILS"); });
-  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), /^Error: TypeSafe review unavailable$/);
+  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }),
+    { message: "TypeSafe request failed", code: "network_error" });
 });
 
 test("audit persists deduplicated results, skips retired active branches and reports denominators", async t => {
@@ -391,6 +397,24 @@ test("memory investigation limits to approved active whole documents before rank
   assert.equal(JSON.stringify(judged).includes("staging"), false);
   assert.deepEqual(await judgeMemoryOpportunity(e, [], params), []);
   assert.equal(calls, 1);
+});
+
+test("memory opportunity judgments isolate concurrent candidates and retain source alignment", { timeout: 2000 }, async t => {
+  const e = responseEpisodes(session, basic(), config.responseAudit).episodes[0]!;
+  const pending: ((response: Response) => void)[] = [];
+  const candidates = ["first", "second"].map(text => ({ text, path: `qmd://memory/${text}.md`, hash: text }));
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    assert.deepEqual(body.state.candidates, [{ text: candidates[pending.length].text }]);
+    assert.deepEqual(Object.keys(body.questions), ["candidate_0"]);
+    assert.doesNotMatch(JSON.stringify(body), /qmd:\/\/|"hash"/);
+    return new Promise<Response>(resolve => pending.push(resolve));
+  });
+  const results = judgeMemoryOpportunity(e, candidates, { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal });
+  assert.equal(pending.length, 2);
+  pending[1](Response.json({ answers: { candidate_0: { type: "noul", noul: 0.9 } } }));
+  pending[0](Response.json({ answers: { candidate_0: { type: "noul", noul: 0.1 } } }));
+  assert.deepEqual((await results).map(result => [result.hash, result.usefulness]), [["first", 0.1], ["second", 0.9]]);
 });
 
 test("uncertain or unassessable grades do not become score means, and retry backoff is bounded", async t => {

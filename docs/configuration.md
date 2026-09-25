@@ -12,8 +12,8 @@ settings; a rotated credential file is reread without a restart.
 | Feature | Required settings/dependencies | TypeSafe disabled / no key | Provider or unreadable-key failure |
 | --- | --- | --- | --- |
 | Ordinary search/get | Installed/enabled memory slot; configured corpora | Unchanged local retrieval | Unchanged; its own indexing/embedding errors still matter |
-| Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | No hint; does not fall back |
-| Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | No hints |
+| Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | Exclude failed candidates; successful siblings may qualify; no vector fallback |
+| Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; recall/deadline failures still suppress the turn |
 | Complementary hints | Enabled Memory Whisperer + `complementaryHints` | No additional judgment; base hints also require a key | Keep baseline hints unless the total deadline expires |
 | People store/tools | `people.enabled` | Available; automatic save review needs primer/key or verified manual alternative | Storage/inspection still available |
 | People Whisperer | People + `people.whisperer.enabled`, host hooks, eligible person/dossier, no prior thread receipt | Unchanged local lookup | Unchanged local lookup |
@@ -32,6 +32,16 @@ not disable people tools/storage or erase dossiers.
 ## Shared TypeSafe credentials
 
 All plugin TypeSafe features use `plugins.entries.unblock-memory.config.typesafe`:
+
+Candidate scoring uses **one HTTP request per candidate**, with ranking done in code.
+Related questions about the same candidate can share a request (for example, quality
+noise and evidence). Memory Whisperer launches all eligible candidate requests together;
+the shared account's request/token limits still apply across simultaneous conversations
+and nodes. There is no automatic retry in the latency-sensitive whisperers.
+
+Not every judgment is reranking: claim verification retains the cited sources for
+one claim, response auditing grades one episode, and redundancy compares one pair.
+These evidence relationships are deliberately preserved, not split into unrelated scores.
 
 ```json
 {

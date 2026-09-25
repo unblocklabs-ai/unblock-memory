@@ -1,6 +1,6 @@
 type RetrievalOperation = "vector" | "lexical" | "memoryWhisperer";
 type RetrievalOutcome = "ok" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped";
-const fields = ["elapsedMs", "retrievalMs", "judgeMs", "candidates", "eligible", "results", "contextChars"] as const;
+const fields = ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "candidates", "eligible", "results", "contextChars"] as const;
 type Field = typeof fields[number];
 export type RetrievalObservation = { outcome: RetrievalOutcome; elapsedMs: number } & Partial<Record<Field, number>>;
 type Entry = {

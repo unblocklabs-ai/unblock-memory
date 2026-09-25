@@ -79,7 +79,7 @@ test("evidence mutation, invalid answers and cancellation cannot verify a claim"
   fetch.mock.mockImplementation(async () => response("made_up_verdict"));
   await assert.rejects(reviewIndexedClaim(params), /invalid/);
   fetch.mock.mockImplementation(async () => new Response("secret", { status: 500 }));
-  await assert.rejects(reviewIndexedClaim(params), /^Error: TypeSafe review unavailable$/);
+  await assert.rejects(reviewIndexedClaim(params), { message: "TypeSafe HTTP 500", code: "http_error", status: 500 });
   await assert.rejects(reviewIndexedClaim({ ...params, signal: AbortSignal.abort() }));
 });
 

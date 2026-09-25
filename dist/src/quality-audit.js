@@ -3,7 +3,6 @@ import { parseSafeVirtualPath } from "./sources.js";
 import { judgeTypeSafeQuality, QUALITY_JUDGE_VERSION } from "./typesafe.js";
 import { qualityTriage } from "./quality-triage.js";
 const MAX_CHUNK_CHARS = 6000;
-const BATCH_SIZE = 4;
 /** A formatting clue, never proof that JSON or structured data is worthless. */
 export function qualityStructure(text) {
     if (!text.trim())
@@ -61,89 +60,95 @@ export async function auditQualityPage(params) {
       AND cv.seq = ? AND cv.pos = ? AND cv.chunk_len = ?`);
     const page = rows.slice(0, limit);
     try {
-        for (let offset = 0; offset < page.length; offset += BATCH_SIZE) {
+        check();
+        const batch = page.map(row => {
+            const source = sources.get(row.collection);
+            const text = row.doc.slice(row.pos, row.pos + row.chunk_len);
+            const fingerprint = chunkFingerprint(text);
+            const cacheKey = chunkFingerprint(JSON.stringify([QUALITY_JUDGE_VERSION, source.kind, fingerprint]));
+            const eligible = Boolean(parseSafeVirtualPath(`qmd://${source.collection}/${row.path}`, sources)) && row.pos >= 0 && row.chunk_len > 0 &&
+                row.pos + row.chunk_len <= row.doc.length;
+            const structure = qualityStructure(text);
+            const judgment = eligible && text.length <= MAX_CHUNK_CHARS
+                ? curation.qualityJudgment(cacheKey) : undefined;
+            return { row, source, text, fingerprint, cacheKey, structure, judgment, eligible };
+        });
+        const missing = [...new Map(batch.filter(item => item.eligible && item.text.length <= MAX_CHUNK_CHARS &&
+                item.structure !== "empty" && !item.judgment).map(item => [item.cacheKey, item])).values()];
+        const answers = await Promise.allSettled(missing.map(async (item) => (await judgeTypeSafeQuality({
+            apiKey: params.apiKey, timeoutMs: params.timeoutMs, signal,
+            chunks: [{ text: item.text, sourceKind: item.source.kind === "sessions" ? "sessions" : "files" }],
+        }))[0]));
+        check();
+        const fresh = new Map();
+        for (const [index, answer] of answers.entries()) {
+            if (answer.status !== "fulfilled")
+                continue;
+            const { cacheKey, row } = missing[index];
+            if (!current.get(row.document_id, row.collection, row.path, row.hash, row.seq, row.pos, row.chunk_len))
+                continue;
+            fresh.set(cacheKey, answer.value);
+            // Keep successful sibling judgments even if the cursor stops at a failed candidate.
+            curation.cacheQualityJudgment(cacheKey, answer.value);
+            judged++;
+        }
+        for (const item of batch) {
             check();
-            const batch = page.slice(offset, offset + BATCH_SIZE).map(row => {
-                const source = sources.get(row.collection);
-                const text = row.doc.slice(row.pos, row.pos + row.chunk_len);
-                const fingerprint = chunkFingerprint(text);
-                const cacheKey = chunkFingerprint(JSON.stringify([QUALITY_JUDGE_VERSION, source.kind, fingerprint]));
-                const eligible = Boolean(parseSafeVirtualPath(`qmd://${source.collection}/${row.path}`, sources)) && row.pos >= 0 && row.chunk_len > 0 &&
-                    row.pos + row.chunk_len <= row.doc.length;
-                const structure = qualityStructure(text);
-                const judgment = eligible && text.length <= MAX_CHUNK_CHARS
-                    ? curation.qualityJudgment(cacheKey) : undefined;
-                return { row, source, text, fingerprint, cacheKey, structure, judgment, eligible };
-            });
-            const missing = [...new Map(batch.filter(item => item.eligible && item.text.length <= MAX_CHUNK_CHARS &&
-                    item.structure !== "empty" && !item.judgment).map(item => [item.cacheKey, item])).values()];
-            const answers = await judgeTypeSafeQuality({
-                apiKey: params.apiKey, timeoutMs: params.timeoutMs, signal,
-                chunks: missing.map(item => ({ text: item.text, sourceKind: item.source.kind === "sessions" ? "sessions" : "files" })),
-            });
-            check();
-            const fresh = new Map(missing.map((item, index) => [item.cacheKey, answers[index]]));
-            judged += answers.length;
-            for (const item of batch) {
-                check();
-                const { row, source, text, fingerprint, cacheKey, structure } = item;
-                const advance = () => { next = { documentId: row.document_id, seq: row.seq }; };
-                scanned++;
-                if (!item.eligible || !parseSafeVirtualPath(`qmd://${source.collection}/${row.path}`, sources) ||
-                    !current.get(row.document_id, row.collection, row.path, row.hash, row.seq, row.pos, row.chunk_len)) {
-                    skippedStale++;
-                    advance();
-                    continue;
-                }
-                if (text.length > MAX_CHUNK_CHARS) {
-                    skippedOversized++;
-                    advance();
-                    continue;
-                }
-                const judgment = structure === "empty"
-                    ? { noise: 1, evidence: 0 } : item.judgment ?? fresh.get(cacheKey);
-                if (!judgment)
-                    throw new Error("missing quality judgment");
-                if (item.judgment)
-                    cached++;
-                else if (structure !== "empty")
-                    curation.cacheQualityJudgment(cacheKey, judgment);
-                if (structure !== "empty" && structure !== "encoded_message" && judgment.noise < params.minNoise) {
-                    advance();
-                    continue;
-                }
-                const reason = structure === "empty" ? "empty_content" :
-                    structure === "encoded_message" ? "possible_double_encoded_message" :
-                        structure === "serialized_message" ? "possible_serialized_message" : "possible_ingestion_noise";
-                const startLine = row.doc.slice(0, row.pos).split("\n").length;
-                const endLine = startLine + text.split("\n").length - 1;
-                const task = curation.addTask({
-                    type: "quality_review", corpus: source.corpus, collection: source.collection,
-                    path: row.path, reason, contentFingerprint: fingerprint,
-                    detail: JSON.stringify({
-                        path: `qmd://${source.collection}/${row.path}`, from: startLine, to: endLine,
-                        excerpt: text.slice(0, 400), excerptTruncated: text.length > 400,
-                        indicator: structure === "empty" ? "deterministic_empty" :
-                            structure === "encoded_message" ? "deterministic_encoding" : "typesafe",
-                        ...judgment, policy: QUALITY_JUDGE_VERSION,
-                        triage: qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message"),
-                        instruction: "Inspect original source and ingestion before acting. Verify source/index after any authorized repair. Never manually edit generated session projections.",
-                    }),
-                });
-                flagged++;
+            const { row, source, text, fingerprint, cacheKey, structure } = item;
+            const advance = () => { next = { documentId: row.document_id, seq: row.seq }; };
+            scanned++;
+            if (!item.eligible || !parseSafeVirtualPath(`qmd://${source.collection}/${row.path}`, sources) ||
+                !current.get(row.document_id, row.collection, row.path, row.hash, row.seq, row.pos, row.chunk_len)) {
+                skippedStale++;
                 advance();
-                if (task.status !== "pending")
-                    continue;
-                const triage = qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message");
-                const key = JSON.stringify([source.collection, reason, triage]);
-                const group = groups.get(key) ?? {
-                    corpus: source.corpus, source: source.configuredPath, reason, triage, pending: 0, examples: [],
-                };
-                group.pending++;
-                if (group.examples.length < 3)
-                    group.examples.push(task);
-                groups.set(key, group);
+                continue;
             }
+            if (text.length > MAX_CHUNK_CHARS) {
+                skippedOversized++;
+                advance();
+                continue;
+            }
+            const judgment = structure === "empty"
+                ? { noise: 1, evidence: 0 } : item.judgment ?? fresh.get(cacheKey);
+            if (!judgment)
+                throw new Error("missing quality judgment");
+            if (item.judgment)
+                cached++;
+            if (structure !== "empty" && structure !== "encoded_message" && judgment.noise < params.minNoise) {
+                advance();
+                continue;
+            }
+            const reason = structure === "empty" ? "empty_content" :
+                structure === "encoded_message" ? "possible_double_encoded_message" :
+                    structure === "serialized_message" ? "possible_serialized_message" : "possible_ingestion_noise";
+            const startLine = row.doc.slice(0, row.pos).split("\n").length;
+            const endLine = startLine + text.split("\n").length - 1;
+            const task = curation.addTask({
+                type: "quality_review", corpus: source.corpus, collection: source.collection,
+                path: row.path, reason, contentFingerprint: fingerprint,
+                detail: JSON.stringify({
+                    path: `qmd://${source.collection}/${row.path}`, from: startLine, to: endLine,
+                    excerpt: text.slice(0, 400), excerptTruncated: text.length > 400,
+                    indicator: structure === "empty" ? "deterministic_empty" :
+                        structure === "encoded_message" ? "deterministic_encoding" : "typesafe",
+                    ...judgment, policy: QUALITY_JUDGE_VERSION,
+                    triage: qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message"),
+                    instruction: "Inspect original source and ingestion before acting. Verify source/index after any authorized repair. Never manually edit generated session projections.",
+                }),
+            });
+            flagged++;
+            advance();
+            if (task.status !== "pending")
+                continue;
+            const triage = qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message");
+            const key = JSON.stringify([source.collection, reason, triage]);
+            const group = groups.get(key) ?? {
+                corpus: source.corpus, source: source.configuredPath, reason, triage, pending: 0, examples: [],
+            };
+            group.pending++;
+            if (group.examples.length < 3)
+                group.examples.push(task);
+            groups.set(key, group);
         }
         return result("ok", rows.length <= limit);
     }

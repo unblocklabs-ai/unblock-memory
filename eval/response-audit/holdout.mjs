@@ -66,7 +66,7 @@ if (mode === "prepare") {
   }
   const { judgeResponse, judgeResponseFollowup, RESPONSE_RUBRIC_VERSION } = await imp("response-judge");
   const { responseOutcome, RESPONSE_REPORT_VERSION } = await imp("response-outcome");
-  const { resolveTypeSafeApiKey } = await imp("typesafe");
+  const { resolveTypeSafeApiKey } = await imp("typesafe-client");
   const apiKey = await resolveTypeSafeApiKey(config.typesafe); assert.ok(apiKey);
   const results = [];
   for (const e of evidence) {

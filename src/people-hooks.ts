@@ -27,11 +27,17 @@ export function renderPeopleWhisper(blurb: string, maxChars: number): string | u
   return normalized ? normalized.slice(0, maxChars) : undefined;
 }
 
+function peopleContext(contribution: string): { appendContext: string } {
+  // Escape only at output: durable receipts retain the original dossier text.
+  const text = contribution.replace(/&/gu, "&amp;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;");
+  return { appendContext: `<people>${text}</people>` };
+}
+
 export function registerPeopleHooks(
   api: OpenClawPluginApi,
   stores: PeopleStores,
   config: UnblockMemoryConfig["people"],
-): void {
+): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
   const threadByRun = new Map<string, string>();
   const pendingThreadByIdentity = new Map<string, string | null>();
 
@@ -99,7 +105,7 @@ export function registerPeopleHooks(
 
   if (!config.whisperer.enabled) return;
 
-  api.on("before_prompt_build", (_event, context) => {
+  const beforePrompt: Parameters<typeof api.on<"before_prompt_build">>[1] = (_event, context) => {
     if (context.trigger !== "user" || context.messageProvider !== "slack") return;
     const sessionKey = nonBlank(context.sessionKey);
     const parsed = parseAgentSessionKey(sessionKey);
@@ -125,28 +131,29 @@ export function registerPeopleHooks(
       if (!person || person.status !== "active" || !person.injectionEnabled) return;
       const previous = store.getWhisperReceipt(threadKey, person.id);
       if (previous) {
-        return previous.runId === runId ? { prependContext: previous.contribution } : undefined;
+        return previous.runId === runId ? peopleContext(previous.contribution) : undefined;
       }
       const blurb = store.getDossierBlurb(person.id);
-      const prependContext = blurb
+      const contribution = blurb
         ? renderPeopleWhisper(blurb, config.whisperer.maxChars)
         : undefined;
-      if (!prependContext) return;
+      if (!contribution) return;
       const receipt = store.recordWhisperReceipt({
         threadKey,
         personId: person.id,
         runId,
-        contribution: prependContext,
+        contribution,
       });
-      return receipt.runId === runId ? { prependContext: receipt.contribution } : undefined;
+      return receipt.runId === runId ? peopleContext(receipt.contribution) : undefined;
     } catch (error) {
       api.logger.warn(`unblock-memory people whisperer lookup failed: ${String(error)}`);
       return;
     }
-  });
+  };
 
   api.on("agent_end", (event, context) => {
     const runId = nonBlank(event.runId) ?? nonBlank(context.runId);
     if (runId) threadByRun.delete(runId);
   });
+  return beforePrompt;
 }

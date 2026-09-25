@@ -1,11 +1,11 @@
 import { Type } from 'typebox';
 import { Value } from 'typebox/value';
-import { postTypeSafe } from './typesafe-transport.js';
+import { requestTypeSafe, TYPESAFE_MODEL } from './typesafe-client.js';
 import type { TrainingInput } from './training-input.js';
 import type { TrainingHit } from './training-retrieval.js';
 
 export const CONTEXT_JUDGE_VERSION = 'conversation-context-usefulness-v1';
-const CONTEXT_JUDGE_MODEL = 'jev-1.13.0';
+const CONTEXT_JUDGE_MODEL = TYPESAFE_MODEL;
 const CONTEXT_QUESTIONS = {
   usefulness: {
     type: 'score',
@@ -57,5 +57,5 @@ export function parseContextJudgment(payload: unknown) {
   return { score: answer.score / 3, answer, model: payload.model, usage: payload.usage ?? null };
 }
 export async function judgeTrainingPassage(request: ReturnType<typeof contextJudgeRequest>, apiKey: string) {
-  return parseContextJudgment(await postTypeSafe({ apiKey, signal: AbortSignal.timeout(30_000) }, request.state, request.questions));
+  return parseContextJudgment(await requestTypeSafe({ apiKey, timeoutMs: 30_000 }, request.state, request.questions));
 }

@@ -1,5 +1,4 @@
-import { TypeSafeHttpError } from "./typesafe-transport.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { TypeSafeRequestError, resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { TrainingTranscriptReader } from "./training-input.js";
 import { judgeTrainingInput, TRAINING_GATE_QUESTIONS } from "./training-gate.js";
 /** A full active-branch rescan is cheap/local; only changed exact inputs need inference. */
@@ -78,9 +77,11 @@ export async function runTraining(source, store, config, options) {
                     judgment = await judgeTrainingInput(input, key, AbortSignal.timeout(30_000));
                 }
                 catch (error) {
-                    const definite = error instanceof TypeSafeHttpError && error.status >= 400 && error.status < 500;
+                    const definite = error instanceof TypeSafeRequestError && error.code === "http_error" &&
+                        error.status !== undefined && error.status >= 400 && error.status < 500;
                     const status = definite ? "failed" : "ambiguous";
-                    store.finish(job.id, attempt, { status, error: error instanceof TypeSafeHttpError ? `http_${error.status}` : "request_or_response_uncertain" });
+                    store.finish(job.id, attempt, { status, error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
+                            `http_${error.status}` : "request_or_response_uncertain" });
                     result[status]++;
                     // Stop on the first failure rather than spending the rest of the budget during an outage.
                     return;

@@ -14,11 +14,12 @@ test("cluster review samples center and edge, excludes unapproved members and pr
   const notes = [];
   for (let i = 0; i < 10; i++) notes.push(await f.insert(i === 9 ? "Useful decision" : `Wrapper ${i}`, i === 8 ? "private" : f.source.collection));
   const clusterId = f.cluster(notes.map(note => note.hash));
+  const seen: string[] = [];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.state.excerpts.length, 5); // 3 center + 3 edge, one unapproved
+    assert.equal(request.state.excerpts.length, 1);
     assert.equal(request.state.excerpts.includes("Wrapper 8"), false);
-    assert.ok(request.state.excerpts.includes("Useful decision"));
+    seen.push(request.state.excerpts[0]);
     return Response.json({ answers: Object.fromEntries(request.state.excerpts.map((text: string, i: number) => [
       `member_${i}`, answer(text === "Useful decision" ? "none_or_uncertain" : "wrapper", text === "Wrapper 7" ? 0.4 : 0.99),
     ])) });
@@ -27,6 +28,8 @@ test("cluster review samples center and edge, excludes unapproved members and pr
   assert.equal(result.status, "ok");
   if (result.status !== "ok") assert.fail();
   assert.equal(result.sampled, 5);
+  assert.equal(seen.length, 5); // 3 center + 3 edge, one unapproved
+  assert.ok(seen.includes("Useful decision"));
   assert.equal(result.clusterSize, 10);
   assert.equal(result.recurring[0].examples.length, 3);
   assert.equal(result.members.filter(member => !member.flagged).length, 2);
@@ -64,5 +67,6 @@ test("oversized members are skipped whole; malformed/provider failures do not be
   f.db.prepare("UPDATE content_vectors SET chunk_len = 100").run();
   await assert.rejects(reviewClusterIngestion({ ...f.params, clusterId }), /invalid/);
   fetch.mock.mockImplementation(async () => new Response("private provider body", { status: 500 }));
-  await assert.rejects(reviewClusterIngestion({ ...f.params, clusterId }), /^Error: TypeSafe review unavailable$/);
+  await assert.rejects(reviewClusterIngestion({ ...f.params, clusterId }),
+    { message: "TypeSafe HTTP 500", code: "http_error", status: 500 });
 });

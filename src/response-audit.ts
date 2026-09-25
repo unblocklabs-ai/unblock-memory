@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { ResolvedSource } from "./sources.js";
 import { abortable } from "./abortable.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader, type ResponseEpisode } from "./response-episodes.js";
 import { RESPONSE_RUBRIC_VERSION, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity } from "./response-judge.js";
 import { ResponseAuditStore, type ResponseResult } from "./response-store.js";

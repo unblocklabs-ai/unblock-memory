@@ -126,7 +126,10 @@ fulfillment/deliverable-fit grade. The feedback pass distinguishes acceptance,
 correction, continuation, unrelated replies, expressed sentiment, repeated constraints
 and avoidable rework. Current-index memory investigation runs only for a strong
 memory-gap signal: lexical retrieval selects up to three whole short documents from
-approved collections. This is an investigation lead, **not proof of historical
+approved collections. Each document is graded in its own concurrent TypeSafe request
+against the same request/answer/feedback; no candidate sees the other documents.
+The isolated memory-stage cache version does not reuse old multi-candidate scores.
+This is an investigation lead, **not proof of historical
 availability, factual truth, or agent fault**. Tool-call counts do not establish what
 the model saw or whether it should have searched. Unseen artifacts are unassessable.
 

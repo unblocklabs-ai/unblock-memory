@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveConfig } from "./config.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { registerPeopleHooks } from "./people-hooks.js";
 import { PeopleStores } from "./people-store.js";
 import { registerPeopleTools } from "./people-tools.js";
@@ -10,6 +10,7 @@ import { registerPeoplePrimerTool } from "./people-primer-tool.js";
 import { QmdMemoryRuntime } from "./runtime.js";
 import { registerSkillWhisperer } from "./skill-whisperer.js";
 import { registerMemoryWhisperer } from "./memory-whisperer.js";
+import { registerWhispererPrompt } from "./whisperer-prompt.js";
 import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
@@ -438,19 +439,23 @@ export function registerUnblockMemory(api) {
         }));
         api.on("gateway_stop", () => runtime.stopSessionSyncSchedule());
     }
+    let peopleWhisperer;
     if (config.people.enabled) {
         const peopleStores = new PeopleStores({
             maxOpenTodos: config.people.todos.maxOpen,
             maxBlurbChars: config.people.whisperer.maxChars,
         });
-        registerPeopleHooks(api, peopleStores, config.people);
+        peopleWhisperer = registerPeopleHooks(api, peopleStores, config.people);
         registerPeopleTools(api, peopleStores, config, runtime);
         registerPeoplePrimerTool(api, runtime, peopleStores, config);
         api.on("gateway_stop", () => peopleStores.closeAll());
     }
-    const diagnostics = new WhispererDiagnostics();
-    registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics);
-    registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe, diagnostics);
+    const diagnostics = WhispererDiagnostics.shared();
+    registerWhispererPrompt(api, {
+        memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe, diagnostics),
+        skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics),
+        people: peopleWhisperer,
+    });
     api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
     api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {

@@ -6,7 +6,7 @@ export declare const RESPONSE_STAGE_VERSIONS: {
     readonly feedback: "feedback-v9";
     readonly sentiment: "sentiment-v10";
     readonly retrospective: "retrospective-v9";
-    readonly memory: "memory-v1";
+    readonly memory: "memory-v2-isolated";
 };
 declare const qualitySchema: Type.TObject<{
     answers: Type.TObject<{

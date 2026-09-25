@@ -6,7 +6,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { abortable } from "./abortable.js";
 
 const claimParameters = Type.Object({

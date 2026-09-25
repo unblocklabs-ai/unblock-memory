@@ -1,8 +1,9 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { askTypeSafeReview, TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
+import { requestTypeSafe } from "./typesafe-client.js";
+import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
 export const RESPONSE_RUBRIC_VERSION = `${TYPESAFE_REVIEW_MODEL}:response-v10`;
-export const RESPONSE_STAGE_VERSIONS = { quality: "quality-v9", feedback: "feedback-v9", sentiment: "sentiment-v10", retrospective: "retrospective-v9", memory: "memory-v1" };
+export const RESPONSE_STAGE_VERSIONS = { quality: "quality-v9", feedback: "feedback-v9", sentiment: "sentiment-v10", retrospective: "retrospective-v9", memory: "memory-v2-isolated" };
 const probability = Type.Number({ minimum: 0, maximum: 1 });
 const noul = Type.Object({ type: Type.Literal("noul"), noul: probability });
 const score = Type.Object({ type: Type.Literal("score"), score: Type.Number({ minimum: 0, maximum: 3 }),
@@ -73,7 +74,7 @@ export async function judgeResponse(episode, params, sentimentEnabled = true, ca
         contextLimited: episode.contextLimited, evidenceLimit: "Visible conversation only. Artifacts, tool results and external facts are not provided." };
     if (!cache?.quality)
         cache?.begin(["quality"]);
-    const qualityPayload = cache?.quality ? { answers: cache.quality } : await askTypeSafeReview(params, state, {
+    const qualityPayload = cache?.quality ? { answers: cache.quality } : await requestTypeSafe(params, state, {
         underdelivery: { type: "noul", instructions: { question: "Does the visible `answer` CLEARLY underdeliver on what the human explicitly asked for in `request`, given `before`?",
                 required: "Identify a concrete unmet requirement, wrong product, explicit constraint violation, materially shallow answer or unjustified deferral. Judge delivery, not politeness or writing style.",
                 exclusions: "Missing verification of unseen work is uncertainty, not failure. Necessary clarification, legitimate safety/approval boundaries, honest blockers and newly added requirements are not underdelivery. Do not infer a failure from memory-search counts or unseen tool activity.", trust } },
@@ -142,7 +143,7 @@ export async function judgeResponse(episode, params, sentimentEnabled = true, ca
     };
     const questions = Object.fromEntries(Object.entries(feedbackQuestions).filter(([key]) => Object.hasOwn(sentimentSchema.properties, key) ? needSentiment : needFeedback));
     cache?.begin([...(needFeedback ? ["feedback"] : []), ...(needSentiment ? ["sentiment"] : [])]);
-    const feedbackPayload = await askTypeSafeReview(params, { ...state, feedback: episode.feedback }, questions);
+    const feedbackPayload = await requestTypeSafe(params, { ...state, feedback: episode.feedback }, questions);
     const base = needFeedback ? feedbackPayload : { answers: cache.feedback };
     if (!Value.Check(feedbackSchema, base))
         throw new Error("Invalid response feedback judgment");
@@ -188,7 +189,7 @@ const retrospectiveSchema = Type.Object({ answers: Type.Object({ correction: nou
 /** Later evidence is kept in a third request and never changes the original grade. */
 export async function judgeResponseFollowup(episode, params) {
     const later = ["complete", "partial"].includes(episode.followup.status) ? episode.followup.messages : [];
-    const payload = await askTypeSafeReview(params, { before: episode.before, originalRequest: episode.request, originalAnswer: episode.answer,
+    const payload = await requestTypeSafe(params, { before: episode.before, originalRequest: episode.request, originalAnswer: episode.answer,
         humanReply: episode.feedback, nextAssistantResponse: later, evidenceStatus: episode.followup.status }, {
         outcome: { type: "choice", instructions: { question: "What does the available conversation establish about delivery of the ORIGINAL request by originalAnswer?",
                 method: "Match each complaint or admission to a concrete requirement or claim in originalRequest/originalAnswer, using before only to resolve existing requirements. Grade the original answer, not the later repair. A concrete shortfall takes precedence over praise.",
@@ -233,16 +234,18 @@ export async function judgeResponseFollowup(episode, params) {
     return { status: episode.followup.status, judgment: payload.answers };
 }
 export async function judgeMemoryOpportunity(episode, candidates, params) {
-    const questions = Object.fromEntries(candidates.map((_c, i) => [`candidate_${i}`, { type: "noul",
-            instructions: { question: `Would the information in \`candidates[${i}]\` materially address the specific context gap expressed in \`feedback\` about \`answer\`?`,
-                limits: "Judge substantive relevance, not shared vocabulary. These are CURRENT indexed excerpts; their presence does not prove historical availability, truth, or agent fault.", trust } }]));
+    const questions = { candidate_0: { type: "noul",
+            instructions: { question: "Would the information in `candidates[0]` materially address the specific context gap expressed in `feedback` about `answer`?",
+                limits: "Judge substantive relevance, not shared vocabulary. This is a CURRENT indexed excerpt; its presence does not prove historical availability, truth, or agent fault.", trust } } };
     if (!candidates.length)
         return [];
-    const payload = await askTypeSafeReview(params, { request: episode.request, answer: episode.answer,
-        feedback: episode.feedback, candidates: candidates.map(c => ({ text: c.text })) }, questions);
-    const schema = Type.Object({ answers: Type.Object(Object.fromEntries(candidates.map((_c, i) => [`candidate_${i}`, noul]))) });
-    if (!Value.Check(schema, payload))
-        throw new Error("Invalid memory opportunity judgment");
-    return candidates.map((c, i) => ({ path: c.path, hash: c.hash, usefulness: payload.answers[`candidate_${i}`].noul,
-        basis: "current_index_only; historical availability and retrieval exposure unknown" }));
+    const schema = Type.Object({ answers: Type.Object({ candidate_0: noul }, { additionalProperties: false }) });
+    return Promise.all(candidates.map(async (candidate) => {
+        const payload = await requestTypeSafe(params, { request: episode.request, answer: episode.answer,
+            feedback: episode.feedback, candidates: [{ text: candidate.text }] }, questions);
+        if (!Value.Check(schema, payload))
+            throw new Error("Invalid memory opportunity judgment");
+        return { path: candidate.path, hash: candidate.hash, usefulness: payload.answers.candidate_0.noul,
+            basis: "current_index_only; historical availability and retrieval exposure unknown" };
+    }));
 }

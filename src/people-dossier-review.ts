@@ -5,7 +5,7 @@ import type { EvidenceCitation } from "./evidence-review.js";
 import type { Person, PersonDossier } from "./people-store.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import type { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 
 /** Review the injected blurb using only exact indexed references already on its claims. */
 export async function reviewPersonDossier(params: {

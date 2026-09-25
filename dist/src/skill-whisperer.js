@@ -1,5 +1,6 @@
 import { basename } from "node:path";
-import { resolveTypeSafeApiKey, selectTypeSafeSkill } from "./typesafe.js";
+import { selectTypeSafeSkill } from "./typesafe.js";
+import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { messageText } from "./whisperer-context.js";
 const CANDIDATE_LIMIT = 10;
 const MAX_QUERY_CHARS = 12_000;
@@ -55,78 +56,89 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
         return state;
     };
     const active = (agentId) => ({ cfg: api.config, agentId });
-    api.on("before_prompt_build", async (event, context) => {
+    const beforePrompt = async (event, context) => {
+        const { agentId, runId } = context;
         const scope = sessionScope(context);
-        if (context.trigger !== "user" || !scope || !context.runId || !context.agentId)
+        if (context.trigger !== "user" || !scope || !runId || !agentId)
             return;
         const state = stateFor(scope);
-        if (state.lastRunId === context.runId)
-            return;
-        state.lastRunId = context.runId;
+        if (state.lastRunId === runId)
+            return state.result;
+        state.lastRunId = runId;
         state.turn += 1;
-        try {
-            const runtimeParams = active(context.agentId);
-            const apiKey = await resolveTypeSafeApiKey(typesafe);
-            if (!apiKey)
-                diagnostics?.record(context.agentId, "skill", typesafe.enabled ? "missing_key" : "typesafe_disabled");
-            const candidates = await runtime.searchSkills(runtimeParams, buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), apiKey ? -1 : config.minScore, CANDIDATE_LIMIT);
-            const resolvedCandidates = candidates.flatMap((candidate) => {
-                const canonicalPath = runtime.resolveSkillPath(runtimeParams, candidate.path);
-                return canonicalPath ? [{ candidate, canonicalPath }] : [];
-            });
-            let resolved = resolvedCandidates[0];
-            if (!resolved) {
-                diagnostics?.record(context.agentId, "skill", "no_candidates");
-                return;
-            }
-            if (apiKey) {
-                const shortlist = resolvedCandidates.slice(0, TYPESAFE_CANDIDATE_LIMIT);
-                const selectedIndex = await selectTypeSafeSkill({
-                    apiKey, timeoutMs: typesafe.timeoutMs,
-                    ...typeSafeConversation(event.prompt, event.messages, config.historyMessages),
-                    candidates: shortlist.map(({ candidate }) => candidate),
+        // Reuse even an in-flight result when the host rebuilds this run's prompt.
+        const run = async () => {
+            try {
+                const runtimeParams = active(agentId);
+                const apiKey = await resolveTypeSafeApiKey(typesafe);
+                if (!apiKey)
+                    diagnostics?.record(agentId, "skill", typesafe.enabled ? "missing_key" : "typesafe_disabled");
+                const candidates = await runtime.searchSkills(runtimeParams, buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), apiKey ? -1 : config.minScore, CANDIDATE_LIMIT);
+                const resolvedCandidates = candidates.flatMap((candidate) => {
+                    const canonicalPath = runtime.resolveSkillPath(runtimeParams, candidate.path);
+                    return canonicalPath ? [{ candidate, canonicalPath }] : [];
                 });
-                if (selectedIndex === undefined) {
-                    diagnostics?.record(context.agentId, "skill", "rejected");
+                let resolved = resolvedCandidates[0];
+                if (!resolved) {
+                    diagnostics?.record(agentId, "skill", "no_candidates");
                     return;
                 }
-                resolved = shortlist[selectedIndex];
+                if (apiKey) {
+                    const shortlist = resolvedCandidates.slice(0, TYPESAFE_CANDIDATE_LIMIT);
+                    const selectedIndex = await selectTypeSafeSkill({
+                        apiKey, timeoutMs: typesafe.timeoutMs,
+                        ...typeSafeConversation(event.prompt, event.messages, config.historyMessages),
+                        candidates: shortlist.map(({ candidate }) => candidate),
+                        onCandidateFailure: (candidateIndex, error) => {
+                            diagnostics?.record(agentId, "skill", "judge_candidate_failed");
+                            api.logger.warn("unblock-memory skill_whisperer " + JSON.stringify({ event: "candidate_failed",
+                                agentId, runId, candidateIndex, errorCode: error instanceof TypeSafeRequestError ? error.code : "unexpected",
+                                httpStatus: error instanceof TypeSafeRequestError ? error.status : undefined }));
+                        },
+                    });
+                    if (selectedIndex === undefined) {
+                        diagnostics?.record(agentId, "skill", "rejected");
+                        return;
+                    }
+                    resolved = shortlist[selectedIndex];
+                }
+                else if (resolved && resolved.candidate.score < config.minScore) {
+                    diagnostics?.record(agentId, "skill", "rejected");
+                    return;
+                }
+                if (!resolved)
+                    return;
+                // A selection completing after session teardown must not resurrect its hint.
+                if (sessions.get(scope) !== state || state.lastRunId !== runId) {
+                    diagnostics?.record(agentId, "skill", "cancelled");
+                    return;
+                }
+                const { candidate: selected, canonicalPath } = resolved;
+                if (apiKey && runtime.resolveSkillPath(runtimeParams, selected.path) !== canonicalPath)
+                    return;
+                const previous = state.skills.get(canonicalPath);
+                const lastSeen = Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity);
+                if (state.turn - lastSeen <= config.cooldownTurns) {
+                    diagnostics?.record(agentId, "skill", "cooldown");
+                    return;
+                }
+                const history = state.skills.get(canonicalPath) ?? {};
+                history.suggested = state.turn;
+                state.skills.set(canonicalPath, history);
+                diagnostics?.record(agentId, "skill", "emitted");
+                return {
+                    appendContext: `<skill>This skill may be relevant: ${JSON.stringify(selected.path).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e")}</skill>`,
+                };
             }
-            else if (resolved && resolved.candidate.score < config.minScore) {
-                diagnostics?.record(context.agentId, "skill", "rejected");
+            catch (error) {
+                diagnostics?.record(agentId, "skill", error instanceof TypeSafeRequestError && error.code === "timeout" ? "timed_out" : "failed");
+                api.logger.warn("unblock-memory skill whisperer failed; no hint emitted");
                 return;
             }
-            if (!resolved)
-                return;
-            // A selection completing after session teardown must not resurrect its hint.
-            if (sessions.get(scope) !== state || state.lastRunId !== context.runId) {
-                diagnostics?.record(context.agentId, "skill", "cancelled");
-                return;
-            }
-            const { candidate: selected, canonicalPath } = resolved;
-            if (apiKey && runtime.resolveSkillPath(runtimeParams, selected.path) !== canonicalPath)
-                return;
-            const previous = state.skills.get(canonicalPath);
-            const lastSeen = Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity);
-            if (state.turn - lastSeen <= config.cooldownTurns) {
-                diagnostics?.record(context.agentId, "skill", "cooldown");
-                return;
-            }
-            const history = state.skills.get(canonicalPath) ?? {};
-            history.suggested = state.turn;
-            state.skills.set(canonicalPath, history);
-            diagnostics?.record(context.agentId, "skill", "emitted");
-            return {
-                prependContext: `A potentially relevant skill is available: ${JSON.stringify(selected.name)} ` +
-                    `at ${JSON.stringify(selected.path)}. Check it before proceeding if applicable.`,
-            };
-        }
-        catch (error) {
-            diagnostics?.record(context.agentId, "skill", error instanceof Error && error.message === "TypeSafe selection timed out" ? "timed_out" : "failed");
-            api.logger.warn("unblock-memory skill whisperer failed; no hint emitted");
-            return;
-        }
-    });
+        };
+        state.result = run();
+        return state.result;
+    };
     api.on("after_tool_call", (event, context) => {
         if (event.toolName !== "read" || event.error ||
             (isRecord(event.result) && event.result.isError === true) || !context.agentId)
@@ -155,4 +167,5 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
         if (context.sessionKey)
             sessions.delete(context.sessionKey);
     });
+    return beforePrompt;
 }

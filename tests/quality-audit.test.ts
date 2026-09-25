@@ -60,7 +60,6 @@ test("double-encoded messages are encoding indicators even when the content is u
   f.insert(JSON.stringify({ role: "user", content: "Deploy only with approval" }));
   t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {
     noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.95 },
-    noise_1: { type: "noul", noul: 0.1 }, evidence_1: { type: "noul", noul: 0.95 },
   } }));
   const result = await auditQualityPage(f.params);
   assert.equal(result.flagged, 1);
@@ -82,6 +81,7 @@ test("bounded pages cache judgments, respect scope and preserve dismissed versio
     const request = JSON.parse(String(init?.body));
     assert.equal(JSON.stringify(request).includes("private source"), false);
     assert.equal(JSON.stringify(request).includes("outside pattern"), false);
+    assert.equal(request.state.chunks.length, 1);
     evaluated += request.state.chunks.length;
     return Response.json({ answers: Object.fromEntries(request.state.chunks.flatMap((chunk: { text: string }, i: number) => [
       [`noise_${i}`, { type: "noul", noul: chunk.text.includes("wrapper") ? 0.97 : 0.1 }],
@@ -158,9 +158,9 @@ test("partial pages resume after completed work and a changed fingerprint gets a
   });
   const first = await auditQualityPage(f.params);
   assert.equal(first.status, "partial");
-  assert.equal(first.scanned, 4);
-  assert.equal(first.next?.documentId, 4);
-  assert.equal(f.curation.listTasks({ limit: 10 }).length, 4);
+  assert.equal(first.scanned, 2);
+  assert.equal(first.next?.documentId, 1);
+  assert.equal(f.curation.listTasks({ limit: 10 }).length, 1);
   assert.equal((await auditQualityPage({ ...f.params, after: first.next })).done, true);
   assert.equal(f.curation.listTasks({ limit: 10 }).length, 5);
   const task = f.curation.listTasks({ limit: 10 }).find(item => item.path === "hash-1.md")!;
@@ -168,7 +168,7 @@ test("partial pages resume after completed work and a changed fingerprint gets a
   f.db.prepare("UPDATE documents SET active = 0 WHERE hash = 'hash-1'").run();
   f.insert("changed noise", f.source.collection, "changed.md");
   await auditQualityPage(f.params);
-  assert.equal(fetch.mock.callCount(), 4);
+  assert.equal(fetch.mock.callCount(), 7, "successful sibling judgments are reused; only the failed or changed chunk is requested again");
   assert.equal(f.curation.listTasks({ limit: 10 }).length, 5);
 });
 
@@ -177,7 +177,6 @@ test("an inbox write failure never advances past unfinished work", async t => {
   f.insert("noise one"); f.insert("noise two");
   t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {
     noise_0: { type: "noul", noul: 1 }, evidence_0: { type: "noul", noul: 0 },
-    noise_1: { type: "noul", noul: 1 }, evidence_1: { type: "noul", noul: 0 },
   } }));
   const original = f.curation.addTask.bind(f.curation);
   let calls = 0;

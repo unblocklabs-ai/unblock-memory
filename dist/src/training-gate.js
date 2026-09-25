@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { postTypeSafe, TYPESAFE_MODEL } from "./typesafe-transport.js";
+import { requestTypeSafe, TYPESAFE_MODEL, TypeSafeRequestError } from "./typesafe-client.js";
 export const TRAINING_GATE_VERSION = "historical-recall-v1";
 export const TRAINING_GATE_MODEL = TYPESAFE_MODEL;
 export const TRAINING_GATE_THRESHOLD = 0.7;
@@ -25,9 +25,9 @@ const resultSchema = Type.Object({
     usage: Type.Object({ input_tokens: Type.Integer({ minimum: 0 }), output_tokens: Type.Integer({ minimum: 0 }) }),
 });
 export async function judgeTrainingInput(input, apiKey, signal) {
-    const result = await postTypeSafe({ apiKey, signal }, input, TRAINING_GATE_QUESTIONS);
+    const result = await requestTypeSafe({ apiKey, signal }, input, TRAINING_GATE_QUESTIONS);
     if (!Value.Check(resultSchema, result) || !Number.isFinite(result.answers.recall_needed.noul)) {
-        throw new Error("Invalid training gate response");
+        throw new TypeSafeRequestError("Invalid training gate response", "invalid_response");
     }
     return { probability: result.answers.recall_needed.noul, model: result.model, usage: result.usage };
 }

@@ -7,7 +7,7 @@ const imp = file => import(pathToFileURL(`${plugin}/dist/src/${file}.js`));
 const { QmdMemoryManager } = await imp("manager");
 const { resolveSources, resolveSessionSource } = await imp("sources");
 const { resolveConfig } = await imp("config");
-const { resolveTypeSafeApiKey } = await imp("typesafe");
+const { resolveTypeSafeApiKey } = await imp("typesafe-client");
 const { registerMemoryWhisperer } = await imp("memory-whisperer");
 const { WhispererDiagnostics } = await imp("diagnostics");
 const report = JSON.parse(await readFile(`${upgraded}/results.json`, "utf8"));
@@ -51,19 +51,20 @@ for (const test of [
 ]) {
 const hooks = new Map();
 const diagnostics = new WhispererDiagnostics();
-registerMemoryWhisperer({ config: {}, logger: { warn() {} }, on(name, handler) { hooks.set(name, handler); } },
+const beforePrompt = registerMemoryWhisperer({ config: {}, logger: { info() {}, warn() {} }, on(name, handler) { hooks.set(name, handler); } },
   { async getMemorySearchManager() { return { manager: { async search() { return test.excerpts.map((snippet, i) => ({
     path: `qmd://synthetic/note-${i}.md`, corpus: "memory", snippet, startLine: 1, endLine: 1,
     citation: `qmd://synthetic/note-${i}.md#L1`, score: 0.9, source: "memory",
   })); } } }; } },
   resolveConfig({ memoryWhisperer: { enabled: true, corpora: ["memory"], ...test.overrides } }).memoryWhisperer,
   { enabled: true, apiKey, timeoutMs: 1500 }, diagnostics);
+assert.ok(beforePrompt);
 const start = performance.now();
-const hint = await hooks.get("before_prompt_build")({ prompt: "Prepare an Atlas staging deployment plan. What constraints from past decisions do we need to honor?", messages: [] },
+const hint = await beforePrompt({ prompt: "Prepare an Atlas staging deployment plan. What constraints from past decisions do we need to honor?", messages: [] },
   { trigger: "user", agentId: "validation", sessionId: "synthetic", runId: "run" });
-const hints = hint ? JSON.parse(hint.prependContext.split("\n")[1]) : [];
+const hints = hint ? JSON.parse(hint.appendContext.split("\n")[1]) : [];
 result.hooks.push({ name: test.name, syntheticRetrievalLiveTypeSafe: true, emitted: hints.length, milliseconds: Math.round(performance.now() - start),
-  complementary: hints.some(h => h.excerpt.includes("EU region")) && hints.filter(h => h.excerpt.includes("Ava")).length === 1,
+  complementary: hints.some(h => h.body.includes("EU region")) && hints.filter(h => h.body.includes("Ava")).length === 1,
   diagnostics: diagnostics.snapshot("validation") });
 hooks.get("gateway_stop")();
 }

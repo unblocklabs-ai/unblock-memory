@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.27",
+  "version": "0.3.28",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -82,11 +82,11 @@
     },
     "skillWhisperer.enabled": {
       "label": "Skill Whisperer",
-      "help": "Suggest at most one semantically relevant configured skill before a user turn. Requires hook conversation access."
+      "help": "Append at most one semantically relevant configured skill after the user prompt and any memory hints. Requires hook conversation access."
     },
     "memoryWhisperer.enabled": {
       "label": "Memory Whisperer",
-      "help": "Inject up to two TypeSafe-approved historical excerpts before user turns. Requires explicit corpora, a TypeSafe key, and hook conversation access. Disabled by default."
+      "help": "Append up to two TypeSafe-approved historical excerpts after the user prompt. Requires explicit corpora, a TypeSafe key, and hook conversation access. Disabled by default."
     },
     "memoryWhisperer.corpora": {
       "label": "Approved Hint Corpora",
@@ -281,7 +281,16 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "complementaryHints": { "type": "boolean", "default": false, "description": "Optionally remove confidently redundant hints with one additional bounded TypeSafe request. Uncertainty retains hints." },
+          "mlx": {
+            "type": "object", "additionalProperties": false,
+            "required": ["pythonPath", "modelPath"],
+            "description": "Opt in to a private resident MLX query worker and speculative recall-gated hybrid retrieval. Install the pinned Python runtime and model separately.",
+            "properties": {
+              "pythonPath": { "type": "string", "pattern": "^/" },
+              "modelPath": { "type": "string", "pattern": "^/" }
+            }
+          },
+          "complementaryHints": { "type": "boolean", "default": false, "description": "Optionally remove confidently redundant hints with up to six concurrent TypeSafe requests, one per directional pair. Uncertainty retains hints." },
           "enabled": { "type": "boolean", "default": false },
           "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
           "historyMessages": { "type": "integer", "minimum": 0, "maximum": 50, "default": 5 },

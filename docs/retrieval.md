@@ -286,18 +286,20 @@ For a complete corpus example, use the [configuration profiles](configuration.md
 QMD searches the current request plus the last N user/assistant messages (at most
 12,000 characters), retrieving up to eight vector candidates without query expansion,
 the local reranker, or a similarity-score cutoff. TypeSafe evaluates one independent
-Noul question per candidate in a single request: does the excerpt add material value
-beyond what the conversation already contains? Merely related, redundant,
-wrong-person/project, and clearly superseded information should be rejected;
-useful contradictory evidence can qualify. `minUsefulness` defaults to `0.7` and
+Noul question per candidate in its own concurrent HTTP request: would a careful
+assistant use a specific factual detail from the excerpt when answering the current
+request? Partial answers and concrete leads count; repeated facts, topic/name matches
+without answer content, unrelated details, and unsupported speculation do not.
+This is the sole Memory Whisperer usefulness prompt, shared by both retrieval paths.
+`minUsefulness` defaults to `0.7` and
 thresholds the probability of yes, not a calibrated guarantee of accuracy.
 Explicit configured thresholds are preserved. Evaluate it on your own conversations.
 
 **Privacy and budgets:** this feature sends up to 16,000 characters of the available
 user/assistant conversation, prioritizing the current request and recent messages,
 plus up to eight 1,200-character excerpts, corpus names, and matched-message timestamps
-when available to `api.typesafe.ai`. The same `messageTimestamp` accompanies the
-injected hint: it records when something was said, without inferring event dates.
+when available to `api.typesafe.ai`. The judge receives `messageTimestamp` to record
+when something was said, without inferring event dates; it is not an injected field.
 Session excerpts retain a complete turn or message when it fits,
 otherwise the complete matched chunk. Chunks exceeding the excerpt budget are
 skipped, never sliced; ordinary `memory_search` is unchanged.
@@ -306,21 +308,111 @@ already have compacted the available context. Truncation is marked in the judge'
 input. System messages, thinking blocks, images, and tool-result messages are omitted;
 anything quoted in ordinary user/assistant text can still be transmitted.
 
-At most two qualifying excerpts are injected verbatim with source references and
-historical/untrusted-data framing. Excerpts are deduplicated by normalized content
+At most two qualifying excerpts are appended after the current user prompt via
+`appendContext`, as a JSON array inside `<memory>` tags within one `<unblock_memory>`
+block. Each entry contains
+only `source` (the QMD path), `lines` (for example, `27-30`), and `body` (the verbatim
+excerpt). No instruction paragraph or required `memory_get` call is
+added. This is still part of the same user message, not a separate message.
+Excerpts are deduplicated by normalized content
 and overlapping source lines; recently injected content has a ten-user-turn cooldown
 by default. Cooldown state is in memory and resets on session end or Gateway restart.
-The complete hint payload is capped at 5,000 characters plus a short framing paragraph.
+Memory and Skill Whisperer reuse their result when the host rebuilds the same run's
+prompt, without repeating retrieval or advancing cooldown.
+The complete hint payload is capped at 5,000 characters plus the wrapper tags.
 
-Unlike Skill Whisperer, **disabled TypeSafe, a missing key, no qualifying hits, or any
-failure means no memory hint**—there is no vector-only fallback. The overall process
+All whisperer contributions share that appended block, in this order: `<memory>`,
+`<skill>`, then `<people>` when People Whisperer has an eligible blurb. Empty sections
+are omitted; no wrapper is emitted when none qualify. The independent whisperers
+run concurrently, and a failed contribution does not discard successful siblings.
+
+Unlike Skill Whisperer, **disabled TypeSafe, a missing key, or no qualifying successful
+judgments means no memory hint**—there is no vector-only fallback. A failed candidate
+does not discard successful siblings. The overall process
 has a 3-second deadline, with the shared 1.5-second TypeSafe request deadline inside it;
 neither performs retries. Timed-out or superseded runs cannot inject late hints.
 Already-running local QMD work may finish in the background, but does not keep the
 agent waiting beyond the deadline. No new indexing, clustering, or summarization runs
 are triggered by this feature beyond the memory manager's normal initialization.
 
+### Local MLX query generation (opt-in)
+
+Add `mlx` to the Memory Whisperer config to use the fine-tuned LFM query model:
+
+```json
+{
+  "memoryWhisperer": {
+    "enabled": true,
+    "corpora": ["memory", "knowledge", "sessions"],
+    "timeoutMs": 8000,
+    "mlx": {
+      "pythonPath": "/absolute/path/to/venv/bin/python",
+      "modelPath": "/absolute/path/to/lfm25-230m-pure-query-mlx-8bit"
+    }
+  }
+}
+```
+
+Approve only corpora suitable for every audience of the agent. Model weights and
+their separate license are not bundled in npm. On Apple Silicon, install Python
+3.12 with `mlx==0.32.2`, `mlx-lm==0.31.3`, and `transformers==5.17.0` in an isolated
+environment. Verify the model's SHA256SUMS before configuring its absolute path.
+The worker requires the supplied model's exact `system.txt` prompt.
+
+One private Python child per Gateway keeps the model warm, using stdin/stdout IPC
+with no listening port. Startup warms the model; failures retry on a later turn
+with a short backoff. Gateway shutdown stops the worker. Queues are bounded and
+cancelled requests are skipped; active generation checks cancellation between
+tokens. No conversation cache or raw worker output is written to Gateway logs.
+
+Two branches start together: TypeSafe's historical-recall judgment and local
+generation requesting three queries. Generation uses visible user/assistant text,
+the exact model prompt/template, greedy decoding and a 256-token output ceiling.
+It keeps the whole current request, drops oldest whole history messages to fit a
+24,000-byte input budget, and excludes oversized/ambiguous inputs. History length
+also follows `historyMessages`. This is not a claim of a 24,000-token context.
+
+Generated queries retrieve ten vector plus ten BM25 matches each per approved
+collection. All unique eligible passages proceed to the existing usefulness
+judge, with one HTTP request per passage, all launched together, without a merged
+passage-count cap or groups of eight. Each request contains the original conversation
+and only its own passage. Successful judgments remain eligible if another
+request times out, fails HTTP/network delivery, or returns invalid answers. Scores
+stay paired with their original passages; failed candidates are excluded, not scored
+as zero. If all requests fail, nothing is injected. Recall approval, the total
+deadline, and session cancellation still apply to every result. No retries are
+added to the latency-sensitive hook.
+The 1,200-character complete-excerpt limit, corpus checks, citations, cooldown and
+two-hint/5,000-character injection budget still apply. The judge sees only the
+original conversation and passages, never generated queries or retrieval scores.
+This can send more passages to TypeSafe than the legacy eight-candidate path.
+
+Recall probability below 0.7 discards/cancels the speculative branch immediately;
+no results are used until recall is approved. A recall error also emits no hint.
+Query output keeps nonempty strings, trims surrounding whitespace and drops exact
+duplicates; it does not require three queries or reject valid JSON based on the
+generation finish reason. Unparseable/unavailable output or no usable queries
+falls back to the legacy query/retrieval path, still subject to the recall gate
+and passage judge.
+Nothing changes in manual `memory_search`. The default total deadline remains
+three seconds; measure the full path before choosing a larger explicit budget.
+Already-running native retrieval may finish after cancellation, but cannot inject.
+
+Diagnostics distinguish `queries_generated`, `query_fallback`,
+`recall_not_needed`, and `judge_candidate_failed`. Gateway logs prefixed
+`unblock-memory memory_whisperer` contain structured JSON with agent/run/session
+IDs, candidate index, elapsed time, request timeout, and safe
+failure codes (`timeout`, `cancelled`, `http_error`, `network_error`,
+`invalid_response`; HTTP failures include the status). Unexpected local errors
+identify the failed stage without dumping the exception. A single completion
+record per run includes its outcome/reason, available stage timings, recall
+probability, query/candidate counts, `requestsSucceeded`/`requestsFailed`, partial-result
+flag, and emitted hint count. Prompt rebuilds reuse the result without duplicate
+logs. Logs never include queries, prompts, excerpts, credentials, provider bodies,
+or raw exceptions; exact query text is not retained by this telemetry.
+
 ## Skill Whisperer
+
 
 Skill Whisperer is an optional semantic reminder for user turns. Configure one
 isolated `skills` corpus, set `skillWhisperer.enabled` to `true`, and authorize
@@ -328,16 +420,24 @@ isolated `skills` corpus, set `skillWhisperer.enabled` to `true`, and authorize
 embeds the current prompt plus the configured number of prior user/assistant
 messages, compares it with each configured skill's frontmatter `name` and
 `description`. With TypeSafe enabled and a key available, the top three valid
-candidates are sent to TypeSafe, without a vector-score cutoff. TypeSafe chooses
-one skill or none. A "none" decision never falls back to a vector hint. Full skill
+candidates are graded in separate concurrent TypeSafe requests, without a vector-score cutoff.
+Each request sees only one skill's name/description plus the conversation. Code chooses
+the highest usefulness probability at or above **0.7**, with retrieval order breaking ties.
+If none qualifies, no skill is suggested; there is no vector fallback. This is an
+absolute per-skill usefulness judgment, not a multi-skill Choice distribution. Full skill
 procedures do not influence routing; no skill is invoked automatically.
+
+The reminder follows memory, when present, in the same appended `<unblock_memory>`
+block: `<skill>This skill may be relevant: "/path/to/SKILL.md"</skill>`.
+It includes the path but does not repeat the skill name.
 
 See [shared TypeSafe credentials](configuration.md#shared-typesafe-credentials) for key setup,
 rotation and the `enabled: true` / `timeoutMs: 1500` defaults.
 
 If TypeSafe is disabled or no key is found, selection uses the original local
 vector process and `skillWhisperer.minScore`. With a key present, an API error,
-invalid response, or timeout emits no hint and logs a sanitized warning; it does
+invalid response, or timeout excludes that candidate and logs a sanitized warning;
+successful siblings can still qualify. If all fail, no hint is emitted. It does
 not switch to vector-only selection. There are no automatic HTTP retries. Other
 credential-file read errors likewise produce a warning and no hint.
 
@@ -363,6 +463,11 @@ tasks. Paths are explicit by design; the plugin does not reconstruct
 OpenClaw's effective skill inventory from `openclaw.json`. Configured skill
 globs follow symlinked directories, including OpenClaw's `plugin-skills`
 directory.
+
+To exclude one plugin skill without uninstalling it, narrow that configured glob,
+for example `~/.openclaw/plugin-skills/!(people-whisperer)/**/SKILL.md`. Other configured
+paths still apply; make sure none re-include the same skill. Restart the Gateway to
+rebuild the skill index from the updated configuration.
 
 ## Review and diagnostics
 
@@ -404,9 +509,9 @@ Optional plugin config fragment (corpora must already be configured):
 ```
 
 Both additions default off. Claim review sends the proposed claim and approved
-source excerpts to TypeSafe; cluster review sends approved sampled excerpts.
-Complementary hints use one extra bounded call over at most four already-useful
-candidates (six directional comparisons). Only redundancy probability >=0.9
+source excerpts to TypeSafe; cluster review sends one approved sampled excerpt per request.
+Complementary hints use up to six concurrent directional-pair requests over at most four already-useful
+candidates. Each request sees only its pair, not the other candidates. Only redundancy probability >=0.9
 removes a hint; distinct evidence and contradictions should remain. Provider errors
 retain baseline hints, while the existing total turn deadline/cancellation still
 suppresses late results. Missing keys or disabled TypeSafe never enable these calls.
@@ -450,8 +555,11 @@ flagged as a possible double-encoding defect, even when its content is useful.
 An ordinary JSON message object is not flagged from its shape alone. These are
 review clues, never verdicts about whether the information should be kept.
 
-At most four unique chunks (24,000 characters) and their source kinds are sent in
-one request, without conversation context or source paths. Requests do not retry
+Each unique chunk (at most 6,000 characters) and its source kind gets its own request,
+without conversation context or source paths. The noise and evidence questions about
+that same chunk share the request. All uncached eligible chunks on the bounded page
+are graded concurrently. Successful sibling judgments are cached even if another
+fails; the cursor stops at unfinished work for safe resumption. Requests do not retry
 automatically and stop starting new work after a 30-second audit deadline; existing
 manager initialization/indexing may finish later. Judgments are cached in the
 curation database by content, source kind, model and question version. A rescan from

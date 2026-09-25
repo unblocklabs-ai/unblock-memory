@@ -1,6 +1,6 @@
 import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { abortable } from "./abortable.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 /** Review the injected blurb using only exact indexed references already on its claims. */
 export async function reviewPersonDossier(params) {
     const unavailable = (reason) => ({ status: "unavailable", needsReview: true, reason });

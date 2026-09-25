@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { messageText } from "./whisperer-context.js";
-import { responseUserText } from "./response-text.js";
+import { conversationUserText } from "./response-text.js";
 // Identical serialized inputs keep their checkpoints when eligibility broadens.
 export const TRAINING_PREPARATION = "visible-history-v1";
 // A deliberately conservative byte budget, NOT a tokenizer or a 32k-token target.
@@ -9,27 +9,6 @@ const MAX_INPUT_BYTES = 24_000, MAX_HISTORY_MESSAGES = 32;
 export const trainingHash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 function record(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
-}
-/** Legacy sender IDs are useful for envelope cleanup, not an admission requirement. */
-function userText(raw, sender) {
-    let senderId = typeof sender === "string" ? sender : undefined;
-    if (senderId === undefined) {
-        const header = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/.exec(raw.trim());
-        if (header) {
-            let metadata;
-            try {
-                metadata = JSON.parse(header[1]);
-            }
-            catch {
-                return;
-            }
-            const id = record(record(metadata)?.sender)?.id;
-            if (typeof id === "string")
-                senderId = id;
-        }
-        senderId ??= /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/.exec(raw.trim())?.[1];
-    }
-    return responseUserText(raw, senderId ?? "");
 }
 /** The following answer establishes eligibility, but is never part of that example's input. */
 export function trainingExamples(rows) {
@@ -88,7 +67,7 @@ export function trainingExamples(rows) {
                 continue;
             }
             const raw = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : messageText(message)?.text;
-            const visible = raw ? userText(raw, meta?.senderId ?? message.senderId) : undefined;
+            const visible = raw ? conversationUserText(raw, meta?.senderId ?? message.senderId) : undefined;
             if (!visible || /^(?:\[OpenClaw heartbeat poll\]|\[Queued messages while agent was busy\]|\[Subagent Context\]|<relevant-memories>)/.test(visible.text)) {
                 coverage.filtered++;
                 boundary();

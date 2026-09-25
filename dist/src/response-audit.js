@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { abortable } from "./abortable.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader } from "./response-episodes.js";
 import { RESPONSE_RUBRIC_VERSION, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity } from "./response-judge.js";
 import { ResponseAuditStore } from "./response-store.js";

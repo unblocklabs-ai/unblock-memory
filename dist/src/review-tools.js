@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { abortable } from "./abortable.js";
 const claimParameters = Type.Object({
     claim: Type.String({ pattern: "\\S", maxLength: 2000 }),

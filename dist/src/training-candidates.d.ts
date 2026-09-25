@@ -8,6 +8,14 @@ type Candidate = {
     explain: {
         methods: string[];
     };
+    vector?: {
+        score: number;
+        rank: number;
+    };
+    bm25?: {
+        score: number;
+        rank: number;
+    };
 };
-export declare function trainingCandidates(qmd: QMDStore, query: string, collection: string, intent: string): Promise<Candidate[]>;
+export declare function trainingCandidates(qmd: QMDStore, query: string, collection: string | string[], intent: string, signal?: AbortSignal): Promise<Candidate[]>;
 export {};

@@ -6,7 +6,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { PeopleStores } from "./people-store.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { primePersonDossier } from "./people-primer.js";
 import { abortable } from "./abortable.js";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";

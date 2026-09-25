@@ -69,6 +69,10 @@ export type UnblockMemoryConfig = {
         maxHints: number;
         cooldownTurns: number;
         timeoutMs: number;
+        mlx?: {
+            pythonPath: string;
+            modelPath: string;
+        };
     };
 };
 export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];

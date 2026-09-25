@@ -1,5 +1,4 @@
-import { TypeSafeHttpError } from "./typesafe-transport.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { TypeSafeRequestError, resolveTypeSafeApiKey } from "./typesafe-client.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import { TrainingTranscriptReader, type TrainingInput } from "./training-input.js";
 import { judgeTrainingInput, TRAINING_GATE_QUESTIONS } from "./training-gate.js";
@@ -72,9 +71,11 @@ export async function runTraining(source: Source, store: TrainingStore, config: 
           // Offline labeling has its own deadline, not Whisperer's latency-sensitive timeout.
           judgment = await judgeTrainingInput(input, key!, AbortSignal.timeout(30_000));
         } catch (error) {
-          const definite = error instanceof TypeSafeHttpError && error.status >= 400 && error.status < 500;
+          const definite = error instanceof TypeSafeRequestError && error.code === "http_error" &&
+            error.status !== undefined && error.status >= 400 && error.status < 500;
           const status = definite ? "failed" : "ambiguous";
-          store.finish(job.id, attempt, { status, error: error instanceof TypeSafeHttpError ? `http_${error.status}` : "request_or_response_uncertain" });
+          store.finish(job.id, attempt, { status, error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
+            `http_${error.status}` : "request_or_response_uncertain" });
           result[status]++;
           // Stop on the first failure rather than spending the rest of the budget during an outage.
           return;

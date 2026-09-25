@@ -1,6 +1,6 @@
 type RetrievalOperation = "vector" | "lexical" | "memoryWhisperer";
 type RetrievalOutcome = "ok" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped";
-declare const fields: readonly ["elapsedMs", "retrievalMs", "judgeMs", "candidates", "eligible", "results", "contextChars"];
+declare const fields: readonly ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "candidates", "eligible", "results", "contextChars"];
 type Field = typeof fields[number];
 export type RetrievalObservation = {
     outcome: RetrievalOutcome;
@@ -16,11 +16,11 @@ export declare class RetrievalTelemetry {
             [k: string]: {
                 calls: number;
                 outcomes: {
+                    cancelled?: number | undefined;
                     ok?: number | undefined;
                     skipped?: number | undefined;
                     failed?: number | undefined;
                     empty?: number | undefined;
-                    cancelled?: number | undefined;
                     timed_out?: number | undefined;
                 };
                 measurements: {

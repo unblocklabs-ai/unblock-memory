@@ -152,7 +152,9 @@ dossier is capped at 64 KiB; larger legacy dossiers remain readable and repairab
 ## Injection and person state
 
 Set `people.whisperer.enabled` to inject context. For each exact Slack sender,
-the plugin prepends that person's stored dossier blurb, bounded by `maxChars`,
+the plugin appends that person's stored dossier blurb inside `<people>` in the
+shared `<unblock_memory>` block, after memory and skill hints when present. The
+blurb is bounded by `maxChars` and injected
 once per `(Slack thread, person)`. Receipts are durable across retries and
 Gateway restarts, while different people in one thread are handled independently.
 Unthreaded DMs use their OpenClaw session as the conversational scope. Unknown,

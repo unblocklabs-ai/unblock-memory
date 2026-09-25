@@ -4,7 +4,8 @@ import { Value } from "typebox/value";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { PeoplePrimerConfig } from "./people-primer-config.js";
 import type { PeopleStore } from "./people-store.js";
-import { askTypeSafeReview, TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
+import { requestTypeSafe } from "./typesafe-client.js";
+import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
 import { abortable } from "./abortable.js";
 
 const VERSION = "people-primer-background-v4";
@@ -121,7 +122,7 @@ export async function primePersonDossier(params: {
         if (valid(payload)) cached++;
         else {
           requests++;
-          payload = await askTypeSafeReview({ apiKey: params.apiKey, timeoutMs: config.timeoutMs, signal }, state, questions);
+          payload = await requestTypeSafe({ apiKey: params.apiKey, timeoutMs: config.timeoutMs, signal }, state, questions);
           signal.throwIfAborted();
           if (!valid(payload) || !Value.Check(answerSchema, payload)) throw new Error("Invalid primer judgments");
           // Keep only validated numerical answers, never provider extras or echoes.

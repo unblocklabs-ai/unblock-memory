@@ -9,8 +9,7 @@ const disabledTypeSafe = { enabled: false, timeoutMs: 1500 };
 const activeTypeSafe = { enabled: true, apiKey: "fake-secret", timeoutMs: 100 };
 
 function typeSafeResponse(choice: string) {
-  return Response.json({ answers: { selected: { type: "choice", choice, confidence: 0.9,
-    probabilities: { skill_0: 0.1, skill_1: 0.8, skill_2: 0.05, none: 0.05 } } } });
+  return Response.json({ answers: { useful: { type: "noul", noul: choice === "none" ? 0.1 : 0.9 } } });
 }
 
 type HookContext = {
@@ -24,7 +23,7 @@ type HookContext = {
 type BeforePromptBuild = (
   event: { prompt: string; messages: unknown[] },
   context: HookContext,
-) => Promise<{ prependContext?: string } | void> | { prependContext?: string } | void;
+) => Promise<{ appendContext?: string } | void> | { appendContext?: string } | void;
 
 type AfterToolCall = (
   event: { toolName: string; params: Record<string, unknown>; error?: string },
@@ -70,13 +69,13 @@ function harness(
     },
     resolveSkillPath(_params: unknown, path: string) { return path.startsWith("/skills/") ? path : undefined; },
   };
-  registerSkillWhisperer(api, runtime, enabled, typesafe, diagnostics);
+  const before = registerSkillWhisperer(api, runtime, enabled, typesafe, diagnostics);
   return {
     queries,
     minimumScores,
     warnings,
     diagnostics,
-    before: hooks.get("before_prompt_build") as unknown as BeforePromptBuild,
+    before: before as BeforePromptBuild,
     after: hooks.get("after_tool_call") as unknown as AfterToolCall,
     end: hooks.get("session_end") as unknown as SessionEnd,
   };
@@ -102,12 +101,17 @@ test("suggests the best skill, emits nothing while it cools down, and is idempot
   const context = (runId: string): HookContext => ({ trigger: "user", runId, agentId: "bill", sessionId: "session" });
   const event = { prompt: "help me deploy", messages: [] };
 
-  assert.match((await testHarness.before(event, context("run-1")))?.prependContext ?? "", /alpha/);
-  assert.equal(await testHarness.before(event, context("run-1")), undefined);
+  const pending = testHarness.before(event, context("run-1"));
+  const pendingRebuild = testHarness.before({ ...event, prompt: "Assembled history\nhelp me deploy" }, context("run-1"));
+  const result = await pending;
+  assert.deepEqual(result, { appendContext: '<skill>This skill may be relevant: "/skills/alpha/SKILL.md"</skill>' });
+  assert.equal(await pendingRebuild, result);
+  assert.equal(await testHarness.before(event, context("run-1")), result);
   assert.equal(testHarness.queries.length, 1);
+  assert.equal(testHarness.diagnostics.snapshot("bill").skill.emitted, 1);
   assert.equal(await testHarness.before(event, context("run-2")), undefined);
   assert.equal(await testHarness.before(event, context("run-3")), undefined);
-  assert.match((await testHarness.before(event, context("run-4")))?.prependContext ?? "", /alpha/);
+  assert.match((await testHarness.before(event, context("run-4")))?.appendContext ?? "", /alpha/);
 });
 
 test("does not fall through when the best skill is cooling down", async () => {
@@ -142,13 +146,13 @@ test("successful direct reads share the suggestion cooldown and session end clea
   assert.match((await testHarness.before(
     { prompt: "task", messages: [] },
     { ...context, runId: "run-2" },
-  ))?.prependContext ?? "", /beta/);
+  ))?.appendContext ?? "", /beta/);
 
   await testHarness.end({ sessionId: "session" }, context);
   assert.match((await testHarness.before(
     { prompt: "task", messages: [] },
     { ...context, runId: "run-3" },
-  ))?.prependContext ?? "", /beta/);
+  ))?.appendContext ?? "", /beta/);
 });
 
 test("symlinked suggestions and canonical reads share cooldown state", async () => {
@@ -160,13 +164,12 @@ test("symlinked suggestions and canonical reads share cooldown state", async () 
   } as unknown as OpenClawPluginApi;
   const lexicalPath = "/skills-linked/deploy/SKILL.md";
   const canonicalPath = "/skills/deploy/SKILL.md";
-  registerSkillWhisperer(api, {
+  const before = registerSkillWhisperer(api, {
     async searchSkills() { return [{ name: "deploy", description: "Deploy releases.", path: lexicalPath, score: 0.9 }]; },
     resolveSkillPath(_params, path) {
       return path === lexicalPath || path === canonicalPath ? canonicalPath : undefined;
     },
-  }, enabled, disabledTypeSafe);
-  const before = hooks.get("before_prompt_build") as unknown as BeforePromptBuild;
+  }, enabled, disabledTypeSafe) as BeforePromptBuild;
   const after = hooks.get("after_tool_call") as unknown as AfterToolCall;
   const context: HookContext = { trigger: "user", runId: "run-1", agentId: "bill", sessionId: "session" };
 
@@ -189,19 +192,17 @@ test("disabled whispering registers no hooks", () => {
 });
 
 test("retrieval failures do not block the agent turn", async () => {
-  let before: BeforePromptBuild | undefined;
   const api = {
     config: {},
     logger: { warn() {} },
-    on(name: string, handler: unknown) {
-      if (name === "before_prompt_build") before = handler as BeforePromptBuild;
-    },
+    on() {},
   } as unknown as OpenClawPluginApi;
-  registerSkillWhisperer(api, {
+  const before = registerSkillWhisperer(api, {
     async searchSkills() { throw new Error("index unavailable"); },
     resolveSkillPath() { return undefined; },
   }, enabled, disabledTypeSafe);
-  assert.equal(await before?.(
+  assert.ok(before);
+  assert.equal(await before(
     { prompt: "task", messages: [] },
     { trigger: "user", runId: "run", agentId: "bill", sessionId: "session" },
   ), undefined);
@@ -210,11 +211,12 @@ test("retrieval failures do not block the agent turn", async () => {
 test("TypeSafe reranks below-threshold candidates and preserves selected-skill cooldown", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.deepEqual(Object.keys(request.questions.selected.criteria), ["skill_0", "skill_1", "skill_2", "none"]);
+    assert.deepEqual(Object.keys(request.questions), ["useful"]);
+    assert.ok(["alpha", "beta", "gamma"].includes(request.state.candidate.name));
     assert.equal(JSON.stringify(request).includes("/skills/"), false);
     assert.equal(request.state.currentRequest, "new task");
     assert.deepEqual(request.state.history, [{ role: "user", content: "previous task" }]);
-    return typeSafeResponse("skill_1");
+    return typeSafeResponse(request.state.candidate.name === "beta" ? "skill_1" : "none");
   });
   const h = harness([
     { name: "invalid", path: "/not-allowed/SKILL.md", score: 0.95 },
@@ -226,10 +228,11 @@ test("TypeSafe reranks below-threshold candidates and preserves selected-skill c
   const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "run-1" };
   const event = { prompt: "new task", messages: [{ role: "system", content: "do not send" },
     { role: "toolResult", content: "do not send" }, { role: "user", content: "previous task" }] };
-  assert.match((await h.before(event, context))?.prependContext ?? "", /beta/);
+  const result = await h.before(event, context);
+  assert.match(result?.appendContext ?? "", /beta/);
   assert.deepEqual(h.minimumScores, [-1]);
-  assert.equal(await h.before(event, context), undefined);
-  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(await h.before(event, context), result);
+  assert.equal(fetch.mock.callCount(), 3);
   assert.equal(await h.before(event, { ...context, runId: "run-2" }), undefined);
   assert.equal(h.warnings.length, 0);
 });
@@ -241,7 +244,7 @@ test("missing key keeps original selection and does not call TypeSafe", async (t
   });
   assert.match((await h.before({ prompt: "task", messages: [] }, {
     trigger: "user", agentId: "main", sessionId: "session", runId: "run",
-  }))?.prependContext ?? "", /alpha/);
+  }))?.appendContext ?? "", /alpha/);
   assert.deepEqual(h.minimumScores, [enabled.minScore]);
   assert.equal(h.warnings.length, 0);
   assert.deepEqual(h.diagnostics.snapshot("main").skill, { missing_key: 1, emitted: 1 });
@@ -255,11 +258,11 @@ test("none and provider failures do not fall back to a strong vector match or co
   assert.equal(await h.before(event, context), undefined);
   fetch.mock.mockImplementation(async () => new Response("fake-secret", { status: 401 }));
   assert.equal(await h.before(event, { ...context, runId: "failed" }), undefined);
-  assert.equal(h.warnings.length, 1);
+  assert.equal(h.warnings.length, 2);
   assert.equal(h.warnings[0].includes("fake-secret"), false);
   fetch.mock.mockImplementation(async () => typeSafeResponse("skill_0"));
-  assert.match((await h.before(event, { ...context, runId: "succeeded" }))?.prependContext ?? "", /alpha/);
-  assert.deepEqual(h.diagnostics.snapshot("main").skill, { rejected: 1, failed: 1, emitted: 1 });
+  assert.match((await h.before(event, { ...context, runId: "succeeded" }))?.appendContext ?? "", /alpha/);
+  assert.deepEqual(h.diagnostics.snapshot("main").skill, { rejected: 1, judge_candidate_failed: 1, failed: 1, emitted: 1 });
 });
 
 test("TypeSafe conversation is bounded and pending selections do not survive session end", async (t) => {

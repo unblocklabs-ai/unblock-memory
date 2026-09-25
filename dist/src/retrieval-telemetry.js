@@ -1,4 +1,4 @@
-const fields = ["elapsedMs", "retrievalMs", "judgeMs", "candidates", "eligible", "results", "contextChars"];
+const fields = ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "candidates", "eligible", "results", "contextChars"];
 const recentLimit = 256;
 const boundedAdd = (left, right) => Math.min(Number.MAX_SAFE_INTEGER, left + right);
 /** Only fixed operation/outcome names and nonnegative numbers enter this store. */

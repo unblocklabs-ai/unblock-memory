@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import type * as TypeSafe from "../../src/typesafe.js";
+import { resolveTypeSafeApiKey } from "../../src/typesafe-client.js";
 
 const history = Type.Array(Type.Object({ role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]), content: Type.String() }));
 const casesSchema = Type.Array(Type.Union([
@@ -30,7 +31,7 @@ async function main() {
   const baseline: typeof TypeSafe = await import(pathToFileURL(resolve(baselinePath)).href);
   const structured: typeof TypeSafe = await import(pathToFileURL(resolve(structuredPath)).href);
   const config = JSON.parse(await readFile(configPath, "utf8"));
-  const apiKey = await baseline.resolveTypeSafeApiKey(config.plugins.entries["unblock-memory"].config.typesafe);
+  const apiKey = await resolveTypeSafeApiKey(config.plugins.entries["unblock-memory"].config.typesafe);
   if (!apiKey) throw new Error("No TypeSafe key configured");
   const raw: unknown = JSON.parse(await readFile(casesPath, "utf8"));
   if (!Value.Check(casesSchema, raw)) throw new Error("Invalid comparison fixtures");
@@ -49,17 +50,17 @@ async function main() {
   await appendFile(outputPath, JSON.stringify({ type: "metadata", fixtureHash, moduleHashes,
     cases: cases.length, jobs: jobs.length, repeats: 2, timeoutMs: 10_000, startedAt: new Date().toISOString() }) + "\n", { flag: "wx", mode: 0o600 });
   const realFetch = globalThis.fetch;
-  let trace: { stateHash?: string; requestBytes?: number; usage?: unknown; model?: unknown } = {};
+  let trace: { stateHash: string; requestBytes: number; usage?: unknown; model?: unknown }[] = [];
   globalThis.fetch = async (url, init) => {
     const body = String(init?.body);
     const request = JSON.parse(body);
-    trace.stateHash = hash(JSON.stringify(request.state));
-    trace.requestBytes = Buffer.byteLength(body);
+    const item: typeof trace[number] = { stateHash: hash(JSON.stringify(request.state)), requestBytes: Buffer.byteLength(body) };
+    trace.push(item);
     const response = await realFetch(url, init);
     if (response.ok) {
       const payload = await response.clone().json() as { usage?: unknown; model?: unknown };
-      trace.usage = payload.usage;
-      trace.model = payload.model;
+      item.usage = payload.usage;
+      item.model = payload.model;
     }
     return response;
   };
@@ -69,7 +70,7 @@ async function main() {
         const order = (index + repeat) % 2 ? ["structured", "baseline"] as const : ["baseline", "structured"] as const;
         for (const arm of order) {
           const module = arm === "baseline" ? baseline : structured;
-          trace = {};
+          trace = [];
           const start = performance.now();
           const common = { apiKey, timeoutMs: 10_000, signal: new AbortController().signal };
           const first = job[0];
@@ -97,7 +98,7 @@ async function main() {
               included: probability >= 0.9, expected: first.expected[i], correct: (probability >= 0.9) === first.expected[i] }));
           }
           await appendFile(outputPath, JSON.stringify({ type: "result", repeat, job: index, arm, kind: first.kind,
-            elapsedMs: Math.round(performance.now() - start), ...trace, outputs }) + "\n");
+            elapsedMs: Math.round(performance.now() - start), requests: trace, outputs }) + "\n");
         }
         if ((index + 1) % 20 === 0) console.log(JSON.stringify({ repeat, jobsCompleted: index + 1, totalJobs: jobs.length }));
       }

@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { primePersonDossier } from "./people-primer.js";
 import { abortable } from "./abortable.js";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";

@@ -3,11 +3,7 @@ type RequestOptions = {
     timeoutMs: number;
     signal: AbortSignal;
 };
-type Json = string | number | boolean | null | Json[] | {
-    [key: string]: Json;
-};
-export { TYPESAFE_MODEL as TYPESAFE_REVIEW_MODEL } from "./typesafe-transport.js";
-export declare function askTypeSafeReview(params: RequestOptions, state: Json, questions: Json): Promise<unknown>;
+export { TYPESAFE_MODEL as TYPESAFE_REVIEW_MODEL } from "./typesafe-client.js";
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
 export declare function reviewTypeSafeClaim(params: RequestOptions & {
     claim: string;
@@ -34,9 +30,9 @@ export declare function reviewTypeSafeClaim(params: RequestOptions & {
 export declare function reviewMemoryRedundancy(params: RequestOptions & {
     excerpts: readonly string[];
 }): Promise<{
-    redundant: number;
     earlier: number;
     later: number;
+    redundant: number;
 }[]>;
 export declare function complementaryIndices(count: number, pairs: readonly {
     earlier: number;

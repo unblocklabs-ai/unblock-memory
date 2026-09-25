@@ -1,6 +1,11 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export class WhispererDiagnostics {
+    static shared() {
+        const scope = globalThis;
+        const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v1");
+        return (scope[symbol] ??= new WhispererDiagnostics());
+    }
     #agents = new Map();
     #entry(agentId) {
         let entry = this.#agents.get(agentId);

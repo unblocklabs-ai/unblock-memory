@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { askTypeSafeReview, TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
+import { requestTypeSafe } from "./typesafe-client.js";
+import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
 import { abortable } from "./abortable.js";
 const VERSION = "people-primer-background-v4";
 const MAX_EXCERPT_CHARS = 6000;
@@ -112,7 +113,7 @@ export async function primePersonDossier(params) {
                     cached++;
                 else {
                     requests++;
-                    payload = await askTypeSafeReview({ apiKey: params.apiKey, timeoutMs: config.timeoutMs, signal }, state, questions);
+                    payload = await requestTypeSafe({ apiKey: params.apiKey, timeoutMs: config.timeoutMs, signal }, state, questions);
                     signal.throwIfAborted();
                     if (!valid(payload) || !Value.Check(answerSchema, payload))
                         throw new Error("Invalid primer judgments");

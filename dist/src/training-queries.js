@@ -1,11 +1,10 @@
 import { collectTraining } from "./training.js";
 import { trainingHash } from "./training-input.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
-import { resolveTypeSafeApiKey } from "./typesafe.js";
+import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { trainingTeacher, trainingTeacherMessage, TRAINING_TEACHER_MODEL, TRAINING_TEACHER_PROMPT, TRAINING_TEACHER_VERSION } from "./training-models.js";
 import { historicalTrainingSearch, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
-import { TypeSafeHttpError } from "./typesafe-transport.js";
 const SELECTION_VERSION = "conversation-utility-top5-sum-v2";
 export const TRAINING_EVALUATION_CONCURRENCY = 4;
 function bounds(options) {
@@ -41,9 +40,11 @@ async function checkpoint(store, step, result, operation) {
         const hostCode = error && typeof error === "object" && "code" in error && typeof error.code === "string" &&
             /^LLM_[A-Z_]+$/u.test(error.code) ? error.code : undefined;
         const status = hostCode === "LLM_COMPLETION_NOT_AUTHORIZED" ||
-            (error instanceof TypeSafeHttpError && error.status >= 400 && error.status < 500) ? "failed" : "ambiguous";
+            (error instanceof TypeSafeRequestError && error.code === "http_error" &&
+                error.status !== undefined && error.status >= 400 && error.status < 500) ? "failed" : "ambiguous";
         store.finishStep(step.stage, step.id, attempt, { status,
-            error: error instanceof TypeSafeHttpError ? `http_${error.status}` : hostCode ?? "request_or_response_uncertain" });
+            error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
+                `http_${error.status}` : hostCode ?? "request_or_response_uncertain" });
         result[status]++;
         return;
     }

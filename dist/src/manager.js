@@ -16,6 +16,7 @@ import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
 import { abortable } from "./abortable.js";
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
+import { trainingCandidates } from "./training-candidates.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
@@ -857,9 +858,39 @@ export class QmdMemoryManager {
             expand: false,
         });
         opts?.signal?.throwIfAborted();
+        return this.#renderSearchHits(hits, store, opts);
+    }
+    /** Whisperer-only discovery: exact trained recipe, no query-conditioned reranker or merged cap. */
+    async searchWhisperer(queries, opts) {
+        return this.#enqueue(async () => {
+            opts.signal?.throwIfAborted();
+            const collections = this.#collectionNames(opts.corpora);
+            if (!collections.length)
+                return [];
+            if (this.#sessions && collections.includes(this.#sessions.collection))
+                await this.#refreshSessionMetadata();
+            const store = await this.#getAnalysisStore();
+            const hits = new Map();
+            // Serialize native QMD work. Cancellation prevents further queries/collections.
+            for (const query of queries)
+                for (const collection of collections) {
+                    opts.signal?.throwIfAborted();
+                    for (const hit of await trainingCandidates(store, query, collection, query, opts.signal)) {
+                        const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk]);
+                        if (!hits.has(key))
+                            hits.set(key, { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
+                                chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: hit.score });
+                    }
+                }
+            opts.signal?.throwIfAborted();
+            return this.#renderSearchHits([...hits.values()], store, opts);
+        });
+    }
+    async #renderSearchHits(hits, store, opts) {
         const tokenizer = store.internal?.llm;
         const results = [];
         for (const hit of hits) {
+            opts?.signal?.throwIfAborted();
             // Proactive hints must retain the entire matched chunk, even when expanded
             // turn/message context exceeds their budget. Ordinary search is unchanged.
             if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity))

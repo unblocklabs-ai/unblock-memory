@@ -9,7 +9,7 @@ assert.ok(snapshot && oldPlugin && newPlugin && output && keyFile && analysisExe
 await mkdir(output, { mode: 0o700 });
 const imp = (root, file) => import(pathToFileURL(`${root}/dist/src/${file}.js`));
 const { resolveSources, resolveSessionSource } = await imp(newPlugin, "sources");
-const { resolveTypeSafeApiKey } = await imp(newPlugin, "typesafe");
+const { resolveTypeSafeApiKey } = await imp(newPlugin, "typesafe-client");
 const config = JSON.parse(await readFile(`${snapshot}/openclaw.json`, "utf8")).plugins.entries["unblock-memory"].config;
 const sourceState = `${snapshot}/agents/main/unblock-memory`;
 const sources = resolveSources(`${snapshot}/workspace`, config.corpora.filter(c => c.kind === "files"));

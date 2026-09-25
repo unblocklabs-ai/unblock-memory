@@ -59,6 +59,6 @@ export async function reviewClusterIngestion(params) {
         });
         return { status: "ok", runId: snapshot.runId, clusterId: params.clusterId, members, recurring,
             sampled: sample.length, considered: snapshot.considered, clusterSize: snapshot.clusterSize,
-            policy: "jev-1.13.0:cluster-defects-v1", scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
+            policy: "jev-1.13.0:cluster-defects-v2-isolated", scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
     });
 }

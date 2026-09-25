@@ -73,6 +73,7 @@ export type UnblockMemoryConfig = {
     maxHints: number;
     cooldownTurns: number;
     timeoutMs: number;
+    mlx?: { pythonPath: string; modelPath: string };
   };
 };
 
@@ -155,7 +156,18 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     throw new Error("unblock-memory memoryWhisperer must be an object");
   }
   const config = value as Record<string, unknown>;
-  assertOnlyKeys(config, Object.keys(DEFAULT_MEMORY_WHISPERER), "memoryWhisperer");
+  assertOnlyKeys(config, [...Object.keys(DEFAULT_MEMORY_WHISPERER), "mlx"], "memoryWhisperer");
+  let mlx: UnblockMemoryConfig["memoryWhisperer"]["mlx"];
+  if (config.mlx !== undefined) {
+    if (!config.mlx || typeof config.mlx !== "object" || Array.isArray(config.mlx)) throw new Error("memoryWhisperer.mlx must be an object");
+    const value = config.mlx as Record<string, unknown>;
+    assertOnlyKeys(value, ["pythonPath", "modelPath"], "memoryWhisperer.mlx");
+    if (typeof value.pythonPath !== "string" || !isAbsolute(value.pythonPath) ||
+        typeof value.modelPath !== "string" || !isAbsolute(value.modelPath)) {
+      throw new Error("memoryWhisperer.mlx requires absolute pythonPath and modelPath");
+    }
+    mlx = { pythonPath: value.pythonPath, modelPath: value.modelPath };
+  }
   const enabled = config.enabled ?? false;
   if (typeof enabled !== "boolean") throw new Error("unblock-memory memoryWhisperer.enabled must be a boolean");
   const complementaryHints = config.complementaryHints ?? false;
@@ -182,6 +194,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     enabled, complementaryHints, corpora: [...new Set(selected)], historyMessages, cooldownTurns, minUsefulness,
     maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
     timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
+    ...(mlx ? { mlx } : {}),
   };
 }
 
