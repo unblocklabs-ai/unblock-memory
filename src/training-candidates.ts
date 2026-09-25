@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 
-// Discovery-only adapter for pinned @unblocklabs/qmd 2.10.1 (MIT, query.js).
+// Discovery-only adapter for pinned @unblocklabs/qmd 2.10.2 (MIT, query.js).
 // Keep its tokenization, FTS highlights, chunk choice and source-aware dedup.
 // Unlike search(), request exactly ten per method and return ALL merged passages.
 // No dependency rewriting, query expansion or query-conditioned remote scoring.

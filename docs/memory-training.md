@@ -83,7 +83,7 @@ unknown/future dates. Never infer dates from quoted headings. Copy existing vect
 only for complete chunks within the safe prefix; BM25 sees that same prefix.
 Validate returned passages/dates again. No reembedding or temporary transcripts.
 
-QMD 2.10.1 cannot independently set per-method depth through its public search API.
+QMD cannot independently set per-method depth through its public search API.
 A small discovery adapter retains its tokenization, FTS-highlight chunk selection,
 source-aware dedup and installed chunk helpers, but requests ten per method and
 omits query-conditioned scoring. It does not rewrite QMD. Its existing
