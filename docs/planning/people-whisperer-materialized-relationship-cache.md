@@ -100,9 +100,7 @@ Only if tests on Bill show ordinary agent-owned maintenance is losing important 
 ## Sources reviewed
 
 - `docs/peoplesql.md`
-- `docs/planning/bek-aug25.md`
 - `docs/planning/contextual-relationship-memory.md`
-- `docs/planning/enhacements-aug25.md`
 - `docs/planning/future-features.md`
 - `docs/planning/memory-consolidation-and-reflection.md`
 - the PeopleSQL storage and prompt-hook implementation at the time of the proposal

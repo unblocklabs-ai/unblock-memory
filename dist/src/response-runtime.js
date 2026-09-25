@@ -6,14 +6,7 @@ import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { resolveSources } from "./sources.js";
 import { auditResponses, responseCohort } from "./response-audit.js";
 import { ResponseAuditStore } from "./response-store.js";
-function dateOption(value, fallback) {
-    if (value === undefined)
-        return fallback;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value) {
-        throw new Error("Dates must be valid YYYY-MM-DD UTC dates");
-    }
-    return Date.parse(value);
-}
+import { dateOption } from "./date-option.js";
 export function registerResponseAudit(api, config) {
     const options = (cfg, id) => {
         const normalized = normalizeAgentIdStrict(id);

@@ -143,8 +143,7 @@ blocker rather than manufacture examples or silently extend the scope.
 Add only validated external-dataset input and offline rescoring to the existing
 lab. Reuse its types, runner, scorer, reports and installed QMD. Snapshot only
 approved indexed documents and necessary source/session metadata with read-only
-consistent reads. The older `eval/enhancements/prepare-corpus.mjs` assumes `main`
-and legacy `curation.sqlite`; reuse its approach, not that script unchanged.
+consistent reads from the current per-agent state layout.
 
 No new service, dependency, index engine, dashboard, provider call or production
 retrieval switch. Keep private snapshots/results on the approved host, outside

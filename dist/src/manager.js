@@ -487,50 +487,43 @@ export class QmdMemoryManager {
             .filter((source) => selected.has(source.corpus))
             .map((source) => source.collection);
     }
+    async #updateAndEmbed(store, collection, force) {
+        const update = await store.update({ collections: collection ? [collection] : [] });
+        this.#cleanupRemovedDocuments?.(update.updated + update.removed);
+        const analysisStore = store;
+        const changed = update.indexed + update.updated + update.removed > 0 || update.needsEmbedding > 0;
+        if ((changed || force) && analysisStore.internal)
+            markMemoryAnalysisStale(analysisStore.internal.db);
+        const embed = await store.embed({
+            ...(collection ? { collection } : {}),
+            force,
+            chunkStrategy: "semantic",
+        });
+        this.#recordEmbedding(embed);
+        const chunksEmbedded = completedEmbeddingCount(embed);
+        if (!changed && !force && chunksEmbedded > 0 && analysisStore.internal) {
+            markMemoryAnalysisStale(analysisStore.internal.db);
+        }
+        return chunksEmbedded;
+    }
+    async #refreshIndexStatus(store) {
+        const status = await store.getStatus();
+        const collections = await store.listCollections();
+        this.#files = collections.reduce((total, collection) => total + collection.active_count, 0);
+        this.#dirty = status.needsEmbedding > 0;
+    }
     sync(params) {
         const run = async () => {
             const store = await this.#getStore();
             this.#dirty = true;
-            const analysisStore = store;
             const collections = this.#qmdSources().filter((source) => source.kind !== "sessions");
-            let analysisMarkedStale = false;
-            const markAnalysisStale = () => {
-                if (analysisMarkedStale || !analysisStore.internal)
-                    return;
-                markMemoryAnalysisStale(analysisStore.internal.db);
-                analysisMarkedStale = true;
-            };
             if (collections.length === 0) {
-                const update = await store.update({ collections: [] });
-                this.#cleanupRemovedDocuments?.(update.updated + update.removed);
-                if (update.indexed + update.updated + update.removed > 0 ||
-                    update.needsEmbedding > 0 || params?.force === true) {
-                    markAnalysisStale();
-                }
-                const embed = await store.embed({ force: params?.force, chunkStrategy: "semantic" });
-                this.#recordEmbedding(embed);
-                if (completedEmbeddingCount(embed) > 0)
-                    markAnalysisStale();
+                await this.#updateAndEmbed(store, undefined, params?.force);
             }
             for (const source of collections) {
-                const update = await store.update({ collections: [source.collection] });
-                this.#cleanupRemovedDocuments?.(update.updated + update.removed);
-                const changed = update.indexed + update.updated + update.removed > 0 || update.needsEmbedding > 0;
-                if (changed || params?.force === true)
-                    markAnalysisStale();
-                const embed = await store.embed({
-                    collection: source.collection,
-                    force: params?.force,
-                    chunkStrategy: "semantic",
-                });
-                this.#recordEmbedding(embed);
-                if (completedEmbeddingCount(embed) > 0)
-                    markAnalysisStale();
+                await this.#updateAndEmbed(store, source.collection, params?.force);
             }
-            const status = await store.getStatus();
-            const indexedCollections = await store.listCollections();
-            this.#files = indexedCollections.reduce((total, collection) => total + collection.active_count, 0);
-            this.#dirty = status.needsEmbedding > 0;
+            await this.#refreshIndexStatus(store);
         };
         return this.#enqueue(run);
     }
@@ -548,24 +541,7 @@ export class QmdMemoryManager {
                 index: async () => {
                     onPhase?.("indexing");
                     const store = await this.#getStore();
-                    const update = await store.update({ collections: [sessions.collection] });
-                    this.#cleanupRemovedDocuments?.(update.updated + update.removed);
-                    const analysisStore = store;
-                    const invalidatesAnalysis = update.indexed + update.updated + update.removed > 0 ||
-                        update.needsEmbedding > 0;
-                    if (invalidatesAnalysis && analysisStore.internal) {
-                        markMemoryAnalysisStale(analysisStore.internal.db);
-                    }
-                    const embed = await store.embed({
-                        collection: sessions.collection,
-                        chunkStrategy: "semantic",
-                    });
-                    const chunksEmbedded = completedEmbeddingCount(embed);
-                    this.#recordEmbedding(embed);
-                    if (!invalidatesAnalysis && chunksEmbedded > 0 && analysisStore.internal) {
-                        markMemoryAnalysisStale(analysisStore.internal.db);
-                    }
-                    return chunksEmbedded;
+                    return this.#updateAndEmbed(store, sessions.collection);
                 },
             });
             this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
@@ -573,10 +549,7 @@ export class QmdMemoryManager {
             if (synced.result.skipReason)
                 return synced.result;
             const store = await this.#getStore();
-            const status = await store.getStatus();
-            const collections = await store.listCollections();
-            this.#files = collections.reduce((total, collection) => total + collection.active_count, 0);
-            this.#dirty = status.needsEmbedding > 0;
+            await this.#refreshIndexStatus(store);
             return synced.result;
         });
     }

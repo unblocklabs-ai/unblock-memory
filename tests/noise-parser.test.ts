@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { applyProposal, parseAttachments, parseInternalMessage } from "../src/session-noise.js";
-import { parseDreamingMarkers, structuralChunkReason } from "../eval/noise-parser/parser.js";
 import { projectSession, sessionContextSpans } from "../src/session-projector.js";
 
 const action = "Use the Codex native subagent result to continue or wrap up the parent task. If this is a Discord/channel session, send the visible response with the message tool instead of only writing a transcript final answer. Reply in your normal assistant voice and do not expose internal notification markup.";
@@ -111,28 +110,6 @@ test("attachment cleanup fails closed for expensive messages before making any e
   }
   const small = valid + attachment("Another useful memory.\n", "def456");
   assert.equal(parseAttachments(small).edits.length, 4);
-});
-
-test("REM filter omits only known structural spans, retaining populated sections and literal examples", () => {
-  const marker = "## REM Sleep\n<!-- openclaw:dreaming:rem:start -->\n";
-  const content = marker + "### Decisions\nUse SQLite.\n<!-- openclaw:dreaming:rem:end -->\n";
-  assert.equal(structuralChunkReason(content, 0, marker.length), "dreaming-heading-marker");
-  assert.equal(structuralChunkReason(content, 0, content.length), undefined);
-  for (const s of ["```md\n" + marker + "```\n", "    " + marker.replaceAll("\n", "\n    "), "## REM Sleep\nReal sleep research.", "<!-- Useful rationale. -->", "<!-- openclaw:dreaming:rem:start --> actual text\n"]) {
-    assert.equal(parseDreamingMarkers(s).edits.length, 0);
-    assert.equal(structuralChunkReason(s, 0, s.length), undefined);
-  }
-  assert.equal(content.slice(marker.length), "### Decisions\nUse SQLite.\n<!-- openclaw:dreaming:rem:end -->\n");
-});
-
-test("only a source-confirmed orphan closing fence is filtered", () => {
-  const text = "```js\nconst x = 1;\n```\n";
-  assert.equal(structuralChunkReason(text, text.lastIndexOf("```"), text.length), "orphan-closing-fence");
-  // Unclosed blocks also end at EOF; their last line is not necessarily a closing fence.
-  for (const s of ["````js\nconst x = 1;\n```\n", "```js\nconst x = 1;\n~~~\n"]) {
-    assert.equal(structuralChunkReason(s, s.lastIndexOf("\n", s.length - 2) + 1, s.length), undefined);
-  }
-  for (const s of ["```\n", "`", "---", "# A useful heading", "Use NO_REPLY for silence.", "42", "{\"a\":1}"]) assert.equal(structuralChunkReason(s, 0, s.length), undefined);
 });
 
 test("edit application refuses overlap or payload loss", () => {

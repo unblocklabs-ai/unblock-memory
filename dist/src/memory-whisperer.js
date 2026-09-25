@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
-import { buildSkillWhispererQuery } from "./skill-whisperer.js";
 import { judgeTypeSafeMemories } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { memoryConversation } from "./whisperer-context.js";
+import { buildSkillWhispererQuery, memoryConversation } from "./whisperer-context.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
 import { MlxQueryGenerator, queryConversation } from "./mlx-query.js";
 import { judgeTrainingInput, TRAINING_GATE_THRESHOLD } from "./training-gate.js";

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { ACTIVE_EVENT_COUNT_SQL, ACTIVE_EVENT_ROWS_SQL, assertAgentTranscriptSchema } from "./agent-transcript.js";
 import type { ResponseAuditConfig } from "./response-config.js";
 import { messageText } from "./whisperer-context.js";
 import { responseUserText } from "./response-text.js";
@@ -159,11 +160,7 @@ export class ResponseTranscriptReader {
     this.#db = new DatabaseSync(path, { readOnly: true });
     try {
       this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
-      const version = this.#db.prepare("PRAGMA user_version").get()?.user_version;
-      const meta = this.#db.prepare("SELECT role,agent_id,schema_version FROM schema_meta WHERE meta_key='primary'").get();
-      if (![17, 18, 19].includes(Number(version)) || meta?.role !== "agent" || meta.agent_id !== agentId || meta.schema_version !== version) {
-        throw new Error("Unsupported response-audit transcript schema or agent");
-      }
+      assertAgentTranscriptSchema(this.#db, agentId, "Unsupported response-audit transcript schema or agent");
     } catch (error) { this.#db.close(); throw error; }
   }
   sessions(config: ResponseAuditConfig, now: number, after = "") {
@@ -195,13 +192,9 @@ export class ResponseTranscriptReader {
             window.conversationId !== input.conversationId || window.chatType !== input.chatType))) return null;
       const session: ResponseSession = { sessionId, accountId: String(window.accountId),
         conversationId: String(window.conversationId), chatType: String(window.chatType) };
-      const count = this.#db.prepare(`SELECT COUNT(*) n,COALESCE(SUM(length(e.event_json)),0) bytes
-        FROM session_transcript_active_events a JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq
-        WHERE a.session_id=?`).get(session.sessionId)!;
+      const count = this.#db.prepare(ACTIVE_EVENT_COUNT_SQL).get(session.sessionId)!;
       if (Number(count.n) > MAX_EVENTS || Number(count.bytes) > MAX_SESSION_BYTES) return undefined;
-      const rows = this.#db.prepare(`SELECT e.seq,e.event_json eventJson,e.created_at createdAt
-        FROM session_transcript_active_events a JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq
-        WHERE a.session_id=? ORDER BY a.active_position`).all(session.sessionId) as Row[];
+      const rows = this.#db.prepare(ACTIVE_EVENT_ROWS_SQL).all(session.sessionId) as Row[];
       // Exact active content catches in-place edits and branch changes even when writer
       // watermarks are absent. Raw text is never retained in the checkpoint database.
       const revision = hash([RESPONSE_EXTRACTOR_VERSION, session, config.historyMessages, [...config.senderIds].sort(), rows]);

@@ -7,7 +7,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { QmdMemoryManager } from "../../src/manager.js";
 import { resolveSources } from "../../src/sources.js";
-import { buildSkillWhispererQuery } from "../../src/skill-whisperer.js";
+import { buildSkillWhispererQuery } from "../../src/whisperer-context.js";
 import { cases } from "./cases.js";
 import { selectTypeSafeSkill } from "../../src/typesafe.js";
 import { TYPESAFE_MODEL } from "../../src/typesafe-client.js";

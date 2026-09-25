@@ -7,14 +7,7 @@ import { TrainingStore } from "./training-store.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { collectTraining, runTraining } from "./training.js";
 import { generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, TRAINING_EVALUATION_CONCURRENCY } from "./training-queries.js";
-function dateOption(value, fallback) {
-    if (value === undefined)
-        return fallback;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value) {
-        throw new Error("Dates must be valid YYYY-MM-DD UTC dates");
-    }
-    return Date.parse(value);
-}
+import { dateOption } from "./date-option.js";
 function thresholdOption(value) {
     const result = Number(value);
     if (!value.trim() || !Number.isFinite(result) || result < 0 || result > 1)

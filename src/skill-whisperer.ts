@@ -4,7 +4,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { SkillSearchCandidate } from "./manager.js";
 import { selectTypeSafeSkill } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { messageText } from "./whisperer-context.js";
+import { buildSkillWhispererQuery, messageText } from "./whisperer-context.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 
 const CANDIDATE_LIMIT = 10;
@@ -30,19 +30,6 @@ type SessionState = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-export function buildSkillWhispererQuery(
-  prompt: string,
-  messages: readonly unknown[],
-  historyMessages: number,
-): string {
-  const availableHistory = messages.flatMap((message) => {
-    const parsed = messageText(message);
-    return parsed ? [`${parsed.role}: ${parsed.text}`] : [];
-  });
-  const history = historyMessages === 0 ? [] : availableHistory.slice(-historyMessages);
-  return [...history, `user: ${prompt.trim()}`].join("\n\n").slice(-MAX_QUERY_CHARS);
 }
 
 function typeSafeConversation(prompt: string, messages: readonly unknown[], historyMessages: number) {

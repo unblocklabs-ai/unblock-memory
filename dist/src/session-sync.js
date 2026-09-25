@@ -3,10 +3,10 @@ import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ACTIVE_EVENTS_FROM, agentTranscriptSchemaVersion, assertAgentTranscriptIdentity } from "./agent-transcript.js";
 import { projectSessionDocument, sessionDocumentPath, } from "./session-projector.js";
 const MANIFEST_VERSION = 1;
 export const PROJECTOR_VERSION = 7;
-const SUPPORTED_SCHEMA_VERSIONS = new Set([17, 18, 19]);
 // Source lives in src/, published code in dist/src/. Read our own pinned dependency
 // metadata, not QMD internals (which may also be substituted by runtime inspectors).
 const sourcePackage = new URL("../package.json", import.meta.url);
@@ -76,12 +76,7 @@ function projectionPath(outputDir, documentPath) {
     return target;
 }
 function assertSchema(db, expectedAgentId) {
-    const pragma = db.prepare("PRAGMA user_version").get();
-    const schemaVersion = pragma?.user_version;
-    if (typeof schemaVersion !== "number" || !SUPPORTED_SCHEMA_VERSIONS.has(schemaVersion)) {
-        throw new Error("unsupported OpenClaw agent database schema: expected one of 17, 18, 19, " +
-            `found ${String(schemaVersion ?? "unknown")}`);
-    }
+    const version = agentTranscriptSchemaVersion(db);
     for (const [table, required] of Object.entries(REQUIRED_COLUMNS)) {
         const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all()
             .map((column) => column.name));
@@ -89,14 +84,7 @@ function assertSchema(db, expectedAgentId) {
         if (missing)
             throw new Error(`unsupported OpenClaw agent database: missing ${table}.${missing}`);
     }
-    const meta = db.prepare("SELECT role, schema_version AS schemaVersion, agent_id AS agentId " +
-        "FROM schema_meta WHERE meta_key = 'primary' LIMIT 1").get();
-    if (meta?.role !== "agent" || meta.schemaVersion !== schemaVersion) {
-        throw new Error("unsupported OpenClaw agent database primary schema metadata");
-    }
-    if (meta.agentId !== expectedAgentId) {
-        throw new Error(`OpenClaw agent database belongs to ${String(meta.agentId)}, not ${expectedAgentId}`);
-    }
+    assertAgentTranscriptIdentity(db, expectedAgentId, version);
 }
 function readSnapshot(params) {
     const db = new DatabaseSync(params.databasePath, { readOnly: true });
@@ -129,13 +117,11 @@ function readSnapshot(params) {
       ORDER BY window.created_at, window.session_id
     `).all(...params.chatTypes);
         const readEvents = db.prepare(`
-      SELECT active.session_id AS sessionId, event.event_json AS eventJson,
-             event.created_at AS createdAt
-      FROM session_transcript_active_events AS active
-      JOIN transcript_events AS event
-        ON event.session_id = active.session_id AND event.seq = active.event_seq
-      WHERE active.session_id = ?
-      ORDER BY active.active_position
+      SELECT a.session_id AS sessionId, e.event_json AS eventJson,
+             e.created_at AS createdAt
+      ${ACTIVE_EVENTS_FROM}
+      WHERE a.session_id = ?
+      ORDER BY a.active_position
     `);
         const events = new Map();
         const changed = new Set();

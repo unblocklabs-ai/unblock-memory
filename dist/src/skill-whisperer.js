@@ -1,20 +1,12 @@
 import { basename } from "node:path";
 import { selectTypeSafeSkill } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { messageText } from "./whisperer-context.js";
+import { buildSkillWhispererQuery, messageText } from "./whisperer-context.js";
 const CANDIDATE_LIMIT = 10;
 const MAX_QUERY_CHARS = 12_000;
 const TYPESAFE_CANDIDATE_LIMIT = 3;
 function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-export function buildSkillWhispererQuery(prompt, messages, historyMessages) {
-    const availableHistory = messages.flatMap((message) => {
-        const parsed = messageText(message);
-        return parsed ? [`${parsed.role}: ${parsed.text}`] : [];
-    });
-    const history = historyMessages === 0 ? [] : availableHistory.slice(-historyMessages);
-    return [...history, `user: ${prompt.trim()}`].join("\n\n").slice(-MAX_QUERY_CHARS);
 }
 function typeSafeConversation(prompt, messages, historyMessages) {
     const currentRequest = prompt.trim().slice(-MAX_QUERY_CHARS);

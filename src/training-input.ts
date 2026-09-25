@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { ACTIVE_EVENT_COUNT_SQL, ACTIVE_EVENT_ROWS_SQL, assertAgentTranscriptSchema } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 
@@ -98,11 +99,7 @@ export class TrainingTranscriptReader {
     this.#db = new DatabaseSync(path, { readOnly: true });
     try {
       this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
-      const version = this.#db.prepare("PRAGMA user_version").get()?.user_version;
-      const meta = this.#db.prepare("SELECT role,agent_id,schema_version FROM schema_meta WHERE meta_key='primary'").get();
-      if (![17, 18, 19].includes(Number(version)) || meta?.role !== "agent" || meta.agent_id !== agentId || meta.schema_version !== version) {
-        throw new Error("Unsupported training transcript schema or agent");
-      }
+      assertAgentTranscriptSchema(this.#db, agentId, "Unsupported training transcript schema or agent");
       const columns = this.#db.prepare("PRAGMA table_info(session_windows)").all().map(c => c.name);
       this.#lineage = ["parent_session_key", "spawned_by", "plugin_owner_id", "hook_external_content_source"].every(c => columns.includes(c));
     } catch (error) { this.#db.close(); throw error; }
@@ -120,13 +117,9 @@ export class TrainingTranscriptReader {
       if (!session || !["channel", "group", "direct"].includes(String(session.chat_type)) ||
         /:(?:cron|subagent|heartbeat|hook)(?::|$)/i.test(String(session.session_key)) ||
         session.parent_session_key || session.spawned_by || session.plugin_owner_id || session.hook_external_content_source) return null;
-      const size = this.#db.prepare(`SELECT COUNT(*) n,COALESCE(SUM(length(e.event_json)),0) bytes
-        FROM session_transcript_active_events a JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq
-        WHERE a.session_id=?`).get(sessionId)!;
+      const size = this.#db.prepare(ACTIVE_EVENT_COUNT_SQL).get(sessionId)!;
       if (Number(size.n) > 50_000 || Number(size.bytes) > 32_000_000) return { oversized: true as const };
-      const rows = this.#db.prepare(`SELECT e.seq,e.event_json eventJson,e.created_at createdAt
-        FROM session_transcript_active_events a JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq
-        WHERE a.session_id=? ORDER BY a.active_position`).iterate(sessionId) as Iterable<Row>;
+      const rows = this.#db.prepare(ACTIVE_EVENT_ROWS_SQL).iterate(sessionId) as Iterable<Row>;
       return trainingExamples(rows);
     } finally { this.#db.exec("COMMIT"); }
   }

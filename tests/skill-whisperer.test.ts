@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
 import test from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { buildSkillWhispererQuery, registerSkillWhisperer } from "../src/skill-whisperer.js";
+import { registerSkillWhisperer } from "../src/skill-whisperer.js";
+import { buildSkillWhispererQuery } from "../src/whisperer-context.js";
 import type { UnblockMemoryConfig } from "../src/config.js";
 
 const disabledTypeSafe = { enabled: false, timeoutMs: 1500 };

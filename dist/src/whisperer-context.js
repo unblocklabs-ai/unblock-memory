@@ -1,3 +1,4 @@
+const MAX_SKILL_QUERY_CHARS = 12_000;
 /** Only visible user/assistant text; never system, tool, image, or thinking blocks. */
 export function messageText(message) {
     if (!message || typeof message !== "object" || !("role" in message) || !("content" in message) ||
@@ -9,6 +10,14 @@ export function messageText(message) {
                 "text" in part && typeof part.text === "string" ? [part.text] : [];
         }).join("\n").trim() : "";
     return text ? { role: message.role, text } : undefined;
+}
+export function buildSkillWhispererQuery(prompt, messages, historyMessages) {
+    const availableHistory = messages.flatMap(message => {
+        const parsed = messageText(message);
+        return parsed ? [`${parsed.role}: ${parsed.text}`] : [];
+    });
+    const history = historyMessages === 0 ? [] : availableHistory.slice(-historyMessages);
+    return [...history, `user: ${prompt.trim()}`].join("\n\n").slice(-MAX_SKILL_QUERY_CHARS);
 }
 export function memoryConversation(prompt, messages) {
     const currentRequest = prompt.trim().slice(-16_000);

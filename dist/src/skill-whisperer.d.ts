@@ -12,6 +12,5 @@ type SkillWhispererRuntime = {
         agentId: string;
     }, path: string): string | undefined;
 };
-export declare function buildSkillWhispererQuery(prompt: string, messages: readonly unknown[], historyMessages: number): string;
 export declare function registerSkillWhisperer(api: OpenClawPluginApi, runtime: SkillWhispererRuntime, config: UnblockMemoryConfig["skillWhisperer"], typesafe: UnblockMemoryConfig["typesafe"], diagnostics?: WhispererDiagnostics): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined;
 export {};

@@ -1,6 +1,6 @@
 # Unblock Memory — Vision
 
-**Written 2026-08-29; revised 2026-08-31.** This is the whole-product vision as it stands today,
+**Written 2026-08-29; revised 2026-08-31.** This is a dated whole-product vision,
 synthesized from the planning documents, the shipped MVP, and the direction
 conversations consolidated in `planning/entity-whispering-direction.md`. It describes
 the destination; the README describes what is implemented. Where this document
