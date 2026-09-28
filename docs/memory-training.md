@@ -25,10 +25,13 @@ changes, memory writes, live-index mutation or automatic background inference.
 8. Independently select the highest-scoring exact query across both rounds for each
    lane, with stable candidate-order ties. Export one `{"lex":"...","vec":"..."}`.
 
-There is one passage grader, not a training-only rubric. Flag failures and examples
-where either lane finds no passage meeting the runtime usefulness threshold (default
-0.7) for manual review. This threshold only flags examples; query scores use raw
-probabilities. Unresolved examples receive no target and are not exported for training.
+There is one passage grader, not a training-only rubric. Keep valid, fully evaluated
+examples even when one or both lanes find no useful evidence. Low scores and empty
+retrieval do not disqualify good queries; select the best query per lane, preserving
+candidate order on ties. The runtime usefulness threshold controls live hints only,
+not training eligibility. Flag failed evaluations, malformed teacher outputs, and
+unavailable historical snapshots for review; these unresolved examples receive no
+target and are not exported for training.
 V2 replaces v1 in place; no v1 execution mode or old-output compatibility parser.
 
 ## Commands
@@ -159,12 +162,15 @@ exact inputs, one `{lex, vec}` target, all lane/round scores and passage referen
 recall probability, corpus coverage and teacher/retrieval/judgment provenance.
 Recall-gate exports include negatives. Export revalidates input sources but does
 not rerun retrieval; evaluate first if a fresh corpus assessment is desired.
+Export reselects targets from saved completed scores, including older v2 evaluations
+excluded only for no useful evidence. It makes no new Luna/TypeSafe calls, records
+the current target policy, and leaves original checkpoint/attempt records untouched.
 
 Freeze one **recall-gate export per node after recall labeling and before selecting
 successful query targets**. Reuse these same files for every preparation/evaluation
 of that cohort; their hashes are recorded in the prepared manifest. Preparation
-uses all completed recall-positive inputs (**>=0.7**), including examples with failed,
-missing, or no-useful-evidence query targets. Negative recall rows are not query examples.
+uses all completed recall-positive inputs (**>=0.7**), including examples with failed
+or missing query targets. Negative recall rows are not query examples.
 
 Transfer privately and verify hashes. Deduplicate identical training inputs while
 retaining source provenance; quarantine suspected secrets. Compute train/validation

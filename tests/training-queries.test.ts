@@ -167,26 +167,66 @@ test("raw top-three mean and stable lane winners do not threshold probabilities"
   assert.deepEqual(selectTrainingQueries([q("first", "lex", 0.1), q("tie", "lex", 0.1), q("other", "vec", 0)]), { lex: "first", vec: "other" });
 });
 
-test("one lane without useful evidence is flagged, preserves scores and never forces a target", async t => {
+test("low-scoring and empty lanes retain targets independently of the live usefulness threshold", async t => {
   const f = fixture(t), host = runtime();
   t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(gradeResponse(0.69))));
   const search = searchFixture(async (_query, lane) => lane === "lex" ? [hit()] : []);
   await f.store.locked(async () => {
     f.initialize(); await generateTrainingQueries(f.source, f.store, host, options);
     const done = await evaluateTrainingQueries(f.source, f.store, config, host, {}, search);
-    assert.equal(done.evaluated, 1); assert.equal(done.flagged, 1);
-    assert.equal([...exportQueryTraining(f.store)].length, 0);
+    assert.equal(done.evaluated, 1); assert.equal(done.flagged, 0);
+    const target = { lex: candidates("lex", 1)[0], vec: candidates("vec", 1)[0] };
+    assert.deepEqual([...exportQueryTraining(f.store)][0]!.target, target);
     const [evaluation] = f.store.completedEvaluations();
-    assert.equal(evaluation!.selected, null);
-    assert.deepEqual(evaluation!.review, ["lex-no-useful-evidence", "vec-no-useful-evidence"]);
+    assert.deepEqual(evaluation!.selected, target);
+    assert.deepEqual(evaluation!.review, []);
     assert.ok(evaluation!.queries.filter(q => q.lane === "lex").every(q => q.score === 0.69));
     assert.ok(evaluation!.queries.filter(q => q.lane === "vec").every(q => q.score === 0));
-    assert.equal(f.store.reviews()[0]!.reason, "no-useful-evidence");
+    assert.equal(f.store.reviews().length, 0);
     assert.equal((await evaluateTrainingQueries(f.source, f.store, config, {}, {}, search)).calls, 0);
     const zeroThreshold = { ...config, memoryWhisperer: { ...config.memoryWhisperer, minUsefulness: 0 } };
-    assert.equal((await evaluateTrainingQueries(f.source, f.store, zeroThreshold, {}, {}, search)).flagged, 1);
-    assert.ok(f.store.completedEvaluations().some(item => item.review.join() === "vec-no-useful-evidence"));
-    assert.equal([...exportQueryTraining(f.store)].length, 0); // Empty retrieval is never evidence, even at threshold zero.
+    const cached = await evaluateTrainingQueries(f.source, f.store, zeroThreshold, {}, {}, search);
+    assert.equal(cached.calls, 0); assert.equal(cached.flagged, 0);
+    assert.equal(f.store.completedEvaluations().length, 1);
+    assert.deepEqual([...exportQueryTraining(f.store)][0]!.target, target);
+  });
+});
+
+test("all-empty retrieval exports stable winners and recovers old usefulness-only exclusions without calls", async t => {
+  const f = fixture(t), host = runtime();
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("Empty retrieval must not call TypeSafe"); });
+  const search = searchFixture(async () => []);
+  const db = new DatabaseSync(f.storePath);
+  t.after(() => db.close());
+  await f.store.locked(async () => {
+    f.initialize(); await generateTrainingQueries(f.source, f.store, host, options);
+    const done = await evaluateTrainingQueries(f.source, f.store, config, host, {}, search);
+    assert.equal(done.flagged, 0);
+    const [original] = [...exportQueryTraining(f.store)];
+    assert.ok(original);
+    assert.deepEqual(original.target, { lex: candidates("lex", 1)[0], vec: candidates("vec", 1)[0] });
+    assert.ok(original.evaluation.queries.every(query => query.score === 0));
+
+    // Reproduce the persisted shape written by 0.4.0, without deleting any paid work.
+    const record = db.prepare("SELECT id,result_json FROM training_steps WHERE stage='evaluate'").get()!;
+    const legacy = { ...JSON.parse(String(record.result_json)), selected: null,
+      review: ["lex-no-useful-evidence", "vec-no-useful-evidence"] };
+    db.prepare("UPDATE training_steps SET result_json=? WHERE id=?").run(JSON.stringify(legacy), record.id);
+    const source = f.store.queryExamples()[0]!;
+    f.store.flagReview(source, "no-useful-evidence", { lanes: legacy.review, evaluationId: String(record.id) });
+    const attempts = db.prepare("SELECT COUNT(*) n FROM training_step_attempts").get()!.n;
+
+    const [recovered] = [...exportQueryTraining(f.store)];
+    assert.deepEqual(recovered!.target, original.target);
+    assert.equal(recovered!.targetPolicy, "best-per-lane-no-minimum-v1");
+    assert.deepEqual(recovered!.evaluation.review, []);
+    assert.equal(f.store.reviews().length, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM training_step_attempts").get()!.n, attempts);
+    assert.equal(f.store.completedEvaluations()[0]!.selected, null); // Original audit data stays untouched.
+    assert.equal(db.prepare("SELECT reason FROM training_reviews").get()!.reason, "no-useful-evidence");
+
+    f.store.flagReview(source, "evaluation-unresolved", { steps: [String(record.id)] });
+    assert.equal([...exportQueryTraining(f.store)].length, 0); // A newer failure must still block export.
   });
 });
 

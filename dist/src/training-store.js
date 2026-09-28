@@ -246,9 +246,11 @@ export class TrainingStore {
         this.#db.prepare("DELETE FROM training_reviews WHERE source_id=? AND recipe=?").run(sourceId, TRAINING_RECIPE_VERSION);
     }
     reviews() {
+        // Old usefulness-only flags remain in SQLite for audit, but no longer block training.
         return this.#db.prepare(`SELECT r.source_id sourceId,r.input_hash inputHash,r.reason,r.details_json details,r.updated_at updatedAt
       FROM training_reviews r JOIN training_examples e ON e.id=r.source_id
-      WHERE r.recipe=? AND e.active=1 AND e.input_hash=r.input_hash ORDER BY r.updated_at DESC,r.source_id`)
+      WHERE r.recipe=? AND e.active=1 AND e.input_hash=r.input_hash AND r.reason!='no-useful-evidence'
+      ORDER BY r.updated_at DESC,r.source_id`)
             .all(TRAINING_RECIPE_VERSION).map(row => ({ sourceId: String(row.sourceId), inputHash: String(row.inputHash),
             reason: String(row.reason), details: JSON.parse(String(row.details)), updatedAt: Number(row.updatedAt) }));
     }

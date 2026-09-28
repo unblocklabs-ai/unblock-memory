@@ -7,6 +7,7 @@ import { historicalTrainingSearch, HistoricalCorpusUnavailableError, TRAINING_RE
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
 const LANES = ["lex", "vec"];
 const SELECTION_VERSION = "independent-lanes-top3-mean-v2";
+const TARGET_POLICY = "best-per-lane-no-minimum-v1";
 export const TRAINING_EVALUATION_CONCURRENCY = 4;
 function bounds(options) {
     for (const value of [options.maxExamples, options.maxCalls, options.maxInputBytes, options.concurrency]) {
@@ -226,15 +227,10 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
             const evaluation = store.step("evaluate", { version: SELECTION_VERSION, sourceId: example.id, inputHash: example.inputHash,
                 timestamp: example.timestamp, teacherIds: initial.map(({ step }) => step.id), corpusHash: snapshot.corpusHash,
                 retrievalVersion: TRAINING_RETRIEVAL_VERSION, judgeVersion: CONTEXT_JUDGE_VERSION,
-                minUsefulness: config.memoryWhisperer.minUsefulness, options: TRAINING_SEARCH_OPTIONS });
+                options: TRAINING_SEARCH_OPTIONS });
             if (evaluation.result) {
                 result.cached++;
-                if (evaluation.result.review.length) {
-                    result.flagged++;
-                    store.flagReview(example, "no-useful-evidence", { lanes: evaluation.result.review, evaluationId: evaluation.id });
-                }
-                else
-                    store.clearReview(example.id);
+                store.clearReview(example.id);
                 return;
             }
             if (evaluation.status !== "pending") {
@@ -369,18 +365,10 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
             if (lanes.some(lane => !lane))
                 return; // Budget pause: completed operations remain reusable.
             const queries = lanes.flatMap(lane => lane.queries);
-            const review = LANES.filter(lane => !queries.some(query => query.lane === lane && query.judgments.length > 0 &&
-                query.maxProbability >= config.memoryWhisperer.minUsefulness))
-                .map(lane => `${lane}-no-useful-evidence`);
-            const selected = review.length ? null : selectTrainingQueries(queries);
+            const selected = selectTrainingQueries(queries);
             save(store, evaluation, { sourceId: example.id, inputHash: example.inputHash, timestamp: example.timestamp,
-                corpusHash: snapshot.corpusHash, corpusReport: snapshot.report, teacherIds: lanes.flatMap(lane => lane.teacherIds), queries, selected, review });
-            if (review.length) {
-                store.flagReview(example, "no-useful-evidence", { lanes: review, evaluationId: evaluation.id });
-                result.flagged++;
-            }
-            else
-                store.clearReview(example.id);
+                corpusHash: snapshot.corpusHash, corpusReport: snapshot.report, teacherIds: lanes.flatMap(lane => lane.teacherIds), queries, selected, review: [] });
+            store.clearReview(example.id);
             result.evaluated++;
         }
         finally {
@@ -414,14 +402,17 @@ export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD)
         if (!source || source.inputHash !== evaluation.inputHash || source.timestamp !== evaluation.timestamp || exported.has(source.id))
             continue;
         exported.add(source.id); // Never fall back to an older accepted corpus after a newer flagged result.
-        if (!evaluation.selected || unresolved.has(source.id))
+        if (unresolved.has(source.id))
             continue;
         if (!LANES.every(lane => evaluation.teacherIds.includes(store.step("generate", teacherRequest(source, lane)).id)))
             continue;
+        // Selection is a local policy over completed scores, not another paid step.
+        // This also recovers v2 checkpoints whose old usefulness policy saved null.
+        const selected = selectTrainingQueries(evaluation.queries);
         const provenance = [...evaluation.teacherIds, ...evaluation.queries.flatMap(q => [q.retrievalId, ...q.judgments])];
         yield { stage: "query-training", input: JSON.parse(source.inputJson), inputHash: source.inputHash,
-            recallProbability: source.recallProbability, threshold, target: evaluation.selected,
-            source: store.sourceDetails(source.id), evaluation, splitGroup: trainingHash(source.sessionId),
+            recallProbability: source.recallProbability, threshold, target: selected, targetPolicy: TARGET_POLICY,
+            source: store.sourceDetails(source.id), evaluation: { ...evaluation, selected, review: [] }, splitGroup: trainingHash(source.sessionId),
             provenance: [...new Set(provenance)].map(id => store.stepRecord(id)) };
     }
 }

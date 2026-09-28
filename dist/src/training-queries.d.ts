@@ -102,12 +102,15 @@ export declare function exportQueryTraining(store: TrainingStore, threshold?: nu
     recallProbability: number;
     threshold: number;
     target: QueryPair;
+    targetPolicy: string;
     source: {
         nodeId: string;
         agentId: string;
         sourceId: string;
     };
     evaluation: {
+        selected: QueryPair;
+        review: never[];
         sourceId: string;
         inputHash: string;
         timestamp: number;
@@ -121,8 +124,6 @@ export declare function exportQueryTraining(store: TrainingStore, threshold?: nu
             excludedChunks: number;
         };
         queries: QueryEvaluation[];
-        selected: QueryPair | null;
-        review: string[];
     };
     splitGroup: string;
     provenance: {
