@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { MlxQueryGenerator } from "../src/mlx-query.js";
 
-test("query worker keeps usable strings and drops only exact duplicates", async t => {
+test("query worker accepts only a complete v2 lex/vec pair and never salvages v1 output", async t => {
   const root = await mkdtemp(join(tmpdir(), "unblock-mlx-queries-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const worker = join(root, "worker.mjs");
@@ -22,18 +22,12 @@ for await (const line of createInterface({ input: process.stdin })) {
   const signal = AbortSignal.timeout(5000);
   const generate = (currentRequest: string) => generator.generate({ history: [], currentRequest }, signal);
 
-  const first = "Alice mushrooms project information and current status";
-  const second = "Alice mushrooms project project overview and current status";
-  for (const [queries, expected] of [
-    [[first, second, first], [first, second]],
-    [[first, first, first], [first]],
-    [[first], [first]],
-    [[" Alice ", "Alice", "alice", "", null, 42], ["Alice", "alice"]],
-    [["a", "b", "c", "d"], ["a", "b", "c", "d"]],
-  ]) {
-    assert.deepEqual(await generate(JSON.stringify({ queries })), expected);
-  }
-  for (const output of ['{"queries":', '{"queries":[null," "]}', '{"queries":"Alice"}']) {
-    await assert.rejects(generate(output), /No usable generated queries/);
+  assert.deepEqual(await generate('{"lex":" Alice mushrooms ","vec":"Alice project current status"}'),
+    { lex: "Alice mushrooms", vec: "Alice project current status" });
+  // Identical wording is valid: the two fields still route to different backends.
+  assert.deepEqual(await generate('{"lex":"Alice","vec":"Alice"}'), { lex: "Alice", vec: "Alice" });
+  for (const output of ['{"queries":["Alice"]}', '{"lex":', '{"lex":"Alice"}',
+    '{"lex":"Alice","vec":" "}', '{"lex":42,"vec":"Alice"}', '{"lex":"Alice","vec":"Alice","extra":true}']) {
+    await assert.rejects(generate(output), /Invalid generated lex\/vec query pair/);
   }
 });

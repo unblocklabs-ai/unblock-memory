@@ -124,6 +124,7 @@ test("read-only extraction excludes cron sessions and inactive branches; dry col
   const f = fixture(t);
   f.add("real", [user("Real"), assistant("Answer")]);
   f.add("cron", [user("Cron"), assistant("Answer")]);
+  f.add("oversized", [user("x".repeat(24001)), assistant("Answer")]);
   f.db.prepare("UPDATE session_windows SET session_key='agent:main:cron:job' WHERE session_id='cron'").run();
   f.append("real", [user("Retracted"), assistant("Answer")]);
   f.db.prepare("DELETE FROM session_transcript_active_events WHERE session_id='real' AND event_seq>2").run();
@@ -138,6 +139,7 @@ test("read-only extraction excludes cron sessions and inactive branches; dry col
   const result = collectTraining(f.source);
   assert.equal(result.eligible, 1);
   assert.equal(result.excludedSessions, 1);
+  assert.deepEqual(result.review, [{ sessionId: "oversized", seq: 1, reason: "current-request-exceeds-context-budget" }]);
   assert.deepEqual(f.store.status(0.7), beforeFiles);
 });
 
@@ -179,7 +181,7 @@ test("appends preserve previous gates; edits invalidate only affected inputs; re
     await runTraining(f.source, f.store, config, bounds);
     f.append("s", [user("Third"), assistant("Third answer")]);
     assert.deepEqual(collectTraining(f.source, f.store), { sessions: 1, excludedSessions: 0, oversizedSessions: 0, eligible: 3,
-      users: 3, filtered: 0, oversized: 0, unanswered: 0, added: 1, changed: 0, unchanged: 2, retired: 0 });
+      users: 3, filtered: 0, oversized: 0, unanswered: 0, added: 1, changed: 0, unchanged: 2, retired: 0, review: [] });
     assert.equal((await runTraining(f.source, f.store, config, bounds)).calls, 1);
     f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='s' AND seq=4")
       .run(JSON.stringify({ type: "message", message: assistant("Edited second answer") }));
@@ -218,9 +220,10 @@ test("concurrent runs are excluded; interrupted requests stay ambiguous until ex
   let calls = 0;
   t.mock.method(globalThis, "fetch", async () => { calls++; return new Response(JSON.stringify(payload(0.9))); });
   await other.locked(async () => {
-    assert.equal(other.retry(false), 0);
+    const retryIds = other.status(0.7).retryable.map(row => String(row.id));
+    assert.equal(other.retry(false, retryIds), 0);
     assert.equal((await runTraining(f.source, other, config, bounds)).calls, 0);
-    assert.equal(other.retry(true), 1);
+    assert.equal(other.retry(true, retryIds), 1);
     assert.equal((await runTraining(f.source, other, config, bounds)).calls, 1);
   });
   assert.equal(calls, 1);
@@ -236,11 +239,30 @@ test("ambiguous transport failures are not silently retried; errors cannot leak 
     assert.equal(result.ambiguous, 1);
     assert.equal((await runTraining(f.source, f.store, config, bounds)).calls, 0);
     assert.doesNotMatch(JSON.stringify(f.store.status(0.7)), /private-test-key|provider body/);
-    assert.equal(f.store.retry(false), 0);
+    assert.equal(f.store.retry(false, f.store.status(0.7).retryable.map(row => String(row.id))), 0);
   });
   const db = new DatabaseSync(f.storePath, { readOnly: true });
   try { assert.equal(db.prepare("SELECT error FROM training_gates").get()!.error, "request_or_response_uncertain"); }
   finally { db.close(); }
+});
+
+test("a failed recall input is preserved for review while unrelated inputs continue", async t => {
+  const f = fixture(t);
+  for (const name of ["One", "Two", "Three"]) f.add(name, [user(name), assistant("Answer")]);
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return calls === 1 ? new Response("unavailable", { status: 503 }) : new Response(JSON.stringify(payload(0.9)));
+  });
+  await f.store.locked(async () => {
+    collectTraining(f.source, f.store);
+    const result = await runTraining(f.source, f.store, config, { ...bounds, concurrency: 1 });
+    assert.equal(result.calls, 3);
+    assert.equal(result.completed, 2);
+    assert.equal(result.ambiguous, 1);
+    assert.equal((await runTraining(f.source, f.store, config, bounds)).calls, 0);
+  });
+  assert.equal(calls, 3);
 });
 
 test("paid calls and serialized input have hard bounds; dry run and missing key do not attempt requests", async t => {
@@ -266,7 +288,7 @@ test("gate requires a valid probability, actual model and usage; HTTP rejection 
     collectTraining(f.source, f.store);
     assert.equal((await runTraining(f.source, f.store, config, bounds)).failed, 1);
     assert.equal((await runTraining(f.source, f.store, config, bounds)).calls, 0);
-    assert.equal(f.store.retry(false), 1);
+    assert.equal(f.store.retry(false, f.store.status(0.7).retryable.map(row => String(row.id))), 1);
   });
   for (const bad of [{ ...payload(0.9), usage: undefined }, payload(2), { ...payload(0.5), model: undefined }]) {
     mocked.mock.mockImplementation(async () => new Response(JSON.stringify(bad)));
@@ -356,41 +378,9 @@ test("expired leases fence old writers and preserve interrupted attempts for exp
     await other.locked(() => {
       assert.throws(() => f.store.finish(job.id, attempt, { probability: 0.9, model: "jev-1.13.0", usage: { input_tokens: 123, output_tokens: 20 } }), /lease lost/);
       assert.equal(other.pending(1).length, 0);
-      assert.equal(other.retry(false), 0);
-      assert.equal(other.retry(true), 1);
+      assert.equal(other.retry(false, [job.id]), 0);
+      assert.equal(other.retry(true, [job.id]), 1);
     });
     assert.throws(() => f.store.renew(), /lease lost/);
-  });
-});
-
-test("existing training databases gain indexed, live exclusion lookups without changing checkpoints", async t => {
-  const f = fixture(t), db = new DatabaseSync(f.storePath);
-  t.after(() => db.close());
-  // Simulate a pre-index database, including non-exclusions with similar JSON.
-  db.exec("DROP INDEX training_judgment_exclusions");
-  const insert = db.prepare("INSERT INTO training_steps (id,stage,status,request_json,result_json) VALUES (?,?,?,?,?)");
-  for (const [id, stage, status, result] of [
-    ["old", "judge", "complete", { excluded: true, reason: "operator-exclusion" }],
-    ["failed", "judge", "failed", { excluded: true }],
-    ["ordinary", "judge", "complete", { usefulness: 1 }],
-    ["other-stage", "generate", "complete", { excluded: true }],
-  ] as const) insert.run(id, stage, status, JSON.stringify({ identity: id }), JSON.stringify(result));
-  const before = db.prepare("SELECT * FROM training_steps ORDER BY id").all();
-  const reopened = new TrainingStore(f.storePath, "main");
-  t.after(() => reopened.close());
-  assert.deepEqual(db.prepare("SELECT * FROM training_steps ORDER BY id").all(), before);
-  assert.equal(reopened.judgmentExcluded("old"), true);
-  for (const identity of ["failed", "ordinary", "other-stage", "missing"]) assert.equal(reopened.judgmentExcluded(identity), false);
-  const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM training_steps WHERE stage='judge' AND status='complete'
-    AND json_extract(request_json,'$.identity')=? AND json_extract(result_json,'$.excluded')=1 LIMIT 1`).all("old");
-  assert.match(plan.map(row => row.detail).join("\n"), /SEARCH training_steps USING INDEX training_judgment_exclusions/);
-  await reopened.locked(() => {
-    const request = { identity: "new", excluded: true }, step = reopened.step("judge", request);
-    const attempt = reopened.startStep("judge", step.id, request);
-    assert.equal(reopened.judgmentExcluded("new"), false);
-    reopened.finishStep("judge", step.id, attempt, { result: { excluded: true, reason: "operator-exclusion" } });
-    assert.equal(reopened.judgmentExcluded("new"), true);
-    // An already-open store sees the new exclusion too; there is no stale cache.
-    assert.equal(f.store.judgmentExcluded("new"), true);
   });
 });

@@ -551,6 +551,34 @@ test("scopes vector search to named corpora and labels results", async () => {
   }
 });
 
+test("v2 Whisperer routes each query only to its lane across the approved corpus scope", async t => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-whisperer-lanes-"));
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const projects = resolveSource(workspace, "projects/**/*.md", "projects");
+  const store = await createStore({ dbPath: ":memory:", config: { collections: Object.fromEntries(
+    [memory, projects].map(source => [source.collection, { path: source.root, pattern: source.pattern }]),
+  ) } });
+  for (const [index, source] of [memory, projects].entries()) {
+    store.internal.insertContent(`lex${index}`, `Exactneedle lexical evidence ${index}`, "2026-01-01");
+    store.internal.insertDocument(source.collection, "lex.md", "Evidence", `lex${index}`, "2026-01-01", "2026-01-01");
+  }
+  const vector = t.mock.method(store, "searchVector", async (query: string, options: { limit: number; collection: string[] }) => {
+    assert.equal(query, "semantic intent only");
+    assert.equal(options.limit, 10);
+    assert.deepEqual(options.collection, [memory.collection, projects.collection]);
+    return [{ filepath: `qmd://${memory.collection}/vec.md`, body: "semantic evidence", chunkPos: 0, chunkLen: 17, score: 0.9 }];
+  });
+  const manager = new QmdMemoryManager({ dbPath: join(workspace, "unused.sqlite"), workspaceDir: workspace,
+    sources: [memory, projects], storeFactory: async () => store });
+  try {
+    const results = await manager.searchWhisperer({ lex: "Exactneedle", vec: "semantic intent only" },
+      { corpora: ["memory", "projects"], maxSnippetChars: 1200 });
+    assert.equal(vector.mock.callCount(), 1);
+    assert.deepEqual(new Set(results.map(result => result.snippet)),
+      new Set(["Exactneedle lexical evidence 0", "Exactneedle lexical evidence 1", "semantic evidence"]));
+  } finally { await manager.close(); }
+});
+
 test("keeps skills out of QMD while direct skill search watches frontmatter", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-skills-"));
   const dbPath = join(workspace, "index.sqlite");

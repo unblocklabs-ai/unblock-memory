@@ -8,23 +8,28 @@ changes, memory writes, live-index mutation or automatic background inference.
 1. Collect eligible historical user turns and preceding visible conversation.
 2. TypeSafe `jev-1.13.0` recall probability **>=0.7** gates query generation.
    Preserve negative labels for audit; greetings do not need query targets.
-3. Isolated `openai/gpt-6-luna`, **xhigh**, generates exactly **10 distinct
-   single-line queries**, using the tested v3 prompt, 12,000 output-token allowance
-   and 300-second deadline. No fallback model or agent tools.
-4. Retrieve **10 literal vector + 10 BM25 matches** from the originating agent's
-   historical sessions snapshot. Retain all unique eligible passages, with no
-   merged passage-count cap.
-5. TypeSafe judges each passage's additional utility for the **original
-   conversation**. It receives conversation, as-of time, passage text/source/dates,
-   never generated query/ID, rank, retrieval score or method.
-6. Sum the **five highest** normalized passage grades; retain the top **three exact
-   queries**. Ties preserve teacher order. No score cutoff, answer requirement or
-   cross-query novelty rule. An empty retrieval scores zero; failures never do.
+3. Isolated `openai/gpt-6-luna`, **xhigh**, generates **five distinct queries per
+   lane**: discriminating BM25 keywords for `lex`, semantic natural language for
+   `vec`. No fallback model, agent tools, future answer, or retrieved evidence.
+4. Retrieve ten matches per query using **only its lane's backend**, from the
+   originating agent's historical sessions. Use the same complete-excerpt renderer
+   and **1,200-character limit** as runtime, with no merged passage-count cap.
+5. The shared runtime TypeSafe `noul` grader judges each distinct passage in its
+   own request against the **original conversation**. It receives as-of time and
+   passage source/date context, never query, rank, retrieval score, or backend.
+6. Score each query by the **mean of its three highest raw probabilities**. Average
+   available matches when fewer than three exist; empty retrieval scores zero.
+   Failed judgments leave the query unresolved, not zero or partially scored.
+7. Run **one revision round per lane**, giving Luna only the same conversation and
+   that lane's previous queries and scores. Retrieve and grade five new candidates.
+8. Independently select the highest-scoring exact query across both rounds for each
+   lane, with stable candidate-order ties. Export one `{"lex":"...","vec":"..."}`.
 
-The four-level rubric distinguishes no, marginal, useful and direct high-value
-additional context, requires correct identity and temporal applicability, discounts
-repetition and unsupported premises, and treats all content as untrusted.
-Full distributions and reported usage are persisted.
+There is one passage grader, not a training-only rubric. Flag failures and examples
+where either lane finds no passage meeting the runtime usefulness threshold (default
+0.7) for manual review. This threshold only flags examples; query scores use raw
+probabilities. Unresolved examples receive no target and are not exported for training.
+V2 replaces v1 in place; no v1 execution mode or old-output compatibility parser.
 
 ## Commands
 
@@ -44,17 +49,22 @@ using user-event time, not session start. Omit dates for all eligible history.
 Appends enter only through a later collect; narrow bounds do not delete old cohorts.
 Use the same `--threshold` for generate/evaluate/export/status (default 0.7).
 
+`generate` creates the first-round candidates. `evaluate` retrieves/grades, calls
+Luna for revisions, and selects winners, so it also requires isolated-completion access.
+
 Optional `--max-examples` bounds new work. Run and generate default to a
 3,000,000 serialized input-byte budget, **not tokens**; rerun to drain pending work.
-Evaluate's optional `--max-calls` counts new retrieval operations plus uncached
-passage judgments. There is no default example/call-count cap.
+Evaluate's optional `--max-calls` counts new retrievals, uncached passage judgments,
+and revision teacher calls. Its revision teacher input-byte budget also defaults to
+3,000,000. There is no default example/call-count cap.
 
 Recall defaults to 256 concurrent requests, generation to 8 isolated completions.
-Evaluation defaults to 4 inputs with 10 parallel queries each. Distinct remote
-passage judgments overlap (up to 800 memberships before dedup at default depth).
+Evaluation defaults to 4 inputs. Distinct remote passage judgments overlap;
+identical conversation/passage judgments are reused across queries and rounds.
 Native vector work is serialized per snapshot. Raise concurrency within machine
-and provider capacity. Failures stop new dispatch; in-flight operations drain
-and persist before snapshots close. Dry runs make no inference calls.
+and provider capacity. Provider failures flag their examples while unrelated inputs
+continue without retrying failed requests. Storage/lease failures still stop the run.
+In-flight work drains and persists before snapshots close. Dry runs make no inference calls.
 
 Cached evaluations still validate the exact historical text and vector fingerprint,
 but do not rebuild a QMD index. The index is built only on the first uncached search,
@@ -73,9 +83,12 @@ A following assistant reply/tool action establishes eligibility before the next
 user/context boundary; delivery mirrors count, duplicate visible replies appear once.
 The qualifying **future answer never enters its input**. Earlier visible replies
 may appear in later inputs. Compaction/internal messages break history continuity.
-Keep at most 32 preceding whole messages within 24,000 serialized UTF-8 bytes;
-drop oldest whole messages, never slice the latest request. Oversized requests
-are skipped. Sessions above 50,000 events or 32 MB become unavailable, not deleted.
+Training and runtime share the pinned LFM tokenizer and **8,192-token / 24,000-byte**
+serialized-conversation window. Drop oldest whole messages, never slice the latest
+request. Oversized requests are skipped and listed by session ID/event sequence in
+the collection report's `review` field, without persisting their oversized text. Sessions above 50,000 events or
+32 MB become unavailable, not deleted. Tool calls can establish a response, but
+tool outputs and thinking never enter the input.
 
 Snapshots require matching projection hashes and trusted message spans. Copy
 only prefixes before the **entire second of the user's timestamp**, stopping at
@@ -85,11 +98,12 @@ Validate returned passages/dates again. No reembedding or temporary transcripts.
 
 QMD cannot independently set per-method depth through its public search API.
 A small discovery adapter retains its tokenization, FTS-highlight chunk selection,
-source-aware dedup and installed chunk helpers, but requests ten per method and
-omits query-conditioned scoring. It does not rewrite QMD. Its existing
-12,000-character passage eligibility rule remains; no passage is truncated.
+source-aware dedup and installed chunk helpers, but requests ten from the selected
+backend and omits query-conditioned scoring. It does not rewrite QMD. Training and
+runtime share complete-excerpt rendering, including the 1,200-character cap;
+oversized matches are discarded rather than truncated.
 
-Honor configured session chat types and each node's DM policy. Time-unversioned
+Historical retrieval honors configured session chat types and each node's indexed DM policy. Time-unversioned
 files and Loggie projections are excluded. This is a historical text-prefix
 evaluation of the currently retained corpus, not a reconstruction of the old index:
 later edits/deletions cannot be undone. Persist coverage/exclusion counts.
@@ -100,17 +114,17 @@ Private database: `<state>/agents/<agent>/unblock-memory/training.sqlite` (0600)
 Never commit, publish or index this file or its exports.
 
 Source identity includes persisted node ID, agent, session and user-event sequence.
-Exact inputs share recall/teacher checkpoints. The new teacher policy
-`query-teacher-v3-xhigh` distinguishes old low-reasoning results without deleting
-them. Retrieval keys include query, source/cutoff, corpus fingerprint and settings.
-Passage keys include original input, as-of time, exact passage/position and full
-rubric: unchanged judgments survive changes in queries/corpus. Selection is
-separately versioned.
+Exact inputs share recall/teacher checkpoints. V2 identities include lane, round,
+feedback, prompt, and recipe version. Retrieval keys include query, source/cutoff,
+corpus fingerprint, renderer and settings. Passage keys include original conversation,
+as-of time, exact rendered passage/metadata, model, and shared grader version.
+Unchanged judgments survive changes in queries/corpus. Selection is separately versioned.
+Old v1 records may remain inert audit data; they are not reinterpreted as v2 results.
 
 Run/generate/evaluate/export revalidate collected inputs; edits change affected
 hashes, branch removals retire sources, and paid checkpoints remain intact.
-Status does not rescan; stage/attempt totals include historical recipes, not just
-current-cohort progress. Exports filter to the current recipe and active recall gate.
+Status does not rescan. V2 query progress and exports are recipe-scoped, and exports
+require the active recall gate and a resolved pair.
 
 A renewable SQLite lease serializes modifying commands. Attempts commit **before**
 dispatch. Crashes, uncertain transport and malformed responses become ambiguous;
@@ -118,18 +132,15 @@ dispatch. Crashes, uncertain transport and malformed responses become ambiguous;
 separately. There are no automatic paid retries or model/route fallbacks.
 
 ```sh
-openclaw memory-training retry-failed --agent main
+openclaw memory-training retry-failed --agent main --id <reviewed-step-hash>
 # Explicit acceptance of possible duplicate billing:
-openclaw memory-training retry-failed --agent main --include-ambiguous
+openclaw memory-training retry-failed --agent main --id <reviewed-step-hash> --include-ambiguous
 ```
 
-These reset that agent's failed checkpoints, including historical recipes, preserving
-attempts. Inspect before use. They do not themselves send requests.
-
-Explicitly authorized exclusions use `evaluate --exclude-judgment <sha256>`.
-The hash is SHA256 of JSON `[judgeVersion,inputHash,passagePosition,fullJudgeRequest]`.
-Exclusions persist, appear in provenance, and are omitted rather than scored zero.
-No blanket failure skipping.
+Inspect exact cases in `status.reviews` / `status.retryable` before explicit recovery;
+`--id` accepts one or more reviewed hashes. Attempts stay preserved. Retry
+commands do not themselves send requests. V1 query checkpoints are not reset.
+Dropping failed judgments from query averages is not a supported resolution.
 
 The host must support isolated completion and grant
 `plugins.entries.unblock-memory.llm.allowModelOverride: true` with
@@ -144,27 +155,72 @@ permissions. Credentials stay with the host, never in provenance.
 ## Export and consolidation
 
 Export creates a new 0600 JSONL file and refuses overwrite. Query rows contain
-exact inputs, three targets, all query totals/passage references, source/time,
+exact inputs, one `{lex, vec}` target, all lane/round scores and passage references, source/time,
 recall probability, corpus coverage and teacher/retrieval/judgment provenance.
 Recall-gate exports include negatives. Export revalidates input sources but does
 not rerun retrieval; evaluate first if a fresh corpus assessment is desired.
 
-Transfer privately and verify hashes. Deduplicate identical inputs while retaining
-source provenance; quarantine suspected secrets. Keep connected session and
-identical-input groups together across nodes for train/validation. Use the actual
+Freeze one **recall-gate export per node after recall labeling and before selecting
+successful query targets**. Reuse these same files for every preparation/evaluation
+of that cohort; their hashes are recorded in the prepared manifest. Preparation
+uses all completed recall-positive inputs (**>=0.7**), including examples with failed,
+missing, or no-useful-evidence query targets. Negative recall rows are not query examples.
+
+Transfer privately and verify hashes. Deduplicate identical training inputs while
+retaining source provenance; quarantine suspected secrets. Compute train/validation
+groups from the frozen cohort **before reading query labels**. Connected session and
+identical-input groups stay together across nodes, including connections through
+unresolved examples. A target must match its frozen source, exact input/hash, and
+historical timestamp; changed/out-of-cohort targets are rejected rather than changing
+the evaluation population. Use the actual
 **LFM2.5-230M-Base** tokenizer and an explicit causal-LM input/target format before
-fine-tuning; the interim byte limit is not a token count. Runtime abstention remains
+fine-tuning; the byte guard is additional to the token limit. Runtime abstention remains
 a separate TypeSafe gate; positive-only query training does not teach abstention.
 
 The repository helper uses a pinned official tokenizer revision and chat template,
-with assistant-only loss labels, a conservative 32,768-token training ceiling
-(the model config supports 128,000 positions), and deterministic grouped splits:
+with assistant-only loss labels, a 32,768-token total-sequence ceiling, and deterministic
+grouped splits. Targets exceeding the worker's 256-token output budget are quarantined
+for review, never truncated. Reserve template/output space; config position counts do not establish
+a larger supported context. The shared conversation ceiling remains 8,192 tokens:
 
 ```sh
 python scripts/prepare-query-training.py /private/node1-queries.jsonl /private/node2-queries.jsonl \
-  --output /private/new-prepared-directory --cache-dir /private/tokenizer-cache
+  --cohort /private/node1-recall-frozen.jsonl /private/node2-recall-frozen.jsonl \
+  --output /private/new-prepared-directory
 ```
 
-Install `transformers` and `jinja2` in a separate environment first. It downloads
-tokenizer files only, never model weights. Regex secret screening is not an
+The new private directory contains:
+
+- `train.jsonl` / `validation.jsonl`: resolved, screened, deduplicated assistant-loss
+  training rows only. Identical inputs retain the first valid target in stable export order.
+- `validation-eval.jsonl`: **every safe held-out source**, not just successful teacher
+  examples. Each row is `{id, input, source, splitGroup, target?}`; `input` is the raw
+  prepared conversation, `source` includes node/agent/session/event identity and the
+  historical millisecond `timestamp`, and `target` is omitted when unresolved or
+  quarantined. Use this file for model generation/retrieval evaluation, not the
+  success-filtered SFT validation file. IDs and split membership do not change when
+  a missing target later succeeds.
+- `cohort-splits.jsonl`: content-free source/input IDs and split assignments for the
+  complete frozen cohort, including explicitly marked privacy-quarantined sources.
+- `quarantine.jsonl`: affected IDs, reason codes, and original export/line references,
+  never secret text. Unsafe cohort inputs are omitted from model-facing files;
+  unsafe or overlong targets leave otherwise safe held-out inputs in evaluation.
+- `provenance.jsonl` / `manifest.json`: source-file references, target hashes, exact
+  input/cohort file hashes, split counts, and artifact hashes. Alternate labels remain
+  in their original private exports rather than copying possible secrets into provenance.
+
+Install `transformers` and `jinja2` in a separate environment first. Preparation uses
+the bundled official pinned tokenizer/template offline, never model weights. Regex secret screening is not an
 exhaustive privacy audit; inspect quarantine references before including those rows.
+
+The MLX worker, prepared data, trainer/evaluator validators, and model `system.txt`
+must use the same v2 contract. Ship the exact pinned tokenizer/template with the
+model. Old three-query models are incompatible: switch model and runtime together.
+Remove the obsolete `memoryWhisperer.historyMessages` setting from existing configs;
+memory now always uses the shared token/byte window. Other features' history settings
+are unchanged. A configured model failure skips the hint; the separately configured
+no-model direct-vector mode remains available.
+Only offline dataset creation has two teacher rounds; deployed LFM generates once.
+Keep the held-out evaluation cohort fixed, including unresolved target-generation
+cases. No retained v1 mode or comparison is required. Actual training and deployment
+remain separate operator actions.

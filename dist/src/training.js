@@ -6,12 +6,13 @@ export function collectTraining(source, store, options = {}) {
     const since = options.since ?? 0, until = options.until ?? Number.MAX_SAFE_INTEGER;
     const reader = new TrainingTranscriptReader(source.databasePath, source.agentId);
     const result = { sessions: 0, excludedSessions: 0, oversizedSessions: 0, eligible: 0,
-        users: 0, filtered: 0, oversized: 0, unanswered: 0, added: 0, changed: 0, unchanged: 0, retired: 0 };
+        users: 0, filtered: 0, oversized: 0, unanswered: 0, added: 0, changed: 0, unchanged: 0, retired: 0,
+        review: [] };
     try {
         const sessions = new Set(options.existingOnly ? store?.sessions() : [...reader.sessions(), ...store?.sessions() ?? []]);
         for (const id of sessions) {
             store?.renew();
-            const extracted = reader.read(id);
+            const extracted = reader.read(id, () => store?.renew());
             result.sessions++;
             if (extracted && "oversized" in extracted) {
                 result.oversizedSessions++;
@@ -21,6 +22,7 @@ export function collectTraining(source, store, options = {}) {
             if (!extracted)
                 result.excludedSessions++;
             else {
+                result.review.push(...extracted.review.map(item => ({ sessionId: id, ...item })));
                 for (const key of ["users", "filtered", "oversized", "unanswered"])
                     result[key] += extracted.coverage[key];
                 result.eligible += extracted.examples.filter(e => e.timestamp >= since && e.timestamp < until).length;
@@ -54,7 +56,7 @@ export async function runTraining(source, store, config, options) {
         throw new Error("TypeSafe is disabled or its credential is unavailable");
     let next = 0, stopped = false;
     const workers = await Promise.allSettled(Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
-        while (!stopped && !result.budgetLimited && !result.failed && !result.ambiguous) {
+        while (!stopped && !result.budgetLimited) {
             const job = jobs[next++];
             if (!job)
                 return;
@@ -83,8 +85,8 @@ export async function runTraining(source, store, config, options) {
                     store.finish(job.id, attempt, { status, error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
                             `http_${error.status}` : "request_or_response_uncertain" });
                     result[status]++;
-                    // Stop on the first failure rather than spending the rest of the budget during an outage.
-                    return;
+                    // Flag this input for operator review; do not stall untouched inputs or retry it.
+                    continue;
                 }
                 // Storage failures must not be misclassified as provider failures/retried.
                 store.finish(job.id, attempt, judgment);

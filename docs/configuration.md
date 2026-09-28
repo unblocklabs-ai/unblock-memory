@@ -191,7 +191,7 @@ contract; these tables explain their effects.
 | `corpora[].kind` | Required for explicit entries | `files`, `sessions`, or `skills` |
 | `corpora[].paths` | Required for files/skills | Nonempty exact-file/directory/glob list; workspace-relative, absolute or `~/`; directory means recursive Markdown; does not grant host write trust |
 | `corpora[sessions].chatTypes` | `['channel','group']` | Nonempty subset of channel/group/direct; DMs require `direct` |
-| `corpora[sessions].maxExpandedTokens` | `500` | 1–10,000; use full turn/message when it fits, otherwise preserve full matched chunk; not a total result-size hard cap |
+| `corpora[sessions].maxExpandedTokens` | `500` | 1–10,000; ordinary search uses full turn/message when it fits, otherwise preserves the matched chunk. Whisperer instead shares a fixed 1,200-character renderer with training. |
 | `corpora[sessions].syncIntervalMinutes` | `60` | 0–1,440; zero manual-only; first scheduled sync after one interval; requires running Gateway |
 | `keepEmbeddingModelWarm` | `true` | Retain embedding model/context after first use; false allows five-minute idle disposal |
 | `analysis.executable` | Unset | Optional absolute local worker path; enables ability to recluster, not automatic scheduling |
@@ -210,7 +210,7 @@ contract; these tables explain their effects.
 | `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, TypeSafe key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
-| `memoryWhisperer.historyMessages` | `5` | 0–50, retrieval history count, not judge-history limit |
+| `memoryWhisperer.mlx` | unset | Optional `{pythonPath, modelPath}` with absolute paths; requires a v2 model returning exactly `{lex, vec}`. Model failure skips the hint rather than falling back. |
 | `memoryWhisperer.minUsefulness` | `0.7` | 0–1, minimum Noul yes-probability per candidate; explicit overrides are preserved |
 | `memoryWhisperer.maxHints` | `2` | 1–2 |
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
@@ -341,7 +341,7 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Feature | Evidence sent when explicitly enabled/approved |
 | --- | --- |
 | Skill selection | Bounded visible current/recent conversation + shortlisted skill names/descriptions; not skill procedures or source-path fields |
-| Memory hints | Bounded visible conversation + up to 8 complete excerpts, corpus names and matched-message timestamps when available; all indexed sessions in the selected corpora are eligible, with DM inclusion controlled by `chatTypes` |
+| Memory hints | Same 8,192-token/24,000-byte visible conversation as training; one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per request. V2 retrieves at most 10 BM25 + 10 vector candidates across the approved scope; without MLX, up to 8 vector candidates. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
 | Complementarity | Up to 4 already-qualified excerpts for pairwise redundancy checks |
 | People primer | Person identity, agent name, approved retrieved excerpts and source/session metadata; all indexed sessions eligible if approved, not just the current chat |
 | Dossier save/draft review | Proposed blurb, person/agent names and 1–3 exact approved indexed evidence ranges, at most 6,000 characters total; existing dossier is not evidence |

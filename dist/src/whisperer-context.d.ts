@@ -4,11 +4,3 @@ export declare function messageText(message: unknown): {
     text: string;
 } | undefined;
 export declare function buildSkillWhispererQuery(prompt: string, messages: readonly unknown[], historyMessages: number): string;
-export declare function memoryConversation(prompt: string, messages: readonly unknown[]): {
-    currentRequest: string;
-    history: {
-        role: "user" | "assistant";
-        content: string;
-    }[];
-    truncated: boolean;
-};

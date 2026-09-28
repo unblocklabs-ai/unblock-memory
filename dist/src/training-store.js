@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { openMemoryDatabase } from "./memory-database.js";
 import { trainingHash, TRAINING_PREPARATION } from "./training-input.js";
 import { TRAINING_GATE_MODEL, TRAINING_GATE_THRESHOLD, TRAINING_GATE_VERSION } from "./training-gate.js";
+import { TRAINING_RECIPE_VERSION } from "./training-models.js";
 const LEASE_MS = 120_000;
 export class TrainingStore {
     #db;
@@ -43,8 +44,10 @@ export class TrainingStore {
           status TEXT NOT NULL CHECK(status IN ('pending','attempted','complete','failed','ambiguous')),
           result_json TEXT, error TEXT, completed_at INTEGER
         ) STRICT;
-        CREATE INDEX IF NOT EXISTS training_judgment_exclusions ON training_steps(json_extract(request_json,'$.identity'))
-          WHERE stage='judge' AND status='complete' AND json_extract(result_json,'$.excluded')=1;
+        CREATE TABLE IF NOT EXISTS training_reviews (
+          source_id TEXT PRIMARY KEY REFERENCES training_examples(id), input_hash TEXT NOT NULL,
+          recipe TEXT NOT NULL, reason TEXT NOT NULL, details_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS training_step_attempts (
           id INTEGER PRIMARY KEY, step_id TEXT NOT NULL REFERENCES training_steps(id), started_at INTEGER NOT NULL,
           finished_at INTEGER, status TEXT NOT NULL, error TEXT, result_json TEXT
@@ -87,10 +90,17 @@ export class TrainingStore {
             if (!lock.changes)
                 throw new Error("Another memory-training command is running");
             // A request may have been billed before a crashed process saved the response.
-            this.#db.exec(`UPDATE training_gates SET status='ambiguous',error='interrupted' WHERE status='attempted';
-        UPDATE training_attempts SET status='ambiguous',error='interrupted' WHERE status='attempted';
-        UPDATE training_steps SET status='ambiguous',error='interrupted' WHERE status='attempted';
-        UPDATE training_step_attempts SET status='ambiguous',error='interrupted' WHERE status='attempted';`);
+            this.#db.prepare(`UPDATE training_gates SET status='ambiguous',error='interrupted' WHERE status='attempted'
+        AND prompt_version=? AND requested_model=? AND input_hash IN (SELECT hash FROM training_inputs WHERE preparation=?)`)
+                .run(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+            this.#db.prepare(`UPDATE training_attempts SET status='ambiguous',error='interrupted' WHERE status='attempted'
+        AND gate_id IN (SELECT g.id FROM training_gates g JOIN training_inputs i ON i.hash=g.input_hash
+          WHERE g.prompt_version=? AND g.requested_model=? AND i.preparation=?)`)
+                .run(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+            this.#db.prepare(`UPDATE training_steps SET status='ambiguous',error='interrupted' WHERE status='attempted'
+        AND json_extract(request_json,'$.recipe')=?`).run(TRAINING_RECIPE_VERSION);
+            this.#db.prepare(`UPDATE training_step_attempts SET status='ambiguous',error='interrupted' WHERE status='attempted'
+        AND step_id IN (SELECT id FROM training_steps WHERE json_extract(request_json,'$.recipe')=?)`).run(TRAINING_RECIPE_VERSION);
         });
         let leaseError;
         const heartbeat = setInterval(() => { try {
@@ -156,13 +166,14 @@ export class TrainingStore {
         this.#db.prepare("UPDATE training_examples SET active=-1 WHERE session_id=? AND active=1").run(sessionId);
     }
     #scope = `g.prompt_version=? AND g.requested_model=? AND EXISTS
-    (SELECT 1 FROM training_examples e WHERE e.input_hash=g.input_hash AND e.active=1)`;
+    (SELECT 1 FROM training_examples e JOIN training_inputs i ON i.hash=e.input_hash
+      WHERE e.input_hash=g.input_hash AND e.active=1 AND i.preparation=?)`;
     pending(limit) {
         return this.#db.prepare(`SELECT g.id,g.input_hash inputHash,i.input_json inputJson
       FROM training_gates g JOIN training_inputs i ON i.hash=g.input_hash
       WHERE ${this.#scope} AND g.status='pending' ORDER BY
       (SELECT MAX(timestamp) FROM training_examples WHERE input_hash=g.input_hash AND active=1) DESC,g.id LIMIT ?`)
-            .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, limit ?? -1);
+            .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION, limit ?? -1);
     }
     start(id) {
         return this.#transaction(() => {
@@ -185,35 +196,61 @@ export class TrainingStore {
                 .run(status, Date.now(), error, ok ? JSON.stringify(result) : null, attempt, id);
         });
     }
-    retry(includeAmbiguous) {
+    retry(includeAmbiguous, ids) {
+        if (!ids.length || ids.some(id => !/^[a-f0-9]{64}$/u.test(id)))
+            throw new Error("Specify exact training gate or step hashes to retry");
         this.#checkLease();
-        return this.#transaction(() => ["training_gates", "training_steps"].reduce((n, table) => n + Number(this.#db.prepare(`UPDATE ${table} SET status='pending',error=NULL WHERE status='failed' ${includeAmbiguous ? "OR status='ambiguous'" : ""}`).run().changes), 0));
+        return this.#transaction(() => ids.reduce((count, id) => {
+            const statuses = includeAmbiguous ? "('failed','ambiguous')" : "('failed')";
+            const gates = this.#db.prepare(`UPDATE training_gates SET status='pending',error=NULL WHERE id=?
+        AND prompt_version=? AND requested_model=? AND status IN ${statuses}
+        AND input_hash IN (SELECT hash FROM training_inputs WHERE preparation=?)`)
+                .run(id, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+            const steps = this.#db.prepare(`UPDATE training_steps SET status='pending',error=NULL WHERE id=?
+        AND json_extract(request_json,'$.recipe')=? AND status IN ${statuses}`).run(id, TRAINING_RECIPE_VERSION);
+            return count + Number(gates.changes) + Number(steps.changes);
+        }, 0));
     }
     activeExamples() {
         return this.#db.prepare(`SELECT e.id,e.input_hash inputHash,i.input_json inputJson,e.session_id sessionId,e.timestamp
       FROM training_examples e JOIN training_inputs i ON i.hash=e.input_hash
-      WHERE e.active=1 ORDER BY e.timestamp DESC,e.id`).all();
+      WHERE e.active=1 AND i.preparation=? ORDER BY e.timestamp DESC,e.id`).all(TRAINING_PREPARATION);
     }
     queryExamples(threshold = TRAINING_GATE_THRESHOLD) {
         if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1)
             throw new Error("Threshold must be between 0 and 1");
         const probabilities = new Map(this.#db.prepare(`SELECT g.input_hash,g.probability FROM training_gates g
       WHERE ${this.#scope} AND g.status='complete' AND g.probability>=?`)
-            .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, threshold).map(row => [String(row.input_hash), Number(row.probability)]));
+            .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION, threshold).map(row => [String(row.input_hash), Number(row.probability)]));
         return this.activeExamples().flatMap(example => {
             const recallProbability = probabilities.get(example.inputHash);
             return recallProbability === undefined ? [] : [{ ...example, recallProbability }];
         });
     }
-    step(stage, request) {
+    step(stage, parameters) {
+        const request = { ...parameters, recipe: TRAINING_RECIPE_VERSION };
         const id = trainingHash([stage, request]);
         const row = this.#db.prepare("SELECT status,result_json FROM training_steps WHERE id=? AND stage=?").get(id, stage);
         return { id, stage, request, status: (row?.status ?? "pending"),
             result: row?.status === "complete" ? JSON.parse(String(row.result_json)) : undefined };
     }
-    judgmentExcluded(identity) {
-        return !!this.#db.prepare(`SELECT 1 FROM training_steps WHERE stage='judge' AND status='complete'
-      AND json_extract(request_json,'$.identity')=? AND json_extract(result_json,'$.excluded')=1 LIMIT 1`).get(identity);
+    flagReview(example, reason, details) {
+        this.#checkLease();
+        this.#db.prepare(`INSERT INTO training_reviews VALUES (?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET
+      input_hash=excluded.input_hash,recipe=excluded.recipe,reason=excluded.reason,
+      details_json=excluded.details_json,updated_at=excluded.updated_at`)
+            .run(example.id, example.inputHash, TRAINING_RECIPE_VERSION, reason, JSON.stringify(details), Date.now());
+    }
+    clearReview(sourceId) {
+        this.#checkLease();
+        this.#db.prepare("DELETE FROM training_reviews WHERE source_id=? AND recipe=?").run(sourceId, TRAINING_RECIPE_VERSION);
+    }
+    reviews() {
+        return this.#db.prepare(`SELECT r.source_id sourceId,r.input_hash inputHash,r.reason,r.details_json details,r.updated_at updatedAt
+      FROM training_reviews r JOIN training_examples e ON e.id=r.source_id
+      WHERE r.recipe=? AND e.active=1 AND e.input_hash=r.input_hash ORDER BY r.updated_at DESC,r.source_id`)
+            .all(TRAINING_RECIPE_VERSION).map(row => ({ sourceId: String(row.sourceId), inputHash: String(row.inputHash),
+            reason: String(row.reason), details: JSON.parse(String(row.details)), updatedAt: Number(row.updatedAt) }));
     }
     startStep(stage, id, request) {
         return this.#transaction(() => {
@@ -242,8 +279,10 @@ export class TrainingStore {
     }
     completedEvaluations(versions) {
         return this.#db.prepare(`SELECT result_json FROM training_steps WHERE stage='evaluate' AND status='complete'
-      AND (? IS NULL OR (json_extract(request_json,'$.version')=? AND json_extract(request_json,'$.retrievalVersion')=?)) ORDER BY completed_at DESC,id`)
-            .all(versions?.selection ?? null, versions?.selection ?? null, versions?.retrieval ?? null)
+      AND json_extract(request_json,'$.recipe')=?
+      AND (? IS NULL OR (json_extract(request_json,'$.version')=? AND json_extract(request_json,'$.retrievalVersion')=?
+        AND json_extract(request_json,'$.judgeVersion')=?)) ORDER BY completed_at DESC,id`)
+            .all(TRAINING_RECIPE_VERSION, versions?.selection ?? null, versions?.selection ?? null, versions?.retrieval ?? null, versions?.judge ?? null)
             .map(row => JSON.parse(String(row.result_json)));
     }
     sourceDetails(id) {
@@ -260,34 +299,49 @@ export class TrainingStore {
         return { id, stage: row.stage, request: JSON.parse(String(row.request_json)),
             result: JSON.parse(String(row.result_json)), completedAt: row.completed_at };
     }
+    stepRecordStatus(id) {
+        return this.#db.prepare("SELECT status FROM training_steps WHERE id=? AND json_extract(request_json,'$.recipe')=?")
+            .get(id, TRAINING_RECIPE_VERSION)?.status;
+    }
     status(threshold) {
         const stages = this.#db.prepare(`SELECT g.status,COUNT(*) count FROM training_gates g WHERE ${this.#scope} GROUP BY g.status`)
-            .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL);
+            .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
         const labels = this.#db.prepare(`SELECT COUNT(*) complete,COALESCE(SUM(g.probability>=?),0) positive,
       COALESCE(SUM(g.input_tokens),0) inputTokens,COALESCE(SUM(g.output_tokens),0) outputTokens
-      FROM training_gates g WHERE ${this.#scope} AND g.status='complete'`).get(threshold, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL);
+      FROM training_gates g WHERE ${this.#scope} AND g.status='complete'`).get(threshold, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
         return { nodeId: this.#nodeId, agentId: this.#agentId, preparation: TRAINING_PREPARATION,
             promptVersion: TRAINING_GATE_VERSION, requestedModel: TRAINING_GATE_MODEL, threshold,
-            examples: this.#db.prepare("SELECT active,COUNT(*) count FROM training_examples GROUP BY active").all(),
-            collectedInputs: Number(this.#db.prepare("SELECT COUNT(DISTINCT input_hash) count FROM training_examples WHERE active=1").get().count),
+            examples: this.#db.prepare(`SELECT e.active,COUNT(*) count FROM training_examples e
+        JOIN training_inputs i ON i.hash=e.input_hash WHERE i.preparation=? GROUP BY e.active`).all(TRAINING_PREPARATION),
+            collectedInputs: Number(this.#db.prepare(`SELECT COUNT(DISTINCT e.input_hash) count FROM training_examples e
+        JOIN training_inputs i ON i.hash=e.input_hash WHERE e.active=1 AND i.preparation=?`).get(TRAINING_PREPARATION).count),
             queryInputs: Number(labels.positive),
             stages, complete: Number(labels.complete), positive: Number(labels.positive),
             inputTokens: Number(labels.inputTokens), outputTokens: Number(labels.outputTokens),
             negative: Number(labels.complete) - Number(labels.positive),
-            queryStages: this.#db.prepare("SELECT stage,status,COUNT(*) count FROM training_steps GROUP BY stage,status ORDER BY stage,status").all(),
+            recipe: TRAINING_RECIPE_VERSION, reviews: this.reviews(),
+            retryable: this.#db.prepare(`SELECT id,stage,status,error FROM training_steps
+        WHERE json_extract(request_json,'$.recipe')=? AND status IN ('failed','ambiguous')
+        UNION ALL SELECT g.id,'recall',g.status,g.error FROM training_gates g WHERE ${this.#scope}
+        AND g.status IN ('failed','ambiguous') ORDER BY stage,id`)
+                .all(TRAINING_RECIPE_VERSION, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION),
+            queryStages: this.#db.prepare(`SELECT stage,status,COUNT(*) count FROM training_steps
+        WHERE json_extract(request_json,'$.recipe')=? GROUP BY stage,status ORDER BY stage,status`).all(TRAINING_RECIPE_VERSION),
             queryAttempts: this.#db.prepare(`SELECT s.stage,a.status,COUNT(*) count,
         COUNT(json_extract(a.result_json,'$.usage.input_tokens')) usageReported,
         SUM(json_extract(a.result_json,'$.usage.input_tokens')) inputTokens,
         SUM(json_extract(a.result_json,'$.usage.output_tokens')) outputTokens
-        FROM training_step_attempts a JOIN training_steps s ON s.id=a.step_id GROUP BY s.stage,a.status`).all(),
-            attempts: this.#db.prepare(`SELECT status,COUNT(*) count,
-        COALESCE(SUM(json_extract(result_json,'$.usage.input_tokens')),0) inputTokens,
-        COALESCE(SUM(json_extract(result_json,'$.usage.output_tokens')),0) outputTokens
-        FROM training_attempts GROUP BY status`).all() };
+        FROM training_step_attempts a JOIN training_steps s ON s.id=a.step_id
+        WHERE json_extract(s.request_json,'$.recipe')=? GROUP BY s.stage,a.status`).all(TRAINING_RECIPE_VERSION),
+            attempts: this.#db.prepare(`SELECT a.status,COUNT(*) count,
+        COALESCE(SUM(json_extract(a.result_json,'$.usage.input_tokens')),0) inputTokens,
+        COALESCE(SUM(json_extract(a.result_json,'$.usage.output_tokens')),0) outputTokens
+        FROM training_attempts a JOIN training_gates g ON g.id=a.gate_id WHERE ${this.#scope} GROUP BY a.status`)
+                .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION) };
     }
     *exportRows(threshold) {
         const rows = this.#db.prepare(`SELECT g.*,i.input_json FROM training_gates g JOIN training_inputs i ON i.hash=g.input_hash
-      WHERE ${this.#scope} AND g.status='complete' ORDER BY g.id`).iterate(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL);
+      WHERE ${this.#scope} AND g.status='complete' ORDER BY g.id`).iterate(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
         for (const row of rows) {
             yield { stage: "recall-gate", inputHash: row.input_hash, preparation: TRAINING_PREPARATION,
                 input: JSON.parse(String(row.input_json)), recallProbability: row.probability,

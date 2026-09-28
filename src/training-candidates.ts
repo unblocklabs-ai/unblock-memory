@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
+import type { QueryLane } from "./query-contract.js";
 
 // Discovery-only adapter for pinned @unblocklabs/qmd 2.10.2 (MIT, query.js).
 // Keep its tokenization, FTS highlights, chunk choice and source-aware dedup.
-// Unlike search(), request exactly ten per method and return ALL merged passages.
+// Request exactly ten from the selected lane. Both runtime and training use this adapter.
 // No dependency rewriting, query expansion or query-conditioned remote scoring.
 type Chunk = { pos: number; text: string };
 type Candidate = { file: string; body: string; bestChunk: string; bestChunkPos: number;
@@ -41,7 +42,7 @@ function lexicalChunk(chunks: Chunk[], body: string, highlighted: string, marker
   }).sort((a, b) => b.matches - a.matches || b.intentMatches - a.intentMatches || a.chunk.pos - b.chunk.pos)[0]?.chunk;
 }
 
-export async function trainingCandidates(qmd: QMDStore, query: string, collection: string | string[], intent: string, signal?: AbortSignal): Promise<Candidate[]> {
+export async function trainingCandidates(qmd: QMDStore, query: string, collection: string | string[], lane: QueryLane, signal?: AbortSignal): Promise<Candidate[]> {
   signal?.throwIfAborted();
   if (!query.trim() || query.length > 12_000) throw new Error("Invalid training query");
   // QMD exposes its store but not these chunk helpers at the package root.
@@ -58,12 +59,15 @@ export async function trainingCandidates(qmd: QMDStore, query: string, collectio
     } else candidates.set(key, { ...hit, score: 1 / (rank + 1), explain: { methods: [method] },
       [method]: { score: rawScore, rank: rank + 1 } });
   };
-  const vectors = await qmd.searchVector(query, { limit: 10, collection });
-  signal?.throwIfAborted();
-  for (const [rank, hit] of vectors.entries()) {
-    const pos = hit.chunkPos, len = hit.chunkLen, body = hit.body ?? "";
-    if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length) continue;
-    add({ file: hit.filepath, body, bestChunk: body.slice(pos, pos + len), bestChunkPos: pos }, "vector", rank, hit.score);
+  if (lane === "vec") {
+    const vectors = await qmd.searchVector(query, { limit: 10, collection });
+    signal?.throwIfAborted();
+    for (const [rank, hit] of vectors.entries()) {
+      const pos = hit.chunkPos, len = hit.chunkLen, body = hit.body ?? "";
+      if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length) continue;
+      add({ file: hit.filepath, body, bestChunk: body.slice(pos, pos + len), bestChunkPos: pos }, "vector", rank, hit.score);
+    }
+    return [...candidates.values()];
   }
   const expression = queryTerms(query).map(term => `"${chunksApi.normalizeCjkForFTS(term).trim()}"`).join(" OR ");
   if (expression) {
@@ -82,7 +86,7 @@ export async function trainingCandidates(qmd: QMDStore, query: string, collectio
         .filter(span => span.pos >= 0 && span.chunk_len > 0 && span.pos + span.chunk_len <= row.doc.length)
         .map(span => ({ pos: span.pos, text: row.doc.slice(span.pos, span.pos + span.chunk_len) }));
       const chunks = stored.length ? stored : await chunksApi.chunkDocumentAsync(row.doc, undefined, undefined, undefined, file);
-      const selected = lexicalChunk(chunks, row.doc, row.highlighted, marker, intent);
+      const selected = lexicalChunk(chunks, row.doc, row.highlighted, marker, query);
       if (selected) add({ file, body: row.doc, bestChunk: selected.text, bestChunkPos: selected.pos }, "bm25", rank, row.rank);
     }
   }

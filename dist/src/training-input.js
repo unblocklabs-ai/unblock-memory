@@ -3,21 +3,22 @@ import { DatabaseSync } from "node:sqlite";
 import { ACTIVE_EVENT_COUNT_SQL, ACTIVE_EVENT_ROWS_SQL, assertAgentTranscriptSchema } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
-// Identical serialized inputs keep their checkpoints when eligibility broadens.
-export const TRAINING_PREPARATION = "visible-history-v1";
-// A deliberately conservative byte budget, NOT a tokenizer or a 32k-token target.
-const MAX_INPUT_BYTES = 24_000, MAX_HISTORY_MESSAGES = 32;
+import { prepareQueryConversation, QUERY_CONTRACT, QueryInputBudgetError } from "./query-contract.js";
+// Window/tokenizer changes must never reuse a previous recipe's checkpoints.
+export const TRAINING_PREPARATION = `${QUERY_CONTRACT.version}-visible-history-${QUERY_CONTRACT.revision}`;
 export const trainingHash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 function record(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
 }
 /** The following answer establishes eligibility, but is never part of that example's input. */
-export function trainingExamples(rows) {
+export function trainingExamples(rows, renew) {
     const examples = [];
+    const review = [];
     const coverage = { users: 0, filtered: 0, oversized: 0, unanswered: 0 };
     let history = [], limited = false;
     const assistantTexts = new Map();
     let pending;
+    let renewedAt = Date.now();
     const boundary = () => {
         if (pending)
             coverage.unanswered++;
@@ -28,12 +29,12 @@ export function trainingExamples(rows) {
     };
     const remember = (role, content) => {
         history.push({ role, content });
-        while (history.length > MAX_HISTORY_MESSAGES || Buffer.byteLength(JSON.stringify(history)) > MAX_INPUT_BYTES) {
-            history.shift();
-            limited = true;
-        }
     };
     for (const row of rows) {
+        if (renew && Date.now() - renewedAt >= 10_000) {
+            renew();
+            renewedAt = Date.now();
+        }
         let event;
         try {
             event = record(JSON.parse(row.eventJson));
@@ -78,17 +79,20 @@ export function trainingExamples(rows) {
                 coverage.unanswered++;
             pending = undefined;
             assistantTexts.clear();
-            const input = { history: [...history], currentRequest: visible.text };
-            let contextLimited = limited || visible.contextLimited;
-            while (input.history.length && Buffer.byteLength(JSON.stringify(input)) > MAX_INPUT_BYTES) {
-                input.history.shift();
-                contextLimited = true;
+            let prepared;
+            try {
+                prepared = prepareQueryConversation(history, visible.text);
             }
-            if (Buffer.byteLength(JSON.stringify(input)) > MAX_INPUT_BYTES) {
+            catch (error) {
+                if (!(error instanceof QueryInputBudgetError))
+                    throw error;
                 coverage.oversized++;
+                review.push({ seq: row.seq, reason: "current-request-exceeds-context-budget" });
                 boundary();
                 continue;
             }
+            const input = prepared.conversation;
+            const contextLimited = limited || visible.contextLimited || prepared.contextLimited;
             const eventTime = typeof event.timestamp === "string" ? Date.parse(event.timestamp) :
                 typeof event.timestamp === "number" ? event.timestamp : NaN;
             // A delayed database append must not move the historical retrieval boundary forward.
@@ -124,7 +128,7 @@ export function trainingExamples(rows) {
     }
     if (pending)
         coverage.unanswered++;
-    return { examples, coverage };
+    return { examples, coverage, review };
 }
 /** Only active events; no Markdown projections, archived branches, or tool bodies. */
 export class TrainingTranscriptReader {
@@ -147,7 +151,7 @@ export class TrainingTranscriptReader {
         return this.#db.prepare("SELECT session_id FROM session_windows ORDER BY session_id").all().map(row => String(row.session_id));
     }
     /** null = absent/ineligible. Oversized sessions are not evidence of deletion. */
-    read(sessionId) {
+    read(sessionId, renew) {
         this.#db.exec("BEGIN");
         try {
             const session = this.#db.prepare(`SELECT session_key,chat_type ${this.#lineage ?
@@ -161,7 +165,7 @@ export class TrainingTranscriptReader {
             if (Number(size.n) > 50_000 || Number(size.bytes) > 32_000_000)
                 return { oversized: true };
             const rows = this.#db.prepare(ACTIVE_EVENT_ROWS_SQL).iterate(sessionId);
-            return trainingExamples(rows);
+            return trainingExamples(rows, renew);
         }
         finally {
             this.#db.exec("COMMIT");

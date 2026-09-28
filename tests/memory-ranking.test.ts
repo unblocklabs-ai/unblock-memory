@@ -33,13 +33,13 @@ test("extracts actual active root-chat searches with frozen pre-turn context, no
     });
     db.prepare("INSERT INTO transcript_events VALUES ('s',99,?,999999)").run(JSON.stringify({ type: "message",
       message: { role: "assistant", content: [{ type: "toolCall", name: "memory_search", arguments: { query: "ARCHIVED" } }] } }));
-    const cases = collectSearches(path, "main", 2, 5);
+    const cases = collectSearches(path, "main", 2);
     assert.deepEqual(cases.map(c => c.query), ["Rico Brussels", "Rico location"]);
     assert.deepEqual(cases[0]!.conversation, { currentRequest: "Where does he live?", history: [
       { role: "user", content: "Rico is my colleague." }, { role: "assistant", content: "Understood." }] });
     assert.deepEqual(cases[0]!.conversation, cases[1]!.conversation);
     assert.doesNotMatch(JSON.stringify(cases), /secret reasoning|FUTURE|INTERMEDIATE|RETURNED|ARCHIVED|FAKE MEMORY/);
-    assert.equal(collectSearches(path, "main", 1, 0)[0]!.conversation!.history.length, 0);
+    assert.equal(collectSearches(path, "main", 1).length, 1);
   } finally { db.close(); }
 });
 

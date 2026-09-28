@@ -66,7 +66,7 @@ export function registerMemoryTraining(api, config) {
                 process.exitCode = 1;
         });
         for (const command of ["generate", "evaluate"]) {
-            const stage = root.command(command).description(command === "generate" ? "Generate ten exact queries with isolated gpt-6-luna" : "Rank queries using existing historical QMD results")
+            const stage = root.command(command).description(command === "generate" ? "Generate five candidates per lex/vec lane with isolated gpt-6-luna" : "Grade, revise once per lane and select independent lex/vec winners")
                 .option("--agent <id>", "Agent id", "main")
                 .option("--threshold <p>", "Minimum completed recall probability", String(TRAINING_GATE_THRESHOLD))
                 .option("--max-examples <n>", "Optional maximum uncached examples")
@@ -75,18 +75,18 @@ export function registerMemoryTraining(api, config) {
                 stage.option("--max-input-bytes <n>", "Teacher input byte budget", "3000000")
                     .option("--concurrency <n>", "Concurrent isolated teacher completions", "8");
             else
-                stage.option("--max-calls <n>", "Maximum new retrieval operations plus uncached passage judgments")
-                    .option("--exclude-judgment <hash...>", "Explicitly exclude exact judgment hashes; persist exclusions, never score as zero")
+                stage.option("--max-calls <n>", "Maximum new teacher completions, retrieval operations and passage judgments")
+                    .option("--max-input-bytes <n>", "Revision teacher input byte budget", "3000000")
                     .option("--concurrency <n>", "Concurrent historical inputs; remote passage judgments run concurrently", String(TRAINING_EVALUATION_CONCURRENCY));
             stage.action(async (opts) => {
                 const options = { maxExamples: opts.maxExamples === undefined ? undefined : Number(opts.maxExamples),
                     dryRun: opts.dryRun, threshold: thresholdOption(opts.threshold) };
                 const result = await withStore(opts.agent, {}, async (store, source) => command === "generate"
                     ? await generateTrainingQueries(source, store, api.runtime, { ...options, maxInputBytes: Number(opts.maxInputBytes), concurrency: Number(opts.concurrency) })
-                    : await evaluateTrainingQueries(source, store, config, { ...options, maxCalls: opts.maxCalls === undefined ? undefined : Number(opts.maxCalls),
-                        concurrency: Number(opts.concurrency), excludeJudgments: opts.excludeJudgment }));
+                    : await evaluateTrainingQueries(source, store, config, api.runtime, { ...options, maxCalls: opts.maxCalls === undefined ? undefined : Number(opts.maxCalls),
+                        concurrency: Number(opts.concurrency), maxInputBytes: Number(opts.maxInputBytes) }));
                 console.log(JSON.stringify(result, null, 2));
-                if (result.failed || result.ambiguous || result.blocked)
+                if (result.failed || result.ambiguous || result.blocked || result.flagged)
                     process.exitCode = 1;
             });
         }
@@ -97,9 +97,10 @@ export function registerMemoryTraining(api, config) {
             console.log(JSON.stringify(await withStore(opts.agent, { readOnly: true }, store => store.status(threshold)), null, 2));
         });
         root.command("retry-failed").option("--agent <id>", "Agent id", "main")
+            .requiredOption("--id <hash...>", "Exact reviewed recall-gate or query-step hashes from status")
             .option("--include-ambiguous", "Explicitly permit retrying requests that may already have been billed")
             .action(async (opts) => {
-            const reset = await withStore(opts.agent, {}, store => store.retry(opts.includeAmbiguous === true));
+            const reset = await withStore(opts.agent, {}, store => store.retry(opts.includeAmbiguous === true, opts.id));
             console.log(JSON.stringify({ reset, calls: 0 }));
         });
         root.command("export").option("--agent <id>", "Agent id", "main")

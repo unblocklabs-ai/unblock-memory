@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.3.30",
+  "version": "0.4.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -293,14 +293,13 @@
           "complementaryHints": { "type": "boolean", "default": false, "description": "Optionally remove confidently redundant hints with up to six concurrent TypeSafe requests, one per directional pair. Uncertainty retains hints." },
           "enabled": { "type": "boolean", "default": false },
           "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
-          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 50, "default": 5 },
           "minUsefulness": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
           "maxHints": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2 },
           "cooldownTurns": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 10 },
           "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 3000 }
         },
         "default": {
-          "enabled": false, "corpora": [], "historyMessages": 5, "minUsefulness": 0.7,
+          "enabled": false, "corpora": [], "minUsefulness": 0.7,
           "maxHints": 2, "cooldownTurns": 10, "timeoutMs": 3000
         }
       },

@@ -6,32 +6,63 @@ import { createInterface } from "node:readline";
 import { abortable } from "./abortable.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
+import { parseQueryPair, prepareQueryConversation } from "./query-contract.js";
+const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
-export function queryConversation(prompt, messages, historyMessages) {
+export function queryConversation(prompt, messages) {
     const currentRequest = conversationUserText(prompt)?.text ?? "";
-    const visible = messages.flatMap(message => {
+    const visible = [];
+    const assistantTexts = new Map();
+    for (const item of messages) {
+        const event = record(item), message = record(event?.type === "message" ? event.message : item);
+        if (event?.type === "compaction" || message?.role === "compactionSummary") {
+            visible.length = 0;
+            assistantTexts.clear();
+            continue;
+        }
+        if (!message || message.role === "toolResult" || message.role === "tool")
+            continue;
+        const meta = record(message.__openclaw);
+        if (message.provenance !== undefined || (message.role === "user" && record(meta?.senderIdentity)?.senderKind === "bot")) {
+            visible.length = 0;
+            assistantTexts.clear();
+            continue;
+        }
+        const mirror = message.provider === "openclaw" && message.model === "delivery-mirror";
+        if (message.role === "assistant" && (message.channel === "analysis" || message.stopReason === "error" ||
+            message.stopReason === "aborted" || (message.provider === "openclaw" && message.model === "gateway-injected") ||
+            (mirror && record(message.openclawDeliveryMirror)?.kind === "channel-final-suppressed")))
+            continue;
         const text = messageText(message);
-        const content = text?.role === "user" ? conversationUserText(text.text)?.text : text?.text;
-        return text && content ? [{ role: text.role, content }] : [];
-    });
+        const raw = text?.role === "user" && typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : text?.text;
+        const content = text?.role === "user" && raw ? conversationUserText(raw, meta?.senderId ?? message.senderId)?.text : raw;
+        if (message.role === "user") {
+            assistantTexts.clear();
+            if (!content || /^(?:\[OpenClaw heartbeat poll\]|\[Queued messages while agent was busy\]|\[Subagent Context\]|<relevant-memories>)/.test(content)) {
+                visible.length = 0;
+                continue;
+            }
+        }
+        if (!text || !content || (text.role === "assistant" && (content === "NO_REPLY" || content === "HEARTBEAT_OK")))
+            continue;
+        if (text.role === "assistant") {
+            const previous = assistantTexts.get(content);
+            assistantTexts.set(content, mirror);
+            if (previous !== undefined && (mirror || previous))
+                continue;
+        }
+        visible.push({ role: text.role, content });
+    }
     if (visible.at(-1)?.role === "user" && visible.at(-1)?.content === currentRequest)
         visible.pop();
-    const history = historyMessages ? visible.slice(-historyMessages) : [];
-    while (history.length && Buffer.byteLength(JSON.stringify({ history, currentRequest })) > 24_000)
-        history.shift();
-    if (!currentRequest)
-        throw new Error("Missing or unparseable current request");
-    if (Buffer.byteLength(JSON.stringify({ history, currentRequest })) > 24_000) {
-        throw new Error("Query input exceeds context budget");
-    }
-    return { history, currentRequest };
+    return prepareQueryConversation(visible, currentRequest).conversation;
 }
 export class MlxQueryGenerator {
     config;
     /** Gateway hook and tool registries can evaluate/register this plugin separately. */
     static shared(config) {
         const scope = globalThis;
-        const symbol = Symbol.for("unblock-memory.mlx-workers.v1");
+        const symbol = Symbol.for("unblock-memory.mlx-workers.v2");
         const workers = (scope[symbol] ??= new Map());
         const key = JSON.stringify([config.pythonPath, config.modelPath]);
         let worker = workers.get(key);
@@ -104,19 +135,12 @@ export class MlxQueryGenerator {
                         request.reject(new Error("Query generation failed"));
                         return;
                     }
-                    let queries;
                     try {
-                        queries = JSON.parse(value.text).queries;
+                        request.resolve(parseQueryPair(JSON.parse(value.text)));
                     }
-                    catch { /* reject below */ }
-                    const usable = Array.isArray(queries) ? [...new Set(queries
-                            .filter((query) => typeof query === "string")
-                            .map(query => query.trim()).filter(Boolean))] : [];
-                    if (!usable.length) {
-                        request.reject(new Error("No usable generated queries"));
-                        return;
+                    catch {
+                        request.reject(new Error("Invalid generated lex/vec query pair"));
                     }
-                    request.resolve(usable);
                 }
                 catch {
                     child.kill();

@@ -22,6 +22,11 @@ export declare function collectTraining(source: Source, store?: TrainingStore, o
     changed: number;
     unchanged: number;
     retired: number;
+    review: {
+        sessionId: string;
+        seq: number;
+        reason: string;
+    }[];
 };
 /** Parallel, bounded paid work. Negative results are just as cacheable as positives. */
 export declare function runTraining(source: Source, store: TrainingStore, config: UnblockMemoryConfig, options: {
@@ -43,6 +48,11 @@ export declare function runTraining(source: Source, store: TrainingStore, config
         changed: number;
         unchanged: number;
         retired: number;
+        review: {
+            sessionId: string;
+            seq: number;
+            reason: string;
+        }[];
     };
     pendingSelected: number;
     calls: number;

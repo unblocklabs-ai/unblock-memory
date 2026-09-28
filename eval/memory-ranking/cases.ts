@@ -17,7 +17,7 @@ export type SearchCase = {
 };
 
 /** Freeze context at the human turn, never use this turn's later answer or tool output. */
-export function searchesInSession(rows: Iterable<Row>, session: { sessionId: string; sessionKey: string; chatType: string }, historyMessages: number) {
+export function searchesInSession(rows: Iterable<Row>, session: { sessionId: string; sessionKey: string; chatType: string }) {
   const results: SearchCase[] = [], history: { role: "user" | "assistant"; content: string }[] = [];
   let context: Pick<SearchCase, "userEventSeq" | "userTimestamp" | "conversation" | "truncated" | "contextError"> = { contextError: "no_user_context" };
   const seenCalls = new Set<string>(), mirrorTexts = new Set<string>();
@@ -43,7 +43,7 @@ export function searchesInSession(rows: Iterable<Row>, session: { sessionId: str
       const timestamp = typeof event.timestamp === "string" ? Date.parse(event.timestamp) : row.createdAt;
       context = { userEventSeq: row.seq, userTimestamp: new Date(Number.isFinite(timestamp) ? Math.min(timestamp, row.createdAt) : row.createdAt).toISOString() };
       try {
-        const conversation = queryConversation(user.text, history, historyMessages);
+        const conversation = queryConversation(user.text, history);
         context = { ...context, conversation, truncated: user.contextLimited || history.length > conversation.history.length };
       } catch { context.contextError = "query_context_unavailable_or_oversized"; }
       history.push({ role: "user", content: user.text });
@@ -71,7 +71,7 @@ export function searchesInSession(rows: Iterable<Row>, session: { sessionId: str
 }
 
 /** Read only active root-chat calls. Stored tool results and archived branches are not searches. */
-export function collectSearches(databasePath: string, agentId: string, count: number, historyMessages: number) {
+export function collectSearches(databasePath: string, agentId: string, count: number) {
   if (!Number.isSafeInteger(count) || count < 1) throw new Error("n must be a positive integer");
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
@@ -93,7 +93,7 @@ export function collectSearches(databasePath: string, agentId: string, count: nu
       const events = db.prepare(`SELECT e.seq,e.created_at createdAt,e.event_json eventJson,a.active_position activePosition
         FROM session_transcript_active_events a JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq
         WHERE a.session_id=? ORDER BY a.active_position`).iterate(String(row.sessionId)) as Iterable<Row>;
-      cases.push(...searchesInSession(events, { sessionId: String(row.sessionId), sessionKey: String(row.sessionKey), chatType: String(row.chatType) }, historyMessages));
+      cases.push(...searchesInSession(events, { sessionId: String(row.sessionId), sessionKey: String(row.sessionKey), chatType: String(row.chatType) }));
       cases.sort((a, b) => b.searchedAt.localeCompare(a.searchedAt) || b.eventSeq - a.eventSeq || a.id.localeCompare(b.id));
       cases = cases.slice(0, count);
     }

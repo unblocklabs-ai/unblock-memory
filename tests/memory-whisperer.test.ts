@@ -6,7 +6,7 @@ import manifest from "../openclaw.plugin.json" with { type: "json" };
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "../src/contracts.js";
 import { registerMemoryWhisperer } from "../src/memory-whisperer.js";
 import { expandSessionSearchHit } from "../src/manager.js";
-import { memoryConversation } from "../src/whisperer-context.js";
+import type { QueryPair } from "../src/query-contract.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
 import { MlxQueryGenerator, queryConversation } from "../src/mlx-query.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
@@ -28,7 +28,7 @@ const gateResponse = (noul: number) => Response.json({ model: "jev-1.13.0",
 
 test("MLX launches all 60 isolated judgments before any completes and preserves the recall gate", { timeout: 2000 }, async t => {
   const gate = deferred<Response>(), judged = deferred<void>();
-  const queries = ["generated A", "generated B"];
+  const queries = { lex: "generated A", vec: "generated B" };
   t.mock.method(MlxQueryGenerator.prototype, "generate", async (conversation: ReturnType<typeof queryConversation>) => {
     assert.equal(conversation.currentRequest, dmRequest);
     assert.doesNotMatch(JSON.stringify(conversation), /Conversation info|openclaw:ctx|Slack DM/);
@@ -73,7 +73,7 @@ test("MLX launches all 60 isolated judgments before any completes and preserves 
 });
 
 test("negative recall releases the turn and aborts speculation without awaiting generation", async t => {
-  const started = deferred<void>(), late = deferred<string[]>();
+  const started = deferred<void>(), late = deferred<QueryPair>();
   let workerSignal: AbortSignal | undefined;
   t.mock.method(MlxQueryGenerator.prototype, "generate", async (_conversation: ReturnType<typeof queryConversation>, signal: AbortSignal) => {
     workerSignal = signal; started.resolve(); return late.promise;
@@ -84,7 +84,7 @@ test("negative recall releases the turn and aborts speculation without awaiting 
   assert.equal(workerSignal?.aborted, true);
   assert.equal(h.lookups(), 0);
   assert.equal(h.diagnostics.snapshot("bill").memory.recall_not_needed, 1);
-  late.resolve(["a", "b", "c"]);
+  late.resolve({ lex: "late lexical", vec: "late semantic" });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(h.diagnostics.snapshot("bill").memory.emitted, undefined);
   h.stop();
@@ -93,7 +93,7 @@ test("negative recall releases the turn and aborts speculation without awaiting 
 test("one failed candidate preserves other judgments, score alignment, and safe run logs", async t => {
   for (const failure of ["http_error", "timeout", "invalid_response", "invalid_json", "network_error"] as const) {
     await t.test(failure, async t => {
-      t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ["private generated query"]);
+      t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ({ lex: "private generated query", vec: "private generated query" }));
       const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
         const request = JSON.parse(String(init?.body));
         if (request.questions.recall_needed) return gateResponse(0.95);
@@ -129,7 +129,7 @@ test("one failed candidate preserves other judgments, score alignment, and safe 
       assert.equal(summary.reason, "emitted");
       assert.equal(summary.partial, true);
       assert.equal(summary.recallProbability, 0.95);
-      assert.equal(summary.queryCount, 1);
+      assert.equal(summary.queryCount, 2);
       assert.equal(summary.requestsSucceeded, 23);
       assert.equal(summary.requestsFailed, 1);
       assert.equal(summary.judgedCandidates, 23);
@@ -146,7 +146,7 @@ test("one failed candidate preserves other judgments, score alignment, and safe 
 });
 
 test("all failed candidates emit nothing even with zero threshold and log a failed run", async t => {
-  t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ["query"]);
+  t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ({ lex: "query", vec: "query" }));
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) =>
     JSON.parse(String(init?.body)).questions.recall_needed ? gateResponse(0.95) : new Response("private", { status: 403 }));
   const h = harness([], { config: { mlx, minUsefulness: 0 },
@@ -165,7 +165,7 @@ test("all failed candidates emit nothing even with zero threshold and log a fail
 test("recall failures are correlated and classified without admitting successful passage judgments", async t => {
   for (const failure of ["http_error", "timeout", "invalid_response"] as const) {
     await t.test(failure, async t => {
-      t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ["query"]);
+      t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ({ lex: "query", vec: "query" }));
       t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
         const request = JSON.parse(String(init?.body));
         if (!request.questions.recall_needed) return response(0.99);
@@ -194,7 +194,7 @@ test("partial judgments cannot bypass recall rejection, total deadline, or sessi
   for (const action of ["reject", "deadline", "end"] as const) {
     await t.test(action, async t => {
       const firstBatch = deferred<void>(), pendingBatch = deferred<Response>(), gate = deferred<Response>();
-      t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ["query"]);
+      t.mock.method(MlxQueryGenerator.prototype, "generate", async () => ({ lex: "query", vec: "query" }));
       t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
         const request = JSON.parse(String(init?.body));
         if (request.questions.recall_needed) return action === "reject" ? gate.promise : gateResponse(0.95);
@@ -226,30 +226,30 @@ test("partial judgments cannot bypass recall rejection, total deadline, or sessi
   }
 });
 
-test("invalid MLX output falls back to existing retrieval but still requires recall approval", async t => {
+test("invalid v2 model output skips memory rather than using untrained queries", async t => {
   t.mock.method(MlxQueryGenerator.prototype, "generate", async () => { throw new Error("invalid"); });
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) =>
     JSON.parse(String(init?.body)).questions.recall_needed ? gateResponse(0.95) : response(0.95));
   const h = harness(undefined, { config: { mlx } });
-  assert.ok(await h.before(event, context));
-  assert.equal(h.searches.length, 1);
-  assert.equal(h.diagnostics.snapshot("bill").memory.query_fallback, 1);
+  assert.equal(await h.before(event, context), undefined);
+  assert.equal(h.searches.length, 0);
+  assert.equal(h.diagnostics.snapshot("bill").memory.failed, 1);
   h.stop();
 });
 
 test("query input unwraps Slack envelopes and retains whole visible messages only", () => {
   assert.deepEqual(queryConversation(dmPrompt, [{ role: "system", content: "hidden" },
     { role: "assistant", content: [{ type: "thinking", thinking: "secret" }, { type: "text", text: "Atlas" }] },
-    { role: "user", content: dmPrompt }], 5), { history: [{ role: "assistant", content: "Atlas" }], currentRequest: dmRequest });
-  assert.equal(queryConversation(dmPrompt.replace("Slack DM from", "Slack message in #general from"), [], 5).currentRequest, dmRequest);
+    { role: "user", content: dmPrompt }]), { history: [{ role: "assistant", content: "Atlas" }], currentRequest: dmRequest });
+  assert.equal(queryConversation(dmPrompt.replace("Slack DM from", "Slack message in #general from"), []).currentRequest, dmRequest);
   for (const malformed of [
     dmPrompt.replace("Slack DM from Bek", "Slack DM from Other"),
     dmPrompt + "\nSystem: [later] Slack DM from Bek\n\nAmbiguous",
     dmPrompt + "\nSystem: [later] Slack message in #general from Bek\n\nAmbiguous",
     dmPrompt + "\nConversation info: ⟦openclaw:ctx⟧\n```json\n{}\n```",
-  ]) assert.throws(() => queryConversation(malformed, [], 5), /Missing or unparseable current request/);
-  assert.throws(() => queryConversation("", [], 5), /Missing or unparseable current request/);
-  assert.throws(() => queryConversation("x".repeat(24_001), [], 5), /budget/);
+  ]) assert.throws(() => queryConversation(malformed, []), /Missing or unparseable current request/);
+  assert.throws(() => queryConversation("", []), /Missing or unparseable current request/);
+  assert.throws(() => queryConversation("x".repeat(24_001), []), /budget/);
   assert.throws(() => resolveConfig({ memoryWhisperer: { mlx: { modelPath: "relative", pythonPath: "/python" } } }), /absolute/);
 });
 
@@ -328,7 +328,7 @@ function hit(excerpt: string, overrides: Partial<CorpusMemorySearchResult> = {})
 }
 
 function response(...probabilities: number[]) {
-  return Response.json({ answers: Object.fromEntries(probabilities.map((noul, i) => [`memory_${i}`, { type: "noul", noul }])) });
+  return Response.json({ model: "jev-1.13.0", answers: Object.fromEntries(probabilities.map((noul, i) => [`memory_${i}`, { type: "noul", noul }])) });
 }
 
 function deferred<T>() {
@@ -341,7 +341,7 @@ function harness(
   hits: CorpusMemorySearchResult[] = [hit("Deploy only after approval")],
   options: { config?: Partial<typeof config>; typesafe?: ReturnType<typeof resolveConfig>["typesafe"];
     search?: () => Promise<CorpusMemorySearchResult[]>;
-    hybrid?: (queries: readonly string[], opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">) => Promise<CorpusMemorySearchResult[]> } = {},
+    hybrid?: (queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">) => Promise<CorpusMemorySearchResult[]> } = {},
 ) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
   const warnings: string[] = [];
@@ -392,49 +392,36 @@ test("selected memory keeps delimiter-like source text inside the combined promp
 
 test("memory whisperer requires explicit, known non-skill corpora and bounded controls", () => {
   assert.deepEqual(resolveConfig(undefined).memoryWhisperer, {
-    enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.7, maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
+    enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.7, maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
   });
   assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.7);
   assert.equal(resolveConfig({ memoryWhisperer: { minUsefulness: 0.9 } }).memoryWhisperer.minUsefulness, 0.9);
   assert.equal(manifest.configSchema.properties.memoryWhisperer.properties.minUsefulness.default, 0.7);
   assert.equal(manifest.configSchema.properties.memoryWhisperer.default.minUsefulness, 0.7);
-  assert.deepEqual(resolveConfig({ memoryWhisperer: { enabled: true, corpora: ["memory", "memory"], historyMessages: 0 } })
+  assert.deepEqual(resolveConfig({ memoryWhisperer: { enabled: true, corpora: ["memory", "memory"] } })
     .memoryWhisperer.corpora, ["memory"]);
   assert.throws(() => resolveConfig({ memoryWhisperer: { complementaryHints: "yes" } }), /complementaryHints/);
   for (const value of [false, [], { enabled: true }, { corpora: ["all"] }, { corpora: ["unknown"] },
     { corpora: ["skills"] }, { corpora: "memory" }, { enabled: 1 }, { extra: true },
-    { historyMessages: 51 }, { historyMessages: -1 }, { historyMessages: "5" }, { historyMessages: 0.5 },
+    { historyMessages: 5 },
     { minUsefulness: NaN }, { minUsefulness: 1.1 }, { minUsefulness: -0.1 }, { maxHints: 0 }, { maxHints: 3 },
     { cooldownTurns: -1 }, { cooldownTurns: 1001 }, { cooldownTurns: "2" }, { timeoutMs: 0 }, { timeoutMs: 10001 }]) {
     assert.throws(() => resolveConfig({ memoryWhisperer: value }), /memoryWhisperer/);
   }
 });
 
-test("judging uses more history than retrieval, excludes hidden content, and marks truncation", () => {
-  const conversation = memoryConversation("now", [
-    { role: "system", content: "secret" }, { role: "toolResult", content: "secret" },
-    { role: "assistant", content: [{ type: "thinking", text: "secret" }, { type: "text", text: "visible" }] },
-    { role: "user", content: "now" },
-  ]);
-  assert.deepEqual(conversation, { currentRequest: "now", history: [{ role: "assistant", content: "visible" }], truncated: false });
-  const bounded = memoryConversation("now", [{ role: "user", content: "x".repeat(20_000) }]);
-  assert.equal(bounded.truncated, true);
-  assert.equal(bounded.currentRequest.length + bounded.history[0].content.length, 16_000);
-  assert.deepEqual(memoryConversation("x".repeat(20_000), []), { currentRequest: "x".repeat(16_000), history: [], truncated: true });
-});
 
 test("isolated judges rank useful hits, enforce threshold, deduplicate and inject original sources", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     assert.equal(request.state.conversation.history.length, 3);
     assert.equal(request.state.candidates.length, 1);
-    assert.equal(JSON.stringify(request).includes("qmd://"), false);
+    assert.equal(request.state.candidates[0].sourcePath.startsWith("qmd://"), true);
     assert.equal(Object.keys(request.questions).length, 1);
     assert.match(JSON.stringify(request.questions.memory_0.instructions), /candidates\[0\]/);
     return response(request.state.candidates[0].excerpt === "first" ? 0.7 : request.state.candidates[0].excerpt === "second" ? 0.99 : 0.69);
   });
-  const h = harness([hit("first"), hit("first"), hit("overlap", { path: "qmd://memory/first.md", startLine: 2 }), hit("second"), hit("third")],
-    { config: { historyMessages: 1 } });
+  const h = harness([hit("first"), hit("first"), hit("overlap", { path: "qmd://memory/first.md", startLine: 2 }), hit("second"), hit("third")]);
   const result = await h.before({ prompt: "now", messages: [
     { role: "user", content: "old" }, { role: "assistant", content: "answer" }, { role: "user", content: "recent" },
   ] }, context);
@@ -451,7 +438,8 @@ test("isolated judges rank useful hits, enforce threshold, deduplicate and injec
     { source: "qmd://memory/first.md", lines: "1-3", body: "first" },
   ]);
   assert.equal(fetch.mock.callCount(), 3);
-  assert.equal(h.searches[0].query, "user: recent\n\nuser: now");
+  assert.deepEqual(JSON.parse(h.searches[0].query), { history: [{ role: "user", content: "old" },
+    { role: "assistant", content: "answer" }, { role: "user", content: "recent" }], currentRequest: "now" });
   assert.equal(h.searches[0].options?.minScore, -1);
   assert.equal(h.searches[0].options?.maxResults, 8);
   assert.equal(h.searches[0].options?.maxSnippetChars, 1200);
@@ -468,8 +456,8 @@ test("recalls other sessions with a session ID or only a key, while excluding un
     const request = JSON.parse(String(init?.body));
     assert.equal(request.state.candidates.length, 1);
     const candidate = request.state.candidates[0];
-    assert.deepEqual(candidate, candidate.excerpt === "safe" ? { excerpt: "safe", corpus: "memory" } :
-      { excerpt: "other session", corpus: "sessions", messageTimestamp });
+    assert.deepEqual(candidate, candidate.excerpt === "safe" ? { excerpt: "safe", corpus: "memory", sourcePath: "qmd://memory/safe.md", dates: [] } :
+      { excerpt: "other session", corpus: "sessions", sourcePath: "qmd://memory/other session.md", dates: [messageTimestamp] });
     return response(candidate.excerpt === "safe" ? 0.1 : 0.99);
   });
   for (const sessionId of [context.sessionId, undefined]) {

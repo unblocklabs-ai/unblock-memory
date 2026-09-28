@@ -1,15 +1,16 @@
-import type { QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
+import type { QMDStore } from "@unblocklabs/qmd";
 import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadResult, MemoryRequestContext, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
 import type { ChatType } from "./config.js";
 import { type MaintenanceStatus, type MaintenanceTask, type TemporalBasis } from "./curation.js";
 import { type SessionSyncResult } from "./session-sync.js";
-import { type SessionMessageSpan } from "./session-projector.js";
 import { type ResolvedSource } from "./sources.js";
 import { type QualityCursor } from "./quality-audit.js";
 import { qualityTaskPresence } from "./quality-triage.js";
 import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
+import type { QueryPair } from "./query-contract.js";
+export { expandSessionSearchHit } from "./memory-passage.js";
 export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "searchLex" | "vsearch" | "get" | "getDocumentBody" | "close">;
 export type ManagerSessionConfig = {
     agentId: string;
@@ -37,11 +38,6 @@ export declare function buildReadResult(params: {
     from?: number;
     lines?: number;
 }): MemoryReadResult;
-export declare function expandSessionSearchHit(result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">, maxTokens: number, countTokens: (text: string) => Promise<number>, maxChars?: number, messages?: SessionMessageSpan[]): Promise<{
-    text: string;
-    position: number;
-    sourceText?: string;
-}>;
 export declare class QmdMemoryManager implements MemorySearchManagerContract {
     #private;
     diagnostics(): Promise<{
@@ -221,7 +217,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     }): MaintenanceTask | undefined;
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     /** Whisperer-only discovery: exact trained recipe, no query-conditioned reranker or merged cap. */
-    searchWhisperer(queries: readonly string[], opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
+    searchWhisperer(queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
     searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
     readFile(params: {
         relPath: string;

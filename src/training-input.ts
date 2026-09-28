@@ -3,12 +3,11 @@ import { DatabaseSync } from "node:sqlite";
 import { ACTIVE_EVENT_COUNT_SQL, ACTIVE_EVENT_ROWS_SQL, assertAgentTranscriptSchema } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
+import { prepareQueryConversation, QUERY_CONTRACT, QueryInputBudgetError, type QueryConversation } from "./query-contract.js";
 
-// Identical serialized inputs keep their checkpoints when eligibility broadens.
-export const TRAINING_PREPARATION = "visible-history-v1";
-// A deliberately conservative byte budget, NOT a tokenizer or a 32k-token target.
-const MAX_INPUT_BYTES = 24_000, MAX_HISTORY_MESSAGES = 32;
-export type TrainingInput = { history: { role: "user" | "assistant"; content: string }[]; currentRequest: string };
+// Window/tokenizer changes must never reuse a previous recipe's checkpoints.
+export const TRAINING_PREPARATION = `${QUERY_CONTRACT.version}-visible-history-${QUERY_CONTRACT.revision}`;
+export type TrainingInput = QueryConversation;
 export type TrainingExample = { seq: number; timestamp: number; input: TrainingInput; inputHash: string; contextLimited: boolean };
 type Row = { seq: number; eventJson: string; createdAt: number };
 export const trainingHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -17,23 +16,23 @@ function record(value: unknown): Record<string, unknown> | undefined {
 }
 
 /** The following answer establishes eligibility, but is never part of that example's input. */
-export function trainingExamples(rows: Iterable<Row>) {
+export function trainingExamples(rows: Iterable<Row>, renew?: () => void) {
   const examples: TrainingExample[] = [];
+  const review: { seq: number; reason: "current-request-exceeds-context-budget" }[] = [];
   const coverage = { users: 0, filtered: 0, oversized: 0, unanswered: 0 };
   let history: TrainingInput["history"] = [], limited = false;
   const assistantTexts = new Map<string, boolean>();
   let pending: TrainingExample | undefined;
+  let renewedAt = Date.now();
   const boundary = () => {
     if (pending) coverage.unanswered++;
     pending = undefined; history = []; limited = true; assistantTexts.clear();
   };
   const remember = (role: "user" | "assistant", content: string) => {
     history.push({ role, content });
-    while (history.length > MAX_HISTORY_MESSAGES || Buffer.byteLength(JSON.stringify(history)) > MAX_INPUT_BYTES) {
-      history.shift(); limited = true;
-    }
   };
   for (const row of rows) {
+    if (renew && Date.now() - renewedAt >= 10_000) { renew(); renewedAt = Date.now(); }
     let event: Record<string, unknown> | undefined;
     try { event = record(JSON.parse(row.eventJson)); } catch { coverage.filtered++; boundary(); continue; }
     if (event?.type !== "message") {
@@ -54,12 +53,16 @@ export function trainingExamples(rows: Iterable<Row>) {
       }
       if (pending) coverage.unanswered++;
       pending = undefined; assistantTexts.clear();
-      const input: TrainingInput = { history: [...history], currentRequest: visible.text };
-      let contextLimited = limited || visible.contextLimited;
-      while (input.history.length && Buffer.byteLength(JSON.stringify(input)) > MAX_INPUT_BYTES) {
-        input.history.shift(); contextLimited = true;
+      let prepared: ReturnType<typeof prepareQueryConversation>;
+      try { prepared = prepareQueryConversation(history, visible.text); }
+      catch (error) {
+        if (!(error instanceof QueryInputBudgetError)) throw error;
+        coverage.oversized++;
+        review.push({ seq: row.seq, reason: "current-request-exceeds-context-budget" });
+        boundary(); continue;
       }
-      if (Buffer.byteLength(JSON.stringify(input)) > MAX_INPUT_BYTES) { coverage.oversized++; boundary(); continue; }
+      const input = prepared.conversation;
+      const contextLimited: boolean = limited || visible.contextLimited || prepared.contextLimited;
       const eventTime = typeof event.timestamp === "string" ? Date.parse(event.timestamp) :
         typeof event.timestamp === "number" ? event.timestamp : NaN;
       // A delayed database append must not move the historical retrieval boundary forward.
@@ -88,7 +91,7 @@ export function trainingExamples(rows: Iterable<Row>) {
     }
   }
   if (pending) coverage.unanswered++;
-  return { examples, coverage };
+  return { examples, coverage, review };
 }
 
 /** Only active events; no Markdown projections, archived branches, or tool bodies. */
@@ -108,7 +111,7 @@ export class TrainingTranscriptReader {
     return this.#db.prepare("SELECT session_id FROM session_windows ORDER BY session_id").all().map(row => String(row.session_id));
   }
   /** null = absent/ineligible. Oversized sessions are not evidence of deletion. */
-  read(sessionId: string) {
+  read(sessionId: string, renew?: () => void) {
     this.#db.exec("BEGIN");
     try {
       const session = this.#db.prepare(`SELECT session_key,chat_type ${this.#lineage ?
@@ -120,7 +123,7 @@ export class TrainingTranscriptReader {
       const size = this.#db.prepare(ACTIVE_EVENT_COUNT_SQL).get(sessionId)!;
       if (Number(size.n) > 50_000 || Number(size.bytes) > 32_000_000) return { oversized: true as const };
       const rows = this.#db.prepare(ACTIVE_EVENT_ROWS_SQL).iterate(sessionId) as Iterable<Row>;
-      return trainingExamples(rows);
+      return trainingExamples(rows, renew);
     } finally { this.#db.exec("COMMIT"); }
   }
   close() { this.#db.close(); }

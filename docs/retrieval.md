@@ -261,7 +261,6 @@ or `memory_get`. Enable it in the plugin config with an explicit corpus allowlis
   "memoryWhisperer": {
     "enabled": true,
     "corpora": ["knowledge"],
-    "historyMessages": 5,
     "minUsefulness": 0.7,
     "maxHints": 2,
     "cooldownTurns": 10,
@@ -283,29 +282,40 @@ indexing/sync schedule.
 The example is a plugin config fragment; `knowledge` must already be configured.
 For a complete corpus example, use the [configuration profiles](configuration.md#example-profiles).
 
-QMD searches the current request plus the last N user/assistant messages (at most
-12,000 characters), retrieving up to eight vector candidates without query expansion,
+With a configured v2 MLX model, QMD searches its independent `lex` and `vec` queries
+through BM25 and vectors respectively, retrieving ten candidates per backend across
+the complete approved collection scope (not ten per collection). The lexical adapter
+uses literal OR keywords; quotation marks do not enable exact-phrase matching.
+Without MLX configured, the optional direct-vector path remains available and retrieves
+up to eight candidates from the prepared conversation, without query expansion,
 the local reranker, or a similarity-score cutoff. TypeSafe evaluates one independent
 Noul question per candidate in its own concurrent HTTP request: would a careful
 assistant use a specific factual detail from the excerpt when answering the current
 request? Partial answers and concrete leads count; repeated facts, topic/name matches
 without answer content, unrelated details, and unsupported speculation do not.
-This is the sole Memory Whisperer usefulness prompt, shared by both retrieval paths.
+This is the sole versioned Memory Whisperer usefulness prompt, shared by runtime
+and offline training. Generated queries, ranks, retrieval scores, and other candidates
+are never included in the passage judge's state.
 `minUsefulness` defaults to `0.7` and
 thresholds the probability of yes, not a calibrated guarantee of accuracy.
 Explicit configured thresholds are preserved. Evaluate it on your own conversations.
 
-**Privacy and budgets:** this feature sends up to 16,000 characters of the available
-user/assistant conversation, prioritizing the current request and recent messages,
-plus up to eight 1,200-character excerpts, corpus names, and matched-message timestamps
-when available to `api.typesafe.ai`. The judge receives `messageTimestamp` to record
-when something was said, without inferring event dates; it is not an injected field.
+**Privacy and budgets:** training and runtime prepare the same visible conversation:
+at most 8,192 pinned-LFM tokens and 24,000 UTF-8 bytes after serialization. The whole
+current request and most recent whole messages are retained; an oversized current
+request skips automatic memory. The judge receives that conversation plus one complete
+1,200-character excerpt, its corpus/source path, all represented message timestamps,
+and the request's evaluation time per HTTP request. A v2 query pair can therefore
+produce up to twenty passage requests before deduplication and eligibility filtering.
+Dates record when source messages were said, without inferring event dates.
 Session excerpts retain a complete turn or message when it fits,
 otherwise the complete matched chunk. Chunks exceeding the excerpt budget are
-skipped, never sliced; ordinary `memory_search` is unchanged.
+skipped, never sliced. This shared Whisperer renderer uses the fixed 1,200-character
+budget independently of `sessions.maxExpandedTokens`; that setting still controls
+ordinary `memory_search` expansion, which is unchanged.
 It does not fetch a complete historical transcript; the host may
-already have compacted the available context. Truncation is marked in the judge's
-input. System messages, thinking blocks, images, and tool-result messages are omitted;
+already have compacted the available context. System messages, thinking blocks,
+images, and tool-result messages are omitted;
 anything quoted in ordinary user/assistant text can still be transmitted.
 
 At most two qualifying excerpts are appended after the current user prompt via
@@ -347,7 +357,7 @@ Add `mlx` to the Memory Whisperer config to use the fine-tuned LFM query model:
     "timeoutMs": 8000,
     "mlx": {
       "pythonPath": "/absolute/path/to/venv/bin/python",
-      "modelPath": "/absolute/path/to/lfm25-230m-pure-query-mlx-8bit"
+      "modelPath": "/absolute/path/to/lfm25-230m-v2-lex-vec-mlx"
     }
   }
 }
@@ -366,14 +376,15 @@ cancelled requests are skipped; active generation checks cancellation between
 tokens. No conversation cache or raw worker output is written to Gateway logs.
 
 Two branches start together: TypeSafe's historical-recall judgment and local
-generation requesting three queries. Generation uses visible user/assistant text,
+generation requesting exactly one `{"lex":"keywords","vec":"semantic query"}` object.
+Generation uses visible user/assistant text,
 the exact model prompt/template, greedy decoding and a 256-token output ceiling.
 It keeps the whole current request, drops oldest whole history messages to fit a
-24,000-byte input budget, and excludes oversized/ambiguous inputs. History length
-also follows `historyMessages`. This is not a claim of a 24,000-token context.
+shared 8,192-token and 24,000-byte input budgets, and excludes oversized/ambiguous
+inputs. The old fixed `historyMessages` limit is not used by memory input preparation.
 
-Generated queries retrieve ten vector plus ten BM25 matches each per approved
-collection. All unique eligible passages proceed to the existing usefulness
+The `lex` query retrieves ten BM25 matches and `vec` retrieves ten vector matches
+across the approved scope. All unique eligible passages proceed to the shared usefulness
 judge, with one HTTP request per passage, all launched together, without a merged
 passage-count cap or groups of eight. Each request contains the original conversation
 and only its own passage. Successful judgments remain eligible if another
@@ -389,16 +400,15 @@ This can send more passages to TypeSafe than the legacy eight-candidate path.
 
 Recall probability below 0.7 discards/cancels the speculative branch immediately;
 no results are used until recall is approved. A recall error also emits no hint.
-Query output keeps nonempty strings, trims surrounding whitespace and drops exact
-duplicates; it does not require three queries or reject valid JSON based on the
-generation finish reason. Unparseable/unavailable output or no usable queries
-falls back to the legacy query/retrieval path, still subject to the recall gate
-and passage judge.
+Query output requires exactly the two nonempty string fields `lex` and `vec`;
+surrounding whitespace is trimmed. Old query arrays are not accepted. Unparseable or
+unavailable v2 output skips automatic memory for that turn rather than switching to
+untrained queries. Successful output still requires recall approval and passage judgments.
 Nothing changes in manual `memory_search`. The default total deadline remains
 three seconds; measure the full path before choosing a larger explicit budget.
 Already-running native retrieval may finish after cancellation, but cannot inject.
 
-Diagnostics distinguish `queries_generated`, `query_fallback`,
+Diagnostics distinguish `queries_generated`, `failed`,
 `recall_not_needed`, and `judge_candidate_failed`. Gateway logs prefixed
 `unblock-memory memory_whisperer` contain structured JSON with agent/run/session
 IDs, candidate index, elapsed time, request timeout, and safe

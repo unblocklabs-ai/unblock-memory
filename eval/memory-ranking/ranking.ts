@@ -38,7 +38,17 @@ export async function retrieve(qmd: QMDStore, item: SearchCase, collections: Map
   const requested = item.requestedCorpora;
   const scope = [...collections].filter(([, corpus]) => !requested || requested.includes(corpus));
   if (!scope.length) return { caseId: item.id, elapsedMs: 0, hits: [], error: "no_approved_collections" };
-  const candidates = await trainingCandidates(qmd, item.query, scope.map(([collection]) => collection), item.query);
+  const laneHits = (await Promise.all((["lex", "vec"] as const).map(lane =>
+    trainingCandidates(qmd, item.query, scope.map(([collection]) => collection), lane)))).flat();
+  const merged = new Map<string, typeof laneHits[number]>();
+  for (const candidate of laneHits) {
+    const id = hash([candidate.file, candidate.bestChunk.trim()]), previous = merged.get(id);
+    if (previous) {
+      previous.vector ??= candidate.vector;
+      previous.bm25 ??= candidate.bm25;
+    } else merged.set(id, candidate);
+  }
+  const candidates = [...merged.values()];
   const { reciprocalRankFusion } = await import(new URL("./store.js", import.meta.resolve("@unblocklabs/qmd")).href) as { reciprocalRankFusion: Rrf };
   const fused = fusePassages(candidates, reciprocalRankFusion);
   const hits: Hit[] = candidates.map(candidate => {

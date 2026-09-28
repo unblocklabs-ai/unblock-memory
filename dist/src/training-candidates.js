@@ -26,7 +26,7 @@ function lexicalChunk(chunks, body, highlighted, marker, intent) {
         return { chunk, matches, intentMatches: intentTerms.filter(term => lower.includes(term)).length };
     }).sort((a, b) => b.matches - a.matches || b.intentMatches - a.intentMatches || a.chunk.pos - b.chunk.pos)[0]?.chunk;
 }
-export async function trainingCandidates(qmd, query, collection, intent, signal) {
+export async function trainingCandidates(qmd, query, collection, lane, signal) {
     signal?.throwIfAborted();
     if (!query.trim() || query.length > 12_000)
         throw new Error("Invalid training query");
@@ -48,13 +48,16 @@ export async function trainingCandidates(qmd, query, collection, intent, signal)
             candidates.set(key, { ...hit, score: 1 / (rank + 1), explain: { methods: [method] },
                 [method]: { score: rawScore, rank: rank + 1 } });
     };
-    const vectors = await qmd.searchVector(query, { limit: 10, collection });
-    signal?.throwIfAborted();
-    for (const [rank, hit] of vectors.entries()) {
-        const pos = hit.chunkPos, len = hit.chunkLen, body = hit.body ?? "";
-        if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length)
-            continue;
-        add({ file: hit.filepath, body, bestChunk: body.slice(pos, pos + len), bestChunkPos: pos }, "vector", rank, hit.score);
+    if (lane === "vec") {
+        const vectors = await qmd.searchVector(query, { limit: 10, collection });
+        signal?.throwIfAborted();
+        for (const [rank, hit] of vectors.entries()) {
+            const pos = hit.chunkPos, len = hit.chunkLen, body = hit.body ?? "";
+            if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length)
+                continue;
+            add({ file: hit.filepath, body, bestChunk: body.slice(pos, pos + len), bestChunkPos: pos }, "vector", rank, hit.score);
+        }
+        return [...candidates.values()];
     }
     const expression = queryTerms(query).map(term => `"${chunksApi.normalizeCjkForFTS(term).trim()}"`).join(" OR ");
     if (expression) {
@@ -71,7 +74,7 @@ export async function trainingCandidates(qmd, query, collection, intent, signal)
                 .filter(span => span.pos >= 0 && span.chunk_len > 0 && span.pos + span.chunk_len <= row.doc.length)
                 .map(span => ({ pos: span.pos, text: row.doc.slice(span.pos, span.pos + span.chunk_len) }));
             const chunks = stored.length ? stored : await chunksApi.chunkDocumentAsync(row.doc, undefined, undefined, undefined, file);
-            const selected = lexicalChunk(chunks, row.doc, row.highlighted, marker, intent);
+            const selected = lexicalChunk(chunks, row.doc, row.highlighted, marker, query);
             if (selected)
                 add({ file, body: row.doc, bestChunk: selected.text, bestChunkPos: selected.pos }, "bm25", rank, row.rank);
         }

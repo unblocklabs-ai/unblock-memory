@@ -1,13 +1,17 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { readSessionManifest } from "./session-sync.js";
 import { resolveSessionSource } from "./sources.js";
 import { trainingCandidates } from "./training-candidates.js";
-export const TRAINING_RETRIEVAL_VERSION = "qmd-2.10.1-historical-prefix-depth10-v2";
+import { MEMORY_PASSAGE_VERSION, renderMemoryPassage, duplicateMemoryPassage } from "./memory-passage.js";
+export const TRAINING_RETRIEVAL_VERSION = `qmd-2.10.2-historical-lanes-depth10-v3:${MEMORY_PASSAGE_VERSION}`;
 export const TRAINING_SEARCH_OPTIONS = { vector: 10, bm25: 10, mergedLimit: null, rerank: false };
+/** Missing historical evidence is reviewable; unexpected SQLite/I/O failures remain fatal. */
+export class HistoricalCorpusUnavailableError extends Error {
+}
 /** Never infer dates by parsing message bodies: headings can be quoted or forged. */
 export function historicalPrefix(body, spans, cutoff) {
     if (!spans?.length || !body.startsWith("# Transcript\n\n") || !Number.isFinite(cutoff))
@@ -47,8 +51,15 @@ export function historicalPrefix(body, spans, cutoff) {
  * No filesystem projection, live-index mutation, model re-embedding or dependency patch. */
 export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, openStore) {
     const indexPath = join(stateDir, "index.sqlite");
-    if (!existsSync(indexPath))
-        throw new Error("No QMD index; sync sessions before evaluating training queries");
+    try {
+        statSync(indexPath);
+    }
+    catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+            throw new HistoricalCorpusUnavailableError("No QMD index; sync sessions before evaluating training queries");
+        }
+        throw error;
+    }
     const manifest = await readSessionManifest(join(stateDir, "sessions-manifest.json"));
     const source = resolveSessionSource(join(stateDir, "sessions"), chatTypes);
     const createStore = openStore ?? (await import("@unblocklabs/qmd")).createStore;
@@ -189,16 +200,21 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
             }
         };
         return { corpusHash, report, maxDate,
-            search: async (query) => {
+            search: async (query, lane) => {
                 if (closed)
                     throw new Error("Historical snapshot is closed");
                 if (!report.sessions)
                     return [];
-                if (!report.chunks)
-                    throw new Error("Historical snapshot has no vectors; refusing a BM25-only evaluation");
+                if (lane === "vec" && !report.chunks)
+                    throw new HistoricalCorpusUnavailableError("Historical snapshot has no vectors; refusing an unresolved vector evaluation");
                 const qmd = await (indexed ??= materialize());
-                const hits = await trainingCandidates(qmd, query, source.collection, `Historical request made at ${maxDate}. Current, now and latest refer to that timestamp.`);
-                return hits.map(hit => trainingHit(hit, metadata, cutoff));
+                const hits = await trainingCandidates(qmd, query, source.collection, lane);
+                const rendered = await Promise.all(hits.map(hit => trainingHit(hit, metadata, cutoff)));
+                const distinct = [];
+                for (const hit of rendered)
+                    if (hit && !duplicateMemoryPassage(hit, distinct))
+                        distinct.push(hit);
+                return distinct;
             }, close: async () => {
                 if (closed)
                     return;
@@ -221,12 +237,20 @@ function historicalChunk(chunk, length) {
     return Number.isSafeInteger(chunk.pos) && Number.isSafeInteger(chunk.chunk_len) && chunk.pos >= 0 && chunk.chunk_len > 0 &&
         chunk.pos + chunk.chunk_len <= length;
 }
-function trainingHit(hit, metadata, cutoff) {
-    const spans = metadata.get(hit.file)?.filter(s => s.start < hit.bestChunkPos + hit.bestChunk.length && s.end > hit.bestChunkPos);
+async function trainingHit(hit, metadata, cutoff) {
+    const messages = metadata.get(hit.file);
+    const selected = await renderMemoryPassage({ body: hit.body, bestChunk: hit.bestChunk,
+        chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length }, messages);
+    if (!selected)
+        return;
+    const spans = messages?.filter(s => s.start < selected.position + (selected.sourceText ?? selected.text).length && s.end > selected.position);
     if (!spans?.length || spans.some(s => !(Date.parse(s.timestamp) < Math.floor(cutoff / 1000) * 1000)) ||
         hit.body.slice(hit.bestChunkPos, hit.bestChunkPos + hit.bestChunk.length) !== hit.bestChunk) {
         throw new Error("QMD returned evidence outside the historical snapshot");
     }
-    return { path: hit.file, position: hit.bestChunkPos, text: hit.bestChunk, dates: [...new Set(spans.map(s => s.timestamp))],
+    const startLine = hit.body.slice(0, selected.position).split("\n").length;
+    const endLine = startLine + (selected.sourceText ?? selected.text).split("\n").length - 1;
+    return { path: hit.file, corpus: "sessions", position: selected.position, text: selected.text, startLine, endLine,
+        dates: [...new Set(spans.map(s => s.timestamp))],
         score: hit.score, methods: hit.explain?.methods ?? [] };
 }

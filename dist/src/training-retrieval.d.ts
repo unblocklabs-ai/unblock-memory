@@ -1,6 +1,7 @@
 import type { ChatType } from "./config.js";
 import type { SessionMessageSpan } from "./session-projector.js";
-export declare const TRAINING_RETRIEVAL_VERSION = "qmd-2.10.1-historical-prefix-depth10-v2";
+import type { QueryLane } from "./query-contract.js";
+export declare const TRAINING_RETRIEVAL_VERSION = "qmd-2.10.2-historical-lanes-depth10-v3:complete-excerpt-1200-v1";
 export declare const TRAINING_SEARCH_OPTIONS: {
     readonly vector: 10;
     readonly bm25: 10;
@@ -9,12 +10,18 @@ export declare const TRAINING_SEARCH_OPTIONS: {
 };
 export type TrainingHit = {
     path: string;
+    corpus: string;
     text: string;
     dates: string[];
     position: number;
+    startLine: number;
+    endLine: number;
     score: number;
     methods: string[];
 };
+/** Missing historical evidence is reviewable; unexpected SQLite/I/O failures remain fatal. */
+export declare class HistoricalCorpusUnavailableError extends Error {
+}
 /** Never infer dates by parsing message bodies: headings can be quoted or forged. */
 export declare function historicalPrefix(body: string, spans: readonly SessionMessageSpan[] | undefined, cutoff: number): {
     body: string;
@@ -32,6 +39,6 @@ export declare function historicalTrainingSearch(stateDir: string, chatTypes: re
         excludedChunks: number;
     };
     maxDate: string;
-    search: (query: string) => Promise<TrainingHit[]>;
+    search: (query: string, lane: QueryLane) => Promise<TrainingHit[]>;
     close: () => Promise<void>;
 }>;

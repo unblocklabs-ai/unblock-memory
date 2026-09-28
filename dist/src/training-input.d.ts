@@ -1,11 +1,6 @@
-export declare const TRAINING_PREPARATION = "visible-history-v1";
-export type TrainingInput = {
-    history: {
-        role: "user" | "assistant";
-        content: string;
-    }[];
-    currentRequest: string;
-};
+import { type QueryConversation } from "./query-contract.js";
+export declare const TRAINING_PREPARATION: string;
+export type TrainingInput = QueryConversation;
 export type TrainingExample = {
     seq: number;
     timestamp: number;
@@ -20,7 +15,7 @@ type Row = {
 };
 export declare const trainingHash: (value: unknown) => string;
 /** The following answer establishes eligibility, but is never part of that example's input. */
-export declare function trainingExamples(rows: Iterable<Row>): {
+export declare function trainingExamples(rows: Iterable<Row>, renew?: () => void): {
     examples: TrainingExample[];
     coverage: {
         users: number;
@@ -28,6 +23,10 @@ export declare function trainingExamples(rows: Iterable<Row>): {
         oversized: number;
         unanswered: number;
     };
+    review: {
+        seq: number;
+        reason: "current-request-exceeds-context-budget";
+    }[];
 };
 /** Only active events; no Markdown projections, archived branches, or tool bodies. */
 export declare class TrainingTranscriptReader {
@@ -35,7 +34,7 @@ export declare class TrainingTranscriptReader {
     constructor(path: string, agentId: string);
     sessions(): string[];
     /** null = absent/ineligible. Oversized sessions are not evidence of deletion. */
-    read(sessionId: string): {
+    read(sessionId: string, renew?: () => void): {
         examples: TrainingExample[];
         coverage: {
             users: number;
@@ -43,6 +42,10 @@ export declare class TrainingTranscriptReader {
             oversized: number;
             unanswered: number;
         };
+        review: {
+            seq: number;
+            reason: "current-request-exceeds-context-budget";
+        }[];
     } | {
         oversized: true;
     } | null;

@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.3.30",
+  "version": "0.4.0",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",
@@ -21,6 +21,8 @@
   "files": [
     "dist",
     "src/mlx-query-worker.py",
+    "src/query_contract.py",
+    "src/query-tokenizer",
     "skills",
     "README.md",
     "docs/configuration.md",
@@ -42,6 +44,7 @@
     "preflight": "npm run knip && npm run build && npm run typecheck && npm test && npm run plugin:inspect && npm run plugin:inspect:runtime && npm pack --dry-run"
   },
   "dependencies": {
+    "@huggingface/tokenizers": "0.2.0",
     "@unblocklabs/qmd": "https://github.com/unblocklabs-ai/qmd/releases/download/v2.10.2/unblocklabs-qmd-2.10.2.tgz",
     "chokidar": "5.0.0",
     "picomatch": "^4.0.5",

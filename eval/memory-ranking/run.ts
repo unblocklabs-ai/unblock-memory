@@ -51,7 +51,7 @@ if (!approved.length) throw new Error("No Memory Whisperer approved corpora; exp
 const collections = new Map(approved.map(s => [s.collection, s.corpus]));
 const recipe = { version: "memory-ranking-v1", model: TYPESAFE_MODEL, limitPerMethod: 10,
   ...(frozenCases ? { frozenCasesHash: hash(frozenCases) } : {}),
-  limitScope: "across_selected_collections", historyMessages: config.memoryWhisperer.historyMessages,
+  limitScope: "across_selected_collections", inputWindow: "lfm-8192-tokens-24000-bytes",
   timeoutMs: config.typesafe.timeoutMs, minUsefulness: config.memoryWhisperer.minUsefulness,
   collections: [...collections], rrf: { implementation: "QMD reciprocalRankFusion", k: 60, weights: [1, 1],
     identity: "source plus trimmed passage", topRankBonus: { first: 0.05, secondAndThird: 0.02 } },
@@ -72,7 +72,7 @@ async function main() {
     if (manifest.recipeHash !== hash(recipe)) throw new Error("Evaluation recipe changed; start a new output directory");
     cases = rows<SearchCase>("cases.jsonl");
   } else {
-    cases = selectedCases ?? collectSearches(values.database!, values.agent!, count, recipe.historyMessages);
+    cases = selectedCases ?? collectSearches(values.database!, values.agent!, count);
     if (!cases.length) throw new Error("No eligible agent-issued memory_search calls found");
     for (const item of cases) append("cases.jsonl", item);
     const requireQmd = createRequire(import.meta.resolve("@unblocklabs/qmd"));
@@ -112,8 +112,9 @@ async function main() {
       if (item.conversation) {
         await Promise.all(result.hits.map(async hit => {
           const identity = `${item.id}:${hit.id}`;
-          const params = { conversation: { ...item.conversation!, truncated: item.truncated ?? false },
-            candidates: [{ excerpt: hit.body.trim(), corpus: hit.corpus, ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}) }] };
+          const params = { conversation: item.conversation!, asOf: item.userTimestamp ?? item.searchedAt,
+            candidates: [{ excerpt: hit.body.trim(), corpus: hit.corpus, sourcePath: hit.source,
+              dates: hit.messageTimestamp ? [hit.messageTimestamp] : [] }] };
           const inputHash = hash([recipe.policyHash, recipe.model, params]);
           const previous = judgments.get(identity);
           if (previous) {

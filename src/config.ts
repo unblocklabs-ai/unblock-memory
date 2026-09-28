@@ -68,7 +68,6 @@ export type UnblockMemoryConfig = {
     enabled: boolean;
     complementaryHints: boolean;
     corpora: readonly string[];
-    historyMessages: number;
     minUsefulness: number;
     maxHints: number;
     cooldownTurns: number;
@@ -146,7 +145,7 @@ const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
 };
 
 const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
-  enabled: false, complementaryHints: false, corpora: [], historyMessages: 5, minUsefulness: 0.7,
+  enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.7,
   maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
 };
 
@@ -178,11 +177,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora");
   }
   if (enabled && !selected.length) throw new Error("unblock-memory enabled memoryWhisperer requires explicit corpora");
-  const historyMessages = config.historyMessages ?? 5;
   const cooldownTurns = config.cooldownTurns ?? 10;
-  if (typeof historyMessages !== "number" || !Number.isInteger(historyMessages) || historyMessages < 0 || historyMessages > 50) {
-    throw new Error("unblock-memory memoryWhisperer.historyMessages must be an integer between 0 and 50");
-  }
   if (typeof cooldownTurns !== "number" || !Number.isInteger(cooldownTurns) || cooldownTurns < 0 || cooldownTurns > 1000) {
     throw new Error("unblock-memory memoryWhisperer.cooldownTurns must be an integer between 0 and 1000");
   }
@@ -191,7 +186,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
   }
   return {
-    enabled, complementaryHints, corpora: [...new Set(selected)], historyMessages, cooldownTurns, minUsefulness,
+    enabled, complementaryHints, corpora: [...new Set(selected)], cooldownTurns, minUsefulness,
     maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
     timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
     ...(mlx ? { mlx } : {}),

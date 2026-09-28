@@ -1,6 +1,6 @@
-import type { TrainingInput } from './training-input.js';
-import type { TrainingHit } from './training-retrieval.js';
-export declare const CONTEXT_JUDGE_VERSION = "conversation-context-usefulness-v1";
+import type { TrainingInput } from "./training-input.js";
+import type { TrainingHit } from "./training-retrieval.js";
+export declare const CONTEXT_JUDGE_VERSION = "jev-1.13.0:memory-usefulness-v2";
 export declare function contextJudgeRequest(input: TrainingInput, asOf: string, hit: TrainingHit): {
     model: string;
     state: {
@@ -12,59 +12,29 @@ export declare function contextJudgeRequest(input: TrainingInput, asOf: string, 
             currentRequest: string;
         };
         asOf: string;
-        passage: {
-            text: string;
+        candidates: {
+            excerpt: string;
+            corpus: string;
             sourcePath: string;
-            dates: string[];
-        };
+            dates: readonly string[];
+        }[];
     };
     questions: {
-        usefulness: {
+        memory_0: {
             type: string;
-            instructions: {
-                question: string;
-                task: string;
-                identity: string;
-                value: string;
-                time: string;
-                limits: string;
-                trust: string;
+            instructions: string;
+            criteria: {
+                true: string;
+                false: string;
             };
-            criteria: string[];
         };
     };
-};
-export declare function parseContextJudgment(payload: unknown): {
-    score: number;
-    answer: {
-        type: "score";
-        confidence: number;
-        probabilities: {
-            '0': number;
-            '1': number;
-            '2': number;
-            '3': number;
-        };
-        score: number;
-    };
-    model: "jev-1.13.0";
-    usage: {
-        input_tokens: number;
-        output_tokens: number;
-    } | null;
 };
 export declare function judgeTrainingPassage(request: ReturnType<typeof contextJudgeRequest>, apiKey: string): Promise<{
-    score: number;
+    probability: number;
     answer: {
-        type: "score";
-        confidence: number;
-        probabilities: {
-            '0': number;
-            '1': number;
-            '2': number;
-            '3': number;
-        };
-        score: number;
+        type: "noul";
+        noul: number;
     };
     model: "jev-1.13.0";
     usage: {

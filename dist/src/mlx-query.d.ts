@@ -1,13 +1,7 @@
 import type { UnblockMemoryConfig } from "./config.js";
-type Conversation = {
-    history: {
-        role: "user" | "assistant";
-        content: string;
-    }[];
-    currentRequest: string;
-};
+import { type QueryConversation, type QueryPair } from "./query-contract.js";
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
-export declare function queryConversation(prompt: string, messages: readonly unknown[], historyMessages: number): Conversation;
+export declare function queryConversation(prompt: string, messages: readonly unknown[]): QueryConversation;
 export declare class MlxQueryGenerator {
     #private;
     private readonly config;
@@ -16,7 +10,6 @@ export declare class MlxQueryGenerator {
     constructor(config: NonNullable<UnblockMemoryConfig["memoryWhisperer"]["mlx"]>);
     get closed(): boolean;
     start(): Promise<void>;
-    generate(conversation: Conversation, signal: AbortSignal): Promise<string[]>;
+    generate(conversation: QueryConversation, signal: AbortSignal): Promise<QueryPair>;
     close(): void;
 }
-export {};

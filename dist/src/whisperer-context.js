@@ -19,26 +19,3 @@ export function buildSkillWhispererQuery(prompt, messages, historyMessages) {
     const history = historyMessages === 0 ? [] : availableHistory.slice(-historyMessages);
     return [...history, `user: ${prompt.trim()}`].join("\n\n").slice(-MAX_SKILL_QUERY_CHARS);
 }
-export function memoryConversation(prompt, messages) {
-    const currentRequest = prompt.trim().slice(-16_000);
-    let remaining = 16_000 - currentRequest.length;
-    let truncated = currentRequest.length < prompt.trim().length;
-    const history = [];
-    const available = messages.flatMap(message => {
-        const parsed = messageText(message);
-        return parsed ? [parsed] : [];
-    });
-    // Hosts may include the current user message in messages as well as prompt.
-    if (available.at(-1)?.role === "user" && available.at(-1)?.text === prompt.trim())
-        available.pop();
-    for (const message of available.reverse()) {
-        if (message.text.length > remaining)
-            truncated = true;
-        if (remaining <= 0)
-            continue;
-        const content = message.text.slice(-remaining);
-        history.unshift({ role: message.role, content });
-        remaining -= content.length;
-    }
-    return { currentRequest, history, truncated };
-}

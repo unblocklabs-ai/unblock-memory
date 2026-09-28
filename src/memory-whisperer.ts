@@ -4,19 +4,20 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import { judgeTypeSafeMemories } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { buildSkillWhispererQuery, memoryConversation } from "./whisperer-context.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { MlxQueryGenerator, queryConversation } from "./mlx-query.js";
 import { judgeTrainingInput, TRAINING_GATE_THRESHOLD } from "./training-gate.js";
+import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
+import type { QueryPair } from "./query-contract.js";
 
-const MAX_EXCERPT_CHARS = 1200;
+const MAX_EXCERPT_CHARS = MEMORY_PASSAGE_CHARS;
 
 type MemoryWhispererRuntime = {
   getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }): Promise<{
     manager: {
       search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
-      searchWhisperer?(queries: readonly string[], opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
+      searchWhisperer?(queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
     } | null;
   }>;
 };
@@ -47,7 +48,7 @@ export function registerMemoryWhisperer(
   const sessions = new Map<string, SessionState>();
   const generator = config.mlx ? MlxQueryGenerator.shared(config.mlx) : undefined;
   if (generator) api.on("gateway_start", () => {
-    void generator.start().catch(() => api.logger.warn("unblock-memory MLX worker unavailable; query fallback active"));
+    void generator.start().catch(() => api.logger.warn("unblock-memory MLX worker unavailable; automatic memory skipped"));
   });
 
   const beforePrompt: Parameters<typeof api.on<"before_prompt_build">>[1] = async (event, context) => {
@@ -60,6 +61,7 @@ export function registerMemoryWhisperer(
     const previous = sessions.get(key);
     if (previous?.runId === runId) return previous.result;
     const started = performance.now();
+    const asOf = new Date().toISOString();
     const measurement: Parameters<WhispererDiagnostics["measureMemory"]>[1] = { outcome: "skipped", elapsedMs: 0 };
     let stage = "credentials", reason = "completed";
     let recallProbability: number | undefined, queryCount: number | undefined;
@@ -92,11 +94,11 @@ export function registerMemoryWhisperer(
       if (signal.aborted) return;
       if (!apiKey) { reason = "missing_key"; diagnostics?.record(agentId, "memory", "missing_key"); return; }
       stage = "input";
-      const conversation = generator ? queryConversation(event.prompt, event.messages, config.historyMessages) : undefined;
+      const conversation = queryConversation(event.prompt, event.messages);
       const gateStarted = performance.now();
       const gateSignal = AbortSignal.any([signal, AbortSignal.timeout(typesafe.timeoutMs)]);
       // Speculation is intentional: neither model generation nor QMD waits for the recall judgment.
-      const gate = conversation ? judgeTrainingInput(conversation, apiKey, gateSignal)
+      const gate = generator ? judgeTrainingInput(conversation, apiKey, gateSignal)
         .then(result => {
           if (signal.aborted) return false;
           measurement.gateMs = performance.now() - gateStarted;
@@ -119,19 +121,22 @@ export function registerMemoryWhisperer(
           return false;
         }) : Promise.resolve(true);
       const retrieveAndJudge = async () => {
-        let queries: string[] | undefined;
-        if (generator && conversation) {
+        let queries: QueryPair | undefined;
+        if (generator) {
           stage = "generation";
           const generationStarted = performance.now();
           try {
             queries = await generator.generate(conversation, signal);
             if (signal.aborted) return;
-            queryCount = queries.length;
+            queryCount = 2;
             diagnostics?.record(agentId, "memory", "queries_generated");
           } catch (error) {
             if (signal.aborted) return;
-            log("warn", "query_fallback", { ...failureFields(error), elapsedMs: performance.now() - generationStarted });
-            diagnostics?.record(agentId, "memory", "query_fallback");
+            reason = "generation_failed";
+            measurement.outcome = "failed";
+            log("warn", "generation_failed", { ...failureFields(error), elapsedMs: performance.now() - generationStarted });
+            diagnostics?.record(agentId, "memory", "failed");
+            return;
           } finally {
             measurement.generationMs = performance.now() - generationStarted;
           }
@@ -141,9 +146,10 @@ export function registerMemoryWhisperer(
         if (signal.aborted) return;
         if (!manager) { reason = "unavailable"; diagnostics?.record(agentId, "memory", "unavailable"); return; }
         const retrievalStarted = performance.now();
-        const hits = queries && manager.searchWhisperer ? await manager.searchWhisperer(queries,
+        if (queries && !manager.searchWhisperer) throw new Error("V2 Whisperer retrieval is unavailable");
+        const hits = queries ? await manager.searchWhisperer!(queries,
           { corpora, signal, maxSnippetChars: MAX_EXCERPT_CHARS }) : await manager.search(
-          buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages),
+          JSON.stringify(conversation),
           { corpora, maxResults: 8, minScore: -1, signal, maxSnippetChars: MAX_EXCERPT_CHARS },
         );
         if (signal.aborted) return;
@@ -158,9 +164,8 @@ export function registerMemoryWhisperer(
           // with a prefix if a manager returns an oversized result.
           if (excerpt.length > MAX_EXCERPT_CHARS) continue;
           const id = fingerprint(excerpt);
-          if (!excerpt || state.recent.has(id) || candidates.some(candidate => candidate.id === id ||
-            (candidate.hit.path === hit.path && candidate.hit.startLine <= hit.endLine &&
-              hit.startLine <= candidate.hit.endLine))) continue;
+          if (!excerpt || state.recent.has(id) || duplicateMemoryPassage({ ...hit, text: excerpt },
+            candidates.map(candidate => ({ ...candidate.hit, text: candidate.excerpt })))) continue;
           candidates.push({ hit, excerpt, id });
           if (!queries && candidates.length === 8) break;
         }
@@ -169,8 +174,6 @@ export function registerMemoryWhisperer(
         if (!candidates.length) { reason = "no_candidates"; diagnostics?.record(agentId, "memory", "no_candidates"); return; }
         stage = "judgment";
         const judgeStarted = performance.now();
-        const judgeConversation = conversation ? { ...conversation, truncated: event.messages.length > conversation.history.length }
-          : memoryConversation(event.prompt, event.messages);
         // Every eligible passage gets its own request; no request sees another candidate.
         const judged = (await Promise.all(candidates.map(async (candidate, candidateIndex) => {
           const requestStarted = performance.now();
@@ -180,9 +183,11 @@ export function registerMemoryWhisperer(
             const { hit, excerpt } = candidate;
             const [probability] = await judgeTypeSafeMemories({
               apiKey, timeoutMs: typesafe.timeoutMs, signal,
-              conversation: judgeConversation,
+              conversation, asOf,
               candidates: [{
-                excerpt, corpus: hit.corpus, ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
+                excerpt, corpus: hit.corpus, sourcePath: hit.path,
+                dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
+                  ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
               }],
             });
             if (signal.aborted) return [];

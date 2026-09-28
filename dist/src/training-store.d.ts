@@ -1,8 +1,9 @@
 import { type TrainingExample, type TrainingInput } from "./training-input.js";
 import { type judgeTrainingInput } from "./training-gate.js";
-import type { TeacherResult } from "./training-models.js";
+import { type TeacherResult, type TrainingRound } from "./training-models.js";
 import type { TrainingHit } from "./training-retrieval.js";
-import type { parseContextJudgment } from "./training-judge.js";
+import type { judgeTrainingPassage } from "./training-judge.js";
+import type { QueryLane, QueryPair } from "./query-contract.js";
 type GateResult = Awaited<ReturnType<typeof judgeTrainingInput>>;
 type Job = {
     id: string;
@@ -18,19 +19,19 @@ export type TrainingSourceExample = {
 };
 export type QueryEvaluation = {
     query: string;
+    lane: QueryLane;
+    round: TrainingRound;
     retrievalId: string;
     score: number;
-    judgments?: {
-        id: string;
-        excluded: boolean;
-    }[];
+    maxProbability: number;
+    judgments: string[];
 };
 type TrainingEvaluation = {
     sourceId: string;
     inputHash: string;
     timestamp: number;
     corpusHash: string;
-    teacherId: string;
+    teacherIds: string[];
     corpusReport: {
         sessions: number;
         chunks: number;
@@ -39,23 +40,31 @@ type TrainingEvaluation = {
         excludedChunks: number;
     };
     queries: QueryEvaluation[];
-    selected: string[];
+    selected: QueryPair | null;
+    review: string[];
 };
 export type TrainingStepResults = {
     generate: TeacherResult;
     retrieve: {
         query: string;
+        lane: QueryLane;
         maxDate: string;
         corpusHash: string;
         hits: TrainingHit[];
     };
-    judge: ReturnType<typeof parseContextJudgment> | {
-        excluded: true;
-        reason: "operator-exclusion";
-    };
+    judge: Awaited<ReturnType<typeof judgeTrainingPassage>>;
+    score: QueryEvaluation;
     evaluate: TrainingEvaluation;
 };
 type StepStatus = "pending" | "attempted" | "complete" | "failed" | "ambiguous";
+type ReviewDetails = {
+    steps: string[];
+} | {
+    lanes: string[];
+    evaluationId: string;
+} | {
+    timestamp: number;
+};
 export declare class TrainingStore {
     #private;
     constructor(path: string, agentId: string);
@@ -75,7 +84,7 @@ export declare class TrainingStore {
         status: "failed" | "ambiguous";
         error: string;
     }): void;
-    retry(includeAmbiguous: boolean): number;
+    retry(includeAmbiguous: boolean, ids: readonly string[]): number;
     activeExamples(): TrainingSourceExample[];
     queryExamples(threshold?: number): {
         recallProbability: number;
@@ -85,14 +94,24 @@ export declare class TrainingStore {
         sessionId: string;
         timestamp: number;
     }[];
-    step<S extends keyof TrainingStepResults>(stage: S, request: unknown): {
+    step<S extends keyof TrainingStepResults>(stage: S, parameters: Record<string, unknown>): {
         id: string;
         stage: S;
-        request: unknown;
+        request: {
+            recipe: string;
+        };
         status: StepStatus;
         result: TrainingStepResults[S] | undefined;
     };
-    judgmentExcluded(identity: string): boolean;
+    flagReview(example: TrainingSourceExample, reason: string, details: ReviewDetails): void;
+    clearReview(sourceId: string): void;
+    reviews(): {
+        sourceId: string;
+        inputHash: string;
+        reason: string;
+        details: ReviewDetails;
+        updatedAt: number;
+    }[];
     startStep(stage: keyof TrainingStepResults, id: string, request: unknown): number;
     finishStep<S extends keyof TrainingStepResults>(stage: S, id: string, attempt: number, outcome: {
         result: TrainingStepResults[S];
@@ -103,6 +122,7 @@ export declare class TrainingStore {
     completedEvaluations(versions?: {
         selection: string;
         retrieval: string;
+        judge: string;
     }): TrainingEvaluation[];
     sourceDetails(id: string): {
         nodeId: string;
@@ -116,6 +136,7 @@ export declare class TrainingStore {
         result: unknown;
         completedAt: import("node:sqlite").SQLOutputValue;
     };
+    stepRecordStatus(id: string): StepStatus | undefined;
     status(threshold: number): {
         nodeId: string;
         agentId: string;
@@ -132,6 +153,15 @@ export declare class TrainingStore {
         inputTokens: number;
         outputTokens: number;
         negative: number;
+        recipe: string;
+        reviews: {
+            sourceId: string;
+            inputHash: string;
+            reason: string;
+            details: ReviewDetails;
+            updatedAt: number;
+        }[];
+        retryable: Record<string, import("node:sqlite").SQLOutputValue>[];
         queryStages: Record<string, import("node:sqlite").SQLOutputValue>[];
         queryAttempts: Record<string, import("node:sqlite").SQLOutputValue>[];
         attempts: Record<string, import("node:sqlite").SQLOutputValue>[];

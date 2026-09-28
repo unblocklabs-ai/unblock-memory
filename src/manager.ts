@@ -5,7 +5,6 @@ import { basename, dirname, relative, resolve, sep } from "node:path";
 import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
 import picomatch from "picomatch";
-import { meetingRevisionAnnotation, meetingSpeakerSpans } from "./loggie-projection.js";
 import {
   ensureMemoryAnalysisSchema,
   latestAnalysisCollections,
@@ -51,7 +50,7 @@ import {
   type SessionManifest,
 } from "./session-sync.js";
 import { parseSessionMessageSpans, sessionContextSpans, sessionSnippetMessages,
-  type SessionMessageSpan, type SessionMetadata } from "./session-projector.js";
+  type SessionMetadata } from "./session-projector.js";
 import { parseSafeVirtualPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
 import { auditQualityPage, type QualityCursor } from "./quality-audit.js";
 import { qualityTaskPresence } from "./quality-triage.js";
@@ -60,6 +59,9 @@ import { reviewClusterIngestion } from "./cluster-review.js";
 import { abortable } from "./abortable.js";
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 import { trainingCandidates } from "./training-candidates.js";
+import { expandSessionSearchHit, renderMemoryPassage } from "./memory-passage.js";
+import type { QueryPair } from "./query-contract.js";
+export { expandSessionSearchHit } from "./memory-passage.js";
 
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
@@ -307,37 +309,6 @@ function lineSpan(
   const startLine = before.split("\n").length;
   const endLine = startLine + Math.max(0, text.split("\n").length - 1);
   return { startLine, endLine };
-}
-
-export async function expandSessionSearchHit(
-  result: Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">,
-  maxTokens: number,
-  countTokens: (text: string) => Promise<number>,
-  maxChars = Infinity,
-  messages?: SessionMessageSpan[],
-): Promise<{ text: string; position: number; sourceText?: string }> {
-  const leaf = { text: result.bestChunk, position: result.chunkPos };
-  const speaker = meetingSpeakerSpans(result.body, result.chunkPos, result.chunkPos + result.chunkLen);
-  const annotation = meetingRevisionAnnotation(result.body, result.chunkPos);
-  const spans = speaker ?? sessionContextSpans(result.body, result.chunkPos, messages);
-  if (!spans && !annotation) return leaf;
-  const leafEnd = result.chunkPos + result.chunkLen;
-  for (const span of spans ? [spans.turn, spans.message] : []) {
-    if (span.start > result.chunkPos || span.end < leafEnd) continue;
-    const sourceText = result.body.slice(span.start, span.end).trimEnd();
-    const text = annotation ? `${annotation}\n${sourceText}` : sourceText;
-    if (text.length > maxChars) continue;
-    if (await countTokens(text) <= maxTokens) return { text, position: span.start, ...(annotation ? { sourceText } : {}) };
-  }
-  if ((speaker && speaker.start < result.chunkPos) || annotation) {
-    const text = [annotation, speaker && speaker.start < result.chunkPos ? speaker.header : undefined, leaf.text].filter(Boolean).join("\n");
-    if (text.length <= maxChars && await countTokens(text) <= maxTokens) {
-      return { ...leaf, text, sourceText: leaf.text };
-    }
-  }
-  // Never silently strip supersession when the caller's snippet budget is tiny.
-  if (annotation) return { ...leaf, text: "", sourceText: "" };
-  return leaf;
 }
 
 function lexicalResult(
@@ -1059,7 +1030,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   }
 
   /** Whisperer-only discovery: exact trained recipe, no query-conditioned reranker or merged cap. */
-  async searchWhisperer(queries: readonly string[], opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]> {
+  async searchWhisperer(queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]> {
     return this.#enqueue(async () => {
       opts.signal?.throwIfAborted();
       const collections = this.#collectionNames(opts.corpora);
@@ -1068,22 +1039,22 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       const store = await this.#getAnalysisStore() as QMDStore;
       const hits = new Map<string, Pick<VectorSearchResult, "file" | "body" | "bestChunk" | "chunkPos" | "chunkLen" | "displayPath" | "score">>();
       // Serialize native QMD work. Cancellation prevents further queries/collections.
-      for (const query of queries) for (const collection of collections) {
+      for (const lane of ["lex", "vec"] as const) {
         opts.signal?.throwIfAborted();
-        for (const hit of await trainingCandidates(store, query, collection, query, opts.signal)) {
+        for (const hit of await trainingCandidates(store, queries[lane], collections, lane, opts.signal)) {
           const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk]);
           if (!hits.has(key)) hits.set(key, { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
             chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: hit.score });
         }
       }
       opts.signal?.throwIfAborted();
-      return this.#renderSearchHits([...hits.values()], store, opts);
+      return this.#renderSearchHits([...hits.values()], store, opts, true);
     });
   }
 
   async #renderSearchHits(
     hits: readonly Pick<VectorSearchResult, "file" | "body" | "bestChunk" | "chunkPos" | "chunkLen" | "displayPath" | "score">[],
-    store: ManagerStore, opts?: Pick<CorpusSearchOptions, "maxSnippetChars" | "signal">,
+    store: ManagerStore, opts?: Pick<CorpusSearchOptions, "maxSnippetChars" | "signal">, whisperer = false,
   ): Promise<CorpusMemorySearchResult[]> {
     const tokenizer = (store as Partial<AnalysisStore>).internal?.llm;
     const results: CorpusMemorySearchResult[] = [];
@@ -1111,7 +1082,8 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       const messageTimestamp = messages
         ? sessionContextSpans(hit.body, hit.chunkPos, messages)?.message.timestamp
         : undefined;
-      const selected = corpus === "sessions" && this.#sessions && tokenizer
+      const selected = whisperer ? await renderMemoryPassage(hit, messages)
+        : corpus === "sessions" && this.#sessions && tokenizer
         ? await expandSessionSearchHit(
             hit,
             this.#sessions.maxExpandedTokens,
@@ -1120,7 +1092,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             messages,
           )
         : { text: hit.bestChunk, position: hit.chunkPos };
-      if (!selected.text) continue;
+      if (!selected?.text) continue;
       const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
       results.push({
         path: hit.file,

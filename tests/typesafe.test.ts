@@ -3,7 +3,8 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { judgeTypeSafeMemories, judgeTypeSafeQuality, selectTypeSafeSkill } from "../src/typesafe.js";
+import { judgeTypeSafeMemories, judgeTypeSafeQuality, selectTypeSafeSkill, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/typesafe.js";
+import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "../src/training-judge.js";
 import { requestTypeSafe, resolveTypeSafeApiKey } from "../src/typesafe-client.js";
 
 const config = { enabled: true, timeoutMs: 100 };
@@ -19,7 +20,7 @@ test("quality judgments keep evidence and noise independent and validate exact a
     assert.equal(typeof request.questions.noise_0.criteria.true.definition, "string");
     assert.ok(Array.isArray(request.questions.noise_0.criteria.false.exclusions));
     assert.deepEqual(Object.keys(request.state), ["chunks"]);
-    return Response.json({ answers: { noise_0: { type: "noul", noul: 0.96 }, evidence_0: { type: "noul", noul: 0.97 } } });
+    return Response.json({ model: "jev-1.13.0", answers: { noise_0: { type: "noul", noul: 0.96 }, evidence_0: { type: "noul", noul: 0.97 } } });
   });
   assert.deepEqual(await judgeTypeSafeQuality(params), [{ noise: 0.96, evidence: 0.97 }]);
   for (const answers of [{}, { noise_0: { type: "noul", noul: 0.95 } },
@@ -34,7 +35,7 @@ const selection = {
   currentRequest: "Deploy this project", history: [],
   candidates: [{ name: "none", description: "Deploy software releases." }],
 };
-const response = (noul: number) => Response.json({ answers: { useful: { type: "noul", noul } } });
+const response = (noul: number) => Response.json({ model: "jev-1.13.0", answers: { useful: { type: "noul", noul } } });
 
 test("credentials support environment, explicit key, plaintext and dotenv files without sourcing", async (t) => {
   const previous = process.env.TYPESAFE_API_KEY;
@@ -113,8 +114,8 @@ test("the request deadline aborts slow fetches", async (t) => {
 
 const memoryJudgment = {
   apiKey: "test-secret", timeoutMs: 100, signal: new AbortController().signal,
-  conversation: { currentRequest: "Deploy alpha", history: [], truncated: false },
-  candidates: [{ excerpt: "Alpha requires approval", corpus: "knowledge" }],
+  conversation: { currentRequest: "Deploy alpha", history: [] }, asOf: "2026-09-28T00:00:00Z",
+  candidates: [{ excerpt: "Alpha requires approval", corpus: "knowledge", sourcePath: "qmd://knowledge/alpha.md", dates: [] }],
 };
 
 test("memory judgments use Noul probabilities and reject missing, extra, mistyped and out-of-range answers", async t => {
@@ -126,7 +127,7 @@ test("memory judgments use Noul probabilities and reject missing, extra, mistype
     assert.equal(request.questions.memory_0.type, "noul");
     assert.match(JSON.stringify(request.questions.memory_0.instructions), /conversation\.currentRequest/);
     assert.equal(request.state.candidates[0].excerpt, "Alpha requires approval");
-    return Response.json({ answers: { memory_0: { type: "noul", noul: 0.97 } } });
+    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.97 } } });
   });
   assert.deepEqual(await judgeTypeSafeMemories(memoryJudgment), [0.97]);
   assert.deepEqual(await judgeTypeSafeMemories({ ...memoryJudgment, candidates: [] }), []);
@@ -224,18 +225,18 @@ test("multi-item helpers isolate requests and keep scores aligned despite revers
     pending.push({ body: JSON.parse(String(init?.body)), resolve });
   }));
   const memories = judgeTypeSafeMemories({ ...memoryJudgment,
-    candidates: [{ excerpt: "first", corpus: "memory" }, { excerpt: "second", corpus: "memory" }] });
+    candidates: [{ excerpt: "first", corpus: "memory", sourcePath: "qmd://memory/first.md", dates: [] }, { excerpt: "second", corpus: "memory", sourcePath: "qmd://memory/second.md", dates: [] }] });
   assert.equal(pending.length, 2, "both requests start before either completes");
   assert.deepEqual(pending.map(p => p.body.state.candidates?.map(c => c.excerpt)), [["first"], ["second"]]);
-  pending[1].resolve(Response.json({ answers: { memory_0: { type: "noul", noul: 0.9 } } }));
-  pending[0].resolve(Response.json({ answers: { memory_0: { type: "noul", noul: 0.1 } } }));
+  pending[1].resolve(Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.9 } } }));
+  pending[0].resolve(Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.1 } } }));
   assert.deepEqual(await memories, [0.1, 0.9]);
   const quality = judgeTypeSafeQuality({ apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal,
     chunks: [{ text: "first", sourceKind: "files" }, { text: "second", sourceKind: "sessions" }] });
   assert.equal(pending.length, 4);
   assert.deepEqual(pending.slice(2).map(p => p.body.state.chunks?.map(c => c.text)), [["first"], ["second"]]);
-  pending[3].resolve(Response.json({ answers: { noise_0: { type: "noul", noul: 0.8 }, evidence_0: { type: "noul", noul: 0.7 } } }));
-  pending[2].resolve(Response.json({ answers: { noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.9 } } }));
+  pending[3].resolve(Response.json({ model: "jev-1.13.0", answers: { noise_0: { type: "noul", noul: 0.8 }, evidence_0: { type: "noul", noul: 0.7 } } }));
+  pending[2].resolve(Response.json({ model: "jev-1.13.0", answers: { noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.9 } } }));
   assert.deepEqual(await quality, [{ noise: 0.1, evidence: 0.9 }, { noise: 0.8, evidence: 0.7 }]);
 });
 
@@ -258,4 +259,26 @@ test("skill reranking isolates candidates, preserves successes, and breaks ties 
   mode = "none";
   assert.equal(await selectTypeSafeSkill(params), undefined);
   assert.equal(fetch.mock.callCount(), 9);
+});
+
+test("offline and runtime use exactly the same blind request and retain raw probabilities and usage", async t => {
+  const candidate = memoryJudgment.candidates[0]!;
+  const hit = { path: candidate.sourcePath, text: candidate.excerpt, corpus: candidate.corpus, dates: [],
+    position: 17, startLine: 1, endLine: 1, score: 0.99, methods: ["bm25"], query: "forbidden generated query" };
+  const offline = contextJudgeRequest(memoryJudgment.conversation, memoryJudgment.asOf, hit);
+  const runtime = memoryUsefulnessRequest(memoryJudgment.conversation, candidate, memoryJudgment.asOf);
+  assert.deepEqual(offline, runtime);
+  assert.equal(CONTEXT_JUDGE_VERSION, MEMORY_JUDGE_VERSION);
+  assert.doesNotMatch(JSON.stringify(offline), /forbidden|position|methods|bm25|"score"/);
+  const requests: unknown[] = [];
+  const usage = { input_tokens: 117, output_tokens: 11 };
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return Response.json({ model: "jev-1.13.0", usage, answers: { memory_0: { type: "noul", noul: 0.831 } } });
+  });
+  assert.deepEqual(await judgeTypeSafeMemories(memoryJudgment), [0.831]);
+  assert.deepEqual(await judgeTrainingPassage(offline, "key"), {
+    probability: 0.831, answer: { type: "noul", noul: 0.831 }, model: "jev-1.13.0", usage,
+  });
+  assert.deepEqual(requests, [runtime, offline]);
 });

@@ -64,7 +64,6 @@ export type UnblockMemoryConfig = {
         enabled: boolean;
         complementaryHints: boolean;
         corpora: readonly string[];
-        historyMessages: number;
         minUsefulness: number;
         maxHints: number;
         cooldownTurns: number;

@@ -3,5 +3,6 @@ node_modules/
 .plugin-inspector/
 reports/
 .env
+__pycache__/
 typesafe-fleet*.csv
 !scripts/typesafe-fleet.example.csv

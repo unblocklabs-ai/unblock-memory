@@ -4,7 +4,6 @@ import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import chokidar from "chokidar";
 import picomatch from "picomatch";
-import { meetingRevisionAnnotation, meetingSpeakerSpans } from "./loggie-projection.js";
 import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
 import { CurationStore, chunkFingerprint, } from "./curation.js";
 import { readSessionManifest, sessionMetadataByPath, syncSessionProjections, PROJECTOR_VERSION, } from "./session-sync.js";
@@ -17,6 +16,8 @@ import { reviewClusterIngestion } from "./cluster-review.js";
 import { abortable } from "./abortable.js";
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 import { trainingCandidates } from "./training-candidates.js";
+import { expandSessionSearchHit, renderMemoryPassage } from "./memory-passage.js";
+export { expandSessionSearchHit } from "./memory-passage.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
@@ -189,35 +190,6 @@ function lineSpan(body, position, text) {
     const startLine = before.split("\n").length;
     const endLine = startLine + Math.max(0, text.split("\n").length - 1);
     return { startLine, endLine };
-}
-export async function expandSessionSearchHit(result, maxTokens, countTokens, maxChars = Infinity, messages) {
-    const leaf = { text: result.bestChunk, position: result.chunkPos };
-    const speaker = meetingSpeakerSpans(result.body, result.chunkPos, result.chunkPos + result.chunkLen);
-    const annotation = meetingRevisionAnnotation(result.body, result.chunkPos);
-    const spans = speaker ?? sessionContextSpans(result.body, result.chunkPos, messages);
-    if (!spans && !annotation)
-        return leaf;
-    const leafEnd = result.chunkPos + result.chunkLen;
-    for (const span of spans ? [spans.turn, spans.message] : []) {
-        if (span.start > result.chunkPos || span.end < leafEnd)
-            continue;
-        const sourceText = result.body.slice(span.start, span.end).trimEnd();
-        const text = annotation ? `${annotation}\n${sourceText}` : sourceText;
-        if (text.length > maxChars)
-            continue;
-        if (await countTokens(text) <= maxTokens)
-            return { text, position: span.start, ...(annotation ? { sourceText } : {}) };
-    }
-    if ((speaker && speaker.start < result.chunkPos) || annotation) {
-        const text = [annotation, speaker && speaker.start < result.chunkPos ? speaker.header : undefined, leaf.text].filter(Boolean).join("\n");
-        if (text.length <= maxChars && await countTokens(text) <= maxTokens) {
-            return { ...leaf, text, sourceText: leaf.text };
-        }
-    }
-    // Never silently strip supersession when the caller's snippet budget is tiny.
-    if (annotation)
-        return { ...leaf, text: "", sourceText: "" };
-    return leaf;
 }
 function lexicalResult(hit, corpus, session) {
     const body = hit.body ?? hit.title;
@@ -845,21 +817,20 @@ export class QmdMemoryManager {
             const store = await this.#getAnalysisStore();
             const hits = new Map();
             // Serialize native QMD work. Cancellation prevents further queries/collections.
-            for (const query of queries)
-                for (const collection of collections) {
-                    opts.signal?.throwIfAborted();
-                    for (const hit of await trainingCandidates(store, query, collection, query, opts.signal)) {
-                        const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk]);
-                        if (!hits.has(key))
-                            hits.set(key, { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
-                                chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: hit.score });
-                    }
+            for (const lane of ["lex", "vec"]) {
+                opts.signal?.throwIfAborted();
+                for (const hit of await trainingCandidates(store, queries[lane], collections, lane, opts.signal)) {
+                    const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk]);
+                    if (!hits.has(key))
+                        hits.set(key, { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
+                            chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: hit.score });
                 }
+            }
             opts.signal?.throwIfAborted();
-            return this.#renderSearchHits([...hits.values()], store, opts);
+            return this.#renderSearchHits([...hits.values()], store, opts, true);
         });
     }
-    async #renderSearchHits(hits, store, opts) {
+    async #renderSearchHits(hits, store, opts, whisperer = false) {
         const tokenizer = store.internal?.llm;
         const results = [];
         for (const hit of hits) {
@@ -888,10 +859,11 @@ export class QmdMemoryManager {
             const messageTimestamp = messages
                 ? sessionContextSpans(hit.body, hit.chunkPos, messages)?.message.timestamp
                 : undefined;
-            const selected = corpus === "sessions" && this.#sessions && tokenizer
-                ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text), opts?.maxSnippetChars, messages)
-                : { text: hit.bestChunk, position: hit.chunkPos };
-            if (!selected.text)
+            const selected = whisperer ? await renderMemoryPassage(hit, messages)
+                : corpus === "sessions" && this.#sessions && tokenizer
+                    ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text), opts?.maxSnippetChars, messages)
+                    : { text: hit.bestChunk, position: hit.chunkPos };
+            if (!selected?.text)
                 continue;
             const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
             results.push({

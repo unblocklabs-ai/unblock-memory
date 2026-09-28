@@ -2,6 +2,7 @@ import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plug
 import type { UnblockMemoryConfig } from "./config.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
+import type { QueryPair } from "./query-contract.js";
 type MemoryWhispererRuntime = {
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;
@@ -9,7 +10,7 @@ type MemoryWhispererRuntime = {
     }): Promise<{
         manager: {
             search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
-            searchWhisperer?(queries: readonly string[], opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
+            searchWhisperer?(queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
         } | null;
     }>;
 };

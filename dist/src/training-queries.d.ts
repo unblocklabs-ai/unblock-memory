@@ -1,5 +1,6 @@
 import type { UnblockMemoryConfig } from "./config.js";
-import type { TrainingInput } from "./training-input.js";
+import type { QueryPair } from "./query-contract.js";
+import { type TrainingInput } from "./training-input.js";
 import { historicalTrainingSearch } from "./training-retrieval.js";
 import type { QueryEvaluation, TrainingStore } from "./training-store.js";
 type Source = {
@@ -26,6 +27,7 @@ export declare function generateTrainingQueries(source: Source, store: TrainingS
     failed: number;
     ambiguous: number;
     blocked: number;
+    flagged: number;
     inputBytes: number;
     budgetLimited: boolean;
     refreshed: {
@@ -41,13 +43,20 @@ export declare function generateTrainingQueries(source: Source, store: TrainingS
         changed: number;
         unchanged: number;
         retired: number;
+        review: {
+            sessionId: string;
+            seq: number;
+            reason: string;
+        }[];
     };
 }>;
-export declare function selectTrainingQueries(queries: QueryEvaluation[]): string[];
-export declare function evaluateTrainingQueries(source: Source, store: TrainingStore, config: UnblockMemoryConfig, options: Options & {
+/** Raw top-three average, including values below runtime's injection threshold. */
+export declare function trainingQueryScore(probabilities: readonly number[]): number;
+export declare function selectTrainingQueries(queries: readonly QueryEvaluation[]): QueryPair;
+export declare function evaluateTrainingQueries(source: Source, store: TrainingStore, config: UnblockMemoryConfig, runtime: unknown, options: Options & {
     maxCalls?: number;
+    maxInputBytes?: number;
     concurrency?: number;
-    excludeJudgments?: string[];
 }, createSearch?: typeof historicalTrainingSearch): Promise<{
     concurrency: number;
     threshold: number;
@@ -63,6 +72,7 @@ export declare function evaluateTrainingQueries(source: Source, store: TrainingS
     failed: number;
     ambiguous: number;
     blocked: number;
+    flagged: number;
     inputBytes: number;
     budgetLimited: boolean;
     refreshed: {
@@ -78,6 +88,11 @@ export declare function evaluateTrainingQueries(source: Source, store: TrainingS
         changed: number;
         unchanged: number;
         retired: number;
+        review: {
+            sessionId: string;
+            seq: number;
+            reason: string;
+        }[];
     };
 }>;
 export declare function exportQueryTraining(store: TrainingStore, threshold?: number): Generator<{
@@ -86,7 +101,7 @@ export declare function exportQueryTraining(store: TrainingStore, threshold?: nu
     inputHash: string;
     recallProbability: number;
     threshold: number;
-    target: string[];
+    target: QueryPair;
     source: {
         nodeId: string;
         agentId: string;
@@ -97,7 +112,7 @@ export declare function exportQueryTraining(store: TrainingStore, threshold?: nu
         inputHash: string;
         timestamp: number;
         corpusHash: string;
-        teacherId: string;
+        teacherIds: string[];
         corpusReport: {
             sessions: number;
             chunks: number;
@@ -106,7 +121,8 @@ export declare function exportQueryTraining(store: TrainingStore, threshold?: nu
             excludedChunks: number;
         };
         queries: QueryEvaluation[];
-        selected: string[];
+        selected: QueryPair | null;
+        review: string[];
     };
     splitGroup: string;
     provenance: {

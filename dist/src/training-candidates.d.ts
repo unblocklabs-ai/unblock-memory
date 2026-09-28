@@ -1,4 +1,5 @@
 import type { QMDStore } from "@unblocklabs/qmd";
+import type { QueryLane } from "./query-contract.js";
 type Candidate = {
     file: string;
     body: string;
@@ -17,5 +18,5 @@ type Candidate = {
         rank: number;
     };
 };
-export declare function trainingCandidates(qmd: QMDStore, query: string, collection: string | string[], intent: string, signal?: AbortSignal): Promise<Candidate[]>;
+export declare function trainingCandidates(qmd: QMDStore, query: string, collection: string | string[], lane: QueryLane, signal?: AbortSignal): Promise<Candidate[]>;
 export {};

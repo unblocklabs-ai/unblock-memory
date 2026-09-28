@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { judgeTypeSafeMemories } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { buildSkillWhispererQuery, memoryConversation } from "./whisperer-context.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
 import { MlxQueryGenerator, queryConversation } from "./mlx-query.js";
 import { judgeTrainingInput, TRAINING_GATE_THRESHOLD } from "./training-gate.js";
-const MAX_EXCERPT_CHARS = 1200;
+import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
+const MAX_EXCERPT_CHARS = MEMORY_PASSAGE_CHARS;
 function fingerprint(text) {
     return createHash("sha256").update(text.replace(/\s+/gu, " ").trim()).digest("hex");
 }
@@ -16,7 +16,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
     const generator = config.mlx ? MlxQueryGenerator.shared(config.mlx) : undefined;
     if (generator)
         api.on("gateway_start", () => {
-            void generator.start().catch(() => api.logger.warn("unblock-memory MLX worker unavailable; query fallback active"));
+            void generator.start().catch(() => api.logger.warn("unblock-memory MLX worker unavailable; automatic memory skipped"));
         });
     const beforePrompt = async (event, context) => {
         const { agentId, runId, sessionId, sessionKey } = context;
@@ -31,6 +31,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         if (previous?.runId === runId)
             return previous.result;
         const started = performance.now();
+        const asOf = new Date().toISOString();
         const measurement = { outcome: "skipped", elapsedMs: 0 };
         let stage = "credentials", reason = "completed";
         let recallProbability, queryCount;
@@ -68,11 +69,11 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 return;
             }
             stage = "input";
-            const conversation = generator ? queryConversation(event.prompt, event.messages, config.historyMessages) : undefined;
+            const conversation = queryConversation(event.prompt, event.messages);
             const gateStarted = performance.now();
             const gateSignal = AbortSignal.any([signal, AbortSignal.timeout(typesafe.timeoutMs)]);
             // Speculation is intentional: neither model generation nor QMD waits for the recall judgment.
-            const gate = conversation ? judgeTrainingInput(conversation, apiKey, gateSignal)
+            const gate = generator ? judgeTrainingInput(conversation, apiKey, gateSignal)
                 .then(result => {
                 if (signal.aborted)
                     return false;
@@ -98,21 +99,24 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
             }) : Promise.resolve(true);
             const retrieveAndJudge = async () => {
                 let queries;
-                if (generator && conversation) {
+                if (generator) {
                     stage = "generation";
                     const generationStarted = performance.now();
                     try {
                         queries = await generator.generate(conversation, signal);
                         if (signal.aborted)
                             return;
-                        queryCount = queries.length;
+                        queryCount = 2;
                         diagnostics?.record(agentId, "memory", "queries_generated");
                     }
                     catch (error) {
                         if (signal.aborted)
                             return;
-                        log("warn", "query_fallback", { ...failureFields(error), elapsedMs: performance.now() - generationStarted });
-                        diagnostics?.record(agentId, "memory", "query_fallback");
+                        reason = "generation_failed";
+                        measurement.outcome = "failed";
+                        log("warn", "generation_failed", { ...failureFields(error), elapsedMs: performance.now() - generationStarted });
+                        diagnostics?.record(agentId, "memory", "failed");
+                        return;
                     }
                     finally {
                         measurement.generationMs = performance.now() - generationStarted;
@@ -128,7 +132,9 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                     return;
                 }
                 const retrievalStarted = performance.now();
-                const hits = queries && manager.searchWhisperer ? await manager.searchWhisperer(queries, { corpora, signal, maxSnippetChars: MAX_EXCERPT_CHARS }) : await manager.search(buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), { corpora, maxResults: 8, minScore: -1, signal, maxSnippetChars: MAX_EXCERPT_CHARS });
+                if (queries && !manager.searchWhisperer)
+                    throw new Error("V2 Whisperer retrieval is unavailable");
+                const hits = queries ? await manager.searchWhisperer(queries, { corpora, signal, maxSnippetChars: MAX_EXCERPT_CHARS }) : await manager.search(JSON.stringify(conversation), { corpora, maxResults: 8, minScore: -1, signal, maxSnippetChars: MAX_EXCERPT_CHARS });
                 if (signal.aborted)
                     return;
                 measurement.retrievalMs = performance.now() - retrievalStarted;
@@ -144,9 +150,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                     if (excerpt.length > MAX_EXCERPT_CHARS)
                         continue;
                     const id = fingerprint(excerpt);
-                    if (!excerpt || state.recent.has(id) || candidates.some(candidate => candidate.id === id ||
-                        (candidate.hit.path === hit.path && candidate.hit.startLine <= hit.endLine &&
-                            hit.startLine <= candidate.hit.endLine)))
+                    if (!excerpt || state.recent.has(id) || duplicateMemoryPassage({ ...hit, text: excerpt }, candidates.map(candidate => ({ ...candidate.hit, text: candidate.excerpt }))))
                         continue;
                     candidates.push({ hit, excerpt, id });
                     if (!queries && candidates.length === 8)
@@ -161,8 +165,6 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 }
                 stage = "judgment";
                 const judgeStarted = performance.now();
-                const judgeConversation = conversation ? { ...conversation, truncated: event.messages.length > conversation.history.length }
-                    : memoryConversation(event.prompt, event.messages);
                 // Every eligible passage gets its own request; no request sees another candidate.
                 const judged = (await Promise.all(candidates.map(async (candidate, candidateIndex) => {
                     const requestStarted = performance.now();
@@ -172,9 +174,11 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                         const { hit, excerpt } = candidate;
                         const [probability] = await judgeTypeSafeMemories({
                             apiKey, timeoutMs: typesafe.timeoutMs, signal,
-                            conversation: judgeConversation,
+                            conversation, asOf,
                             candidates: [{
-                                    excerpt, corpus: hit.corpus, ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
+                                    excerpt, corpus: hit.corpus, sourcePath: hit.path,
+                                    dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
+                                            ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
                                 }],
                         });
                         if (signal.aborted)
