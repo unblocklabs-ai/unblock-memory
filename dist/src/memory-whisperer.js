@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { judgeTypeSafeMemories } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
-import { MlxQueryGenerator, queryConversation } from "./mlx-query.js";
+import { ApiQueryGenerator, QueryApiError, queryConversation } from "./query-generator.js";
 import { judgeTrainingInput, TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
 const MAX_EXCERPT_CHARS = MEMORY_PASSAGE_CHARS;
@@ -13,11 +13,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
     if (!config.enabled || !typesafe.enabled)
         return;
     const sessions = new Map();
-    const generator = config.mlx ? MlxQueryGenerator.shared(config.mlx) : undefined;
-    if (generator)
-        api.on("gateway_start", () => {
-            void generator.start().catch(() => api.logger.warn("unblock-memory MLX worker unavailable; automatic memory skipped"));
-        });
+    const generator = new ApiQueryGenerator(config.api);
     const beforePrompt = async (event, context) => {
         const { agentId, runId, sessionId, sessionKey } = context;
         const scope = sessionId || sessionKey;
@@ -37,7 +33,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         let recallProbability, queryCount;
         let requestsSucceeded = 0, requestsFailed = 0;
         const log = (level, event, fields) => api.logger[level]("unblock-memory memory_whisperer " + JSON.stringify({ event, agentId, runId, sessionId, stage, ...fields }));
-        const failureFields = (error) => error instanceof TypeSafeRequestError
+        const failureFields = (error) => error instanceof TypeSafeRequestError || error instanceof QueryApiError
             ? { errorCode: error.code, httpStatus: error.status } : { errorCode: "unexpected" };
         previous?.controller.abort();
         const state = {
@@ -73,7 +69,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
             const gateStarted = performance.now();
             const gateSignal = AbortSignal.any([signal, AbortSignal.timeout(typesafe.timeoutMs)]);
             // Speculation is intentional: neither model generation nor QMD waits for the recall judgment.
-            const gate = generator ? judgeTrainingInput(conversation, apiKey, gateSignal)
+            const gate = judgeTrainingInput(conversation, apiKey, gateSignal)
                 .then(result => {
                 if (signal.aborted)
                     return false;
@@ -96,31 +92,29 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                     state.controller.abort();
                 }
                 return false;
-            }) : Promise.resolve(true);
+            });
             const retrieveAndJudge = async () => {
                 let queries;
-                if (generator) {
-                    stage = "generation";
-                    const generationStarted = performance.now();
-                    try {
-                        queries = await generator.generate(conversation, signal);
-                        if (signal.aborted)
-                            return;
-                        queryCount = 2;
-                        diagnostics?.record(agentId, "memory", "queries_generated");
-                    }
-                    catch (error) {
-                        if (signal.aborted)
-                            return;
-                        reason = "generation_failed";
-                        measurement.outcome = "failed";
-                        log("warn", "generation_failed", { ...failureFields(error), elapsedMs: performance.now() - generationStarted });
-                        diagnostics?.record(agentId, "memory", "failed");
+                stage = "generation";
+                const generationStarted = performance.now();
+                try {
+                    queries = await generator.generate(conversation, signal);
+                    if (signal.aborted)
                         return;
-                    }
-                    finally {
-                        measurement.generationMs = performance.now() - generationStarted;
-                    }
+                    queryCount = 2;
+                    diagnostics?.record(agentId, "memory", "queries_generated");
+                }
+                catch (error) {
+                    if (signal.aborted)
+                        return;
+                    reason = "generation_failed";
+                    measurement.outcome = "failed";
+                    log("warn", "generation_failed", { ...failureFields(error), elapsedMs: performance.now() - generationStarted });
+                    diagnostics?.record(agentId, "memory", "failed");
+                    return;
+                }
+                finally {
+                    measurement.generationMs = performance.now() - generationStarted;
                 }
                 stage = "retrieval";
                 const { manager } = await runtime.getMemorySearchManager({ cfg: api.config, agentId });
@@ -132,9 +126,9 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                     return;
                 }
                 const retrievalStarted = performance.now();
-                if (queries && !manager.searchWhisperer)
+                if (!manager.searchWhisperer)
                     throw new Error("V2 Whisperer retrieval is unavailable");
-                const hits = queries ? await manager.searchWhisperer(queries, { corpora, signal, maxSnippetChars: MAX_EXCERPT_CHARS }) : await manager.search(JSON.stringify(conversation), { corpora, maxResults: 8, minScore: -1, signal, maxSnippetChars: MAX_EXCERPT_CHARS });
+                const hits = await manager.searchWhisperer(queries, { corpora, signal, maxSnippetChars: MAX_EXCERPT_CHARS });
                 if (signal.aborted)
                     return;
                 measurement.retrievalMs = performance.now() - retrievalStarted;
@@ -153,8 +147,6 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                     if (!excerpt || state.recent.has(id) || duplicateMemoryPassage({ ...hit, text: excerpt }, candidates.map(candidate => ({ ...candidate.hit, text: candidate.excerpt }))))
                         continue;
                     candidates.push({ hit, excerpt, id });
-                    if (!queries && candidates.length === 8)
-                        break;
                 }
                 measurement.eligible = candidates.length;
                 measurement.outcome = "empty";
@@ -306,7 +298,6 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         }
     });
     api.on("gateway_stop", () => {
-        generator?.close();
         for (const state of sessions.values())
             state.controller.abort();
         sessions.clear();

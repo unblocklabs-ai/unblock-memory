@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { queryConversation } from "../../src/mlx-query.js";
+import { queryConversation } from "../../src/query-generator.js";
 import { messageText } from "../../src/whisperer-context.js";
 import { conversationUserText } from "../../src/response-text.js";
 

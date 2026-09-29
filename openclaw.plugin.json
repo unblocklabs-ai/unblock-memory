@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -86,7 +86,7 @@
     },
     "memoryWhisperer.enabled": {
       "label": "Memory Whisperer",
-      "help": "Append up to two TypeSafe-approved historical excerpts after the user prompt. Requires explicit corpora, a TypeSafe key, and hook conversation access. Disabled by default."
+      "help": "Append up to two TypeSafe-approved historical excerpts after the user prompt. Requires explicit corpora, TypeSafe and query API credentials, and hook conversation access. Disabled by default."
     },
     "memoryWhisperer.corpora": {
       "label": "Approved Hint Corpora",
@@ -281,10 +281,19 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "api": {
+            "type": "object", "additionalProperties": false,
+            "description": "Authenticated resident query-model API. Override endpoint with a loopback URL for nodes outside the Studio LAN.",
+            "properties": {
+              "endpoint": { "type": "string", "pattern": "^https?://", "default": "http://192.168.1.191:18087" },
+              "apiKeyFile": { "type": "string", "pattern": "^/", "description": "Absolute path to the API bearer token file; required to generate queries." }
+            },
+            "default": { "endpoint": "http://192.168.1.191:18087" }
+          },
           "mlx": {
             "type": "object", "additionalProperties": false,
             "required": ["pythonPath", "modelPath"],
-            "description": "Opt in to a private resident MLX query worker and speculative recall-gated hybrid retrieval. Install the pinned Python runtime and model separately.",
+            "description": "Deprecated and ignored. Remove this field and configure memoryWhisperer.api. Local workers are no longer launched by the plugin.",
             "properties": {
               "pythonPath": { "type": "string", "pattern": "^/" },
               "modelPath": { "type": "string", "pattern": "^/" }
@@ -300,7 +309,8 @@
         },
         "default": {
           "enabled": false, "corpora": [], "minUsefulness": 0.7,
-          "maxHints": 2, "cooldownTurns": 10, "timeoutMs": 3000
+          "maxHints": 2, "cooldownTurns": 10, "timeoutMs": 3000,
+          "api": { "endpoint": "http://192.168.1.191:18087" }
         }
       },
       "skillWhisperer": {

@@ -83,16 +83,41 @@ const DEFAULT_SKILL_WHISPERER = {
 const DEFAULT_MEMORY_WHISPERER = {
     enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.7,
     maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
+    api: { endpoint: "http://192.168.1.191:18087" },
 };
+function resolveQueryApi(value) {
+    if (value === undefined)
+        return { ...DEFAULT_MEMORY_WHISPERER.api };
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error("memoryWhisperer.api must be an object");
+    const config = value;
+    assertOnlyKeys(config, ["endpoint", "apiKeyFile"], "memoryWhisperer.api");
+    const endpoint = config.endpoint ?? DEFAULT_MEMORY_WHISPERER.api.endpoint;
+    let url;
+    try {
+        url = new URL(typeof endpoint === "string" ? endpoint : "");
+    }
+    catch {
+        throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL");
+    }
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+        throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL without credentials, query or fragment");
+    }
+    const apiKeyFile = config.apiKeyFile;
+    if (apiKeyFile !== undefined && (typeof apiKeyFile !== "string" || !isAbsolute(apiKeyFile))) {
+        throw new Error("memoryWhisperer.api.apiKeyFile must be an absolute path");
+    }
+    return { endpoint: url.href.replace(/\/$/u, ""), ...(apiKeyFile ? { apiKeyFile } : {}) };
+}
 function resolveMemoryWhisperer(value, corpora) {
     if (value === undefined)
-        return { ...DEFAULT_MEMORY_WHISPERER };
+        return { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined) };
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         throw new Error("unblock-memory memoryWhisperer must be an object");
     }
     const config = value;
     assertOnlyKeys(config, [...Object.keys(DEFAULT_MEMORY_WHISPERER), "mlx"], "memoryWhisperer");
-    let mlx;
+    // Accept old fleet configs during migration, but never launch a local worker.
     if (config.mlx !== undefined) {
         if (!config.mlx || typeof config.mlx !== "object" || Array.isArray(config.mlx))
             throw new Error("memoryWhisperer.mlx must be an object");
@@ -102,7 +127,6 @@ function resolveMemoryWhisperer(value, corpora) {
             typeof value.modelPath !== "string" || !isAbsolute(value.modelPath)) {
             throw new Error("memoryWhisperer.mlx requires absolute pythonPath and modelPath");
         }
-        mlx = { pythonPath: value.pythonPath, modelPath: value.modelPath };
     }
     const enabled = config.enabled ?? false;
     if (typeof enabled !== "boolean")
@@ -128,7 +152,7 @@ function resolveMemoryWhisperer(value, corpora) {
         enabled, complementaryHints, corpora: [...new Set(selected)], cooldownTurns, minUsefulness,
         maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
         timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
-        ...(mlx ? { mlx } : {}),
+        api: resolveQueryApi(config.api),
     };
 }
 function assertOnlyKeys(value, allowed, label) {
@@ -277,7 +301,7 @@ export function resolveConfig(value) {
             peoplePrimer: resolvePeoplePrimer(undefined, DEFAULT_CORPORA, false),
             people: DEFAULT_PEOPLE_CONFIG,
             skillWhisperer: DEFAULT_SKILL_WHISPERER,
-            memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
+            memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined) },
         };
     }
     if (typeof value !== "object" || Array.isArray(value)) {

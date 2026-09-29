@@ -72,7 +72,7 @@ export type UnblockMemoryConfig = {
     maxHints: number;
     cooldownTurns: number;
     timeoutMs: number;
-    mlx?: { pythonPath: string; modelPath: string };
+    api: { endpoint: string; apiKeyFile?: string };
   };
 };
 
@@ -147,16 +147,36 @@ const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
 const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
   enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.7,
   maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
+  api: { endpoint: "http://192.168.1.191:18087" },
 };
 
+function resolveQueryApi(value: unknown): UnblockMemoryConfig["memoryWhisperer"]["api"] {
+  if (value === undefined) return { ...DEFAULT_MEMORY_WHISPERER.api };
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("memoryWhisperer.api must be an object");
+  const config = value as Record<string, unknown>;
+  assertOnlyKeys(config, ["endpoint", "apiKeyFile"], "memoryWhisperer.api");
+  const endpoint = config.endpoint ?? DEFAULT_MEMORY_WHISPERER.api.endpoint;
+  let url: URL;
+  try { url = new URL(typeof endpoint === "string" ? endpoint : ""); }
+  catch { throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL"); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL without credentials, query or fragment");
+  }
+  const apiKeyFile = config.apiKeyFile;
+  if (apiKeyFile !== undefined && (typeof apiKeyFile !== "string" || !isAbsolute(apiKeyFile))) {
+    throw new Error("memoryWhisperer.api.apiKeyFile must be an absolute path");
+  }
+  return { endpoint: url.href.replace(/\/$/u, ""), ...(apiKeyFile ? { apiKeyFile } : {}) };
+}
+
 function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]): UnblockMemoryConfig["memoryWhisperer"] {
-  if (value === undefined) return { ...DEFAULT_MEMORY_WHISPERER };
+  if (value === undefined) return { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined) };
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("unblock-memory memoryWhisperer must be an object");
   }
   const config = value as Record<string, unknown>;
   assertOnlyKeys(config, [...Object.keys(DEFAULT_MEMORY_WHISPERER), "mlx"], "memoryWhisperer");
-  let mlx: UnblockMemoryConfig["memoryWhisperer"]["mlx"];
+  // Accept old fleet configs during migration, but never launch a local worker.
   if (config.mlx !== undefined) {
     if (!config.mlx || typeof config.mlx !== "object" || Array.isArray(config.mlx)) throw new Error("memoryWhisperer.mlx must be an object");
     const value = config.mlx as Record<string, unknown>;
@@ -165,7 +185,6 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
         typeof value.modelPath !== "string" || !isAbsolute(value.modelPath)) {
       throw new Error("memoryWhisperer.mlx requires absolute pythonPath and modelPath");
     }
-    mlx = { pythonPath: value.pythonPath, modelPath: value.modelPath };
   }
   const enabled = config.enabled ?? false;
   if (typeof enabled !== "boolean") throw new Error("unblock-memory memoryWhisperer.enabled must be a boolean");
@@ -189,7 +208,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     enabled, complementaryHints, corpora: [...new Set(selected)], cooldownTurns, minUsefulness,
     maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
     timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
-    ...(mlx ? { mlx } : {}),
+    api: resolveQueryApi(config.api),
   };
 }
 
@@ -386,7 +405,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       peoplePrimer: resolvePeoplePrimer(undefined, DEFAULT_CORPORA, false),
       people: DEFAULT_PEOPLE_CONFIG,
       skillWhisperer: DEFAULT_SKILL_WHISPERER,
-      memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER },
+      memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined) },
     };
   }
   if (typeof value !== "object" || Array.isArray(value)) {

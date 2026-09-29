@@ -68,9 +68,9 @@ export type UnblockMemoryConfig = {
         maxHints: number;
         cooldownTurns: number;
         timeoutMs: number;
-        mlx?: {
-            pythonPath: string;
-            modelPath: string;
+        api: {
+            endpoint: string;
+            apiKeyFile?: string;
         };
     };
 };

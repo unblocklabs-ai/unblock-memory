@@ -41,7 +41,7 @@ Optional installation from source:
 | [Search and reads](docs/retrieval.md#search-and-read) | Vector recall, then exact indexed source reads | Available with the memory plugin; files only unless more corpora are configured |
 | [Session indexing](docs/retrieval.md#sessions) | Makes past user/assistant exchanges searchable | Opt-in corpus; channel/group by default, DMs explicitly included |
 | [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill; never invokes it | Off; explicit skills corpus; TypeSafe optional |
-| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Injects up to two useful historical excerpts | Off; approved corpora + TypeSafe |
+| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Injects up to two useful historical excerpts; query generation via resident API | Off; approved corpora + TypeSafe + query API credential |
 | [People dossiers](docs/peoplesql.md) | Stores agent-authored, evidence-backed recognition snippets | Off; `people.enabled` |
 | [People Primer](docs/peoplesql.md#optional-people-dossier-primer) | Selects evidence and reviews proposed blurbs; never generates/saves dossiers itself | Off; people + approved corpora + TypeSafe |
 | [People Whisperer](docs/peoplesql.md#injection-and-person-state) | Injects a saved blurb for an exact Slack identity | Off; separate global/per-person gates; no model call |

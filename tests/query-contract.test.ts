@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { queryConversation } from "../src/mlx-query.js";
+import { queryConversation } from "../src/query-generator.js";
 import { prepareQueryConversation, queryTokenIds, serializeQueryConversation } from "../src/query-contract.js";
 import { trainingExamples } from "../src/training-input.js";
 

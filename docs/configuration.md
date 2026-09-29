@@ -210,7 +210,9 @@ contract; these tables explain their effects.
 | `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, TypeSafe key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
-| `memoryWhisperer.mlx` | unset | Optional `{pythonPath, modelPath}` with absolute paths; requires a v2 model returning exactly `{lex, vec}`. Model failure skips the hint rather than falling back. |
+| `memoryWhisperer.api.endpoint` | `http://192.168.1.191:18087` | Resident V2 query-model API base URL. Override with `http://127.0.0.1:18087` for a node hosting its own API (e.g. Theo). |
+| `memoryWhisperer.api.apiKeyFile` | unset | Absolute path to a file containing the API bearer token. Missing credentials/API failure skips the hint; no local-model fallback. |
+| `memoryWhisperer.mlx` | unset | Deprecated: old absolute `{pythonPath, modelPath}` values are accepted but ignored for upgrade compatibility. Remove after configuring `api`. |
 | `memoryWhisperer.minUsefulness` | `0.7` | 0–1, minimum Noul yes-probability per candidate; explicit overrides are preserved |
 | `memoryWhisperer.maxHints` | `2` | 1–2 |
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
@@ -341,7 +343,7 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Feature | Evidence sent when explicitly enabled/approved |
 | --- | --- |
 | Skill selection | Bounded visible current/recent conversation + shortlisted skill names/descriptions; not skill procedures or source-path fields |
-| Memory hints | Same 8,192-token/24,000-byte visible conversation as training; one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per request. V2 retrieves at most 10 BM25 + 10 vector candidates across the approved scope; without MLX, up to 8 vector candidates. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
+| Memory hints | Same 8,192-token/24,000-byte visible conversation as training goes to the configured query API and recall gate; one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per passage judgment. V2 retrieves at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
 | Complementarity | Up to 4 already-qualified excerpts for pairwise redundancy checks |
 | People primer | Person identity, agent name, approved retrieved excerpts and source/session metadata; all indexed sessions eligible if approved, not just the current chat |
 | Dossier save/draft review | Proposed blurb, person/agent names and 1–3 exact approved indexed evidence ranges, at most 6,000 characters total; existing dossier is not evidence |

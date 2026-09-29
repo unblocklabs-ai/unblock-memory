@@ -282,13 +282,12 @@ indexing/sync schedule.
 The example is a plugin config fragment; `knowledge` must already be configured.
 For a complete corpus example, use the [configuration profiles](configuration.md#example-profiles).
 
-With a configured v2 MLX model, QMD searches its independent `lex` and `vec` queries
+Using the configured V2 query API, QMD searches its independent `lex` and `vec` queries
 through BM25 and vectors respectively, retrieving ten candidates per backend across
 the complete approved collection scope (not ten per collection). The lexical adapter
 uses literal OR keywords; quotation marks do not enable exact-phrase matching.
-Without MLX configured, the optional direct-vector path remains available and retrieves
-up to eight candidates from the prepared conversation, without query expansion,
-the local reranker, or a similarity-score cutoff. TypeSafe evaluates one independent
+API or generated-output failures skip the hint; there is no direct-vector fallback.
+TypeSafe evaluates one independent
 Noul question per candidate in its own concurrent HTTP request: would a careful
 assistant use a specific factual detail from the excerpt when answering the current
 request? Partial answers and concrete leads count; repeated facts, topic/name matches
@@ -345,37 +344,44 @@ Already-running local QMD work may finish in the background, but does not keep t
 agent waiting beyond the deadline. No new indexing, clustering, or summarization runs
 are triggered by this feature beyond the memory manager's normal initialization.
 
-### Local MLX query generation (opt-in)
+### API query generation (Memory Whisperer remains off by default)
 
-Add `mlx` to the Memory Whisperer config to use the fine-tuned LFM query model:
+Query generation always uses a resident V2 model API. Configure its credential file
+and explicitly enable Memory Whisperer only when ready:
 
 ```json
 {
   "memoryWhisperer": {
-    "enabled": true,
+    "enabled": false,
     "corpora": ["memory", "knowledge", "sessions"],
     "timeoutMs": 8000,
-    "mlx": {
-      "pythonPath": "/absolute/path/to/venv/bin/python",
-      "modelPath": "/absolute/path/to/lfm25-230m-v2-lex-vec-mlx"
+    "api": {
+      "endpoint": "http://192.168.1.191:18087",
+      "apiKeyFile": "/absolute/path/to/memory-query-api/api-token"
     }
   }
 }
 ```
 
-Approve only corpora suitable for every audience of the agent. Model weights and
-their separate license are not bundled in npm. On Apple Silicon, install Python
-3.12 with `mlx==0.32.2`, `mlx-lm==0.31.3`, and `transformers==5.17.0` in an isolated
-environment. Verify the model's SHA256SUMS before configuring its absolute path.
-The worker requires the supplied model's exact `system.txt` prompt.
+The Studio LAN endpoint is the default. Nodes outside this LAN (e.g. Theo) can host
+the same API/model themselves and override the endpoint with `http://127.0.0.1:18087`.
+The plugin does not launch Python, download weights, or manage the server. The host
+service must retain and warm the model and restart it after failure. The Studio
+service starts at Roman's login, uses bearer authentication and a client-IP allowlist;
+each new fleet client must be provisioned there before enabling hints. Plain HTTP is
+for the trusted LAN/loopback only; use TLS or a private tunnel across untrusted networks.
+Visible conversation text is sent to this endpoint, never tool outputs/thinking.
+Approve only corpora suitable for every audience of the agent.
 
-One private Python child per Gateway keeps the model warm, using stdin/stdout IPC
-with no listening port. Startup warms the model; failures retry on a later turn
-with a short backoff. Gateway shutdown stops the worker. Queues are bounded and
-cancelled requests are skipped; active generation checks cancellation between
-tokens. No conversation cache or raw worker output is written to Gateway logs.
+`POST /generate` accepts `{id, conversation: {history, currentRequest}}` and returns
+`{response: {id, text}}`, where `text` is JSON with exactly two nonempty strings,
+`lex` and `vec`. The request ID must match. Redirects, malformed/oversized responses,
+missing credentials and HTTP failures skip hints; no retries or local fallback.
+Turn cancellation aborts HTTP and prevents late hints; already-running server-side
+generation may finish independently. Gateway shutdown does not stop the shared API.
+Old `mlx` config is accepted but ignored; remove it after migrating.
 
-Two branches start together: TypeSafe's historical-recall judgment and local
+Two branches start together: TypeSafe's historical-recall judgment and API
 generation requesting exactly one `{"lex":"keywords","vec":"semantic query"}` object.
 Generation uses visible user/assistant text,
 the exact model prompt/template, greedy decoding and a 256-token output ceiling.
