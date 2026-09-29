@@ -72,15 +72,26 @@ test("API generation launches all 60 isolated judgments before any completes and
   h.stop();
 });
 
-test("negative recall releases the turn and aborts speculation without awaiting generation", async t => {
+test("time-window recall rejection releases the turn and aborts speculation without awaiting generation", async t => {
   const started = deferred<void>(), late = deferred<QueryPair>();
   let workerSignal: AbortSignal | undefined;
   t.mock.method(ApiQueryGenerator.prototype, "generate", async (_conversation: ReturnType<typeof queryConversation>, signal: AbortSignal) => {
     workerSignal = signal; started.resolve(); return late.promise;
   });
-  t.mock.method(globalThis, "fetch", async () => { await started.promise; return gateResponse(0.01); });
+  const prompt = "what did we talk about 13 days ago?";
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    assert.equal(request.state.currentRequest, prompt);
+    const { instructions, criteria } = request.questions.recall_needed;
+    assert.match(instructions.timeWindow, /QMD retrieval has no date filters/);
+    assert.match(instructions.timeWindow, /Answer no/);
+    assert.match(instructions.timeWindow, /13 days ago/);
+    assert.match(criteria.false, /specific date or time window, even if historical memory would otherwise help/);
+    await started.promise;
+    return gateResponse(0.01);
+  });
   const h = harness([], { config: {}, hybrid: async () => { assert.fail("Rejected turn searched memory"); } });
-  assert.equal(await h.before(event, context), undefined);
+  assert.equal(await h.before({ prompt, messages: [{ role: "user", content: prompt }] }, context), undefined);
   assert.equal(workerSignal?.aborted, true);
   assert.equal(h.lookups(), 0);
   assert.equal(h.diagnostics.snapshot("bill").memory.recall_not_needed, 1);

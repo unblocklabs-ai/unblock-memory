@@ -1,5 +1,5 @@
 import type { TrainingInput } from "./training-input.js";
-export declare const TRAINING_GATE_VERSION = "historical-recall-v1";
+export declare const TRAINING_GATE_VERSION = "historical-recall-v2";
 export declare const TRAINING_GATE_MODEL = "jev-1.13.0";
 export declare const TRAINING_GATE_THRESHOLD = 0.7;
 export declare const TRAINING_GATE_QUESTIONS: {
@@ -9,6 +9,7 @@ export declare const TRAINING_GATE_QUESTIONS: {
             question: string;
             history: string;
             scope: string;
+            timeWindow: string;
             trust: string;
         };
         criteria: {

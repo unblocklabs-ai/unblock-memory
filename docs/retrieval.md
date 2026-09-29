@@ -282,6 +282,13 @@ indexing/sync schedule.
 The example is a plugin config fragment; `knowledge` must already be configured.
 For a complete corpus example, use the [configuration profiles](configuration.md#example-profiles).
 
+The initial TypeSafe recall gate is instructed to reject requests constrained to a
+specific date or time window (for example, "what did we talk about 13 days ago?").
+Whisperer's QMD retrieval has no date filters, so topic relevance cannot establish
+that an excerpt belongs to the requested period. Incidental dates, such as a future
+deadline on a topic-based request, do not trigger this exclusion. The gate is shared
+with offline training; this policy is versioned as `historical-recall-v2`.
+
 Using the configured V2 query API, QMD searches its independent `lex` and `vec` queries
 through BM25 and vectors respectively, retrieving ten candidates per backend across
 the complete approved collection scope (not ten per collection). The lexical adapter
