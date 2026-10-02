@@ -48,6 +48,7 @@ Optional installation from source:
 | [Analysis and curation](docs/retrieval.md#memory-analysis) | Clusters existing vectors; agent maintains useful knowledge | Optional local analysis worker; no plugin-owned curation schedule |
 | [Quality and evidence review](docs/retrieval.md#review-and-diagnostics) | Advisory ingestion/claim checks and maintenance leads | Off; feature-specific corpora + TypeSafe |
 | [Response quality/sentiment](docs/response-audit.md) | Operator-only evaluation of approved Slack exchanges | Off; approved humans + TypeSafe; no memory/dossier updates |
+| [Inside Out](docs/configuration.md#inside-out) | Six emotion probabilities per human reply, with backfill and operator reports | Off; TypeSafe; channel agnostic; no memory or prompt changes |
 | [Compaction memory flush](docs/configuration.md#compaction-memory-writes) | Supplies the host an append-only daily-memory write plan | Offered unless the host's memory-flush setting is false; separate from whisperers |
 
 **Search is not one interchangeable API:** plugin `memory_search` is vector-only;

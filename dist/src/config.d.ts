@@ -1,5 +1,6 @@
 import { type ResponseAuditConfig } from "./response-config.js";
 import { type PeoplePrimerConfig } from "./people-primer-config.js";
+import { type InsideOutConfig } from "./inside-out.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -43,6 +44,7 @@ export type UnblockMemoryConfig = {
         corpora: readonly string[];
     };
     responseAudit: ResponseAuditConfig;
+    insideOut: InsideOutConfig;
     peoplePrimer: PeoplePrimerConfig;
     people: {
         enabled: boolean;

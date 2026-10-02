@@ -15,6 +15,7 @@ import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
+import { registerInsideOut } from "./inside-out-runtime.js";
 import { registerMemoryTraining } from "./training-runtime.js";
 import { resolveTimezone } from "./session-projector.js";
 const searchParameters = Type.Object({
@@ -414,6 +415,7 @@ export function resolveFlushPlan(params = {}) {
 export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
     registerResponseAudit(api, config);
+    registerInsideOut(api, config);
     registerMemoryTraining(api, config);
     if (api.registrationMode === "cli-metadata")
         return;

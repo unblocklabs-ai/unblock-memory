@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import { resolveResponseAudit, type ResponseAuditConfig } from "./response-config.js";
 import { resolvePeoplePrimer, type PeoplePrimerConfig } from "./people-primer-config.js";
+import { resolveInsideOut, type InsideOutConfig } from "./inside-out.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -52,6 +53,7 @@ export type UnblockMemoryConfig = {
   qualityAudit: { enabled: boolean; corpora: readonly string[]; minNoise: number };
   evidenceReview: { enabled: boolean; corpora: readonly string[] };
   responseAudit: ResponseAuditConfig;
+  insideOut: InsideOutConfig;
   peoplePrimer: PeoplePrimerConfig;
   people: {
     enabled: boolean;
@@ -402,6 +404,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
       evidenceReview: { enabled: false, corpora: [] },
       responseAudit: resolveResponseAudit(undefined, DEFAULT_CORPORA),
+      insideOut: resolveInsideOut(undefined),
       peoplePrimer: resolvePeoplePrimer(undefined, DEFAULT_CORPORA, false),
       people: DEFAULT_PEOPLE_CONFIG,
       skillWhisperer: DEFAULT_SKILL_WHISPERER,
@@ -414,7 +417,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -509,5 +512,6 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,
     responseAudit: resolveResponseAudit(config.responseAudit, corpora),
+    insideOut: resolveInsideOut(config.insideOut),
     memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora), typesafe: resolveTypeSafe(config.typesafe) };
 }

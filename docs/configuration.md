@@ -21,6 +21,7 @@ settings; a rotated credential file is reread without a restart.
 | Quality audit / cluster review | `qualityAudit.enabled`, approved corpora; cluster review also needs fresh analysis | No judgment | Unavailable/partial; preserve evidence and retry as documented |
 | Ordinary claim review | `evidenceReview.enabled`, approved corpora | No judgment | Unavailable; no claim verified |
 | Response quality/sentiment | `responseAudit.enabled`, approved humans/chat types | No inference | Unavailable; successful assessment stages stay cached |
+| Inside Out | `insideOut.enabled`; opts in all retained channels | No inference | Failed reviews are recorded and retried; successes stay cached |
 | Clustering | Configured local `analysis.executable` | Unchanged | Unchanged; worker failures do not disable ordinary search |
 
 Whisperers, people storage, the primer and audits default off. `typesafe.enabled` defaults true but does not
@@ -351,6 +352,7 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Ordinary claim review | One proposed claim + up to 3 approved indexed ranges, at most 6,000 characters total |
 | Cluster review | Up to 6 eligible complete sampled chunks, each at most 2,000 characters; conclusions only concern the sample |
 | Response audit | Approved visible request/answer/context/feedback and bounded later response evidence, separated by assessment stage; optional current-index whole-short-document evidence from approved file corpora |
+| Inside Out | Target human reply, nearest assistant text and bounded preceding visible history; channel-scoped speaker identity keys |
 | Standalone QMD query | Query, optional intent, selected excerpts, source paths and evaluation time; separate process/SDK credentials and collection scope |
 
 Omitting tool-result/thinking/system fields does not remove their content if it
@@ -358,11 +360,110 @@ was quoted in ordinary visible text. Provider judgments are advisory; probabilit
 or score is not proof. Enabling a feature approves only that feature's documented processing.
 
 
+## Inside Out
+
+Inside Out records six independent emotion-presence probabilities for each human
+reply following assistant text, including consecutive follow-ups and replies to
+progress updates. It is channel agnostic and does not grade agent quality or
+change memories, retrieval, prompts, or dossiers.
+
+```json
+{
+  "insideOut": {
+    "enabled": true,
+    "intervalMinutes": 1440,
+    "maxInteractions": 100,
+    "maxContextTokens": 12000
+  }
+}
+```
+
+Defaults: disabled; daily cadence; at most 100 attempted reviews per run; estimated
+12,000-token context budget. `intervalMinutes: 0` is manual-only. The shared
+`typesafe` settings supply Jev credentials and request timeout.
+
+**Enabling this approves sending visible human/assistant conversation text across
+all retained channels to TypeSafe.** System messages, tool bodies, thinking blocks,
+known bots, delivery mirrors, and recognized automated inputs are omitted. The
+state includes human identity keys for speaker attribution. Probabilities describe
+expressed emotion, not intensity; several emotions can be present, and they need
+not sum to one. High sadness need not mean the agent caused it.
+
+Each request contains chronological visible `history` and a separate `target`
+human reply. Six Noul questions judge only `target.text`, using history to interpret
+tone and speaker attribution. Short yes/no criteria define each emotion; subtle
+emotion counts without requiring explicit emotion words. Raw tool-result messages
+and tool-call blocks never enter either field; visible assistant text explaining a
+tool's findings remains conversation text. The rubric is `emotion-presence-v2`.
+
+```bash
+openclaw memory-emotions run --agent main
+openclaw memory-emotions report --agent main --sender U123 --bucket week
+openclaw memory-emotions export --agent main --emotion anger --min 0.8
+openclaw memory-emotions run --agent main --retry
+openclaw memory-emotions run --agent main --session SESSION_ID
+openclaw memory-emotions export --agent main --session SESSION_ID
+```
+
+`run` handles backfill and new interactions through the same bounded pass. Repeat
+it until `reviewed` and `failed` are zero to finish backfill. Gateway startup also
+runs one pass, then repeats at the configured interval. Successful results are
+cached; new interactions take priority over retries. Request failures retry after
+an hour when the pass has remaining capacity, or immediately with `--retry`.
+Oversized context failures require explicit `--retry`, for example after increasing
+the context budget. Source read failures appear in the run's `errors` list.
+Run one writer per agent: pause the
+background cadence during concurrent operator backfills. There is no cross-process
+lease or persistent scheduling infrastructure.
+
+`--session` limits `run`, `report`, and `export` to one exact session ID. For a
+manual canary, keep `intervalMinutes: 0` and run/export that session; this still
+requires `insideOut.enabled: true` and sends its eligible interactions to Jev.
+Files are scoped by their session filename, with a header-only check for legacy
+names that differ from the session ID; unrelated transcript bodies are not parsed.
+
+A small `inside_out_checkpoints` table skips unchanged sources before loading or
+decompressing transcript bodies. SQLite uses the rewrite generation and persisted
+event sequence; files use inode, size, and modification/change time. Discovery
+still checks source metadata each pass. Changed sessions load earlier history for
+context, but completed SQLite event sequences do not trigger review/cache lookups.
+Queued replies with older send timestamps remain discoverable by persisted sequence.
+Only exhausted snapshots advance checkpoints. Bounded or interrupted passes resume
+through the review cache. Failures do not rewind checkpoints; retries load only
+the source that owns the failed review, after their cooldown.
+`sources` counts loaded sources, and `skippedSources` counts unchanged ones skipped.
+
+The reader scans SQLite active transcripts, retained reset/delete archive blobs,
+and JSONL files in the agent's sessions directory, including zstd archives. There
+is no age cutoff. Files resolve their selected branch; duplicate copies with the
+same session/message IDs produce one result. Each copy supplies its own context;
+this version does not stitch archive prefixes onto live tails or reconcile edits,
+deletions, forks, or identity changes. A cached review is an observation of that
+snapshot, not a continuously revalidated claim. Future rubric changes use a new
+version to distinguish results.
+
+Queued messages use their original send timestamps when available; missing times
+fall back to retained transcript order rather than excluding interactions. Context
+keeps the target and nearest assistant whole and drops older messages to fit an
+estimated token budget. If that essential pair alone exceeds the budget, the row
+records an error and nothing is uploaded. This is an estimate, not Jev's tokenizer.
+
+The `inside_out` results table and its checkpoints live in `unblock-memory.sqlite`.
+Results store source
+references, channel-scoped human keys, timestamps, rubric/model, six probabilities,
+and errors—not conversation text. Missing account or sender identity stays
+session-scoped; identities are not guessed or automatically linked across channels.
+`export` emits all matching rows as JSON, including errors. `report` averages
+successful rows by human, UTC day/week, rubric, and model; counts are the denominator.
+Both accept `--session`, `--sender`, `--since YYYY-MM-DD`, `--emotion`, and `--min`. `--sender`
+matches exact sender IDs across channels; use exported `human_key` for precise
+account-specific analysis. These commands are read-only and never invoke Jev.
+
 ## Storage, upgrades and recovery
 
 Each agent's state lives under the configured OpenClaw state directory, normally
 `~/.openclaw/agents/<agentId>/unblock-memory/`. `index.sqlite` is rebuildable;
-`unblock-memory.sqlite` holds durable people, curation and response-audit state.
+`unblock-memory.sqlite` holds durable people, curation, response-audit and Inside Out state.
 Disabling a feature does not delete its data.
 
 ### Durable database migration
