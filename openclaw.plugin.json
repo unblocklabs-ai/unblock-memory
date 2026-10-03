@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -116,7 +116,7 @@
           "enabled": { "type": "boolean", "default": false },
           "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "default": 1440 },
           "maxInteractions": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 100 },
-          "maxContextTokens": { "type": "integer", "minimum": 256, "maximum": 24000, "default": 12000 }
+          "maxContextTokens": { "type": "integer", "minimum": 256, "maximum": 30000, "default": 30000 }
         }
       },
       "responseAudit": {

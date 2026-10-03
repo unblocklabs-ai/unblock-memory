@@ -305,7 +305,8 @@ test("bounded passes discover new replies before retries and leave oversized fai
   };
   t.after(() => db.close());
   append("one", 1, assistant("Answer"));
-  append("one", 2, user("x".repeat(3000)));
+  const longReply = "x".repeat(75000);
+  append("one", 2, user(longReply));
   append("one", 3, user("Temporary failure"));
   append("two", 1, assistant("Other answer"));
   let now = Date.now();
@@ -337,7 +338,9 @@ test("bounded passes discover new replies before retries and leave oversized fai
   assert.equal(reportInsideOut(options.storePath).find(r => r.message_id === "one-2")?.reviewed_at, oversizedAt);
   const unchanged = await runInsideOut(options);
   assert.equal("sources" in unchanged && unchanged.sources, 0, "permanent budget failures do not trigger transcript reads");
-  await runInsideOut({ ...options, retry: true, config: cfg({ maxContextTokens: 4000 }) });
+  targets.length = 0;
+  await runInsideOut({ ...options, retry: true, config: cfg() });
+  assert.deepEqual(targets, [longReply], "the default budget retries long replies whole without repeating successes");
   assert.ok(reportInsideOut(options.storePath).every(r => r.error === null), "explicit retry can reconsider budget failures");
 });
 

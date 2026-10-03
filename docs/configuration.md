@@ -373,13 +373,14 @@ change memories, retrieval, prompts, or dossiers.
     "enabled": true,
     "intervalMinutes": 1440,
     "maxInteractions": 100,
-    "maxContextTokens": 12000
+    "maxContextTokens": 30000
   }
 }
 ```
 
 Defaults: disabled; daily cadence; at most 100 attempted reviews per run; estimated
-12,000-token context budget. `intervalMinutes: 0` is manual-only. The shared
+30,000-token context budget, leaving room for questions under Jev's 32k
+state-plus-longest-question limit. `intervalMinutes: 0` is manual-only. The shared
 `typesafe` settings supply Jev credentials and request timeout.
 
 **Enabling this approves sending visible human/assistant conversation text across
