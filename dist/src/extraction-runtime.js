@@ -1,10 +1,15 @@
 import { join } from "node:path";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
+import { callGatewayFromCli, errorShape, ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { MEMORY_DATABASE, hasMemoryTable } from "./memory-database.js";
 import { ExtractionStore } from "./extraction-store.js";
 import { extractionSessions } from "./extraction-source.js";
 export function registerExtraction(api, config, runtime) {
+    let lifetime = new AbortController();
+    let timer, running;
     const options = (cfg, agentId) => {
         if (!listAgentIds(cfg).includes(agentId))
             throw new Error("Unknown extraction agent");
@@ -39,13 +44,14 @@ export function registerExtraction(api, config, runtime) {
                 }
             }
             try {
-                const result = await run(cfg, opts.agent, AbortSignal.timeout(600_000), since, opts.session);
+                // Native harnesses live in the Gateway, not the cold CLI metadata loader.
+                const result = await callGatewayFromCli("unblock-memory.extract", { timeout: "600000" }, { agentId: opts.agent, ...(since === undefined ? {} : { since }), ...(opts.session ? { sessionId: opts.session } : {}) });
                 console.log(JSON.stringify(result, null, 2));
                 if (result.status === "unavailable" || (result.status === "completed" && result.failed))
                     process.exitCode = 1;
             }
             catch {
-                console.log(JSON.stringify({ status: "unavailable", reason: "Extraction failed; check host prerequisites and operator report" }));
+                console.log(JSON.stringify({ status: "unavailable", reason: "Extraction failed; check the running Gateway, host prerequisites and operator report" }));
                 process.exitCode = 1;
             }
         });
@@ -64,10 +70,28 @@ export function registerExtraction(api, config, runtime) {
             }
         });
     }, { descriptors: [{ name: "memory-extract", description: "Extract and inspect source-linked session facts", hasSubcommands: true }] });
-    if (api.registrationMode === "cli-metadata" || !config.extraction.enabled || !config.extraction.intervalMinutes || !config.typesafe.enabled)
+    if (api.registrationMode === "cli-metadata")
         return;
-    let timer, running;
-    let lifetime = new AbortController();
+    const runParams = Type.Object({ agentId: Type.String(), since: Type.Optional(Type.Integer({ minimum: 0 })),
+        sessionId: Type.Optional(Type.String()) }, { additionalProperties: false });
+    api.registerGatewayMethod("unblock-memory.extract", async ({ params, respond }) => {
+        if (!Value.Check(runParams, params)) {
+            respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "Invalid extraction parameters"));
+            return;
+        }
+        try {
+            respond(true, await run(api.config, params.agentId, lifetime.signal, params.since, params.sessionId));
+        }
+        catch {
+            respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Extraction failed; check host prerequisites and operator report"));
+        }
+    }, { scope: "operator.admin" });
+    if (!config.extraction.enabled)
+        return;
+    api.on("gateway_stop", async () => { lifetime.abort(); if (timer)
+        clearInterval(timer); timer = undefined; await running; });
+    if (!config.extraction.intervalMinutes || !config.typesafe.enabled)
+        return;
     const tick = () => {
         if (running || lifetime.signal.aborted)
             return;
@@ -94,6 +118,4 @@ export function registerExtraction(api, config, runtime) {
         timer.unref();
         tick();
     });
-    api.on("gateway_stop", async () => { if (timer)
-        clearInterval(timer); timer = undefined; lifetime.abort(); await running; });
 }

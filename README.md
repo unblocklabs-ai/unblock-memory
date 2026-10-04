@@ -49,6 +49,7 @@ Optional installation from source:
 | [Quality and evidence review](docs/retrieval.md#review-and-diagnostics) | Advisory ingestion/claim checks and maintenance leads | Off; feature-specific corpora + TypeSafe |
 | [Response quality/sentiment](docs/response-audit.md) | Operator-only evaluation of approved Slack exchanges | Off; approved humans + TypeSafe; no memory/dossier updates |
 | [Inside Out](docs/configuration.md#inside-out) | Six emotion probabilities per human reply, with backfill and operator reports | Off; TypeSafe; channel agnostic; no memory or prompt changes |
+| [Session memory extraction](docs/extraction.md) | Luna proposes lasting facts; Jev verifies them; optional QMD search | Off; approved session types + TypeSafe + host LLM permission; shadow-only by default |
 | [Compaction memory flush](docs/configuration.md#compaction-memory-writes) | Supplies the host an append-only daily-memory write plan | Offered unless the host's memory-flush setting is false; separate from whisperers |
 
 **Search is not one interchangeable API:** plugin `memory_search` is vector-only;
@@ -69,6 +70,8 @@ They have separate configuration/index boundaries. See
 - [Memory training](docs/memory-training.md): resumable, operator-only conversation
   collection, TypeSafe recall gating, independent lex/vector Luna candidates, one
   score-feedback revision, and the runtime's shared passage grader for LFM targets.
+- [Session extraction](docs/extraction.md): incremental/backfill runs, configurable
+  acceptance thresholds, shadow evaluation, and publishing lasting facts to search.
 
 The shared TypeSafe integration defaults on, but its features are opt-in.
 A key activates only features already enabled. Ordinary search and People

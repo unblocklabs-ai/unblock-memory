@@ -17,7 +17,7 @@ export type PriorMemory = { id: string; text: string; observedAt?: number };
 const proposalSchema = Type.Object({ memories: Type.Array(Type.Object({
   text: Type.String({ minLength: 1, maxLength: 600 }),
   replaces: Type.Union([Type.Null(), Type.String({ minLength: 1 })]),
-  evidence: Type.Array(Type.Object({ messageId: Type.String(), quote: Type.String({ minLength: 1, maxLength: 2000 }) },
+  evidence: Type.Array(Type.Object({ messageId: Type.String(), quote: Type.String({ minLength: 1, maxLength: 512 }) },
     { additionalProperties: false }), { minItems: 1, maxItems: 4 }),
 }, { additionalProperties: false }), { maxItems: 20 }) }, { additionalProperties: false });
 export type MemoryProposal = Static<typeof proposalSchema>["memories"][number];

@@ -176,6 +176,15 @@ Set this only after [installing the worker](retrieval.md#memory-analysis). No
 clustering or curation schedule is created. Response-audit setup and a dry-run-first
 workflow are in [its own guide](response-audit.md).
 
+## Session memory extraction
+
+See [the extraction guide](extraction.md) for source approval, host LLM policy,
+single-session validation, backfill, and publication. Defaults: disabled,
+`publish: false`, `chatTypes: []`, hourly, six overlap messages, five chunks per run.
+`extraction.minSupport`, `minRetention`, and `minReplacement` independently accept
+0–1 and default to 0.90. Settings are operator-controlled; reload/restart after edits.
+Extraction always uses its own 10-second Jev deadline, not `typesafe.timeoutMs`.
+
 ## Settings reference
 
 The tables show resolved defaults. For source-specific entries,

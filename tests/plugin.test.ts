@@ -32,6 +32,7 @@ test("quality audit is inert when disabled or an explicit key file is absent", a
         typesafe: { apiKeyFile: join(root, "missing.env") },
       },
       registerCli() {},
+      registerGatewayMethod() {},
       registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
         Object.defineProperty(capability.runtime, "getMemorySearchManager", {
           value: () => { assert.fail("credential gate must precede manager access"); },
@@ -87,6 +88,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
   const api = {
     pluginConfig: {},
     registerCli() {},
+    registerGatewayMethod() {},
     registerMemoryCapability() {},
     registerTool(
       factory: (ctx: OpenClawPluginToolContext) => Tool | null,
@@ -195,6 +197,7 @@ test("memory search compacts public results without changing evidence, precision
   const api = {
     pluginConfig: {},
     registerCli() {},
+    registerGatewayMethod() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
       runtime = capability.runtime;
     },
@@ -346,6 +349,7 @@ test("session sync tools accept and report status without awaiting cold initiali
       ],
     },
     registerCli() {},
+    registerGatewayMethod() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
       runtime = capability.runtime;
     },

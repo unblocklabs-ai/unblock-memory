@@ -12,7 +12,7 @@ const EXTRACTION_MODEL = "openai/gpt-5.6-luna";
 const proposalSchema = Type.Object({ memories: Type.Array(Type.Object({
         text: Type.String({ minLength: 1, maxLength: 600 }),
         replaces: Type.Union([Type.Null(), Type.String({ minLength: 1 })]),
-        evidence: Type.Array(Type.Object({ messageId: Type.String(), quote: Type.String({ minLength: 1, maxLength: 2000 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 4 }),
+        evidence: Type.Array(Type.Object({ messageId: Type.String(), quote: Type.String({ minLength: 1, maxLength: 512 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 4 }),
     }, { additionalProperties: false }), { maxItems: 20 }) }, { additionalProperties: false });
 const RETENTION_POLICY = {
     goal: "Select enduring background about people, relationships and standing intent, not task history. This is a category test, not a ranking of importance or a prediction that someone will ask about the fact. Ordinary stable personal preferences qualify even when low-stakes or unrelated to work. Truth, specificity and possible future search relevance alone do not make task history a lasting memory.",

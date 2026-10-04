@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",
@@ -30,6 +30,7 @@
     "docs/peoplesql.md",
     "docs/response-audit.md",
     "docs/memory-training.md",
+    "docs/extraction.md",
     "openclaw.plugin.json"
   ],
   "scripts": {

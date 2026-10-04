@@ -1,4 +1,7 @@
 import { join } from "node:path";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
+import { callGatewayFromCli, errorShape, ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import type { OpenClawPluginApi, OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
@@ -9,6 +12,8 @@ import { ExtractionStore } from "./extraction-store.js";
 import { extractionSessions } from "./extraction-source.js";
 
 export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemoryConfig, runtime?: QmdMemoryRuntime) {
+  let lifetime = new AbortController();
+  let timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
   const options = (cfg: OpenClawConfig, agentId: string) => {
     if (!listAgentIds(cfg).includes(agentId)) throw new Error("Unknown extraction agent");
     return { agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
@@ -41,10 +46,12 @@ export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemory
           }
         }
         try {
-          const result = await run(cfg, opts.agent, AbortSignal.timeout(600_000), since, opts.session);
+          // Native harnesses live in the Gateway, not the cold CLI metadata loader.
+          const result = await callGatewayFromCli("unblock-memory.extract", { timeout: "600000" },
+            { agentId: opts.agent, ...(since === undefined ? {} : { since }), ...(opts.session ? { sessionId: opts.session } : {}) });
           console.log(JSON.stringify(result, null, 2));
           if (result.status === "unavailable" || (result.status === "completed" && result.failed)) process.exitCode = 1;
-        } catch { console.log(JSON.stringify({ status: "unavailable", reason: "Extraction failed; check host prerequisites and operator report" })); process.exitCode = 1; }
+        } catch { console.log(JSON.stringify({ status: "unavailable", reason: "Extraction failed; check the running Gateway, host prerequisites and operator report" })); process.exitCode = 1; }
       });
     root.command("report").option("--agent <id>", "Agent id", "main").action((opts: { agent: string }) => {
       const { storePath } = options(cfg, opts.agent);
@@ -53,9 +60,19 @@ export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemory
       try { console.log(JSON.stringify(store.report(), null, 2)); } finally { store.close(); }
     });
   }, { descriptors: [{ name: "memory-extract", description: "Extract and inspect source-linked session facts", hasSubcommands: true }] });
-  if (api.registrationMode === "cli-metadata" || !config.extraction.enabled || !config.extraction.intervalMinutes || !config.typesafe.enabled) return;
-  let timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
-  let lifetime = new AbortController();
+  if (api.registrationMode === "cli-metadata") return;
+  const runParams = Type.Object({ agentId: Type.String(), since: Type.Optional(Type.Integer({ minimum: 0 })),
+    sessionId: Type.Optional(Type.String()) }, { additionalProperties: false });
+  api.registerGatewayMethod("unblock-memory.extract", async ({ params, respond }) => {
+    if (!Value.Check(runParams, params)) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "Invalid extraction parameters")); return;
+    }
+    try { respond(true, await run(api.config, params.agentId, lifetime.signal, params.since, params.sessionId)); }
+    catch { respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Extraction failed; check host prerequisites and operator report")); }
+  }, { scope: "operator.admin" });
+  if (!config.extraction.enabled) return;
+  api.on("gateway_stop", async () => { lifetime.abort(); if (timer) clearInterval(timer); timer = undefined; await running; });
+  if (!config.extraction.intervalMinutes || !config.typesafe.enabled) return;
   const tick = () => {
     if (running || lifetime.signal.aborted) return;
     running = (async () => {
@@ -72,5 +89,4 @@ export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemory
     if (timer) clearInterval(timer);
     lifetime = new AbortController(); timer = setInterval(tick, 60_000); timer.unref(); tick();
   });
-  api.on("gateway_stop", async () => { if (timer) clearInterval(timer); timer = undefined; lifetime.abort(); await running; });
 }
