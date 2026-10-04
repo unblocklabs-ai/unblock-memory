@@ -27,8 +27,21 @@ export declare function historicalPrefix(body: string, spans: readonly SessionMe
     body: string;
     spans: SessionMessageSpan[];
 } | undefined;
-/** Fingerprint a read-only source snapshot; build its search index only on demand.
- * No filesystem projection, live-index mutation, model re-embedding or dependency patch. */
+/** Capture source bytes once per run; each cutoff still owns its index and native model context. */
+export declare function historicalTrainingSource(stateDir: string, chatTypes: readonly ChatType[]): Promise<(cutoff: number, openStore?: typeof import("@unblocklabs/qmd")["createStore"]) => Promise<{
+    corpusHash: string;
+    report: {
+        sessions: number;
+        chunks: number;
+        excluded: number;
+        truncated: number;
+        excludedChunks: number;
+    };
+    maxDate: string;
+    search: (query: string, lane: QueryLane) => Promise<TrainingHit[]>;
+    close: () => Promise<void>;
+}>>;
+/** Standalone calls get a fresh source capture; evaluation runs reuse their own capture. */
 export declare function historicalTrainingSearch(stateDir: string, chatTypes: readonly ChatType[], cutoff: number, openStore?: typeof import("@unblocklabs/qmd")["createStore"]): Promise<{
     corpusHash: string;
     report: {

@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
-import { requestTypeSafe } from "./typesafe-client.js";
+import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
 export { TYPESAFE_MODEL as TYPESAFE_REVIEW_MODEL } from "./typesafe-client.js";
 const relationSchema = Type.Object({ answers: Type.Object({ relation: Type.Object({
             type: Type.Literal("choice"),
@@ -61,8 +61,8 @@ export async function reviewTypeSafeClaim(params) {
     let background;
     if (params.personBackground) {
         const schema = Type.Object({ answers: Type.Object({
-                backgroundOnly: Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) }),
-                explicitSupport: Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) }),
+                backgroundOnly: TYPESAFE_NOUL_SCHEMA,
+                explicitSupport: TYPESAFE_NOUL_SCHEMA,
             }) });
         if (!Value.Check(schema, payload))
             throw new Error("TypeSafe returned an invalid background review");
@@ -73,9 +73,7 @@ export async function reviewTypeSafeClaim(params) {
         needsReview: answer.choice !== "supports" || answer.confidence < 0.9 ||
             (background !== undefined && (background.backgroundOnly < 0.9 || background.explicitSupport < 0.9)) };
 }
-const nouls = Type.Object({ answers: Type.Record(Type.String(), Type.Object({
-        type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
-    })) });
+const nouls = Type.Object({ answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA) });
 /** Directional coverage, not topic similarity. Bounded at six comparisons of four ranked candidates. */
 export async function reviewMemoryRedundancy(params) {
     if (params.excerpts.length > 4)

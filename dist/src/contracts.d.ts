@@ -29,7 +29,7 @@ export type SessionSearchFilter = {
     conversationId?: string;
 };
 export type MemoryRequestContext = Pick<OpenClawPluginToolContext, "sessionKey" | "sessionId" | "messageChannel" | "agentAccountId" | "nativeChannelId" | "deliveryContext">;
-export type CorpusSearchOptions = NonNullable<Parameters<MemorySearchManagerContract["search"]>[1]> & {
+export type CorpusSearchOptions = Omit<NonNullable<Parameters<MemorySearchManagerContract["search"]>[1]>, "lexicalOnly"> & {
     corpora?: readonly string[];
     /** Internal vector-hint budget; oversized matched chunks are omitted, never sliced. */
     maxSnippetChars?: number;

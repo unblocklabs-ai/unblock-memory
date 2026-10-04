@@ -118,22 +118,28 @@ test("TypeSafe failure cannot commit earlier accepted facts or advance a collect
   const config = resolveConfig({ typesafe: { apiKey: "test" }, corpora: [
     { name: "memory", kind: "files", paths: ["memory/**/*.md"] }, { name: "sessions", kind: "sessions", chatTypes: ["channel"] },
   ], extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 } });
-  let fail = true;
+  let fail = true, active = 0, peak = 0;
+  const source = ["one", "two", "three", "four", "five", "six"].map(id => message(id));
   const opts = { config, storePath, runtime: {}, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0,
-    signal: AbortSignal.timeout(30_000), readPage: fixture([[message("one")], [message("two")]]),
+    signal: AbortSignal.timeout(30_000), readPage: fixture([source]),
     extract: async (_r: unknown, _a: string, messages: ExtractionMessage[]) => messages.map(m => ({
       text: m.text, replaces: null, evidence: [{ messageId: m.id, quote: m.text }],
     })),
     validate: async ({ proposal }: { proposal: { text: string } }) => {
+      peak = Math.max(peak, ++active);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      active--;
       if (fail && proposal.text === "two") throw new Error("API unavailable");
       return { accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction };
     },
   };
   assert.equal((await runExtraction(opts)).failed, 1);
+  assert.equal(peak, 4, "proposal validation overlaps within a four-call bound");
+  assert.equal(active, 0, "failed chunks drain every in-flight validation before releasing the lease");
   const store = new ExtractionStore(storePath);
   try { assert.equal(store.checkpoint(session).cursor, null); assert.deepEqual(store.records(), []); }
   finally { store.close(); }
-  fail = false; assert.equal((await runExtraction(opts)).accepted, 2);
+  fail = false; assert.equal((await runExtraction(opts)).accepted, source.length);
 });
 
 test("worker retries whole chunks, isolates sessions, maps split citations, and makes zero unchanged calls", async () => {
@@ -146,7 +152,7 @@ test("worker retries whole chunks, isolates sessions, maps split citations, and 
   const source = fixture([[message("original", " red".repeat(55_000))]]);
   let fail = true, calls = 0;
   const opts = { config, storePath, agentId: "main", agentName: "Bill", runtime: {}, since: 0,
-    sessions: () => [session, other], signal: AbortSignal.timeout(60_000),
+    sessions: () => [{ ...session, sourceRevision: "stable-throughout-partial-chunks" }, other], signal: AbortSignal.timeout(60_000),
     readPage: (async (a,n,s,c) => s.sessionId === "s1" ? source(a,n,s,c) : fixture([[message("other")]])(a,n,s,c)) as typeof readExtractionPage,
     extract: async (_r: unknown, _a: string, messages: ExtractionMessage[], ids: string[]) => {
       calls++; if (fail) throw new Error("inference failed");

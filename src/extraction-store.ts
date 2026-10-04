@@ -3,8 +3,8 @@ import { openMemoryDatabase } from "./memory-database.js";
 import type { ExtractionMessage, MemoryProposal } from "./extraction-model.js";
 import type { SessionMetadata } from "./session-projector.js";
 
-export type ExtractionSession = SessionMetadata & { sessionKey: string; changedAt?: number };
-type Checkpoint = { cursor: string | null; context: ExtractionMessage[]; since: number };
+export type ExtractionSession = SessionMetadata & { sessionKey: string; changedAt?: number; sourceRevision?: string };
+type Checkpoint = { cursor: string | null; context: ExtractionMessage[]; since: number; completeRevision: string | null };
 export type ExtractedRecord = { id: string; revision: number; text: string; sessionId: string;
   observedAt: number; evidence: MemoryProposal["evidence"]; metadata: ExtractionSession; judgment: unknown };
 function memoryDigest(text: string): string {
@@ -27,7 +27,7 @@ export class ExtractionStore {
         session_id TEXT PRIMARY KEY, metadata TEXT NOT NULL CHECK(json_valid(metadata)), cursor TEXT,
         extract_since INTEGER NOT NULL,
         context TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(context)), updated_at INTEGER NOT NULL,
-        error TEXT
+        error TEXT, complete_revision TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS extracted_memories (
         id TEXT NOT NULL, revision INTEGER NOT NULL, session_id TEXT NOT NULL REFERENCES extraction_sessions(session_id),
@@ -40,6 +40,9 @@ export class ExtractionStore {
       CREATE UNIQUE INDEX IF NOT EXISTS extracted_duplicate ON extracted_memories(session_id,digest) WHERE status='active';
       INSERT OR IGNORE INTO memory_schema VALUES('extraction',1);
     `);
+      if (!this.db.prepare("SELECT 1 FROM pragma_table_info('extraction_sessions') WHERE name='complete_revision'").get()) {
+        this.db.exec("ALTER TABLE extraction_sessions ADD COLUMN complete_revision TEXT");
+      }
       this.db.prepare("INSERT OR IGNORE INTO extraction_worker(id,live_since) VALUES(1,?)").run(Date.now());
     } catch (error) { this.db.close(); throw error; }
   }
@@ -60,22 +63,23 @@ export class ExtractionStore {
   checkpoint(session: ExtractionSession, since?: number): Checkpoint {
     this.db.prepare(`INSERT INTO extraction_sessions(session_id,metadata,updated_at,extract_since) VALUES(?,?,?,?)
       ON CONFLICT(session_id) DO UPDATE SET metadata=excluded.metadata`).run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince());
-    const row = this.db.prepare("SELECT cursor,context,extract_since FROM extraction_sessions WHERE session_id=?").get(session.sessionId)!;
+    const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision FROM extraction_sessions WHERE session_id=?").get(session.sessionId)!;
     if (since !== undefined && since < Number(row.extract_since)) {
       // A broader explicitly approved backfill replays this session. Existing facts are
       // supplied to Luna and exact duplicates are ignored; history is never deleted.
-      this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',extract_since=? WHERE session_id=?").run(since, session.sessionId);
-      return { cursor: null, context: [], since };
+      this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=? WHERE session_id=?").run(since, session.sessionId);
+      return { cursor: null, context: [], since, completeRevision: null };
     }
-    return { cursor: row.cursor as string | null, context: JSON.parse(String(row.context)) as ExtractionMessage[], since: Number(row.extract_since) };
+    return { cursor: row.cursor as string | null, context: JSON.parse(String(row.context)) as ExtractionMessage[], since: Number(row.extract_since),
+      completeRevision: row.complete_revision as string | null };
   }
   records(sessionId?: string, paths?: readonly string[]): ExtractedRecord[] {
     const keys = paths?.filter(path => /^[a-f0-9-]+\/[1-9]\d*$/.test(path)).map(path => path.split("/"));
     if (keys && !keys.length) return [];
     return this.db.prepare(`SELECT m.*,s.metadata FROM extracted_memories m JOIN extraction_sessions s USING(session_id)
-      WHERE status='active' AND (? IS NULL OR session_id=?)
+      WHERE status='active' ${sessionId === undefined ? "" : "AND session_id=?"}
       ${keys ? `AND (m.id,m.revision) IN (VALUES ${keys.map(() => "(?,?)").join(",")})` : ""}
-      ORDER BY observed_at,id`).all(sessionId ?? null, sessionId ?? null, ...(keys?.flat() ?? []))
+      ORDER BY observed_at,id`).all(...(sessionId === undefined ? [] : [sessionId]), ...(keys?.flat() ?? []))
       .map(r => ({ id: String(r.id), revision: Number(r.revision), text: String(r.text), sessionId: String(r.session_id),
         observedAt: Number(r.observed_at), evidence: JSON.parse(String(r.evidence)), metadata: JSON.parse(String(r.metadata)), judgment: JSON.parse(String(r.judgment)) }));
   }
@@ -84,12 +88,12 @@ export class ExtractionStore {
     try {
       this.renew(owner);
       this.db.prepare("UPDATE extracted_memories SET status='withdrawn' WHERE session_id=? AND status='active'").run(sessionId);
-      this.db.prepare("UPDATE extraction_sessions SET cursor=?,context='[]',error=NULL WHERE session_id=?").run(cursor, sessionId);
+      this.db.prepare("UPDATE extraction_sessions SET cursor=?,context='[]',complete_revision=NULL,error=NULL WHERE session_id=?").run(cursor, sessionId);
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
   commit(params: { session: ExtractionSession; expected: string | null; cursor: string; context: ExtractionMessage[];
-    accepted: { proposal: MemoryProposal; observedAt: number; judgment: unknown }[]; owner: string; version: string }) {
+    accepted: { proposal: MemoryProposal; observedAt: number; judgment: unknown }[]; owner: string; version: string; completeRevision?: string }) {
     this.db.exec("BEGIN IMMEDIATE");
     let written = 0;
     try {
@@ -114,8 +118,8 @@ export class ExtractionStore {
             JSON.stringify(judgment), params.version, Date.now());
         written++;
       }
-      this.db.prepare("UPDATE extraction_sessions SET cursor=?,context=?,updated_at=?,error=NULL WHERE session_id=?")
-        .run(params.cursor, JSON.stringify(params.context), Date.now(), params.session.sessionId);
+      this.db.prepare("UPDATE extraction_sessions SET cursor=?,context=?,updated_at=?,complete_revision=?,error=NULL WHERE session_id=?")
+        .run(params.cursor, JSON.stringify(params.context), Date.now(), params.completeRevision ?? null, params.session.sessionId);
       this.db.exec("COMMIT");
       return written;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }

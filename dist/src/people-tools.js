@@ -112,10 +112,6 @@ const syncParameters = Type.Object({
     accountId: Type.String({ pattern: "\\S", maxLength: 200 }),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
 }, { additionalProperties: false });
-function context(ctx) {
-    const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
-    return cfg && ctx.agentId ? { agentId: ctx.agentId } : undefined;
-}
 function personView(stores, agentId, selector, maxChars) {
     const store = stores.get(agentId);
     const person = "personId" in selector
@@ -138,7 +134,7 @@ function personView(stores, agentId, selector, maxChars) {
     };
 }
 function createInspectTool(stores, config, ctx) {
-    const active = context(ctx);
+    const active = getContext(ctx);
     if (!active)
         return null;
     return {
@@ -265,7 +261,7 @@ function createUpdateTool(stores, config, runtime, ctx) {
     };
 }
 function createSyncTool(stores, reader, ctx) {
-    const active = context(ctx);
+    const active = getContext(ctx);
     if (!active)
         return null;
     return {

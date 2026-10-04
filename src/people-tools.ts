@@ -181,11 +181,6 @@ const syncParameters = Type.Object(
   { additionalProperties: false },
 );
 
-function context(ctx: OpenClawPluginToolContext): { agentId: string } | undefined {
-  const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
-  return cfg && ctx.agentId ? { agentId: ctx.agentId } : undefined;
-}
-
 function personView(
   stores: PeopleStores,
   agentId: string,
@@ -228,7 +223,7 @@ function createInspectTool(
   config: UnblockMemoryConfig["people"],
   ctx: OpenClawPluginToolContext,
 ) {
-  const active = context(ctx);
+  const active = getContext(ctx);
   if (!active) return null;
   return {
     name: "memory_people_inspect",
@@ -361,7 +356,7 @@ function createSyncTool(
   reader: SlackDirectoryReader,
   ctx: OpenClawPluginToolContext,
 ) {
-  const active = context(ctx);
+  const active = getContext(ctx);
   if (!active) return null;
   return {
     name: "memory_people_sync",

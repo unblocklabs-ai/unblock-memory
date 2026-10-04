@@ -83,6 +83,26 @@ test("opens one store lazily per agent and preserves it across reopen", async ()
   reopened.closeAll();
 });
 
+test("existing people stores gain indexed per-person identity lookups without changing their records", async () => {
+  const path = await temporaryPath();
+  const original = new PeopleStore(path, options);
+  const saved = original.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U123" });
+  original.close();
+  const oldDb = new DatabaseSync(path);
+  try { oldDb.exec("DROP INDEX IF EXISTS person_identities_person"); }
+  finally { oldDb.close(); }
+  const reopened = new PeopleStore(path, options);
+  try { assert.deepEqual(reopened.listIdentities(saved.person.id), [saved.identity]); }
+  finally { reopened.close(); }
+  const db = new DatabaseSync(path);
+  try {
+    const plan = db.prepare("EXPLAIN QUERY PLAN SELECT * FROM person_identities WHERE person_id = ? ORDER BY provider, account_scope, external_id")
+      .all(saved.person.id).map(row => String(row.detail)).join("\n");
+    assert.match(plan, /SEARCH person_identities/);
+    assert.doesNotMatch(plan, /SCAN person_identities/);
+  } finally { db.close(); }
+});
+
 test("rejects agent ids that could escape the state root", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-people-owner-"));
   const stores = new PeopleStores({ stateRoot, ...options });

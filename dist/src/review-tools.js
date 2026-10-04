@@ -13,6 +13,18 @@ const claimParameters = Type.Object({
 }, { additionalProperties: false });
 const clusterParameters = Type.Object({ clusterId: Type.String({ pattern: "^[0-9a-f]{10}$" }) }, { additionalProperties: false });
 const noParameters = Type.Object({}, { additionalProperties: false });
+/** Bound initialization as well as inference, without cancelling shared managers. */
+export async function reviewRequestContext(runtime, active, typesafe, signal) {
+    const deadline = AbortSignal.timeout(30_000);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), combined);
+    if (!apiKey)
+        return { status: "unavailable", reason: "TypeSafe API key not configured" };
+    const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
+    if (!manager)
+        return { status: "unavailable", reason: "Memory manager unavailable" };
+    return { status: "ready", manager, apiKey, signal: combined, timeoutMs: typesafe.timeoutMs };
+}
 export function registerReviewTools(api, runtime, config, diagnostics) {
     api.registerTool(ctx => {
         const active = getContext(ctx);
@@ -59,20 +71,12 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
                 const parsed = Value.Parse(claimParameters, params);
                 if (!config.evidenceReview.enabled || !config.typesafe.enabled)
                     return jsonResult({ status: "disabled" });
-                const deadline = AbortSignal.timeout(30_000);
-                const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
                 try {
-                    combined.throwIfAborted();
-                    const apiKey = await abortable(resolveTypeSafeApiKey(config.typesafe), combined);
-                    combined.throwIfAborted();
-                    if (!apiKey)
-                        return jsonResult({ status: "unavailable", reason: "TypeSafe API key not configured" });
-                    const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
-                    combined.throwIfAborted();
-                    if (!manager)
-                        return jsonResult({ status: "unavailable" });
-                    return jsonResult(await manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora,
-                        apiKey, timeoutMs: config.typesafe.timeoutMs, signal: combined }));
+                    const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
+                    if (context.status !== "ready")
+                        return jsonResult(context);
+                    return jsonResult(await context.manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora,
+                        apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal }));
                 }
                 catch {
                     return jsonResult({ status: "unavailable", needsReview: true, reason: "Claim review failed or was cancelled; no claim verified" });
@@ -92,20 +96,12 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
                 const parsed = Value.Parse(clusterParameters, params);
                 if (!config.qualityAudit.enabled || !config.typesafe.enabled)
                     return jsonResult({ status: "disabled" });
-                const deadline = AbortSignal.timeout(30_000);
-                const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
                 try {
-                    combined.throwIfAborted();
-                    const apiKey = await abortable(resolveTypeSafeApiKey(config.typesafe), combined);
-                    combined.throwIfAborted();
-                    if (!apiKey)
-                        return jsonResult({ status: "unavailable", reason: "TypeSafe API key not configured" });
-                    const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
-                    combined.throwIfAborted();
-                    if (!manager)
-                        return jsonResult({ status: "unavailable" });
-                    return jsonResult(await manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora,
-                        apiKey, timeoutMs: config.typesafe.timeoutMs, signal: combined }));
+                    const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
+                    if (context.status !== "ready")
+                        return jsonResult(context);
+                    return jsonResult(await context.manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora,
+                        apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal }));
                 }
                 catch {
                     return jsonResult({ status: "unavailable", reason: "Cluster review failed or was cancelled; no cluster judgment made" });

@@ -1,5 +1,10 @@
+import { Type } from "typebox";
 import type { UnblockMemoryConfig } from "./config.js";
 export declare const TYPESAFE_MODEL = "jev-1.13.0";
+export declare const TYPESAFE_NOUL_SCHEMA: Type.TObject<{
+    type: Type.TLiteral<"noul">;
+    noul: Type.TNumber;
+}>;
 export declare class TypeSafeRequestError extends Error {
     readonly code: "timeout" | "cancelled" | "http_error" | "invalid_response" | "network_error";
     readonly status?: number | undefined;

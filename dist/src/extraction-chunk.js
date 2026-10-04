@@ -98,6 +98,7 @@ export async function readExtractionChunk(params) {
         const finish = (index, offset = 0) => {
             const next = page.messages[index];
             return { kind: "page", messages, newIds, entryCount, fence: startingFence ?? page.cursor,
+                exhausted: !next && !page.hasMore,
                 cursor: next ? PREFIX + JSON.stringify({ before, fence: page.cursor, index, offset, id: next.id, hash: digest(next) }) : page.cursor };
         };
         for (let i = resume?.index ?? 0; i < page.messages.length; i++) {

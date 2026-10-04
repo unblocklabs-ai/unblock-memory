@@ -22,7 +22,8 @@ export class ResponseAuditStore {
           attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT,
           PRIMARY KEY(cohort,id));
         CREATE TABLE IF NOT EXISTS response_scans (cohort TEXT PRIMARY KEY, observed_at INTEGER, coverage TEXT);
-        CREATE INDEX IF NOT EXISTS response_results_time ON response_results(cohort,episode_at);`);
+        CREATE INDEX IF NOT EXISTS response_results_time ON response_results(cohort,episode_at);
+        CREATE INDEX IF NOT EXISTS response_results_session ON response_results(cohort,session_id,episode_at);`);
             this.#db.exec(`CREATE TABLE IF NOT EXISTS response_checkpoints (
         cohort TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, coverage TEXT NOT NULL,
         PRIMARY KEY(cohort,session_id));

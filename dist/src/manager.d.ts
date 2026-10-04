@@ -12,7 +12,7 @@ import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
 import type { QueryPair } from "./query-contract.js";
 export { expandSessionSearchHit } from "./memory-passage.js";
-export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "searchLex" | "vsearch" | "get" | "getDocumentBody" | "close">;
+export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "vsearch" | "get" | "getDocumentBody" | "close">;
 export type ManagerSessionConfig = {
     agentId: string;
     agentName: string;

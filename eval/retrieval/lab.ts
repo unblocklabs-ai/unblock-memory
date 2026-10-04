@@ -126,7 +126,7 @@ function markdownReport(indexMs: number, arms: readonly ArmReport[]): string {
     lines.push(`| ${arm.name} | ${split} | ${format(aggregate.evidenceGroupRecall)} | ${format(aggregate.completeCoverage)} | ${format(aggregate.meanReciprocalRank)} | ${aggregate.errors} |`);
   }
   lines.push("", "## Interpretation", "",
-    "- vector@5 and vector@20 use the unchanged production manager with the normal 0.3 cutoff; lexical uses its whole-document BM25 path.",
+    "- vector@5 and vector@20 use the production manager with the normal 0.3 cutoff; lexical directly uses QMD's whole-document BM25 API.",
     "- hybrid@20 calls QMD search with rerank:false, limit:20, candidateLimit:20 and minScore:0. QMD owns discovery, deduplication and local rank fusion; no TypeSafe call.",
     "- Hybrid's rank-fusion scores are not vector similarities: compare evidence at equal context budgets, not numeric score thresholds. Internal retrieval breadth is SDK-owned, not an equal-compute ablation.",
     "- All repeat trials include result construction. First trials determine quality; successful repeats measure query latency, not independent quality observations.",
@@ -175,9 +175,14 @@ async function main(): Promise<void> {
         corpora: ["memory"], maxResults: limit, minScore: 0.3,
       }), syntheticCases, documents, repeat, indexError));
     }
-    arms.push(await runArm("lexical", query => manager.search(query, {
-      corpora: ["memory"], lexicalOnly: true, maxResults: 20, minScore: -1,
-    }), syntheticCases, documents, repeat, indexError));
+    arms.push(await runArm("lexical", async query => {
+      const hits = await store.searchLex(query, { collection: source.collection, limit: 20 });
+      return hits.map(hit => {
+        const snippet = hit.body ?? hit.title;
+        return { path: hit.filepath, snippet, startLine: 1,
+          endLine: Math.max(1, snippet.split("\n").length), score: hit.score };
+      });
+    }, syntheticCases, documents, repeat, indexError));
     arms.push(await runArm("hybrid@20", async query => {
       const results = await store.search({ query, collection: source.collection,
         rerank: false, limit: 20, candidateLimit: 20, minScore: 0 });

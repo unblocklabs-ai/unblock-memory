@@ -380,6 +380,12 @@ for the trusted LAN/loopback only; use TLS or a private tunnel across untrusted 
 Visible conversation text is sent to this endpoint, never tool outputs/thinking.
 Approve only corpora suitable for every audience of the agent.
 
+The packaged `src/mlx-query-worker.py` is a standalone JSON-lines worker for
+separately managed model-serving integrations, not a Gateway subprocess or HTTP
+server. It is retained with `query_contract.py` and the pinned tokenizer assets;
+the latter also define the training-data contract. A host service owns any adapter
+between that private worker protocol and the HTTP API below.
+
 `POST /generate` accepts `{id, conversation: {history, currentRequest}}` and returns
 `{response: {id, text}}`, where `text` is JSON with exactly two nonempty strings,
 `lex` and `vec`. The request ID must match. Redirects, malformed/oversized responses,
@@ -464,6 +470,13 @@ successful siblings can still qualify. If all fail, no hint is emitted. It does
 not switch to vector-only selection. There are no automatic HTTP retries. Other
 credential-file read errors likewise produce a warning and no hint.
 
+The complete skill contribution has a fixed three-second deadline, including
+credential resolution, retrieval and provider calls. A slow skill lookup cannot
+hold up ready memory or people hints beyond that budget. Session teardown,
+superseding turns and Gateway shutdown cancel its wait and provider requests;
+shared indexing/embedding work can finish for other callers, but cannot trigger
+late Jev calls or hints for the cancelled run.
+
 **Privacy:** enabled TypeSafe selection sends up to 12,000 characters of current
 prompt/recent user-assistant text, plus the shortlisted names/descriptions, to
 `api.typesafe.ai`. Source-path fields, full skill procedures, tool-result messages,
@@ -476,7 +489,8 @@ The defaults use five prior messages, a vector-only score threshold of `0.5`,
 and a ten-turn cooldown. A skill is cooling down after either a suggestion or a
 successful direct `read` of its indexed `SKILL.md`. When the selected
 skill is cooling down, no hint is emitted; Skill Whisperer does not fall through
-to a weaker match. Cooldown state is per session and intentionally resets with
+to a weaker match. When every shortlisted skill is cooling down, Jev is skipped.
+Cooldown state is per session and intentionally resets with
 the Gateway. Shell-command reads are not tracked.
 
 The `skills` corpus shares the existing QMD store and warm embedding model but

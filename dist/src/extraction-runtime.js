@@ -7,6 +7,7 @@ import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-cor
 import { MEMORY_DATABASE, hasMemoryTable } from "./memory-database.js";
 import { ExtractionStore } from "./extraction-store.js";
 import { extractionSessions } from "./extraction-source.js";
+import { dateOption } from "./date-option.js";
 export function registerExtraction(api, config, runtime) {
     let lifetime = new AbortController();
     let timer, running;
@@ -36,13 +37,7 @@ export function registerExtraction(api, config, runtime) {
             .option("--since <date>", "Explicit bounded backfill from YYYY-MM-DD UTC; repeat to resume")
             .option("--session <id>", "Restrict this run to one session")
             .action(async (opts) => {
-            let since;
-            if (opts.since !== undefined) {
-                since = Date.parse(opts.since);
-                if (!/^\d{4}-\d{2}-\d{2}$/.test(opts.since) || !Number.isFinite(since) || new Date(since).toISOString().slice(0, 10) !== opts.since) {
-                    throw new Error("since must be a valid YYYY-MM-DD UTC date");
-                }
-            }
+            const since = opts.since === undefined ? undefined : dateOption(opts.since, 0);
             try {
                 // Native harnesses live in the Gateway, not the cold CLI metadata loader.
                 const result = await callGatewayFromCli("unblock-memory.extract", { timeout: "600000" }, { agentId: opts.agent, ...(since === undefined ? {} : { since }), ...(opts.session ? { sessionId: opts.session } : {}) });

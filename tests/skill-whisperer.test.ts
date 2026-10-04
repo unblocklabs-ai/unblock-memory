@@ -3,6 +3,7 @@ import { WhispererDiagnostics } from "../src/diagnostics.js";
 import test from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { registerSkillWhisperer } from "../src/skill-whisperer.js";
+import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 import { buildSkillWhispererQuery } from "../src/whisperer-context.js";
 import type { UnblockMemoryConfig } from "../src/config.js";
 
@@ -72,6 +73,8 @@ function harness(
   };
   const before = registerSkillWhisperer(api, runtime, enabled, typesafe, diagnostics);
   return {
+    api,
+    runtime,
     queries,
     minimumScores,
     warnings,
@@ -79,6 +82,8 @@ function harness(
     before: before as BeforePromptBuild,
     after: hooks.get("after_tool_call") as unknown as AfterToolCall,
     end: hooks.get("session_end") as unknown as SessionEnd,
+    stop: () => hooks.get("gateway_stop")?.(),
+    prompt: () => hooks.get("before_prompt_build") as unknown as BeforePromptBuild,
   };
 }
 
@@ -270,10 +275,12 @@ test("TypeSafe conversation is bounded and pending selections do not survive ses
   let resolveRequest!: (value: Response) => void;
   let requestStarted!: () => void;
   const started = new Promise<void>(resolve => { requestStarted = resolve; });
+  let requestSignal: AbortSignal | null | undefined;
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     assert.equal(request.state.currentRequest.length, 12_000);
     assert.deepEqual(request.state.history, []);
+    requestSignal = init?.signal;
     requestStarted();
     return new Promise<Response>(resolve => { resolveRequest = resolve; });
   });
@@ -282,6 +289,73 @@ test("TypeSafe conversation is bounded and pending selections do not survive ses
   const pending = h.before({ prompt: "x".repeat(13_000), messages: [{ role: "user", content: "older" }] }, context);
   await started;
   await h.end({ sessionId: "session" }, context);
+  assert.equal(requestSignal?.aborted, true);
   resolveRequest(typeSafeResponse("skill_0"));
   assert.equal(await pending, undefined);
+});
+
+test("an entirely cooling shortlist avoids Jev without changing the winning-skill policy", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("skill_0"));
+  const h = harness(["alpha", "beta"].map(name => ({ name, path: `/skills/${name}/SKILL.md`, score: 0.9 })), activeTypeSafe);
+  const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "run-1" };
+  const event = { prompt: "task", messages: [] };
+  for (const name of ["alpha", "beta"]) await h.after({ toolName: "read", params: { path: `/skills/${name}/SKILL.md` } }, context);
+  assert.equal(await h.before(event, context), undefined);
+  assert.equal(fetch.mock.callCount(), 0);
+  await h.end({ sessionId: "session" }, context);
+  assert.match((await h.before(event, { ...context, runId: "run-2" }))?.appendContext ?? "", /alpha/);
+  assert.equal(await h.before(event, { ...context, runId: "run-3" }), undefined);
+  assert.equal(fetch.mock.callCount(), 4, "a cooling winner must not fall through to the other candidate");
+});
+
+test("late skill retrieval cannot send Jev requests after teardown, shutdown or supersession", async t => {
+  for (const action of ["end", "stop", "supersede"]) await t.test(action, async t => {
+    const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("skill_0"));
+    const h = harness([], activeTypeSafe);
+    let finish!: (hits: Awaited<ReturnType<typeof h.runtime.searchSkills>>) => void;
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const retrieval = new Promise<Awaited<ReturnType<typeof h.runtime.searchSkills>>>(resolve => { finish = resolve; });
+    t.mock.method(h.runtime, "searchSkills", async () => { started(); return retrieval; });
+    const event = { prompt: "task", messages: [] };
+    const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "old" };
+    const old = h.before(event, context);
+    await ready;
+    let fresh: ReturnType<BeforePromptBuild> = undefined;
+    if (action === "end") await h.end({ sessionId: "session" }, context);
+    else if (action === "stop") h.stop();
+    else fresh = h.before(event, { ...context, runId: "new" });
+    finish([{ name: "alpha", description: "Useful skill", path: "/skills/alpha/SKILL.md", score: 0.9 }]);
+    assert.equal(await old, undefined);
+    if (action === "supersede") assert.ok(await fresh!);
+    assert.equal(fetch.mock.callCount(), action === "supersede" ? 1 : 0);
+  });
+});
+
+test("the total skill deadline releases ready memory and people without late egress", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("skill_0"));
+  const h = harness([], activeTypeSafe);
+  let finish!: (hits: Awaited<ReturnType<typeof h.runtime.searchSkills>>) => void;
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const retrieval = new Promise<Awaited<ReturnType<typeof h.runtime.searchSkills>>>(resolve => { finish = resolve; });
+  t.mock.method(h.runtime, "searchSkills", async () => { started(); return retrieval; });
+  registerWhispererPrompt(h.api, {
+    skill: h.before as Parameters<typeof registerWhispererPrompt>[1]["skill"],
+    memory: () => ({ appendContext: "<memory>ready</memory>" }),
+    people: () => ({ appendContext: "<people>ready</people>" }),
+  });
+  const result: { value: Awaited<ReturnType<BeforePromptBuild>> } = { value: undefined };
+  const pending = Promise.resolve(h.prompt()({ prompt: "task", messages: [] }, {
+    trigger: "user", agentId: "main", sessionId: "session", runId: "slow",
+  })).then(value => { result.value = value; });
+  await ready;
+  t.mock.timers.tick(3000);
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  assert.match(result.value?.appendContext ?? "", /<memory>ready<\/memory>\n<people>ready<\/people>/);
+  finish([{ name: "alpha", description: "Useful skill", path: "/skills/alpha/SKILL.md", score: 0.9 }]);
+  await pending;
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  assert.equal(fetch.mock.callCount(), 0);
 });

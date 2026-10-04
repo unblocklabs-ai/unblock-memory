@@ -10,6 +10,7 @@ import type { QmdMemoryRuntime } from "./runtime.js";
 import { MEMORY_DATABASE, hasMemoryTable } from "./memory-database.js";
 import { ExtractionStore } from "./extraction-store.js";
 import { extractionSessions } from "./extraction-source.js";
+import { dateOption } from "./date-option.js";
 
 export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemoryConfig, runtime?: QmdMemoryRuntime) {
   let lifetime = new AbortController();
@@ -38,13 +39,7 @@ export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemory
       .option("--since <date>", "Explicit bounded backfill from YYYY-MM-DD UTC; repeat to resume")
       .option("--session <id>", "Restrict this run to one session")
       .action(async (opts: { agent: string; since?: string; session?: string }) => {
-        let since: number | undefined;
-        if (opts.since !== undefined) {
-          since = Date.parse(opts.since);
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(opts.since) || !Number.isFinite(since) || new Date(since).toISOString().slice(0,10) !== opts.since) {
-            throw new Error("since must be a valid YYYY-MM-DD UTC date");
-          }
-        }
+        const since = opts.since === undefined ? undefined : dateOption(opts.since, 0);
         try {
           // Native harnesses live in the Gateway, not the cold CLI metadata loader.
           const result = await callGatewayFromCli("unblock-memory.extract", { timeout: "600000" },

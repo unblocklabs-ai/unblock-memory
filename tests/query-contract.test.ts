@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { Tokenizer } from "@huggingface/tokenizers";
 import test from "node:test";
 import { queryConversation } from "../src/query-generator.js";
-import { prepareQueryConversation, queryTokenIds, serializeQueryConversation } from "../src/query-contract.js";
+import { prepareQueryConversation, queryTokenIds, serializeQueryConversation, QUERY_CONTRACT } from "../src/query-contract.js";
 import { trainingExamples } from "../src/training-input.js";
 
 test("JS token IDs match the pinned official HF tokenizer, including Unicode and escaped conversations", () => {
@@ -30,6 +31,32 @@ test("shared window preserves more than 32 short messages and drops only whole o
   assert.equal(prepared.contextLimited, true);
   assert.deepEqual(prepared.conversation.history, history);
   assert.ok(queryTokenIds(serializeQueryConversation(prepared.conversation)).length <= 8192);
+});
+
+test("token-limited histories retain the longest whole-message suffix without quadratic tokenization work", t => {
+  const history = Array.from({ length: 390 }, (_, index) => ({
+    role: index % 2 ? "assistant" as const : "user" as const, content: "a ".repeat(15),
+  }));
+  const currentRequest = "Now";
+  const original = Tokenizer.prototype.encode;
+  let tokenizedBytes = 0;
+  const encode = t.mock.method(Tokenizer.prototype, "encode", function (this: Tokenizer, ...args: Parameters<Tokenizer["encode"]>) {
+    tokenizedBytes += Buffer.byteLength(String(args[0]));
+    return original.apply(this, args);
+  });
+  const prepared = prepareQueryConversation(history, currentRequest);
+  encode.mock.restore();
+  const serialized = serializeQueryConversation(prepared.conversation);
+  assert.equal(prepared.conversation.currentRequest, currentRequest);
+  assert.deepEqual(prepared.conversation.history, history.slice(-prepared.conversation.history.length));
+  assert.equal(prepared.contextLimited, true);
+  assert.ok(Buffer.byteLength(serialized) <= QUERY_CONTRACT.conversationBytes);
+  assert.ok(queryTokenIds(serialized).length <= QUERY_CONTRACT.conversationTokens);
+  const oneOlder = serializeQueryConversation({ currentRequest, history: history.slice(-prepared.conversation.history.length - 1) });
+  assert.ok(queryTokenIds(oneOlder).length > QUERY_CONTRACT.conversationTokens);
+  // Bound expensive codec work, not wall-clock time or a specific search algorithm.
+  assert.ok(tokenizedBytes <= 12 * Buffer.byteLength(serializeQueryConversation({ history, currentRequest })),
+    `tokenized ${tokenizedBytes} bytes for one bounded conversation`);
 });
 
 test("token cap is independent of bytes and never truncates the current request", () => {

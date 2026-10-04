@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { Tiktoken } from "js-tiktoken/lite";
 import o200kBase from "js-tiktoken/ranks/o200k_base";
-import { requestTypeSafe } from "./typesafe-client.js";
+import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
 export const EXTRACTION_VERSION = "lasting-facts-v11";
 // Jev allows 32k for state plus its longest question. Leave room for validation
 // instructions, proposal evidence and tokenizer differences, not just Luna input.
@@ -34,6 +34,7 @@ Only extract facts supported by at least one NEW message. Context-only messages 
 If a fact is already in existing memories, omit it. Source dates control chronology, not processing order: during backfill, never replace a newer observed fact with an older one, or emit the older value as an undated duplicate. If new evidence clearly corrects/changes an existing memory, set replaces to its exact id and emit the concise replacement. Otherwise replaces is null. Never replace unrelated facts. If a previous claim is explicitly withdrawn without a replacement, retain a concise qualified correction rather than inventing a value.
 Cite exact contiguous substrings copied from the supplied messages using their ids. Preserve Markdown markers, mentions, whitespace and punctuation inside each quote. Never join separated spans into one quote or clean up its formatting. Prefer short exact spans; use separate evidence entries when needed. Include enough evidence to resolve corrections and speaker attribution. Output an empty memories array when nothing qualifies. Do not fill a quota.`;
 let tokenizer;
+let promptTokens;
 // o200k_base is an explicit budgeting proxy, not a claim about the host's private tokenizer.
 function extractionTokens(text) {
     return (tokenizer ??= new Tiktoken(o200kBase)).encode(text, [], []).length;
@@ -45,7 +46,7 @@ function extractionInput(messages, newIds, existing) {
     return JSON.stringify({ messages: messages.map(datedMessage), newMessageIds: newIds, existing, schema: proposalSchema });
 }
 export function extractionOverhead(existing) {
-    return extractionTokens(EXTRACTION_PROMPT) + extractionTokens(extractionInput([], [], existing)) + 512;
+    return (promptTokens ??= extractionTokens(EXTRACTION_PROMPT)) + extractionTokens(extractionInput([], [], existing)) + 512;
 }
 export function extractionMessageTokens(message) {
     return extractionTokens(JSON.stringify(datedMessage(message))) + extractionTokens(JSON.stringify(message.id)) + 8;
@@ -84,8 +85,8 @@ export async function extractWithLuna(runtime, agentId, messages, newIds, existi
 const judgments = Type.Object({ answers: Type.Object({
         supported: Type.Object({ type: Type.Literal("choice"), choice: Type.Union([Type.Literal("supported"), Type.Literal("contradicted"), Type.Literal("unsupported")]),
             probabilities: Type.Object({ supported: Type.Number({ minimum: 0, maximum: 1 }), contradicted: Type.Number({ minimum: 0, maximum: 1 }), unsupported: Type.Number({ minimum: 0, maximum: 1 }) }) }),
-        useful: Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) }),
-        replacement: Type.Optional(Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) })),
+        useful: noul,
+        replacement: Type.Optional(noul),
     }) });
 export async function validateExtractedMemory(params) {
     const { proposal, messages, existing } = params;

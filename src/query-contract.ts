@@ -50,14 +50,19 @@ export function prepareQueryConversation(history: QueryConversation["history"], 
     conversation.history.unshift(message);
     bytes += added;
   }
-  let contextLimited = conversation.history.length < history.length;
-  for (;;) {
-    const serialized = serializeQueryConversation(conversation);
-    if (Buffer.byteLength(serialized) <= contract.conversationBytes && queryTokenIds(serialized).length <= contract.conversationTokens) {
-      return { conversation, contextLimited };
-    }
-    if (!conversation.history.length) throw new QueryInputBudgetError();
-    conversation.history.shift();
-    contextLimited = true;
+  const fits = (start: number) => queryTokenIds(serializeQueryConversation({
+    history: conversation.history.slice(start), currentRequest,
+  })).length <= contract.conversationTokens;
+  if (fits(0)) return { conversation, contextLimited: conversation.history.length < history.length };
+  if (!fits(conversation.history.length)) throw new QueryInputBudgetError();
+  // Search whole-message suffixes with the exact serialized tokenizer contract;
+  // never approximate the budget by adding independently tokenized messages.
+  let tooLarge = 0, fitting = conversation.history.length;
+  while (fitting - tooLarge > 1) {
+    const middle = Math.floor((tooLarge + fitting) / 2);
+    if (fits(middle)) fitting = middle;
+    else tooLarge = middle;
   }
+  conversation.history = conversation.history.slice(fitting);
+  return { conversation, contextLimited: true };
 }

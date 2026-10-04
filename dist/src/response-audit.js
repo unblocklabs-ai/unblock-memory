@@ -142,11 +142,11 @@ export async function auditResponses(options) {
                         }
                     }
                     signal.throwIfAborted();
-                    const fresh = reader.read(session, config.responseAudit);
-                    if (!fresh?.episodes.some(candidate => candidate.id === e.id && candidate.inputHash === e.inputHash)) {
+                    const fresh = reader.read(session, config.responseAudit, snapshot.revision);
+                    if (!fresh || !("unchanged" in fresh) && !fresh.episodes.some(candidate => candidate.id === e.id && candidate.inputHash === e.inputHash)) {
                         coverage.stale++;
                         store.stale(cohort, e);
-                        if (fresh !== undefined) {
+                        if (fresh !== undefined && (!fresh || !("unchanged" in fresh))) {
                             store.observe(cohort, session, fresh?.episodes ?? []);
                             store.checkpointForget(cohort, session);
                         }

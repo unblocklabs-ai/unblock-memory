@@ -153,6 +153,8 @@ export class PeopleStore {
         this.#maxBlurbChars = options.maxBlurbChars;
         try {
             this.#migrate();
+            this.#db.exec(`CREATE INDEX IF NOT EXISTS person_identities_person
+        ON person_identities(person_id, provider, account_scope, external_id)`);
         }
         catch (error) {
             this.#db.close();

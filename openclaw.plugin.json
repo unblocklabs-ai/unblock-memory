@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -67,7 +67,7 @@
       "help": "Shared provider gate for opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Ordinary search and People Whisperer injection stay local."
     },
     "typesafe.apiKey": { "label": "TypeSafe API Key", "sensitive": true },
-    "typesafe.timeoutMs": { "label": "TypeSafe Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer also has its own total deadline." },
+    "typesafe.timeoutMs": { "label": "TypeSafe Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, and Skill Whisperer has a fixed 3-second total budget." },
     "typesafe.apiKeyFile": {
       "label": "TypeSafe Key File",
       "help": "Absolute path to a plaintext API key or a dotenv file containing TYPESAFE_API_KEY. Prefer this over storing a key in config."

@@ -51,8 +51,10 @@ test("real BM25 plus vector union retains raw method scores, uses actual QMD RRF
       qmd.internal.insertContent(`hash${i}`, body, "2026-01-01");
       qmd.internal.insertDocument("memory", `${i}.md`, "Rico", `hash${i}`, "2026-01-01", "2026-01-01");
     });
-    t.mock.method(qmd, "searchVector", async (...[_query, options]: Parameters<typeof qmd.searchVector>) => {
-      assert.deepEqual(options, { limit: 10, collection: ["memory"] });
+    qmd.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+    t.mock.method(qmd.internal, "searchVec", async (...[_query, _model, limit, collection]: Parameters<typeof qmd.internal.searchVec>) => {
+      assert.equal(limit, 10);
+      assert.deepEqual(collection, ["memory"]);
       return bodies.map((body, i) => ({ filepath: `qmd://memory/${i}.md`, body, chunkPos: 0, chunkLen: body.length,
         score: 0.9 - i / 10 }));
     });

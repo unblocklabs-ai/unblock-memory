@@ -26,10 +26,10 @@ test("invalid metric values are ignored without leaking content", () => {
     // This value must never be represented by the snapshot, even if a caller casts at runtime.
     query: "private query", path: "/private/path", excerpt: "secret excerpt",
   } as unknown as Parameters<RetrievalTelemetry["record"]>[1];
-  telemetry.record("lexical", observation);
+  telemetry.record("vector", observation);
   const snapshot = telemetry.snapshot();
-  assert.equal(snapshot.operations.lexical.calls, 1);
-  assert.equal(snapshot.operations.lexical.measurements.retrievalMs.samples, 0);
+  assert.equal(snapshot.operations.vector.calls, 1);
+  assert.equal(snapshot.operations.vector.measurements.retrievalMs.samples, 0);
   assert.equal(JSON.stringify(snapshot).includes("private query"), false);
   assert.equal(JSON.stringify(snapshot).includes("secret excerpt"), false);
 });
@@ -44,7 +44,6 @@ test("snapshots are detached and operations remain isolated", () => {
   assert.equal(telemetry.snapshot().operations.vector.calls, 1);
   assert.equal(telemetry.snapshot().operations.vector.outcomes.empty, 1);
   assert.equal(telemetry.snapshot().operations.memoryWhisperer.calls, 1);
-  assert.equal(telemetry.snapshot().operations.lexical, undefined);
 });
 
 test("manager search telemetry is exposed through diagnostics", async () => {
@@ -52,10 +51,8 @@ test("manager search telemetry is exposed through diagnostics", async () => {
   const manager = new QmdMemoryManager({ dbPath: join(root, "index.sqlite"), workspaceDir: root, sources: [] });
   try {
     assert.deepEqual(await manager.search("empty"), []);
-    assert.deepEqual(await manager.search("empty", { lexicalOnly: true }), []);
     const retrieval = (await manager.diagnostics()).retrieval;
     assert.equal(retrieval.operations.vector.outcomes.empty, 1);
-    assert.equal(retrieval.operations.lexical.outcomes.empty, 1);
   } finally {
     await manager.close();
   }

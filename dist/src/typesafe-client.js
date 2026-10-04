@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { parseEnv } from "node:util";
+import { Type } from "typebox";
 export const TYPESAFE_MODEL = "jev-1.13.0";
+export const TYPESAFE_NOUL_SCHEMA = Type.Object({
+    type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
+});
 export class TypeSafeRequestError extends Error {
     code;
     status;

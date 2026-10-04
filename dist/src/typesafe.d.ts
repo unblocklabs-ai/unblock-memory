@@ -3,6 +3,7 @@ import type { QueryConversation } from "./query-contract.js";
 export declare function selectTypeSafeSkill(params: {
     apiKey: string;
     timeoutMs: number;
+    signal?: AbortSignal;
     currentRequest: string;
     history: readonly {
         role: "user" | "assistant";
@@ -82,12 +83,3 @@ export declare function judgeMemoryPassage(request: ReturnType<typeof memoryUsef
         output_tokens: number;
     } | null;
 }>;
-/** One HTTP request per candidate; result order matches input order. */
-export declare function judgeTypeSafeMemories(params: {
-    apiKey: string;
-    timeoutMs: number;
-    signal: AbortSignal;
-    conversation: QueryConversation;
-    asOf: string;
-    candidates: readonly MemoryPassage[];
-}): Promise<number[]>;

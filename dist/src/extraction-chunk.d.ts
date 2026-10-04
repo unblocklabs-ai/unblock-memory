@@ -25,5 +25,6 @@ export declare function readExtractionChunk(params: {
     newIds: string[];
     entryCount: number;
     fence: string;
+    exhausted: boolean;
     cursor: string;
 }>;

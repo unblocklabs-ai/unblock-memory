@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -13,6 +14,8 @@ import type { ExtractionPage } from "../src/extraction-source.js";
 import { EXTRACTED_COLLECTION, extractedPath, syncExtractedIndex } from "../src/extraction-index.js";
 import { QmdMemoryManager } from "../src/manager.js";
 import { resolveSource } from "../src/sources.js";
+import { extractionSessions } from "../src/extraction-source.js";
+import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 const session: ExtractionSession = { sessionId: "s1", sessionKey: "agent:main:slack:channel:test", chatType: "channel", startedAt: 1 };
 const messages: ExtractionMessage[] = [{ id: "m1", speaker: "Bek", role: "user", text: "My favorite color is red.", timestamp: 1000 }];
@@ -163,6 +166,39 @@ test("incremental worker skips unchanged pages, retries failures and never loses
   const store = new ExtractionStore(f.storePath); assert.equal(store.records().length, 2); assert.equal(store.checkpoint(session).cursor, "c2"); store.close();
 });
 
+test("completed source revisions skip delta reads, while appends, resets and broader backfills remain discoverable", async t => {
+  const f = await fixture(), sourcePath = join(f.dir, "agent.sqlite"), db = createAgentDatabase(sourcePath);
+  t.after(() => db.close());
+  insertSession(db, { sessionId: "s1", chatType: "channel", message: { type: "message", message: { role: "user", content: messages[0]!.text } } });
+  db.exec("ALTER TABLE session_windows ADD COLUMN updated_at INTEGER; ALTER TABLE session_windows ADD COLUMN transcript_updated_at INTEGER");
+  let reads = 0, extractions = 0;
+  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {}, signal: signal(), since: 1000,
+    sessions: () => extractionSessions(sourcePath, "main", ["channel"]),
+    readPage: async (_agent: string, _name: string, _session: ExtractionSession, cursor: string | null): Promise<ExtractionPage> => {
+      reads++;
+      const generation = String(db.prepare("SELECT generation FROM transcript_rewrite_watermarks").get()!.generation);
+      if (cursor && !cursor.startsWith(generation + ":")) return { kind: "reset", cursor: generation + ":0" };
+      const tail = Number(db.prepare("SELECT MAX(seq) tail FROM transcript_events").get()!.tail);
+      const at = cursor ? Number(cursor.split(":").at(-1)) : 0;
+      return { kind: "page", cursor: generation + ":" + tail, hasMore: false, entryCount: tail - at,
+        messages: at < tail ? [{ ...messages[0]!, id: "m" + tail, timestamp: tail * 1000 }] : [] };
+    }, extract: async () => { extractions++; return []; } };
+  await runExtraction(opts);
+  const afterFirst = reads;
+  assert.equal(extractions, 1);
+  await runExtraction(opts);
+  assert.equal(reads, afterFirst, "an exhausted unchanged revision must not reopen its delta");
+  db.prepare("INSERT INTO transcript_events VALUES('s1',2,?,4000)").run(JSON.stringify({ type: "message", message: { role: "user", content: "New message" } }));
+  await runExtraction(opts);
+  assert.equal(extractions, 2, "appends change the watermark and are processed");
+  db.prepare("UPDATE transcript_rewrite_watermarks SET generation='rewritten'").run();
+  await runExtraction(opts);
+  await runExtraction(opts);
+  assert.equal(extractions, 3, "a source reset must resume rather than mark the new branch complete");
+  await runExtraction({ ...opts, since: 0 });
+  assert.equal(extractions, 4, "broader explicit backfill invalidates the completed revision");
+});
+
 test("rewrite during inference withdraws old evidence and discards the stale completion", async () => {
   const f = await fixture();
   const result = await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {}, sessions: () => [session], since: 0, signal: signal(),
@@ -195,7 +231,7 @@ test("scheduled run resumes an approved historical backfill rather than skipping
   const store = new ExtractionStore(f.storePath); assert.equal(store.checkpoint(session).since, 0); store.close();
 });
 
-test("QMD projection and authoritative reads reject withdrawn versions without a Markdown file", async () => {
+test("QMD projection and authoritative reads reject withdrawn versions without a Markdown file", async t => {
   const f = await fixture(), store = new ExtractionStore(f.storePath), owner = store.claim(false, 0)!;
   store.checkpoint(session);
   store.commit({ session, expected: null, cursor: "c1", context: messages, accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
@@ -204,14 +240,19 @@ test("QMD projection and authoritative reads reject withdrawn versions without a
     sources: [resolveSource(f.dir, "memory", "memory")], extraction: { ...config().extraction, publish: true }, storeFactory: async () => qmd });
   try {
     await syncExtractedIndex({ internal: qmd.internal, embed: async () => ({ docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }) }, store.records());
+    const hash = createHash("sha256").update(proposal.text).digest("hex");
+    const model = qmd.internal.llm!.embedModelName;
+    qmd.internal.ensureVecTable(2);
+    qmd.internal.insertEmbedding(hash, 0, 0, new Float32Array([1, 0]), model, "now", 1, undefined, proposal.text.length);
+    t.mock.method(qmd.internal.llm!, "embed", async () => ({ embedding: [1, 0], model }));
     const path = `qmd://${EXTRACTED_COLLECTION}/${extractedPath(store.records()[0]!)}`;
     assert.equal((await manager.readFile({ relPath: path })).status, "ok");
-    const hits = await manager.search("red", { lexicalOnly: true, corpora: ["extracted"] });
+    const hits = await manager.search("red", { corpora: ["extracted"] });
     assert.equal(hits.length, 1); assert.equal(hits[0]!.snippet, proposal.text);
-    assert.deepEqual(await manager.search("red", { lexicalOnly: true, corpora: ["extracted"], sessionFilter: { chatType: "direct" } }), []);
+    assert.deepEqual(await manager.search("red", { corpora: ["extracted"], sessionFilter: { chatType: "direct" } }), []);
     store.reset(session.sessionId, null, owner);
     assert.equal((await manager.readFile({ relPath: path })).status, "not_found");
-    assert.deepEqual(await manager.search("red", { lexicalOnly: true, corpora: ["extracted"] }), []);
+    assert.deepEqual(await manager.search("red", { corpora: ["extracted"] }), []);
     await assert.rejects(syncExtractedIndex({ internal: qmd.internal,
       embed: async () => ({ docsProcessed: 1, chunksEmbedded: 0, errors: 1, durationMs: 0 }) }, []), /failed to embed/);
   } finally { store.close(); await manager.close(); }
@@ -230,9 +271,13 @@ test("extracted facts survive manager startup and ordinary file sync", async () 
   const manager = new QmdMemoryManager({ dbPath, curationPath: f.storePath, workspaceDir: f.dir,
     sources: [resolveSource(f.dir, "memory", "memory")], extraction: { ...config().extraction, publish: true } });
   try {
-    assert.equal((await manager.search("red", { lexicalOnly: true, corpora: ["extracted"] })).length, 1);
+    await manager.start();
+    const path = `qmd://${EXTRACTED_COLLECTION}/${extractedPath(store.records()[0]!)}`;
+    assert.equal((await manager.readFile({ relPath: path })).status, "ok");
     // No new files: sync must not treat DB-projected facts as missing Markdown.
     await manager.sync();
-    assert.equal((await manager.search("red", { lexicalOnly: true, corpora: ["extracted"] })).length, 1);
+    const indexed = await createStore({ dbPath });
+    try { assert.equal(indexed.internal.getActiveDocumentPaths(EXTRACTED_COLLECTION).length, 1); }
+    finally { await indexed.close(); }
   } finally { await manager.close(); store.close(); }
 });

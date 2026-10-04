@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
-import { judgeTypeSafeMemories } from "./typesafe.js";
+import { judgeMemoryPassage, memoryUsefulnessRequest } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
@@ -171,15 +171,11 @@ export function registerMemoryWhisperer(
             timeoutMs: typesafe.timeoutMs };
           try {
             const { hit, excerpt } = candidate;
-            const [probability] = await judgeTypeSafeMemories({
-              apiKey, timeoutMs: typesafe.timeoutMs, signal,
-              conversation, asOf,
-              candidates: [{
+            const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
                 excerpt, corpus: hit.corpus, sourcePath: hit.path,
                 dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
                   ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
-              }],
-            });
+              }, asOf), { apiKey, timeoutMs: typesafe.timeoutMs, signal });
             if (signal.aborted) return [];
             requestsSucceeded++;
             log("info", "candidate_completed", { ...fields, elapsedMs: performance.now() - requestStarted });

@@ -2,9 +2,11 @@ import { basename } from "node:path";
 import { selectTypeSafeSkill } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { buildSkillWhispererQuery, messageText } from "./whisperer-context.js";
+import { abortable } from "./abortable.js";
 const CANDIDATE_LIMIT = 10;
 const MAX_QUERY_CHARS = 12_000;
 const TYPESAFE_CANDIDATE_LIMIT = 3;
+const TOTAL_TIMEOUT_MS = 3000;
 function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -56,16 +58,23 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
         const state = stateFor(scope);
         if (state.lastRunId === runId)
             return state.result;
+        state.controller?.abort();
+        const controller = new AbortController();
+        state.controller = controller;
+        const { signal } = controller;
+        const timer = setTimeout(() => controller.abort(new DOMException("Skill deadline", "TimeoutError")), TOTAL_TIMEOUT_MS);
         state.lastRunId = runId;
         state.turn += 1;
         // Reuse even an in-flight result when the host rebuilds this run's prompt.
         const run = async () => {
             try {
                 const runtimeParams = active(agentId);
-                const apiKey = await resolveTypeSafeApiKey(typesafe);
+                const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
+                signal.throwIfAborted();
                 if (!apiKey)
                     diagnostics?.record(agentId, "skill", typesafe.enabled ? "missing_key" : "typesafe_disabled");
-                const candidates = await runtime.searchSkills(runtimeParams, buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), apiKey ? -1 : config.minScore, CANDIDATE_LIMIT);
+                const candidates = await abortable(runtime.searchSkills(runtimeParams, buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), apiKey ? -1 : config.minScore, CANDIDATE_LIMIT), signal);
+                signal.throwIfAborted();
                 const resolvedCandidates = candidates.flatMap((candidate) => {
                     const canonicalPath = runtime.resolveSkillPath(runtimeParams, candidate.path);
                     return canonicalPath ? [{ candidate, canonicalPath }] : [];
@@ -75,19 +84,29 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
                     diagnostics?.record(agentId, "skill", "no_candidates");
                     return;
                 }
+                const cooling = (path) => {
+                    const previous = state.skills.get(path);
+                    return state.turn - Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity) <= config.cooldownTurns;
+                };
                 if (apiKey) {
                     const shortlist = resolvedCandidates.slice(0, TYPESAFE_CANDIDATE_LIMIT);
-                    const selectedIndex = await selectTypeSafeSkill({
-                        apiKey, timeoutMs: typesafe.timeoutMs,
+                    if (shortlist.every(({ canonicalPath }) => cooling(canonicalPath))) {
+                        diagnostics?.record(agentId, "skill", "cooldown");
+                        return;
+                    }
+                    const selectedIndex = await abortable(selectTypeSafeSkill({
+                        apiKey, timeoutMs: typesafe.timeoutMs, signal,
                         ...typeSafeConversation(event.prompt, event.messages, config.historyMessages),
                         candidates: shortlist.map(({ candidate }) => candidate),
                         onCandidateFailure: (candidateIndex, error) => {
+                            if (signal.aborted)
+                                return;
                             diagnostics?.record(agentId, "skill", "judge_candidate_failed");
                             api.logger.warn("unblock-memory skill_whisperer " + JSON.stringify({ event: "candidate_failed",
                                 agentId, runId, candidateIndex, errorCode: error instanceof TypeSafeRequestError ? error.code : "unexpected",
                                 httpStatus: error instanceof TypeSafeRequestError ? error.status : undefined }));
                         },
-                    });
+                    }), signal);
                     if (selectedIndex === undefined) {
                         diagnostics?.record(agentId, "skill", "rejected");
                         return;
@@ -108,9 +127,7 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
                 const { candidate: selected, canonicalPath } = resolved;
                 if (apiKey && runtime.resolveSkillPath(runtimeParams, selected.path) !== canonicalPath)
                     return;
-                const previous = state.skills.get(canonicalPath);
-                const lastSeen = Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity);
-                if (state.turn - lastSeen <= config.cooldownTurns) {
+                if (cooling(canonicalPath)) {
                     diagnostics?.record(agentId, "skill", "cooldown");
                     return;
                 }
@@ -123,9 +140,15 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
                 };
             }
             catch (error) {
-                diagnostics?.record(agentId, "skill", error instanceof TypeSafeRequestError && error.code === "timeout" ? "timed_out" : "failed");
-                api.logger.warn("unblock-memory skill whisperer failed; no hint emitted");
+                const timedOut = (error instanceof TypeSafeRequestError && error.code === "timeout") ||
+                    (signal.aborted && signal.reason instanceof Error && signal.reason.name === "TimeoutError");
+                diagnostics?.record(agentId, "skill", timedOut ? "timed_out" : signal.aborted ? "cancelled" : "failed");
+                if (!signal.aborted)
+                    api.logger.warn("unblock-memory skill whisperer failed; no hint emitted");
                 return;
+            }
+            finally {
+                clearTimeout(timer);
             }
         };
         state.result = run();
@@ -153,11 +176,17 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
         }
     }, { matcher: ["read"] });
     api.on("session_end", (event, context) => {
-        sessions.delete(event.sessionId);
-        if (event.sessionKey)
-            sessions.delete(event.sessionKey);
-        if (context.sessionKey)
-            sessions.delete(context.sessionKey);
+        for (const scope of [event.sessionId, event.sessionKey, context.sessionKey]) {
+            if (!scope)
+                continue;
+            sessions.get(scope)?.controller?.abort();
+            sessions.delete(scope);
+        }
+    });
+    api.on("gateway_stop", () => {
+        for (const state of sessions.values())
+            state.controller?.abort();
+        sessions.clear();
     });
     return beforePrompt;
 }

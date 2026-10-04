@@ -1,11 +1,10 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe } from "./typesafe-client.js";
+import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
 import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
 export const RESPONSE_RUBRIC_VERSION = `${TYPESAFE_REVIEW_MODEL}:response-v10`;
 export const RESPONSE_STAGE_VERSIONS = { quality: "quality-v9", feedback: "feedback-v9", sentiment: "sentiment-v10", retrospective: "retrospective-v9", memory: "memory-v2-isolated" };
 const probability = Type.Number({ minimum: 0, maximum: 1 });
-const noul = Type.Object({ type: Type.Literal("noul"), noul: probability });
 const score = Type.Object({ type: Type.Literal("score"), score: Type.Number({ minimum: 0, maximum: 3 }),
     confidence: probability, probabilities: Type.Object({ "0": probability, "1": probability, "2": probability, "3": probability }) });
 function choiceSchema(criteria) {

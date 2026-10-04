@@ -7,7 +7,6 @@ import type {
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig, type UnblockMemoryConfig } from "./config.js";
-import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { registerPeopleHooks } from "./people-hooks.js";
 import { PeopleStores } from "./people-store.js";
 import { registerPeopleTools } from "./people-tools.js";
@@ -18,7 +17,7 @@ import { registerMemoryWhisperer } from "./memory-whisperer.js";
 import { registerWhispererPrompt } from "./whisperer-prompt.js";
 import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
-import { registerReviewTools } from "./review-tools.js";
+import { registerReviewTools, reviewRequestContext } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
 import { registerInsideOut } from "./inside-out-runtime.js";
 import { registerMemoryTraining } from "./training-runtime.js";
@@ -332,18 +331,12 @@ function createAuditQualityTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
       const options = Value.Parse(auditQualityParameters, params);
       if (!config.qualityAudit.enabled || !config.typesafe.enabled) return jsonResult({ status: "disabled" });
-      const deadline = AbortSignal.timeout(30_000);
-      const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
       try {
-        combined.throwIfAborted();
-        const apiKey = await resolveTypeSafeApiKey(config.typesafe);
-        if (!apiKey) return jsonResult({ status: "unavailable", reason: "TypeSafe API key not configured" });
-        combined.throwIfAborted();
-        const { manager } = await runtime.getMemorySearchManager(active);
-        if (!manager) return jsonResult({ status: "unavailable", reason: "Memory manager unavailable" });
-        return jsonResult(await manager.auditQuality({
+        const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
+        if (context.status !== "ready") return jsonResult(context);
+        return jsonResult(await context.manager.auditQuality({
           ...options, corpora: config.qualityAudit.corpora, minNoise: config.qualityAudit.minNoise,
-          apiKey, timeoutMs: config.typesafe.timeoutMs, signal: combined,
+          apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal,
         }));
       } catch {
         return jsonResult({ status: "unavailable", reason: "Quality audit failed or was cancelled; retry the same page" });

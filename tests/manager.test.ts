@@ -58,7 +58,6 @@ function createManagerStore(
       return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true, collections: [] };
     },
     async listCollections() { return []; },
-    async searchLex() { return []; },
     async vsearch() { return []; },
     async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
     async getDocumentBody() { return null; },
@@ -131,7 +130,7 @@ for (const kind of ["claim", "cluster"] as const) {
       : manager.reviewCluster({ ...options, clusterId });
     await fetched.promise;
     // These must complete while the provider response is still deliberately held.
-    assert.deepEqual(await manager.search("staging", { lexicalOnly: true }), []);
+    assert.deepEqual(await manager.search("staging"), []);
     await manager.diagnostics();
     const mutation = manager.sync();
     await mutationStarted.promise;
@@ -273,13 +272,19 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
   const existing = join(memoryDir, "today.md");
   await mkdir(memoryDir);
   await writeFile(existing, "initial\n");
+  await mkdir(join(workspace, "knowledge"));
+  await writeFile(join(workspace, "knowledge", "untouched.md"), "untouched\n");
+  const memorySource = resolveSource(workspace, "memory/**/*.md");
+  const knowledgeSource = resolveSource(workspace, "knowledge/**/*.md");
+  const updatedCollections: string[][] = [];
 
   let activeSyncs = 0;
   let maxActiveSyncs = 0;
   let syncRuns = 0;
   const store = {
-    async update() {
-      activeSyncs += 1;
+    async update(options?: Parameters<ManagerStore["update"]>[0]) {
+      updatedCollections.push(options?.collections ?? []);
+      activeSyncs += options?.collections?.length ?? 1;
       syncRuns += 1;
       maxActiveSyncs = Math.max(maxActiveSyncs, activeSyncs);
       await delay(250);
@@ -294,7 +299,6 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
       return { totalDocuments: 1, needsEmbedding: 0, hasVectorIndex: true, collections: [] };
     },
     async listCollections() { return []; },
-    async searchLex() { return []; },
     async vsearch() { return []; },
     async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
     async getDocumentBody() { return null; },
@@ -304,18 +308,20 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
   const manager = new QmdMemoryManager({
     dbPath: join(workspace, "index.sqlite"),
     workspaceDir: workspace,
-    sources: [resolveSource(workspace, "memory/**/*.md")],
+    sources: [memorySource, knowledgeSource],
     storeFactory: async () => store,
   });
 
   await manager.start();
   syncRuns = 0;
   maxActiveSyncs = 0;
+  updatedCollections.length = 0;
 
   await writeFile(existing, "modified\n");
   await waitFor(() => syncRuns === 1, "modified-file refresh");
   await writeFile(join(memoryDir, "new.md"), "new\n");
-  await waitFor(() => syncRuns === 2 && activeSyncs === 0, "new-file refresh");
+  await waitFor(() => updatedCollections.length >= 2 && activeSyncs === 0, "new-file refresh");
+  assert.deepEqual(updatedCollections, [[memorySource.collection], [memorySource.collection]]);
   assert.equal(maxActiveSyncs, 1);
 
   await manager.close();
@@ -423,53 +429,6 @@ test("purges replaced plaintext after an indexed Markdown file is edited", async
   await assertMarkerAbsent(dbPath, marker);
 });
 
-test("lexical-only search returns useful document content and its virtual path", async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-lexical-"));
-  const source = resolveSource(workspace, "MEMORY.md");
-  const store = {
-    async update() { return { collections: 1, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 }; },
-    async embed() { return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }; },
-    async getStatus() { return { totalDocuments: 1, needsEmbedding: 0, hasVectorIndex: true, collections: [] }; },
-    async listCollections() { return []; },
-    async searchLex() {
-      return [{
-        filepath: `qmd://${source.collection}/MEMORY.md`,
-        displayPath: `${source.collection}/MEMORY.md`,
-        title: "Memory",
-        context: null,
-        hash: "hash",
-        docid: "hash",
-        collectionName: source.collection,
-        modifiedAt: "",
-        bodyLength: 27,
-        body: "Rico leads client operations.",
-        score: 0.8,
-        source: "fts" as const,
-      }];
-    },
-    async vsearch() { return []; },
-    async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; },
-    async close() {},
-  } satisfies ManagerStore;
-  const manager = new QmdMemoryManager({
-    dbPath: join(workspace, "index.sqlite"),
-    workspaceDir: workspace,
-    sources: [source],
-    storeFactory: async () => store,
-  });
-  try {
-    await manager.start();
-    const [hit] = await manager.search("Rico", { lexicalOnly: true });
-    assert.equal(hit?.path, `qmd://${source.collection}/MEMORY.md`);
-    assert.equal(hit?.corpus, "memory");
-    assert.equal(hit?.snippet, "Rico leads client operations.");
-    assert.equal(hit?.textScore, 0.8);
-  } finally {
-    await manager.close();
-  }
-});
-
 test("scopes vector search to named corpora and labels results", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-corpora-"));
   await mkdir(join(workspace, "projects"));
@@ -562,10 +521,11 @@ test("v2 Whisperer routes each query only to its lane across the approved corpus
     store.internal.insertContent(`lex${index}`, `Exactneedle lexical evidence ${index}`, "2026-01-01");
     store.internal.insertDocument(source.collection, "lex.md", "Evidence", `lex${index}`, "2026-01-01", "2026-01-01");
   }
-  const vector = t.mock.method(store, "searchVector", async (query: string, options: { limit: number; collection: string[] }) => {
+  store.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+  const vector = t.mock.method(store.internal, "searchVec", async (query: string, _model: string, limit: number, collection: string[]) => {
     assert.equal(query, "semantic intent only");
-    assert.equal(options.limit, 10);
-    assert.deepEqual(options.collection, [memory.collection, projects.collection]);
+    assert.equal(limit, 10);
+    assert.deepEqual(collection, [memory.collection, projects.collection]);
     return [{ filepath: `qmd://${memory.collection}/vec.md`, body: "semantic evidence", chunkPos: 0, chunkLen: 17, score: 0.9 }];
   });
   const manager = new QmdMemoryManager({ dbPath: join(workspace, "unused.sqlite"), workspaceDir: workspace,
@@ -1315,10 +1275,10 @@ test("analysis failure does not disable ordinary memory search", async () => {
   const source = resolveSource(root, "MEMORY.md");
   const store = createManagerStore({
     internal: backing.internal,
-    async searchLex() { return [{
-      filepath: `qmd://${source.collection}/MEMORY.md`, displayPath: `${source.collection}/MEMORY.md`,
-      title: "Memory", context: null, hash: "hash", docid: "hash", collectionName: source.collection,
-      modifiedAt: "", bodyLength: 11, body: "still works", score: 0.8, source: "fts" as const,
+    async vsearch() { return [{
+      file: `qmd://${source.collection}/MEMORY.md`, displayPath: `${source.collection}/MEMORY.md`,
+      title: "Memory", context: null, docid: "hash", body: "still works", score: 0.8,
+      bestChunk: "still works", chunkPos: 0, chunkLen: 11,
     }]; },
     async close() { await backing.close(); },
   });
@@ -1332,7 +1292,7 @@ test("analysis failure does not disable ordinary memory search", async () => {
   });
   try {
     await assert.rejects(manager.recluster(), /worker missing/);
-    assert.equal((await manager.search("memory", { lexicalOnly: true }))[0]?.snippet, "still works");
+    assert.equal((await manager.search("memory"))[0]?.snippet, "still works");
   } finally {
     await manager.close();
   }
@@ -1555,6 +1515,33 @@ test("keeps analysis fresh for a no-op sync and marks it stale before embedding 
   } finally {
     await manager.close();
   }
+});
+
+test("partial collection updates invalidate analysis and purge replaced plaintext before failing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-partial-update-"));
+  const sources = [resolveSource(root, "first.md", "memory"), resolveSource(root, "second.md", "knowledge")];
+  const marker = "partialupdateoldplaintextmarkerz";
+  await writeFile(join(root, "first.md"), marker);
+  await writeFile(join(root, "second.md"), "unchanged second collection");
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: Object.fromEntries(
+    sources.map(source => [source.collection, { path: source.root, pattern: source.pattern }]),
+  ) } });
+  await backing.update();
+  backing.internal.db.prepare("INSERT OR REPLACE INTO store_config(key,value) VALUES('embedding_chunk_strategy','semantic')").run();
+  const manager = new QmdMemoryManager({ dbPath: backing.dbPath, workspaceDir: root, sources });
+  try {
+    await manager.diagnostics();
+    backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+      (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+      VALUES ('run', 'now', 'done', 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run();
+    await writeFile(join(root, "first.md"), "replacement with a different length");
+    await writeFile(join(root, "second.md"), "second replacement");
+    backing.internal.db.exec(`CREATE TRIGGER fail_second_collection BEFORE UPDATE ON documents
+      WHEN OLD.path='second.md' BEGIN SELECT RAISE(ABORT,'second collection failed'); END`);
+    await assert.rejects(manager.sync(), /second collection failed/);
+    assert.equal((await manager.listClusters()).stale, true);
+    await assertMarkerAbsent(backing.dbPath, marker);
+  } finally { await manager.close(); await backing.close(); }
 });
 
 test("marks retained analysis stale for add, edit, delete, embedding, and forced sync", async () => {

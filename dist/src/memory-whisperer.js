@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { judgeTypeSafeMemories } from "./typesafe.js";
+import { judgeMemoryPassage, memoryUsefulnessRequest } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
 import { ApiQueryGenerator, QueryApiError, queryConversation } from "./query-generator.js";
@@ -164,15 +164,11 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                         timeoutMs: typesafe.timeoutMs };
                     try {
                         const { hit, excerpt } = candidate;
-                        const [probability] = await judgeTypeSafeMemories({
-                            apiKey, timeoutMs: typesafe.timeoutMs, signal,
-                            conversation, asOf,
-                            candidates: [{
-                                    excerpt, corpus: hit.corpus, sourcePath: hit.path,
-                                    dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
-                                            ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
-                                }],
-                        });
+                        const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
+                            excerpt, corpus: hit.corpus, sourcePath: hit.path,
+                            dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
+                                    ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
+                        }, asOf), { apiKey, timeoutMs: typesafe.timeoutMs, signal });
                         if (signal.aborted)
                             return [];
                         requestsSucceeded++;

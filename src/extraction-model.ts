@@ -2,7 +2,7 @@ import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { Tiktoken } from "js-tiktoken/lite";
 import o200kBase from "js-tiktoken/ranks/o200k_base";
-import { requestTypeSafe } from "./typesafe-client.js";
+import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
 import type { ExtractionConfig } from "./extraction-config.js";
 
 export const EXTRACTION_VERSION = "lasting-facts-v11";
@@ -44,6 +44,7 @@ If a fact is already in existing memories, omit it. Source dates control chronol
 Cite exact contiguous substrings copied from the supplied messages using their ids. Preserve Markdown markers, mentions, whitespace and punctuation inside each quote. Never join separated spans into one quote or clean up its formatting. Prefer short exact spans; use separate evidence entries when needed. Include enough evidence to resolve corrections and speaker attribution. Output an empty memories array when nothing qualifies. Do not fill a quota.`;
 
 let tokenizer: Tiktoken | undefined;
+let promptTokens: number | undefined;
 // o200k_base is an explicit budgeting proxy, not a claim about the host's private tokenizer.
 function extractionTokens(text: string): number {
   return (tokenizer ??= new Tiktoken(o200kBase)).encode(text, [], []).length;
@@ -55,7 +56,7 @@ function extractionInput(messages: ExtractionMessage[], newIds: string[], existi
   return JSON.stringify({ messages: messages.map(datedMessage), newMessageIds: newIds, existing, schema: proposalSchema });
 }
 export function extractionOverhead(existing: PriorMemory[]): number {
-  return extractionTokens(EXTRACTION_PROMPT) + extractionTokens(extractionInput([], [], existing)) + 512;
+  return (promptTokens ??= extractionTokens(EXTRACTION_PROMPT)) + extractionTokens(extractionInput([], [], existing)) + 512;
 }
 export function extractionMessageTokens(message: ExtractionMessage): number {
   return extractionTokens(JSON.stringify(datedMessage(message))) + extractionTokens(JSON.stringify(message.id)) + 8;
@@ -87,8 +88,8 @@ export async function extractWithLuna(runtime: unknown, agentId: string, message
 const judgments = Type.Object({ answers: Type.Object({
   supported: Type.Object({ type: Type.Literal("choice"), choice: Type.Union([Type.Literal("supported"), Type.Literal("contradicted"), Type.Literal("unsupported")]),
     probabilities: Type.Object({ supported: Type.Number({ minimum: 0, maximum: 1 }), contradicted: Type.Number({ minimum: 0, maximum: 1 }), unsupported: Type.Number({ minimum: 0, maximum: 1 }) }) }),
-  useful: Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) }),
-  replacement: Type.Optional(Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) })),
+  useful: noul,
+  replacement: Type.Optional(noul),
 }) });
 
 export async function validateExtractedMemory(params: { proposal: MemoryProposal; messages: ExtractionMessage[];

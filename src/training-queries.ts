@@ -6,7 +6,7 @@ import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_MODEL,
   TRAINING_TEACHER_VERSION, type QueryFeedback, type TrainingRound } from "./training-models.js";
-import { historicalTrainingSearch, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
+import { historicalTrainingSearch, historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import type { QueryEvaluation, TrainingStore, TrainingStepResults, TrainingSourceExample } from "./training-store.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
 
@@ -142,6 +142,7 @@ export async function evaluateTrainingQueries(source: Source, store: TrainingSto
   const refreshed = collectTraining(source, store, { existingOnly: true });
   const result = { ...summary(), retrievals: 0, evaluated: 0, awaitingTeacher: 0 };
   const concurrency = options.concurrency ?? TRAINING_EVALUATION_CONCURRENCY;
+  let historicalSource: ReturnType<typeof historicalTrainingSource> | undefined;
   let key: Promise<string> | undefined, teacher: ReturnType<typeof trainingTeacher> | undefined;
   const apiKey = () => key ??= resolveTypeSafeApiKey(config.typesafe).then(value => {
     if (!value) throw new Error("TypeSafe is disabled or its credential is unavailable");
@@ -180,7 +181,11 @@ export async function evaluateTrainingQueries(source: Source, store: TrainingSto
     if (options.maxExamples !== undefined && result.examples >= options.maxExamples) return;
     store.renew();
     let snapshot: Awaited<ReturnType<typeof createSearch>>;
-    try { snapshot = await createSearch(source.stateDir, corpus.chatTypes, example.timestamp); }
+    try {
+      snapshot = createSearch === historicalTrainingSearch
+        ? await (await (historicalSource ??= historicalTrainingSource(source.stateDir, corpus.chatTypes)))(example.timestamp)
+        : await createSearch(source.stateDir, corpus.chatTypes, example.timestamp);
+    }
     catch (error) {
       if (!(error instanceof HistoricalCorpusUnavailableError)) throw error;
       store.flagReview(example, "historical-snapshot-unavailable", { timestamp: example.timestamp }); result.flagged++; return;

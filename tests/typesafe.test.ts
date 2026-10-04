@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { judgeTypeSafeMemories, judgeTypeSafeQuality, selectTypeSafeSkill, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/typesafe.js";
+import { judgeMemoryPassage, judgeTypeSafeQuality, selectTypeSafeSkill, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/typesafe.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "../src/training-judge.js";
 import { requestTypeSafe, resolveTypeSafeApiKey } from "../src/typesafe-client.js";
 
@@ -117,6 +117,8 @@ const memoryJudgment = {
   conversation: { currentRequest: "Deploy alpha", history: [] }, asOf: "2026-09-28T00:00:00Z",
   candidates: [{ excerpt: "Alpha requires approval", corpus: "knowledge", sourcePath: "qmd://knowledge/alpha.md", dates: [] }],
 };
+const judgeMemory = (params = memoryJudgment) =>
+  judgeMemoryPassage(memoryUsefulnessRequest(params.conversation, params.candidates[0]!, params.asOf), params);
 
 test("memory judgments use Noul probabilities and reject missing, extra, mistyped and out-of-range answers", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof globalThis.fetch>) => {
@@ -129,21 +131,20 @@ test("memory judgments use Noul probabilities and reject missing, extra, mistype
     assert.equal(request.state.candidates[0].excerpt, "Alpha requires approval");
     return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.97 } } });
   });
-  assert.deepEqual(await judgeTypeSafeMemories(memoryJudgment), [0.97]);
-  assert.deepEqual(await judgeTypeSafeMemories({ ...memoryJudgment, candidates: [] }), []);
+  assert.equal((await judgeMemory()).probability, 0.97);
   assert.equal(fetch.mock.callCount(), 1);
   for (const answers of [{}, { unknown: { type: "noul", noul: 0.99 } },
     { memory_0: { type: "score", noul: 0.99 } }, { memory_0: { type: "noul", noul: "0.99" } },
     { memory_0: { type: "noul", noul: 1.1 } }, { memory_0: { type: "noul", noul: -0.1 } },
     { memory_0: { type: "noul", noul: 0.9 }, memory_1: { type: "noul", noul: 0.99 } }]) {
     fetch.mock.mockImplementation(async () => Response.json({ answers }));
-    await assert.rejects(judgeTypeSafeMemories(memoryJudgment), /invalid memory judgments/);
+    await assert.rejects(judgeMemory(), /invalid memory judgments/);
   }
 });
 
 test("memory requests sanitize failures, do not retry, and honor the provider deadline", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => new Response("test-secret", { status: 529 }));
-  await assert.rejects(judgeTypeSafeMemories(memoryJudgment), { message: "TypeSafe HTTP 529", code: "http_error", status: 529 });
+  await assert.rejects(judgeMemory(), { message: "TypeSafe HTTP 529", code: "http_error", status: 529 });
   assert.equal(fetch.mock.callCount(), 1);
   fetch.mock.mockImplementation(async (...[_url, init]: Parameters<typeof globalThis.fetch>) => new Promise<Response>((_resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("did not abort")), 1000);
@@ -152,14 +153,14 @@ test("memory requests sanitize failures, do not retry, and honor the provider de
       reject(new Error("private transport detail"));
     }, { once: true });
   }));
-  await assert.rejects(judgeTypeSafeMemories({ ...memoryJudgment, timeoutMs: 20 }), { message: "TypeSafe request timed out", code: "timeout" });
+  await assert.rejects(judgeMemory({ ...memoryJudgment, timeoutMs: 20 }), { message: "TypeSafe request timed out", code: "timeout" });
 });
 
 test("shared transport preserves caller errors for HTTP, cancellation and invalid JSON failures", async t => {
   const params = { apiKey: "test-secret", timeoutMs: 100, signal: new AbortController().signal };
   const callers = [
     { request: () => selectTypeSafeSkill(selection), error: "TypeSafe HTTP 529", status: true },
-    { request: () => judgeTypeSafeMemories(memoryJudgment), error: "TypeSafe HTTP 529", status: true },
+    { request: () => judgeMemory(), error: "TypeSafe HTTP 529", status: true },
     { request: () => judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
       error: "TypeSafe HTTP 529", status: true },
     { request: () => requestTypeSafe(params, {}, {}), error: "TypeSafe HTTP 529", status: true },
@@ -191,7 +192,7 @@ test("caller cancellation preserves quality, memory and review abort errors", as
   });
   await assert.rejects(judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
     { message: "TypeSafe request cancelled", code: "cancelled" });
-  await assert.rejects(judgeTypeSafeMemories({ ...memoryJudgment, signal: params.signal }),
+  await assert.rejects(judgeMemory({ ...memoryJudgment, signal: params.signal }),
     { message: "TypeSafe request cancelled", code: "cancelled" });
   assert.equal(fetch.mock.callCount(), 0, "already-aborted requests never reach fetch");
   await assert.rejects(requestTypeSafe(params, {}, {}), { message: "TypeSafe request cancelled", code: "cancelled" });
@@ -218,25 +219,18 @@ test("client distinguishes timeout, first caller cancellation, and body-read fai
     { code: "network_error", message: "TypeSafe request failed" });
 });
 
-test("multi-item helpers isolate requests and keep scores aligned despite reversed completion", { timeout: 2000 }, async t => {
-  const pending: { body: { state: { chunks?: { text: string }[]; candidates?: { excerpt: string }[] } };
+test("quality helper isolates requests and keeps scores aligned despite reversed completion", { timeout: 2000 }, async t => {
+  const pending: { body: { state: { chunks: { text: string }[] } };
     resolve: (response: Response) => void }[] = [];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => new Promise<Response>(resolve => {
     pending.push({ body: JSON.parse(String(init?.body)), resolve });
   }));
-  const memories = judgeTypeSafeMemories({ ...memoryJudgment,
-    candidates: [{ excerpt: "first", corpus: "memory", sourcePath: "qmd://memory/first.md", dates: [] }, { excerpt: "second", corpus: "memory", sourcePath: "qmd://memory/second.md", dates: [] }] });
-  assert.equal(pending.length, 2, "both requests start before either completes");
-  assert.deepEqual(pending.map(p => p.body.state.candidates?.map(c => c.excerpt)), [["first"], ["second"]]);
-  pending[1].resolve(Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.9 } } }));
-  pending[0].resolve(Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.1 } } }));
-  assert.deepEqual(await memories, [0.1, 0.9]);
   const quality = judgeTypeSafeQuality({ apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal,
     chunks: [{ text: "first", sourceKind: "files" }, { text: "second", sourceKind: "sessions" }] });
-  assert.equal(pending.length, 4);
-  assert.deepEqual(pending.slice(2).map(p => p.body.state.chunks?.map(c => c.text)), [["first"], ["second"]]);
-  pending[3].resolve(Response.json({ model: "jev-1.13.0", answers: { noise_0: { type: "noul", noul: 0.8 }, evidence_0: { type: "noul", noul: 0.7 } } }));
-  pending[2].resolve(Response.json({ model: "jev-1.13.0", answers: { noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.9 } } }));
+  assert.equal(pending.length, 2, "both requests start before either completes");
+  assert.deepEqual(pending.map(p => p.body.state.chunks.map(c => c.text)), [["first"], ["second"]]);
+  pending[1].resolve(Response.json({ model: "jev-1.13.0", answers: { noise_0: { type: "noul", noul: 0.8 }, evidence_0: { type: "noul", noul: 0.7 } } }));
+  pending[0].resolve(Response.json({ model: "jev-1.13.0", answers: { noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.9 } } }));
   assert.deepEqual(await quality, [{ noise: 0.1, evidence: 0.9 }, { noise: 0.8, evidence: 0.7 }]);
 });
 
@@ -276,7 +270,7 @@ test("offline and runtime use exactly the same blind request and retain raw prob
     requests.push(JSON.parse(String(init?.body)));
     return Response.json({ model: "jev-1.13.0", usage, answers: { memory_0: { type: "noul", noul: 0.831 } } });
   });
-  assert.deepEqual(await judgeTypeSafeMemories(memoryJudgment), [0.831]);
+  assert.equal((await judgeMemory()).probability, 0.831);
   assert.deepEqual(await judgeTrainingPassage(offline, "key"), {
     probability: 0.831, answer: { type: "noul", noul: 0.831 }, model: "jev-1.13.0", usage,
   });

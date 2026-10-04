@@ -154,8 +154,8 @@ export function projectMessage(row: SessionProjectionInput["events"][number], in
   };
 }
 
-function formatTimestamp(value: number, timezone: string): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
+function timestampFormatter(timezone: string): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
     year: "numeric",
     month: "2-digit",
@@ -165,7 +165,11 @@ function formatTimestamp(value: number, timezone: string): string {
     second: "2-digit",
     hourCycle: "h23",
     timeZoneName: "short",
-  }).formatToParts(value);
+  });
+}
+
+function formatTimestamp(value: number, formatter: Intl.DateTimeFormat): string {
+  const parts = formatter.formatToParts(value);
   const part = (type: Intl.DateTimeFormatPartTypes) =>
     parts.find((entry) => entry.type === type)?.value ?? "";
   return `${part("year")}-${part("month")}-${part("day")} ` +
@@ -211,10 +215,11 @@ export function projectSessionDocument(input: SessionProjectionInput): {
   }
   let content = "# Transcript\n\n";
   const spans: SessionMessageSpan[] = [];
+  const formatter = timestampFormatter(input.timezone);
   for (const message of messages.filter(message => !hidden.has(message))) {
     if (spans.length) content += "\n\n";
     const start = content.length;
-    const timestamp = formatTimestamp(message.timestamp, input.timezone);
+    const timestamp = formatTimestamp(message.timestamp, formatter);
     content += `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ${timestamp}\n\n`;
     const bodyStart = content.length;
     content += message.text;

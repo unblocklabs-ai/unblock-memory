@@ -3,11 +3,13 @@ import type { SessionMetadata } from "./session-projector.js";
 export type ExtractionSession = SessionMetadata & {
     sessionKey: string;
     changedAt?: number;
+    sourceRevision?: string;
 };
 type Checkpoint = {
     cursor: string | null;
     context: ExtractionMessage[];
     since: number;
+    completeRevision: string | null;
 };
 export type ExtractedRecord = {
     id: string;
@@ -42,6 +44,7 @@ export declare class ExtractionStore {
         }[];
         owner: string;
         version: string;
+        completeRevision?: string;
     }): number;
     error(sessionId: string, code: string): void;
     report(): {

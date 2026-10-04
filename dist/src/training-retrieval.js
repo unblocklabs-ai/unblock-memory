@@ -47,9 +47,8 @@ export function historicalPrefix(body, spans, cutoff) {
         return;
     return { body: body.slice(0, parsed[safe.length]?.span.start ?? body.length), spans: safe.map(s => s.span) };
 }
-/** Fingerprint a read-only source snapshot; build its search index only on demand.
- * No filesystem projection, live-index mutation, model re-embedding or dependency patch. */
-export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, openStore) {
+/** Capture source bytes once per run; each cutoff still owns its index and native model context. */
+export async function historicalTrainingSource(stateDir, chatTypes) {
     const indexPath = join(stateDir, "index.sqlite");
     try {
         statSync(indexPath);
@@ -62,22 +61,13 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
     }
     const manifest = await readSessionManifest(join(stateDir, "sessions-manifest.json"));
     const source = resolveSessionSource(join(stateDir, "sessions"), chatTypes);
-    const createStore = openStore ?? (await import("@unblocklabs/qmd")).createStore;
-    const maxDate = new Date(cutoff).toISOString();
-    const report = { sessions: 0, chunks: 0, excluded: 0, truncated: 0, excludedChunks: 0 };
-    const metadata = new Map();
-    const fingerprint = createHash("sha256").update(JSON.stringify([TRAINING_RETRIEVAL_VERSION, chatTypes.toSorted(), maxDate]));
     // Use QMD's exact binding, never mix node:sqlite with sqlite-vec.
     const requireQmd = createRequire(import.meta.resolve("@unblocklabs/qmd"));
     const Database = requireQmd("better-sqlite3");
     const sourceDb = new Database(indexPath, { readonly: true, fileMustExist: true });
-    const documents = [];
-    let sourceClosed = false, closed = false;
-    const closeSource = () => { if (!sourceClosed) {
-        sourceDb.close();
-        sourceClosed = true;
-    } documents.length = 0; };
-    let indexed;
+    const sessions = [];
+    let excluded = 0;
+    let settings;
     try {
         const extension = requireQmd("sqlite-vec");
         if (!extension || typeof extension !== "object" || !("getLoadablePath" in extension) || typeof extension.getLoadablePath !== "function") {
@@ -88,16 +78,13 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
             throw new Error("QMD sqlite-vec path unavailable");
         sourceDb.loadExtension(extensionPath);
         sourceDb.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=5000; BEGIN");
-        const settings = sourceDb.prepare("SELECT key,value FROM store_config WHERE key='embedding_chunk_strategy'").all();
-        fingerprint.update(JSON.stringify(settings));
+        settings = sourceDb.prepare("SELECT key,value FROM store_config WHERE key='embedding_chunk_strategy'").all();
         const document = sourceDb.prepare(`SELECT d.hash,c.doc FROM documents d JOIN content c ON c.hash=d.hash
         WHERE d.active=1 AND d.collection=? AND d.path=?`);
         const chunks = sourceDb.prepare(`SELECT cv.seq,cv.pos,cv.chunk_len,cv.model,cv.embed_fingerprint,v.embedding
         FROM content_vectors cv JOIN vectors_vec v ON v.hash_seq=cv.hash||'_'||cv.seq
         WHERE cv.hash=? ORDER BY cv.seq`);
-        let dimensions;
-        // Both passes use this same read transaction. Cached evaluations still
-        // verify every prefix/vector byte, but never build an index or load a model.
+        const vectors = new Map();
         let yieldAt = performance.now() + 25;
         for (const session of Object.values(manifest.sessions).sort((a, b) => a.documentPath.localeCompare(b.documentPath))) {
             if (performance.now() >= yieldAt) {
@@ -106,28 +93,67 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
             }
             // Loggie projections can retroactively annotate old text using later revisions.
             // Workspace files and meetings lack immutable historical content proof here.
-            if (!chatTypes.includes(session.chatType) || session.provider === "loggie" || session.startedAt >= cutoff) {
-                report.excluded++;
+            if (!chatTypes.includes(session.chatType) || session.provider === "loggie") {
+                excluded++;
                 continue;
             }
             const row = document.get(source.collection, session.documentPath);
             if (!row || createHash("sha256").update(row.doc).digest("hex") !== session.projectionHash) {
+                excluded++;
+                continue;
+            }
+            let captured = vectors.get(row.hash);
+            if (!captured) {
+                captured = [];
+                for (const chunk of chunks.iterate(row.hash)) {
+                    if (performance.now() >= yieldAt) {
+                        await yieldToEventLoop();
+                        yieldAt = performance.now() + 25;
+                    }
+                    captured.push({ ...chunk, embedding: Buffer.from(chunk.embedding) });
+                }
+                vectors.set(row.hash, captured);
+            }
+            sessions.push({ session, body: row.doc, chunks: captured });
+        }
+    }
+    finally {
+        sourceDb.close();
+    }
+    return async (cutoff, openStore) => {
+        const createStore = openStore ?? (await import("@unblocklabs/qmd")).createStore;
+        const maxDate = new Date(cutoff).toISOString();
+        const report = { sessions: 0, chunks: 0, excluded, truncated: 0, excludedChunks: 0 };
+        const metadata = new Map();
+        const fingerprint = createHash("sha256").update(JSON.stringify([TRAINING_RETRIEVAL_VERSION, chatTypes.toSorted(), maxDate]));
+        fingerprint.update(JSON.stringify(settings));
+        const documents = [];
+        let dimensions, closed = false;
+        let indexed;
+        let yieldAt = performance.now() + 25;
+        for (const { session, body, chunks } of sessions) {
+            if (performance.now() >= yieldAt) {
+                await yieldToEventLoop();
+                yieldAt = performance.now() + 25;
+            }
+            if (session.startedAt >= cutoff) {
                 report.excluded++;
                 continue;
             }
-            const prefix = historicalPrefix(row.doc, session.messages, cutoff);
+            const prefix = historicalPrefix(body, session.messages, cutoff);
             if (!prefix) {
                 report.excluded++;
                 continue;
             }
             const hash = createHash("sha256").update(prefix.body).digest("hex");
-            documents.push({ path: session.documentPath, sourceHash: row.hash, hash, body: prefix.body });
+            const safeChunks = [];
+            documents.push({ path: session.documentPath, hash, body: prefix.body, chunks: safeChunks });
             metadata.set(`qmd://${source.collection}/${session.documentPath}`, prefix.spans);
             fingerprint.update(JSON.stringify([session.documentPath, hash]));
             report.sessions++;
             if (prefix.spans.length < (session.messages?.length ?? 0))
                 report.truncated++;
-            for (const chunk of chunks.iterate(row.hash)) {
+            for (const chunk of chunks) {
                 if (performance.now() >= yieldAt) {
                     await yieldToEventLoop();
                     yieldAt = performance.now() + 25;
@@ -136,13 +162,14 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
                     report.excludedChunks++;
                     continue;
                 }
-                const bytes = Buffer.from(chunk.embedding);
+                const bytes = chunk.embedding;
                 if (bytes.length % 4 || !bytes.length)
                     throw new Error("Invalid historical embedding");
                 const size = bytes.length / 4;
                 dimensions ??= size;
                 if (dimensions !== size)
                     throw new Error("Mixed historical embedding dimensions");
+                safeChunks.push(chunk);
                 fingerprint.update(JSON.stringify([chunk.seq, chunk.pos, chunk.chunk_len, chunk.model, chunk.embed_fingerprint])).update(bytes);
                 report.chunks++;
             }
@@ -175,14 +202,13 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
                     }
                     qmd.internal.insertContent(document.hash, document.body, maxDate);
                     qmd.internal.insertDocument(source.collection, document.path, "Transcript", document.hash, maxDate, maxDate);
-                    for (const chunk of chunks.iterate(document.sourceHash)) {
+                    for (const chunk of document.chunks) {
                         if (performance.now() >= yieldAt) {
                             await yieldToEventLoop();
                             yieldAt = performance.now() + 25;
                         }
-                        if (!historicalChunk(chunk, document.body.length))
-                            continue;
-                        const bytes = Buffer.from(chunk.embedding), vector = new Float32Array(bytes.length / 4);
+                        const bytes = Buffer.from(chunk.embedding.buffer, chunk.embedding.byteOffset, chunk.embedding.byteLength);
+                        const vector = new Float32Array(bytes.length / 4);
                         for (let i = 0; i < vector.length; i++)
                             vector[i] = bytes.readFloatLE(i * 4);
                         qmd.internal.insertEmbedding(document.hash, chunk.seq, chunk.pos, vector, chunk.model, maxDate, 1, chunk.embed_fingerprint, chunk.chunk_len);
@@ -194,9 +220,6 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
             catch (error) {
                 await qmd?.close();
                 throw error;
-            }
-            finally {
-                closeSource();
             }
         };
         return { corpusHash, report, maxDate,
@@ -224,14 +247,15 @@ export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, open
                         await indexed.then(qmd => qmd.close(), () => { });
                 }
                 finally {
-                    closeSource();
+                    documents.length = 0;
                 }
             } };
-    }
-    catch (error) {
-        closeSource();
-        throw error;
-    }
+    };
+}
+/** Standalone calls get a fresh source capture; evaluation runs reuse their own capture. */
+export async function historicalTrainingSearch(stateDir, chatTypes, cutoff, openStore) {
+    const source = await historicalTrainingSource(stateDir, chatTypes);
+    return source(cutoff, openStore);
 }
 function historicalChunk(chunk, length) {
     return Number.isSafeInteger(chunk.pos) && Number.isSafeInteger(chunk.chunk_len) && chunk.pos >= 0 && chunk.chunk_len > 0 &&

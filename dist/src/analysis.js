@@ -200,22 +200,21 @@ export function latestAnalysisCollections(db) {
         return undefined;
     }
 }
-function count(db, sql, runId) {
-    return db.prepare(sql).get(runId)?.count ?? 0;
-}
 function analysisSummary(db, run) {
-    const clusters = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_clusters WHERE run_id = ?", run.id);
-    const members = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_memberships WHERE run_id = ?", run.id);
-    const expectedNonNoise = count(db, "SELECT COALESCE(SUM(size), 0) AS count FROM memory_analysis_clusters WHERE run_id = ?", run.id);
-    const nonNoise = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_memberships WHERE run_id = ? AND cluster_id <> -1", run.id);
-    const noise = count(db, "SELECT COUNT(*) AS count FROM memory_analysis_memberships WHERE run_id = ? AND cluster_id = -1", run.id);
-    const unassigned = count(db, `
-    SELECT COUNT(*) AS count
+    const { clusters, expectedNonNoise } = db.prepare(`
+    SELECT COUNT(*) AS clusters, COALESCE(SUM(size), 0) AS expectedNonNoise
+    FROM memory_analysis_clusters WHERE run_id = ?
+  `).get(run.id);
+    const { members, nonNoise, noise, unassigned } = db.prepare(`
+    SELECT COUNT(*) AS members,
+      COALESCE(SUM(m.cluster_id <> -1), 0) AS nonNoise,
+      COALESCE(SUM(m.cluster_id = -1), 0) AS noise,
+      COALESCE(SUM(m.cluster_id <> -1 AND c.cluster_id IS NULL), 0) AS unassigned
     FROM memory_analysis_memberships m
     LEFT JOIN memory_analysis_clusters c
       ON c.run_id = m.run_id AND c.cluster_id = m.cluster_id
-    WHERE m.run_id = ? AND m.cluster_id <> -1 AND c.cluster_id IS NULL
-  `, run.id);
+    WHERE m.run_id = ?
+  `).get(run.id);
     if (nonNoise !== expectedNonNoise || members !== nonNoise + noise || unassigned > 0)
         return undefined;
     return {

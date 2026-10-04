@@ -1,13 +1,12 @@
 import { createHash } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe } from "./typesafe-client.js";
+import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
 import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
 import { abortable } from "./abortable.js";
 const VERSION = "people-primer-background-v4";
 const MAX_EXCERPT_CHARS = 6000;
-const noul = Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) });
-const answerSchema = Type.Object({ answers: Type.Record(Type.String(), noul) });
+const answerSchema = Type.Object({ answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA) });
 function questionsFor(name, agent) {
     return [
         { id: "role", question: `Who is ${name}? What is their explicitly stated role and organization?` },
@@ -115,15 +114,14 @@ export async function primePersonDossier(params) {
                     requests++;
                     payload = await requestTypeSafe({ apiKey: params.apiKey, timeoutMs: config.timeoutMs, signal }, state, questions);
                     signal.throwIfAborted();
-                    if (!valid(payload) || !Value.Check(answerSchema, payload))
+                    if (!valid(payload))
                         throw new Error("Invalid primer judgments");
                     // Keep only validated numerical answers, never provider extras or echoes.
                     const answers = payload.answers;
-                    payload = { answers: Object.fromEntries(expectedKeys.map(k => [k, { type: "noul", noul: answers[k].noul }])) };
-                    store.cachePrimerJudgment(person.id, key, payload);
+                    store.cachePrimerJudgment(person.id, key, {
+                        answers: Object.fromEntries(expectedKeys.map(k => [k, { type: "noul", noul: answers[k].noul }])),
+                    });
                 }
-                if (!Value.Check(answerSchema, payload))
-                    throw new Error("Invalid primer cache");
                 graded.push({ ...candidate, aboutPerson: payload.answers.aboutPerson.noul,
                     explicitBackground: payload.answers.explicitBackground.noul, enduring: payload.answers.enduring.noul,
                     recognition: payload.answers.recognition.noul,

@@ -1,4 +1,4 @@
-type RetrievalOperation = "vector" | "lexical" | "memoryWhisperer";
+type RetrievalOperation = "vector" | "memoryWhisperer";
 type RetrievalOutcome = "ok" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped";
 declare const fields: readonly ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "candidates", "eligible", "results", "contextChars"];
 type Field = typeof fields[number];

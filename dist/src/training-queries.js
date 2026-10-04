@@ -3,7 +3,7 @@ import { trainingHash } from "./training-input.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_MODEL, TRAINING_TEACHER_VERSION } from "./training-models.js";
-import { historicalTrainingSearch, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
+import { historicalTrainingSearch, historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
 const LANES = ["lex", "vec"];
 const SELECTION_VERSION = "independent-lanes-top3-mean-v2";
@@ -162,6 +162,7 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
     const refreshed = collectTraining(source, store, { existingOnly: true });
     const result = { ...summary(), retrievals: 0, evaluated: 0, awaitingTeacher: 0 };
     const concurrency = options.concurrency ?? TRAINING_EVALUATION_CONCURRENCY;
+    let historicalSource;
     let key, teacher;
     const apiKey = () => key ??= resolveTypeSafeApiKey(config.typesafe).then(value => {
         if (!value)
@@ -214,7 +215,9 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
         store.renew();
         let snapshot;
         try {
-            snapshot = await createSearch(source.stateDir, corpus.chatTypes, example.timestamp);
+            snapshot = createSearch === historicalTrainingSearch
+                ? await (await (historicalSource ??= historicalTrainingSource(source.stateDir, corpus.chatTypes)))(example.timestamp)
+                : await createSearch(source.stateDir, corpus.chatTypes, example.timestamp);
         }
         catch (error) {
             if (!(error instanceof HistoricalCorpusUnavailableError))

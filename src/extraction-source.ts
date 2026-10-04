@@ -15,13 +15,17 @@ export function extractionSessions(databasePath: string, agentId: string, chatTy
     }
     return db.prepare(`SELECT w.session_id,w.session_key,w.chat_type,COALESCE(w.channel,c.channel) AS provider,
       COALESCE(w.account_id,c.account_id) AS account_id,COALESCE(c.native_channel_id,c.native_direct_user_id,c.peer_id,w.primary_conversation_id) AS conversation_id,
-      COALESCE(w.started_at,w.created_at) AS started_at, COALESCE(w.transcript_updated_at,w.updated_at,w.created_at) AS changed_at FROM session_windows w
+      COALESCE(w.started_at,w.created_at) AS started_at, COALESCE(w.transcript_updated_at,w.updated_at,w.created_at) AS changed_at,
+      r.generation,(SELECT MAX(seq) FROM transcript_events WHERE session_id=w.session_id) AS tail FROM session_windows w
       LEFT JOIN conversations c ON c.conversation_id=w.primary_conversation_id
+      LEFT JOIN transcript_rewrite_watermarks r ON r.session_id=w.session_id
       WHERE w.chat_type IN (${chatTypes.map(() => "?").join(",")}) ORDER BY w.created_at,w.session_id`)
       .all(...chatTypes).map(r => ({ sessionId: String(r.session_id), sessionKey: String(r.session_key),
         chatType: r.chat_type as ChatType, provider: r.provider === null ? undefined : String(r.provider),
         accountId: r.account_id === null ? undefined : String(r.account_id),
-        conversationId: r.conversation_id === null ? undefined : String(r.conversation_id), startedAt: Number(r.started_at), changedAt: Number(r.changed_at) }));
+        conversationId: r.conversation_id === null ? undefined : String(r.conversation_id), startedAt: Number(r.started_at), changedAt: Number(r.changed_at),
+        // The host uses this append-stable watermark for transcript cache validation.
+        sourceRevision: r.generation === null ? undefined : JSON.stringify([r.generation, r.tail]) }));
   } finally { db.close(); }
 }
 

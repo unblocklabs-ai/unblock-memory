@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe, TYPESAFE_MODEL, TypeSafeRequestError } from "./typesafe-client.js";
+import { requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
 import type { TrainingInput } from "./training-input.js";
 
 export const TRAINING_GATE_VERSION = "historical-recall-v2";
@@ -29,7 +29,7 @@ export const TRAINING_GATE_QUESTIONS = { recall_needed: {
 } };
 const resultSchema = Type.Object({
   model: Type.Literal(TRAINING_GATE_MODEL),
-  answers: Type.Object({ recall_needed: Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) }) }),
+  answers: Type.Object({ recall_needed: TYPESAFE_NOUL_SCHEMA }),
   usage: Type.Object({ input_tokens: Type.Integer({ minimum: 0 }), output_tokens: Type.Integer({ minimum: 0 }) }),
 });
 

@@ -32,9 +32,10 @@ export async function runExtraction(params) {
         const visible = new Set(sessions.map(s => s.sessionId));
         if (params.sessionId && !visible.has(params.sessionId))
             throw new Error("Unknown or unapproved extraction session");
-        for (const memory of store.records())
-            if (!visible.has(memory.sessionId))
-                store.reset(memory.sessionId, null, owner);
+        for (const { session_id } of store.db.prepare("SELECT DISTINCT session_id FROM extracted_memories WHERE status='active'").all()) {
+            if (!visible.has(String(session_id)))
+                store.reset(String(session_id), null, owner);
+        }
         // Oldest last-checked first: bounded runs must not starve later sessions.
         const checked = new Map(store.db.prepare("SELECT session_id,updated_at FROM extraction_sessions").all()
             .map(r => [String(r.session_id), Number(r.updated_at)]));
@@ -48,6 +49,10 @@ export async function runExtraction(params) {
             if (processed >= config.maxBatches)
                 break;
             const checkpoint = store.checkpoint(session, params.since);
+            if (session.sourceRevision !== undefined && checkpoint.completeRevision === session.sourceRevision) {
+                unchanged++;
+                continue;
+            }
             let stage = "read";
             try {
                 const existing = store.records(session.sessionId);
@@ -69,7 +74,8 @@ export async function runExtraction(params) {
                     continue;
                 }
                 if (!page.entryCount) {
-                    store.db.prepare("UPDATE extraction_sessions SET updated_at=? WHERE session_id=?").run(Date.now(), session.sessionId);
+                    store.db.prepare("UPDATE extraction_sessions SET updated_at=?,complete_revision=? WHERE session_id=?")
+                        .run(Date.now(), page.exhausted ? session.sourceRevision ?? null : null, session.sessionId);
                     unchanged++;
                     continue;
                 }
@@ -82,17 +88,26 @@ export async function runExtraction(params) {
                 const proposals = newIds.length ? await (params.extract ?? extractWithLuna)(params.runtime, params.agentId, messages, newIds, existing.map(m => ({ id: m.id, text: m.text, observedAt: m.observedAt })), signal) : [];
                 const accepted = [];
                 stage = "validate";
-                for (const proposal of proposals) {
+                for (let start = 0; start < proposals.length; start += 4) {
                     signal.throwIfAborted();
-                    const judgment = await (params.validate ?? validateExtractedMemory)({ proposal, messages, newIds,
-                        existing, apiKey, signal, thresholds: config });
-                    const observedAt = judgment.accepted ? Math.max(...proposal.evidence.map(e => messages.find(m => m.id === e.messageId).timestamp)) : 0;
-                    const prior = existing.find(m => m.id === proposal.replaces);
-                    if (judgment.accepted && (!prior || prior.observedAt <= observedAt))
-                        accepted.push({ proposal: { ...proposal,
-                                evidence: proposal.evidence.map(e => ({ ...e, messageId: messages.find(m => m.id === e.messageId).sourceMessageId ?? e.messageId })) }, judgment, observedAt });
-                    else
-                        rejectedCount++;
+                    // Isolated judgments overlap, but failed chunks drain before their lease is released.
+                    const judgments = await Promise.allSettled(proposals.slice(start, start + 4).map(async (proposal) => ({ proposal,
+                        judgment: await (params.validate ?? validateExtractedMemory)({ proposal, messages, newIds, existing, apiKey, signal, thresholds: config }) })));
+                    const failure = judgments.find(result => result.status === "rejected");
+                    if (failure)
+                        throw failure.reason;
+                    for (const result of judgments) {
+                        if (result.status !== "fulfilled")
+                            continue;
+                        const { proposal, judgment } = result.value;
+                        const observedAt = judgment.accepted ? Math.max(...proposal.evidence.map(e => messages.find(m => m.id === e.messageId).timestamp)) : 0;
+                        const prior = existing.find(m => m.id === proposal.replaces);
+                        if (judgment.accepted && (!prior || prior.observedAt <= observedAt))
+                            accepted.push({ proposal: { ...proposal,
+                                    evidence: proposal.evidence.map(e => ({ ...e, messageId: messages.find(m => m.id === e.messageId).sourceMessageId ?? e.messageId })) }, judgment, observedAt });
+                        else
+                            rejectedCount++;
+                    }
                 }
                 // A branch rewrite during inference invalidates its proposals. Appends are safe and processed next time.
                 const check = await readPage(params.agentId, params.agentName, session, page.fence);
@@ -107,7 +122,8 @@ export async function runExtraction(params) {
                 const context = extractionHistory(messages, config.historyMessages);
                 stage = "commit";
                 const written = store.commit({ session, expected: checkpoint.cursor, cursor: page.cursor,
-                    context, accepted, owner, version: EXTRACTION_VERSION });
+                    context, accepted, owner, version: EXTRACTION_VERSION,
+                    completeRevision: page.exhausted ? session.sourceRevision : undefined });
                 processed++;
                 acceptedCount += written;
             }

@@ -6,14 +6,14 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { setTimeout as delay, setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
-import { historicalPrefix, historicalTrainingSearch } from "../src/training-retrieval.js";
+import { historicalPrefix, historicalTrainingSearch, historicalTrainingSource } from "../src/training-retrieval.js";
 import { projectSessionDocument } from "../src/session-projector.js";
 import { resolveSessionSource } from "../src/sources.js";
 import { trainingExamples } from "../src/training-input.js";
 import { trainingCandidates } from "../src/training-candidates.js";
 import { renderMemoryPassage } from "../src/memory-passage.js";
 import { QmdMemoryManager } from "../src/manager.js";
-import { judgeTypeSafeMemories } from "../src/typesafe.js";
+import { judgeMemoryPassage, memoryUsefulnessRequest } from "../src/typesafe.js";
 import { contextJudgeRequest, judgeTrainingPassage } from "../src/training-judge.js";
 
 const queries = Array.from({length: 10}, (_, i) => `Atlas decision ${i}`);
@@ -25,8 +25,9 @@ test("query lanes retrieve ten candidates from only their backend with literal k
       qmd.internal.insertContent(`lex${i}`, `Exactneedle useful evidence ${i}`, "2026-01-01");
       qmd.internal.insertDocument("sessions", `lex${i}.md`, "Transcript", `lex${i}`, "2026-01-01", "2026-01-01");
     }
-    const vector = t.mock.method(qmd, "searchVector", async (_query: string, options: { limit: number }) => {
-      assert.equal(options.limit, 10);
+    qmd.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+    const vector = t.mock.method(qmd.internal, "searchVec", async (_query: string, _model: string, limit: number) => {
+      assert.equal(limit, 10);
       return Array.from({ length: 10 }, (_, i) => ({ filepath: `qmd://sessions/vec${i}.md`, body: "Other evidence",
         chunkPos: 0, chunkLen: 14, score: 0.9 }));
     });
@@ -95,9 +96,10 @@ test("runtime and historical retrieval send byte-identical expanded-turn evidenc
       return Response.json({ model: "jev-1.13.0", usage: { input_tokens: 20, output_tokens: 5 }, answers: { memory_0: { type: "noul", noul: 0.9 } } });
     });
     const conversation = { history: [], currentRequest: "Who approved our staging deployment?" };
-    await judgeTypeSafeMemories({ apiKey: "unused", timeoutMs: 1000, signal: new AbortController().signal,
-      conversation, asOf: snapshot.maxDate, candidates: [{ excerpt: runtime.snippet, corpus: runtime.corpus, sourcePath: runtime.path,
-        dates: [...new Set(runtime.sessionMessages!.flatMap(message => message.timestamp ? [message.timestamp] : []))] }] });
+    await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
+      excerpt: runtime.snippet, corpus: runtime.corpus, sourcePath: runtime.path,
+      dates: [...new Set(runtime.sessionMessages!.flatMap(message => message.timestamp ? [message.timestamp] : []))],
+    }, snapshot.maxDate), { apiKey: "unused", timeoutMs: 1000, signal: new AbortController().signal });
     await judgeTrainingPassage(contextJudgeRequest(conversation, snapshot.maxDate, offline), "unused");
     assert.deepEqual(requests[0], requests[1]);
   } finally { await snapshot.close(); await manager.close(); }
@@ -248,7 +250,7 @@ test("snapshot copying yields between documents and vectors without changing his
   } finally { await snapshot.close(); }
 });
 
-test("lazy indexes retain the fingerprinted source transaction and release failed initializations", async t => {
+test("run-scoped source evidence survives live writes with isolated cutoff indexes and releases failed initializations", async t => {
   const root = mkdtempSync(join(tmpdir(), "training-lazy-qmd-"));
   const source = resolveSessionSource(join(root, "sessions"), ["direct"]);
   const original = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {
@@ -256,7 +258,10 @@ test("lazy indexes retain the fingerprinted source transaction and release faile
   } } });
   t.after(() => original.close());
   const projection = projectSessionDocument({ sessionId: "s", chatType: "direct", agentName: "Bill", timezone: "UTC", startedAt: 0,
-    events: [{ createdAt: 1000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "Past evidence" } }) }],
+    events: [
+      { createdAt: 1000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "Past evidence" } }) },
+      { createdAt: 150_000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "LATEREVIDENCE" } }) },
+    ],
   })!;
   const hash = createHash("sha256").update(projection.content).digest("hex"), span = projection.messages[0]!;
   original.internal.insertContent(hash, projection.content, "now");
@@ -269,12 +274,16 @@ test("lazy indexes retain the fingerprinted source transaction and release faile
     sessionId: "s", provider: "slack", chatType: "direct", startedAt: 0, projectionHash: hash, documentPath: "s.md", messages: projection.messages,
   } } }));
   let captured: QMDStore | undefined;
-  const snapshot = await historicalTrainingSearch(root, ["direct"], 100_000, async opts => {
+  const runSource = await historicalTrainingSource(root, ["direct"]);
+  const snapshot = await runSource(100_000, async opts => {
     captured = await createStore(opts);
     t.mock.method(captured.internal.llm!, "embed", async () => ({ embedding: [1, 0], model: captured!.internal.llm!.embedModelName }));
     return captured;
   });
   try {
+    original.internal.db.exec("PRAGMA busy_timeout=0");
+    assert.equal(original.internal.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get<{ busy: number }>()!.busy, 0,
+      "Fingerprint-only snapshots must release the source reader before retrieval");
     updateVector([0, 1]); // A live index write after fingerprinting must not leak into this snapshot.
     const changed = await historicalTrainingSearch(root, ["direct"], 100_000);
     assert.notEqual(changed.corpusHash, snapshot.corpusHash);
@@ -282,10 +291,27 @@ test("lazy indexes retain the fingerprinted source transaction and release faile
     assert.equal(captured, undefined);
     const hits = await snapshot.search("Past evidence", "vec");
     assert.deepEqual(hits[0]!.methods.toSorted(), ["vector"]);
-    const row = captured!.internal.db.prepare("SELECT embedding FROM vectors_vec WHERE hash_seq=?")
-      .get<{ embedding: Uint8Array }>(hash + "_0")!;
+    const row = captured!.internal.db.prepare("SELECT embedding FROM vectors_vec")
+      .get<{ embedding: Uint8Array }>()!;
     const bytes = Buffer.from(row.embedding);
     assert.deepEqual([bytes.readFloatLE(0), bytes.readFloatLE(4)], [1, 0]);
+    assert.equal((await captured!.searchLex("LATEREVIDENCE")).length, 0);
+    let laterIndex: QMDStore | undefined;
+    const later = await runSource(200_000, async opts => {
+      laterIndex = await createStore(opts);
+      return laterIndex;
+    });
+    try {
+      assert.equal(snapshot.report.truncated, 1);
+      assert.equal(later.report.truncated, 0);
+      assert.notEqual(later.corpusHash, snapshot.corpusHash);
+      assert.ok((await later.search("LATEREVIDENCE", "lex")).length);
+      assert.notEqual(laterIndex, captured);
+      const reused = Buffer.from(laterIndex!.internal.db.prepare("SELECT embedding FROM vectors_vec")
+        .get<{ embedding: Uint8Array }>()!.embedding);
+      assert.deepEqual([reused.readFloatLE(0), reused.readFloatLE(4)], [1, 0],
+        "Later cutoffs in the same run must reuse captured bytes, not a newly read live vector");
+    } finally { await later.close(); }
   } finally { await snapshot.close(); }
   let creates = 0, closes = 0;
   const failed = await historicalTrainingSearch(root, ["direct"], 100_000, async opts => {

@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe, TypeSafeRequestError, TYPESAFE_MODEL } from "./typesafe-client.js";
+import { requestTypeSafe, TypeSafeRequestError, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 const SKILL_MIN_USEFULNESS = 0.7;
 /** Select from trusted candidates; never accept a provider-generated path or skill name. */
@@ -26,7 +26,7 @@ export async function selectTypeSafeSkill(params) {
 /** One skill per request; rank the comparable usefulness probabilities in code. */
 async function judgeTypeSafeSkill(params) {
     let payload;
-    payload = await requestTypeSafe({ apiKey: params.apiKey, timeoutMs: params.timeoutMs }, { currentRequest: params.currentRequest, history: params.history,
+    payload = await requestTypeSafe(params, { currentRequest: params.currentRequest, history: params.history,
         candidate: { name: params.candidate.name, description: params.candidate.description } }, { useful: {
             type: "noul",
             instructions: {
@@ -51,9 +51,7 @@ async function judgeTypeSafeSkill(params) {
     return payload.answers.useful.noul;
 }
 const memoryAnswersSchema = Type.Object({
-    answers: Type.Record(Type.String(), Type.Object({
-        type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
-    })),
+    answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA),
 });
 export const QUALITY_JUDGE_VERSION = "jev-1.13.0:quality-v3-isolated";
 /** These are indicators for review, never authorization to delete or rewrite. */
@@ -137,7 +135,7 @@ export function memoryUsefulnessRequest(conversation, candidate, asOf) {
 }
 const memoryJudgmentSchema = Type.Object({
     model: Type.Literal(TYPESAFE_MODEL),
-    answers: Type.Object({ memory_0: Type.Object({ type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }) }) }, { additionalProperties: false }),
+    answers: Type.Object({ memory_0: TYPESAFE_NOUL_SCHEMA }, { additionalProperties: false }),
     usage: Type.Optional(Type.Object({ input_tokens: Type.Integer({ minimum: 0 }), output_tokens: Type.Integer({ minimum: 0 }) })),
 });
 function parseMemoryJudgment(payload) {
@@ -149,8 +147,4 @@ function parseMemoryJudgment(payload) {
 }
 export async function judgeMemoryPassage(request, params) {
     return parseMemoryJudgment(await requestTypeSafe(params, request.state, request.questions));
-}
-/** One HTTP request per candidate; result order matches input order. */
-export async function judgeTypeSafeMemories(params) {
-    return Promise.all(params.candidates.map(async (candidate) => (await judgeMemoryPassage(memoryUsefulnessRequest(params.conversation, candidate, params.asOf), params)).probability));
 }

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import { resolveConfig } from "../../src/config.js";
 import { resolveSources, resolveSessionSource } from "../../src/sources.js";
-import { judgeTypeSafeMemories } from "../../src/typesafe.js";
+import { judgeMemoryPassage, memoryUsefulnessRequest } from "../../src/typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError, TYPESAFE_MODEL } from "../../src/typesafe-client.js";
 import { collectSearches, hash, record, type SearchCase } from "./cases.js";
 import type { SessionManifest } from "../../src/session-sync.js";
@@ -131,8 +131,10 @@ async function main() {
           const started = performance.now();
           let terminal: Judgment;
           try {
-            const [score] = await judgeTypeSafeMemories({ ...params, apiKey: key, timeoutMs: recipe.timeoutMs, signal: new AbortController().signal });
-            terminal = { ...attempt, status: "complete", typesafe_score: score!, elapsedMs: performance.now() - started };
+            const { probability: score } = await judgeMemoryPassage(
+              memoryUsefulnessRequest(params.conversation, params.candidates[0]!, params.asOf),
+              { apiKey: key, timeoutMs: recipe.timeoutMs, signal: new AbortController().signal });
+            terminal = { ...attempt, status: "complete", typesafe_score: score, elapsedMs: performance.now() - started };
           } catch (error) {
             terminal = { ...attempt, status: "failed", elapsedMs: performance.now() - started,
               error: error instanceof TypeSafeRequestError ? error.code : "unexpected",

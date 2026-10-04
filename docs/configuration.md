@@ -86,7 +86,8 @@ The plugin reads only `TYPESAFE_API_KEY` from the environment. Standalone QMD al
 supports `TYPESAFE_API_KEY_FILE`; these are separate credential resolvers.
 `typesafe.timeoutMs` is not a universal total deadline: People Primer and dossier
 save review use `peoplePrimer.timeoutMs` per request; Memory Whisperer has its
-own overall budget.
+own overall budget. Skill Whisperer's fixed three-second total budget includes
+credential resolution, retrieval and judging, even when its provider timeout is longer.
 
 ## Example profiles
 
@@ -214,7 +215,7 @@ contract; these tables explain their effects.
 | `typesafe.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
 | `typesafe.apiKeyFile` | Unset | Absolute raw-key or dotenv file, reread at credential resolution; explicit missing file never falls back to a different key |
 | `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` instead** |
-| `skillWhisperer.enabled` | `false` | Requires explicit skills corpus and appropriate host hook access |
+| `skillWhisperer.enabled` | `false` | Requires explicit skills corpus and appropriate host hook access; fixed 3-second total deadline |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for TypeSafe shortlist admission |
 | `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |
