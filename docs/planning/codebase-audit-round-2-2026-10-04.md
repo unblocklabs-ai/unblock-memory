@@ -86,6 +86,15 @@ cross-process SQLite transaction. Content remains hash-addressed and source
 coordinates are checked after inference; a concurrent missing body produces
 a retryable partial result without advancing the cursor.
 
-Cleanup was prepared and validated on `codex/audit-round-2` in both repositories.
-Versions/dependency pins are unchanged; no host or paid-model validation is
-claimed. Release remains a separate, explicitly authorized next step.
+Cleanup was prepared and validated on `codex/audit-round-2` in both repositories,
+then included in unblock-memory 0.7.3 and QMD 2.11.1. The plugin pins that QMD
+release tarball. No host deployment or paid-model validation is claimed.
+
+The test-audit follow-up wires eight Python preparation tests and 13 QMD
+lint-rule test files into validation, replaces literal SDK checks with a real
+consumer typecheck, and removes nine redundant runtime tests plus the unused
+CLI exit injection. Migration now verifies 1,001 documents across multiple
+batches; maintenance listings measure returned text rather than SQL aliases.
+Both strengthened regressions failed under deliberately broken code before
+passing with production behavior restored. FTS resource/concurrency guards
+remain until equally strong owner-boundary replacements exist.
