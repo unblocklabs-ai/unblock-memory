@@ -402,6 +402,8 @@ openclaw memory-emotions run --agent main
 openclaw memory-emotions report --agent main --sender U123 --bucket week
 openclaw memory-emotions export --agent main --emotion anger --min 0.8
 openclaw memory-emotions run --agent main --retry
+openclaw memory-emotions link-people --agent main
+openclaw memory-emotions link-people --agent main --repair-identities
 openclaw memory-emotions run --agent main --session SESSION_ID
 openclaw memory-emotions export --agent main --session SESSION_ID
 ```
@@ -454,6 +456,20 @@ Results store source
 references, channel-scoped human keys, timestamps, rubric/model, six probabilities,
 and errors—not conversation text. Missing account or sender identity stays
 session-scoped; identities are not guessed or automatically linked across channels.
+Each new review also stores a nullable `person_id`, resolved from PeopleSQL's
+existing `(provider, account_scope, external_id)` mapping. Human keys remain
+session-scoped when the account is missing, but `person_id`
+can resolve by provider and external ID if all matching People identities point to
+one person. Known accounts must match exactly; ambiguous IDs stay unlinked. Modern
+sender metadata takes precedence over legacy message-level `sourceChannel` and
+`senderId`, which take precedence over session/owner fallbacks. Names and text
+envelopes are not identity evidence.
+`link-people` upgrades older results and refreshes their person links, including
+changed or removed mappings; by default it never reads transcripts. Its explicit
+`--repair-identities` option reads sources owning unlinked reviews and repairs
+their channel, sender ID and human key from persisted metadata before linking.
+Neither mode calls Jev or changes scores, timestamps, review IDs or checkpoints.
+Unmatched identities stay null. Exports include `person_id`.
 `export` emits all matching rows as JSON, including errors. `report` averages
 successful rows by human, UTC day/week, rubric, and model; counts are the denominator.
 Both accept `--session`, `--sender`, `--since YYYY-MM-DD`, `--emotion`, and `--min`. `--sender`

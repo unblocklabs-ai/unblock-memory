@@ -11,7 +11,8 @@ import { zstdCompressSync } from "node:zlib";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { resolveConfig } from "../src/config.js";
-import { runInsideOut, reportInsideOut } from "../src/inside-out.js";
+import { linkInsideOutPeople, repairInsideOutIdentities, runInsideOut, reportInsideOut } from "../src/inside-out.js";
+import { PeopleStore } from "../src/people-store.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 const emotions = ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
@@ -21,6 +22,106 @@ const user = (content: string, senderId = "bek", timestamp?: number) => ({ role:
   __openclaw: { senderId, senderIdentity: { senderKind: "human" } } });
 const assistant = (text: string, extra = {}) => ({ role: "assistant", content: [{ type: "text", text }], ...extra });
 const event = (id: string, message: unknown, timestamp?: string) => ({ type: "message", id, message, timestamp });
+
+test("People links are stored on new reviews and backfilled on legacy rows without repeating Jev", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-people-")), sessionsDir = join(root, "sessions");
+  await mkdir(sessionsDir);
+  const storePath = join(root, "unblock-memory.sqlite");
+  const people = new PeopleStore(storePath, { maxOpenTodos: 100, maxBlurbChars: 1000 });
+  t.after(() => people.close());
+  const first = people.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U111", displayName: "Bek" }).person.id;
+  const other = people.upsertIdentity({ provider: "slack", accountScope: "other", externalId: "U111", displayName: "Other person" }).person.id;
+  const reply = (channel: string, accountId: string, senderId = "U111") => ({ ...user("Thanks!", senderId),
+    __openclaw: { senderId, senderIdentity: { senderKind: "human", pluginId: channel, accountId } } });
+  await writeFile(join(sessionsDir, "s.jsonl"), [{ type: "session", id: "s" }, event("a", assistant("Answer")),
+    event("b", reply("slack", "default")), event("c", reply("slack", "other")),
+    event("d", reply("telegram", "default")), event("e", reply("slack", "default", "unknown"))]
+    .map(e => JSON.stringify(e)).join("\n"));
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({
+    answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])),
+  }));
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath, config: cfg() };
+  await runInsideOut(options);
+  const rows = reportInsideOut(storePath);
+  assert.equal(rows.find(r => r.message_id === "b")?.person_id, first);
+  assert.equal(rows.find(r => r.message_id === "c")?.person_id, other);
+  assert.equal(rows.find(r => r.message_id === "d")?.person_id, null, "same user ID in another provider is not the same identity");
+  assert.equal(rows.find(r => r.message_id === "e")?.person_id, null);
+  assert.equal(fetch.mock.callCount(), 4);
+
+  // Downgrade the genuinely written table to the previous release's shape.
+  const db = new DatabaseSync(storePath);
+  t.after(() => db.close());
+  db.exec("DROP INDEX inside_out_person_time; ALTER TABLE inside_out DROP COLUMN person_id");
+  const before = reportInsideOut(storePath).map(row => ({ ...row }));
+  assert.deepEqual(linkInsideOutPeople(storePath), { updated: 2, linked: 2, unlinked: 2 });
+  assert.deepEqual(reportInsideOut(storePath).map(({ person_id: _person, ...row }) => row), before,
+    "backfill changes only person links, not judgments or their original provenance");
+  assert.deepEqual(linkInsideOutPeople(storePath), { updated: 0, linked: 2, unlinked: 2 });
+  const telegram = people.upsertIdentity({ provider: "telegram", accountScope: "default", externalId: "U111" }).person.id;
+  assert.deepEqual(linkInsideOutPeople(storePath), { updated: 1, linked: 3, unlinked: 1 });
+  assert.equal(reportInsideOut(storePath).find(r => r.message_id === "d")?.person_id, telegram);
+  db.prepare("UPDATE person_identities SET person_id=? WHERE provider='slack' AND account_scope='other'").run(first);
+  db.exec("DELETE FROM person_identities WHERE provider='telegram'");
+  assert.deepEqual(linkInsideOutPeople(storePath), { updated: 2, linked: 2, unlinked: 2 });
+  assert.equal(reportInsideOut(storePath).find(r => r.message_id === "c")?.person_id, first);
+  assert.equal(reportInsideOut(storePath).find(r => r.message_id === "d")?.person_id, null);
+  await runInsideOut(options);
+  assert.equal(fetch.mock.callCount(), 4, "migration, linking and cached reruns do not repeat inference");
+});
+
+test("legacy sender metadata links only unambiguous People identities without guessing owners or account scope", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-legacy-people-")), sessionsDir = join(root, "sessions");
+  await mkdir(sessionsDir);
+  const storePath = join(root, "unblock-memory.sqlite");
+  const people = new PeopleStore(storePath, { maxOpenTodos: 100, maxBlurbChars: 1000 });
+  t.after(() => people.close());
+  const known = people.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U111" }).person.id;
+  people.upsertIdentity({ provider: "slack", accountScope: "other", externalId: "U111" });
+  const unique = people.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U222" }).person.id;
+  const legacy = (senderId: string, extra = {}) => ({ role: "user", content: "Thanks!", sourceChannel: "slack", senderId,
+    __openclaw: { senderIsOwner: true }, ...extra });
+  await writeFile(join(sessionsDir, "old.jsonl"), [{ type: "session", id: "old" }, event("a", assistant("Answer")),
+    event("unique", legacy("U222")), event("ambiguous", legacy("U111")),
+    event("wrong-account", legacy("U222", { __openclaw: { senderIdentity: { accountId: "missing" } } })),
+    event("modern", legacy("U222", { sourceChannel: "telegram", __openclaw: {
+      senderIdentity: { id: "U111", pluginId: "slack", accountId: "default" } } })),
+    event("owner", { role: "user", content: "From: Bek (U222)\nThanks!", sourceChannel: "slack", senderName: "Bek",
+      __openclaw: { senderIsOwner: true } }), event("other-provider", legacy("U222", { sourceChannel: "telegram" }))]
+    .map(e => JSON.stringify(e)).join("\n"));
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({
+    answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])),
+  }));
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath, config: cfg() };
+  await runInsideOut(options);
+  const rows = reportInsideOut(storePath);
+  assert.equal(rows.find(r => r.message_id === "unique")?.person_id, unique);
+  assert.equal(rows.find(r => r.message_id === "unique")?.sender_id, "U222", "explicit legacy ID takes precedence over owner alias");
+  assert.equal(rows.find(r => r.message_id === "ambiguous")?.person_id, null);
+  assert.equal(rows.find(r => r.message_id === "wrong-account")?.person_id, null, "known account mismatch cannot use the fallback");
+  assert.equal(rows.find(r => r.message_id === "modern")?.person_id, known, "modern sender metadata takes precedence");
+  assert.equal(rows.find(r => r.message_id === "owner")?.person_id, null, "names and body envelopes do not establish identity");
+  assert.equal(rows.find(r => r.message_id === "other-provider")?.person_id, null);
+  assert.equal(fetch.mock.callCount(), 6);
+
+  // Recreate the old reader's persisted identity, then repair through the production backfill path.
+  const db = new DatabaseSync(storePath);
+  t.after(() => db.close());
+  db.prepare("UPDATE inside_out SET person_id=NULL,channel='local',sender_id='owner',human_key=? WHERE message_id='unique'")
+    .run(JSON.stringify(["local", "session:old", "owner"]));
+  const immutable = () => reportInsideOut(storePath).map(({ channel: _channel, sender_id: _sender, human_key: _human, person_id: _person, ...row }) => row);
+  const before = immutable(), checkpoints = db.prepare("SELECT * FROM inside_out_checkpoints").all();
+  fetch.mock.mockImplementation(async () => { throw new Error("Identity repair must not call Jev"); });
+  assert.deepEqual(await repairInsideOutIdentities(options), { repaired: 1, errors: [] });
+  assert.deepEqual(linkInsideOutPeople(storePath), { updated: 1, linked: 2, unlinked: 4 });
+  assert.deepEqual(reportInsideOut(storePath).find(r => r.message_id === "unique"), rows.find(r => r.message_id === "unique"));
+  assert.deepEqual(immutable(), before, "identity repair preserves every non-identity review field");
+  assert.deepEqual(db.prepare("SELECT * FROM inside_out_checkpoints").all(), checkpoints);
+  assert.deepEqual(await repairInsideOutIdentities(options), { repaired: 0, errors: [] });
+  assert.deepEqual(linkInsideOutPeople(storePath), { updated: 0, linked: 2, unlinked: 4 });
+  await runInsideOut(options);
+  assert.equal(fetch.mock.callCount(), 6, "repair and unchanged runs never repeat inference");
+});
 
 test("session-scoped passes skip unchanged payloads and resume bounded appends, including delayed replies", async t => {
   const root = await mkdtemp(join(tmpdir(), "inside-out-incremental-"));

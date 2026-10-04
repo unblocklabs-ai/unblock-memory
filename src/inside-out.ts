@@ -59,6 +59,14 @@ function tokens(value: unknown): number {
   return Math.ceil(n);
 }
 
+function humanIdentity(source: InsideOutSource, message: NonNullable<InsideOutSource["events"][number]["message"]>) {
+  const meta = message.__openclaw, identity = meta?.senderIdentity;
+  const channel = meta?.transport?.channel ?? identity?.pluginId ?? message.sourceChannel ?? source.channel;
+  const sender = identity?.id ?? meta?.senderId ?? message.senderId ?? (meta?.senderIsOwner ? "owner" : `session:${source.sessionId}`);
+  const human = JSON.stringify([channel, (identity?.accountId ?? source.account) || `session:${source.sessionId}`, sender]);
+  return { channel, sender, human };
+}
+
 function* interactions(source: InsideOutSource, budget: number, cached: (id: string) => boolean, after: number) {
   let history: Message[] = [], thread: string | undefined;
   const at = (e: InsideOutSource["events"][number]) => e.message?.role === "user" && typeof e.message.timestamp === "number"
@@ -89,9 +97,7 @@ function* interactions(source: InsideOutSource, budget: number, cached: (id: str
       text = conversationUserText(meta?.upstreamUserText ?? text, meta?.senderId)?.text ?? text;
     }
     if (!text) continue;
-    const channel = meta?.transport?.channel ?? identity?.pluginId ?? source.channel;
-    const sender = identity?.id ?? meta?.senderId ?? (meta?.senderIsOwner ? "owner" : `session:${source.sessionId}`);
-    const human = JSON.stringify([channel, (identity?.accountId ?? source.account) || `session:${source.sessionId}`, sender]);
+    const { channel, sender, human } = humanIdentity(source, m);
     const message: Message = { id: event.id ?? hash(event), role: parsed.role, text,
       ...(parsed.role === "user" ? { human } : {}) };
     const assistant = parsed.role === "user" && event.seq > after ? history.findLastIndex(item => item.role === "assistant") : -1;
@@ -119,7 +125,7 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS inside_out (
   interaction_id TEXT NOT NULL, rubric TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL,
   assistant_id TEXT NOT NULL, human_key TEXT NOT NULL, sender_id TEXT NOT NULL, channel TEXT NOT NULL, source TEXT NOT NULL,
   target_at INTEGER, reviewed_at INTEGER NOT NULL, model TEXT NOT NULL, context_trimmed INTEGER NOT NULL,
-  joy REAL, sadness REAL, fear REAL, anger REAL, disgust REAL, surprise REAL, error TEXT,
+  joy REAL, sadness REAL, fear REAL, anger REAL, disgust REAL, surprise REAL, error TEXT, person_id TEXT,
   PRIMARY KEY(interaction_id,rubric)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS inside_out_human_time ON inside_out(human_key,target_at);
@@ -130,6 +136,63 @@ CREATE TABLE IF NOT EXISTS inside_out_checkpoints (
   PRIMARY KEY(source,rubric)
 ) STRICT;`;
 const running = new Set<string>();
+// A missing account may match across scopes only when every candidate names the same person.
+const PERSON_MATCH = `SELECT min(i.person_id) person_id FROM person_identities i
+  WHERE i.provider=e.channel AND i.external_id=e.sender_id
+  AND (i.account_scope=json_extract(e.human_key,'$[1]') OR substr(json_extract(e.human_key,'$[1]'),1,8)='session:')
+  HAVING count(DISTINCT i.person_id)=1`;
+
+function openInsideOutStore(path: string): DatabaseSync {
+  const db = openMemoryDatabase(path);
+  try {
+    db.exec(SCHEMA);
+    if (!db.prepare("SELECT 1 FROM pragma_table_info('inside_out') WHERE name='person_id'").get()) {
+      db.exec("ALTER TABLE inside_out ADD COLUMN person_id TEXT");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS inside_out_person_time ON inside_out(person_id,target_at)");
+    return db;
+  } catch (error) { db.close(); throw error; }
+}
+
+/** Refresh People links without loading transcripts or calling Jev. Known accounts stay exact. */
+export function linkInsideOutPeople(path: string) {
+  const db = openInsideOutStore(path);
+  try {
+    let updated = 0;
+    if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name='person_identities'").get()) {
+      const person = `(${PERSON_MATCH})`;
+      updated = Number(db.prepare(`UPDATE inside_out AS e SET person_id=${person} WHERE person_id IS NOT ${person}`).run().changes);
+    }
+    const counts = db.prepare(`SELECT count(person_id) linked,count(*)-count(person_id) unlinked FROM inside_out`).get()!;
+    return { updated, linked: Number(counts.linked), unlinked: Number(counts.unlinked) };
+  } finally { db.close(); }
+}
+
+/** Explicit legacy repair: only read sources owning unlinked reviews; never rejudge their text. */
+export async function repairInsideOutIdentities(options: Parameters<typeof readInsideOutSources>[0] & { storePath: string }) {
+  const db = openInsideOutStore(options.storePath), errors: string[] = [];
+  let repaired = 0;
+  try {
+    const sources = new Set(db.prepare("SELECT DISTINCT source FROM inside_out WHERE person_id IS NULL").all().map(row => row.source));
+    const rows = db.prepare("SELECT message_id FROM inside_out WHERE source=? AND person_id IS NULL");
+    const update = db.prepare(`UPDATE inside_out SET channel=?,sender_id=?,human_key=?
+      WHERE source=? AND message_id=? AND person_id IS NULL AND (channel<>? OR sender_id<>? OR human_key<>?)`);
+    for await (const reader of readInsideOutSources(options, errors)) {
+      if (!sources.has(reader.source)) continue;
+      let source: InsideOutSource;
+      try { source = reader.read(); }
+      catch { errors.push(`${reader.source}: unreadable transcript`); continue; }
+      const messages = new Map(source.events.map(event => [event.id, event.message]));
+      for (const row of rows.all(reader.source)) {
+        const message = messages.get(String(row.message_id));
+        if (!message) continue;
+        const { channel, sender, human } = humanIdentity(source, message);
+        repaired += Number(update.run(channel, sender, human, reader.source, row.message_id, channel, sender, human).changes);
+      }
+    }
+    return { repaired, errors };
+  } finally { db.close(); }
+}
 
 export async function runInsideOut(options: { agentId: string; databasePath: string; sessionsDir?: string; storePath: string;
   config: UnblockMemoryConfig; signal?: AbortSignal; retry?: boolean; sessionId?: string }) {
@@ -142,12 +205,15 @@ export async function runInsideOut(options: { agentId: string; databasePath: str
   let store: DatabaseSync | undefined;
   const result = { reviewed: 0, cached: 0, failed: 0, sources: 0, skippedSources: 0, errors: [] as string[] };
   try {
-    store = openMemoryDatabase(storePath); store.exec(SCHEMA);
+    store = openInsideOutStore(storePath);
+    const person = store.prepare("SELECT 1 FROM sqlite_schema WHERE name='person_identities'").get()
+      ? store.prepare(`SELECT (${PERSON_MATCH}) person_id FROM (SELECT ? channel,? human_key,? sender_id) e`)
+      : undefined;
     const existing = store.prepare("SELECT 1 FROM inside_out WHERE interaction_id=? AND rubric=?");
     const save = store.prepare(`INSERT OR REPLACE INTO inside_out (
       interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,channel,source,
-      target_at,reviewed_at,model,context_trimmed,joy,sadness,fear,anger,disgust,surprise,error
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      target_at,reviewed_at,model,context_trimmed,joy,sadness,fear,anger,disgust,surprise,error,person_id
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const checkpoint = store.prepare("SELECT * FROM inside_out_checkpoints WHERE source=? AND rubric=?");
     const finish = store.prepare(`INSERT OR REPLACE INTO inside_out_checkpoints
       (source,rubric,session_id,signature,revision,last_seq) VALUES(?,?,?,?,?,?)`);
@@ -212,7 +278,8 @@ export async function runInsideOut(options: { agentId: string; databasePath: str
           }
           save.run(interaction.id, RUBRIC, source.sessionId, interaction.messageId, interaction.assistantId,
             interaction.human, interaction.sender, interaction.channel, source.source, interaction.targetAt, Date.now(), model,
-            Number(interaction.trimmed), ...probabilities, error);
+            Number(interaction.trimmed), ...probabilities, error,
+            person?.get(interaction.channel, interaction.human, interaction.sender)?.person_id ?? null);
           if (error) result.failed++; else result.reviewed++;
         }
         // Only exhausted snapshots advance: partial passes resume using the existing per-interaction cache.

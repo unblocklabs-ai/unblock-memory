@@ -12,6 +12,8 @@ type InsideOutEvent = {
         channel?: string;
         provider?: string;
         model?: string;
+        sourceChannel?: string;
+        senderId?: string;
         openclawDeliveryMirror?: unknown;
         openclawMessageToolMirror?: unknown;
         provenance?: {

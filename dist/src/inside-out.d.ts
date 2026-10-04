@@ -1,4 +1,5 @@
 import type { UnblockMemoryConfig } from "./config.js";
+import { readInsideOutSources } from "./inside-out-sources.js";
 export type InsideOutConfig = {
     enabled: boolean;
     intervalMinutes: number;
@@ -6,6 +7,19 @@ export type InsideOutConfig = {
     maxContextTokens: number;
 };
 export declare function resolveInsideOut(value: unknown): InsideOutConfig;
+/** Refresh People links without loading transcripts or calling Jev. Known accounts stay exact. */
+export declare function linkInsideOutPeople(path: string): {
+    updated: number;
+    linked: number;
+    unlinked: number;
+};
+/** Explicit legacy repair: only read sources owning unlinked reviews; never rejudge their text. */
+export declare function repairInsideOutIdentities(options: Parameters<typeof readInsideOutSources>[0] & {
+    storePath: string;
+}): Promise<{
+    repaired: number;
+    errors: string[];
+}>;
 export declare function runInsideOut(options: {
     agentId: string;
     databasePath: string;

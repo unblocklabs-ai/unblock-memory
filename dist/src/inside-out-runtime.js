@@ -3,7 +3,7 @@ import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-cor
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { dateOption } from "./date-option.js";
-import { reportInsideOut, runInsideOut } from "./inside-out.js";
+import { linkInsideOutPeople, repairInsideOutIdentities, reportInsideOut, runInsideOut } from "./inside-out.js";
 export function registerInsideOut(api, config) {
     const paths = (cfg, agentId) => {
         if (!listAgentIds(cfg).includes(agentId))
@@ -14,6 +14,16 @@ export function registerInsideOut(api, config) {
     };
     api.registerCli(({ program, config: cfg }) => {
         const root = program.command("memory-emotions").description("Inside Out: review human replies and analyze emotion probabilities");
+        root.command("link-people").description("Backfill or refresh People identity links without Jev")
+            .option("--agent <id>", "Agent id", "main")
+            .option("--repair-identities", "Recover legacy sender/channel metadata for unlinked reviews")
+            .action(async (opts) => {
+            const p = paths(cfg, opts.agent);
+            const repair = opts.repairIdentities ? await repairInsideOutIdentities(p) : undefined;
+            console.log(JSON.stringify({ ...repair, ...linkInsideOutPeople(p.storePath) }, null, 2));
+            if (repair?.errors.length)
+                process.exitCode = 1;
+        });
         root.command("run").option("--agent <id>", "Agent id", "main").option("--retry", "Retry failed judgments immediately")
             .option("--session <id>", "Review only this session")
             .action(async (opts) => {

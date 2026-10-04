@@ -10,6 +10,7 @@ import { ACTIVE_EVENTS_FROM, assertAgentTranscriptSchema } from "./agent-transcr
 type InsideOutEvent = {
   type: string; seq: number; id?: string; parentId?: string | null; targetId?: string | null; timestamp?: string;
   message?: { role: string; content?: unknown; timestamp?: number; channel?: string; provider?: string; model?: string;
+    sourceChannel?: string; senderId?: string;
     openclawDeliveryMirror?: unknown; openclawMessageToolMirror?: unknown;
     provenance?: { kind?: string }; __openclaw?: { senderId?: string; senderIsOwner?: boolean; upstreamUserText?: string;
       senderIdentity?: { id?: string; senderKind?: string; type?: string; pluginId?: string; accountId?: string };

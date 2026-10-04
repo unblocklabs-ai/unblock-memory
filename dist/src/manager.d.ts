@@ -53,8 +53,8 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
                 [k: string]: {
                     calls: number;
                     outcomes: {
-                        cancelled?: number | undefined;
                         ok?: number | undefined;
+                        cancelled?: number | undefined;
                         skipped?: number | undefined;
                         failed?: number | undefined;
                         empty?: number | undefined;
