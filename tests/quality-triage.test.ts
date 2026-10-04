@@ -4,6 +4,8 @@ import { qualityTaskPresence, qualityTriage } from "../src/quality-triage.js";
 import { chunkFingerprint } from "../src/curation.js";
 import { reviewFixture } from "./helpers/review-store.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
+import { QmdMemoryManager } from "../src/manager.js";
+import { join } from "node:path";
 
 test("triage prioritizes evidence-preserving repairs, keeps ambiguity and does not require a new judge", async t => {
   assert.equal(qualityTriage(0.99, 0.99), "preserve_evidence_repair");
@@ -38,8 +40,12 @@ test("diagnostic snapshots are isolated, bounded and detached from live counters
   assert.equal(diagnostics.snapshot("agent-99").memory.emitted, 1);
 });
 
-test("presence reads one document per listing, retains UTF-16 offsets and does not cache across listings", async t => {
-  const f = await reviewFixture(); t.after(f.close);
+test("maintenance listings read one document, retain UTF-16 offsets and refresh after mutations", async t => {
+  const f = await reviewFixture(); t.after(() => f.curation.close());
+  const manager = new QmdMemoryManager({ dbPath: join(f.source.root, "index.sqlite"),
+    curationPath: f.curationPath, workspaceDir: f.source.root, sources: [f.source], storeFactory: async () => f.store });
+  t.after(() => manager.close());
+  await manager.diagnostics();
   const chunks = Array.from({ length: 200 }, (_, i) => `🚀 ${i} ${"x".repeat(990)}\n`);
   const note = await f.insert(chunks.join(""));
   f.db.prepare("DELETE FROM content_vectors WHERE hash = ?").run(note.hash);
@@ -50,20 +56,36 @@ test("presence reads one document per listing, retains UTF-16 offsets and does n
   const first = f.curation.addTask({ ...base, contentFingerprint: chunkFingerprint(chunks[0]) });
   const last = f.curation.addTask({ ...base, contentFingerprint: chunkFingerprint(chunks[199]) });
   const prepare = f.db.prepare.bind(f.db);
-  let documentReads = 0, offsetReads = 0;
+  let materializedChars = 0;
+  const countText = (row: unknown) => {
+    if (row && typeof row === "object") {
+      for (const value of Object.values(row)) if (typeof value === "string") materializedChars += value.length;
+    }
+  };
   t.mock.method(f.db, "prepare", (sql: string) => {
-    if (sql.includes("c.doc")) {
-      documentReads++;
-      assert.doesNotMatch(sql, /content_vectors/, "must not repeat document text per chunk");
-    } else if (sql.includes("content_vectors")) offsetReads++;
-    return prepare(sql);
+    const statement = prepare(sql);
+    return {
+      run: statement.run.bind(statement),
+      get<T>(...params: Parameters<typeof statement.get>) {
+        const row = statement.get<T>(...params); countText(row); return row;
+      },
+      all<T>(...params: Parameters<typeof statement.all>) {
+        const rows = statement.all<T>(...params); rows.forEach(countText); return rows;
+      },
+      *iterate<T>(...params: Parameters<typeof statement.iterate>) {
+        for (const row of statement.iterate<T>(...params)) { countText(row); yield row; }
+      },
+    };
   });
-  const cache = new Map<string, Set<string>>();
-  assert.equal(qualityTaskPresence(f.db, first, cache), "present_in_index");
-  assert.equal(qualityTaskPresence(f.db, last, cache), "present_in_index");
-  assert.equal(documentReads, 1);
-  assert.equal(offsetReads, 1);
+  const listed = await manager.listMaintenanceTasks();
+  assert.equal(listed.find(task => task.id === first.id)?.indexPresence, "present_in_index");
+  assert.equal(listed.find(task => task.id === last.id)?.indexPresence, "present_in_index");
+  assert.ok(materializedChars >= note.text.length && materializedChars <= note.text.length + 100,
+    `one listing materialized ${materializedChars} characters for a ${note.text.length}-character document`);
   f.db.prepare("DELETE FROM content_vectors WHERE hash = ? AND seq = 199").run(note.hash);
-  assert.equal(qualityTaskPresence(f.db, last), "not_present_in_index");
-  assert.equal(documentReads, 2);
+  materializedChars = 0;
+  const refreshed = await manager.listMaintenanceTasks();
+  assert.equal(refreshed.find(task => task.id === first.id)?.indexPresence, "present_in_index");
+  assert.equal(refreshed.find(task => task.id === last.id)?.indexPresence, "not_present_in_index");
+  assert.ok(materializedChars >= note.text.length && materializedChars <= note.text.length + 100);
 });

@@ -7,7 +7,7 @@ import { CurationStore } from "../../src/curation.js";
 import { ensureMemoryAnalysisSchema, clusterReference } from "../../src/analysis.js";
 
 export async function reviewFixture(): Promise<{
-  db: QMDStore["internal"]["db"]; store: QMDStore; source: ResolvedSource; curation: CurationStore;
+  db: QMDStore["internal"]["db"]; store: QMDStore; source: ResolvedSource; curation: CurationStore; curationPath: string;
   insert(text: string, collection?: string): Promise<{ hash: string; path: string; uri: string; text: string }>;
   cluster(hashes: string[]): string;
   params: { db: QMDStore["internal"]["db"]; sources: ResolvedSource[]; apiKey: string; timeoutMs: number; signal: AbortSignal };
@@ -18,7 +18,8 @@ export async function reviewFixture(): Promise<{
   await mkdir(source.root, { recursive: true });
   const store = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   const db = store.internal.db;
-  const curation = new CurationStore(join(root, "curation.sqlite"));
+  const curationPath = join(root, "curation.sqlite");
+  const curation = new CurationStore(curationPath);
   ensureMemoryAnalysisSchema(db);
   let count = 0;
   const insert = async (text: string, collection = source.collection) => {
@@ -38,7 +39,7 @@ export async function reviewFixture(): Promise<{
       .run(hash, 1 - i / hashes.length, i + 1));
     return clusterReference("run", 1);
   };
-  return { db, store, source, curation, insert, cluster,
+  return { db, store, source, curation, curationPath, insert, cluster,
     params: { db, sources: [source], apiKey: "fake-secret", timeoutMs: 1000, signal: new AbortController().signal },
     close: async () => { curation.close(); await store.close(); },
   };
