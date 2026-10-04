@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-memory",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Workspace-native memory for OpenClaw, powered by QMD",
   "type": "module",
   "license": "MIT",
@@ -46,7 +46,7 @@
   },
   "dependencies": {
     "@huggingface/tokenizers": "0.2.0",
-    "@unblocklabs/qmd": "https://github.com/unblocklabs-ai/qmd/releases/download/v2.10.3/unblocklabs-qmd-2.10.3.tgz",
+    "@unblocklabs/qmd": "https://github.com/unblocklabs-ai/qmd/releases/download/v2.10.4/unblocklabs-qmd-2.10.4.tgz",
     "chokidar": "5.0.0",
     "js-tiktoken": "1.0.21",
     "picomatch": "^4.0.5",
