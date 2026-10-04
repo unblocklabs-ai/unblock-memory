@@ -85,15 +85,9 @@ export declare class TrainingStore {
         error: string;
     }): void;
     retry(includeAmbiguous: boolean, ids: readonly string[]): number;
-    activeExamples(): TrainingSourceExample[];
-    queryExamples(threshold?: number): {
+    queryExamples(threshold?: number): (TrainingSourceExample & {
         recallProbability: number;
-        id: string;
-        inputHash: string;
-        inputJson: string;
-        sessionId: string;
-        timestamp: number;
-    }[];
+    })[];
     step<S extends keyof TrainingStepResults>(stage: S, parameters: Record<string, unknown>): {
         id: string;
         stage: S;

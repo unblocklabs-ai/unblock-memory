@@ -60,7 +60,6 @@ function createManagerStore(
     async listCollections() { return []; },
     async vsearch() { return []; },
     async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; },
     async close() {},
     ...overrides,
   };
@@ -301,7 +300,6 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
     async listCollections() { return []; },
     async vsearch() { return []; },
     async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
-    async getDocumentBody() { return null; },
     async close() {},
   } satisfies ManagerStore;
 
@@ -459,7 +457,7 @@ test("scopes vector search to named corpora and labels results", async () => {
       searchedWithoutExpansion.push(options?.expand === false);
       return hits.filter((hit) => collections.some((collection) => hit.file.startsWith(`qmd://${collection}/`)));
     },
-    async get(query) {
+    async get(query, options) {
       return {
         filepath: query,
         displayPath: "note.md",
@@ -470,9 +468,9 @@ test("scopes vector search to named corpora and labels results", async () => {
         collectionName: projects.collection,
         modifiedAt: "",
         bodyLength: 13,
+        ...(options?.includeBody ? { body: "projects body\n" } : {}),
       };
     },
-    async getDocumentBody() { return "projects body\n"; },
   });
   const manager = new QmdMemoryManager({
     dbPath: join(workspace, "index.sqlite"),
@@ -486,7 +484,7 @@ test("scopes vector search to named corpora and labels results", async () => {
     assert.deepEqual((await manager.search("notes", { corpora: ["all"] })).map((hit) => hit.corpus), ["memory", "projects"]);
     const [projectHit] = await manager.search("notes", { corpora: ["projects"] });
     assert.equal(projectHit?.corpus, "projects");
-    assert.equal((await manager.readFile({ relPath: projectHit!.path })).status, "ok");
+    assert.equal((await manager.readFile({ relPath: projectHit!.path })).text, "projects body");
     assert.deepEqual(
       (await manager.search("notes", { corpora: ["memory", "projects", "memory"] })).map((hit) => hit.corpus),
       ["memory", "projects"],

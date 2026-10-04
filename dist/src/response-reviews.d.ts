@@ -8,7 +8,7 @@ export declare class ResponseReviews {
     constructor(db: DatabaseSync);
     sync(cohort: string, episodeId: string, inputHash: string, result: ResponseResult, now: number): void;
     refresh(cohort: string, since: number): number;
-    reconcile(cohort: string): void;
+    reconcile(cohort: string, sessionId: string): void;
     list(cohort: string, id?: string): {
         id: string;
         episodeId: string;

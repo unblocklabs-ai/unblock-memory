@@ -3,4 +3,8 @@ export declare function messageText(message: unknown): {
     role: "user" | "assistant";
     text: string;
 } | undefined;
-export declare function buildSkillWhispererQuery(prompt: string, messages: readonly unknown[], historyMessages: number): string;
+export declare function recentSkillMessages(messages: readonly unknown[], limit: number): {
+    role: "user" | "assistant";
+    text: string;
+}[];
+export declare function buildSkillWhispererQuery(prompt: string, history: readonly NonNullable<ReturnType<typeof messageText>>[]): string;

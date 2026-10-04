@@ -61,20 +61,29 @@ export async function auditQualityPage(params: {
   if (!sources.size) return result("ok", true);
   const limit = Math.max(1, Math.min(20, Math.floor(params.limit ?? 10)));
   const rows = db.prepare(`SELECT d.id AS document_id, cv.seq, d.collection, d.path,
-      d.hash, cv.pos, cv.chunk_len, c.doc
+      d.hash, cv.pos, cv.chunk_len
     FROM documents d JOIN content c ON c.hash = d.hash JOIN content_vectors cv ON cv.hash = d.hash
     WHERE d.active = 1 AND d.collection IN (${[...sources].map(() => "?").join(",")})
       AND (d.id > ? OR (d.id = ? AND cv.seq > ?))
-    ORDER BY d.id, cv.seq LIMIT ?`).all<ChunkRow>(
+    ORDER BY d.id, cv.seq LIMIT ?`).all<Omit<ChunkRow, "doc">>(
     ...sources.keys(), params.after?.documentId ?? 0, params.after?.documentId ?? 0, params.after?.seq ?? -1, limit + 1,
   );
   const current = db.prepare(`SELECT 1 FROM documents d JOIN content_vectors cv ON cv.hash = d.hash
     WHERE d.id = ? AND d.active = 1 AND d.collection = ? AND d.path = ? AND d.hash = ?
       AND cv.seq = ? AND cv.pos = ? AND cv.chunk_len = ?`);
   const page = rows.slice(0, limit);
+  const bodies = new Map<string, string>();
+  const readBody = db.prepare("SELECT doc FROM content WHERE hash = ?");
   try {
     check();
-    const batch = page.map(row => {
+    const batch = page.map(metadata => {
+      let doc = bodies.get(metadata.hash);
+      if (doc === undefined) {
+        // Content is hash-addressed; this capture does not yield before inference.
+        doc = readBody.get<{ doc: string }>(metadata.hash)!.doc;
+        bodies.set(metadata.hash, doc);
+      }
+      const row = { ...metadata, doc };
       const source = sources.get(row.collection)!;
       const text = row.doc.slice(row.pos, row.pos + row.chunk_len);
       const fingerprint = chunkFingerprint(text);

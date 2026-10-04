@@ -8,15 +8,18 @@ type ClassifyWorkspaceMemoryPaths = NonNullable<
   MemoryPluginRuntimeContract["classifyWorkspaceMemoryPaths"]
 >;
 
-export const classifyWorkspaceMemoryPaths: ClassifyWorkspaceMemoryPaths = async (params) =>
-  await Promise.all(params.relativePaths.map(async (relativePath) => {
-    let workspacePath: string;
+export const classifyWorkspaceMemoryPaths: ClassifyWorkspaceMemoryPaths = async (params) => {
+  if (!params.relativePaths.length) return [];
+  let workspacePath: string;
+  try {
+    workspacePath = await fs.realpath(params.workspaceDir);
+  } catch {
+    return params.relativePaths.map(relativePath => ({ relativePath, originClass: "untrusted" }));
+  }
+  return await Promise.all(params.relativePaths.map(async (relativePath) => {
     let filePath: string;
     try {
-      [workspacePath, filePath] = await Promise.all([
-        fs.realpath(params.workspaceDir),
-        fs.realpath(path.resolve(params.workspaceDir, relativePath)),
-      ]);
+      filePath = await fs.realpath(path.resolve(params.workspaceDir, relativePath));
     } catch {
       return { relativePath, originClass: "untrusted" };
     }
@@ -47,3 +50,4 @@ export const classifyWorkspaceMemoryPaths: ClassifyWorkspaceMemoryPaths = async 
       originClass: recorded?.originClass ?? (isWorkspaceMemory ? "agent" : "untrusted"),
     };
   }));
+};

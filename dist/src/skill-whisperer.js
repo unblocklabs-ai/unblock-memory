@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 import { selectTypeSafeSkill } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { buildSkillWhispererQuery, messageText } from "./whisperer-context.js";
+import { buildSkillWhispererQuery, recentSkillMessages } from "./whisperer-context.js";
 import { abortable } from "./abortable.js";
 const CANDIDATE_LIMIT = 10;
 const MAX_QUERY_CHARS = 12_000;
@@ -10,18 +10,15 @@ const TOTAL_TIMEOUT_MS = 3000;
 function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-function typeSafeConversation(prompt, messages, historyMessages) {
+function typeSafeConversation(prompt, messages) {
     const currentRequest = prompt.trim().slice(-MAX_QUERY_CHARS);
     let remaining = MAX_QUERY_CHARS - currentRequest.length;
-    const available = messages.flatMap(message => {
-        const parsed = messageText(message);
-        return parsed ? [{ role: parsed.role, content: parsed.text }] : [];
-    });
     const history = [];
-    for (const message of (historyMessages ? available.slice(-historyMessages) : []).reverse()) {
+    for (let i = messages.length - 1; i >= 0; i--) {
         if (remaining <= 0)
             break;
-        const content = message.content.slice(-remaining);
+        const message = messages[i];
+        const content = message.text.slice(-remaining);
         history.unshift({ role: message.role, content });
         remaining -= content.length;
     }
@@ -73,7 +70,8 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
                 signal.throwIfAborted();
                 if (!apiKey)
                     diagnostics?.record(agentId, "skill", typesafe.enabled ? "missing_key" : "typesafe_disabled");
-                const candidates = await abortable(runtime.searchSkills(runtimeParams, buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages), apiKey ? -1 : config.minScore, CANDIDATE_LIMIT), signal);
+                const recentMessages = recentSkillMessages(event.messages, config.historyMessages);
+                const candidates = await abortable(runtime.searchSkills(runtimeParams, buildSkillWhispererQuery(event.prompt, recentMessages), apiKey ? -1 : config.minScore, CANDIDATE_LIMIT), signal);
                 signal.throwIfAborted();
                 const resolvedCandidates = candidates.flatMap((candidate) => {
                     const canonicalPath = runtime.resolveSkillPath(runtimeParams, candidate.path);
@@ -96,7 +94,7 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
                     }
                     const selectedIndex = await abortable(selectTypeSafeSkill({
                         apiKey, timeoutMs: typesafe.timeoutMs, signal,
-                        ...typeSafeConversation(event.prompt, event.messages, config.historyMessages),
+                        ...typeSafeConversation(event.prompt, recentMessages),
                         candidates: shortlist.map(({ candidate }) => candidate),
                         onCandidateFailure: (candidateIndex, error) => {
                             if (signal.aborted)

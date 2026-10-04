@@ -61,6 +61,27 @@ test("closes failed startup attempts before retrying and preserves the startup e
   assert.equal(watcherClose.mock.callCount(), 3);
 });
 
+test("a failed old startup does not evict its replacement after close", async t => {
+  let failStartup!: (error: Error) => void;
+  const startup = new Promise<void>((_, reject) => { failStartup = reject; });
+  let attempts = 0;
+  t.mock.method(QmdMemoryManager.prototype, "start", async () => {
+    if (++attempts === 1) await startup;
+  });
+  t.mock.method(QmdMemoryManager.prototype, "close", async () => {});
+  const runtime = new QmdMemoryRuntime([]);
+  t.after(() => runtime.closeAllMemorySearchManagers());
+
+  const oldLookup = runtime.getMemorySearchManager(active);
+  const oldClose = runtime.closeMemorySearchManager(active).catch(() => undefined);
+  const replacement = await runtime.getMemorySearchManager(active);
+  failStartup(new Error("old startup failed"));
+  assert.deepEqual(await oldLookup, { manager: null, error: "old startup failed" });
+  await oldClose;
+  assert.ok(replacement.manager);
+  assert.equal((await runtime.getMemorySearchManager(active)).manager, replacement.manager);
+});
+
 test("schedules configured agents after the interval, retries failures, and stops cleanly", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const runtime = new QmdMemoryRuntime(sessionCorpora);
@@ -133,6 +154,14 @@ test("classifies only canonical workspace memory as trusted", async () => {
     { relativePath: "memory/dreaming/report.md", originClass: "system" },
     { relativePath: "memory/linked.md", originClass: "untrusted" },
     { relativePath: "missing.md", originClass: "untrusted" },
+  ]);
+  const missingWorkspace = { cfg: {}, agentId: "main", workspaceDir: join(workspaceDir, "missing") };
+  assert.deepEqual(await runtime.classifyWorkspaceMemoryPaths({ ...missingWorkspace, relativePaths: [] }), []);
+  assert.deepEqual(await runtime.classifyWorkspaceMemoryPaths({
+    ...missingWorkspace, relativePaths: ["MEMORY.md", "notes.md"],
+  }), [
+    { relativePath: "MEMORY.md", originClass: "untrusted" },
+    { relativePath: "notes.md", originClass: "untrusted" },
   ]);
 });
 

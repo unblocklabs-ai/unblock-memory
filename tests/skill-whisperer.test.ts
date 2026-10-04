@@ -4,7 +4,6 @@ import test from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { registerSkillWhisperer } from "../src/skill-whisperer.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
-import { buildSkillWhispererQuery } from "../src/whisperer-context.js";
 import type { UnblockMemoryConfig } from "../src/config.js";
 
 const disabledTypeSafe = { enabled: false, timeoutMs: 1500 };
@@ -47,6 +46,7 @@ const enabled = {
 function harness(
   candidates: Array<{ name: string; path: string; score: number }>,
   typesafe: UnblockMemoryConfig["typesafe"] = disabledTypeSafe,
+  controls: UnblockMemoryConfig["skillWhisperer"] = enabled,
 ) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
   const queries: string[] = [];
@@ -71,7 +71,7 @@ function harness(
     },
     resolveSkillPath(_params: unknown, path: string) { return path.startsWith("/skills/") ? path : undefined; },
   };
-  const before = registerSkillWhisperer(api, runtime, enabled, typesafe, diagnostics);
+  const before = registerSkillWhisperer(api, runtime, controls, typesafe, diagnostics);
   return {
     api,
     runtime,
@@ -87,17 +87,33 @@ function harness(
   };
 }
 
-test("builds a bounded semantic query from only the configured recent conversation", () => {
-  assert.equal(buildSkillWhispererQuery("current request", [
+test("skill query and Jev use only bounded visible history without reading discarded messages", async t => {
+  let expectedHistory = [{ role: "assistant", content: "recent answer" }, { role: "user", content: "recent question" }];
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    assert.deepEqual(JSON.parse(String(init?.body)).state.history, expectedHistory);
+    return typeSafeResponse("skill_0");
+  });
+  let discardedReads = 0;
+  const ignored = { role: "user", get content(): string { discardedReads++; return "old excluded request"; } };
+  const messages = [
+    ignored,
     { role: "system", content: "secret system" },
-    { role: "user", content: "too old" },
     { role: "assistant", content: [{ type: "text", text: "recent answer" }, { type: "tool_call", text: "ignored" }] },
     { role: "toolResult", content: "ignored result" },
     { role: "user", content: "recent question" },
-  ], 2), "assistant: recent answer\n\nuser: recent question\n\nuser: current request");
-  assert.equal(buildSkillWhispererQuery("current request", [
-    { role: "user", content: "ignored history" },
-  ], 0), "user: current request");
+    { role: "assistant", content: [{ type: "thinking", text: "private" }] },
+  ];
+  const candidates = [{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }];
+  const context = { trigger: "user", runId: "run", agentId: "bill", sessionId: "session" };
+  const h = harness(candidates, activeTypeSafe);
+  assert.match((await h.before({ prompt: "current request", messages }, context))?.appendContext ?? "", /alpha/);
+  assert.deepEqual(h.queries, ["assistant: recent answer\n\nuser: recent question\n\nuser: current request"]);
+  assert.equal(discardedReads, 0, "discarded history must not be read");
+  expectedHistory = [];
+  const noHistory = harness(candidates, activeTypeSafe, { ...enabled, historyMessages: 0 });
+  assert.match((await noHistory.before({ prompt: "current request", messages: [ignored] }, context))?.appendContext ?? "", /alpha/);
+  assert.deepEqual(noHistory.queries, ["user: current request"]);
+  assert.equal(discardedReads, 0, "zero-history turns must not read any history");
 });
 
 test("suggests the best skill, emits nothing while it cools down, and is idempotent per run", async () => {

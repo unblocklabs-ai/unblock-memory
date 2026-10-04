@@ -17,6 +17,8 @@ test("TypeSafe is enabled by default with optional explicit credentials", () => 
 });
 
 test("uses the canonical memory corpus when corpora are absent", () => {
+  assert.deepEqual(resolveConfig(undefined), resolveConfig({}));
+  assert.deepEqual(resolveConfig(null), resolveConfig({}));
   assert.deepEqual(resolveConfig(undefined).corpora, DEFAULT_CORPORA);
   assert.deepEqual(resolveConfig({}).corpora, DEFAULT_CORPORA);
 });

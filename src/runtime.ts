@@ -141,7 +141,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     try {
       return { manager: await pending };
     } catch (error) {
-      this.#managers.delete(params.agentId);
+      if (this.#managers.get(params.agentId) === pending) this.#managers.delete(params.agentId);
       return { manager: null, error: error instanceof Error ? error.message : String(error) };
     }
   }

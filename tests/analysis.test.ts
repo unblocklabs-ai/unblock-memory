@@ -213,6 +213,9 @@ test("lists short cluster references and fetches representative and noise member
     assert.equal(listed.analyzedAt, "2026-08-24T10:00:00Z");
     assert.match(listed.clusters[0]?.clusterId ?? "", /^[0-9a-f]{10}$/);
     assert.equal(listed.clusters[0]?.preview?.hash, "rank-one");
+    assert.equal(listed.clusters[0]?.preview?.probability, 0.5);
+    assert.deepEqual(listed.clusters[0]?.preview?.sourcePaths, ["qmd://memory/rank-one.md"]);
+    assert.ok(Buffer.byteLength(listed.clusters[0]!.preview!.text) <= 600);
     assert.equal(listed.clusters[0]?.availableSize, 3);
     assert.match(listed.noise?.clusterId ?? "", /^[0-9a-f]{10}$/);
 

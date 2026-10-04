@@ -70,9 +70,11 @@ continue without retrying failed requests. Storage/lease failures still stop the
 In-flight work drains and persists before snapshots close. Dry runs make no inference calls.
 
 Cached evaluations still validate the exact historical text and vector fingerprint,
-but do not rebuild a QMD index. The index is built only on the first uncached search,
-from the same read-only SQLite transaction used to compute that fingerprint.
-Concurrent queries share that index; changed corpus content still invalidates caches.
+but do not rebuild a QMD index. Each evaluation run captures immutable source text
+and vector bytes once, then closes the source reader. Each exact cutoff derives its
+own fingerprint and builds a private index only on its first uncached search.
+Concurrent queries at that cutoff share the index; later runs capture fresh source
+bytes, so changed corpus content still invalidates caches.
 
 ## Input and historical boundaries
 
@@ -99,10 +101,9 @@ unknown/future dates. Never infer dates from quoted headings. Copy existing vect
 only for complete chunks within the safe prefix; BM25 sees that same prefix.
 Validate returned passages/dates again. No reembedding or temporary transcripts.
 
-QMD cannot independently set per-method depth through its public search API.
-A small discovery adapter retains its tokenization, FTS-highlight chunk selection,
-source-aware dedup and installed chunk helpers, but requests ten from the selected
-backend and omits query-conditioned scoring. It does not rewrite QMD. Training and
+QMD's public `discoverCandidates` API owns tokenization, FTS-highlight chunk
+selection and source-aware deduplication. A small adapter requests ten from the
+selected backend and omits query-conditioned scoring. Training and
 runtime share complete-excerpt rendering, including the 1,200-character cap;
 oversized matches are discarded rather than truncated.
 

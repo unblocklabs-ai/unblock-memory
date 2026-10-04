@@ -78,7 +78,6 @@ export type ManagerStore = Pick<
   | "listCollections"
   | "vsearch"
   | "get"
-  | "getDocumentBody"
   | "close"
 >;
 
@@ -1205,14 +1204,12 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     }
     await this.#operationChain;
     const store = await this.#getStore();
-    const doc = await store.get(safe.normalized);
-    if ("error" in doc || doc.filepath !== safe.normalized) {
+    const doc = await store.get(safe.normalized, { includeBody: true });
+    if ("error" in doc || doc.filepath !== safe.normalized || doc.body === undefined) {
       return { status: "not_found", text: "", path: params.relPath };
     }
-    const content = await store.getDocumentBody(safe.normalized);
-    if (content === null) return { status: "not_found", text: "", path: params.relPath };
     return buildReadResult({
-      content,
+      content: doc.body,
       path: safe.normalized,
       from: params.from,
       lines: params.lines,

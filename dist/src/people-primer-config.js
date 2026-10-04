@@ -10,12 +10,9 @@ export const peoplePrimerSchema = Type.Object({
     timeoutMs: Type.Integer({ minimum: 1, maximum: 60000, default: 30000 }),
 }, { additionalProperties: false });
 export function resolvePeoplePrimer(value, corpora, peopleEnabled) {
-    if (value === undefined)
-        return { enabled: false, corpora: [], hitsPerQuestion: 30,
-            minScore: 0.35, minUsefulness: 0.8, maxEvidencePerQuestion: 3, timeoutMs: 30000 };
     let config;
     try {
-        const withDefaults = Value.Default(peoplePrimerSchema, value);
+        const withDefaults = Value.Default(peoplePrimerSchema, value === undefined ? {} : value);
         if (!Value.Check(peoplePrimerSchema, withDefaults))
             throw new Error("Invalid config");
         config = withDefaults;

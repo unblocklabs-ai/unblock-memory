@@ -136,20 +136,21 @@ export class TrainingStore {
             this.#db.prepare("UPDATE training_examples SET active=0 WHERE session_id=?").run(sessionId);
             const counts = { added: 0, changed: 0, unchanged: 0, retired: 0 };
             const retained = new Set();
+            const input = this.#db.prepare("INSERT OR IGNORE INTO training_inputs VALUES (?,?,?)");
+            const source = this.#db.prepare(`INSERT INTO training_examples VALUES (?,?,?,?,?,?,1)
+        ON CONFLICT(session_id,event_seq) DO UPDATE SET timestamp=excluded.timestamp,input_hash=excluded.input_hash,
+        context_limited=excluded.context_limited,active=1`);
+            const gate = this.#db.prepare(`INSERT OR IGNORE INTO training_gates
+        (id,input_hash,prompt_version,requested_model,status) VALUES (?,?,?,?,'pending')`);
             for (const example of examples) {
                 const old = previous.get(example.seq);
                 if (!old && (existingOnly || example.timestamp < since || example.timestamp >= until))
                     continue;
                 retained.add(example.seq);
-                this.#db.prepare("INSERT OR IGNORE INTO training_inputs VALUES (?,?,?)")
-                    .run(example.inputHash, TRAINING_PREPARATION, JSON.stringify(example.input));
-                this.#db.prepare(`INSERT INTO training_examples VALUES (?,?,?,?,?,?,1)
-          ON CONFLICT(session_id,event_seq) DO UPDATE SET timestamp=excluded.timestamp,input_hash=excluded.input_hash,
-          context_limited=excluded.context_limited,active=1`)
-                    .run(trainingHash([this.#nodeId, this.#agentId, sessionId, example.seq]), sessionId, example.seq, example.timestamp, example.inputHash, Number(example.contextLimited));
+                input.run(example.inputHash, TRAINING_PREPARATION, JSON.stringify(example.input));
+                source.run(trainingHash([this.#nodeId, this.#agentId, sessionId, example.seq]), sessionId, example.seq, example.timestamp, example.inputHash, Number(example.contextLimited));
                 const id = trainingHash([example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL]);
-                this.#db.prepare(`INSERT OR IGNORE INTO training_gates (id,input_hash,prompt_version,requested_model,status) VALUES (?,?,?,?,'pending')`)
-                    .run(id, example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL);
+                gate.run(id, example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL);
                 if (!old)
                     counts.added++;
                 else if (old.input_hash !== example.inputHash || old.active !== 1)
@@ -211,21 +212,15 @@ export class TrainingStore {
             return count + Number(gates.changes) + Number(steps.changes);
         }, 0));
     }
-    activeExamples() {
-        return this.#db.prepare(`SELECT e.id,e.input_hash inputHash,i.input_json inputJson,e.session_id sessionId,e.timestamp
-      FROM training_examples e JOIN training_inputs i ON i.hash=e.input_hash
-      WHERE e.active=1 AND i.preparation=? ORDER BY e.timestamp DESC,e.id`).all(TRAINING_PREPARATION);
-    }
     queryExamples(threshold = TRAINING_GATE_THRESHOLD) {
         if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1)
             throw new Error("Threshold must be between 0 and 1");
-        const probabilities = new Map(this.#db.prepare(`SELECT g.input_hash,g.probability FROM training_gates g
-      WHERE ${this.#scope} AND g.status='complete' AND g.probability>=?`)
-            .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION, threshold).map(row => [String(row.input_hash), Number(row.probability)]));
-        return this.activeExamples().flatMap(example => {
-            const recallProbability = probabilities.get(example.inputHash);
-            return recallProbability === undefined ? [] : [{ ...example, recallProbability }];
-        });
+        return this.#db.prepare(`SELECT e.id,e.input_hash inputHash,i.input_json inputJson,e.session_id sessionId,e.timestamp,
+      g.probability recallProbability FROM training_examples e JOIN training_inputs i ON i.hash=e.input_hash
+      JOIN training_gates g ON g.input_hash=e.input_hash
+      WHERE e.active=1 AND i.preparation=? AND g.prompt_version=? AND g.requested_model=?
+      AND g.status='complete' AND g.probability>=? ORDER BY e.timestamp DESC,e.id`)
+            .all(TRAINING_PREPARATION, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, threshold);
     }
     step(stage, parameters) {
         const request = { ...parameters, recipe: TRAINING_RECIPE_VERSION };

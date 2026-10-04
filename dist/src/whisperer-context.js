@@ -11,11 +11,16 @@ export function messageText(message) {
         }).join("\n").trim() : "";
     return text ? { role: message.role, text } : undefined;
 }
-export function buildSkillWhispererQuery(prompt, messages, historyMessages) {
-    const availableHistory = messages.flatMap(message => {
-        const parsed = messageText(message);
-        return parsed ? [`${parsed.role}: ${parsed.text}`] : [];
-    });
-    const history = historyMessages === 0 ? [] : availableHistory.slice(-historyMessages);
-    return [...history, `user: ${prompt.trim()}`].join("\n\n").slice(-MAX_SKILL_QUERY_CHARS);
+export function recentSkillMessages(messages, limit) {
+    const history = [];
+    for (let i = messages.length - 1; i >= 0 && history.length < limit; i--) {
+        const parsed = messageText(messages[i]);
+        if (parsed)
+            history.push(parsed);
+    }
+    return history.reverse();
+}
+export function buildSkillWhispererQuery(prompt, history) {
+    return [...history.map(message => `${message.role}: ${message.text}`), `user: ${prompt.trim()}`]
+        .join("\n\n").slice(-MAX_SKILL_QUERY_CHARS);
 }

@@ -332,8 +332,9 @@ export async function syncSessionProjections(params) {
         else
             counts.unchanged += 1;
     }
+    const liveIds = new Set(snapshot.windows.map(window => window.sessionId));
     for (const [sessionId, session] of Object.entries(previousManifest.sessions)) {
-        if (sessions[sessionId] || snapshot.windows.some((window) => window.sessionId === sessionId))
+        if (sessions[sessionId] || liveIds.has(sessionId))
             continue;
         await remove(projectionPath(params.outputDir, session.documentPath));
         counts.removed += 1;

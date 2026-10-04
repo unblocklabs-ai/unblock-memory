@@ -15,11 +15,9 @@ export const peoplePrimerSchema = Type.Object({
 export type PeoplePrimerConfig = Static<typeof peoplePrimerSchema>;
 
 export function resolvePeoplePrimer(value: unknown, corpora: readonly CorpusConfig[], peopleEnabled: boolean): PeoplePrimerConfig {
-  if (value === undefined) return { enabled: false, corpora: [], hitsPerQuestion: 30,
-    minScore: 0.35, minUsefulness: 0.8, maxEvidencePerQuestion: 3, timeoutMs: 30000 };
   let config: PeoplePrimerConfig;
   try {
-    const withDefaults: unknown = Value.Default(peoplePrimerSchema, value);
+    const withDefaults: unknown = Value.Default(peoplePrimerSchema, value === undefined ? {} : value);
     if (!Value.Check(peoplePrimerSchema, withDefaults)) throw new Error("Invalid config");
     config = withDefaults;
   }

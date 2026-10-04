@@ -397,23 +397,7 @@ function resolvePeople(value: unknown): UnblockMemoryConfig["people"] {
 }
 
 export function resolveConfig(value: unknown): UnblockMemoryConfig {
-  if (value === undefined || value === null) {
-    return {
-      corpora: DEFAULT_CORPORA,
-      extraction: resolveExtraction(undefined, DEFAULT_CORPORA),
-      keepEmbeddingModelWarm: true,
-      analysis: {},
-      typesafe: { ...DEFAULT_TYPESAFE_CONFIG },
-      qualityAudit: { ...DEFAULT_QUALITY_AUDIT },
-      evidenceReview: { enabled: false, corpora: [] },
-      responseAudit: resolveResponseAudit(undefined, DEFAULT_CORPORA),
-      insideOut: resolveInsideOut(undefined),
-      peoplePrimer: resolvePeoplePrimer(undefined, DEFAULT_CORPORA, false),
-      people: DEFAULT_PEOPLE_CONFIG,
-      skillWhisperer: DEFAULT_SKILL_WHISPERER,
-      memoryWhisperer: { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined) },
-    };
-  }
+  if (value === undefined || value === null) value = {};
   if (typeof value !== "object" || Array.isArray(value)) {
     throw new Error("unblock-memory config must be an object");
   }

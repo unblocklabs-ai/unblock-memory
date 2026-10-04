@@ -68,11 +68,13 @@ export class ResponseReviews {
             throw error;
         }
     }
-    reconcile(cohort) {
+    reconcile(cohort, sessionId) {
         this.db.prepare(`UPDATE response_review_evidence AS e SET active=CASE WHEN EXISTS (
       SELECT 1 FROM response_review_tasks t JOIN response_results r ON r.id=t.episode_id
       WHERE t.id=e.task_id AND r.cohort=e.cohort AND r.input_hash=e.input_hash AND r.active=1 AND r.status='ok')
-      THEN 1 ELSE 0 END WHERE cohort=? AND active>=0`).run(cohort);
+      THEN 1 ELSE 0 END WHERE cohort=? AND active>=0 AND task_id IN (
+        SELECT t.id FROM response_results r JOIN response_review_tasks t ON t.episode_id=r.id
+        WHERE r.cohort=? AND r.session_id=?)`).run(cohort, cohort, sessionId);
     }
     list(cohort, id) {
         return this.db.prepare(`SELECT t.*,e.input_hash,e.active,e.detail FROM response_review_tasks t

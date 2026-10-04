@@ -83,6 +83,29 @@ test("opens one store lazily per agent and preserves it across reopen", async ()
   reopened.closeAll();
 });
 
+test("primer cache retains the newest 2000 judgments across reopen", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const person = store.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U123" }).person;
+    for (let i = 0; i < 2002; i++) {
+      // Lower keys break equal-millisecond timestamps in favor of newer entries.
+      store.cachePrimerJudgment(person.id, `key-${String(2001 - i).padStart(4, "0")}`, { score: i });
+    }
+    assert.equal(store.getPrimerJudgment("key-2001"), undefined);
+    assert.equal(store.getPrimerJudgment("key-2000"), undefined);
+    assert.deepEqual(store.getPrimerJudgment("key-1999"), { score: 2 });
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM person_primer_judgments").get()?.n, 2000);
+    } finally { db.close(); }
+  } finally { store.close(); }
+  const reopened = new PeopleStore(path, options);
+  try {
+    assert.deepEqual(reopened.getPrimerJudgment("key-0000"), { score: 2001 });
+  } finally { reopened.close(); }
+});
+
 test("existing people stores gain indexed per-person identity lookups without changing their records", async () => {
   const path = await temporaryPath();
   const original = new PeopleStore(path, options);

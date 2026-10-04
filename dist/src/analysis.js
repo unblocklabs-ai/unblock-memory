@@ -260,8 +260,8 @@ function byteSlice(text, maxBytes) {
         return "";
     return bytes.subarray(0, maxBytes - 3).toString("utf8").replace(/\uFFFD$/u, "") + "…";
 }
-function members(db, runId, clusterId, limit, offset = 0, sort = "representative", maxExcerptBytes = MAX_EXCERPT_BYTES, maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES, maxTotalAliases = MAX_TOTAL_ALIASES, temporal = {}) {
-    const representativeOrder = clusterId === -1
+function representativeOrder(clusterId) {
+    return clusterId === -1
         ? "m.outlier_score DESC, m.hash, m.seq"
         : `CASE WHEN m.representative_rank IS NULL THEN 1 ELSE 0 END,
        m.representative_rank,
@@ -269,9 +269,11 @@ function members(db, runId, clusterId, limit, offset = 0, sort = "representative
        m.outlier_score,
        m.hash,
        m.seq`;
+}
+function members(db, runId, clusterId, limit, offset = 0, sort = "representative", maxExcerptBytes = MAX_EXCERPT_BYTES, maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES, maxTotalAliases = MAX_TOTAL_ALIASES, temporal = {}) {
     const score = clusterId === -1 ? "m.outlier_score" : "m.probability";
     const order = {
-        representative: representativeOrder,
+        representative: representativeOrder(clusterId),
         score_desc: `${score} DESC, m.hash, m.seq`,
         score_asc: `${score} ASC, m.hash, m.seq`,
         date_desc: "julianday(COALESCE(m.event_time, m.source_modified_at)) DESC, m.hash, m.seq",
@@ -395,24 +397,34 @@ function readMetadata(run) {
     }
     return { stale: false, staleSince: null, analyzedAt: run.completed_at };
 }
+function clusterPreview(db, runId, clusterId, maxBytes, aliasLimit) {
+    const row = db.prepare(`
+    SELECT m.hash, m.seq, m.probability, m.pos, m.chunk_len, m.doc
+    FROM memory_analysis_available_memberships m
+    WHERE m.run_id = ? AND m.cluster_id = ?
+    ORDER BY ${representativeOrder(clusterId)}
+    LIMIT 1
+  `).get(runId, clusterId);
+    if (!row)
+        return undefined;
+    return {
+        hash: row.hash,
+        seq: row.seq,
+        probability: row.probability,
+        text: byteSlice(row.doc.slice(row.pos, row.pos + row.chunk_len), maxBytes),
+        sourcePaths: sourcePaths(db, row.hash, Math.min(MAX_ALIASES_PER_MEMBER, aliasLimit)),
+    };
+}
 function toSummary(db, run, row, includePreview, previewBytes = 600, aliasLimit = MAX_TOTAL_ALIASES) {
     const preview = includePreview
-        ? members(db, run.id, row.cluster_id, 1, 0, "representative", previewBytes, previewBytes, aliasLimit)[0]
+        ? clusterPreview(db, run.id, row.cluster_id, previewBytes, aliasLimit)
         : undefined;
     return {
         clusterId: clusterReference(run.id, row.cluster_id),
         size: row.size,
         availableSize: row.available_size,
         meanProbability: row.mean_probability,
-        ...(preview ? {
-            preview: {
-                hash: preview.hash,
-                seq: preview.seq,
-                probability: preview.probability,
-                text: preview.text,
-                sourcePaths: preview.sourcePaths,
-            },
-        } : {}),
+        ...(preview ? { preview } : {}),
     };
 }
 function noiseRow(db, runId) {

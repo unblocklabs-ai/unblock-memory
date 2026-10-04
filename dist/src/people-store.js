@@ -147,6 +147,7 @@ export class PeopleStore {
     #db;
     #maxOpenTodos;
     #maxBlurbChars;
+    #primerCacheReady = false;
     constructor(path, options) {
         this.#db = openMemoryDatabase(path);
         this.#maxOpenTodos = options.maxOpenTodos;
@@ -167,12 +168,17 @@ export class PeopleStore {
     // Derived, bounded cache: no source text or credentials. Kept outside the
     // authoritative dossier schema so older plugin versions can still open it.
     #ensurePrimerCache() {
+        if (this.#primerCacheReady)
+            return;
         this.#db.exec(`CREATE TABLE IF NOT EXISTS person_primer_judgments (
       cache_key TEXT PRIMARY KEY,
       person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
       judgment_json TEXT NOT NULL,
       created_at TEXT NOT NULL
-    ) STRICT`);
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS person_primer_judgments_created
+      ON person_primer_judgments(created_at DESC, cache_key)`);
+        this.#primerCacheReady = true;
     }
     getPrimerJudgment(key) {
         this.#ensurePrimerCache();

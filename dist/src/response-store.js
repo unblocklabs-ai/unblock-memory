@@ -87,7 +87,7 @@ export class ResponseAuditStore {
         result=CASE WHEN input_hash=excluded.input_hash THEN result ELSE NULL END`);
             for (const e of episodes)
                 insert.run(cohort, e.id, sessionId, e.inputHash, e.timestamp);
-            this.reviews.reconcile(cohort);
+            this.reviews.reconcile(cohort, sessionId);
             this.#db.exec("COMMIT");
         }
         catch (error) {

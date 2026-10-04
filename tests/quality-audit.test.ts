@@ -108,6 +108,53 @@ test("bounded pages cache judgments, respect scope and preserve dismissed versio
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM documents WHERE active = 1").get<{ n: number }>()!.n, 5);
 });
 
+test("multi-chunk pages preserve UTF-16 slices without repeatedly materializing document bodies", async t => {
+  const f = await fixture(); t.after(f.close);
+  const chunks = Array.from({ length: 25 }, (_, index) => `🚀 ${index} ${"x".repeat(1000)}\n`);
+  const body = chunks.join("");
+  const hash = f.insert(body);
+  f.db.prepare("DELETE FROM content_vectors WHERE hash = ?").run(hash);
+  const insert = f.db.prepare("INSERT INTO content_vectors(hash, seq, pos, chunk_len, model, embedded_at) VALUES (?, ?, ?, ?, 'model', 'now')");
+  let pos = 0;
+  chunks.forEach((text, seq) => { insert.run(hash, seq, pos, text.length); pos += text.length; });
+  const requested: string[] = [];
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    requested.push(request.state.chunks[0].text);
+    return Response.json({ answers: {
+      noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.95 },
+    } });
+  });
+  let materializedChars = 0;
+  const countBody = (row: unknown) => {
+    if (row && typeof row === "object" && "doc" in row && typeof row.doc === "string") {
+      materializedChars += row.doc.length;
+    }
+  };
+  const prepare = f.db.prepare.bind(f.db);
+  t.mock.method(f.db, "prepare", (sql: string) => {
+    const statement = prepare(sql);
+    return {
+      run: statement.run.bind(statement),
+      iterate: statement.iterate.bind(statement),
+      get<T>(...params: Parameters<typeof statement.get>) {
+        const row = statement.get<T>(...params); countBody(row); return row;
+      },
+      all<T>(...params: Parameters<typeof statement.all>) {
+        const rows = statement.all<T>(...params); rows.forEach(countBody); return rows;
+      },
+    };
+  });
+  const first = await auditQualityPage({ ...f.params, limit: 20 });
+  assert.equal(first.scanned, 20);
+  assert.equal(first.done, false);
+  assert.deepEqual(requested, chunks.slice(0, 20));
+  assert.ok(materializedChars <= 2 * body.length, `materialized ${materializedChars} characters for one document`);
+  const second = await auditQualityPage({ ...f.params, after: first.next, limit: 20 });
+  assert.equal(second.done, true);
+  assert.deepEqual(requested, chunks);
+});
+
 test("failure, cancellation and changed index content cannot produce stale findings", async t => {
   const f = await fixture(); t.after(f.close);
   const hash = f.insert("suspected noise");

@@ -4,7 +4,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { SkillSearchCandidate } from "./manager.js";
 import { selectTypeSafeSkill } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { buildSkillWhispererQuery, messageText } from "./whisperer-context.js";
+import { buildSkillWhispererQuery, recentSkillMessages } from "./whisperer-context.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
 
@@ -35,17 +35,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function typeSafeConversation(prompt: string, messages: readonly unknown[], historyMessages: number) {
+function typeSafeConversation(prompt: string, messages: ReturnType<typeof recentSkillMessages>) {
   const currentRequest = prompt.trim().slice(-MAX_QUERY_CHARS);
   let remaining = MAX_QUERY_CHARS - currentRequest.length;
-  const available = messages.flatMap(message => {
-    const parsed = messageText(message);
-    return parsed ? [{ role: parsed.role, content: parsed.text }] : [];
-  });
   const history: { role: "user" | "assistant"; content: string }[] = [];
-  for (const message of (historyMessages ? available.slice(-historyMessages) : []).reverse()) {
+  for (let i = messages.length - 1; i >= 0; i--) {
     if (remaining <= 0) break;
-    const content = message.content.slice(-remaining);
+    const message = messages[i];
+    const content = message.text.slice(-remaining);
     history.unshift({ role: message.role, content });
     remaining -= content.length;
   }
@@ -102,9 +99,10 @@ export function registerSkillWhisperer(
         const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
         signal.throwIfAborted();
         if (!apiKey) diagnostics?.record(agentId, "skill", typesafe.enabled ? "missing_key" : "typesafe_disabled");
+        const recentMessages = recentSkillMessages(event.messages, config.historyMessages);
         const candidates = await abortable(runtime.searchSkills(
           runtimeParams,
-          buildSkillWhispererQuery(event.prompt, event.messages, config.historyMessages),
+          buildSkillWhispererQuery(event.prompt, recentMessages),
           apiKey ? -1 : config.minScore,
           CANDIDATE_LIMIT,
         ), signal);
@@ -124,7 +122,7 @@ export function registerSkillWhisperer(
           if (shortlist.every(({ canonicalPath }) => cooling(canonicalPath))) { diagnostics?.record(agentId, "skill", "cooldown"); return; }
           const selectedIndex = await abortable(selectTypeSafeSkill({
             apiKey, timeoutMs: typesafe.timeoutMs, signal,
-            ...typeSafeConversation(event.prompt, event.messages, config.historyMessages),
+            ...typeSafeConversation(event.prompt, recentMessages),
             candidates: shortlist.map(({ candidate }) => candidate),
             onCandidateFailure: (candidateIndex, error) => {
               if (signal.aborted) return;
