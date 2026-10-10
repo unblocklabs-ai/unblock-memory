@@ -37,7 +37,7 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
     if (!active) return null;
     return {
       name: "memory_diagnostics", label: "Memory Diagnostics",
-      description: "Read content-free whisperer counters, configuration state, projection version and index readiness. Does not call TypeSafe.",
+      description: "Read content-free manual-search and whisperer telemetry, configuration state, projection version and index readiness. Does not call TypeSafe.",
       parameters: noParameters,
       async execute(_id: string, params: unknown) {
         Value.Parse(noParameters, params);

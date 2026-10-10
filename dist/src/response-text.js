@@ -43,6 +43,19 @@ export function responseUserText(input, senderId) {
         const marker = markers[0];
         contextLimited = meta.history_truncated === true || rest.slice(0, marker.index).includes("Chat history since last reply:");
         text = rest.slice(marker.index + marker[0].length).trim();
+        // OpenClaw appends channel metadata after the current Slack message. Only
+        // recognize its exact boundary inside an already validated envelope.
+        const contexts = [...text.matchAll(/\r?\n\r?\nContext: ⟦openclaw:ctx⟧\r?\n/g)];
+        if (contexts.length) {
+            if (contexts.length !== 1)
+                return undefined;
+            const context = contexts[0];
+            const suffix = text.slice(context.index + context[0].length);
+            if (!suffix.trim() || suffix.includes("⟦openclaw:ctx⟧") || /^Chat history since last reply:/m.test(suffix))
+                return undefined;
+            text = text.slice(0, context.index).trim();
+            contextLimited = true;
+        }
     }
     else {
         const from = /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/.exec(text);

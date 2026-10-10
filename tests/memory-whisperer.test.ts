@@ -248,6 +248,32 @@ test("invalid v2 model output skips memory rather than using untrained queries",
   h.stop();
 });
 
+test("oversized input is reported as skipped before provider calls, including prompt rebuilds", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => { assert.fail("Oversized input reached TypeSafe"); });
+  const generation = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => { assert.fail("Oversized input reached query generation"); });
+  for (const prompt of ["private ".repeat(3001), "🚀".repeat(4000)]) {
+    const h = harness();
+    t.after(() => h.stop());
+    const oversized = { prompt, messages: [] };
+    assert.equal(await h.before(oversized, context), undefined);
+    assert.equal(await h.before(oversized, context), undefined);
+    const snapshot = h.diagnostics.snapshot("bill");
+    assert.equal(snapshot.memory.input_too_large, 1);
+    assert.equal(snapshot.memory.failed, undefined);
+    assert.deepEqual(snapshot.telemetry.operations.memoryWhisperer?.outcomes, { skipped: 1 });
+    const completed = JSON.parse(h.logs[0]!.slice(logPrefix.length));
+    assert.equal(completed.event, "completed");
+    assert.equal(completed.stage, "input");
+    assert.equal(completed.outcome, "skipped");
+    assert.equal(completed.reason, "input_too_large");
+    assert.equal(h.warnings.length, 0);
+    assert.equal(h.lookups(), 0);
+    assert.doesNotMatch(JSON.stringify(snapshot) + h.logs.join(""), /private|🚀/);
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(generation.mock.callCount(), 0);
+});
+
 test("query input unwraps Slack envelopes and retains whole visible messages only", () => {
   assert.deepEqual(queryConversation(dmPrompt, [{ role: "system", content: "hidden" },
     { role: "assistant", content: [{ type: "thinking", thinking: "secret" }, { type: "text", text: "Atlas" }] },
@@ -368,7 +394,7 @@ function harness(
   const before = registerMemoryWhisperer(api, {
     async getMemorySearchManager() {
       lookups++;
-      return { manager: { search: async () => { throw new Error("Unexpected direct-vector fallback"); }, searchWhisperer: options.hybrid ?? (async (queries, searchOptions) => {
+      return { manager: { searchCandidates: options.hybrid ?? (async (queries, searchOptions) => {
         const query = JSON.stringify(queries);
         searches.push({ query, options: searchOptions });
         return options.search ? options.search() : hits;

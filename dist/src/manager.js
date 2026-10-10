@@ -831,8 +831,8 @@ export class QmdMemoryManager {
         opts?.signal?.throwIfAborted();
         return this.#renderSearchHits(hits, store, opts);
     }
-    /** Whisperer-only discovery: exact trained recipe, no query-conditioned reranker or merged cap. */
-    async searchWhisperer(queries, opts) {
+    /** Shared discovery: exact trained recipe, scoped before either retrieval lane. */
+    async searchCandidates(queries, opts) {
         return this.#enqueue(async () => {
             opts.signal?.throwIfAborted();
             const collections = this.#collectionNames(opts.corpora);
@@ -840,12 +840,18 @@ export class QmdMemoryManager {
                 return [];
             if (this.#sessions && collections.includes(this.#sessions.collection))
                 await this.#refreshSessionMetadata();
+            const sessions = this.#sessions;
+            let allowedPaths = opts.sessionFilter && sessions && collections.includes(sessions.collection)
+                ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter) : undefined;
+            if (collections.includes(EXTRACTED_COLLECTION)) {
+                allowedPaths = { ...allowedPaths, [EXTRACTED_COLLECTION]: this.#currentExtracted(undefined, opts.sessionFilter).map(extractedPath) };
+            }
             const store = await this.#getAnalysisStore();
             const hits = new Map();
             // Serialize native QMD work. Cancellation prevents further queries/collections.
             for (const lane of ["lex", "vec"]) {
                 opts.signal?.throwIfAborted();
-                for (const hit of await trainingCandidates(store, queries[lane], collections, lane, opts.signal)) {
+                for (const hit of await trainingCandidates(store, queries[lane], collections, lane, opts.signal, allowedPaths)) {
                     const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk]);
                     if (!hits.has(key))
                         hits.set(key, { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,

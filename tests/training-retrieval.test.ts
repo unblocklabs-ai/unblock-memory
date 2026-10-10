@@ -77,7 +77,7 @@ test("runtime and historical retrieval send byte-identical expanded-turn evidenc
   const manager = new QmdMemoryManager({ dbPath, workspaceDir: root, sources: [source], storeFactory: async () => store,
     sessions: { agentId: "bill", agentName: "Bill", chatTypes: ["direct"], collection: source.collection, outputDir: source.root,
       databasePath: join(root, "unused-agent.sqlite"), manifestPath, timezone: "UTC", maxExpandedTokens: 1 } });
-  const [runtime] = await manager.searchWhisperer({ lex: "approved", vec: "semantic approval" }, { corpora: ["sessions"], maxSnippetChars: 1200 });
+  const [runtime] = await manager.searchCandidates({ lex: "approved", vec: "semantic approval" }, { corpora: ["sessions"], maxSnippetChars: 1200 });
   assert.ok(runtime);
   const snapshot = await historicalTrainingSearch(root, ["direct"], 100_000, async opts => {
     const qmd = await createStore(opts);

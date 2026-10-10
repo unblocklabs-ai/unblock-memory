@@ -3,7 +3,7 @@ import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 type Whisperer = "skill" | "memory";
 type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" |
   "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" |
-  "recall_not_needed" | "queries_generated" | "judge_candidate_failed";
+  "recall_not_needed" | "queries_generated" | "judge_candidate_failed" | "input_too_large";
 
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export class WhispererDiagnostics {
@@ -31,6 +31,10 @@ export class WhispererDiagnostics {
 
   measureMemory(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void {
     this.#entry(agentId).telemetry.record("memoryWhisperer", observation);
+  }
+
+  measureSearch(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void {
+    this.#entry(agentId).telemetry.record("memorySearch", observation);
   }
 
   snapshot(agentId: string) {

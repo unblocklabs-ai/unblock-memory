@@ -1,5 +1,5 @@
 import type { ResponseAuditConfig } from "./response-config.js";
-export declare const RESPONSE_EXTRACTOR_VERSION = 5;
+export declare const RESPONSE_EXTRACTOR_VERSION = 6;
 type Row = {
     seq: number;
     eventJson: string;

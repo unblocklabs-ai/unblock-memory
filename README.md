@@ -2,8 +2,9 @@
 
 Workspace-native memory for OpenClaw, powered internally by `@unblocklabs/qmd`.
 It keeps one warm QMD store per agent and exposes `memory_search` and `memory_get`.
-Ordinary recall is local vector search over semantic chunks: no query expansion,
-reranker or TypeSafe key is required.
+Recall combines BM25 and vector candidates, then independently ranks complete
+passages with TypeSafe. The agent supplies both queries; no query generation or
+"do we need memory?" gate runs for explicit search. A TypeSafe key is required.
 
 ## Start here
 
@@ -38,7 +39,7 @@ Optional installation from source:
 
 | Capability | What it does | Default / prerequisite |
 | --- | --- | --- |
-| [Search and reads](docs/retrieval.md#search-and-read) | Vector recall, then exact indexed source reads | Available with the memory plugin; files only unless more corpora are configured |
+| [Search and reads](docs/retrieval.md#search-and-read) | BM25 + vector recall with TypeSafe ranking, then exact indexed reads | Search requires TypeSafe; reads stay local; files only unless more corpora are configured |
 | [Session indexing](docs/retrieval.md#sessions) | Makes past user/assistant exchanges searchable | Opt-in corpus; channel/group by default, DMs explicitly included |
 | [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill; never invokes it | Off; explicit skills corpus; TypeSafe optional |
 | [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Injects up to two useful historical excerpts; query generation via resident API | Off; approved corpora + TypeSafe + query API credential |
@@ -52,10 +53,9 @@ Optional installation from source:
 | [Session memory extraction](docs/extraction.md) | Luna proposes lasting facts; Jev verifies them; optional QMD search | Off; approved session types + TypeSafe + host LLM permission; shadow-only by default |
 | [Compaction memory flush](docs/configuration.md#compaction-memory-writes) | Supplies the host an append-only daily-memory write plan | Offered unless the host's memory-flush setting is false; separate from whisperers |
 
-**Search is not one interchangeable API:** plugin `memory_search` is vector-only;
-standalone QMD `query` is hybrid vector + BM25 with TypeSafe ranking.
-They have separate configuration/index boundaries. See
-[search modes and the xsearch migration](docs/retrieval.md#qmd-search-modes).
+**One agent search pipeline:** `memory_search` and Memory Whisperer share
+candidate discovery, passage rendering, deduplication and TypeSafe ranking.
+Whisperer additionally generates queries and applies its automatic recall/delivery policy.
 
 ## Configuration and operating guides
 
@@ -73,9 +73,9 @@ They have separate configuration/index boundaries. See
 - [Session extraction](docs/extraction.md): incremental/backfill runs, configurable
   acceptance thresholds, shadow evaluation, and publishing lasting facts to search.
 
-The shared TypeSafe integration defaults on, but its features are opt-in.
-A key activates only features already enabled. Ordinary search and People
-Whisperer's injection stay local; Skill Whisperer has a local fallback.
+The shared TypeSafe integration defaults on. Ordinary search requires a key;
+other TypeSafe features remain opt-in. People Whisperer's injection stays local;
+Skill Whisperer has a local fallback.
 [Provider gates and failure behavior](docs/configuration.md#feature-gates-and-fallbacks)
 differ by feature.
 

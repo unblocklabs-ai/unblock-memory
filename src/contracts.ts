@@ -44,7 +44,7 @@ export type CorpusSearchOptions = Omit<NonNullable<
   Parameters<MemorySearchManagerContract["search"]>[1]
 >, "lexicalOnly"> & {
   corpora?: readonly string[];
-  /** Internal vector-hint budget; oversized matched chunks are omitted, never sliced. */
+  /** Internal passage budget; oversized matched chunks are omitted, never sliced. */
   maxSnippetChars?: number;
   sessionFilter?: SessionSearchFilter;
   requestContext?: MemoryRequestContext;

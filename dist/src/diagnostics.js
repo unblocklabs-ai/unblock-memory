@@ -24,6 +24,9 @@ export class WhispererDiagnostics {
     measureMemory(agentId, observation) {
         this.#entry(agentId).telemetry.record("memoryWhisperer", observation);
     }
+    measureSearch(agentId, observation) {
+        this.#entry(agentId).telemetry.record("memorySearch", observation);
+    }
     snapshot(agentId) {
         const entry = this.#agents.get(agentId);
         return { skill: { ...entry?.counts.skill }, memory: { ...entry?.counts.memory },

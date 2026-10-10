@@ -9,7 +9,7 @@ import { resolveConfig } from "../../src/config.js";
 import { resolveSources, resolveSessionSource } from "../../src/sources.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "../../src/typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError, TYPESAFE_MODEL } from "../../src/typesafe-client.js";
-import { collectSearches, hash, record, type SearchCase } from "./cases.js";
+import { collectSearches, hash, record, searchQueries, type SearchCase } from "./cases.js";
 import type { SessionManifest } from "../../src/session-sync.js";
 import { blindCase, retrieve, type Judgment, type Retrieval } from "./ranking.js";
 
@@ -22,9 +22,15 @@ if (!values.database || !values["state-dir"] || !values.config || !values.out) t
 const out = resolve(values.out), stateDir = resolve(values["state-dir"]), count = Number(values.n);
 if (!Number.isSafeInteger(count) || count < 1) throw new Error("n must be a positive integer");
 const frozenCases = values.cases ? readFileSync(values.cases, "utf8") : undefined;
-const selectedCases = frozenCases?.split("\n").filter(Boolean).map(line => JSON.parse(line) as SearchCase);
+const selectedCases = frozenCases?.split("\n").filter(Boolean).map(line => {
+  const item = record(JSON.parse(line));
+  const queries = searchQueries(item);
+  if (!item || !queries) throw new Error("Frozen cases must contain valid retrieval queries");
+  const { query: _legacyQuery, ...rest } = item;
+  return { ...rest, ...queries } as SearchCase;
+});
 if (selectedCases && (selectedCases.length !== count || new Set(selectedCases.map(c => c.id)).size !== count ||
-    selectedCases.some(c => !c.id || !c.sessionId || !c.callId || !c.query || !Number.isFinite(Date.parse(c.searchedAt)) ||
+    selectedCases.some(c => !c.id || !c.sessionId || !c.callId || !Number.isFinite(Date.parse(c.searchedAt)) ||
       !c.conversation?.currentRequest || !Array.isArray(c.conversation.history) || c.contextError))) {
   throw new Error("Frozen cases must contain n unique searches with eligible conversation context");
 }
@@ -56,7 +62,7 @@ const recipe = { version: "memory-ranking-v1", model: TYPESAFE_MODEL, limitPerMe
   collections: [...collections], rrf: { implementation: "QMD reciprocalRankFusion", k: 60, weights: [1, 1],
     identity: "source plus trimmed passage", topRankBonus: { first: 0.05, secondAndThird: 0.02 } },
   queryMode: "actual_agent_query_no_generation", contextMode: "visible_history_before_latest_user_turn",
-  extractorVersion: "canonical-user-content-v2",
+  extractorVersion: "canonical-user-content-v3-dual-query-transcript-reader",
   chronologyVersion: "hash-matched-projection-spans-v2",
   corpusMode: "current_index_snapshot_not_historical_reconstruction",
   policyHash: hash(readFileSync(new URL(existsSync(new URL("../../src/typesafe.js", import.meta.url)) ?

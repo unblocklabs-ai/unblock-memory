@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { createStore } from "@unblocklabs/qmd";
-import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
+import { compressAgentTranscripts, createAgentDatabase, insertSession } from "./helpers/session-database.js";
 import { collectSearches, type SearchCase } from "../eval/memory-ranking/cases.js";
 import { blindCase, fusePassages, retrieve } from "../eval/memory-ranking/ranking.js";
 import { analyze, type Label } from "../eval/memory-ranking/analyze.js";
@@ -24,7 +24,8 @@ test("extracts actual active root-chat searches with frozen pre-turn context, no
         { type: "toolCall", id: "call1", name: "memory_search", arguments: { query: "Rico location" } }] },
       { role: "toolResult", content: [{ type: "text", text: "ANSWER ALREADY RETURNED" }] },
       { role: "assistant", content: [{ type: "text", text: "INTERMEDIATE ANSWER" },
-        { type: "toolCall", id: "call2", name: "memory_search", arguments: { query: "Rico Brussels" } }] },
+        { type: "toolCall", id: "call2", name: "memory_search", arguments: {
+          bm25Query: "Rico Brussels", vectorQuery: "Where does Rico live?" } }] },
       { role: "assistant", content: "FUTURE ANSWER" },
     ];
     events.forEach((message, i) => {
@@ -34,12 +35,18 @@ test("extracts actual active root-chat searches with frozen pre-turn context, no
     db.prepare("INSERT INTO transcript_events VALUES ('s',99,?,999999)").run(JSON.stringify({ type: "message",
       message: { role: "assistant", content: [{ type: "toolCall", name: "memory_search", arguments: { query: "ARCHIVED" } }] } }));
     const cases = collectSearches(path, "main", 2);
-    assert.deepEqual(cases.map(c => c.query), ["Rico Brussels", "Rico location"]);
+    assert.deepEqual(cases.map(c => [c.bm25Query, c.vectorQuery]), [
+      ["Rico Brussels", "Where does Rico live?"], ["Rico location", "Rico location"]]);
     assert.deepEqual(cases[0]!.conversation, { currentRequest: "Where does he live?", history: [
       { role: "user", content: "Rico is my colleague." }, { role: "assistant", content: "Understood." }] });
     assert.deepEqual(cases[0]!.conversation, cases[1]!.conversation);
     assert.doesNotMatch(JSON.stringify(cases), /secret reasoning|FUTURE|INTERMEDIATE|RETURNED|ARCHIVED|FAKE MEMORY/);
     assert.equal(collectSearches(path, "main", 1).length, 1);
+    compressAgentTranscripts(db);
+    assert.deepEqual(collectSearches(path, "main", 2), cases, "compressed schema 24 preserves searches and frozen context");
+    db.prepare("INSERT INTO session_transcript_cold_archives VALUES ('s')").run();
+    assert.deepEqual(collectSearches(path, "main", 2), [], "cold transcripts must not be restored or graded from partial hot rows");
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM transcript_events WHERE event_json IS NOT NULL").get()!.n, 0);
   } finally { db.close(); }
 });
 
@@ -52,14 +59,15 @@ test("real BM25 plus vector union retains raw method scores, uses actual QMD RRF
       qmd.internal.insertDocument("memory", `${i}.md`, "Rico", `hash${i}`, "2026-01-01", "2026-01-01");
     });
     qmd.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
-    t.mock.method(qmd.internal, "searchVec", async (...[_query, _model, limit, collection]: Parameters<typeof qmd.internal.searchVec>) => {
+    t.mock.method(qmd.internal, "searchVec", async (...[query, _model, limit, collection]: Parameters<typeof qmd.internal.searchVec>) => {
+      assert.equal(query, "Where does Rico live?");
       assert.equal(limit, 10);
       assert.deepEqual(collection, ["memory"]);
       return bodies.map((body, i) => ({ filepath: `qmd://memory/${i}.md`, body, chunkPos: 0, chunkLen: body.length,
         score: 0.9 - i / 10 }));
     });
     const item: SearchCase = { id: "c", sessionId: "s", sessionKey: "s", chatType: "direct", eventSeq: 4,
-      callId: "t", query: "Rico Brussels", searchedAt: "2026-09-24T00:00:00Z", userEventSeq: 3,
+      callId: "t", bm25Query: "Rico Brussels", vectorQuery: "Where does Rico live?", searchedAt: "2026-09-24T00:00:00Z", userEventSeq: 3,
       conversation: { currentRequest: "Where does Rico live?", history: [] } };
     const result = await retrieve(qmd, item, new Map([["memory", "memory"]]));
     assert.equal(result.hits.length, 2);
@@ -71,6 +79,8 @@ test("real BM25 plus vector union retains raw method scores, uses actual QMD RRF
     assert.equal(blind.passages.length, 2);
     assert.ok(blind.passages.every(h => Object.keys(h).every(k => ["id", "source", "lines", "body", "messageTimestamp"].includes(k))));
     assert.equal("query" in blind, false);
+    assert.equal("bm25Query" in blind, false);
+    assert.equal("vectorQuery" in blind, false);
     const labels: Label[] = result.hits.map(h => ({ caseId: "c", hitId: h.id, grade: h === first ? 3 : 0, reason: "fixture", uncertain: false }));
     const scored = { ...item, hits: result.hits.map(h => ({ ...h, typesafe_score: h === first ? 0.9 : 0.1, typesafe_status: "complete" })) };
     const summary = analyze([scored], labels);

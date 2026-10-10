@@ -1,5 +1,5 @@
-type RetrievalOperation = "vector" | "memoryWhisperer";
-type RetrievalOutcome = "ok" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped";
+type RetrievalOperation = "vector" | "memoryWhisperer" | "memorySearch";
+type RetrievalOutcome = "ok" | "partial" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped";
 const fields = ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "candidates", "eligible", "results", "contextChars"] as const;
 type Field = typeof fields[number];
 export type RetrievalObservation = { outcome: RetrievalOutcome; elapsedMs: number } & Partial<Record<Field, number>>;

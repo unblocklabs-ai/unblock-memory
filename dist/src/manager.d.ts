@@ -56,6 +56,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
                     outcomes: {
                         ok?: number | undefined;
                         cancelled?: number | undefined;
+                        partial?: number | undefined;
                         skipped?: number | undefined;
                         failed?: number | undefined;
                         empty?: number | undefined;
@@ -219,8 +220,8 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         };
     }): MaintenanceTask | undefined;
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
-    /** Whisperer-only discovery: exact trained recipe, no query-conditioned reranker or merged cap. */
-    searchWhisperer(queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
+    /** Shared discovery: exact trained recipe, scoped before either retrieval lane. */
+    searchCandidates(queries: QueryPair, opts: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
     readFile(params: {
         relPath: string;

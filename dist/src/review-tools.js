@@ -32,7 +32,7 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
             return null;
         return {
             name: "memory_diagnostics", label: "Memory Diagnostics",
-            description: "Read content-free whisperer counters, configuration state, projection version and index readiness. Does not call TypeSafe.",
+            description: "Read content-free manual-search and whisperer telemetry, configuration state, projection version and index readiness. Does not call TypeSafe.",
             parameters: noParameters,
             async execute(_id, params) {
                 Value.Parse(noParameters, params);

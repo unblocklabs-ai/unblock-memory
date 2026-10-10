@@ -46,7 +46,8 @@ export function analyze(results: Result[], labels: Label[]) {
           usefulRecallAt2: useful ? grades.slice(0, 2).filter(g => g >= 2).length / useful : null,
           topHitIds: ranked.slice(0, 5).map(h => h.id) }];
       }));
-      return { caseId: r.id, turn: `${r.sessionId}:${r.userEventSeq}`, query: r.query, candidates: hits.length, useful, scores };
+      return { caseId: r.id, turn: `${r.sessionId}:${r.userEventSeq}`, bm25Query: r.bm25Query, vectorQuery: r.vectorQuery,
+        candidates: hits.length, useful, scores };
     });
     const aggregate = (turnBalanced: boolean) => Object.fromEntries(["typesafe", "rrf", "vector", "bm25"].map(name => [name,
       Object.fromEntries(["top1Useful", "top1Grade", "bestAt2", "ndcgAt2", "ndcgAt5", "usefulRecallAt2"].map(metric => {

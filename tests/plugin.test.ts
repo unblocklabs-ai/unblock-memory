@@ -146,15 +146,19 @@ test("registers exactly the clean memory tool contract and validates every tool 
     ["memory_audit_quality", { limit: 21 }],
     ["memory_audit_quality", { corpora: ["private"] }],
     ["memory_audit_quality", { after: { documentId: -1, seq: 0 } }],
-    ["memory_search", { query: "memory", maxResults: 21 }],
-    ["memory_search", { query: "   " }],
-    ["memory_search", { query: "memory", corpora: [] }],
-    ["memory_search", { query: "memory", corpora: [""] }],
-    ["memory_search", { query: "memory", sessionFilter: { startedFrom: "yesterday" } }],
-    ["memory_search", { query: "memory", sessionFilter: { chatType: "thread" } }],
-    ["memory_search", { query: "memory", sessionFilter: { provider: " " } }],
-    ["memory_search", { query: "memory", sessionFilter: { extra: true } }],
-    ["memory_search", { query: "memory", extra: true }],
+    ["memory_search", { query: "memory" }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", maxResults: 21 }],
+    ["memory_search", { bm25Query: "   ", vectorQuery: "memory" }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "   " }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", minScore: 0.3 }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", minUsefulness: 1.1 }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", corpora: [] }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", corpora: [""] }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", sessionFilter: { startedFrom: "yesterday" } }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", sessionFilter: { chatType: "thread" } }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", sessionFilter: { provider: " " } }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", sessionFilter: { extra: true } }],
+    ["memory_search", { bm25Query: "memory", vectorQuery: "memory", extra: true }],
     ["memory_get", { path: "qmd://memory/MEMORY.md", lines: 1_001 }],
     ["memory_get", { path: "   " }],
     ["memory_get", { path: "qmd://memory/MEMORY.md", extra: true }],
@@ -190,12 +194,12 @@ test("registers exactly the clean memory tool contract and validates every tool 
   }
 });
 
-test("memory search compacts public results without changing evidence, precision or request context internally", async () => {
+test("memory search compacts judged results without changing evidence or request context internally", async t => {
   let runtime: QmdMemoryRuntime | undefined;
   let searchFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   let getFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   const api = {
-    pluginConfig: {},
+    pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
     registerCli() {},
     registerGatewayMethod() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
@@ -250,7 +254,7 @@ test("memory search compacts public results without changing evidence, precision
     citation: "memory/MEMORY.md#L3-L4",
   };
   const unknownSessionResult = {
-    path: internalResult.path, startLine: 1, endLine: 2,
+    path: internalResult.path, startLine: 8, endLine: 9,
     score: internalResult.score, vectorScore: internalResult.vectorScore,
     source: "memory", corpus: "sessions", session: internalResult.session,
     snippet: "Unattributed legacy text",
@@ -261,7 +265,7 @@ test("memory search compacts public results without changing evidence, precision
   Object.defineProperty(runtime, "getMemorySearchManager", {
     value: async () => ({
       manager: {
-        search: async (_query: string, options: { requestContext?: unknown }) => {
+        searchCandidates: async (_queries: unknown, options: { requestContext?: unknown }) => {
           searchContext = options.requestContext;
           return [internalResult, fileResult, unknownSessionResult];
         },
@@ -283,8 +287,14 @@ test("memory search compacts public results without changing evidence, precision
     nativeChannelId: "C123",
     deliveryContext: { channel: "slack", accountId: "workspace-1", to: "channel:C123" },
   } satisfies OpenClawPluginToolContext;
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    assert.deepEqual(request.state.conversation, { history: [], currentRequest: "session" });
+    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul",
+      noul: request.state.candidates[0].corpus === "memory" ? 0.304999 : 0.87654321 } } });
+  });
   const tool = searchFactory(context)!;
-  const response = await tool.execute("search", { query: "session" }) as {
+  const response = await tool.execute("search", { bm25Query: "session", vectorQuery: "session", minUsefulness: 0 }) as {
     content: Array<{ type: string; text: string }>;
     details: unknown;
   };
@@ -297,7 +307,6 @@ test("memory search compacts public results without changing evidence, precision
         startLine: 1,
         endLine: 2,
         score: 0.88,
-        vectorScore: 0.88,
         snippet: internalResult.sessionMessages,
         corpus: "sessions",
         messageTimestamp: internalResult.messageTimestamp,
@@ -307,17 +316,13 @@ test("memory search compacts public results without changing evidence, precision
         },
       },
       {
-        path: fileResult.path,
-        startLine: 3,
-        endLine: 4,
-        score: 0.3,
-        snippet: fileResult.snippet,
-        corpus: "memory",
-      },
-      {
-        path: internalResult.path, startLine: 1, endLine: 2, score: 0.88, vectorScore: 0.88,
+        path: internalResult.path, startLine: 8, endLine: 9, score: 0.88,
         snippet: [{ body: unknownSessionResult.snippet, partial: true }], corpus: "sessions",
         session: { ...internalResult.session, startedAt: "2026-08-25T14:00:00.000Z" },
+      },
+      {
+        path: fileResult.path, startLine: 3, endLine: 4, score: 0.3,
+        snippet: fileResult.snippet, corpus: "memory",
       },
     ],
   });

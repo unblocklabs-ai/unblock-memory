@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -64,7 +64,7 @@
     },
     "typesafe.enabled": {
       "label": "TypeSafe Judgments",
-      "help": "Shared provider gate for opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Ordinary search and People Whisperer injection stay local."
+      "help": "Shared provider gate for opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Memory search discovers locally and uses TypeSafe to rank usefulness; People Whisperer injection stays local."
     },
     "typesafe.apiKey": { "label": "TypeSafe API Key", "sensitive": true },
     "typesafe.timeoutMs": { "label": "TypeSafe Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, and Skill Whisperer has a fixed 3-second total budget." },

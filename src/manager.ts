@@ -1032,19 +1032,25 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     return this.#renderSearchHits(hits, store, opts);
   }
 
-  /** Whisperer-only discovery: exact trained recipe, no query-conditioned reranker or merged cap. */
-  async searchWhisperer(queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]> {
+  /** Shared discovery: exact trained recipe, scoped before either retrieval lane. */
+  async searchCandidates(queries: QueryPair, opts: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]> {
     return this.#enqueue(async () => {
       opts.signal?.throwIfAborted();
       const collections = this.#collectionNames(opts.corpora);
       if (!collections.length) return [];
       if (this.#sessions && collections.includes(this.#sessions.collection)) await this.#refreshSessionMetadata();
+      const sessions = this.#sessions;
+      let allowedPaths = opts.sessionFilter && sessions && collections.includes(sessions.collection)
+        ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter) : undefined;
+      if (collections.includes(EXTRACTED_COLLECTION)) {
+        allowedPaths = { ...allowedPaths, [EXTRACTED_COLLECTION]: this.#currentExtracted(undefined, opts.sessionFilter).map(extractedPath) };
+      }
       const store = await this.#getAnalysisStore() as QMDStore;
       const hits = new Map<string, Pick<VectorSearchResult, "file" | "body" | "bestChunk" | "chunkPos" | "chunkLen" | "displayPath" | "score">>();
       // Serialize native QMD work. Cancellation prevents further queries/collections.
       for (const lane of ["lex", "vec"] as const) {
         opts.signal?.throwIfAborted();
-        for (const hit of await trainingCandidates(store, queries[lane], collections, lane, opts.signal)) {
+        for (const hit of await trainingCandidates(store, queries[lane], collections, lane, opts.signal, allowedPaths)) {
           const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk]);
           if (!hits.has(key)) hits.set(key, { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
             chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: hit.score });

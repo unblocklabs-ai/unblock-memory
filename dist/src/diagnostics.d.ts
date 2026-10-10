@@ -1,12 +1,13 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 type Whisperer = "skill" | "memory";
-type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "recall_not_needed" | "queries_generated" | "judge_candidate_failed";
+type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "recall_not_needed" | "queries_generated" | "judge_candidate_failed" | "input_too_large";
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export declare class WhispererDiagnostics {
     #private;
     static shared(): WhispererDiagnostics;
     record(agentId: string, whisperer: Whisperer, outcome: Outcome): void;
     measureMemory(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void;
+    measureSearch(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void;
     snapshot(agentId: string): {
         skill: {
             cancelled?: number | undefined;
@@ -24,6 +25,7 @@ export declare class WhispererDiagnostics {
             recall_not_needed?: number | undefined;
             queries_generated?: number | undefined;
             judge_candidate_failed?: number | undefined;
+            input_too_large?: number | undefined;
         };
         memory: {
             cancelled?: number | undefined;
@@ -41,6 +43,7 @@ export declare class WhispererDiagnostics {
             recall_not_needed?: number | undefined;
             queries_generated?: number | undefined;
             judge_candidate_failed?: number | undefined;
+            input_too_large?: number | undefined;
         };
         telemetry: {
             scope: string;
@@ -50,6 +53,7 @@ export declare class WhispererDiagnostics {
                     outcomes: {
                         ok?: number | undefined;
                         cancelled?: number | undefined;
+                        partial?: number | undefined;
                         skipped?: number | undefined;
                         failed?: number | undefined;
                         empty?: number | undefined;

@@ -11,7 +11,8 @@ settings; a rotated credential file is reread without a restart.
 
 | Feature | Required settings/dependencies | TypeSafe disabled / no key | Provider or unreadable-key failure |
 | --- | --- | --- | --- |
-| Ordinary search/get | Installed/enabled memory slot; configured corpora | Unchanged local retrieval | Unchanged; its own indexing/embedding errors still matter |
+| `memory_search` | Installed/enabled memory slot; configured corpora; TypeSafe key | Explicit unavailable error | Successful judged siblings returned with a partial warning; total failure is an error; no vector fallback |
+| `memory_get` | Installed/enabled memory slot; configured corpora | Unchanged local indexed reads | Unchanged; its own indexing errors still matter |
 | Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | Exclude failed candidates; successful siblings may qualify; no vector fallback |
 | Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; recall/deadline failures still suppress the turn |
 | Complementary hints | Enabled Memory Whisperer + `complementaryHints` | No additional judgment; base hints also require a key | Keep baseline hints unless the total deadline expires |
@@ -202,7 +203,7 @@ contract; these tables explain their effects.
 | `corpora[].kind` | Required for explicit entries | `files`, `sessions`, or `skills` |
 | `corpora[].paths` | Required for files/skills | Nonempty exact-file/directory/glob list; workspace-relative, absolute or `~/`; directory means recursive Markdown; does not grant host write trust |
 | `corpora[sessions].chatTypes` | `['channel','group']` | Nonempty subset of channel/group/direct; DMs require `direct` |
-| `corpora[sessions].maxExpandedTokens` | `500` | 1–10,000; ordinary search uses full turn/message when it fits, otherwise preserves the matched chunk. Whisperer instead shares a fixed 1,200-character renderer with training. |
+| `corpora[sessions].maxExpandedTokens` | `500` | 1–10,000; internal host vector retrieval expands a full turn/message when it fits. Public search and Whisperer share the fixed 1,200-character complete-passage renderer with training. |
 | `corpora[sessions].syncIntervalMinutes` | `60` | 0–1,440; zero manual-only; first scheduled sync after one interval; requires running Gateway |
 | `keepEmbeddingModelWarm` | `true` | Retain embedding model/context after first use; false allows five-minute idle disposal |
 | `analysis.executable` | Unset | Optional absolute local worker path; enables ability to recluster, not automatic scheduling |

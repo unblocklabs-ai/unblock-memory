@@ -17,9 +17,13 @@ import { registerResponseAudit } from "./response-runtime.js";
 import { registerInsideOut } from "./inside-out-runtime.js";
 import { registerMemoryTraining } from "./training-runtime.js";
 import { resolveTimezone } from "./session-projector.js";
+import { searchMemory } from "./memory-search.js";
+import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
+import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { registerExtraction } from "./extraction-runtime.js";
 const searchParameters = Type.Object({
-    query: Type.String({ pattern: "\\S" }),
+    bm25Query: Type.String({ pattern: "\\S", description: "Distinctive names, identifiers and keywords for BM25 retrieval." }),
+    vectorQuery: Type.String({ pattern: "\\S", description: "Natural-language question describing the information needed; also the intent used to judge usefulness." }),
     corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), {
         minItems: 1, description: 'Configured corpus names; default is all non-skill corpora. Use ["all"] alone for explicit all-corpora recall.',
     })),
@@ -38,7 +42,7 @@ const searchParameters = Type.Object({
         conversationId: Type.Optional(Type.String({ pattern: "\\S" })),
     }, { additionalProperties: false, description: "Restricts session documents only; selected file corpora remain eligible. Not an audience access control." })),
     maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum hits; default 5." })),
-    minScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Minimum vector similarity; default 0.3. Not confidence in factual truth." })),
+    minUsefulness: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Minimum TypeSafe usefulness probability; default 0.7. Not confidence in factual truth." })),
 }, { additionalProperties: false });
 const getParameters = Type.Object({
     path: Type.String({ pattern: "\\S" }),
@@ -49,45 +53,79 @@ const syncSessionsParameters = Type.Object({
     force: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 const syncStatusParameters = Type.Object({}, { additionalProperties: false });
-function createSearchTool(runtime, ctx) {
+function createSearchTool(runtime, ctx, typesafe, diagnostics) {
     const active = getContext(ctx);
     if (!active)
         return null;
     return {
         name: "memory_search",
         label: "Memory Search",
-        description: "Search this agent's configured memory corpora with local vector retrieval, not QMD's hybrid query. Skills are excluded. Session snippets are arrays of messages (type, name, timestamp, body; partial when incomplete); file snippets are strings. Results are evidence leads; inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
+        description: "Search this agent's configured memory corpora with BM25 and vector queries, then TypeSafe usefulness ranking. Supply keywords in bm25Query and the information needed in vectorQuery; no query generation or recall gate runs. Queries and candidate passages are sent to TypeSafe. Skills are excluded. Session snippets are message arrays; file snippets are strings. Inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
         parameters: searchParameters,
         async execute(_toolCallId, params, signal) {
-            const { query: untrimmedQuery, corpora, sessionFilter, maxResults, minScore, } = Value.Parse(searchParameters, params);
-            const query = untrimmedQuery.trim();
-            const { manager, error } = await runtime.getMemorySearchManager(active);
-            if (!manager)
-                return jsonResult({ results: [], error: error ?? "memory unavailable" });
-            const results = await manager.search(query, {
-                corpora: corpora?.map((corpus) => corpus.trim()),
-                sessionFilter,
-                maxResults,
-                minScore,
-                signal,
-                requestContext: active.requestContext,
-            });
-            // Compact only the public tool response; internal ranking and consumers keep
-            // full-precision scores and the host's source/citation compatibility fields.
-            const payload = {
-                results: results.map(({ source: _source, citation: _citation, session, sessionMessages, ...result }) => ({
-                    ...result,
-                    snippet: result.corpus === "sessions" ? sessionMessages ?? [{ body: result.snippet, partial: true }] : result.snippet,
-                    score: Number(result.score.toFixed(2)),
-                    ...(result.vectorScore !== undefined ? { vectorScore: Number(result.vectorScore.toFixed(2)) } : {}),
-                    ...(result.textScore !== undefined ? { textScore: Number(result.textScore.toFixed(2)) } : {}),
-                    ...(session ? { session: { ...session, startedAt: new Date(session.startedAt).toISOString() } } : {}),
-                })),
-            };
-            return {
-                content: [{ type: "text", text: JSON.stringify(payload) }],
-                details: payload,
-            };
+            const started = performance.now();
+            const measurement = { outcome: "failed", elapsedMs: 0 };
+            try {
+                signal?.throwIfAborted();
+                const { bm25Query, vectorQuery, corpora, sessionFilter, maxResults, minUsefulness, } = Value.Parse(searchParameters, params);
+                const queries = { lex: bm25Query.trim(), vec: vectorQuery.trim() };
+                // Reject oversized explicit inputs before credential resolution or any service call.
+                prepareQueryConversation([], queries.lex);
+                const { conversation } = prepareQueryConversation([], queries.vec);
+                const apiKey = await resolveTypeSafeApiKey(typesafe);
+                if (!apiKey) {
+                    measurement.outcome = "skipped";
+                    return jsonResult({ results: [], error: "TypeSafe API key not configured or TypeSafe disabled" });
+                }
+                const { manager, error } = await runtime.getMemorySearchManager(active);
+                if (!manager)
+                    return jsonResult({ results: [], error: error ?? "memory unavailable" });
+                const search = await searchMemory(manager, queries, {
+                    corpora: corpora?.map((corpus) => corpus.trim()),
+                    sessionFilter,
+                    maxResults,
+                    minUsefulness,
+                    apiKey, timeoutMs: typesafe.timeoutMs, conversation,
+                    signal,
+                    requestContext: active.requestContext,
+                    onCandidates: ({ retrievalMs, candidates, eligible }) => {
+                        Object.assign(measurement, { retrievalMs, candidates, eligible });
+                    },
+                });
+                measurement.judgeMs = search.judgeMs;
+                measurement.results = search.results.length;
+                measurement.contextChars = search.results.reduce((sum, hit) => sum + hit.snippet.length, 0);
+                if (search.eligible && !search.requestsSucceeded)
+                    return jsonResult({ results: [], error: "All memory usefulness judgments failed" });
+                measurement.outcome = search.requestsFailed ? "partial" : search.results.length ? "ok" : "empty";
+                // Compact only the public tool response; internal ranking and consumers keep
+                // full-precision scores and the host's source/citation compatibility fields.
+                const payload = {
+                    ...(search.requestsFailed ? { warning: `${search.requestsFailed} candidate usefulness judgments failed; results are partial` } : {}),
+                    results: search.results.map(({ source: _source, citation: _citation, session, sessionMessages, ...result }) => ({
+                        ...result,
+                        snippet: result.corpus === "sessions" ? sessionMessages ?? [{ body: result.snippet, partial: true }] : result.snippet,
+                        score: Number(result.score.toFixed(2)),
+                        ...(session ? { session: { ...session, startedAt: new Date(session.startedAt).toISOString() } } : {}),
+                    })),
+                };
+                return {
+                    content: [{ type: "text", text: JSON.stringify(payload) }],
+                    details: payload,
+                };
+            }
+            catch (error) {
+                if (error instanceof QueryInputBudgetError)
+                    measurement.outcome = "skipped";
+                throw error;
+            }
+            finally {
+                measurement.elapsedMs = performance.now() - started;
+                if (signal?.aborted)
+                    measurement.outcome = signal.reason instanceof Error && signal.reason.name === "TimeoutError"
+                        ? "timed_out" : "cancelled";
+                diagnostics.measureSearch(active.agentId, measurement);
+            }
         },
     };
 }
@@ -455,7 +493,7 @@ export function registerUnblockMemory(api) {
         skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics),
         people: peopleWhisperer,
     });
-    api.registerTool((ctx) => createSearchTool(runtime, ctx), { names: ["memory_search"] });
+    api.registerTool((ctx) => createSearchTool(runtime, ctx, config.typesafe, diagnostics), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
     api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
         names: ["memory_sync_sessions"],

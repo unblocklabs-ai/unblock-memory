@@ -67,6 +67,20 @@ test("recognized envelopes expose only current human text and preserve ordinary 
   assert.deepEqual(responseUserText(wrapped("Current request"), "owner"), { text: "Current request", contextLimited: true });
   const dmWrapped = wrapped("Current request").replace("Slack message in #test", "Slack DM");
   assert.deepEqual(responseUserText(dmWrapped, "owner"), { text: "Current request", contextLimited: true });
+  const channelContext = "\n\nContext: ⟦openclaw:ctx⟧\nPRIVATE CHANNEL CONTEXT";
+  for (const envelope of [wrapped("Current request"), dmWrapped]) {
+    const contextual = envelope + channelContext;
+    assert.deepEqual(responseUserText(contextual, "owner"), { text: "Current request", contextLimited: true });
+    assert.deepEqual(responseUserText(contextual.replaceAll("\n", "\r\n"), "owner"), { text: "Current request", contextLimited: true });
+    for (const ambiguous of [contextual + channelContext,
+      contextual + "\nConversation info: ⟦openclaw:ctx⟧\n```json\n{}\n```",
+      contextual + "\nSystem: [later] Slack DM from Bek\n\nAnother request",
+      envelope + "\n\nContext: ⟦openclaw:ctx⟧\n",
+      envelope.replace("from Bek", "from Other") + channelContext,
+    ]) assert.equal(responseUserText(ambiguous, "owner"), undefined);
+    assert.equal(responseUserText(contextual, "stranger"), undefined);
+  }
+  assert.equal(responseUserText("Current request" + channelContext, "owner"), undefined);
   assert.equal(responseUserText(wrapped("Current request"), "stranger"), undefined);
   assert.equal(responseUserText(wrapped("Current request").replace("from Bek", "from Other"), "owner"), undefined);
   assert.equal(responseUserText(wrapped("Current request").replace("```json", "```broken"), "owner"), undefined);
@@ -75,11 +89,12 @@ test("recognized envelopes expose only current human text and preserve ordinary 
   const normal = 'Please explain this JSON:\n```json\n{"history_truncated":true}\n```\nDo not delete it.';
   assert.deepEqual(responseUserText(normal, "owner"), { text: normal, contextLimited: false });
   const meta = user("x").__openclaw;
-  const input = rows([user("fallback", { __openclaw: { ...meta, upstreamUserText: wrapped("Question") } }),
+  const input = rows([user("fallback", { __openclaw: { ...meta, upstreamUserText: wrapped("Question") + channelContext } }),
     answer("Answer"), user(wrapped("Thanks")), answer("Welcome")]);
   const e = responseEpisodes(session, input, config.responseAudit).episodes[0]!;
   assert.equal(e.request[0]!.text, "Question"); assert.equal(e.feedback[0]!.text, "Thanks");
   assert.equal(e.contextLimited, true); assert.equal(JSON.stringify(e).includes("PRIVATE EMBEDDED"), false);
+  assert.equal(JSON.stringify(e).includes("PRIVATE CHANNEL"), false);
   const dmEpisode = responseEpisodes(session, rows([user(dmWrapped), answer("Answer"), user("Thanks"), answer("Welcome")]), config.responseAudit).episodes[0]!;
   assert.equal(dmEpisode.request[0]!.text, "Current request");
 });

@@ -529,7 +529,7 @@ test("v2 Whisperer routes each query only to its lane across the approved corpus
   const manager = new QmdMemoryManager({ dbPath: join(workspace, "unused.sqlite"), workspaceDir: workspace,
     sources: [memory, projects], storeFactory: async () => store });
   try {
-    const results = await manager.searchWhisperer({ lex: "Exactneedle", vec: "semantic intent only" },
+    const results = await manager.searchCandidates({ lex: "Exactneedle", vec: "semantic intent only" },
       { corpora: ["memory", "projects"], maxSnippetChars: 1200 });
     assert.equal(vector.mock.callCount(), 1);
     assert.deepEqual(new Set(results.map(result => result.snippet)),

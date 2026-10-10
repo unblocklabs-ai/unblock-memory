@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
 import { responseUserText } from "./response-text.js";
-export const RESPONSE_EXTRACTOR_VERSION = 5;
+export const RESPONSE_EXTRACTOR_VERSION = 6;
 const MAX_EVENTS = 2000, MAX_SESSION_BYTES = 2_000_000, MAX_EPISODE_CHARS = 24_000;
 function record(v) {
     return v !== null && typeof v === "object" && !Array.isArray(v) ? v : undefined;

@@ -1,24 +1,16 @@
-import { createHash } from "node:crypto";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
-import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
-import { judgeMemoryPassage, memoryUsefulnessRequest } from "./typesafe.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { ApiQueryGenerator, QueryApiError, queryConversation } from "./query-generator.js";
 import { judgeTrainingInput, TRAINING_GATE_THRESHOLD } from "./training-gate.js";
-import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
-import type { QueryPair } from "./query-contract.js";
-
-const MAX_EXCERPT_CHARS = MEMORY_PASSAGE_CHARS;
+import { QueryInputBudgetError, type QueryPair } from "./query-contract.js";
+import { searchMemory, memoryPassageId, type MemoryCandidateManager } from "./memory-search.js";
 
 type MemoryWhispererRuntime = {
   getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }): Promise<{
-    manager: {
-      search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
-      searchWhisperer?(queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">): Promise<CorpusMemorySearchResult[]>;
-    } | null;
+    manager: MemoryCandidateManager | null;
   }>;
 };
 
@@ -32,10 +24,6 @@ type SessionState = {
   recent: Map<string, number>;
   result?: Promise<{ appendContext: string } | undefined>;
 };
-
-function fingerprint(text: string): string {
-  return createHash("sha256").update(text.replace(/\s+/gu, " ").trim()).digest("hex");
-}
 
 export function registerMemoryWhisperer(
   api: OpenClawPluginApi,
@@ -60,7 +48,7 @@ export function registerMemoryWhisperer(
     const started = performance.now();
     const asOf = new Date().toISOString();
     const measurement: Parameters<WhispererDiagnostics["measureMemory"]>[1] = { outcome: "skipped", elapsedMs: 0 };
-    let stage = "credentials", reason = "completed";
+    let stage = "input", reason = "completed";
     let recallProbability: number | undefined, queryCount: number | undefined;
     let requestsSucceeded = 0, requestsFailed = 0;
     const log = (level: "info" | "warn", event: string, fields: Record<string, string | number | boolean | undefined>) =>
@@ -87,11 +75,11 @@ export function registerMemoryWhisperer(
       signal.addEventListener("abort", onAbort, { once: true });
     });
     const run = async () => {
+      const conversation = queryConversation(event.prompt, event.messages);
+      stage = "credentials";
       const apiKey = await resolveTypeSafeApiKey(typesafe);
       if (signal.aborted) return;
       if (!apiKey) { reason = "missing_key"; diagnostics?.record(agentId, "memory", "missing_key"); return; }
-      stage = "input";
-      const conversation = queryConversation(event.prompt, event.messages);
       const gateStarted = performance.now();
       const gateSignal = AbortSignal.any([signal, AbortSignal.timeout(typesafe.timeoutMs)]);
       // Speculation is intentional: neither model generation nor QMD waits for the recall judgment.
@@ -140,67 +128,38 @@ export function registerMemoryWhisperer(
         const { manager } = await runtime.getMemorySearchManager({ cfg: api.config, agentId });
         if (signal.aborted) return;
         if (!manager) { reason = "unavailable"; diagnostics?.record(agentId, "memory", "unavailable"); return; }
-        const retrievalStarted = performance.now();
-        if (!manager.searchWhisperer) throw new Error("V2 Whisperer retrieval is unavailable");
-        const hits = await manager.searchWhisperer(queries, { corpora, signal, maxSnippetChars: MAX_EXCERPT_CHARS });
-        if (signal.aborted) return;
-        measurement.retrievalMs = performance.now() - retrievalStarted;
-        measurement.candidates = hits.length;
-        const candidates: { hit: CorpusMemorySearchResult; excerpt: string; id: string }[] = [];
-        for (const hit of hits) {
-          // Enforce scope again before sending anything to the external judge.
-          if (!corpora.includes(hit.corpus)) continue;
-          const excerpt = hit.snippet.trim();
-          // Retrieval bounds context around a complete match. Never replace it
-          // with a prefix if a manager returns an oversized result.
-          if (excerpt.length > MAX_EXCERPT_CHARS) continue;
-          const id = fingerprint(excerpt);
-          if (!excerpt || state.recent.has(id) || duplicateMemoryPassage({ ...hit, text: excerpt },
-            candidates.map(candidate => ({ ...candidate.hit, text: candidate.excerpt })))) continue;
-          candidates.push({ hit, excerpt, id });
-        }
-        measurement.eligible = candidates.length;
-        measurement.outcome = "empty";
-        if (!candidates.length) { reason = "no_candidates"; diagnostics?.record(agentId, "memory", "no_candidates"); return; }
-        stage = "judgment";
-        const judgeStarted = performance.now();
-        // Every eligible passage gets its own request; no request sees another candidate.
-        const judged = (await Promise.all(candidates.map(async (candidate, candidateIndex) => {
-          const requestStarted = performance.now();
-          const fields = { stage: "judgment", candidateIndex,
-            timeoutMs: typesafe.timeoutMs };
-          try {
-            const { hit, excerpt } = candidate;
-            const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
-                excerpt, corpus: hit.corpus, sourcePath: hit.path,
-                dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
-                  ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
-              }, asOf), { apiKey, timeoutMs: typesafe.timeoutMs, signal });
-            if (signal.aborted) return [];
-            requestsSucceeded++;
-            log("info", "candidate_completed", { ...fields, elapsedMs: performance.now() - requestStarted });
-            // Failed candidates have no score, not zero. Keep each score with its own source.
-            return [{ ...candidate, probability }];
-          } catch (error) {
-            if (signal.aborted) return [];
-            requestsFailed++;
-            diagnostics?.record(agentId, "memory", "judge_candidate_failed");
-            log("warn", "candidate_failed", { ...fields, ...failureFields(error), elapsedMs: performance.now() - requestStarted });
-            return [];
-          }
-        }))).flat();
+        const search = await searchMemory(manager, queries, {
+          corpora, signal, apiKey, timeoutMs: typesafe.timeoutMs, conversation, asOf,
+          minUsefulness: config.minUsefulness, maxResults: 4, excludedPassages: state.recent,
+          onCandidates: observation => {
+            measurement.retrievalMs = observation.retrievalMs;
+            measurement.candidates = observation.candidates;
+            measurement.eligible = observation.eligible;
+            measurement.outcome = "empty";
+            stage = "judgment";
+          },
+          onJudgment: ({ candidateIndex, elapsedMs, error }) => {
+            const fields = { stage: "judgment", candidateIndex, elapsedMs, timeoutMs: typesafe.timeoutMs };
+            if (error !== undefined) {
+              requestsFailed++;
+              diagnostics?.record(agentId, "memory", "judge_candidate_failed");
+              log("warn", "candidate_failed", { ...fields, ...failureFields(error) });
+            } else {
+              requestsSucceeded++;
+              log("info", "candidate_completed", fields);
+            }
+          },
+        });
         if (signal.aborted || sessions.get(key) !== state) return;
-        measurement.judgeMs = performance.now() - judgeStarted;
+        measurement.judgeMs = search.judgeMs;
+        if (!search.eligible) { reason = "no_candidates"; diagnostics?.record(agentId, "memory", "no_candidates"); return; }
         if (!await gate || signal.aborted || sessions.get(key) !== state) return;
-        if (!judged.length) {
+        if (!search.requestsSucceeded) {
           reason = "all_candidates_failed"; measurement.outcome = "failed";
           diagnostics?.record(agentId, "memory", "failed");
           return;
         }
-        const ranked = judged
-          .filter(candidate => candidate.probability >= config.minUsefulness)
-          .sort((a, b) => b.probability - a.probability)
-          .slice(0, 4);
+        const ranked = search.results.map(hit => ({ hit, excerpt: hit.snippet, id: memoryPassageId(hit.snippet) }));
         let selected = ranked.slice(0, config.maxHints);
         if (!selected.length) { reason = "rejected"; diagnostics?.record(agentId, "memory", "rejected"); return; }
         if (config.complementaryHints && config.maxHints > 1 && ranked.length > 1) {
@@ -243,6 +202,12 @@ export function registerMemoryWhisperer(
       try {
         return await Promise.race([run(), aborted]);
       } catch (error) {
+        if (error instanceof QueryInputBudgetError) {
+          reason = "input_too_large";
+          measurement.outcome = "skipped";
+          diagnostics?.record(agentId, "memory", "input_too_large");
+          return;
+        }
         reason = "stage_failed";
         measurement.outcome = "failed";
         if (!signal.aborted) {

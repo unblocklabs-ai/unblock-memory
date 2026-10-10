@@ -6,26 +6,31 @@
 
 `memory_search` searches every configured **non-skill** corpus for this agent by
 default. Select named corpora, or use `["all"]` alone. An empty list or unknown
-name is an error. Default: **5 results**, vector `minScore: 0.3`; configurable
-`maxResults` is 1–20 and `minScore` is 0–1. No TypeSafe, BM25, query expansion
-or reranker runs in this tool.
+name is an error. Supply `bm25Query` (distinctive keywords/names) and
+`vectorQuery` (a natural-language question describing the information needed).
+Each lane retrieves ten candidates; complete passages are deduplicated and
+independently judged by TypeSafe against `vectorQuery`. No query generation or
+recall gate runs. Default: **5 results**, `minUsefulness: 0.7`;
+`maxResults` is 1–20 and `minUsefulness` is 0–1. The old `query` and vector
+`minScore` parameters are removed, not silently reinterpreted.
 
 Example tool input (the `memory` corpus exists by default):
 
 ```json
-{ "query": "Who approved the staging rollout?", "corpora": ["memory"], "maxResults": 5 }
+{ "bm25Query": "staging rollout approval", "vectorQuery": "Who approved the staging rollout?", "corpora": ["memory"], "maxResults": 5 }
 ```
 
 Results use compact JSON and carry `path`, `startLine`, `endLine`, `snippet`,
-`corpus`, and `score`/`vectorScore` rounded to hundredths. Ranking and threshold
+`corpus`, and a usefulness `score` rounded to hundredths. Ranking and threshold
 filtering still use full precision. The constant `source` and top-level `provider`
 fields are omitted; `path` plus line numbers replace the redundant `citation`.
 Session hits also carry session metadata and, when available,
 `messageTimestamp`: the original timestamp text (including timezone) of the message
 containing the matched chunk. It stays tied to that message even when the excerpt
 expands to the surrounding turn. Missing timestamps are omitted, not replaced by
-session start time. Vector similarity is a retrieval signal, not confidence in
-the truth of a claim.
+session start time. Usefulness is not confidence in the truth of a claim.
+Passages retain complete evidence within 1,200 characters; oversized matches
+are omitted, never trimmed into a misleading prefix.
 
 Session `snippet` values are arrays of messages, in source order:
 
@@ -61,56 +66,40 @@ Search snippets are leads. Inspect attribution, qualifications, dates and adjace
 context before relying on a factual claim. An old plan is not proof it happened,
 and memory does not grant permission to act. No results may mean the wrong corpus,
 a high threshold, an unsynced session or an unavailable index—not absence of the fact.
+Search requires enabled TypeSafe and a configured key. It sends the semantic
+query, candidate excerpts, dates, corpus and source paths to TypeSafe. Missing
+credentials and total judging failure include an `error` alongside empty `results`;
+partial judging failure includes a `warning` and only successfully judged results.
+Oversized queries are rejected before credentials, retrieval or provider calls.
 Search initialization errors include an `error` alongside empty `results`;
 other failures may surface as tool errors. Investigate them instead of reporting
 “nothing is remembered.”
+`memory_diagnostics` exposes content-free manual-search measurements under
+`whisperers.telemetry.operations.memorySearch`: end-to-end latency, retrieval and
+judging time, candidate/result counts and outcomes (including partial failures).
+These counters are separate from automatic `memoryWhisperer` and internal `vector`
+retrieval; no query or evidence text is recorded.
 
 Corpora and session filters select evidence; they are not audience ACLs. Normal
 tools can access this agent's configured non-skill corpora, not just its current
 chat. Only index material suitable for the agent's tool callers. Per-feature
 TypeSafe allowlists do not restrict ordinary retrieval.
 
-## QMD search modes
+## QMD entry points
 
-The following describes QMD's TypeSafe-ranked `query` API (2.10+). Use the exact
-dependency in the installed plugin's package metadata when diagnosing an older
-installation.
+`memory_search` is the agent-facing ranked search. The QMD CLI `query`,
+`search` and `deep-search` alias, MCP `query` tool, and HTTP `/query` and
+`/search` routes are removed in the companion QMD change. Existing installations
+retain those commands until that QMD change is released and installed.
 
-| Surface | Retrieval/ranking | Score / useful distinction |
-| --- | --- | --- |
-| Plugin `memory_search` | Direct vector search, expansion off | Vector similarity; ordinary agent recall |
-| QMD CLI `search` / SDK `searchLex` | Local BM25 | Normalized lexical relevance; useful for names, identifiers and exact phrases |
-| QMD CLI/SDK `vsearch` | Local vectors; standalone default includes local query expansion | Vector similarity; `--no-expand` / `expand:false` selects literal retrieval |
-| QMD CLI/MCP `query` / SDK `search` | Literal vectors + BM25, deduplicated source excerpts, independent TypeSafe usefulness ranking | Usefulness divided by 3, not cosine similarity; default limit 10/minScore 0 |
-| QMD `query --no-rerank` / SDK/MCP `rerank:false` | Local retrieval, best reciprocal retrieval-rank ordering | 1 / rank; explicitly skips remote scoring |
+QMD remains the local indexing/retrieval backend. Its BM25/vector SDK primitives,
+vector-only `vsearch`, indexed reads, collection maintenance and benchmark APIs
+remain available. Private skill retrieval and response-audit lexical investigations
+are internal workflows, not extra public plugin search tools.
 
-Plain `query` takes `ceil(1.5 × limit)` candidates per backend, without local
-expansion or local reranking. Explicit `lex`/`vec`/`hyde` variants share the
-TypeSafe ranking policy by default. A supplied hypothetical `hyde` passage is
-a retrieval input, not evidence. Scores across modes are not interchangeable.
-
-**Migration:** Memory 0.3.22 removed the temporary `memory_xsearch` tool. QMD's
-`query` provides that hybrid retrieval/ranking functionality; there is no plugin
-`memory_query`, and `memory_search` did not become hybrid.
-
-Standalone QMD is a separate entry point. Its project/named/global index is not
-automatically this agent's `unblock-memory/index.sqlite`. Plugin corpus names
-also are not QMD collection IDs: each configured path maps to a `source-<hash>`
-collection, and a corpus can contain several. Establish the intended index,
-collection scope and installed QMD version before using CLI/MCP as an alternative.
-Do not run standalone collection/update/embed maintenance against a live
-plugin-managed index as a casual search fallback.
-
-QMD CLI/MCP read `TYPESAFE_API_KEY` or `TYPESAFE_API_KEY_FILE` from their own
-process; SDK callers can supply credentials. Plugin `typesafe.apiKeyFile` does
-not export a key to those processes. Ranked query sends the query, intent,
-selected excerpts, source paths and evaluation time to TypeSafe. Missing keys or
-scoring failures return errors, not vector fallback or a successful empty answer.
-Use an explicitly local mode when appropriate.
-
-See the [QMD guide](https://github.com/unblocklabs-ai/qmd#readme) for CLI/MCP syntax.
-Private skill frontmatter retrieval and response-audit lexical investigations are
-internal workflows, not extra public plugin search modes.
+Standalone QMD and the plugin need not use the same index. Do not run standalone
+collection/update/embed maintenance against a live plugin-managed index as a
+casual search fallback.
 
 ## Sessions
 
@@ -127,7 +116,8 @@ corpora searchable. Supported fields are `startedFrom` and `startedTo`
 
 ```json
 {
-  "query": "deployment decision",
+  "bm25Query": "deployment decision",
+  "vectorQuery": "What deployment decision was made?",
   "sessionFilter": {
     "startedFrom": "2026-08-01T00:00:00Z",
     "provider": "slack",
@@ -300,7 +290,9 @@ through BM25 and vectors respectively, retrieving ten candidates per backend acr
 the complete approved collection scope (not ten per collection). The lexical adapter
 uses literal OR keywords; quotation marks do not enable exact-phrase matching.
 API or generated-output failures skip the hint; there is no direct-vector fallback.
-TypeSafe evaluates one independent
+After query generation Whisperer uses the same discovery, deduplication and
+ranking core as `memory_search`, but judges against the bounded conversation
+rather than the explicit tool's semantic query alone. TypeSafe evaluates one independent
 Noul question per candidate in its own concurrent HTTP request: would a careful
 assistant use a specific factual detail from the excerpt when answering the current
 request? Partial answers and concrete leads count; repeated facts, topic/name matches
@@ -315,16 +307,18 @@ Explicit configured thresholds are preserved. Evaluate it on your own conversati
 **Privacy and budgets:** training and runtime prepare the same visible conversation:
 at most 8,192 pinned-LFM tokens and 24,000 UTF-8 bytes after serialization. The whole
 current request and most recent whole messages are retained; an oversized current
-request skips automatic memory. The judge receives that conversation plus one complete
-1,200-character excerpt, its corpus/source path, all represented message timestamps,
+request skips automatic memory before query generation or the TypeSafe recall gate.
+Diagnostics count `input_too_large`; completed logs report `outcome: "skipped"` and
+`reason: "input_too_large"`, without recording the input. The judge receives that
+conversation plus one complete 1,200-character excerpt, its corpus/source path, all represented message timestamps,
 and the request's evaluation time per HTTP request. A v2 query pair can therefore
 produce up to twenty passage requests before deduplication and eligibility filtering.
 Dates record when source messages were said, without inferring event dates.
 Session excerpts retain a complete turn or message when it fits,
 otherwise the complete matched chunk. Chunks exceeding the excerpt budget are
-skipped, never sliced. This shared Whisperer renderer uses the fixed 1,200-character
-budget independently of `sessions.maxExpandedTokens`; that setting still controls
-ordinary `memory_search` expansion, which is unchanged.
+skipped, never sliced. Public `memory_search` and Whisperer use the same fixed
+1,200-character renderer, independently of `sessions.maxExpandedTokens`.
+That setting controls only internal host-vector retrieval expansion.
 It does not fetch a complete historical transcript; the host may
 already have compacted the available context. System messages, thinking blocks,
 images, and tool-result messages are omitted;

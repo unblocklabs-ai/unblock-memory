@@ -39,7 +39,8 @@ export async function retrieve(qmd: QMDStore, item: SearchCase, collections: Map
   const scope = [...collections].filter(([, corpus]) => !requested || requested.includes(corpus));
   if (!scope.length) return { caseId: item.id, elapsedMs: 0, hits: [], error: "no_approved_collections" };
   const laneHits = (await Promise.all((["lex", "vec"] as const).map(lane =>
-    trainingCandidates(qmd, item.query, scope.map(([collection]) => collection), lane)))).flat();
+    trainingCandidates(qmd, lane === "lex" ? item.bm25Query : item.vectorQuery,
+      scope.map(([collection]) => collection), lane)))).flat();
   const merged = new Map<string, typeof laneHits[number]>();
   for (const candidate of laneHits) {
     const id = hash([candidate.file, candidate.bestChunk.trim()]), previous = merged.get(id);

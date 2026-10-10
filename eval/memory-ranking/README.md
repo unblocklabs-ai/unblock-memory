@@ -2,7 +2,11 @@
 
 Replay the last **N actual agent-issued `memory_search` calls**, not automatic
 Whisperer queries. Save the pre-user-turn context using the production 230m input
-builder. This first arm does **not** generate new queries.
+builder. This first arm does **not** generate new queries. It preserves each
+call's `bm25Query` and `vectorQuery`; historical `query` calls use that wording
+for both lanes. Compressed transcripts use the shared read-only transcript
+reader. Cold archives are excluded without restoration; unreadable or oversized
+hot transcripts fail collection rather than silently biasing the sample.
 
 ## Run on the node holding the index and credentials
 
@@ -42,7 +46,7 @@ The candidate adapter and TypeSafe usefulness rubric are production code.
 ## Artifacts
 
 - `manifest.json`: scope, models, rubric hash, snapshot hash, limits and caveats.
-- `cases.jsonl`: actual query, call/session provenance, frozen 230m-ready context.
+- `cases.jsonl`: both actual retrieval queries, call/session provenance, frozen 230m-ready context.
 - `retrieval.jsonl`: deduplicated passages, raw per-method scores and **one-based**
   ranks, QMD RRF score/rank, dates, eligibility flags, retrieval latency.
 - `judgments.jsonl`: write-ahead attempts and terminal results, per-hit TypeSafe
