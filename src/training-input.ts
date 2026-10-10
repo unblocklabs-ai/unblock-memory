@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { ACTIVE_EVENT_COUNT_SQL, ACTIVE_EVENT_ROWS_SQL, assertAgentTranscriptSchema } from "./agent-transcript.js";
+import { AgentTranscriptReader } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 import { prepareQueryConversation, QUERY_CONTRACT, QueryInputBudgetError, type QueryConversation } from "./query-contract.js";
@@ -97,12 +97,13 @@ export function trainingExamples(rows: Iterable<Row>, renew?: () => void) {
 /** Only active events; no Markdown projections, archived branches, or tool bodies. */
 export class TrainingTranscriptReader {
   readonly #db: DatabaseSync;
+  readonly #transcripts: AgentTranscriptReader;
   readonly #lineage: boolean;
   constructor(path: string, agentId: string) {
     this.#db = new DatabaseSync(path, { readOnly: true });
     try {
       this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
-      assertAgentTranscriptSchema(this.#db, agentId, "Unsupported training transcript schema or agent");
+      this.#transcripts = new AgentTranscriptReader(this.#db, agentId, "Unsupported training transcript schema or agent");
       const columns = this.#db.prepare("PRAGMA table_info(session_windows)").all().map(c => c.name);
       this.#lineage = ["parent_session_key", "spawned_by", "plugin_owner_id", "hook_external_content_source"].every(c => columns.includes(c));
     } catch (error) { this.#db.close(); throw error; }
@@ -120,10 +121,10 @@ export class TrainingTranscriptReader {
       if (!session || !["channel", "group", "direct"].includes(String(session.chat_type)) ||
         /:(?:cron|subagent|heartbeat|hook)(?::|$)/i.test(String(session.session_key)) ||
         session.parent_session_key || session.spawned_by || session.plugin_owner_id || session.hook_external_content_source) return null;
-      const size = this.#db.prepare(ACTIVE_EVENT_COUNT_SQL).get(sessionId)!;
-      if (Number(size.n) > 50_000 || Number(size.bytes) > 32_000_000) return { oversized: true as const };
-      const rows = this.#db.prepare(ACTIVE_EVENT_ROWS_SQL).iterate(sessionId) as Iterable<Row>;
-      return trainingExamples(rows, renew);
+      const snapshot = this.#transcripts.read(sessionId, { maxEvents: 50_000, maxBytes: 32_000_000 });
+      if (snapshot.kind === "oversized") return { oversized: true as const };
+      if (snapshot.kind !== "ready") return { unavailable: true as const };
+      return trainingExamples(snapshot.rows, renew);
     } finally { this.#db.exec("COMMIT"); }
   }
   close() { this.#db.close(); }

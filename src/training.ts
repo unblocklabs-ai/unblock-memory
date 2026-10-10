@@ -12,7 +12,7 @@ export function collectTraining(source: Source, store?: TrainingStore, options: 
 } = {}) {
   const since = options.since ?? 0, until = options.until ?? Number.MAX_SAFE_INTEGER;
   const reader = new TrainingTranscriptReader(source.databasePath, source.agentId);
-  const result = { sessions: 0, excludedSessions: 0, oversizedSessions: 0, eligible: 0,
+  const result = { sessions: 0, excludedSessions: 0, oversizedSessions: 0, unavailableSessions: 0, eligible: 0,
     users: 0, filtered: 0, oversized: 0, unanswered: 0, added: 0, changed: 0, unchanged: 0, retired: 0,
     review: [] as { sessionId: string; seq: number; reason: string }[] };
   try {
@@ -21,6 +21,11 @@ export function collectTraining(source: Source, store?: TrainingStore, options: 
       store?.renew();
       const extracted = reader.read(id, () => store?.renew());
       result.sessions++;
+      if (extracted && "unavailable" in extracted) {
+        result.unavailableSessions++;
+        store?.unavailable(id);
+        continue;
+      }
       if (extracted && "oversized" in extracted) {
         result.oversizedSessions++;
         store?.unavailable(id);

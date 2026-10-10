@@ -1,13 +1,46 @@
 import { DatabaseSync } from "node:sqlite";
+import { zstdCompressSync } from "node:zlib";
+
+/** The schema-23 storage transition: preserve logical events, move their UTF-8 JSON into Zstd. */
+export function compressAgentTranscripts(db: DatabaseSync): void {
+  // Real pre-23 stores require the same nullable-TEXT table rebuild as the host
+  // migration. Preserve their event rows; this only operates on test fixtures.
+  if (db.prepare("PRAGMA table_info(transcript_events)").all().some(c => c.name === "event_json" && c.notnull === 1)) {
+    const schema = String(db.prepare("SELECT sql FROM sqlite_schema WHERE name='transcript_events'").get()!.sql);
+    const nullable = schema.replace(/\bevent_json TEXT NOT NULL\b/i, "event_json TEXT")
+      .replace(/\btranscript_events\b/, "transcript_events_compressed");
+    const foreignKeys = db.prepare("PRAGMA foreign_keys").get()!.foreign_keys;
+    db.exec("PRAGMA foreign_keys=OFF; BEGIN");
+    try {
+      db.exec(nullable);
+      db.exec(`INSERT INTO transcript_events_compressed SELECT * FROM transcript_events;
+        DROP TABLE transcript_events;
+        ALTER TABLE transcript_events_compressed RENAME TO transcript_events;
+        COMMIT;`);
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    finally { db.exec(`PRAGMA foreign_keys=${Number(foreignKeys)}`); }
+  }
+  db.exec(`PRAGMA user_version=24; UPDATE schema_meta SET schema_version=24;
+    ALTER TABLE transcript_events ADD COLUMN event_zstd BLOB;
+    ALTER TABLE transcript_events ADD COLUMN event_utf8_bytes INTEGER;
+    CREATE TABLE session_transcript_cold_archives (session_id TEXT PRIMARY KEY);`);
+  const update = db.prepare("UPDATE transcript_events SET event_json=NULL,event_zstd=?,event_utf8_bytes=? WHERE session_id=? AND seq=?");
+  for (const row of db.prepare("SELECT session_id,seq,event_json FROM transcript_events").all()) {
+    const bytes = Buffer.from(String(row.event_json));
+    update.run(zstdCompressSync(bytes), bytes.byteLength, row.session_id!, row.seq!);
+  }
+}
 
 export function createAgentDatabase(
   path: string,
   agentId = "main",
   appVersion = "2026.8.1-beta.3",
   schemaVersion = 17,
+  encoding: "UTF-8" | "UTF-16le" = "UTF-8",
 ): DatabaseSync {
   const db = new DatabaseSync(path);
   db.exec(`
+    PRAGMA encoding = '${encoding}';
     PRAGMA user_version = ${schemaVersion};
     CREATE TABLE schema_meta (
       meta_key TEXT PRIMARY KEY, role TEXT, schema_version INTEGER,

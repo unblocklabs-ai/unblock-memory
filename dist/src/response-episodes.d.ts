@@ -48,12 +48,12 @@ export declare function responseEpisodes(session: ResponseSession, rows: readonl
     episodes: ResponseEpisode[];
     coverage: ResponseCoverage;
 };
-/** Bounded, read-only active transcript snapshot; archived/deleted branches are excluded. */
+/** Bounded, read-only active transcript snapshot; cold history is deferred, inactive branches excluded. */
 export declare class ResponseTranscriptReader {
     #private;
     constructor(path: string, agentId: string);
     sessions(config: ResponseAuditConfig, now: number, after?: string): ResponseSession[];
-    /** null = confirmed absent/ineligible; undefined = over budget, not evidence of deletion. */
+    /** null = confirmed absent/ineligible; undefined = unavailable/over budget, never evidence of deletion. */
     read(input: ResponseSession | string, config: ResponseAuditConfig): (ReturnType<typeof responseEpisodes> & {
         revision: string;
     }) | null | undefined;

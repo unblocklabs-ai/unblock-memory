@@ -5,7 +5,7 @@ import { createZstdDecompress, zstdDecompressSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { ACTIVE_EVENTS_FROM, assertAgentTranscriptSchema } from "./agent-transcript.js";
+import { AgentTranscriptReader } from "./agent-transcript.js";
 /** Files contain branch trees; keep the selected leaf, not abandoned sibling conversations. */
 function selectedBranch(events) {
     const nodes = new Map(events.filter(e => e.id).map(e => [e.id, e]));
@@ -57,10 +57,11 @@ export async function* readInsideOutSources(paths, errors) {
         const db = new DatabaseSync(paths.databasePath, { readOnly: true });
         try {
             db.exec("PRAGMA busy_timeout=1000");
-            assertAgentTranscriptSchema(db, paths.agentId);
+            const transcripts = new AgentTranscriptReader(db, paths.agentId);
             const sessions = db.prepare(`SELECT w.session_id sessionId, COALESCE(w.channel,c.channel,'local') channel,
         COALESCE(w.account_id,c.account_id,'') account, COALESCE(r.generation,'') revision,
-        COALESCE((SELECT MAX(seq) FROM transcript_events WHERE session_id=w.session_id),0) tail FROM session_windows w
+        COALESCE((SELECT MAX(seq) FROM transcript_events WHERE session_id=w.session_id),0) tail,
+        ${transcripts.coldSql("w.session_id")} cold FROM session_windows w
         LEFT JOIN conversations c ON c.conversation_id=w.primary_conversation_id
         LEFT JOIN transcript_rewrite_watermarks r ON r.session_id=w.session_id
         WHERE (? IS NULL OR w.session_id=?) ORDER BY w.started_at,w.session_id`).all(paths.sessionId ?? null, paths.sessionId ?? null);
@@ -83,15 +84,23 @@ export async function* readInsideOutSources(paths, errors) {
             }
             for (const s of sessions) {
                 const sessionId = String(s.sessionId), source = `live:${sessionId}`;
-                yield { source, sessionId, revision: String(s.revision), signature: JSON.stringify([s.revision, s.tail]), read: () => {
-                        const events = db.prepare(`SELECT e.seq,e.event_json eventJson,e.created_at createdAt
-            ${ACTIVE_EVENTS_FROM} WHERE a.session_id=? AND e.seq<=? ORDER BY a.active_position`).all(sessionId, s.tail).map(row => {
-                            const event = JSON.parse(String(row.eventJson));
-                            event.seq = Number(row.seq);
-                            event.timestamp ??= new Date(Number(row.createdAt)).toISOString();
-                            return event;
-                        });
-                        return { sessionId, source, events, ...metadata.get(sessionId) };
+                yield { source, sessionId, revision: String(s.revision), signature: JSON.stringify([s.revision, s.tail, s.cold]), read: () => {
+                        db.exec("BEGIN");
+                        try {
+                            const snapshot = transcripts.read(sessionId, { maxSeq: Number(s.tail) });
+                            if (snapshot.kind !== "ready")
+                                throw new Error(`Transcript unavailable: ${snapshot.kind}`);
+                            const events = snapshot.rows.map(row => {
+                                const event = JSON.parse(row.eventJson);
+                                event.seq = row.seq;
+                                event.timestamp ??= new Date(row.createdAt).toISOString();
+                                return event;
+                            });
+                            return { sessionId, source, events, ...metadata.get(sessionId) };
+                        }
+                        finally {
+                            db.exec("COMMIT");
+                        }
                     } };
             }
         }

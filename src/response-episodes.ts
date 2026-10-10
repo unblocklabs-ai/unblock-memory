@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { ACTIVE_EVENT_COUNT_SQL, ACTIVE_EVENT_ROWS_SQL, assertAgentTranscriptSchema } from "./agent-transcript.js";
+import { AgentTranscriptReader } from "./agent-transcript.js";
 import type { ResponseAuditConfig } from "./response-config.js";
 import { messageText } from "./whisperer-context.js";
 import { responseUserText } from "./response-text.js";
@@ -153,30 +153,56 @@ export function responseEpisodes(session: ResponseSession, rows: readonly Row[],
   return { episodes, coverage };
 }
 
-/** Bounded, read-only active transcript snapshot; archived/deleted branches are excluded. */
+/** Bounded, read-only active transcript snapshot; cold history is deferred, inactive branches excluded. */
 export class ResponseTranscriptReader {
   readonly #db: DatabaseSync;
+  readonly #transcripts: AgentTranscriptReader;
   constructor(path: string, agentId: string) {
     this.#db = new DatabaseSync(path, { readOnly: true });
     try {
       this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
-      assertAgentTranscriptSchema(this.#db, agentId, "Unsupported response-audit transcript schema or agent");
+      this.#transcripts = new AgentTranscriptReader(this.#db, agentId, "Unsupported response-audit transcript schema or agent");
     } catch (error) { this.#db.close(); throw error; }
   }
   sessions(config: ResponseAuditConfig, now: number, after = "") {
-    return this.#db.prepare(`SELECT w.session_id sessionId, COALESCE(w.account_id,c.account_id,'') accountId,
+    // Page metadata candidates, then apply the approved-sender filter to decoded
+    // events before the audit cap. Unrelated Slack traffic must not hide previews.
+    const candidates = this.#db.prepare(`SELECT w.session_id sessionId, COALESCE(w.account_id,c.account_id,'') accountId,
       w.chat_type chatType, w.primary_conversation_id conversationId
       FROM session_windows w JOIN conversations c ON c.conversation_id=w.primary_conversation_id
       WHERE COALESCE(w.channel,c.channel)='slack' AND w.chat_type IN (${config.chatTypes.map(() => "?").join(",")})
       AND w.session_id>?
       AND EXISTS (SELECT 1 FROM transcript_events e JOIN session_transcript_active_events a
-        ON a.session_id=e.session_id AND a.event_seq=e.seq WHERE e.session_id=w.session_id AND e.created_at >= ?
-        AND json_extract(e.event_json,'$.message.role')='user'
-        AND json_extract(e.event_json,'$.message.__openclaw.senderId') IN (${config.senderIds.map(() => "?").join(",")}))
-      ORDER BY w.session_id LIMIT 101`)
-      .all(...config.chatTypes, after, now - config.lookbackDays * 86400_000, ...config.senderIds) as ResponseSession[];
+        ON a.session_id=e.session_id AND a.event_seq=e.seq WHERE e.session_id=w.session_id AND e.created_at >= ?)
+      ORDER BY w.session_id LIMIT 101`);
+    const since = now - config.lookbackDays * 86400_000;
+    const sessions: ResponseSession[] = [];
+    this.#db.exec("BEGIN");
+    try {
+      while (sessions.length < 101) {
+        const page = candidates.all(...config.chatTypes, after, since) as ResponseSession[];
+        for (const session of page) {
+          const snapshot = this.#transcripts.read(session.sessionId, { maxEvents: MAX_EVENTS, maxBytes: MAX_SESSION_BYTES });
+          // Saved unavailable sessions are reconciled separately by the caller.
+          if (snapshot.kind !== "ready") continue;
+          const approved = snapshot.rows.some(row => {
+            if (row.createdAt < since) return false;
+            let event: Record<string, unknown> | undefined;
+            try { event = record(JSON.parse(row.eventJson)); } catch { return false; }
+            const message = record(event?.message), sender = record(message?.__openclaw)?.senderId;
+            return event?.type === "message" && message?.role === "user" &&
+              typeof sender === "string" && config.senderIds.includes(sender);
+          });
+          if (approved) sessions.push(session);
+          if (sessions.length === 101) break;
+        }
+        if (page.length < 101) break;
+        after = page.at(-1)!.sessionId;
+      }
+      return sessions;
+    } finally { this.#db.exec("COMMIT"); }
   }
-  /** null = confirmed absent/ineligible; undefined = over budget, not evidence of deletion. */
+  /** null = confirmed absent/ineligible; undefined = unavailable/over budget, never evidence of deletion. */
   read(input: ResponseSession | string, config: ResponseAuditConfig): (ReturnType<typeof responseEpisodes> & { revision: string }) | null | undefined;
   read(input: ResponseSession | string, config: ResponseAuditConfig, previousRevision: string | undefined):
     (ReturnType<typeof responseEpisodes> & { revision: string }) | { unchanged: true; revision: string } | null | undefined;
@@ -192,9 +218,9 @@ export class ResponseTranscriptReader {
             window.conversationId !== input.conversationId || window.chatType !== input.chatType))) return null;
       const session: ResponseSession = { sessionId, accountId: String(window.accountId),
         conversationId: String(window.conversationId), chatType: String(window.chatType) };
-      const count = this.#db.prepare(ACTIVE_EVENT_COUNT_SQL).get(session.sessionId)!;
-      if (Number(count.n) > MAX_EVENTS || Number(count.bytes) > MAX_SESSION_BYTES) return undefined;
-      const rows = this.#db.prepare(ACTIVE_EVENT_ROWS_SQL).all(session.sessionId) as Row[];
+      const snapshot = this.#transcripts.read(session.sessionId, { maxEvents: MAX_EVENTS, maxBytes: MAX_SESSION_BYTES });
+      if (snapshot.kind !== "ready") return undefined;
+      const rows = snapshot.rows;
       // Exact active content catches in-place edits and branch changes even when writer
       // watermarks are absent. Raw text is never retained in the checkpoint database.
       const revision = hash([RESPONSE_EXTRACTOR_VERSION, session, config.historyMessages, [...config.senderIds].sort(), rows]);

@@ -155,13 +155,19 @@ fits. The default is `500`; the original semantic chunk is preserved when
 neither complete context fits, so expansion never clips the matched evidence.
 Run
 `memory_sync_sessions` to start a refresh, then use `memory_sync_status` to
-check its progress or result. The read-only adapter explicitly supports OpenClaw
-agent database schemas 17, 18, and 19 and validates its required columns before
-reading. Projections are private derived Markdown under the
+check its progress or result. The shared read-only transcript adapter validates
+agent identity and the storage capabilities it needs, rather than rejecting every
+new schema number. It reads both text and bounded Zstd payloads (schema 23+),
+counts decoded UTF-8 bytes for budgets, and preserves previous projections when
+history is cold, oversized, or unreadable. Cold history is deferred until restored
+by OpenClaw; the plugin never restores or migrates the source database. The public
+full-transcript SDK reader currently permits restoration, while its read-only
+catalog redacts and truncates text, so neither supplies this full-fidelity read-only
+contract. Extraction retains its supported host cursor API. Projections are private derived Markdown under the
 agent's `unblock-memory/sessions` state directory and can be rebuilt from
 OpenClaw at any time. Their embedded text contains only `# Transcript` and
 role-labeled, timestamped speaker messages; filtering metadata remains in the
-session manifest. Projection v7 also retains message metadata and exact character
+session manifest. Projection v8 retains message metadata and exact character
 boundaries there, without duplicating message bodies. Readers use those boundaries
 only when the projection hash matches the indexed document. Older/mismatched snapshots
 use a conservative heading parser that skips code fences and blockquotes; an unfenced

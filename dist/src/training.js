@@ -5,7 +5,7 @@ import { judgeTrainingInput, TRAINING_GATE_QUESTIONS } from "./training-gate.js"
 export function collectTraining(source, store, options = {}) {
     const since = options.since ?? 0, until = options.until ?? Number.MAX_SAFE_INTEGER;
     const reader = new TrainingTranscriptReader(source.databasePath, source.agentId);
-    const result = { sessions: 0, excludedSessions: 0, oversizedSessions: 0, eligible: 0,
+    const result = { sessions: 0, excludedSessions: 0, oversizedSessions: 0, unavailableSessions: 0, eligible: 0,
         users: 0, filtered: 0, oversized: 0, unanswered: 0, added: 0, changed: 0, unchanged: 0, retired: 0,
         review: [] };
     try {
@@ -14,6 +14,11 @@ export function collectTraining(source, store, options = {}) {
             store?.renew();
             const extracted = reader.read(id, () => store?.renew());
             result.sessions++;
+            if (extracted && "unavailable" in extracted) {
+                result.unavailableSessions++;
+                store?.unavailable(id);
+                continue;
+            }
             if (extracted && "oversized" in extracted) {
                 result.oversizedSessions++;
                 store?.unavailable(id);

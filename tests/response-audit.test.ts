@@ -14,7 +14,7 @@ import { ResponseAuditStore } from "../src/response-store.js";
 import { responseOutcome } from "../src/response-outcome.js";
 import { responseMemoryCandidates } from "../src/response-memory.js";
 import { resolveSource } from "../src/sources.js";
-import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
+import { compressAgentTranscripts, createAgentDatabase, insertSession } from "./helpers/session-database.js";
 import { ResponsePeople } from "../src/response-identity.js";
 
 const session = { sessionId: "s", accountId: "workspace", conversationId: "conversation-s", chatType: "direct" };
@@ -353,11 +353,59 @@ test("cancellation settles even with an uncooperative provider and releases the 
   assert.ok(store.acquire(Date.now()));
 });
 
-test("reader rejects another agent and oversized sessions without returning partial context", async t => {
+test("dry-run discovery applies the session cap only to approved senders, including compressed events", async t => {
+  const { db, options } = await fixture(); t.after(() => db.close());
+  for (let i = 0; i < 110; i++) {
+    insertSession(db, { sessionId: `a-${String(i).padStart(3, "0")}`, chatType: "direct",
+      message: { type: "message", message: i % 2 ? answer("Scheduled update") :
+        user("Unapproved request", { __openclaw: { ...user("").__openclaw, senderId: "stranger" } }) } });
+  }
+  db.exec("UPDATE transcript_events SET created_at=strftime('%s','now')*1000");
+  compressAgentTranscripts(db);
+  t.mock.method(globalThis, "fetch", () => { assert.fail("dry run must not infer"); });
+  const preview = await auditResponses({ ...options, dryRun: true });
+  assert.equal(preview.status, "dry_run");
+  assert.equal(preview.coverage?.sessions, 1);
+  assert.equal(preview.coverage?.eligible, 1);
+  assert.equal(preview.coverage?.sessionLimitReached, false);
+  assert.equal(existsSync(options.storePath), false);
+});
+
+test("reader budgets decoded UTF-8 bytes regardless of database encoding", async t => {
+  const root = await mkdtemp(join(tmpdir(), "response-encoding-"));
+  for (const encoding of ["UTF-8", "UTF-16le"] as const) {
+    const path = join(root, `${encoding}.sqlite`), db = createAgentDatabase(path, "main", "2026.8.1", 19, encoding);
+    t.after(() => db.close());
+    insertSession(db, { sessionId: "s", chatType: "direct",
+      message: { type: "message", message: answer("x".repeat(1_100_000)) } });
+    const reader = new ResponseTranscriptReader(path, "main"); t.after(() => reader.close());
+    assert.ok(reader.read(session, config.responseAudit), `${encoding}: below UTF-8 budget`);
+    db.prepare("UPDATE transcript_events SET event_json=?").run(JSON.stringify({ type: "message", message: answer("🦉".repeat(500_001)) }));
+    assert.equal(reader.read(session, config.responseAudit), undefined, `${encoding}: above UTF-8 budget`);
+  }
+});
+
+test("reader discovers compressed human events, defers cold history and enforces decoded UTF-8 budgets", async t => {
   const { db, options } = await fixture(); t.after(() => db.close());
   assert.throws(() => new ResponseTranscriptReader(options.databasePath, "other"), /schema or agent/);
-  db.prepare("UPDATE transcript_events SET event_json=? WHERE seq=1").run("x".repeat(2_000_001));
+  const original = new ResponseTranscriptReader(options.databasePath, "main");
+  t.after(() => original.close());
+  const before = original.read(session, config.responseAudit);
+  compressAgentTranscripts(db);
   const reader = new ResponseTranscriptReader(options.databasePath, "main"); t.after(() => reader.close());
+  assert.deepEqual(reader.read(session, config.responseAudit), before);
+  assert.ok(reader.sessions(config.responseAudit, 0).some(s => s.sessionId === session.sessionId));
+  db.prepare("INSERT INTO session_transcript_cold_archives VALUES (?)").run(session.sessionId);
+  db.exec("DELETE FROM session_transcript_active_events");
+  assert.equal(reader.read(session, config.responseAudit), undefined);
+  assert.equal(original.read(session, config.responseAudit), undefined,
+    "a reader opened before migration must not mistake newly cold history for empty history");
+  db.exec("DELETE FROM session_transcript_cold_archives");
+  db.exec("INSERT INTO session_transcript_active_events SELECT session_id,seq-1,seq,seq-1 FROM transcript_events");
+  db.prepare("UPDATE transcript_events SET event_utf8_bytes=2000001 WHERE seq=1").run();
+  assert.equal(reader.read(session, config.responseAudit), undefined);
+  // Plaintext uses bytes too: SQLite length(TEXT) would count these as only 500,001 characters.
+  db.prepare("UPDATE transcript_events SET event_json=? WHERE seq=1").run("🦉".repeat(500_001));
   assert.equal(reader.read(session, config.responseAudit), undefined);
 });
 

@@ -78,7 +78,9 @@ bytes, so changed corpus content still invalidates caches.
 
 ## Input and historical boundaries
 
-Read original agent SQLite active-branch conversations (schema 17–19), including
+Read original agent SQLite active-branch conversations through the shared read-only
+adapter, including compressed payloads, while deferring cold or oversized sessions
+without retiring their previously collected examples. This includes
 direct/group/channel chats, excluding cron, heartbeat, spawned/subagent, hook/plugin
 and untyped diagnostic sessions. Exclude explicit bots, synthetic messages,
 analysis/thinking, errors and tool payloads. Ordinary older users need not have

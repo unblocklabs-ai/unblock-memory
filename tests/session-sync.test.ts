@@ -4,8 +4,48 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { zstdCompressSync } from "node:zlib";
 import { PROJECTOR_VERSION, syncSessionProjections } from "../src/session-sync.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
+
+test("refresh retains compressed active history and preserves projections when history goes cold or corrupt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-storage-evolution-"));
+  const databasePath = join(root, "agent.sqlite");
+  const params = { databasePath, outputDir: join(root, "sessions"), manifestPath: join(root, "manifest.json"),
+    agentId: "main", agentName: "Theo", timezone: "UTC", chatTypes: ["channel"] as const };
+  const db = createAgentDatabase(databasePath, "main", "2026.9.2", 19);
+  const eventJson = JSON.stringify({ type: "message", message: { role: "user", content: "Keep this compressed history 🦉" } });
+  insertSession(db, { sessionId: "evolved", chatType: "channel", message: JSON.parse(eventJson) });
+  const original = await syncSessionProjections(params);
+  const path = join(params.outputDir, original.manifest.sessions.evolved!.documentPath);
+  const text = await readFile(path, "utf8");
+  db.exec(`PRAGMA user_version=24; UPDATE schema_meta SET schema_version=24;
+    ALTER TABLE transcript_events ADD COLUMN event_zstd BLOB;
+    ALTER TABLE transcript_events ADD COLUMN event_utf8_bytes INTEGER;
+    CREATE TABLE session_transcript_cold_archives (session_id TEXT PRIMARY KEY);`);
+  db.prepare("UPDATE transcript_events SET event_json=NULL,event_zstd=?,event_utf8_bytes=?")
+    .run(zstdCompressSync(Buffer.from(eventJson)), Buffer.byteLength(eventJson));
+  const compressed = await syncSessionProjections({ ...params, force: true });
+  assert.equal(compressed.result.failed, 0);
+  assert.equal(await readFile(path, "utf8"), text);
+  // A storage transition must invalidate the incremental fast path even without a rewrite.
+  db.prepare("INSERT INTO session_transcript_cold_archives VALUES ('evolved')").run();
+  db.exec("DELETE FROM transcript_events; DELETE FROM session_transcript_active_events;");
+  const cold = await syncSessionProjections(params);
+  assert.equal(cold.result.failed, 1);
+  assert.equal(cold.result.removed, 0);
+  assert.equal(await readFile(path, "utf8"), text);
+  assert.deepEqual(cold.manifest.sessions.evolved, compressed.manifest.sessions.evolved);
+  db.exec("DELETE FROM session_transcript_cold_archives");
+  db.prepare("INSERT INTO transcript_events VALUES ('evolved',1,NULL,3000,?,?)")
+    .run(zstdCompressSync(Buffer.from(eventJson)), Buffer.byteLength(eventJson) + 1);
+  db.exec("INSERT INTO session_transcript_active_events VALUES ('evolved',0,1,0)");
+  const corrupt = await syncSessionProjections({ ...params, force: true });
+  assert.equal(corrupt.result.failed, 1);
+  assert.equal(corrupt.result.removed, 0);
+  assert.equal(await readFile(path, "utf8"), text);
+  db.close();
+});
 
 function writeStaleManifest(path: string, documentPath: string): Promise<void> {
   return writeFile(path, JSON.stringify({
@@ -288,10 +328,10 @@ test("schema and malformed-event failures preserve prior projections", async () 
 
   const unsupported = new DatabaseSync(databasePath);
   unsupported.exec("PRAGMA user_version = 16");
-  await assert.rejects(syncSessionProjections(params), /expected one of 17, 18, 19, found 16/);
+  await assert.rejects(syncSessionProjections(params), /unsupported.*schema.*found 16/);
   unsupported.exec("PRAGMA user_version = 20");
   unsupported.prepare("UPDATE schema_meta SET schema_version = 20 WHERE meta_key = 'primary'").run();
   unsupported.close();
-  await assert.rejects(syncSessionProjections(params), /expected one of 17, 18, 19, found 20/);
+  await assert.rejects(syncSessionProjections(params), /Unsupported transcript cold-storage capabilities/);
   assert.equal(await readFile(projectedPath, "utf8"), original);
 });

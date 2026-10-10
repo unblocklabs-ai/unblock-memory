@@ -202,8 +202,8 @@ factual verification. Week buckets
 may be partial, and several exchanges in one session are not independent. Wilson
 intervals are descriptive, not calibrated confidence about overall agent ability.
 
-Each run selects at most 100 recent sessions for inference, each at most 2,000 active events/2M
-characters; episodes must fit 24K characters and six feedback messages without
+Each run selects at most 100 recent sessions containing approved-sender messages for inference,
+each at most 2,000 active events/2M decoded UTF-8 bytes; episodes must fit 24K characters and six feedback messages without
 truncating the answer. Coverage counts describe the scanned sessions; only episodes
 within `lookbackDays` are judged. Caps, failures and no-feedback cases remain visible.
 Saved sessions in the report window are also reconciled independently of that

@@ -13,6 +13,7 @@ export declare function collectTraining(source: Source, store?: TrainingStore, o
     sessions: number;
     excludedSessions: number;
     oversizedSessions: number;
+    unavailableSessions: number;
     eligible: number;
     users: number;
     filtered: number;
@@ -39,6 +40,7 @@ export declare function runTraining(source: Source, store: TrainingStore, config
         sessions: number;
         excludedSessions: number;
         oversizedSessions: number;
+        unavailableSessions: number;
         eligible: number;
         users: number;
         filtered: number;

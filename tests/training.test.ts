@@ -11,7 +11,7 @@ import { trainingExamples, TrainingTranscriptReader } from "../src/training-inpu
 import { TrainingStore } from "../src/training-store.js";
 import { collectTraining, runTraining } from "../src/training.js";
 import { judgeTrainingInput } from "../src/training-gate.js";
-import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
+import { compressAgentTranscripts, createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 const config = resolveConfig({ typesafe: { apiKey: "private-test-key" } });
 const user = (content: string, extra = {}) => ({ role: "user", content,
@@ -180,7 +180,7 @@ test("appends preserve previous gates; edits invalidate only affected inputs; re
     collectTraining(f.source, f.store);
     await runTraining(f.source, f.store, config, bounds);
     f.append("s", [user("Third"), assistant("Third answer")]);
-    assert.deepEqual(collectTraining(f.source, f.store), { sessions: 1, excludedSessions: 0, oversizedSessions: 0, eligible: 3,
+    assert.deepEqual(collectTraining(f.source, f.store), { sessions: 1, excludedSessions: 0, oversizedSessions: 0, unavailableSessions: 0, eligible: 3,
       users: 3, filtered: 0, oversized: 0, unanswered: 0, added: 1, changed: 0, unchanged: 2, retired: 0, review: [] });
     assert.equal((await runTraining(f.source, f.store, config, bounds)).calls, 1);
     f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='s' AND seq=4")
@@ -358,6 +358,15 @@ test("schema 19 lineage excludes spawned/hook sessions and oversized sessions su
     assert.equal(f.store.pending(100).length, 0);
     assert.deepEqual(f.store.status(0.7).examples.map(row => ({ ...row })), [{ active: -1, count: 1 }]);
     f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='s' AND seq=2").run(original);
+    assert.equal(collectTraining(f.source, f.store).changed, 1);
+    assert.equal(f.store.pending(100).length, 1);
+    compressAgentTranscripts(f.db);
+    assert.equal(collectTraining(f.source, f.store).unchanged, 1);
+    f.db.prepare("INSERT INTO session_transcript_cold_archives VALUES ('s')").run();
+    assert.equal(collectTraining(f.source, f.store).unavailableSessions, 1);
+    assert.equal(f.store.pending(100).length, 0);
+    assert.deepEqual(f.store.status(0.7).examples.map(row => ({ ...row })), [{ active: -1, count: 1 }]);
+    f.db.exec("DELETE FROM session_transcript_cold_archives");
     assert.equal(collectTraining(f.source, f.store).changed, 1);
     assert.equal(f.store.pending(100).length, 1);
     f.db.prepare("UPDATE session_windows SET spawned_by='agent:main:parent' WHERE session_id='s'").run();

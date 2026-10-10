@@ -34,6 +34,7 @@ export declare function generateTrainingQueries(source: Source, store: TrainingS
         sessions: number;
         excludedSessions: number;
         oversizedSessions: number;
+        unavailableSessions: number;
         eligible: number;
         users: number;
         filtered: number;
@@ -79,6 +80,7 @@ export declare function evaluateTrainingQueries(source: Source, store: TrainingS
         sessions: number;
         excludedSessions: number;
         oversizedSessions: number;
+        unavailableSessions: number;
         eligible: number;
         users: number;
         filtered: number;

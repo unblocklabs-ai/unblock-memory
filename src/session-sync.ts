@@ -3,7 +3,7 @@ import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { ACTIVE_EVENTS_FROM, agentTranscriptSchemaVersion, assertAgentTranscriptIdentity } from "./agent-transcript.js";
+import { AgentTranscriptReader, agentTranscriptSchemaVersion, assertAgentTranscriptIdentity } from "./agent-transcript.js";
 import type { ChatType } from "./config.js";
 import {
   projectSessionDocument,
@@ -14,7 +14,7 @@ import {
 } from "./session-projector.js";
 
 const MANIFEST_VERSION = 1;
-export const PROJECTOR_VERSION = 7;
+export const PROJECTOR_VERSION = 8;
 // Source lives in src/, published code in dist/src/. Read our own pinned dependency
 // metadata, not QMD internals (which may also be substituted by runtime inspectors).
 const sourcePackage = new URL("../package.json", import.meta.url);
@@ -85,6 +85,7 @@ type WindowRow = {
   sourceGeneration: string | null;
   maxSeq: number | null;
   activeEventCount: number;
+  cold: number;
 };
 
 type EventRow = { sessionId: string; eventJson: string; createdAt: number };
@@ -159,11 +160,12 @@ function readSnapshot(params: {
   outputDir: string;
   previousManifest: SessionManifest;
   metadataOnly?: boolean;
-}): { windows: WindowRow[]; events: Map<string, EventRow[]>; changed: Set<string> } {
+}): { windows: WindowRow[]; events: Map<string, EventRow[]>; changed: Set<string>; unavailable: Set<string> } {
   const db = new DatabaseSync(params.databasePath, { readOnly: true });
   try {
     db.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; BEGIN");
     assertSchema(db, params.agentId);
+    const transcripts = new AgentTranscriptReader(db, params.agentId);
     const placeholders = params.chatTypes.map(() => "?").join(", ");
     const windows = db.prepare(`
       SELECT
@@ -177,7 +179,8 @@ function readSnapshot(params: {
         COALESCE(window.started_at, window.created_at) AS startedAt,
         rewrite.generation AS sourceGeneration,
         MAX(active.event_seq) AS maxSeq,
-        COUNT(active.event_seq) AS activeEventCount
+        COUNT(active.event_seq) AS activeEventCount,
+        ${transcripts.coldSql("window.session_id")} AS cold
       FROM session_windows AS window
       LEFT JOIN conversations AS conversation
         ON conversation.conversation_id = window.primary_conversation_id
@@ -189,15 +192,9 @@ function readSnapshot(params: {
       GROUP BY window.session_id
       ORDER BY window.created_at, window.session_id
     `).all(...params.chatTypes) as WindowRow[];
-    const readEvents = db.prepare(`
-      SELECT a.session_id AS sessionId, e.event_json AS eventJson,
-             e.created_at AS createdAt
-      ${ACTIVE_EVENTS_FROM}
-      WHERE a.session_id = ?
-      ORDER BY a.active_position
-    `);
     const events = new Map<string, EventRow[]>();
     const changed = new Set<string>();
+    const unavailable = new Set<string>();
     for (const window of windows) {
       const metadata: SessionMetadata = {
         sessionId: window.sessionId,
@@ -210,7 +207,7 @@ function readSnapshot(params: {
       const previous = params.previousManifest.sessions[window.sessionId];
       const documentPath = sessionDocumentPath(metadata);
       const sourceFingerprint = JSON.stringify(window);
-      const unchanged = !params.force &&
+      const unchanged = !window.cold && !params.force &&
         (previous ? previous.sourceFingerprint === sourceFingerprint &&
           previous.projectorVersion === PROJECTOR_VERSION &&
           previous.documentPath === documentPath &&
@@ -218,11 +215,18 @@ function readSnapshot(params: {
           params.previousManifest.ignoredSessions?.[window.sessionId] === sourceFingerprint);
       if (!unchanged) {
         changed.add(window.sessionId);
-        if (!params.metadataOnly) events.set(window.sessionId, readEvents.all(window.sessionId) as EventRow[]);
+        if (!params.metadataOnly) {
+          try {
+            const snapshot = transcripts.read(window.sessionId);
+            if (snapshot.kind === "ready") events.set(window.sessionId,
+              snapshot.rows.map(row => ({ ...row, sessionId: window.sessionId })));
+            else unavailable.add(window.sessionId);
+          } catch { unavailable.add(window.sessionId); }
+        }
       }
     }
     db.exec("COMMIT");
-    return { windows, events, changed };
+    return { windows, events, changed, unavailable };
   } catch (error) {
     try { db.exec("ROLLBACK"); } catch { /* transaction may not have started */ }
     throw error;
@@ -339,6 +343,11 @@ export async function syncSessionProjections(params: ProjectionOptions & {
       startedAt: window.startedAt,
     };
     const documentPath = sessionDocumentPath(metadata);
+    if (snapshot.unavailable.has(window.sessionId)) {
+      counts.failed += 1;
+      if (previous) sessions[window.sessionId] = previous;
+      continue;
+    }
     if (events === undefined) {
       if (previous) sessions[window.sessionId] = previous;
       else ignoredSessions[window.sessionId] = JSON.stringify(window);

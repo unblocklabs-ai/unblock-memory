@@ -48,6 +48,10 @@ export declare class TrainingTranscriptReader {
         }[];
     } | {
         oversized: true;
+        unavailable?: undefined;
+    } | {
+        unavailable: true;
+        oversized?: undefined;
     } | null;
     close(): void;
 }

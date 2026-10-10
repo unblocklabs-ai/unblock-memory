@@ -1,8 +1,39 @@
 import type { DatabaseSync } from "node:sqlite";
-/** The OpenClaw agent database versions whose transcript layout we read. */
+/** Identity fence, not a payload-format allowlist. Required capabilities are checked below. */
 export declare function agentTranscriptSchemaVersion(db: DatabaseSync, errorMessage?: string): number;
 export declare function assertAgentTranscriptIdentity(db: DatabaseSync, agentId: string, version: number, errorMessage?: string): void;
-export declare function assertAgentTranscriptSchema(db: DatabaseSync, agentId: string, errorMessage?: string): void;
-export declare const ACTIVE_EVENTS_FROM = "FROM session_transcript_active_events a\n  JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq";
-export declare const ACTIVE_EVENT_COUNT_SQL = "SELECT COUNT(*) n,COALESCE(SUM(length(e.event_json)),0) bytes\n  FROM session_transcript_active_events a\n  JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq WHERE a.session_id=?";
-export declare const ACTIVE_EVENT_ROWS_SQL = "SELECT e.seq,e.event_json eventJson,e.created_at createdAt\n  FROM session_transcript_active_events a\n  JOIN transcript_events e ON e.session_id=a.session_id AND e.seq=a.event_seq WHERE a.session_id=? ORDER BY a.active_position";
+type AgentTranscriptRow = {
+    seq: number;
+    eventJson: string;
+    createdAt: number;
+};
+type TranscriptSnapshot = {
+    kind: "ready";
+    rows: AgentTranscriptRow[];
+} | {
+    kind: "cold";
+} | {
+    kind: "oversized";
+} | {
+    kind: "unreadable";
+};
+/**
+ * One read-only storage boundary for full-fidelity active transcripts. The public
+ * SDK's full reader may restore cold archives; its read-only catalog truncates and
+ * redacts content. Neither currently provides the contract these consumers need.
+ * Keep payload SQL here until the SDK offers a bounded, full-fidelity read-only API.
+ */
+export declare class AgentTranscriptReader {
+    #private;
+    readonly db: DatabaseSync;
+    constructor(db: DatabaseSync, agentId: string, errorMessage?: string);
+    /** Include storage availability in incremental fingerprints, not just hot row counts. */
+    coldSql(sessionIdExpression: string): string;
+    /** Caller owns a transaction so metadata, cold marker, bounds and rows share one snapshot. */
+    read(sessionId: string, limits?: {
+        maxEvents?: number;
+        maxBytes?: number;
+        maxSeq?: number;
+    }): TranscriptSnapshot;
+}
+export {};

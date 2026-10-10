@@ -13,7 +13,7 @@ import { pathToFileURL } from "node:url";
 import { resolveConfig } from "../src/config.js";
 import { linkInsideOutPeople, repairInsideOutIdentities, runInsideOut, reportInsideOut } from "../src/inside-out.js";
 import { PeopleStore } from "../src/people-store.js";
-import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
+import { compressAgentTranscripts, createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 const emotions = ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
 const cfg = (insideOut = {}) => resolveConfig({ typesafe: { apiKey: "fake", timeoutMs: 1000 },
@@ -298,6 +298,41 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   assert.equal(cliResult.output[2].length, 4);
   assert.equal(cliResult.output[3].reviewed, 4);
   assert.equal(cliResult.calls, 8, "reports and the cached background pass do not repeat inference");
+  // Evolve the real SDK-written store after the old SDK writer has finished.
+  const evolved = new DatabaseSync(options.databasePath);
+  try {
+    compressAgentTranscripts(evolved);
+    // Force a reread; unchanged metadata alone would not prove decoding works.
+    evolved.exec("UPDATE transcript_rewrite_watermarks SET generation='compressed-fixture'");
+    const reread = await runInsideOut({ ...options, config: cfg() });
+    assert.deepEqual("errors" in reread && reread.errors, []);
+    assert.deepEqual(reportInsideOut(options.storePath), rows);
+    assert.equal(requests.length, 8, "compressed events retain their identities and cached judgments");
+    const last = evolved.prepare(`SELECT max(e.seq) seq,max(a.active_position) position FROM transcript_events e
+      JOIN session_transcript_active_events a ON a.session_id=e.session_id AND a.event_seq=e.seq
+      WHERE e.session_id='live'`).get()!;
+    for (const [i, message] of [assistant("New compressed answer."), user("That makes me happy!", "bek", time + 21_000)].entries()) {
+      const bytes = Buffer.from(JSON.stringify(event(`compressed-${i}`, message, new Date(time + 20_000 + i * 1000).toISOString())));
+      const seq = Number(last.seq) + i + 1, position = Number(last.position) + i + 1;
+      evolved.prepare(`INSERT INTO transcript_events(session_id,seq,event_json,created_at,event_zstd,event_utf8_bytes)
+        VALUES('live',?,NULL,?,?,?)`).run(seq, time + 20_000 + i * 1000, zstdCompressSync(bytes), bytes.byteLength);
+      evolved.prepare(`INSERT INTO session_transcript_active_events(session_id,active_position,event_seq,message_position)
+        VALUES('live',?,?,?)`).run(position, seq, position);
+    }
+    const fresh = await runInsideOut({ ...options, config: cfg() });
+    assert.deepEqual("errors" in fresh && fresh.errors, []);
+    assert.equal("reviewed" in fresh && fresh.reviewed, 1);
+    assert.equal(requests.length, 9);
+    assert.equal(requests.at(-1)!.state.target.text, "That makes me happy!");
+    assert.ok(requests.at(-1)!.state.history.some(m => m.text === "New compressed answer."));
+    const compressedRows = reportInsideOut(options.storePath);
+    assert.equal(compressedRows.length, 9);
+    assert.ok(compressedRows.some(row => row.message_id === "compressed-1" && row.joy === 0.85));
+    evolved.prepare("INSERT INTO session_transcript_cold_archives VALUES ('live')").run();
+    const cold = await runInsideOut({ ...options, config: cfg(), sessionId: "live" });
+    assert.ok("errors" in cold && cold.errors.length);
+    assert.deepEqual(reportInsideOut(options.storePath), compressedRows);
+  } finally { evolved.close(); }
 });
 
 test("legacy files keep whole messages, unknown identities, broad formatting, branches and bounded context", async t => {
