@@ -348,13 +348,13 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean", "default": false },
+          "enabled": { "type": "boolean", "default": true },
           "historyMessages": { "type": "integer", "minimum": 0, "default": 5 },
           "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
           "cooldownTurns": { "type": "integer", "minimum": 0, "default": 10 }
         },
         "default": {
-          "enabled": false,
+          "enabled": true,
           "historyMessages": 5,
           "minScore": 0.5,
           "cooldownTurns": 10

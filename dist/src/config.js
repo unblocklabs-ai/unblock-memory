@@ -78,7 +78,7 @@ function resolveTypeSafe(value) {
     };
 }
 const DEFAULT_SKILL_WHISPERER = {
-    enabled: false,
+    enabled: true,
     historyMessages: 5,
     minScore: 0.5,
     cooldownTurns: 10,
@@ -345,7 +345,7 @@ export function resolveConfig(value) {
         }
         const value = config.skillWhisperer;
         assertOnlyKeys(value, ["enabled", "historyMessages", "minScore", "cooldownTurns"], "skillWhisperer");
-        const enabled = value.enabled ?? false;
+        const enabled = value.enabled ?? DEFAULT_SKILL_WHISPERER.enabled;
         const historyMessages = value.historyMessages ?? 5;
         const minScore = value.minScore ?? 0.5;
         const cooldownTurns = value.cooldownTurns ?? 10;
@@ -368,9 +368,6 @@ export function resolveConfig(value) {
             throw new Error("unblock-memory skillWhisperer.cooldownTurns must be a non-negative integer");
         }
         skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns };
-    }
-    if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
-        throw new Error('unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"');
     }
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
         extraction: resolveExtraction(config.extraction, corpora),

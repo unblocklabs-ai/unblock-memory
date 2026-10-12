@@ -26,8 +26,10 @@ settings; a rotated credential file is reread without a restart.
 | Inside Out | `insideOut.enabled`; opts in all retained channels | No inference | Failed reviews are recorded and retried; successes stay cached |
 | Clustering | Configured local `analysis.executable` | Unchanged | Unchanged; worker failures do not disable ordinary search |
 
-Whisperers, people storage, the primer and audits default off. `typesafe.enabled` defaults true but does not
-enable any feature; `sentimentEnabled` defaults true only **within an enabled
+Skill Whisperer defaults on but emits no hints without a configured skills corpus.
+Memory/People Whisperers, people storage, the primer and audits default off.
+`typesafe.enabled` defaults true but does not enable those opt-in features;
+`sentimentEnabled` defaults true only **within an enabled
 response audit**. `peoplePrimer` controls automatic dossier-save review;
 `evidenceReview` is a different advisory tool. Disabling people injection does
 not disable people tools/storage or erase dossiers.
@@ -217,7 +219,7 @@ contract; these tables explain their effects.
 | `typesafe.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
 | `typesafe.apiKeyFile` | Unset | Absolute raw-key or dotenv file, reread at credential resolution; explicit missing file never falls back to a different key |
 | `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
-| `skillWhisperer.enabled` | `false` | Requires explicit skills corpus and appropriate host hook access; fixed 3-second total deadline |
+| `skillWhisperer.enabled` | `true` | No hints without an explicit skills corpus and appropriate host hook access; fixed 3-second total deadline; `false` opts out |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for TypeSafe shortlist admission |
 | `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |

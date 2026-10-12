@@ -79,9 +79,9 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
   assert.throws(() => resolveConfig({ people: { extra: true } }), /unknown property/);
 });
 
-test("keeps skill whispering disabled by default and validates its lean controls", () => {
+test("enables skill whispering by default without requiring a corpus and validates its lean controls", () => {
   assert.deepEqual(resolveConfig(undefined).skillWhisperer, {
-    enabled: false,
+    enabled: true,
     historyMessages: 5,
     minScore: 0.5,
     cooldownTurns: 10,
@@ -107,7 +107,8 @@ test("keeps skill whispering disabled by default and validates its lean controls
     kind: "skills",
     paths: ["skills/**/SKILL.md"],
   });
-  assert.throws(() => resolveConfig({ skillWhisperer: { enabled: true } }), /requires.*skills/);
+  assert.equal(resolveConfig({ skillWhisperer: {} }).skillWhisperer.enabled, true);
+  assert.equal(resolveConfig({ skillWhisperer: { enabled: false } }).skillWhisperer.enabled, false);
   assert.throws(
     () => resolveConfig({ skillWhisperer: { historyMessages: -1 } }),
     /non-negative integer/,
