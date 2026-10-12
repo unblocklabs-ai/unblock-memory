@@ -120,7 +120,7 @@ Everything below is off until you configure it.
 | [Clustering and curation](docs/retrieval.md#memory-analysis) | Groups related memories so the agent can spot duplicates and maintain its knowledge. Needs a local analysis worker. |
 | [Quality and claim review](docs/retrieval.md#review-and-diagnostics) | Flags noisy indexed content and checks whether a claim is supported by its sources. Advisory only. |
 | [Response audit](docs/response-audit.md) | Operator-only grading of reply quality and sentiment in approved Slack conversations. |
-| [Inside Out](docs/configuration.md#inside-out) | Operator-only scores for six emotions in human replies, with reports. Never changes memory or prompts. |
+| [Inside Out](docs/configuration.md#inside-out) | Operator-only scores for six emotions in human replies, compared with each person's own weekly baseline, with reports. Never changes memory or prompts. |
 
 Whisperers also need conversation-hook and prompt-injection permissions on the
 plugin entry; see [host controls](docs/configuration.md#host-controls). Each

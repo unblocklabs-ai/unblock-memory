@@ -9,6 +9,11 @@ store with `people.enabled`; enable injection separately with
 and automatic save review, not a maintenance scheduler. For independent setup
 examples, see the [configuration profiles](configuration.md#example-profiles).
 
+[Inside Out baselines](configuration.md#person-relative-baselines-and-deviations)
+reuse PeopleSQL's person IDs in separate analytics tables in the same database.
+They retain weekly emotion-grade distributions and interaction deviations; none of
+this analytics is written into dossiers or injected by People Whisperer.
+
 ## Optional People Dossier Primer
 
 `memory_people_prime({ personId, agentName? })` prepares evidence for an existing person;

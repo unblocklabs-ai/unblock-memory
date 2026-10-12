@@ -143,7 +143,7 @@ test("diagnostics reports disabled features, safe credential state and per-agent
   const runtime = { async getMemorySearchManager() { return { manager: { async diagnostics() {
     return { projectorVersion: 6, semanticChunkingVersion: 7, needsEmbedding: 3, embeddingReady: false };
   } } }; } } as unknown as QmdMemoryRuntime;
-  const call = tools(resolveConfig({ typesafe: { apiKey: "fake-secret" } }), runtime, diagnostics);
+  const call = tools(resolveConfig({ skillWhisperer: { enabled: false }, typesafe: { apiKey: "fake-secret" } }), runtime, diagnostics);
   const result = await call("memory_diagnostics");
   assert.equal(result.credential, "available");
   assert.equal(JSON.stringify(result).includes("fake-secret"), false);

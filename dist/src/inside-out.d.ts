@@ -1,10 +1,12 @@
 import type { UnblockMemoryConfig } from "./config.js";
 import { readInsideOutSources } from "./inside-out-sources.js";
+import { emotionBaselineHistory } from "./emotion-baselines.js";
 export type InsideOutConfig = {
     enabled: boolean;
     intervalMinutes: number;
     maxInteractions: number;
     maxContextTokens: number;
+    baselineMinInteractions: number;
 };
 export declare function resolveInsideOut(value: unknown): InsideOutConfig;
 /** Refresh People links without loading transcripts or calling Jev. Known accounts stay exact. */
@@ -39,6 +41,155 @@ export declare function runInsideOut(options: {
 } | {
     status: string;
 }>;
+/** Rebuild local statistics from existing grades, also refreshing exact People links. */
+export declare function refreshInsideOutBaselines(path: string, options?: {
+    minInteractions?: number;
+    now?: number;
+    recompare?: boolean;
+}): {
+    snapshots: number;
+    comparisons: number;
+};
+/** Keep historical aggregation off the Gateway event loop; serialize writers per store. */
+export declare function refreshInsideOutBaselinesAsync(path: string, options?: Parameters<typeof refreshInsideOutBaselines>[1]): Promise<{
+    snapshots: number;
+    comparisons: number;
+}>;
+export declare function reportInsideOutBaselines(path: string, options?: Parameters<typeof emotionBaselineHistory>[1]): {
+    id: string;
+    person_id: string;
+    rubric: string;
+    model: string;
+    version: string;
+    week_start: number;
+    week_end: number;
+    computed_at: number;
+    is_current: number;
+    weekly: {
+        joy: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        sadness: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        fear: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        anger: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        disgust: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        surprise: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+    };
+    cumulative: {
+        joy: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        sadness: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        fear: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        anger: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        disgust: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+        surprise: {
+            count: number;
+            mean: number | null;
+            min: number | null;
+            p10: number | null;
+            median: number | null;
+            p90: number | null;
+            max: number | null;
+            distribution: [number, number][];
+        };
+    };
+}[];
 export declare function reportInsideOut(path: string, options?: {
     summary?: boolean;
     sender?: string;
@@ -47,4 +198,7 @@ export declare function reportInsideOut(path: string, options?: {
     emotion?: string;
     min?: number;
     bucket?: string;
-}): Record<string, import("node:sqlite").SQLOutputValue>[];
+    personId?: string;
+    personal?: boolean;
+    deviationHistory?: boolean;
+}): Record<string, unknown>[];
