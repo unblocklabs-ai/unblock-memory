@@ -96,5 +96,10 @@
       "publishToClawHub": false,
       "publishToNpm": true
     }
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": "1.32.0",
+    "@modelcontextprotocol/server": "2.3.0",
+    "hono": "4.13.11"
   }
 }
