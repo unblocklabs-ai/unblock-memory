@@ -23,7 +23,6 @@ export { expandSessionSearchHit } from "./memory-passage.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
-const qmdModule = import("@unblocklabs/qmd");
 function readSkillDocuments(source) {
     const documents = [];
     const visitedDirectories = new Set();
@@ -365,7 +364,7 @@ export class QmdMemoryManager {
             }
             return this.#store;
         }
-        const { createStore } = await qmdModule;
+        const { createStore } = await import("@unblocklabs/qmd");
         const store = await createStore({
             dbPath: this.#dbPath,
             keepModelsWarm: this.#keepModelsWarm,
@@ -958,7 +957,7 @@ export class QmdMemoryManager {
         if (!store.internal?.llm)
             throw new Error("Skill Whisperer requires the QMD embedding model");
         const llm = store.internal.llm;
-        const { formatDocForEmbedding, formatQueryForEmbedding } = await qmdModule;
+        const { formatDocForEmbedding, formatQueryForEmbedding } = await import("@unblocklabs/qmd");
         let skillIndex = this.#skillIndex;
         if (!skillIndex) {
             const pending = (async () => {

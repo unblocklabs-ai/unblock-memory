@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,21 @@ import type {
 } from "openclaw/plugin-sdk/plugin-entry";
 import { registerUnblockMemory, resolveFlushPlan } from "../src/plugin.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
+
+test("cold plugin loading does not start the QMD backend", () => {
+  const entry = new URL("../index.ts", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+    import { registerHooks } from "node:module";
+    registerHooks({ resolve(specifier, context, next) {
+      if (specifier === "@unblocklabs/qmd") throw new Error("QMD loaded before a memory operation");
+      return next(specifier, context);
+    }});
+    const entry = await import(${JSON.stringify(entry)});
+    if (!entry.default) throw new Error("Plugin entry did not load");
+    await new Promise(resolve => setTimeout(resolve, 100));
+  `], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(child.status, 0, child.stderr || child.error?.message);
+});
 
 type Tool = {
   name: string;
