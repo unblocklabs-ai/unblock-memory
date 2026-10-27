@@ -1,9 +1,10 @@
 import { timingFields, type RetrievalTimings } from "./retrieval-timing.js";
 
 type RetrievalOperation = "vector" | "memoryWhisperer" | "memorySearch";
-type RetrievalOutcome = "ok" | "partial" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped";
+type RetrievalOutcome = "ok" | "partial" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped" | "degraded";
 const fields = ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", ...timingFields,
-  "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars"] as const;
+  "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars",
+  "requestsSucceeded", "requestsFailed", "fallbackKeyUnavailable", "fallbackAllJudgmentsFailed"] as const;
 type Field = typeof fields[number];
 export type RetrievalObservation = { outcome: RetrievalOutcome; elapsedMs: number } & RetrievalTimings & Partial<Record<Field, number>>;
 type Entry = {
@@ -14,7 +15,7 @@ type Entry = {
 };
 
 const recentLimit = 256;
-const outcomes: readonly RetrievalOutcome[] = ["ok", "partial", "empty", "failed", "cancelled", "timed_out", "skipped"];
+const outcomes: readonly RetrievalOutcome[] = ["ok", "partial", "empty", "failed", "cancelled", "timed_out", "skipped", "degraded"];
 const boundedAdd = (left: number, right: number) => Math.min(Number.MAX_SAFE_INTEGER, left + right);
 
 /** Only fixed operation/outcome names and nonnegative numbers enter this store. */

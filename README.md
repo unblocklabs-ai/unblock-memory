@@ -8,8 +8,9 @@ keyword or vector similarity.
 
 ## Quick start
 
-**Requirements:** Node.js 22+, OpenClaw 2026.8.1-beta.3 or later, and a
-[TypeSafe](https://docs.typesafe.ai) API key. Search uses TypeSafe to rank results.
+**Requirements:** Node.js 22+ and OpenClaw 2026.8.1-beta.3 or later.
+A [TypeSafe](https://docs.typesafe.ai) API key enables usefulness ranking; without
+it, explicit search returns labeled local search leads.
 
 1. Install once per OpenClaw host, not once per agent:
 
@@ -88,12 +89,14 @@ come back with their source location.
 
 The agent then calls `memory_get` with that `path` to read the surrounding
 context, attribution and dates. Search defaults to 5 results with a usefulness
-score of at least 0.7. See [search and read](docs/retrieval.md#search-and-read)
-for every parameter.
+score of at least 0.7 when TypeSafe is available. If ranking is unavailable,
+search returns unjudged local leads with a warning; the usefulness threshold
+is not applied. Automatic Memory Whisperer hints still require TypeSafe.
+See [search and read](docs/retrieval.md#search-and-read) for every parameter.
 
 **What leaves your machine:** indexing, embeddings, storage and `memory_get` run
 locally. `memory_search` sends the search question and candidate passages, with
-their paths and dates, to TypeSafe for scoring. Optional TypeSafe features send
+their paths and dates, to TypeSafe for scoring when available. Optional TypeSafe features send
 only what their own settings approve; see
 [TypeSafe data scope](docs/configuration.md#typesafe-data-scope).
 

@@ -322,6 +322,9 @@ test("memory search compacts judged results without changing evidence or request
   const result = parseJsonResult(response);
   await getFactory(context)!.execute("get", { path: "qmd://memory/missing.md" });
   assert.deepEqual(result, {
+    rankingMode: "typesafe_usefulness",
+    scoreMeaning: "usefulness_probability",
+    minUsefulnessApplied: true,
     results: [
       {
         path: internalResult.path,
