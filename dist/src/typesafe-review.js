@@ -1,8 +1,7 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
-import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
-export { TYPESAFE_MODEL as TYPESAFE_REVIEW_MODEL } from "./typesafe-client.js";
+import { requestTypeSafe, TYPESAFE_NOUL_ANSWERS_SCHEMA as nouls, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
 const relationSchema = Type.Object({ answers: Type.Object({ relation: Type.Object({
             type: Type.Literal("choice"),
             choice: Type.Union([Type.Literal("supports"), Type.Literal("contradicts"), Type.Literal("insufficient_evidence")]),
@@ -73,7 +72,6 @@ export async function reviewTypeSafeClaim(params) {
         needsReview: answer.choice !== "supports" || answer.confidence < 0.9 ||
             (background !== undefined && (background.backgroundOnly < 0.9 || background.explicitSupport < 0.9)) };
 }
-const nouls = Type.Object({ answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA) });
 /** Directional coverage, not topic similarity. Bounded at six comparisons of four ranked candidates. */
 export async function reviewMemoryRedundancy(params) {
     if (params.excerpts.length > 4)

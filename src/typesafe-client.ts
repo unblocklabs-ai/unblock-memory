@@ -2,11 +2,13 @@ import { readFile } from "node:fs/promises";
 import { parseEnv } from "node:util";
 import { Type } from "typebox";
 import type { UnblockMemoryConfig } from "./config.js";
+import { abortedByTimeout } from "./abortable.js";
 
 export const TYPESAFE_MODEL = "jev-1.13.0";
 export const TYPESAFE_NOUL_SCHEMA = Type.Object({
   type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
 });
+export const TYPESAFE_NOUL_ANSWERS_SCHEMA = Type.Object({ answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA) });
 
 /** A conservative estimate of serialized size, not Jev's tokenizer. Non-ASCII is budgeted separately. */
 export function estimateJevTokens(value: unknown): number {
@@ -18,6 +20,11 @@ export function estimateJevTokens(value: unknown): number {
 export class TypeSafeRequestError extends Error {
   constructor(message: string, readonly code: "timeout" | "cancelled" | "http_error" | "invalid_response" | "network_error",
     readonly status?: number) { super(message); }
+}
+
+/** A TypeSafe deadline: the request's own timeout, or the caller's timed-out signal. */
+export function isTypeSafeTimeout(error: unknown, signal: AbortSignal): boolean {
+  return (error instanceof TypeSafeRequestError && error.code === "timeout") || abortedByTimeout(signal);
 }
 
 /** Explicit credentials take precedence; a missing explicit file never selects another key. */
@@ -64,7 +71,7 @@ export async function requestTypeSafe(params: { apiKey: string; timeoutMs?: numb
   } catch (error) {
     if (error instanceof TypeSafeRequestError) throw error;
     if (signal?.aborted) {
-      const timedOut = signal.reason instanceof Error && signal.reason.name === "TimeoutError";
+      const timedOut = abortedByTimeout(signal);
       throw new TypeSafeRequestError(timedOut ? "TypeSafe request timed out" : "TypeSafe request cancelled",
         timedOut ? "timeout" : "cancelled");
     }

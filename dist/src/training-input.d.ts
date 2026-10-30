@@ -13,7 +13,6 @@ type Row = {
     eventJson: string;
     createdAt: number;
 };
-export declare const trainingHash: (value: unknown) => string;
 /** The following answer establishes eligibility, but is never part of that example's input. */
 export declare function trainingExamples(rows: Iterable<Row>, renew?: () => void): {
     examples: TrainingExample[];

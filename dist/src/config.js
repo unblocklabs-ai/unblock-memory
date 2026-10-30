@@ -370,8 +370,8 @@ export function resolveConfig(value) {
         skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns };
     }
     // Default-on means "on once skills exist": without a skills corpus it could never
-    // hint, so it registers no prompt hook and reports inactive. Host-applied schema
-    // defaults are indistinguishable from an explicit true, so this never throws.
+    // hint, so it registers no prompt hook and reports inactive. An explicit true is
+    // overridden too, never thrown; plugin registration warns about that case.
     if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
         skillWhisperer = { ...skillWhisperer, enabled: false };
     }

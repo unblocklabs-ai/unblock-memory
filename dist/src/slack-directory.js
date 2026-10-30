@@ -1,11 +1,7 @@
 import { inspectReadOnlyChannelAccount } from "openclaw/plugin-sdk/directory-runtime";
+import { record } from "./guards.js";
 function text(value, maxLength) {
     return typeof value === "string" && value.trim() ? value.trim().slice(0, maxLength) : undefined;
-}
-function record(value) {
-    return value && typeof value === "object" && !Array.isArray(value)
-        ? value
-        : undefined;
 }
 function slackToken(account) {
     return text(account.userToken, 10_000) ?? text(account.botToken, 10_000);

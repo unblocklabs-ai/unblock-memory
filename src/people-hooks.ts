@@ -2,10 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { PeopleStores } from "./people-store.js";
-
-function nonBlank(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
+import { nonBlank } from "./guards.js";
 
 function identifier(value: unknown): string | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
@@ -116,10 +113,8 @@ export function registerPeopleHooks(
     const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
     const mappedThreadKey = threadByRun.get(runId);
     const pendingThreadKey = mappedThreadKey ? undefined : pendingThreadByIdentity.get(identityKey);
-    if (!mappedThreadKey && pendingThreadByIdentity.has(identityKey)) {
-      pendingThreadByIdentity.delete(identityKey);
-    }
-    const threadKey = mappedThreadKey ?? pendingThreadKey ?? undefined;
+    if (!mappedThreadKey) pendingThreadByIdentity.delete(identityKey);
+    const threadKey = mappedThreadKey ?? pendingThreadKey;
     if (!threadKey) return;
     if (typeof pendingThreadKey === "string") {
       threadByRun.set(runId, pendingThreadKey);

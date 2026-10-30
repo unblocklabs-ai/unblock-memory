@@ -4,13 +4,13 @@ import { Value } from "typebox/value";
 import { callGatewayFromCli, errorShape, ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import type { OpenClawPluginApi, OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
-import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import { MEMORY_DATABASE, hasMemoryTable } from "./memory-database.js";
 import { ExtractionStore } from "./extraction-store.js";
 import { extractionSessions } from "./extraction-source.js";
 import { dateOption } from "./date-option.js";
+import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
 export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemoryConfig, runtime?: QmdMemoryRuntime) {
   let lifetime = new AbortController();
@@ -18,8 +18,8 @@ export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemory
   const options = (cfg: OpenClawConfig, agentId: string) => {
     if (!listAgentIds(cfg).includes(agentId)) throw new Error("Unknown extraction agent");
     return { agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
-      config, runtime: api.runtime, storePath: join(resolveStateDir(), "agents", agentId, "unblock-memory", MEMORY_DATABASE),
-      sessions: () => extractionSessions(join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"), agentId, config.extraction.chatTypes) };
+      config, runtime: api.runtime, storePath: join(agentStateDir(agentId), MEMORY_DATABASE),
+      sessions: () => extractionSessions(agentTranscriptDatabase(cfg, agentId), agentId, config.extraction.chatTypes) };
   };
   const run = async (cfg: OpenClawConfig, agentId: string, signal: AbortSignal, since?: number, sessionId?: string, scheduled = false) => {
     const opts = options(cfg, agentId);

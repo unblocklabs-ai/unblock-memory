@@ -1,21 +1,15 @@
 import { Value } from "typebox/value";
-import { estimateJevTokens, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
+import { estimateJevTokens, isTypeSafeTimeout, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
 import { messageText } from "./whisperer-context.js";
-import { conversationEnvelope, conversationUserText } from "./response-text.js";
+import { CONVERSATION_INFO, conversationEnvelope, conversationUserText } from "./response-text.js";
 import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
 import { abortable } from "./abortable.js";
+import { isRecord, nonBlank } from "./guards.js";
 // Leaves room for the longest scenario question under Jev's 32k state-plus-question limit.
 const MAX_STATE_TOKENS = 24_000;
 const MAX_SESSIONS = 1000;
 const RUNS_PER_SESSION = 4;
-const CONVERSATION_INFO = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n[^]*?\r?\n```\r?\n/;
 class SafetyInputError extends Error {
-}
-function isRecord(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function nonBlank(value) {
-    return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 /** Thread replies and forum topics belong to their parent conversation (`C1:thread:1712.01`, `-100:topic:5`). */
 function conversationId(value) {
@@ -241,9 +235,7 @@ export function registerSafetyWhisperer(api, plugin, diagnostics) {
         }
         catch (error) {
             // Fail open by design, but never silently: "could not check" is recorded separately from "no match".
-            const timedOut = (error instanceof TypeSafeRequestError && error.code === "timeout") ||
-                (signal.aborted && signal.reason instanceof Error && signal.reason.name === "TimeoutError");
-            const outcome = error instanceof SafetyInputError ? "input_too_large" : timedOut ? "timed_out" : signal.aborted ? "cancelled" : "failed";
+            const outcome = error instanceof SafetyInputError ? "input_too_large" : isTypeSafeTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed";
             record(outcome);
             if (outcome !== "cancelled") {
                 warn({ event: "check_failed", agentId, runId: context.runId, outcome, eligibleScenarios: scenarios.length,

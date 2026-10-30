@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import type { QueryConversation } from "./query-contract.js";
-import { requestTypeSafe, TypeSafeRequestError, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
+import { requestTypeSafe, TypeSafeRequestError, TYPESAFE_MODEL, TYPESAFE_NOUL_ANSWERS_SCHEMA, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 
 const SKILL_MIN_USEFULNESS = 0.7;
@@ -58,16 +58,12 @@ async function judgeTypeSafeSkill(params: {
         criteria: { true: "This skill's specific workflow materially helps with the actual requested work.",
           false: "The workflow is unnecessary, inapplicable, excluded by its description, or only topically related." },
       } });
-  if (!Value.Check(memoryAnswersSchema, payload) || Object.keys(payload.answers).length !== 1 || !payload.answers.useful)
+  if (!Value.Check(TYPESAFE_NOUL_ANSWERS_SCHEMA, payload) || Object.keys(payload.answers).length !== 1 || !payload.answers.useful)
     throw new TypeSafeRequestError("TypeSafe returned an invalid selection", "invalid_response");
   return payload.answers.useful.noul;
 }
 
-const memoryAnswersSchema = Type.Object({
-  answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA),
-});
-
-export const QUALITY_JUDGE_VERSION = "jev-1.13.0:quality-v3-isolated";
+export const QUALITY_JUDGE_VERSION = `${TYPESAFE_MODEL}:quality-v3-isolated`;
 export type QualityJudgment = { noise: number; evidence: number };
 
 /** These are indicators for review, never authorization to delete or rewrite. */
@@ -115,7 +111,7 @@ export async function judgeTypeSafeQuality(params: {
     let payload: unknown;
     payload = await requestTypeSafe({ apiKey: params.apiKey, signal: params.signal, timeoutMs: params.timeoutMs },
       { chunks: [chunk] }, questions);
-    if (!Value.Check(memoryAnswersSchema, payload) ||
+    if (!Value.Check(TYPESAFE_NOUL_ANSWERS_SCHEMA, payload) ||
         Object.keys(payload.answers).length !== Object.keys(questions).length ||
         Object.keys(questions).some(key => !Object.hasOwn(payload.answers, key))) {
       throw new Error("TypeSafe returned invalid quality judgments");

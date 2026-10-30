@@ -4,8 +4,6 @@ export declare const INSIDE_OUT_EMOTIONS: readonly ["joy", "sadness", "fear", "a
 export declare const PURGED_GRADE = "Purged by operator";
 type Emotion = typeof INSIDE_OUT_EMOTIONS[number];
 type Row = Record<string, SQLOutputValue>;
-export declare const hash: (value: unknown) => string;
-export declare const tableExists: (db: DatabaseSync, name: string) => boolean;
 type Statistics = {
     count: number;
     mean: number | null;

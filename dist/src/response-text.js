@@ -1,3 +1,5 @@
+export const CONVERSATION_INFO = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/;
+const FROM_HEADER = /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/;
 /** Infer legacy transport sender metadata only to unwrap visible conversation text. */
 export function conversationUserText(raw, sender) {
     const parsed = conversationEnvelope(raw, sender);
@@ -8,7 +10,7 @@ export function conversationUserText(raw, sender) {
 export function conversationEnvelope(raw, sender) {
     let senderId = typeof sender === "string" ? sender : undefined;
     if (senderId === undefined) {
-        const header = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/.exec(raw.trim());
+        const header = CONVERSATION_INFO.exec(raw.trim());
         if (header) {
             let metadata;
             try {
@@ -22,7 +24,7 @@ export function conversationEnvelope(raw, sender) {
                 senderId = metadata.sender.id;
             }
         }
-        senderId ??= /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/.exec(raw.trim())?.[1];
+        senderId ??= FROM_HEADER.exec(raw.trim())?.[1];
     }
     return userEnvelope(raw, senderId ?? "");
 }
@@ -36,7 +38,7 @@ function userEnvelope(input, senderId) {
     let text = input.trim();
     let contextLimited = false;
     let context;
-    const header = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/.exec(text);
+    const header = CONVERSATION_INFO.exec(text);
     if (header) {
         let meta;
         try {
@@ -70,7 +72,7 @@ function userEnvelope(input, senderId) {
         }
     }
     else {
-        const from = /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/.exec(text);
+        const from = FROM_HEADER.exec(text);
         if (from) {
             if (from[1] !== senderId)
                 return undefined;

@@ -132,6 +132,7 @@ export async function auditQualityPage(params: {
         structure === "serialized_message" ? "possible_serialized_message" : "possible_ingestion_noise";
       const startLine = row.doc.slice(0, row.pos).split("\n").length;
       const endLine = startLine + text.split("\n").length - 1;
+      const triage = qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message");
       const task = curation.addTask({
         type: "quality_review", corpus: source.corpus, collection: source.collection,
         path: row.path, reason, contentFingerprint: fingerprint,
@@ -141,14 +142,13 @@ export async function auditQualityPage(params: {
           indicator: structure === "empty" ? "deterministic_empty" :
             structure === "encoded_message" ? "deterministic_encoding" : "typesafe",
           ...judgment, policy: QUALITY_JUDGE_VERSION,
-          triage: qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message"),
+          triage,
           instruction: "Inspect original source and ingestion before acting. Verify source/index after any authorized repair. Never manually edit generated session projections.",
         }),
       });
       flagged++;
       advance();
       if (task.status !== "pending") continue;
-      const triage = qualityTriage(judgment.noise, judgment.evidence, structure === "encoded_message");
       const key = JSON.stringify([source.collection, reason, triage]);
       const group = groups.get(key) ?? {
         corpus: source.corpus, source: source.configuredPath, reason, triage, pending: 0, examples: [],

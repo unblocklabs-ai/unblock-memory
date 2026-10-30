@@ -5,8 +5,10 @@ import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 import { estimateJevTokens, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
 import { readInsideOutSources } from "./inside-out-sources.js";
-import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHistory, hash, tableExists } from "./emotion-baselines.js";
+import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHistory } from "./emotion-baselines.js";
 import { PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
+import { jsonHash } from "./json-hash.js";
+import { tableExists } from "./memory-database.js";
 export { linkInsideOutPeople, purgeInsideOutPerson, refreshInsideOutBaselines, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 const RUBRIC = "emotion-presence-v2";
 const CONTEXT_ERROR = "Target reply and preceding assistant exceed context budget";
@@ -99,10 +101,10 @@ function* interactions(source, budget, cached, after) {
         if (!text)
             continue;
         const { channel, sender, human } = humanIdentity(source, m);
-        const message = { id: event.id ?? hash(event), role: parsed.role, text,
+        const message = { id: event.id ?? jsonHash(event), role: parsed.role, text,
             ...(parsed.role === "user" ? { human } : {}) };
         const assistant = parsed.role === "user" && event.seq > after ? history.findLastIndex(item => item.role === "assistant") : -1;
-        const id = assistant >= 0 ? hash([source.sessionId, message.id]) : "";
+        const id = assistant >= 0 ? jsonHash([source.sessionId, message.id]) : "";
         if (assistant >= 0 && !cached(id)) {
             const selected = [{ message: history[assistant], position: assistant }];
             let size = estimateJevTokens({ history: selected.map(s => s.message), target: message });

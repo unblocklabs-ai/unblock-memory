@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { openMemoryDatabase } from "./memory-database.js";
+import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import type { QualityJudgment } from "./typesafe.js";
 
 const TEMPORAL_BASES = ["path", "frontmatter", "session", "agent_verified"] as const;
@@ -263,12 +263,10 @@ export class CurationStore {
       evidence: string;
     };
   }): MaintenanceTask | undefined {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    return immediateTransaction(this.#db, () => {
       const row = this.#db.prepare("SELECT * FROM maintenance_tasks WHERE id = ?")
         .get(params.id) as TaskRow | undefined;
       if (!row) {
-        this.#db.exec("COMMIT");
         return undefined;
       }
       const now = new Date().toISOString();
@@ -324,12 +322,8 @@ export class CurationStore {
       const updated = task(
         this.#db.prepare("SELECT * FROM maintenance_tasks WHERE id = ?").get(params.id) as TaskRow,
       );
-      this.#db.exec("COMMIT");
       return updated;
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   updateAnnotationLocation(params: {

@@ -27,7 +27,14 @@ import { searchMemory } from "./memory-search.js";
 import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
 import type { RetrievalObservation } from "./retrieval-telemetry.js";
 import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
+
+function managerUnavailable(error?: string) {
+  return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+}
+
+const ISO_TIMESTAMP_PATTERN = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$";
 
 const searchParameters = Type.Object(
   {
@@ -42,15 +49,13 @@ const searchParameters = Type.Object(
           startedFrom: Type.Optional(
             Type.String({
               description: "Inclusive lower bound on session start time, not message or claim dates (ISO 8601).",
-              pattern:
-                "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+              pattern: ISO_TIMESTAMP_PATTERN,
             }),
           ),
           startedTo: Type.Optional(
             Type.String({
               description: "Inclusive upper bound on session start time, not message or claim dates (ISO 8601).",
-              pattern:
-                "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+              pattern: ISO_TIMESTAMP_PATTERN,
             }),
           ),
           provider: Type.Optional(Type.String({ pattern: "\\S" })),
@@ -162,8 +167,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
         // Manual search is sequential. Whisperer stages overlap and cannot use this subtraction.
         measurement.otherMs = Math.max(0, measurement.elapsedMs - measurement.setupMs -
           (measurement.retrievalMs ?? 0) - (measurement.candidatePrepMs ?? 0) - (measurement.judgeMs ?? 0));
-        if (signal?.aborted) measurement.outcome = signal.reason instanceof Error && signal.reason.name === "TimeoutError"
-          ? "timed_out" : "cancelled";
+        if (signal?.aborted) measurement.outcome = abortedByTimeout(signal) ? "timed_out" : "cancelled";
         diagnostics.measureSearch(active.agentId, measurement);
       }
     },
@@ -182,8 +186,7 @@ function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext
       const { path: untrimmedPath, from, lines } = Value.Parse(getParameters, params);
       const path = untrimmedPath.trim();
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager)
-        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager) return managerUnavailable(error);
       return jsonResult(
         await manager.readFile({
           relPath: path,
@@ -271,8 +274,7 @@ function createReclusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolC
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
       const options = Value.Parse(reclusterParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager)
-        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager) return managerUnavailable(error);
       try {
         return jsonResult(await manager.recluster(options, signal));
       } catch (analysisError) {
@@ -304,8 +306,7 @@ function createListClustersTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
     async execute(_toolCallId: string, params: unknown) {
       const { limit } = Value.Parse(listClustersParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager)
-        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager) return managerUnavailable(error);
       return jsonResult(await manager.listClusters(limit));
     },
   };
@@ -341,8 +342,7 @@ function createFetchClusterTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
     async execute(_toolCallId: string, params: unknown) {
       const { clusterId, topK, offset, sort } = Value.Parse(fetchClusterParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager)
-        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager) return managerUnavailable(error);
       return jsonResult(await manager.fetchCluster({ clusterId, topK, offset, sort }));
     },
   };
@@ -406,16 +406,13 @@ function createListMaintenanceTool(runtime: QmdMemoryRuntime, ctx: OpenClawPlugi
     async execute(_toolCallId: string, params: unknown) {
       const options = Value.Parse(listMaintenanceParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager)
-        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager) return managerUnavailable(error);
       return jsonResult({ status: "ok", tasks: await manager.listMaintenanceTasks(options) });
     },
   };
 }
 
-const isoTimestamp = Type.String({
-  pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
-});
+const isoTimestamp = Type.String({ pattern: ISO_TIMESTAMP_PATTERN });
 
 const updateMaintenanceParameters = Type.Object(
   {
@@ -458,8 +455,7 @@ function createUpdateMaintenanceTool(runtime: QmdMemoryRuntime, ctx: OpenClawPlu
     async execute(_toolCallId: string, params: unknown) {
       const { taskId, action, note, annotation } = Value.Parse(updateMaintenanceParameters, params);
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager)
-        return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+      if (!manager) return managerUnavailable(error);
       const updated = manager.updateMaintenanceTask({
         id: taskId,
         status: action === "resolve" ? "resolved" : action === "defer" ? "deferred" : "irrelevant",

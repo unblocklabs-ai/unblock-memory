@@ -4,7 +4,7 @@ import { abortable } from "./abortable.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 import { parseQueryPair, prepareQueryConversation } from "./query-contract.js";
-const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+import { record } from "./guards.js";
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
 export function queryConversation(prompt, messages) {
     const currentRequest = conversationUserText(prompt)?.text ?? "";

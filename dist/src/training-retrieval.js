@@ -3,7 +3,7 @@ import { statSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
-import { readSessionManifest } from "./session-sync.js";
+import { projectionHash, readSessionManifest } from "./session-sync.js";
 import { resolveSessionSource } from "./sources.js";
 import { trainingCandidates } from "./training-candidates.js";
 import { MEMORY_PASSAGE_VERSION, renderMemoryPassage, duplicateMemoryPassage } from "./memory-passage.js";
@@ -98,7 +98,7 @@ export async function historicalTrainingSource(stateDir, chatTypes) {
                 continue;
             }
             const row = document.get(source.collection, session.documentPath);
-            if (!row || createHash("sha256").update(row.doc).digest("hex") !== session.projectionHash) {
+            if (!row || projectionHash(row.doc) !== session.projectionHash) {
                 excluded++;
                 continue;
             }

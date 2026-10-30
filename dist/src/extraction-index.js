@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import { hasMemoryTable } from "./memory-database.js";
 import { ExtractionStore } from "./extraction-store.js";
 export const EXTRACTED_COLLECTION = "unblock-extracted";
+export const EXTRACTED_PREFIX = `qmd://${EXTRACTED_COLLECTION}/`;
 export function extractedPath(record) { return `${record.id}/${record.revision}`; }
+export function extractedUri(record) { return `${EXTRACTED_PREFIX}${extractedPath(record)}`; }
 export function extractedRecords(storePath, paths) {
-    if (!hasMemoryTable(storePath, "extracted_memories"))
+    if (paths?.length === 0 || !hasMemoryTable(storePath, "extracted_memories"))
         return [];
     const store = new ExtractionStore(storePath);
     try {
@@ -15,7 +17,7 @@ export function extractedRecords(storePath, paths) {
     }
 }
 export function extractedHit(record, score) {
-    return { path: `qmd://${EXTRACTED_COLLECTION}/${extractedPath(record)}`, startLine: 1, endLine: 1, score,
+    return { path: extractedUri(record), startLine: 1, endLine: 1, score,
         snippet: record.text, corpus: "extracted", source: "memory", session: record.metadata,
         extracted: { id: record.id, revision: record.revision, observedAt: new Date(record.observedAt).toISOString() },
         citation: `session:${record.sessionId}#${record.evidence.map(e => e.messageId).join(",")}` };

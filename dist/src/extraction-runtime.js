@@ -3,11 +3,11 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { callGatewayFromCli, errorShape, ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
-import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { MEMORY_DATABASE, hasMemoryTable } from "./memory-database.js";
 import { ExtractionStore } from "./extraction-store.js";
 import { extractionSessions } from "./extraction-source.js";
 import { dateOption } from "./date-option.js";
+import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 export function registerExtraction(api, config, runtime) {
     let lifetime = new AbortController();
     let timer, running;
@@ -15,8 +15,8 @@ export function registerExtraction(api, config, runtime) {
         if (!listAgentIds(cfg).includes(agentId))
             throw new Error("Unknown extraction agent");
         return { agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
-            config, runtime: api.runtime, storePath: join(resolveStateDir(), "agents", agentId, "unblock-memory", MEMORY_DATABASE),
-            sessions: () => extractionSessions(join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"), agentId, config.extraction.chatTypes) };
+            config, runtime: api.runtime, storePath: join(agentStateDir(agentId), MEMORY_DATABASE),
+            sessions: () => extractionSessions(agentTranscriptDatabase(cfg, agentId), agentId, config.extraction.chatTypes) };
     };
     const run = async (cfg, agentId, signal, since, sessionId, scheduled = false) => {
         const opts = options(cfg, agentId);

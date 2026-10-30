@@ -5,9 +5,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 import { parseQueryPair, prepareQueryConversation, type QueryConversation, type QueryPair } from "./query-contract.js";
-
-const record = (value: unknown): Record<string, unknown> | undefined =>
-  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+import { record } from "./guards.js";
 
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
 export function queryConversation(prompt: string, messages: readonly unknown[]): QueryConversation {

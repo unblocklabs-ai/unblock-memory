@@ -14,3 +14,8 @@ export async function abortable<T>(pending: Promise<T>, signal?: AbortSignal): P
     return result;
   } finally { signal.removeEventListener("abort", onAbort); }
 }
+
+/** Whether the signal fired because an `AbortSignal.timeout` deadline elapsed. */
+export function abortedByTimeout(signal: AbortSignal | undefined): boolean {
+  return Boolean(signal?.aborted && signal.reason instanceof Error && signal.reason.name === "TimeoutError");
+}

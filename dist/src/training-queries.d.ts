@@ -1,6 +1,6 @@
 import type { UnblockMemoryConfig } from "./config.js";
 import type { QueryPair } from "./query-contract.js";
-import { type TrainingInput } from "./training-input.js";
+import type { TrainingInput } from "./training-input.js";
 import { historicalTrainingSearch } from "./training-retrieval.js";
 import type { QueryEvaluation, TrainingStore } from "./training-store.js";
 type Source = {

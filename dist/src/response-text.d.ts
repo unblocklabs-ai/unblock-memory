@@ -1,3 +1,4 @@
+export declare const CONVERSATION_INFO: RegExp;
 /** Infer legacy transport sender metadata only to unwrap visible conversation text. */
 export declare function conversationUserText(raw: string, sender?: unknown): {
     text: string;

@@ -17,8 +17,8 @@ export declare class RetrievalTelemetry {
             [k: string]: {
                 calls: number;
                 outcomes: {
-                    ok?: number | undefined;
                     cancelled?: number | undefined;
+                    ok?: number | undefined;
                     partial?: number | undefined;
                     skipped?: number | undefined;
                     failed?: number | undefined;

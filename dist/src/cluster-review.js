@@ -1,7 +1,13 @@
 import { readAnalysisSummary, readCluster } from "./analysis.js";
 import { parseSafeVirtualPath } from "./sources.js";
+import { TYPESAFE_MODEL } from "./typesafe-client.js";
 import { reviewClusterDefects } from "./typesafe-review.js";
 import { chunkFingerprint } from "./curation.js";
+function indexedChunk(db, safe, member) {
+    return db.prepare(`SELECT c.doc, v.pos, v.chunk_len FROM documents d JOIN content c ON c.hash = d.hash
+    JOIN content_vectors v ON v.hash = d.hash WHERE d.active = 1 AND d.collection = ? AND d.path = ? AND d.hash = ? AND v.seq = ?`)
+        .get(safe.source.collection, safe.relativePath, member.hash, member.seq);
+}
 /** Inspect center and edge samples; never extrapolate their labels to the rest of a cluster. */
 export async function reviewClusterIngestion(params) {
     params.signal.throwIfAborted();
@@ -19,9 +25,7 @@ export async function reviewClusterIngestion(params) {
                 return [];
             const safe = parseSafeVirtualPath(path, sources);
             // Reload the full chunk; analysis previews may be truncated. Never judge a silently cut prefix.
-            const row = params.db.prepare(`SELECT c.doc, v.pos, v.chunk_len FROM documents d JOIN content c ON c.hash = d.hash
-        JOIN content_vectors v ON v.hash = d.hash WHERE d.active = 1 AND d.collection = ? AND d.path = ? AND d.hash = ? AND v.seq = ?`)
-                .get(safe.source.collection, safe.relativePath, member.hash, member.seq);
+            const row = indexedChunk(params.db, safe, member);
             if (!row || row.pos < 0 || row.chunk_len < 1 || row.pos + row.chunk_len > row.doc.length || row.chunk_len > 2000)
                 return [];
             const text = row.doc.slice(row.pos, row.pos + row.chunk_len);
@@ -45,9 +49,7 @@ export async function reviewClusterIngestion(params) {
             const safe = parseSafeVirtualPath(member.path, sources);
             if (!safe)
                 return { status: "unavailable", reason: "Source scope changed; retry" };
-            const row = params.db.prepare(`SELECT c.doc, v.pos, v.chunk_len FROM documents d JOIN content c ON c.hash = d.hash
-        JOIN content_vectors v ON v.hash = d.hash WHERE d.active = 1 AND d.collection = ? AND d.path = ? AND d.hash = ? AND v.seq = ?`)
-                .get(safe.source.collection, safe.relativePath, member.hash, member.seq);
+            const row = indexedChunk(params.db, safe, member);
             if (!row || chunkFingerprint(row.doc.slice(row.pos, row.pos + row.chunk_len)) !== member.fingerprint)
                 return { status: "unavailable", reason: "Sample changed during review; retry" };
         }
@@ -59,6 +61,6 @@ export async function reviewClusterIngestion(params) {
         });
         return { status: "ok", runId: snapshot.runId, clusterId: params.clusterId, members, recurring,
             sampled: sample.length, considered: snapshot.considered, clusterSize: snapshot.clusterSize,
-            policy: "jev-1.13.0:cluster-defects-v2-isolated", scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
+            policy: `${TYPESAFE_MODEL}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
     });
 }

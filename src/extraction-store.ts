@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { openMemoryDatabase } from "./memory-database.js";
+import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import type { ExtractionMessage, MemoryProposal } from "./extraction-model.js";
 import type { SessionMetadata } from "./session-projector.js";
 
@@ -62,7 +62,7 @@ export class ExtractionStore {
   release(owner: string) { this.db.prepare("UPDATE extraction_worker SET owner=NULL,lease_until=0 WHERE id=1 AND owner=?").run(owner); }
   checkpoint(session: ExtractionSession, since?: number): Checkpoint {
     this.db.prepare(`INSERT INTO extraction_sessions(session_id,metadata,updated_at,extract_since) VALUES(?,?,?,?)
-      ON CONFLICT(session_id) DO UPDATE SET metadata=excluded.metadata`).run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince());
+      ON CONFLICT(session_id) DO UPDATE SET metadata=excluded.metadata WHERE metadata IS NOT excluded.metadata`).run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince());
     const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision FROM extraction_sessions WHERE session_id=?").get(session.sessionId)!;
     if (since !== undefined && since < Number(row.extract_since)) {
       // A broader explicitly approved backfill replays this session. Existing facts are
@@ -84,19 +84,16 @@ export class ExtractionStore {
         observedAt: Number(r.observed_at), evidence: JSON.parse(String(r.evidence)), metadata: JSON.parse(String(r.metadata)), judgment: JSON.parse(String(r.judgment)) }));
   }
   reset(sessionId: string, cursor: string | null, owner: string) {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    immediateTransaction(this.db, () => {
       this.renew(owner);
       this.db.prepare("UPDATE extracted_memories SET status='withdrawn' WHERE session_id=? AND status='active'").run(sessionId);
       this.db.prepare("UPDATE extraction_sessions SET cursor=?,context='[]',complete_revision=NULL,error=NULL WHERE session_id=?").run(cursor, sessionId);
-      this.db.exec("COMMIT");
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    });
   }
   commit(params: { session: ExtractionSession; expected: string | null; cursor: string; context: ExtractionMessage[];
     accepted: { proposal: MemoryProposal; observedAt: number; judgment: unknown }[]; owner: string; version: string; completeRevision?: string }) {
-    this.db.exec("BEGIN IMMEDIATE");
-    let written = 0;
-    try {
+    return immediateTransaction(this.db, () => {
+      let written = 0;
       this.renew(params.owner);
       const current = this.db.prepare("SELECT cursor FROM extraction_sessions WHERE session_id=?").get(params.session.sessionId);
       if (current?.cursor !== params.expected) throw new Error("Extraction checkpoint changed");
@@ -120,9 +117,8 @@ export class ExtractionStore {
       }
       this.db.prepare("UPDATE extraction_sessions SET cursor=?,context=?,updated_at=?,complete_revision=?,error=NULL WHERE session_id=?")
         .run(params.cursor, JSON.stringify(params.context), Date.now(), params.completeRevision ?? null, params.session.sessionId);
-      this.db.exec("COMMIT");
       return written;
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    });
   }
   error(sessionId: string, code: string) {
     this.db.prepare("UPDATE extraction_sessions SET error=?,updated_at=? WHERE session_id=?").run(code, Date.now(), sessionId);

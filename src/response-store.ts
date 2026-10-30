@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { openMemoryDatabase } from "./memory-database.js";
+import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import type { ResponseEpisode } from "./response-episodes.js";
 import type { ResponseJudgment, ResponseStages, judgeMemoryOpportunity, judgeResponseFollowup } from "./response-judge.js";
 import { responseOutcome, RESPONSE_REPORT_VERSION } from "./response-outcome.js";
@@ -60,16 +60,14 @@ export class ResponseAuditStore {
   }
   /** Claim one bounded scheduled attempt, never replay every missed interval. */
   claimScheduled(now: number, intervalMs: number): boolean {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    return immediateTransaction(this.#db, () => {
       this.#db.prepare(`INSERT INTO response_schedule VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET
         next_due=next_due + excluded.interval_ms - interval_ms, interval_ms=excluded.interval_ms`)
         .run(intervalMs, now + intervalMs);
       const claimed = this.#db.prepare("UPDATE response_schedule SET next_due=? WHERE id=1 AND next_due<=?")
         .run(now + intervalMs, now).changes > 0;
-      this.#db.exec("COMMIT");
       return claimed;
-    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    });
   }
   acquire(now: number): string | undefined {
     const token = randomUUID();
@@ -84,8 +82,7 @@ export class ResponseAuditStore {
       WHERE cohort=? AND active=1 AND episode_at>=? ORDER BY session_id`).all(cohort, since).map(row => String(row.session_id));
   }
   observe(cohort: string, sessionId: string, episodes: readonly ResponseEpisode[]) {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    immediateTransaction(this.#db, () => {
       this.#db.prepare("UPDATE response_results SET active=0 WHERE cohort=? AND session_id=?").run(cohort, sessionId);
       const insert = this.#db.prepare(`INSERT INTO response_results(cohort,id,session_id,input_hash,episode_at,active,status)
         VALUES(?,?,?,?,?,1,'pending') ON CONFLICT(cohort,id) DO UPDATE SET active=1,
@@ -97,8 +94,7 @@ export class ResponseAuditStore {
         result=CASE WHEN input_hash=excluded.input_hash THEN result ELSE NULL END`);
       for (const e of episodes) insert.run(cohort, e.id, sessionId, e.inputHash, e.timestamp);
       this.reviews.reconcile(cohort, sessionId);
-      this.#db.exec("COMMIT");
-    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    });
   }
   needsJudgment(cohort: string, e: ResponseEpisode, now: number) {
     const row = this.#db.prepare("SELECT status,attempts,attempted_at FROM response_results WHERE cohort=? AND id=? AND input_hash=? AND active=1")
@@ -116,13 +112,11 @@ export class ResponseAuditStore {
   }
   save(cohort: string, e: ResponseEpisode, result: ResponseResult, now: number) {
     result = { ...result, human: result.human ?? new ResponsePeople().resolve(e) };
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    immediateTransaction(this.#db, () => {
       const changed = this.#db.prepare("UPDATE response_results SET status='ok',assessed_at=?,result=? WHERE cohort=? AND id=? AND input_hash=? AND active=1")
         .run(now, JSON.stringify(result), cohort, e.id, e.inputHash).changes;
       if (changed) this.reviews.sync(cohort, e.id, e.inputHash, result, now);
-      this.#db.exec("COMMIT");
-    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    });
   }
   cursor(cohort: string) { return String(this.#db.prepare("SELECT cursor FROM response_cursors WHERE cohort=?").get(cohort)?.cursor ?? ""); }
   advance(cohort: string, cursor: string) {
@@ -157,22 +151,19 @@ export class ResponseAuditStore {
     return row ? JSON.parse(String(row.result)) as ResponseStages[K] : undefined;
   }
   stageBegin(keys: string[], now: number) {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    immediateTransaction(this.#db, () => {
       for (const key of keys) {
         const changed = this.#db.prepare(`UPDATE response_stages SET attempts=attempts+1,attempted_at=?,status='failed'
           WHERE key=? AND status!='ok' AND attempts<3 AND (attempted_at IS NULL OR attempted_at<=?)`).run(now, key, now - 600_000).changes;
         if (!changed) throw new Error("Response stage in backoff or retry exhausted");
       }
-      this.#db.exec("COMMIT");
-    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    });
   }
   stageSave<K extends keyof ResponseStages>(key: string, result: ResponseStages[K], now: number) {
     this.#db.prepare("UPDATE response_stages SET status='ok',result=?,assessed_at=? WHERE key=?").run(JSON.stringify(result), now, key);
   }
   retryFailed(cohort: string) {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    return immediateTransaction(this.#db, () => {
       const episodes = this.#db.prepare(`UPDATE response_results AS r SET attempts=0,attempted_at=NULL,status='pending'
         WHERE cohort=? AND active=1 AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable' OR EXISTS (
           SELECT 1 FROM response_stage_links l JOIN response_stages s ON s.key=l.key
@@ -181,8 +172,8 @@ export class ResponseAuditStore {
         WHERE status!='ok' AND key IN (SELECT l.key FROM response_stage_links l JOIN response_results r
         ON r.cohort=l.cohort AND r.id=l.episode_id AND r.input_hash=l.input_hash WHERE r.cohort=? AND r.active=1)`)
         .run(cohort).changes;
-      this.#db.exec("COMMIT"); return { stages, episodes };
-    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+      return { stages, episodes };
+    });
   }
   scan(cohort: string, coverage: object, now: number) {
     this.#db.prepare("INSERT INTO response_scans VALUES(?,?,?) ON CONFLICT(cohort) DO UPDATE SET observed_at=excluded.observed_at,coverage=excluded.coverage")
@@ -325,16 +316,17 @@ export class ResponseAuditStore {
         const scoreDimension = dimension === "fulfillment" || dimension === "deliverableFit" || dimension === "dissatisfactionIntensity" ? dimension : null;
         const sentimentDimension = dimension === "dissatisfactionRate" || dimension === "sentimentUnknownRate";
         const emotionDimension = dimension === "annoyanceRate" || dimension === "frustrationRate";
+        const assessedSubset = scoreDimension || sentimentDimension || emotionDimension;
         const beforeN = scoreDimension ? previous[`${scoreDimension}Scored`] : sentimentDimension ? previous.sentimentAssessed : emotionDimension ? previous.emotionAssessed : previous.evaluated;
         const afterN = scoreDimension ? current[`${scoreDimension}Scored`] : sentimentDimension ? current.sentimentAssessed : emotionDimension ? current.emotionAssessed : current.evaluated;
         const before = dimension === "fulfillment" || dimension === "deliverableFit" || dimension === "dissatisfactionIntensity" ? previous[`${dimension}Mean`] : previous[dimension];
         const after = dimension === "fulfillment" || dimension === "deliverableFit" || dimension === "dissatisfactionIntensity" ? current[`${dimension}Mean`] : current[dimension];
-        const beforeCoverage = scoreDimension || sentimentDimension || emotionDimension ? beforeN / previous.evaluated : previous.outcomeCoverage;
-        const afterCoverage = scoreDimension || sentimentDimension || emotionDimension ? afterN / current.evaluated : current.outcomeCoverage;
+        const beforeCoverage = assessedSubset ? beforeN / previous.evaluated : previous.outcomeCoverage;
+        const afterCoverage = assessedSubset ? afterN / current.evaluated : current.outcomeCoverage;
         const coverageChanged = beforeCoverage !== afterCoverage;
         const enough = beforeN >= 20 && afterN >= 20 && current.taskType !== "uncertain" && current.agentModel !== "unknown";
         const status = !current.human || !current.human.accountScope || current.taskType === "uncertain" || current.agentModel === "unknown" ? "unknown_stratum" :
-          !enough ? "insufficient_samples" : (scoreDimension || sentimentDimension || emotionDimension) && coverageChanged ? "coverage_changed" : "descriptive_comparison";
+          !enough ? "insufficient_samples" : assessedSubset && coverageChanged ? "coverage_changed" : "descriptive_comparison";
         return { fromWeek: previous.week, toWeek: current.week, taskType: current.taskType, agentModel: current.agentModel,
           fromPeriod: previous.week, toPeriod: current.week, human: current.human,
           dimension, beforeN, afterN, status,

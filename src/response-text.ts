@@ -1,3 +1,6 @@
+export const CONVERSATION_INFO = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/;
+const FROM_HEADER = /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/;
+
 /** Infer legacy transport sender metadata only to unwrap visible conversation text. */
 export function conversationUserText(raw: string, sender?: unknown) {
   const parsed = conversationEnvelope(raw, sender);
@@ -9,7 +12,7 @@ export function conversationUserText(raw: string, sender?: unknown) {
 export function conversationEnvelope(raw: string, sender?: unknown) {
   let senderId = typeof sender === "string" ? sender : undefined;
   if (senderId === undefined) {
-    const header = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/.exec(raw.trim());
+    const header = CONVERSATION_INFO.exec(raw.trim());
     if (header) {
       let metadata: unknown;
       try { metadata = JSON.parse(header[1]!); } catch { return; }
@@ -18,7 +21,7 @@ export function conversationEnvelope(raw: string, sender?: unknown) {
         senderId = metadata.sender.id;
       }
     }
-    senderId ??= /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/.exec(raw.trim())?.[1];
+    senderId ??= FROM_HEADER.exec(raw.trim())?.[1];
   }
   return userEnvelope(raw, senderId ?? "");
 }
@@ -34,7 +37,7 @@ function userEnvelope(input: string, senderId: string): { text: string; contextL
   let text = input.trim();
   let contextLimited = false;
   let context: string | undefined;
-  const header = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/.exec(text);
+  const header = CONVERSATION_INFO.exec(text);
   if (header) {
     let meta: { sender?: { id?: unknown; name?: unknown }; history_truncated?: unknown };
     try { meta = JSON.parse(header[1]!); } catch { return undefined; }
@@ -58,7 +61,7 @@ function userEnvelope(input: string, senderId: string): { text: string; contextL
       contextLimited = true;
     }
   } else {
-    const from = /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/.exec(text);
+    const from = FROM_HEADER.exec(text);
     if (from) {
       if (from[1] !== senderId) return undefined;
       text = text.slice(from[0].length).trim();

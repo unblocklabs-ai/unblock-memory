@@ -1,10 +1,10 @@
 import { collectTraining } from "./training.js";
-import { trainingHash } from "./training-input.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_MODEL, TRAINING_TEACHER_VERSION } from "./training-models.js";
-import { historicalTrainingSearch, historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
+import { historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
+import { jsonHash } from "./json-hash.js";
 const LANES = ["lex", "vec"];
 const SELECTION_VERSION = "independent-lanes-top3-mean-v2";
 const TARGET_POLICY = "best-per-lane-no-minimum-v1";
@@ -154,7 +154,7 @@ export function selectTrainingQueries(queries) {
     };
     return { lex: winner("lex"), vec: winner("vec") };
 }
-export async function evaluateTrainingQueries(source, store, config, runtime, options, createSearch = historicalTrainingSearch) {
+export async function evaluateTrainingQueries(source, store, config, runtime, options, createSearch) {
     bounds(options);
     const corpus = config.corpora.find(c => c.kind === "sessions");
     if (!corpus)
@@ -215,9 +215,10 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
         store.renew();
         let snapshot;
         try {
-            snapshot = createSearch === historicalTrainingSearch
-                ? await (await (historicalSource ??= historicalTrainingSource(source.stateDir, corpus.chatTypes)))(example.timestamp)
-                : await createSearch(source.stateDir, corpus.chatTypes, example.timestamp);
+            // By default one source capture serves the whole run; an injected search owns its own capture.
+            snapshot = createSearch
+                ? await createSearch(source.stateDir, corpus.chatTypes, example.timestamp)
+                : await (await (historicalSource ??= historicalTrainingSource(source.stateDir, corpus.chatTypes)))(example.timestamp);
         }
         catch (error) {
             if (!(error instanceof HistoricalCorpusUnavailableError))
@@ -251,7 +252,7 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
             const problems = new Set();
             const judge = (hit) => {
                 const request = contextJudgeRequest(input, snapshot.maxDate, hit);
-                const identity = trainingHash([CONTEXT_JUDGE_VERSION, request]);
+                const identity = jsonHash([CONTEXT_JUDGE_VERSION, request]);
                 let pending = judgments.get(identity);
                 if (!pending) {
                     pending = (async () => {
@@ -415,7 +416,7 @@ export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD)
         const provenance = [...evaluation.teacherIds, ...evaluation.queries.flatMap(q => [q.retrievalId, ...q.judgments])];
         yield { stage: "query-training", input: JSON.parse(source.inputJson), inputHash: source.inputHash,
             recallProbability: source.recallProbability, threshold, target: selected, targetPolicy: TARGET_POLICY,
-            source: store.sourceDetails(source.id), evaluation: { ...evaluation, selected, review: [] }, splitGroup: trainingHash(source.sessionId),
+            source: store.sourceDetails(source.id), evaluation: { ...evaluation, selected, review: [] }, splitGroup: jsonHash(source.sessionId),
             provenance: [...new Set(provenance)].map(id => store.stepRecord(id)) };
     }
 }

@@ -1,15 +1,13 @@
 import { basename } from "node:path";
 import { selectTypeSafeSkill } from "./typesafe.js";
-import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
+import { isTypeSafeTimeout, resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { buildSkillWhispererQuery, recentSkillMessages } from "./whisperer-context.js";
 import { abortable } from "./abortable.js";
+import { isRecord } from "./guards.js";
 const CANDIDATE_LIMIT = 10;
 const MAX_QUERY_CHARS = 12_000;
 const TYPESAFE_CANDIDATE_LIMIT = 3;
 export const SKILL_WHISPERER_TIMEOUT_MS = 3000;
-function isRecord(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 function typeSafeConversation(prompt, messages) {
     const currentRequest = prompt.trim().slice(-MAX_QUERY_CHARS);
     let remaining = MAX_QUERY_CHARS - currentRequest.length;
@@ -67,12 +65,10 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
             try {
                 const runtimeParams = active(agentId);
                 const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
-                signal.throwIfAborted();
                 if (!apiKey)
                     diagnostics?.record(agentId, "skill", typesafe.enabled ? "missing_key" : "typesafe_disabled");
                 const recentMessages = recentSkillMessages(event.messages, config.historyMessages);
                 const candidates = await abortable(runtime.searchSkills(runtimeParams, buildSkillWhispererQuery(event.prompt, recentMessages), apiKey ? -1 : config.minScore, CANDIDATE_LIMIT), signal);
-                signal.throwIfAborted();
                 const resolvedCandidates = candidates.flatMap((candidate) => {
                     const canonicalPath = runtime.resolveSkillPath(runtimeParams, candidate.path);
                     return canonicalPath ? [{ candidate, canonicalPath }] : [];
@@ -138,9 +134,7 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
                 };
             }
             catch (error) {
-                const timedOut = (error instanceof TypeSafeRequestError && error.code === "timeout") ||
-                    (signal.aborted && signal.reason instanceof Error && signal.reason.name === "TimeoutError");
-                diagnostics?.record(agentId, "skill", timedOut ? "timed_out" : signal.aborted ? "cancelled" : "failed");
+                diagnostics?.record(agentId, "skill", isTypeSafeTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed");
                 if (!signal.aborted)
                     api.logger.warn("unblock-memory skill whisperer failed; no hint emitted");
                 return;

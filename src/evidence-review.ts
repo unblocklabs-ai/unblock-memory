@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
+import { TYPESAFE_MODEL } from "./typesafe-client.js";
 import { reviewTypeSafeClaim } from "./typesafe-review.js";
 
 export type EvidenceCitation = { path: string; from: number; lines: number };
@@ -47,7 +48,7 @@ export async function reviewIndexedClaim(params: {
     }
     return { status: "ok" as const, ...judgment,
       evidence: evidence.map(({ text: _text, ...citation }) => citation),
-      policy: params.personBackground ? "jev-1.13.0:person-background-v2" : "jev-1.13.0:claim-v1",
+      policy: `${TYPESAFE_MODEL}:${params.personBackground ? "person-background-v2" : "claim-v1"}`,
       scope: "Advisory support check against cited indexed excerpts only, not current truth or authorization to write. Verify original sources and identity before promotion." };
   });
 }

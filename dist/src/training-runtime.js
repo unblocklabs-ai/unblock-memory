@@ -1,6 +1,5 @@
 import { existsSync, openSync, writeSync, closeSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { TrainingStore } from "./training-store.js";
@@ -8,6 +7,7 @@ import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { collectTraining, runTraining } from "./training.js";
 import { generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, TRAINING_EVALUATION_CONCURRENCY } from "./training-queries.js";
 import { dateOption } from "./date-option.js";
+import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 function thresholdOption(value) {
     const result = Number(value);
     if (!value.trim() || !Number.isFinite(result) || result < 0 || result > 1)
@@ -21,8 +21,8 @@ export function registerMemoryTraining(api, config) {
         if (!normalized.ok || !listAgentIds(cfg).includes(normalized.value))
             throw new Error("Unknown memory-training agent");
         const agentId = normalized.value;
-        const stateDir = join(resolveStateDir(), "agents", agentId, "unblock-memory");
-        return { agentId, databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
+        const stateDir = agentStateDir(agentId);
+        return { agentId, databasePath: agentTranscriptDatabase(cfg, agentId),
             stateDir, storePath: join(stateDir, "training.sqlite") };
     };
     api.registerCli(({ program, config: cfg }) => {

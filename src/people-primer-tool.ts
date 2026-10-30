@@ -47,7 +47,6 @@ export function registerPeoplePrimerTool(api: OpenClawPluginApi, runtime: QmdMem
         try {
           combined.throwIfAborted();
           const apiKey = await abortable(resolveTypeSafeApiKey(config.typesafe), combined);
-          combined.throwIfAborted();
           if (!apiKey) return jsonResult({ status: "unavailable", reason: "TypeSafe API key not configured" });
           const store = stores.get(active.agentId);
           const person = store.getPerson(personId);
@@ -55,7 +54,6 @@ export function registerPeoplePrimerTool(api: OpenClawPluginApi, runtime: QmdMem
           const identities = store.listIdentities(personId);
           if (identities.length && identities.every(i => i.isBot === true || i.isDeactivated)) return jsonResult({ status: "unavailable", reason: "No active human identity" });
           const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
-          combined.throwIfAborted();
           if (!manager) return jsonResult({ status: "unavailable", reason: "Memory unavailable" });
           const agentName = resolveAgentIdentity(active.cfg, active.agentId)?.name?.trim() || suppliedName?.trim() || "the assistant";
           if (draft) return jsonResult(await manager.reviewClaim({ claim: draft.blurb, citations: draft.citations,

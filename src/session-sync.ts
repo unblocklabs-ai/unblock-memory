@@ -88,6 +88,17 @@ type WindowRow = {
   cold: number;
 };
 
+function windowMetadata(window: WindowRow): SessionMetadata {
+  return {
+    sessionId: window.sessionId,
+    provider: window.provider ?? undefined,
+    chatType: window.chatType,
+    accountId: window.accountId ?? undefined,
+    conversationId: window.conversationId ?? undefined,
+    startedAt: window.startedAt,
+  };
+}
+
 type EventRow = { sessionId: string; eventJson: string; createdAt: number };
 
 type ProjectionOptions = {
@@ -196,14 +207,7 @@ function readSnapshot(params: {
     const changed = new Set<string>();
     const unavailable = new Set<string>();
     for (const window of windows) {
-      const metadata: SessionMetadata = {
-        sessionId: window.sessionId,
-        provider: window.provider ?? undefined,
-        chatType: window.chatType,
-        accountId: window.accountId ?? undefined,
-        conversationId: window.conversationId ?? undefined,
-        startedAt: window.startedAt,
-      };
+      const metadata = windowMetadata(window);
       const previous = params.previousManifest.sessions[window.sessionId];
       const documentPath = sessionDocumentPath(metadata);
       const sourceFingerprint = JSON.stringify(window);
@@ -297,7 +301,7 @@ async function remove(path: string): Promise<boolean> {
   }
 }
 
-function projectionHash(content: string): string {
+export function projectionHash(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
@@ -334,14 +338,7 @@ export async function syncSessionProjections(params: ProjectionOptions & {
   for (const window of snapshot.windows) {
     const previous = previousManifest.sessions[window.sessionId];
     const events = snapshot.events.get(window.sessionId);
-    const metadata: SessionMetadata = {
-      sessionId: window.sessionId,
-      provider: window.provider ?? undefined,
-      chatType: window.chatType,
-      accountId: window.accountId ?? undefined,
-      conversationId: window.conversationId ?? undefined,
-      startedAt: window.startedAt,
-    };
+    const metadata = windowMetadata(window);
     const documentPath = sessionDocumentPath(metadata);
     if (snapshot.unavailable.has(window.sessionId)) {
       counts.failed += 1;

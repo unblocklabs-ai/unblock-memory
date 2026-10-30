@@ -1,5 +1,7 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { responseOutcome } from "./response-outcome.js";
+import { immediateTransaction } from "./memory-database.js";
+import { jsonHash } from "./json-hash.js";
 export const RESPONSE_REVIEW_POLICY = "response-review-v2";
 /** Operator-only tasks, intentionally not exposed as memory-curation agent tools. */
 export class ResponseReviews {
@@ -40,7 +42,7 @@ export class ResponseReviews {
         ];
         for (const s of signals) {
             const humanKey = result.human?.key ?? "unknown";
-            const id = createHash("sha256").update(JSON.stringify([episodeId, s.family, humanKey])).digest("hex");
+            const id = jsonHash([episodeId, s.family, humanKey]);
             this.db.prepare(`INSERT INTO response_review_tasks(id,episode_id,family,human_key,created_at,updated_at) VALUES(?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at`).run(id, episodeId, s.family, humanKey, now, now);
             this.db.prepare(`INSERT INTO response_review_evidence VALUES(?,?,?,1,?) ON CONFLICT(task_id,cohort)
@@ -51,8 +53,7 @@ export class ResponseReviews {
       DO UPDATE SET input_hash=excluded.input_hash,policy=excluded.policy`).run(cohort, episodeId, inputHash, RESPONSE_REVIEW_POLICY);
     }
     refresh(cohort, since) {
-        this.db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.db, () => {
             const rows = this.db.prepare(`SELECT r.id,r.input_hash,r.result FROM response_results r
         LEFT JOIN response_review_versions v ON v.cohort=r.cohort AND v.episode_id=r.id
         WHERE r.cohort=? AND r.active=1 AND r.status='ok' AND r.episode_at>=?
@@ -60,13 +61,8 @@ export class ResponseReviews {
                 .all(cohort, since, RESPONSE_REVIEW_POLICY);
             for (const row of rows)
                 this.sync(cohort, String(row.id), String(row.input_hash), JSON.parse(String(row.result)), Date.now());
-            this.db.exec("COMMIT");
             return rows.length;
-        }
-        catch (error) {
-            this.db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     reconcile(cohort, sessionId) {
         this.db.prepare(`UPDATE response_review_evidence AS e SET active=CASE WHEN EXISTS (
@@ -92,18 +88,12 @@ export class ResponseReviews {
             throw new Error("Invalid response review decision");
         if (!this.list(cohort, id).length)
             throw new Error("Unknown response review task in current cohort");
-        this.db.exec("BEGIN IMMEDIATE");
-        try {
+        immediateTransaction(this.db, () => {
             this.db.prepare("UPDATE response_review_tasks SET status=?,reviewer_kind=?,resolution_note=?,updated_at=? WHERE id=?")
                 .run(status, reviewer, note.trim(), now, id);
             this.db.prepare("INSERT INTO response_review_decisions(task_id,status,reviewer_kind,note,decided_at) VALUES(?,?,?,?,?)")
                 .run(id, status, reviewer, note.trim(), now);
-            this.db.exec("COMMIT");
-        }
-        catch (error) {
-            this.db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     annotate(occurredAt, kind, note) {
         if (!Number.isFinite(occurredAt) || !["model", "prompt", "deployment", "other"].includes(kind) || !note.trim() || note.length > 4000)

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { chunkFingerprint } from "./curation.js";
 const DEFAULT_CLUSTER_LIMIT = 20;
 const MAX_CLUSTER_LIMIT = 50;
 const DEFAULT_MEMBER_LIMIT = 20;
@@ -170,7 +171,7 @@ export function runAnalysisWorker(params) {
 }
 function latestRun(db) {
     return db.prepare(`
-    SELECT id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, stale_at
+    SELECT id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, stale_at, params_json
     FROM memory_analysis_runs
     WHERE completed_at IS NOT NULL
     ORDER BY completed_at DESC, created_at DESC, id DESC
@@ -181,13 +182,7 @@ export function latestAnalysisRunId(db) {
     return latestRun(db)?.id;
 }
 export function latestAnalysisCollections(db) {
-    const row = db.prepare(`
-    SELECT params_json
-    FROM memory_analysis_runs
-    WHERE completed_at IS NOT NULL
-    ORDER BY completed_at DESC, created_at DESC, id DESC
-    LIMIT 1
-  `).get();
+    const row = latestRun(db);
     if (!row)
         return undefined;
     try {
@@ -270,7 +265,7 @@ function representativeOrder(clusterId) {
        m.hash,
        m.seq`;
 }
-function members(db, runId, clusterId, limit, offset = 0, sort = "representative", maxExcerptBytes = MAX_EXCERPT_BYTES, maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES, maxTotalAliases = MAX_TOTAL_ALIASES, temporal = {}) {
+function members(db, runId, clusterId, limit, offset, sort, temporal) {
     const score = clusterId === -1 ? "m.outlier_score" : "m.probability";
     const order = {
         representative: representativeOrder(clusterId),
@@ -342,11 +337,11 @@ function members(db, runId, clusterId, limit, offset = 0, sort = "representative
     ORDER BY ${order}
     LIMIT ? OFFSET ?
   `).all(temporal.sessionCollection ?? "", temporal.sessionCollection ?? "", temporal.sessionCollection ?? "", runId, clusterId, runId, clusterId, limit, offset);
-    let remaining = maxTotalBytes;
-    let remainingAliases = maxTotalAliases;
+    let remaining = MAX_TOTAL_EXCERPT_BYTES;
+    let remainingAliases = MAX_TOTAL_ALIASES;
     return rows.map((row, index) => {
         const remainingRows = rows.length - index;
-        const excerptBudget = Math.min(maxExcerptBytes, Math.floor(remaining / remainingRows));
+        const excerptBudget = Math.min(MAX_EXCERPT_BYTES, Math.floor(remaining / remainingRows));
         const fullText = row.doc.slice(row.pos, row.pos + row.chunk_len);
         const text = byteSlice(fullText, excerptBudget);
         remaining -= Buffer.byteLength(text);
@@ -365,7 +360,7 @@ function members(db, runId, clusterId, limit, offset = 0, sort = "representative
             eventTime: row.event_time,
             eventTimeBasis: row.event_time_basis,
             eventTimeSource: `qmd://${row.event_collection}/${row.event_path}`,
-            contentFingerprint: createHash("sha256").update(fullText).digest("hex"),
+            contentFingerprint: chunkFingerprint(fullText),
             text,
             sourcePaths: aliases,
         };
@@ -415,8 +410,8 @@ function clusterPreview(db, runId, clusterId, maxBytes, aliasLimit) {
         sourcePaths: sourcePaths(db, row.hash, Math.min(MAX_ALIASES_PER_MEMBER, aliasLimit)),
     };
 }
-function toSummary(db, run, row, includePreview, previewBytes = 600, aliasLimit = MAX_TOTAL_ALIASES) {
-    const preview = includePreview
+function toSummary(db, run, row, previewBytes = 0, aliasLimit = MAX_TOTAL_ALIASES) {
+    const preview = previewBytes > 0
         ? clusterPreview(db, run.id, row.cluster_id, previewBytes, aliasLimit)
         : undefined;
     return {
@@ -468,7 +463,7 @@ export function readClusters(db, requestedLimit = DEFAULT_CLUSTER_LIMIT) {
     let remainingAliases = MAX_TOTAL_ALIASES;
     const clusters = rows.map((row) => {
         const previewBytes = Math.min(600, remainingBytes);
-        const summary = toSummary(db, run, row, previewBytes > 0, previewBytes, remainingAliases);
+        const summary = toSummary(db, run, row, previewBytes, remainingAliases);
         remainingBytes -= Buffer.byteLength(summary.preview?.text ?? "");
         remainingAliases -= summary.preview?.sourcePaths.length ?? 0;
         return summary;
@@ -479,7 +474,7 @@ export function readClusters(db, requestedLimit = DEFAULT_CLUSTER_LIMIT) {
         runId: run.id,
         ...readMetadata(run),
         clusters,
-        noise: noise ? toSummary(db, run, noise, false) : null,
+        noise: noise ? toSummary(db, run, noise) : null,
     };
 }
 function resolveClusterId(db, runId, reference) {
@@ -523,7 +518,7 @@ export function readCluster(db, clusterReferenceId, requestedLimit = DEFAULT_MEM
     const limit = Math.max(1, Math.min(MAX_MEMBER_LIMIT, Math.floor(requestedLimit)));
     const offset = Math.max(0, Math.floor(requestedOffset));
     const total = availableSize(db, run.id, clusterId);
-    const pageMembers = members(db, run.id, clusterId, limit, offset, sort, MAX_EXCERPT_BYTES, MAX_TOTAL_EXCERPT_BYTES, MAX_TOTAL_ALIASES, temporal);
+    const pageMembers = members(db, run.id, clusterId, limit, offset, sort, temporal);
     const nextOffset = offset + pageMembers.length;
     const hasMore = nextOffset < total;
     return {

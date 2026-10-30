@@ -1,10 +1,9 @@
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
-import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
+import { requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
 import type { ResponseEpisode } from "./response-episodes.js";
 
-export const RESPONSE_RUBRIC_VERSION = `${TYPESAFE_REVIEW_MODEL}:response-v10`;
+export const RESPONSE_RUBRIC_VERSION = `${TYPESAFE_MODEL}:response-v10`;
 export const RESPONSE_STAGE_VERSIONS = { quality: "quality-v9", feedback: "feedback-v9", sentiment: "sentiment-v10", retrospective: "retrospective-v9", memory: "memory-v2-isolated" } as const;
 const probability = Type.Number({ minimum: 0, maximum: 1 });
 const score = Type.Object({ type: Type.Literal("score"), score: Type.Number({ minimum: 0, maximum: 3 }),

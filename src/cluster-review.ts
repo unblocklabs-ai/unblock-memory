@@ -1,8 +1,15 @@
 import type { QMDStore } from "@unblocklabs/qmd";
 import { readAnalysisSummary, readCluster } from "./analysis.js";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
+import { TYPESAFE_MODEL } from "./typesafe-client.js";
 import { reviewClusterDefects } from "./typesafe-review.js";
 import { chunkFingerprint } from "./curation.js";
+
+function indexedChunk(db: QMDStore["internal"]["db"], safe: { source: ResolvedSource; relativePath: string }, member: { hash: string; seq: number }) {
+  return db.prepare(`SELECT c.doc, v.pos, v.chunk_len FROM documents d JOIN content c ON c.hash = d.hash
+    JOIN content_vectors v ON v.hash = d.hash WHERE d.active = 1 AND d.collection = ? AND d.path = ? AND d.hash = ? AND v.seq = ?`)
+    .get<{ doc: string; pos: number; chunk_len: number }>(safe.source.collection, safe.relativePath, member.hash, member.seq);
+}
 
 /** Inspect center and edge samples; never extrapolate their labels to the rest of a cluster. */
 export async function reviewClusterIngestion(params: {
@@ -23,9 +30,7 @@ export async function reviewClusterIngestion(params: {
       if (!path) return [];
       const safe = parseSafeVirtualPath(path, sources)!;
       // Reload the full chunk; analysis previews may be truncated. Never judge a silently cut prefix.
-      const row = params.db.prepare(`SELECT c.doc, v.pos, v.chunk_len FROM documents d JOIN content c ON c.hash = d.hash
-        JOIN content_vectors v ON v.hash = d.hash WHERE d.active = 1 AND d.collection = ? AND d.path = ? AND d.hash = ? AND v.seq = ?`)
-        .get<{ doc: string; pos: number; chunk_len: number }>(safe.source.collection, safe.relativePath, member.hash, member.seq);
+      const row = indexedChunk(params.db, safe, member);
       if (!row || row.pos < 0 || row.chunk_len < 1 || row.pos + row.chunk_len > row.doc.length || row.chunk_len > 2000) return [];
       const text = row.doc.slice(row.pos, row.pos + row.chunk_len);
       return [{ path, hash: member.hash, seq: member.seq, from: row.doc.slice(0, row.pos).split("\n").length,
@@ -44,9 +49,7 @@ export async function reviewClusterIngestion(params: {
     for (const member of sample) {
       const safe = parseSafeVirtualPath(member.path, sources);
       if (!safe) return { status: "unavailable" as const, reason: "Source scope changed; retry" };
-      const row = params.db.prepare(`SELECT c.doc, v.pos, v.chunk_len FROM documents d JOIN content c ON c.hash = d.hash
-        JOIN content_vectors v ON v.hash = d.hash WHERE d.active = 1 AND d.collection = ? AND d.path = ? AND d.hash = ? AND v.seq = ?`)
-        .get<{ doc: string; pos: number; chunk_len: number }>(safe.source.collection, safe.relativePath, member.hash, member.seq);
+      const row = indexedChunk(params.db, safe, member);
       if (!row || chunkFingerprint(row.doc.slice(row.pos, row.pos + row.chunk_len)) !== member.fingerprint) return { status: "unavailable" as const, reason: "Sample changed during review; retry" };
     }
     const members = sample.map(({ text: _text, ...member }, index) => ({ ...member, ...judgments[index],
@@ -57,6 +60,6 @@ export async function reviewClusterIngestion(params: {
     });
     return { status: "ok" as const, runId: snapshot.runId, clusterId: params.clusterId, members, recurring,
       sampled: sample.length, considered: snapshot.considered, clusterSize: snapshot.clusterSize,
-      policy: "jev-1.13.0:cluster-defects-v2-isolated", scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
+      policy: `${TYPESAFE_MODEL}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
   });
 }

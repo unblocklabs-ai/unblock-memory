@@ -59,9 +59,10 @@ export async function runExtraction(params) {
                 if (existing.length > 100 || JSON.stringify(existing.map(m => ({ id: m.id, text: m.text }))).length > 40_000) {
                     throw new Error("Existing memories exceed review budget");
                 }
+                const existingFacts = existing.map(m => ({ id: m.id, text: m.text, observedAt: m.observedAt }));
                 const page = await readExtractionChunk({ agentId: params.agentId, agentName: params.agentName, session,
                     cursor: checkpoint.cursor, context: extractionHistory(checkpoint.context, config.historyMessages),
-                    existing: existing.map(m => ({ id: m.id, text: m.text, observedAt: m.observedAt })), signal, readPage });
+                    existing: existingFacts, signal, readPage });
                 if (page.kind === "unavailable") {
                     store.error(session.sessionId, "source_unavailable");
                     failed++;
@@ -85,7 +86,7 @@ export async function runExtraction(params) {
                 const messages = page.messages;
                 const newIds = fresh.map(m => m.id);
                 stage = "propose";
-                const proposals = newIds.length ? await (params.extract ?? extractWithLuna)(params.runtime, params.agentId, messages, newIds, existing.map(m => ({ id: m.id, text: m.text, observedAt: m.observedAt })), signal) : [];
+                const proposals = newIds.length ? await (params.extract ?? extractWithLuna)(params.runtime, params.agentId, messages, newIds, existingFacts, signal) : [];
                 const accepted = [];
                 stage = "validate";
                 for (let start = 0; start < proposals.length; start += 4) {

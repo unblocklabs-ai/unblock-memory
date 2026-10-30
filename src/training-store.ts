@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { openMemoryDatabase } from "./memory-database.js";
-import { trainingHash, TRAINING_PREPARATION, type TrainingExample, type TrainingInput } from "./training-input.js";
+import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
+import { TRAINING_PREPARATION, type TrainingExample, type TrainingInput } from "./training-input.js";
 import { TRAINING_GATE_MODEL, TRAINING_GATE_THRESHOLD, TRAINING_GATE_VERSION, type judgeTrainingInput } from "./training-gate.js";
 import { TRAINING_RECIPE_VERSION, type TeacherResult, type TrainingRound } from "./training-models.js";
 import type { TrainingHit } from "./training-retrieval.js";
 import type { judgeTrainingPassage } from "./training-judge.js";
 import type { QueryLane, QueryPair } from "./query-contract.js";
+import { jsonHash } from "./json-hash.js";
 
 type GateResult = Awaited<ReturnType<typeof judgeTrainingInput>>;
 type Job = { id: string; inputHash: string; inputJson: string };
@@ -82,17 +83,12 @@ export class TrainingStore {
       this.#nodeId = String(identity.node_id);
     } catch (error) { this.#db.close(); throw error; }
   }
-  #transaction<T>(fn: () => T): T {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try { const result = fn(); this.#db.exec("COMMIT"); return result; }
-    catch (error) { this.#db.exec("ROLLBACK"); throw error; }
-  }
   #checkLease() {
     const lease = this.#db.prepare("SELECT owner,expires FROM training_lock WHERE singleton=1").get();
     if (lease?.owner !== this.#owner || Number(lease.expires) <= Date.now()) throw new Error("Training lease lost; no further API requests permitted");
   }
   async locked<T>(fn: () => T | Promise<T>): Promise<T> {
-    this.#transaction(() => {
+    immediateTransaction(this.#db, () => {
       const lock = this.#db.prepare(`INSERT INTO training_lock VALUES (1,?,?) ON CONFLICT(singleton)
         DO UPDATE SET owner=excluded.owner,expires=excluded.expires WHERE training_lock.expires<=?`)
         .run(this.#owner, Date.now() + LEASE_MS, Date.now());
@@ -123,14 +119,14 @@ export class TrainingStore {
     }
   }
   renew() {
-    this.#transaction(() => {
+    immediateTransaction(this.#db, () => {
       this.#checkLease();
       this.#db.prepare("UPDATE training_lock SET expires=? WHERE owner=?").run(Date.now() + LEASE_MS, this.#owner);
     });
   }
   sessions() { return this.#db.prepare("SELECT DISTINCT session_id FROM training_examples").all().map(r => String(r.session_id)); }
   syncSession(sessionId: string, examples: TrainingExample[], since: number, until: number, existingOnly: boolean) {
-    return this.#transaction(() => {
+    return immediateTransaction(this.#db, () => {
       this.#checkLease();
       const previous = new Map(this.#db.prepare("SELECT event_seq,input_hash,active FROM training_examples WHERE session_id=?").all(sessionId)
         .map(row => [Number(row.event_seq), row]));
@@ -148,9 +144,9 @@ export class TrainingStore {
         if (!old && (existingOnly || example.timestamp < since || example.timestamp >= until)) continue;
         retained.add(example.seq);
         input.run(example.inputHash, TRAINING_PREPARATION, JSON.stringify(example.input));
-        source.run(trainingHash([this.#nodeId, this.#agentId, sessionId, example.seq]), sessionId, example.seq,
+        source.run(jsonHash([this.#nodeId, this.#agentId, sessionId, example.seq]), sessionId, example.seq,
           example.timestamp, example.inputHash, Number(example.contextLimited));
-        const id = trainingHash([example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL]);
+        const id = jsonHash([example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL]);
         gate.run(id, example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL);
         if (!old) counts.added++;
         else if (old.input_hash !== example.inputHash || old.active !== 1) counts.changed++;
@@ -175,7 +171,7 @@ export class TrainingStore {
       .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION, limit ?? -1) as Job[];
   }
   start(id: string): number {
-    return this.#transaction(() => {
+    return immediateTransaction(this.#db, () => {
       this.#checkLease();
       if (!this.#db.prepare("UPDATE training_gates SET status='attempted',error=NULL WHERE id=? AND status='pending'").run(id).changes) {
         throw new Error("Training gate is not pending");
@@ -185,7 +181,7 @@ export class TrainingStore {
     });
   }
   finish(id: string, attempt: number, result: GateResult | { status: "failed" | "ambiguous"; error: string }) {
-    this.#transaction(() => {
+    immediateTransaction(this.#db, () => {
       this.#checkLease();
       const ok = "probability" in result;
       const status = ok ? "complete" : result.status, error = ok ? null : result.error;
@@ -199,7 +195,7 @@ export class TrainingStore {
   retry(includeAmbiguous: boolean, ids: readonly string[]) {
     if (!ids.length || ids.some(id => !/^[a-f0-9]{64}$/u.test(id))) throw new Error("Specify exact training gate or step hashes to retry");
     this.#checkLease();
-    return this.#transaction(() => ids.reduce((count, id) => {
+    return immediateTransaction(this.#db, () => ids.reduce((count, id) => {
       const statuses = includeAmbiguous ? "('failed','ambiguous')" : "('failed')";
       const gates = this.#db.prepare(`UPDATE training_gates SET status='pending',error=NULL WHERE id=?
         AND prompt_version=? AND requested_model=? AND status IN ${statuses}
@@ -222,7 +218,7 @@ export class TrainingStore {
   }
   step<S extends keyof TrainingStepResults>(stage: S, parameters: Record<string, unknown>) {
     const request = { ...parameters, recipe: TRAINING_RECIPE_VERSION };
-    const id = trainingHash([stage, request]);
+    const id = jsonHash([stage, request]);
     const row = this.#db.prepare("SELECT status,result_json FROM training_steps WHERE id=? AND stage=?").get(id, stage);
     return { id, stage, request, status: (row?.status ?? "pending") as StepStatus,
       result: row?.status === "complete" ? JSON.parse(String(row.result_json)) as TrainingStepResults[S] : undefined };
@@ -248,7 +244,7 @@ export class TrainingStore {
         reason: String(row.reason), details: JSON.parse(String(row.details)) as ReviewDetails, updatedAt: Number(row.updatedAt) }));
   }
   startStep(stage: keyof TrainingStepResults, id: string, request: unknown) {
-    return this.#transaction(() => {
+    return immediateTransaction(this.#db, () => {
       this.#checkLease();
       this.#db.prepare("INSERT OR IGNORE INTO training_steps (id,stage,request_json,status) VALUES (?,?,?,'pending')")
         .run(id, stage, JSON.stringify(request));
@@ -261,7 +257,7 @@ export class TrainingStore {
   }
   finishStep<S extends keyof TrainingStepResults>(stage: S, id: string, attempt: number,
     outcome: { result: TrainingStepResults[S] } | { status: "failed" | "ambiguous"; error: string }) {
-    this.#transaction(() => {
+    immediateTransaction(this.#db, () => {
       this.#checkLease();
       const ok = "result" in outcome, status = ok ? "complete" : outcome.status;
       const json = ok ? JSON.stringify(outcome.result) : null, error = ok ? null : outcome.error;

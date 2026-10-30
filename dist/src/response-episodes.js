@@ -1,14 +1,11 @@
-import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
 import { responseUserText } from "./response-text.js";
+import { jsonHash } from "./json-hash.js";
+import { record } from "./guards.js";
 export const RESPONSE_EXTRACTOR_VERSION = 6;
 const MAX_EVENTS = 2000, MAX_SESSION_BYTES = 2_000_000, MAX_EPISODE_CHARS = 24_000;
-function record(v) {
-    return v !== null && typeof v === "object" && !Array.isArray(v) ? v : undefined;
-}
-const hash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 /** Never deduce human identity from text or the user role alone. */
 export function responseEpisodes(session, rows, config) {
     const coverage = { completedResponses: 0, eligible: 0, noFeedback: 0,
@@ -44,7 +41,7 @@ export function responseEpisodes(session, rows, config) {
             coverage.oversized++;
         else {
             const { final: _final, ...content } = current;
-            const id = hash([session.sessionId, current.answer.at(-1).seq]);
+            const id = jsonHash([session.sessionId, current.answer.at(-1).seq]);
             const episode = { id, inputHash: "", session, ...content, followup: { status: "pending", messages: [] } };
             episodes.push(episode);
             followupTarget = episode;
@@ -172,7 +169,7 @@ export function responseEpisodes(session, rows, config) {
     finish(false); // No next assistant turn: the feedback block may still grow.
     for (const episode of episodes) {
         const { inputHash: _hash, session: s, ...content } = episode;
-        episode.inputHash = hash([RESPONSE_EXTRACTOR_VERSION, s.sessionId, s.accountId, s.chatType, s.conversationId, content]);
+        episode.inputHash = jsonHash([RESPONSE_EXTRACTOR_VERSION, s.sessionId, s.accountId, s.chatType, s.conversationId, content]);
     }
     return { episodes, coverage };
 }
@@ -261,7 +258,7 @@ export class ResponseTranscriptReader {
             const rows = snapshot.rows;
             // Exact active content catches in-place edits and branch changes even when writer
             // watermarks are absent. Raw text is never retained in the checkpoint database.
-            const revision = hash([RESPONSE_EXTRACTOR_VERSION, session, config.historyMessages, [...config.senderIds].sort(), rows]);
+            const revision = jsonHash([RESPONSE_EXTRACTOR_VERSION, session, config.historyMessages, [...config.senderIds].sort(), rows]);
             if (revision === previousRevision)
                 return { unchanged: true, revision };
             return { ...responseEpisodes(session, rows, config), revision };

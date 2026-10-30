@@ -1,8 +1,7 @@
-import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
-import { EXTRACTED_COLLECTION, extractedRecords, extractedPath, extractedHit, syncExtractedIndex } from "./extraction-index.js";
+import { EXTRACTED_COLLECTION, EXTRACTED_PREFIX, extractedRecords, extractedPath, extractedHit, extractedUri, syncExtractedIndex } from "./extraction-index.js";
 import type { ExtractionConfig } from "./extraction-config.js";
 import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
@@ -44,6 +43,7 @@ import {
   type TemporalBasis,
 } from "./curation.js";
 import {
+  projectionHash,
   readSessionManifest,
   sessionMetadataByPath,
   syncSessionProjections,
@@ -335,8 +335,13 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   readonly #dbPath: string;
   readonly #workspaceDir: string;
   readonly #curationPath: string;
-  readonly #extraction?: ExtractionConfig;
+  /** Present only when extracted memories are published into search. */
+  readonly #publishedExtraction?: ExtractionConfig;
   readonly #sources: ReadonlyMap<string, ResolvedSource>;
+  /** Non-skill sources: the QMD-indexed, analyzable corpora. */
+  readonly #indexSources: readonly ResolvedSource[];
+  readonly #indexCollections: readonly string[];
+  readonly #hasSkills: boolean;
   readonly #storeFactory?: () => Promise<ManagerStore>;
   readonly #keepModelsWarm: boolean;
   readonly #analysisExecutable?: string;
@@ -402,9 +407,12 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   }) {
     this.#dbPath = params.dbPath;
     this.#curationPath = params.curationPath ?? `${params.dbPath}.curation.sqlite`;
-    this.#extraction = params.extraction;
+    this.#publishedExtraction = params.extraction?.enabled && params.extraction.publish ? params.extraction : undefined;
     this.#workspaceDir = params.workspaceDir;
     this.#sources = new Map(params.sources.map((source) => [source.collection, source]));
+    this.#indexSources = [...this.#sources.values()].filter((source) => source.kind !== "skills");
+    this.#indexCollections = this.#indexSources.map((source) => source.collection);
+    this.#hasSkills = [...this.#sources.values()].some((source) => source.kind === "skills");
     this.#storeFactory = params.storeFactory;
     this.#keepModelsWarm = params.keepModelsWarm ?? true;
     this.#analysisExecutable = params.analysisExecutable;
@@ -492,11 +500,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       const store = this.#store as Partial<AnalysisStore>;
       if (store.internal) {
         ensureMemoryAnalysisSchema(store.internal.db);
-        markStaleForAnalysisCollectionChange(
-          store.internal.db,
-          this.#analysisCollectionNames(),
-          this.#skillCollectionNames().length > 0,
-        );
+        markStaleForAnalysisCollectionChange(store.internal.db, this.#indexCollections, this.#hasSkills);
       }
       return this.#store;
     }
@@ -506,10 +510,10 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       keepModelsWarm: this.#keepModelsWarm,
       config: {
         collections: Object.fromEntries(
-          [...this.#qmdSources().map((source) => [
+          [...this.#indexSources.map((source) => [
             source.collection,
             { path: source.root, pattern: source.pattern },
-          ]), ...(this.#extraction?.enabled && this.#extraction.publish
+          ]), ...(this.#publishedExtraction
             ? [[EXTRACTED_COLLECTION, { path: dirname(this.#dbPath), pattern: ".no-extracted-files", includeByDefault: false }]] : [])],
         ),
       },
@@ -517,29 +521,21 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     try {
       enableSecureDelete(store);
       ensureMemoryAnalysisSchema(store.internal.db);
-      markStaleForAnalysisCollectionChange(
-        store.internal.db,
-        this.#analysisCollectionNames(),
-        this.#skillCollectionNames().length > 0,
-      );
-      const configuredCollections = new Set(this.#qmdSources().map((source) => source.collection));
-      if (this.#extraction?.enabled && this.#extraction.publish) configuredCollections.add(EXTRACTED_COLLECTION);
+      markStaleForAnalysisCollectionChange(store.internal.db, this.#indexCollections, this.#hasSkills);
+      const configuredCollections = new Set(this.#collectionNames());
       const staleCollections = (await store.getStatus()).collections
         .map((collection) => collection.name)
         .filter((collection) => !configuredCollections.has(collection));
+      const latestRunId = latestAnalysisRunId(store.internal.db);
       const appearsInAnalysis = store.internal.db.prepare(`
         SELECT 1
         FROM memory_analysis_memberships membership
         JOIN documents document ON document.hash = membership.hash
-        WHERE membership.run_id = (
-          SELECT id FROM memory_analysis_runs
-          WHERE completed_at IS NOT NULL
-          ORDER BY completed_at DESC, created_at DESC, id DESC
-          LIMIT 1
-        ) AND document.collection = ?
+        WHERE membership.run_id = ? AND document.collection = ?
         LIMIT 1
       `);
-      const prunedAnalysisInput = staleCollections.some((collection) => appearsInAnalysis.get(collection));
+      const prunedAnalysisInput = latestRunId !== undefined &&
+        staleCollections.some((collection) => appearsInAnalysis.get(latestRunId, collection));
       const prunedDocuments = await pruneStaleCollections(store, configuredCollections);
       if (prunedDocuments > 0 && prunedAnalysisInput) markMemoryAnalysisStale(store.internal.db);
       await ensureSemanticChunking(store);
@@ -554,59 +550,52 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     return store;
   }
 
-  #qmdSources(): ResolvedSource[] {
-    return [...this.#sources.values()].filter((source) => source.kind !== "skills");
-  }
-
-  #analysisCollectionNames(): string[] {
-    return [...this.#sources.values()]
-      .filter((source) => source.kind !== "skills")
-      .map((source) => source.collection);
-  }
-
-  #skillCollectionNames(): string[] {
-    return [...this.#sources.values()]
-      .filter((source) => source.kind === "skills")
-      .map((source) => source.collection);
-  }
-
   #collectionNames(corpora?: readonly string[]): string[] {
-    const publicSources = [...this.#sources.values()].filter((source) => source.kind !== "skills");
-    const extracted = this.#extraction?.enabled && this.#extraction.publish ? [EXTRACTED_COLLECTION] : [];
-    if (corpora === undefined) return [...publicSources.map((source) => source.collection), ...extracted];
+    const extracted = this.#publishedExtraction ? [EXTRACTED_COLLECTION] : [];
+    if (corpora === undefined) return [...this.#indexCollections, ...extracted];
     if (corpora.length === 0) throw new Error("memory_search corpora must not be empty");
     const selected = new Set(corpora);
     if (selected.has("all")) {
       if (selected.size > 1) throw new Error('memory_search corpus "all" must be used alone');
-      return [...publicSources.map((source) => source.collection), ...extracted];
+      return [...this.#indexCollections, ...extracted];
     }
-    const known = new Set(publicSources.map((source) => source.corpus));
+    const known = new Set(this.#indexSources.map((source) => source.corpus));
     if (extracted.length) known.add("extracted");
     const unknown = [...selected].find((corpus) => !known.has(corpus));
     if (unknown) throw new Error(`memory_search unknown corpus: ${unknown}`);
-    return [...publicSources
+    return [...this.#indexSources
       .filter((source) => selected.has(source.corpus))
       .map((source) => source.collection), ...(selected.has("extracted") ? extracted : [])];
   }
 
   syncExtracted(): Promise<void> {
     return this.#enqueue(async () => {
-      if (!this.#extraction?.enabled || !this.#extraction.publish) return;
+      if (!this.#publishedExtraction) return;
       const store = await this.#getAnalysisStore();
-      const records = extractedRecords(this.#curationPath).filter(r => this.#extraction!.chatTypes.includes(r.metadata.chatType));
-      await syncExtractedIndex(store, records);
+      await syncExtractedIndex(store, this.#currentExtracted());
       await this.#refreshIndexStatus(store);
     });
   }
 
   #currentExtracted(paths?: readonly string[], filter?: SessionSearchFilter) {
-    if (!this.#extraction?.enabled || !this.#extraction.publish) return [];
-    const records = extractedRecords(this.#curationPath, paths?.filter(path => path.startsWith(`qmd://${EXTRACTED_COLLECTION}/`))
-      .map(path => path.slice(`qmd://${EXTRACTED_COLLECTION}/`.length)))
-      .filter(r => this.#extraction!.chatTypes.includes(r.metadata.chatType));
+    const extraction = this.#publishedExtraction;
+    if (!extraction) return [];
+    const records = extractedRecords(this.#curationPath, paths?.filter(path => path.startsWith(EXTRACTED_PREFIX))
+      .map(path => path.slice(EXTRACTED_PREFIX.length)))
+      .filter(r => extraction.chatTypes.includes(r.metadata.chatType));
     if (!filter) return records;
     const allowed = new Set(sessionAllowedPaths(new Map(records.map(r => [extractedPath(r), r.metadata])), EXTRACTED_COLLECTION, filter)[EXTRACTED_COLLECTION]);
     return records.filter(r => allowed.has(extractedPath(r)));
+  }
+
+  /** Search scope: session-filtered transcripts plus currently published extracted memories. */
+  #allowedPaths(collections: readonly string[], filter?: SessionSearchFilter): AllowedDocumentPaths | undefined {
+    const sessions = this.#sessions;
+    const allowed = filter && sessions && collections.includes(sessions.collection)
+      ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, filter) : undefined;
+    return collections.includes(EXTRACTED_COLLECTION)
+      ? { ...allowed, [EXTRACTED_COLLECTION]: this.#currentExtracted(undefined, filter).map(extractedPath) }
+      : allowed;
   }
 
   async #updateAndEmbed(store: ManagerStore, collections?: readonly string[], force?: boolean): Promise<number> {
@@ -614,7 +603,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const analysisStore = store as Partial<AnalysisStore>;
     let changedDocuments = 0;
     try {
-      const update = await store.update({ collections: collections ? [...collections] : this.#qmdSources().map(source => source.collection) });
+      const update = await store.update({ collections: [...(collections ?? this.#indexCollections)] });
       changedDocuments = update.updated + update.removed;
       if ((update.indexed + changedDocuments > 0 || update.needsEmbedding > 0 || force) && analysisStore.internal) {
         markMemoryAnalysisStale(analysisStore.internal.db);
@@ -654,7 +643,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const run = async () => {
       const store = await this.#getStore();
       this.#dirty = true;
-      const collections = affectedCollections ?? this.#qmdSources().filter((source) => source.kind !== "sessions").map(source => source.collection);
+      const collections = affectedCollections ?? this.#indexSources.filter((source) => source.kind !== "sessions").map(source => source.collection);
       await this.#updateAndEmbed(store, collections.length ? collections : undefined, params?.force);
       await this.#refreshIndexStatus(store);
     };
@@ -707,7 +696,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       await this.#analysisRunner({
         executable: this.#analysisExecutable,
         dbPath: this.#dbPath,
-        collections: this.#analysisCollectionNames(),
+        collections: this.#indexCollections,
         options,
         signal,
       });
@@ -1011,18 +1000,9 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     if (sessions && collections.includes(sessions.collection)) {
       await this.#refreshSessionMetadata();
     }
-    let allowedPaths = opts?.sessionFilter && sessions && collections.includes(sessions.collection)
-      ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter)
-      : undefined;
     const store = await this.#getStore();
     opts?.signal?.throwIfAborted();
-    const currentRecords = (paths?: string[]) => {
-      if (!collections.includes(EXTRACTED_COLLECTION)) return [];
-      return this.#currentExtracted(paths, opts?.sessionFilter);
-    };
-    if (collections.includes(EXTRACTED_COLLECTION)) {
-      allowedPaths = { ...allowedPaths, [EXTRACTED_COLLECTION]: currentRecords().map(extractedPath) };
-    }
+    const allowedPaths = this.#allowedPaths(collections, opts?.sessionFilter);
     const hits = await store.vsearch(query, {
       collection: collections,
       limit: opts?.maxResults ?? 5,
@@ -1049,13 +1029,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
             const reloaded = await this.#refreshSessionMetadata();
             if (timings && !signal?.aborted) timings.metadataReloads = Number(reloaded);
           }
-          const sessions = this.#sessions;
-          let allowed = opts.sessionFilter && sessions && collections.includes(sessions.collection)
-            ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, opts.sessionFilter) : undefined;
-          if (collections.includes(EXTRACTED_COLLECTION)) {
-            allowed = { ...allowed, [EXTRACTED_COLLECTION]: this.#currentExtracted(undefined, opts.sessionFilter).map(extractedPath) };
-          }
-          return allowed;
+          return this.#allowedPaths(collections, opts.sessionFilter);
         });
         const store = await timeStage("storeSetupMs", timings, signal, () => this.#getAnalysisStore()) as QMDStore;
         const hits = new Map<string, Pick<VectorSearchResult, "file" | "body" | "bestChunk" | "chunkPos" | "chunkLen" | "displayPath" | "score">>();
@@ -1090,7 +1064,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   ): Promise<CorpusMemorySearchResult[]> {
     const tokenizer = (store as Partial<AnalysisStore>).internal?.llm;
     const results: CorpusMemorySearchResult[] = [];
-    const current = new Map(this.#currentExtracted(hits.map(hit => hit.file), opts?.sessionFilter).map(r => [`qmd://${EXTRACTED_COLLECTION}/${extractedPath(r)}`, r]));
+    const current = new Map(this.#currentExtracted(hits.map(hit => hit.file), opts?.sessionFilter).map(r => [extractedUri(r), r]));
     for (const hit of hits) {
       opts?.signal?.throwIfAborted();
       // Proactive hints must retain the entire matched chunk, even when expanded
@@ -1114,7 +1088,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       // Never apply offsets from a newer projection to an older indexed snapshot.
       const messages = corpus === "sessions"
         ? projection?.messages && projection.documentPath === relativePath &&
-          projection.projectionHash === createHash("sha256").update(hit.body).digest("hex")
+          projection.projectionHash === projectionHash(hit.body)
           ? projection.messages : parseSessionMessageSpans(hit.body)
         : undefined;
       const messageTimestamp = messages
@@ -1147,13 +1121,12 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       });
     }
     // Expansion above can yield; recheck only derived hits once more before returning.
-    const finalPaths = new Set(this.#currentExtracted(results.map(hit => hit.path), opts?.sessionFilter).map(r => `qmd://${EXTRACTED_COLLECTION}/${extractedPath(r)}`));
-    return results.filter(hit => !hit.path.startsWith(`qmd://${EXTRACTED_COLLECTION}/`) || finalPaths.has(hit.path));
+    const finalPaths = new Set(this.#currentExtracted(results.map(hit => hit.path), opts?.sessionFilter).map(extractedUri));
+    return results.filter(hit => !hit.path.startsWith(EXTRACTED_PREFIX) || finalPaths.has(hit.path));
   }
 
   async searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]> {
-    const collections = this.#skillCollectionNames();
-    if (collections.length === 0) return [];
+    if (!this.#hasSkills) return [];
     await this.#operationChain;
     const store = await this.#getStore() as Partial<AnalysisStore>;
     if (!store.internal?.llm) throw new Error("Skill Whisperer requires the QMD embedding model");
@@ -1162,35 +1135,23 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     let skillIndex = this.#skillIndex;
     if (!skillIndex) {
       const pending = (async () => {
-        const sourceOrder = new Map([...this.#sources.keys()].map((collection, index) => [collection, index]));
-        const metadata = new Map<string, {
-          candidate: Omit<SkillSearchCandidate, "score">;
-          description: string;
-          sourceOrder: number;
-        }>();
+        // Sources iterate in configuration order, so the first skill of a name wins.
+        const byName = new Map<string, Omit<SkillSearchCandidate, "score">>();
         for (const source of this.#sources.values()) {
           if (source.kind !== "skills") continue;
           for (const document of readSkillDocuments(source)) {
             const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
-            const description = frontmatterValue(document.body, "description") ?? "";
             const key = name.toLowerCase();
-            const order = sourceOrder.get(source.collection) ?? Number.MAX_SAFE_INTEGER;
-            const current = metadata.get(key);
-            if (!current || order < current.sourceOrder) {
-              metadata.set(key, {
-                candidate: { name, description, path: document.path },
-                description,
-                sourceOrder: order,
-              });
-            }
+            if (byName.has(key)) continue;
+            byName.set(key, { name, description: frontmatterValue(document.body, "description") ?? "", path: document.path });
           }
         }
-        const skills = [...metadata.values()];
+        const skills = [...byName.values()];
         const embeddings = await llm.embedBatch(
-          skills.map(({ candidate, description }) =>
-            formatDocForEmbedding(description, candidate.name, llm.embedModelName)),
+          skills.map((candidate) =>
+            formatDocForEmbedding(candidate.description, candidate.name, llm.embedModelName)),
         );
-        return skills.flatMap(({ candidate }, index) => {
+        return skills.flatMap((candidate, index) => {
           const embedding = embeddings[index]?.embedding;
           return embedding ? [{ ...candidate, score: 0, embedding }] : [];
         });
@@ -1220,10 +1181,8 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     lines?: number;
     requestContext?: MemoryRequestContext;
   }): Promise<MemoryReadResult> {
-    if (params.relPath.startsWith(`qmd://${EXTRACTED_COLLECTION}/`)) {
-      const record = this.#extraction?.enabled && this.#extraction.publish
-        ? extractedRecords(this.#curationPath, [params.relPath.slice(`qmd://${EXTRACTED_COLLECTION}/`.length)]).find(r => this.#extraction!.chatTypes.includes(r.metadata.chatType) &&
-          params.relPath === `qmd://${EXTRACTED_COLLECTION}/${extractedPath(r)}`) : undefined;
+    if (params.relPath.startsWith(EXTRACTED_PREFIX)) {
+      const record = this.#currentExtracted([params.relPath]).find(r => params.relPath === extractedUri(r));
       return record ? buildReadResult({ content: `${record.text}\nObserved: ${new Date(record.observedAt).toISOString()}\nSource: ${extractedHit(record, 1).citation}`,
         path: params.relPath, from: params.from, lines: params.lines }) : { status: "not_found", text: "", path: params.relPath };
     }

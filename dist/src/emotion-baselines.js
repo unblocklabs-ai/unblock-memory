@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
+import { immediateTransaction, tableExists } from "./memory-database.js";
+import { jsonHash } from "./json-hash.js";
 export const INSIDE_OUT_EMOTIONS = ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
 /** Erased by an operator purge: never retried, linked, aggregated or compared. */
 export const PURGED_GRADE = "Purged by operator";
+/** Builds a per-emotion record in canonical emotion order, so serialized key order is stable. */
+const perEmotion = (f) => Object.fromEntries(INSIDE_OUT_EMOTIONS.map(emotion => [emotion, f(emotion)]));
 const WEEK = 7 * 86400_000;
 const MONDAY = Date.UTC(1970, 0, 5);
 const VERSION = "personal-deviation-v2";
@@ -10,10 +14,8 @@ const STEPS = 100;
 // Writers on the shared store wait for at most one short batch, never a whole refresh.
 const BATCH = 500;
 const PAGE = 2000;
-export const hash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const weekStart = (time) => MONDAY + Math.floor((time - MONDAY) / WEEK) * WEEK;
 const bin = (value) => Math.round(value * STEPS);
-export const tableExists = (db, name) => Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name));
 const GRADE = `interaction_id,rubric,model,person_id,target_at,reviewed_at,error,${INSIDE_OUT_EMOTIONS.join(",")}`;
 const VALID = INSIDE_OUT_EMOTIONS.map(e => `e.${e} BETWEEN 0 AND 1`).join(" AND ");
 // Comparable grades: successful, timed, not after `now`. Callers add the People join.
@@ -28,8 +30,7 @@ function schemaVersion(db) {
 function initializeEmotionBaselines(db) {
     if (schemaVersion(db) === 2)
         return;
-    db.exec("BEGIN IMMEDIATE");
-    try {
+    immediateTransaction(db, () => {
         const version = schemaVersion(db);
         if (version !== undefined && version !== 1 && version !== 2)
             throw new Error("Unsupported Inside Out baseline storage version");
@@ -48,20 +49,15 @@ function initializeEmotionBaselines(db) {
     CREATE INDEX IF NOT EXISTS inside_out_deviations_interaction ON inside_out_deviations(interaction_id,rubric);
     CREATE INDEX IF NOT EXISTS inside_out_deviations_person ON inside_out_deviations(person_id);
     INSERT OR REPLACE INTO memory_schema VALUES ('emotion-baselines',2);`);
-        db.exec("COMMIT");
-    }
-    catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-    }
+    });
 }
 function gradeSignature(row) {
-    return hash([row.interaction_id, row.rubric, row.model, row.person_id ?? null, row.target_at,
+    return jsonHash([row.interaction_id, row.rubric, row.model, row.person_id ?? null, row.target_at,
         row.reviewed_at, row.error, ...INSIDE_OUT_EMOTIONS.map(e => row[e])]);
 }
 function histograms() {
     const empty = () => ({ count: 0, sum: 0, carry: 0, min: Infinity, max: -Infinity, bins: new Array(STEPS + 1).fill(0) });
-    return { joy: empty(), sadness: empty(), fear: empty(), anger: empty(), disgust: empty(), surprise: empty() };
+    return perEmotion(empty);
 }
 // Neumaier summation keeps means exact for repeated values: twenty 0.8s average to 0.8.
 function accumulate(target, value, count, min, max) {
@@ -127,8 +123,7 @@ function summarize(week) {
         return { count: h.count, mean: h.count ? (h.sum + h.carry) / h.count : null, min: h.count ? h.min : null,
             p10: quantile(0.1), median: quantile(0.5), p90: quantile(0.9), max: h.count ? h.max : null, distribution: values };
     };
-    return { joy: statistics(week.joy), sadness: statistics(week.sadness), fear: statistics(week.fear),
-        anger: statistics(week.anger), disgust: statistics(week.disgust), surprise: statistics(week.surprise) };
+    return perEmotion(emotion => statistics(week[emotion]));
 }
 /** Freeze a population's rank prefixes before later grades join it. */
 function ranks(population) {
@@ -138,8 +133,7 @@ function ranks(population) {
             prefix.push(prefix.at(-1) + n);
         return { count: h.count, mean: (h.sum + h.carry) / h.count, prefix };
     };
-    return { joy: freeze(population.joy), sadness: freeze(population.sadness), fear: freeze(population.fear),
-        anger: freeze(population.anger), disgust: freeze(population.disgust), surprise: freeze(population.surprise) };
+    return perEmotion(emotion => freeze(population[emotion]));
 }
 function compare(row, population, minimum) {
     const count = population.joy.count;
@@ -151,8 +145,7 @@ function compare(row, population, minimum) {
         const percentile = (prefix[b] + (prefix[b + 1] - prefix[b]) / 2) / count;
         return { delta: score - mean, percentile, unusualness: Math.abs(2 * percentile - 1) };
     };
-    return { status: "ok", count, emotions: { joy: deviation("joy"), sadness: deviation("sadness"), fear: deviation("fear"),
-            anger: deviation("anger"), disgust: deviation("disgust"), surprise: deviation("surprise") } };
+    return { status: "ok", count, emotions: perEmotion(deviation) };
 }
 /** Queue writes and commit them in short IMMEDIATE transactions. Only call between completed reads. */
 function batches(db) {
@@ -160,16 +153,8 @@ function batches(db) {
     const flush = () => {
         if (!pending.length)
             return;
-        db.exec("BEGIN IMMEDIATE");
-        try {
-            for (const write of pending)
-                write();
-            db.exec("COMMIT");
-        }
-        catch (error) {
-            db.exec("ROLLBACK");
-            throw error;
-        }
+        immediateTransaction(db, () => { for (const write of pending)
+            write(); });
         pending.length = 0;
     };
     return { write(change) { pending.push(change); if (pending.length >= BATCH)
@@ -199,12 +184,12 @@ export function refreshEmotionBaselines(db, options) {
         const result = { version: VERSION, status: "insufficient_history", personId: row.person_id === null ? null : String(row.person_id),
             baselineId: null, baselineEnd: null, assessedAt: now, minInteractions: minimum, cumulative: null, weekly: null };
         decide(result);
-        const key = (assessment) => hash([assessment.version, signature, assessment.baselineId, assessment.status, assessment.minInteractions]);
+        const key = (assessment) => jsonHash([assessment.version, signature, assessment.baselineId, assessment.status, assessment.minInteractions]);
         if (previous && key(JSON.parse(String(previous.result_json))) === key(result))
             return;
         // Chaining records permits an explicit return to an earlier baseline without
         // selecting an obsolete intervening assessment or losing either observation.
-        const id = hash([key(result), previous?.id ?? null]);
+        const id = jsonHash([key(result), previous?.id ?? null]);
         queue.write(() => {
             // Rechecked under the write lock: a purge, regrade or relink committed since the read wins.
             const current = grade.get(row.interaction_id, row.rubric);
@@ -269,7 +254,7 @@ export function refreshEmotionBaselines(db, options) {
                 merge(cumulative, weekly);
                 // Chained ids address the whole cumulative population without rehashing earlier weeks.
                 // Empty weeks are kept: a weekly comparison always means the preceding calendar week.
-                const id = hash([VERSION, person, rubric, model, start, previous?.id ?? null, signatures]), json = encode(weekly);
+                const id = jsonHash([VERSION, person, rubric, model, start, previous?.id ?? null, signatures]), json = encode(weekly);
                 current.add(start);
                 if (existing.get(start) !== id)
                     queue.write(() => {
@@ -408,8 +393,7 @@ export function purgeEmotionProfile(db, personId, options = {}) {
     if (!tableExists(db, "inside_out"))
         return counts;
     initializeEmotionBaselines(db);
-    db.exec("BEGIN IMMEDIATE");
-    try {
+    return immediateTransaction(db, () => {
         if (options.grades) {
             counts.assessments += Number(db.prepare(`DELETE FROM inside_out_deviations WHERE (interaction_id,rubric) IN
         (SELECT interaction_id,rubric FROM inside_out WHERE person_id=?)`).run(personId).changes);
@@ -418,11 +402,6 @@ export function purgeEmotionProfile(db, personId, options = {}) {
         }
         counts.assessments += Number(db.prepare("DELETE FROM inside_out_deviations WHERE person_id=?").run(personId).changes);
         counts.baselines = Number(db.prepare("DELETE FROM person_emotion_baselines WHERE person_id=?").run(personId).changes);
-        db.exec("COMMIT");
         return counts;
-    }
-    catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-    }
+    });
 }

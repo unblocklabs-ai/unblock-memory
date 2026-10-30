@@ -454,7 +454,7 @@ test("new background writes reject long blurbs, legacy categories and inferred p
       sections: [{ category: "role", claims: [{ ...claim, epistemicType: "inferred" }] }] }));
     assert.equal(store.getDossier(person.id), undefined);
     assert.equal(store.listDossierChanges(person.id).length, 0);
-    assert.equal(store.replaceDossier(person.id, "test", { ...dossier, blurb: "word ".repeat(70).trim() }).blurb.split(" ").length, 70);
+    assert.equal(store.replaceDossier(person.id, "test", { ...dossier, blurb: "word ".repeat(70).trim() })?.blurb.split(" ").length, 70);
   } finally { store.close(); }
 });
 

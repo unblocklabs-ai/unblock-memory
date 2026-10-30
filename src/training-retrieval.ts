@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { QMDStore } from "@unblocklabs/qmd";
 import type { ChatType } from "./config.js";
-import { readSessionManifest, type SessionManifest } from "./session-sync.js";
+import { projectionHash, readSessionManifest, type SessionManifest } from "./session-sync.js";
 import type { SessionMessageSpan } from "./session-projector.js";
 import { resolveSessionSource } from "./sources.js";
 import { trainingCandidates } from "./training-candidates.js";
@@ -92,7 +92,7 @@ export async function historicalTrainingSource(stateDir: string, chatTypes: read
       // Workspace files and meetings lack immutable historical content proof here.
       if (!chatTypes.includes(session.chatType) || session.provider === "loggie") { excluded++; continue; }
       const row = document.get<{ hash: string; doc: string }>(source.collection, session.documentPath);
-      if (!row || createHash("sha256").update(row.doc).digest("hex") !== session.projectionHash) { excluded++; continue; }
+      if (!row || projectionHash(row.doc) !== session.projectionHash) { excluded++; continue; }
       let captured = vectors.get(row.hash);
       if (!captured) {
         captured = [];

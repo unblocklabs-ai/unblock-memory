@@ -3,7 +3,6 @@ type RequestOptions = {
     timeoutMs: number;
     signal: AbortSignal;
 };
-export { TYPESAFE_MODEL as TYPESAFE_REVIEW_MODEL } from "./typesafe-client.js";
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
 export declare function reviewTypeSafeClaim(params: RequestOptions & {
     claim: string;
@@ -46,3 +45,4 @@ export declare function reviewClusterDefects(params: RequestOptions & {
     defect: "encoding" | "wrapper" | "boilerplate" | "none_or_uncertain";
     confidence: number;
 }[]>;
+export {};
