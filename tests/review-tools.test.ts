@@ -148,5 +148,7 @@ test("diagnostics reports disabled features, safe credential state and per-agent
   assert.equal(result.credential, "available");
   assert.equal(JSON.stringify(result).includes("fake-secret"), false);
   assert.equal(JSON.stringify(result).includes("failed"), false);
-  assert.deepEqual(result.enabled, { skill: false, memory: false, complementaryHints: false, qualityAudit: false, evidenceReview: false });
+  assert.deepEqual(result.enabled, { skill: false, memory: false, complementaryHints: false, qualityAudit: false, evidenceReview: false,
+    safety: false });
+  assert.deepEqual(result.safety, { enabled: false, active: false, reason: "disabled" });
 });

@@ -8,6 +8,13 @@ export const TYPESAFE_NOUL_SCHEMA = Type.Object({
   type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
 });
 
+/** A conservative estimate of serialized size, not Jev's tokenizer. Non-ASCII is budgeted separately. */
+export function estimateJevTokens(value: unknown): number {
+  let n = 0;
+  for (const c of JSON.stringify(value)) n += c.codePointAt(0)! < 128 ? 1 / 3 : 2;
+  return Math.ceil(n);
+}
+
 export class TypeSafeRequestError extends Error {
   constructor(message: string, readonly code: "timeout" | "cancelled" | "http_error" | "invalid_response" | "network_error",
     readonly status?: number) { super(message); }

@@ -12,7 +12,7 @@ declare const qualitySchema: Type.TObject<{
     answers: Type.TObject<{
         taskType: Type.TObject<{
             type: Type.TLiteral<"choice">;
-            choice: Type.TEnum<("action" | "question" | "artifact" | "discussion" | "other")[]>;
+            choice: Type.TEnum<("action" | "question" | "other" | "artifact" | "discussion")[]>;
             confidence: Type.TNumber;
             probabilities: Type.TObject<{
                 [k: string]: Type.TNumber;

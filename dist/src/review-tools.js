@@ -3,6 +3,7 @@ import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { getContext } from "./tool-context.js";
 import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { safetyStatus } from "./safety-whisperer.js";
 import { abortable } from "./abortable.js";
 const claimParameters = Type.Object({
     claim: Type.String({ pattern: "\\S", maxLength: 2000 }),
@@ -47,7 +48,9 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
                 }
                 const result = { status: "ok", credential,
                     enabled: { skill: config.skillWhisperer.enabled, memory: config.memoryWhisperer.enabled && config.typesafe.enabled,
-                        complementaryHints: config.memoryWhisperer.complementaryHints, qualityAudit: config.qualityAudit.enabled, evidenceReview: config.evidenceReview.enabled },
+                        complementaryHints: config.memoryWhisperer.complementaryHints, qualityAudit: config.qualityAudit.enabled, evidenceReview: config.evidenceReview.enabled,
+                        safety: config.safetyWhisperer.enabled },
+                    safety: safetyStatus(api.config, config),
                     whisperers: diagnostics.snapshot(active.agentId) };
                 try {
                     const { manager } = await runtime.getMemorySearchManager(active);

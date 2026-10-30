@@ -11,7 +11,7 @@ import { abortable } from "./abortable.js";
 const CANDIDATE_LIMIT = 10;
 const MAX_QUERY_CHARS = 12_000;
 const TYPESAFE_CANDIDATE_LIMIT = 3;
-const TOTAL_TIMEOUT_MS = 3000;
+export const SKILL_WHISPERER_TIMEOUT_MS = 3000;
 
 type SkillWhispererRuntime = {
   searchSkills(
@@ -89,7 +89,7 @@ export function registerSkillWhisperer(
     const controller = new AbortController();
     state.controller = controller;
     const { signal } = controller;
-    const timer = setTimeout(() => controller.abort(new DOMException("Skill deadline", "TimeoutError")), TOTAL_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(new DOMException("Skill deadline", "TimeoutError")), SKILL_WHISPERER_TIMEOUT_MS);
     state.lastRunId = runId;
     state.turn += 1;
     // Reuse even an in-flight result when the host rebuilds this run's prompt.

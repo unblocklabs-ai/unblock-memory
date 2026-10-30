@@ -62,5 +62,5 @@ test("a failed contribution does not discard another whisperer or leak errors", 
   assert.deepEqual(await h.before!({ prompt: "task", messages: [] }, {}), {
     appendContext: '<unblock_memory>\n<skill>This skill may be relevant: "/skills/deploy/SKILL.md"</skill>\n</unblock_memory>',
   });
-  assert.deepEqual(h.warnings, ["unblock-memory whisperer contribution failed"]);
+  assert.deepEqual(h.warnings, ["unblock-memory memory whisperer contribution failed"]);
 });

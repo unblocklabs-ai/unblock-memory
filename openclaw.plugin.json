@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.8.3",
+  "version": "0.9.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -91,6 +91,14 @@
     "memoryWhisperer.corpora": {
       "label": "Approved Hint Corpora",
       "help": "Explicit non-skill corpus allowlist for automatic recall and TypeSafe processing. Session recall spans this agent's indexed sessions; the sessions corpus chatTypes setting controls direct-message inclusion."
+    },
+    "safetyWhisperer.enabled": {
+      "label": "Safety Whisperer",
+      "help": "Prompt-level guardrail, not access control. Sends every checked human message and bounded recent history to TypeSafe and appends a scenario's flaggedPrompt when an unapproved requestor's message matches. Fails open: if the check cannot run, the turn proceeds without it. Requires hook conversation access and prompt injection. Disabled by default."
+    },
+    "safetyWhisperer.scenarios": {
+      "label": "Safety Scenarios",
+      "help": "Each scenario is judged independently. Approval and exclusions match exact provider/account/sender or channel IDs from trusted channel metadata, never names or message text."
     },
     "people.enabled": {
       "label": "PeopleSQL",
@@ -350,6 +358,92 @@
           "historyMessages": 5,
           "minScore": 0.5,
           "cooldownTurns": 10
+        }
+      },
+      "safetyWhisperer": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional prompt-level guardrail for sensitive request scenarios. Fails open when the check cannot run.",
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20, "default": 6 },
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 3000 },
+          "excludedChannels": {
+            "type": "array",
+            "maxItems": 500,
+            "description": "Channels where every safety scenario is skipped. Threads inherit their channel.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["provider", "accountId", "channelId"],
+              "properties": {
+                "name": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                "provider": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                "accountId": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                "channelId": { "type": "string", "pattern": "\\S", "maxLength": 256 }
+              }
+            }
+          },
+          "scenarios": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "instructions", "flaggedPrompt"],
+              "properties": {
+                "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+                "enabled": { "type": "boolean", "default": true },
+                "instructions": { "type": "string", "pattern": "\\S", "maxLength": 2000, "description": "What requests this scenario covers, including exclusions." },
+                "flaggedPrompt": { "type": "string", "pattern": "\\S", "maxLength": 2000, "description": "Appended next to the human message when an unapproved requestor's message matches." },
+                "minProbability": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4, "description": "Minimum TypeSafe yes-probability that the current request is covered." },
+                "agentIds": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 500,
+                  "description": "Limit the scenario to these agents; omit for every agent.",
+                  "items": { "type": "string", "pattern": "\\S", "maxLength": 256 }
+                },
+                "approvedRequestors": {
+                  "type": "array",
+                  "maxItems": 500,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider", "accountId", "senderId"],
+                    "properties": {
+                      "name": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                      "provider": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                      "accountId": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                      "senderId": { "type": "string", "pattern": "\\S", "maxLength": 256 }
+                    }
+                  }
+                },
+                "excludedChannels": {
+                  "type": "array",
+                  "maxItems": 500,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider", "accountId", "channelId"],
+                    "properties": {
+                      "name": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                      "provider": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                      "accountId": { "type": "string", "pattern": "\\S", "maxLength": 256 },
+                      "channelId": { "type": "string", "pattern": "\\S", "maxLength": 256 }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "default": {
+          "enabled": false,
+          "historyMessages": 6,
+          "timeoutMs": 3000,
+          "excludedChannels": [],
+          "scenarios": []
         }
       }
     }
