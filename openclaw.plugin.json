@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -349,7 +349,7 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean", "default": true },
+          "enabled": { "type": "boolean", "default": true, "description": "Takes effect only when a corpus with kind \"skills\" is configured." },
           "historyMessages": { "type": "integer", "minimum": 0, "default": 5 },
           "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
           "cooldownTurns": { "type": "integer", "minimum": 0, "default": 10 }

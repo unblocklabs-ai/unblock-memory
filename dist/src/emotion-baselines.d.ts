@@ -1,5 +1,7 @@
 import type { DatabaseSync, SQLOutputValue } from "node:sqlite";
 export declare const INSIDE_OUT_EMOTIONS: readonly ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
+/** Erased by an operator purge: never retried, linked, aggregated or compared. */
+export declare const PURGED_GRADE = "Purged by operator";
 type Emotion = typeof INSIDE_OUT_EMOTIONS[number];
 type Row = Record<string, SQLOutputValue>;
 type Statistics = {
@@ -34,7 +36,11 @@ type PersonalDeviation = {
     cumulative: Comparison | null;
     weekly: Comparison | null;
 };
-/** Immutable, content-addressed revisions; no inference and no modifications to raw grades. */
+/**
+ * One current, content-addressed snapshot per person, rubric, model and completed week.
+ * Reads finish before each batch commits, so the shared store is never held for a whole pass.
+ * No inference and no changes to raw grades.
+ */
 export declare function refreshEmotionBaselines(db: DatabaseSync, options: {
     minInteractions: number;
     now?: number;
@@ -43,7 +49,8 @@ export declare function refreshEmotionBaselines(db: DatabaseSync, options: {
     snapshots: number;
     comparisons: number;
 };
-export declare function personalDeviation(db: DatabaseSync, row: Row, history?: boolean): PersonalDeviation | {
+/** Prepared once per export, not per row. */
+export declare function deviationReader(db: DatabaseSync): (row: Row, history?: boolean) => PersonalDeviation | {
     status: string;
 } | {
     history: {
@@ -82,6 +89,7 @@ export declare function personalDeviation(db: DatabaseSync, row: Row, history?: 
     }[];
     status: "not_compared";
 };
+/** Weekly snapshots, newest first; cumulative statistics are prefix sums of each population's stored weeks. */
 export declare function emotionBaselineHistory(db: DatabaseSync, options?: {
     personId?: string;
     since?: number;
@@ -95,8 +103,18 @@ export declare function emotionBaselineHistory(db: DatabaseSync, options?: {
     week_start: number;
     week_end: number;
     computed_at: number;
-    is_current: number;
     weekly: Summary;
     cumulative: Summary;
 }[];
+/**
+ * Delete one person's baselines and assessment history. With `grades`, also erase their six
+ * probabilities and person link, keeping a tombstone so the reply is never sent to Jev again.
+ */
+export declare function purgeEmotionProfile(db: DatabaseSync, personId: string, options?: {
+    grades?: boolean;
+}): {
+    baselines: number;
+    assessments: number;
+    grades: number;
+};
 export {};

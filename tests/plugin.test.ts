@@ -44,7 +44,6 @@ test("quality audit is inert when disabled or an explicit key file is absent", a
     let auditFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
     const api = {
       pluginConfig: {
-        skillWhisperer: { enabled: false },
         qualityAudit: { enabled, corpora: ["memory"] },
         typesafe: { apiKeyFile: join(root, "missing.env") },
       },
@@ -102,8 +101,10 @@ test("registers exactly the clean memory tool contract and validates every tool 
     names: string[];
     factory: (ctx: OpenClawPluginToolContext) => Tool | null;
   }> = [];
+  const hooks: string[] = [];
   const api = {
-    pluginConfig: { skillWhisperer: { enabled: false } },
+    pluginConfig: {},
+    on(name: string) { hooks.push(name); },
     registerCli() {},
     registerGatewayMethod() {},
     registerMemoryCapability() {},
@@ -141,6 +142,9 @@ test("registers exactly the clean memory tool contract and validates every tool 
       ),
     ),
   );
+  // A default install has no skills corpus, so no whisperer may ask the host for
+  // conversation access (non-bundled plugins would log a blocked-hook warning).
+  assert.equal(hooks.includes("before_prompt_build"), false);
 
   const context = {
     agentId: "bill",
@@ -216,7 +220,7 @@ test("memory search compacts judged results without changing evidence or request
   let searchFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   let getFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   const api = {
-    pluginConfig: { skillWhisperer: { enabled: false }, typesafe: { enabled: true, apiKey: "test-key" } },
+    pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
     registerCli() {},
     registerGatewayMethod() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
@@ -365,7 +369,6 @@ test("session sync tools accept and report status without awaiting cold initiali
   const api = {
     on(name: string) { hooks.push(name); },
     pluginConfig: {
-      skillWhisperer: { enabled: false },
       corpora: [
         { name: "memory", kind: "files", paths: ["MEMORY.md"] },
         { name: "sessions", kind: "sessions" },

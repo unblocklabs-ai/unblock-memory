@@ -492,6 +492,12 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     }
     skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns };
   }
+  // Default-on means "on once skills exist": without a skills corpus it could never
+  // hint, so it registers no prompt hook and reports inactive. Host-applied schema
+  // defaults are indistinguishable from an explicit true, so this never throws.
+  if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
+    skillWhisperer = { ...skillWhisperer, enabled: false };
+  }
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
     extraction: resolveExtraction(config.extraction, corpora),
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),

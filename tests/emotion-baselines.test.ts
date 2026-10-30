@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { resolveConfig } from "../src/config.js";
 import { PeopleStore } from "../src/people-store.js";
-import { personalDeviation } from "../src/emotion-baselines.js";
-import { runInsideOut, reportInsideOut, refreshInsideOutBaselines, reportInsideOutBaselines } from "../src/inside-out.js";
+import { deviationReader } from "../src/emotion-baselines.js";
+import { runInsideOut, reportInsideOut, refreshInsideOutBaselines, reportInsideOutBaselines, linkInsideOutPeople,
+  purgeInsideOutPerson, refreshInsideOutBaselinesAsync } from "../src/inside-out.js";
+import { openInsideOutStore } from "../src/inside-out-store.js";
 
 // Owns the persisted statistical contract: real PeopleSQL identities, transcript grading,
 // snapshot refresh, operator export and immutable historical comparisons. Only Jev is offline.
@@ -56,7 +61,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   const db = new DatabaseSync(path);
   t.after(() => db.close());
   const deviation = (messageId: string) => {
-    const result = personalDeviation(db, db.prepare("SELECT * FROM inside_out WHERE message_id=?").get(messageId)!);
+    const result = deviationReader(db)(db.prepare("SELECT * FROM inside_out WHERE message_id=?").get(messageId)!);
     assert.ok("baselineId" in result, "the persisted runner assessed this grade");
     return result;
   };
@@ -92,15 +97,17 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   assert.equal(calls, beforeCalls, "statistics require no inference");
   assert.deepEqual(reportInsideOut(path, { personal: true, personId: restrained }).find(r => r.message_id === "unusual")?.personal_deviation, unusual);
 
-  // A delayed historical reply changes baseline revisions, not the already recorded comparison.
+  // A delayed historical reply replaces the affected snapshots, not the already recorded comparison.
   now += 1000;
   add("late", "one", "0.2", firstWeek - week + 1000);
   await saveTranscript();
   await runInsideOut(options);
   assert.equal(calls, beforeCalls + 1, "backfill grades only the newly discovered reply");
   assert.deepEqual(deviation("routine"), routine);
-  assert.deepEqual(reportInsideOutBaselines(path).find(s => s.id === initial.id)?.cumulative, initial.cumulative);
-  assert.equal(reportInsideOutBaselines(path).find(s => s.id === initial.id)?.is_current, 0);
+  const replaced = reportInsideOutBaselines(path, { personId: expressive }).filter(s => s.model === "jev-test");
+  assert.equal(replaced.length, 3, "the late reply's week joins; later weeks are replaced, never duplicated");
+  assert.equal(replaced.some(s => s.id === initial.id), false);
+  assert.equal(replaced.find(s => s.week_end === initial.week_end)?.cumulative.joy.count, 21);
   now += 1000;
   refreshInsideOutBaselines(path, { recompare: true });
   const revised = deviation("routine");
@@ -132,7 +139,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   db.exec("DELETE FROM person_identities WHERE account_scope='one'");
   refreshInsideOutBaselines(path);
   assert.equal(deviation("routine").status, "unlinked_person");
-  assert.ok(reportInsideOutBaselines(path, { personId: expressive }).every(s => s.is_current === 0));
+  assert.equal(reportInsideOutBaselines(path, { personId: expressive }).length, 0, "no snapshot outlives its identity link");
   db.prepare(`INSERT INTO person_identities (${Object.keys(identity).join(",")}) VALUES (${Object.keys(identity).map(() => "?").join(",")})`)
     .run(...Object.values(identity));
   refreshInsideOutBaselines(path, { recompare: true });
@@ -143,7 +150,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   now = firstWeek + 5 * week + 86400_000;
   refreshInsideOutBaselines(path);
   const emptyWeek = reportInsideOutBaselines(path, { personId: expressive })
-    .find(s => s.model === "jev-test" && s.week_start === firstWeek + 3 * week && s.is_current === 1)!;
+    .find(s => s.model === "jev-test" && s.week_start === firstWeek + 3 * week)!;
   assert.equal(emptyWeek.weekly.joy.count, 0);
   add("after-gap", "one", "0.8", firstWeek + 4 * week + 1000);
   await saveTranscript();
@@ -156,6 +163,19 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   refreshInsideOutBaselines(path, { recompare: true });
   assert.equal(deviation("after-gap").baselineId, emptyWeek.id);
   assert.equal(calls, beforeCalls + 2);
+
+  // Purging grades leaves tombstones: never relinked, compared, or sent to Jev again, even on --retry.
+  const purged = purgeInsideOutPerson(path, expressive, { grades: true });
+  assert.ok(purged.grades > 0 && purged.assessments > 0 && purged.baselines > 0);
+  await runInsideOut({ ...options, retry: true });
+  linkInsideOutPeople(path);
+  refreshInsideOutBaselines(path, { recompare: true });
+  assert.equal(calls, beforeCalls + 2, "purged replies are not regraded");
+  assert.equal(reportInsideOutBaselines(path, { personId: expressive }).length, 0);
+  assert.equal(db.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(expressive)?.n, 0);
+  assert.ok(db.prepare("SELECT * FROM inside_out WHERE error=?").all("Purged by operator")
+    .every(row => row.person_id === null && row.joy === null), "tombstones keep no probabilities or person link");
+  assert.ok(reportInsideOutBaselines(path, { personId: restrained }).length > 0, "other people are untouched");
   assert.equal(db.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
 });
 
@@ -197,4 +217,153 @@ test("new grades use history linked since the preceding grading run", async t =>
   assert.equal(result.cumulative.count, 20);
   assert.equal(result.history.length, 1, "the first assessment is correct without explicit re-comparison");
   assert.equal(calls, 21, "linking old replies never repeats inference");
+});
+
+const WEEK = 7 * 86400_000, FIRST_WEEK = Date.UTC(2026, 0, 5);
+const EMOTIONS = ["joy", "sadness", "fear", "anger", "disgust", "surprise"] as const;
+/** Linked grades written straight to the store: statistics need neither transcripts nor Jev. */
+async function gradedStore(people: { account: string; grades: number; weeks: number }[]) {
+  const root = await mkdtemp(join(tmpdir(), "emotion-store-")), path = join(root, "unblock-memory.sqlite");
+  const store = new PeopleStore(path, { maxOpenTodos: 100, maxBlurbChars: 1000 });
+  const ids = people.map(p => store.upsertIdentity({ provider: "slack", accountScope: p.account, externalId: "u" }).person.id);
+  store.close();
+  const db = openInsideOutStore(path);
+  const insert = db.prepare(`INSERT INTO inside_out (interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,
+    channel,source,target_at,reviewed_at,model,context_trimmed,${EMOTIONS.join(",")},error,person_id) VALUES (${Array(21).fill("?").join(",")})`);
+  db.exec("BEGIN");
+  people.forEach((p, n) => {
+    for (let i = 0; i < p.grades; i++) {
+      // Distinct raw floats: the previous format stored one histogram entry per grade.
+      const at = FIRST_WEEK + Math.floor(i * p.weeks / p.grades) * WEEK + i, score = ((i * 7919) % p.grades + 0.5) / p.grades;
+      insert.run(`${p.account}-${i}`, "emotion-presence-v2", "s", `${p.account}-${i}`, "a", JSON.stringify(["slack", p.account, "u"]), "u",
+        "slack", "s.jsonl", at, at, "jev-test", 0, ...EMOTIONS.map(() => score), null, ids[n]!);
+    }
+  });
+  db.exec("COMMIT");
+  db.close();
+  return { root, path, ids, now: FIRST_WEEK + Math.max(...people.map(p => p.weeks)) * WEEK + 86400_000 };
+}
+
+test("snapshots stay bounded, are replaced rather than duplicated, and commit in short batches", async t => {
+  const { path, ids: [person], now } = await gradedStore([{ account: "one", grades: 3000, weeks: 30 }]);
+  const exec = DatabaseSync.prototype.exec;
+  let transactions = 0;
+  t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") transactions++;
+    return exec.call(this, sql);
+  });
+  const first = refreshInsideOutBaselines(path, { now });
+  assert.deepEqual(first, { snapshots: 30, comparisons: 3000 });
+  assert.ok(transactions >= 7, `3,030 writes commit in batches of at most 500, not one long transaction (${transactions})`);
+  const db = new DatabaseSync(path);
+  t.after(() => db.close());
+  const size = () => db.prepare("SELECT count(*) n,max(length(weekly_json)) largest FROM person_emotion_baselines").get()!;
+  assert.equal(size().n, 30);
+  assert.ok(Number(size().largest) < 8000, "100 distinct grades per week fit in at most 101 bins per emotion");
+
+  // Backfill and regrading change week ids from the affected week onwards; rows are rewritten in place.
+  for (let round = 1; round <= 3; round++) {
+    db.prepare("UPDATE inside_out SET reviewed_at=reviewed_at+1,joy=? WHERE interaction_id='one-0'").run(round / 10);
+    assert.equal(refreshInsideOutBaselines(path, { now }).snapshots, 30);
+    assert.equal(size().n, 30, "every refresh keeps exactly one snapshot per completed week");
+  }
+  assert.deepEqual(refreshInsideOutBaselines(path, { now }), { snapshots: 0, comparisons: 0 });
+  const [latest] = reportInsideOutBaselines(path, { personId: person, limit: 1 });
+  assert.equal(latest!.cumulative.joy.count, 3000);
+  assert.equal(latest!.weekly.joy.count, 100);
+  assert.ok(latest!.cumulative.joy.distribution.length <= 101);
+  const raw = db.prepare("SELECT avg(sadness) mean,min(sadness) min,max(sadness) max FROM inside_out").get()!;
+  assert.ok(Math.abs(latest!.cumulative.sadness.mean! - Number(raw.mean)) < 1e-12, "means use exact sums, not bin centres");
+  assert.equal(latest!.cumulative.sadness.min, raw.min);
+  assert.equal(latest!.cumulative.sadness.max, raw.max);
+});
+
+test("purging without grades removes derived history; the next refresh rebuilds only from current links", async () => {
+  const { path, ids: [one, two], now } = await gradedStore([{ account: "one", grades: 60, weeks: 3 }, { account: "two", grades: 60, weeks: 3 }]);
+  refreshInsideOutBaselines(path, { now });
+  assert.deepEqual(purgeInsideOutPerson(path, one!), { baselines: 3, assessments: 60, grades: 0 });
+  assert.equal(reportInsideOutBaselines(path, { personId: one }).length, 0);
+  assert.equal(reportInsideOutBaselines(path, { personId: two }).length, 3);
+  assert.deepEqual(refreshInsideOutBaselines(path, { now }), { snapshots: 3, comparisons: 60 }, "grades remain, so statistics return");
+  assert.deepEqual(purgeInsideOutPerson(path, "unknown-person", { grades: true }), { baselines: 0, assessments: 0, grades: 0 });
+  assert.throws(() => purgeInsideOutPerson(path, " "), /person ID is required/);
+  const empty = join(await mkdtemp(join(tmpdir(), "emotion-empty-")), "unblock-memory.sqlite");
+  new PeopleStore(empty, { maxOpenTodos: 100, maxBlurbChars: 1000 }).close();
+  assert.deepEqual(purgeInsideOutPerson(empty, one!), { baselines: 0, assessments: 0, grades: 0 });
+  const probe = new DatabaseSync(empty, { readOnly: true });
+  assert.equal(probe.prepare("SELECT 1 FROM sqlite_schema WHERE name='inside_out'").get(), undefined, "purge never creates Inside Out tables");
+  probe.close();
+});
+
+test("aborting a baseline refresh skips queued work, terminates the worker and leaves the store writable", async () => {
+  const { path, now } = await gradedStore([{ account: "one", grades: 2000, weeks: 20 }]);
+  const before = new AbortController();
+  before.abort();
+  await assert.rejects(refreshInsideOutBaselinesAsync(path, { now }, before.signal), { name: "AbortError" });
+  const during = new AbortController();
+  const job = refreshInsideOutBaselinesAsync(path, { now }, during.signal);
+  await new Promise(setImmediate);
+  during.abort();
+  await assert.rejects(job, { name: "AbortError" });
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA busy_timeout=0; CREATE TABLE probe(x); DROP TABLE probe;");
+  db.close();
+  const resumed = await refreshInsideOutBaselinesAsync(path, { now });
+  assert.equal(resumed.snapshots, 20);
+  assert.equal(resumed.comparisons, 2000);
+});
+
+test("unreleased v1 baseline tables are rebuilt as bounded v2 storage", async () => {
+  const { path, now } = await gradedStore([{ account: "one", grades: 40, weeks: 2 }]);
+  const db = new DatabaseSync(path);
+  db.exec(`CREATE TABLE person_emotion_baselines (id TEXT PRIMARY KEY, cumulative_json TEXT) STRICT;
+    CREATE TABLE inside_out_deviations (id TEXT PRIMARY KEY, baseline_id TEXT REFERENCES person_emotion_baselines(id)) STRICT;
+    INSERT INTO person_emotion_baselines VALUES ('old','{}'); INSERT INTO inside_out_deviations VALUES ('old','old');
+    INSERT INTO memory_schema VALUES ('emotion-baselines',1);`);
+  db.close();
+  assert.deepEqual(refreshInsideOutBaselines(path, { now }), { snapshots: 2, comparisons: 40 });
+  const migrated = new DatabaseSync(path, { readOnly: true });
+  assert.equal(migrated.prepare("SELECT version FROM memory_schema WHERE component='emotion-baselines'").get()?.version, 2);
+  assert.equal(migrated.prepare("SELECT count(*) n FROM inside_out_deviations WHERE id='old'").get()?.n, 0);
+  migrated.close();
+});
+
+test("a failed baseline refresh never turns a saved grading run into a failure", async t => {
+  const root = await mkdtemp(join(tmpdir(), "emotion-refresh-failure-")), sessionsDir = join(root, "sessions");
+  await mkdir(sessionsDir);
+  const storePath = join(root, "unblock-memory.sqlite");
+  t.mock.method(globalThis, "fetch", async () => Response.json({ model: "jev-test",
+    answers: Object.fromEntries(EMOTIONS.map(e => [e, { type: "noul", noul: 0.4 }])) }));
+  await writeFile(join(sessionsDir, "s.jsonl"), [{ type: "message", id: "answer", message: { role: "assistant", content: "Answer" } },
+    { type: "message", id: "reply", message: { role: "user", content: "Thanks!" } }].map(e => JSON.stringify(e)).join("\n"));
+  const blocker = openInsideOutStore(storePath);
+  blocker.exec("INSERT INTO memory_schema VALUES ('emotion-baselines',99)");
+  blocker.close();
+  const result = await runInsideOut({ agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath,
+    config: resolveConfig({ typesafe: { apiKey: "offline" }, insideOut: { enabled: true, intervalMinutes: 0 } }) });
+  assert.ok("reviewed" in result);
+  assert.equal(result.reviewed, 1);
+  assert.match(result.baselineError ?? "", /Unsupported Inside Out baseline storage version/);
+  assert.equal(reportInsideOut(storePath).length, 1, "the grade stays saved");
+});
+
+test("the compiled baseline worker runs under plain Node and never imports the OpenClaw SDK", async () => {
+  const entry = new URL("../dist/src/inside-out-store.js", import.meta.url), seen = new Set<string>();
+  const visit = (url: URL) => {
+    if (seen.has(url.href)) return;
+    seen.add(url.href);
+    for (const [, specifier] of readFileSync(url, "utf8").matchAll(/(?:from|import)\s*\(?\s*["']([^"']+)["']/g)) {
+      assert.ok(!specifier!.startsWith("openclaw"), `${url.pathname} imports ${specifier}`);
+      if (specifier!.startsWith(".")) visit(new URL(specifier!, url));
+    }
+  };
+  visit(entry);
+  assert.ok(seen.size >= 3, "the worker graph includes the store, database and statistics modules");
+  const { root, path, now } = await gradedStore([{ account: "one", grades: 40, weeks: 2 }]);
+  // No tsx: the worker must load compiled JavaScript exactly as an installed plugin does.
+  const script = join(root, "compiled-worker.mjs");
+  await writeFile(script, `const m = await import(${JSON.stringify(entry.href)});
+    process.stdout.write(JSON.stringify(await m.refreshInsideOutBaselinesAsync(${JSON.stringify(path)}, { now: ${now} })));`);
+  const { stdout } = await promisify(execFile)(process.execPath, [script], { env: { ...process.env, NODE_OPTIONS: "" }, timeout: 30_000 });
+  assert.deepEqual(JSON.parse(stdout), { snapshots: 2, comparisons: 40 });
 });

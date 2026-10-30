@@ -298,7 +298,7 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     await new Promise(setImmediate);
     await hooks.gateway_stop();
     // A first large historical refresh must leave the Gateway event loop free,
-    // and stop must drain it before readers inspect the completed assessments.
+    // and stop must cancel it without leaving the shared store locked.
     const { DatabaseSync } = await import("node:sqlite");
     const db = new DatabaseSync(${JSON.stringify(join(state, "agents/main/unblock-memory/unblock-memory.sqlite"))});
     const seed = db.prepare("SELECT * FROM inside_out WHERE person_id=? LIMIT 1").get(person);
@@ -321,15 +321,18 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     if (db.prepare("SELECT count(*) n FROM inside_out_deviations WHERE interaction_id LIKE 'bulk-%'").get().n !== 0)
       throw new Error("Gateway startup synchronously completed historical comparisons before yielding");
     await hooks.gateway_stop();
+    db.exec("PRAGMA busy_timeout=0; CREATE TABLE stop_probe(x); DROP TABLE stop_probe;");
+    await program.parseAsync(["node","openclaw","memory-emotions","baseline-refresh"]);
     if (db.prepare("SELECT count(*) n FROM inside_out_deviations WHERE interaction_id LIKE 'bulk-%'").get().n !== 2000)
-      throw new Error("Gateway stop did not drain the historical refresh");
+      throw new Error("The next refresh did not complete the cancelled historical pass");
     const sample = JSON.parse(db.prepare("SELECT result_json FROM inside_out_deviations WHERE interaction_id='bulk-1000'").get().result_json);
     const score = db.prepare("SELECT joy FROM inside_out WHERE interaction_id='bulk-1000'").get().joy;
-    const population = db.prepare("SELECT count(*) n,sum(joy<?) lower,sum(joy=?) equal FROM inside_out WHERE person_id=? AND target_at<?")
-      .get(score,score,person,sample.baselineEnd);
-    const expectedRank = (population.lower+population.equal/2)/population.n;
-    if (sample.cumulative.count !== population.n || Math.abs(sample.cumulative.emotions.joy.percentile-expectedRank)>1e-12)
-      throw new Error("Large-history percentile did not match the preceding raw population");
+    // Percentiles rank within 0.01-wide bins: same-bin grades are ties.
+    const bin = value => Math.round(value*100);
+    const population = db.prepare("SELECT joy FROM inside_out WHERE person_id=? AND target_at<?").all(person,sample.baselineEnd).map(r => bin(r.joy));
+    const expectedRank = (population.filter(b => b<bin(score)).length+population.filter(b => b===bin(score)).length/2)/population.length;
+    if (sample.cumulative.count !== population.length || Math.abs(sample.cumulative.emotions.joy.percentile-expectedRank)>1e-12)
+      throw new Error("Large-history percentile did not match the preceding binned population");
     db.close();
     await program.parseAsync(["node","openclaw","memory-emotions","baselines","--person",person,"--limit","1"]);
     process.stdout.write(JSON.stringify({output,calls}));
@@ -346,9 +349,10 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   assert.ok(cliResult.output[5].some((s: { cumulative: { joy: { count: number } } }) => s.cumulative.joy.count === 3));
   assert.equal(cliResult.output[6].length, 3, "the person filter follows exact PeopleSQL links");
   assert.ok(cliResult.output[6].every((r: { personal_deviation: { history: unknown[] } }) => r.personal_deviation.history.length === 1));
-  assert.equal(cliResult.output[7][0].week_end - cliResult.output[5][0].week_end, 7 * 86400_000,
+  assert.ok(cliResult.output[7].comparisons >= 1, "the refresh after a cancelled stop completes the remaining work");
+  assert.equal(cliResult.output[8][0].week_end - cliResult.output[5][0].week_end, 7 * 86400_000,
     "manual-only startup publishes the next completed week without inference");
-  assert.equal(cliResult.output[7][0].weekly.joy.count, 0);
+  assert.equal(cliResult.output[8][0].weekly.joy.count, 0);
   assert.equal(cliResult.calls, 8, "reports and the cached background pass do not repeat inference");
   // Evolve the real SDK-written store after the old SDK writer has finished.
   const evolved = new DatabaseSync(options.databasePath);

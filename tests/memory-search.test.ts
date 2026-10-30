@@ -50,7 +50,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   let factory: ((context: OpenClawPluginToolContext) => Tool | null) | undefined;
   let diagnosticsFactory: typeof factory;
   const api = {
-    pluginConfig: { skillWhisperer: { enabled: false }, typesafe: { enabled: true, apiKey: "test-key" } },
+    pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
     registerCli() {}, registerGatewayMethod() {},
     registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
       Object.defineProperty(runtime, "getMemorySearchManager", { value: async () => ({ manager }) });

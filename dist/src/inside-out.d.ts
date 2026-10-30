@@ -1,6 +1,7 @@
 import type { UnblockMemoryConfig } from "./config.js";
 import { readInsideOutSources } from "./inside-out-sources.js";
 import { emotionBaselineHistory } from "./emotion-baselines.js";
+export { linkInsideOutPeople, purgeInsideOutPerson, refreshInsideOutBaselines, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 export type InsideOutConfig = {
     enabled: boolean;
     intervalMinutes: number;
@@ -9,12 +10,6 @@ export type InsideOutConfig = {
     baselineMinInteractions: number;
 };
 export declare function resolveInsideOut(value: unknown): InsideOutConfig;
-/** Refresh People links without loading transcripts or calling Jev. Known accounts stay exact. */
-export declare function linkInsideOutPeople(path: string): {
-    updated: number;
-    linked: number;
-    unlinked: number;
-};
 /** Explicit legacy repair: only read sources owning unlinked reviews; never rejudge their text. */
 export declare function repairInsideOutIdentities(options: Parameters<typeof readInsideOutSources>[0] & {
     storePath: string;
@@ -38,22 +33,9 @@ export declare function runInsideOut(options: {
     sources: number;
     skippedSources: number;
     errors: string[];
+    baselineError?: string;
 } | {
     status: string;
-}>;
-/** Rebuild local statistics from existing grades, also refreshing exact People links. */
-export declare function refreshInsideOutBaselines(path: string, options?: {
-    minInteractions?: number;
-    now?: number;
-    recompare?: boolean;
-}): {
-    snapshots: number;
-    comparisons: number;
-};
-/** Keep historical aggregation off the Gateway event loop; serialize writers per store. */
-export declare function refreshInsideOutBaselinesAsync(path: string, options?: Parameters<typeof refreshInsideOutBaselines>[1]): Promise<{
-    snapshots: number;
-    comparisons: number;
 }>;
 export declare function reportInsideOutBaselines(path: string, options?: Parameters<typeof emotionBaselineHistory>[1]): {
     id: string;
@@ -64,7 +46,6 @@ export declare function reportInsideOutBaselines(path: string, options?: Paramet
     week_start: number;
     week_end: number;
     computed_at: number;
-    is_current: number;
     weekly: {
         joy: {
             count: number;

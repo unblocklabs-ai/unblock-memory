@@ -79,9 +79,9 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
   assert.throws(() => resolveConfig({ people: { extra: true } }), /unknown property/);
 });
 
-test("enables skill whispering by default without requiring a corpus and validates its lean controls", () => {
+test("enables skill whispering by default only once a skills corpus exists and validates its lean controls", () => {
   assert.deepEqual(resolveConfig(undefined).skillWhisperer, {
-    enabled: true,
+    enabled: false,
     historyMessages: 5,
     minScore: 0.5,
     cooldownTurns: 10,
@@ -107,8 +107,12 @@ test("enables skill whispering by default without requiring a corpus and validat
     kind: "skills",
     paths: ["skills/**/SKILL.md"],
   });
-  assert.equal(resolveConfig({ skillWhisperer: {} }).skillWhisperer.enabled, true);
-  assert.equal(resolveConfig({ skillWhisperer: { enabled: false } }).skillWhisperer.enabled, false);
+  // No skills corpus means nothing to suggest: inactive, even when explicitly or host-defaulted true.
+  assert.equal(resolveConfig({ skillWhisperer: {} }).skillWhisperer.enabled, false);
+  assert.equal(resolveConfig({ skillWhisperer: { enabled: true } }).skillWhisperer.enabled, false);
+  assert.equal(resolveConfig({ corpora }).skillWhisperer.enabled, true, "a skills corpus turns it on by default");
+  assert.equal(resolveConfig({ corpora, skillWhisperer: {} }).skillWhisperer.enabled, true);
+  assert.equal(resolveConfig({ corpora, skillWhisperer: { enabled: false } }).skillWhisperer.enabled, false);
   assert.throws(
     () => resolveConfig({ skillWhisperer: { historyMessages: -1 } }),
     /non-negative integer/,

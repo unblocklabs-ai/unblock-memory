@@ -5,7 +5,7 @@ import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import type { UnblockMemoryConfig } from "./config.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { dateOption } from "./date-option.js";
-import { linkInsideOutPeople, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
+import { linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
 
 export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryConfig) {
   const paths = (cfg: OpenClawConfig, agentId: string) => {
@@ -23,7 +23,7 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
         const p = paths(cfg, opts.agent);
         const repair = opts.repairIdentities ? await repairInsideOutIdentities(p) : undefined;
         console.log(JSON.stringify({ ...repair, ...linkInsideOutPeople(p.storePath) }, null, 2));
-        await refreshInsideOutBaselinesAsync(p.storePath, { minInteractions: config.insideOut.baselineMinInteractions });
+        await refreshInsideOutBaselinesAsync(p.storePath, { minInteractions: config.insideOut.baselineMinInteractions, link: false });
         if (repair?.errors.length) process.exitCode = 1;
       });
     root.command("run").option("--agent <id>", "Agent id", "main").option("--retry", "Retry failed judgments immediately")
@@ -31,7 +31,7 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
       .action(async (opts: { agent: string; retry?: boolean; session?: string }) => {
         const result = await runInsideOut({ ...paths(cfg, opts.agent), config, retry: opts.retry, sessionId: opts.session });
         console.log(JSON.stringify(result, null, 2));
-        if ("failed" in result && (result.failed || result.errors.length)) process.exitCode = 1;
+        if ("failed" in result && (result.failed || result.errors.length || result.baselineError)) process.exitCode = 1;
       });
     root.command("baseline-refresh").description("Update local weekly baselines and missing comparisons; no Jev calls")
       .option("--agent <id>", "Agent id", "main")
@@ -42,10 +42,16 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
       });
     root.command("baselines").description("Read person-linked weekly and cumulative baseline history")
       .option("--agent <id>", "Agent id", "main").option("--person <id>", "Exact PeopleSQL person ID")
-      .option("--since <date>", "Inclusive UTC period-end date YYYY-MM-DD").option("--limit <n>", "Maximum snapshot revisions, 1–1000", "100")
+      .option("--since <date>", "Inclusive UTC period-end date YYYY-MM-DD").option("--limit <n>", "Maximum weekly snapshots, 1–1000", "100")
       .action((opts: { agent: string; person?: string; since?: string; limit: string }) => {
         console.log(JSON.stringify(reportInsideOutBaselines(paths(cfg, opts.agent).storePath,
           { personId: opts.person, since: opts.since ? dateOption(opts.since, 0) : undefined, limit: Number(opts.limit) }), null, 2));
+      });
+    root.command("purge").description("Delete one person's emotion baselines and assessment history; no Jev calls")
+      .requiredOption("--person <id>", "Exact PeopleSQL person ID").option("--agent <id>", "Agent id", "main")
+      .option("--grades", "Also erase this person's raw emotion grades; tombstones keep those replies from being regraded")
+      .action((opts: { agent: string; person: string; grades?: boolean }) => {
+        console.log(JSON.stringify(purgeInsideOutPerson(paths(cfg, opts.agent).storePath, opts.person, { grades: opts.grades }), null, 2));
       });
     for (const command of ["report", "export"] as const) {
       root.command(command).option("--agent <id>", "Agent id", "main")
@@ -73,6 +79,7 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
         try {
           const result = await runInsideOut({ ...paths(api.config, agentId), config, signal: lifetime.signal });
           if ("failed" in result && (result.failed || result.errors.length)) api.logger.warn("Inside Out: some reviews or sources failed; inspect memory-emotions export");
+          if ("baselineError" in result && result.baselineError) api.logger.warn(`Inside Out baselines: ${result.baselineError}`);
         } catch (error) { if (!lifetime.signal.aborted) api.logger.warn(`Inside Out: ${String(error)}`); }
       }
     })().finally(() => { running = undefined; });
@@ -84,8 +91,8 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
       refreshing = (async () => {
         for (const agentId of listAgentIds(api.config)) {
           if (lifetime.signal.aborted) break;
-          try { await refreshInsideOutBaselinesAsync(paths(api.config, agentId).storePath, { minInteractions: config.insideOut.baselineMinInteractions }); }
-          catch (error) { api.logger.warn(`Inside Out baselines: ${String(error)}`); }
+          try { await refreshInsideOutBaselinesAsync(paths(api.config, agentId).storePath, { minInteractions: config.insideOut.baselineMinInteractions }, lifetime.signal); }
+          catch (error) { if (!lifetime.signal.aborted) api.logger.warn(`Inside Out baselines: ${String(error)}`); }
         }
       })().finally(() => { refreshing = undefined; });
     };
@@ -95,5 +102,6 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
       timer = setInterval(tick, config.insideOut.intervalMinutes * 60_000); timer.unref(); tick();
     }
   });
+  // Aborting cancels active baseline workers rather than waiting for a full historical pass.
   api.on("gateway_stop", async () => { if (timer) clearInterval(timer); if (baselineTimer) clearInterval(baselineTimer); lifetime.abort(); await Promise.all([running, refreshing]); });
 }

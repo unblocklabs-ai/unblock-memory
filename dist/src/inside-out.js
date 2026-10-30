@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { Worker } from "node:worker_threads";
 import { stripReasoningTagsFromText } from "openclaw/plugin-sdk/text-chunking";
-import { openMemoryDatabase } from "./memory-database.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 import { estimateJevTokens, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
 import { readInsideOutSources } from "./inside-out-sources.js";
-import { INSIDE_OUT_EMOTIONS, refreshEmotionBaselines, personalDeviation, emotionBaselineHistory } from "./emotion-baselines.js";
+import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHistory } from "./emotion-baselines.js";
+import { PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
+export { linkInsideOutPeople, purgeInsideOutPerson, refreshInsideOutBaselines, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 const RUBRIC = "emotion-presence-v2";
 const CONTEXT_ERROR = "Target reply and preceding assistant exceed context budget";
 const meanings = {
@@ -126,57 +126,7 @@ function* interactions(source, budget, cached, after) {
         history.push(message);
     }
 }
-const SCHEMA = `CREATE TABLE IF NOT EXISTS inside_out (
-  interaction_id TEXT NOT NULL, rubric TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL,
-  assistant_id TEXT NOT NULL, human_key TEXT NOT NULL, sender_id TEXT NOT NULL, channel TEXT NOT NULL, source TEXT NOT NULL,
-  target_at INTEGER, reviewed_at INTEGER NOT NULL, model TEXT NOT NULL, context_trimmed INTEGER NOT NULL,
-  joy REAL, sadness REAL, fear REAL, anger REAL, disgust REAL, surprise REAL, error TEXT, person_id TEXT,
-  PRIMARY KEY(interaction_id,rubric)
-) STRICT;
-CREATE INDEX IF NOT EXISTS inside_out_human_time ON inside_out(human_key,target_at);
-CREATE INDEX IF NOT EXISTS inside_out_failed_rubric ON inside_out(rubric,reviewed_at) WHERE error IS NOT NULL;
-CREATE TABLE IF NOT EXISTS inside_out_checkpoints (
-  source TEXT NOT NULL, rubric TEXT NOT NULL, session_id TEXT NOT NULL, signature TEXT NOT NULL,
-  revision TEXT NOT NULL, last_seq INTEGER NOT NULL,
-  PRIMARY KEY(source,rubric)
-) STRICT;`;
 const running = new Set();
-// A missing account may match across scopes only when every candidate names the same person.
-const PERSON_MATCH = `SELECT min(i.person_id) person_id FROM person_identities i
-  WHERE i.provider=e.channel AND i.external_id=e.sender_id
-  AND (i.account_scope=json_extract(e.human_key,'$[1]') OR substr(json_extract(e.human_key,'$[1]'),1,8)='session:')
-  HAVING count(DISTINCT i.person_id)=1`;
-function openInsideOutStore(path) {
-    const db = openMemoryDatabase(path);
-    try {
-        db.exec(SCHEMA);
-        if (!db.prepare("SELECT 1 FROM pragma_table_info('inside_out') WHERE name='person_id'").get()) {
-            db.exec("ALTER TABLE inside_out ADD COLUMN person_id TEXT");
-        }
-        db.exec("CREATE INDEX IF NOT EXISTS inside_out_person_time ON inside_out(person_id,target_at)");
-        return db;
-    }
-    catch (error) {
-        db.close();
-        throw error;
-    }
-}
-/** Refresh People links without loading transcripts or calling Jev. Known accounts stay exact. */
-export function linkInsideOutPeople(path) {
-    const db = openInsideOutStore(path);
-    try {
-        let updated = 0;
-        if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name='person_identities'").get()) {
-            const person = `(${PERSON_MATCH})`;
-            updated = Number(db.prepare(`UPDATE inside_out AS e SET person_id=${person} WHERE person_id IS NOT ${person}`).run().changes);
-        }
-        const counts = db.prepare(`SELECT count(person_id) linked,count(*)-count(person_id) unlinked FROM inside_out`).get();
-        return { updated, linked: Number(counts.linked), unlinked: Number(counts.unlinked) };
-    }
-    finally {
-        db.close();
-    }
-}
 /** Explicit legacy repair: only read sources owning unlinked reviews; never rejudge their text. */
 export async function repairInsideOutIdentities(options) {
     const db = openInsideOutStore(options.storePath), errors = [];
@@ -238,13 +188,13 @@ export async function runInsideOut(options) {
         const finish = store.prepare(`INSERT OR REPLACE INTO inside_out_checkpoints
       (source,rubric,session_id,signature,revision,last_seq) VALUES(?,?,?,?,?,?)`);
         const failures = store.prepare(`SELECT interaction_id,source FROM inside_out
-      WHERE rubric=? AND error IS NOT NULL AND (? OR (error<>? AND reviewed_at<=?))
+      WHERE rubric=? AND error IS NOT NULL AND error<>? AND (? OR (error<>? AND reviewed_at<=?))
       AND (? IS NULL OR session_id=?) ORDER BY reviewed_at,interaction_id`);
         // Discover unseen work across all sources first. Failures never rewind the forward cursor.
         processing: for (const retrying of [false, true]) {
             const pending = new Map();
             if (retrying) {
-                for (const row of failures.all(RUBRIC, Number(options.retry ?? false), CONTEXT_ERROR, Date.now() - 3600_000, options.sessionId ?? null, options.sessionId ?? null)) {
+                for (const row of failures.all(RUBRIC, PURGED_GRADE, Number(options.retry ?? false), CONTEXT_ERROR, Date.now() - 3600_000, options.sessionId ?? null, options.sessionId ?? null)) {
                     const source = String(row.source);
                     if (!pending.has(source))
                         pending.set(source, new Set());
@@ -325,59 +275,22 @@ export async function runInsideOut(options) {
         }
         store.close();
         store = undefined;
-        await refreshInsideOutBaselinesAsync(storePath, { minInteractions: config.insideOut.baselineMinInteractions });
+        // Grades are already saved; derived statistics never turn a completed run into a failure.
+        if (result.reviewed + result.failed) {
+            try {
+                await refreshInsideOutBaselinesAsync(storePath, { minInteractions: config.insideOut.baselineMinInteractions }, options.signal);
+            }
+            catch (error) {
+                options.signal?.throwIfAborted();
+                result.baselineError = error instanceof Error ? error.message : String(error);
+            }
+        }
         return result;
     }
     finally {
         store?.close();
         running.delete(storePath);
     }
-}
-/** Rebuild local statistics from existing grades, also refreshing exact People links. */
-export function refreshInsideOutBaselines(path, options = {}) {
-    if (!existsSync(path))
-        return { snapshots: 0, comparisons: 0 };
-    linkInsideOutPeople(path);
-    const db = openInsideOutStore(path);
-    try {
-        return refreshEmotionBaselines(db, { ...options, minInteractions: options.minInteractions ?? 20 });
-    }
-    finally {
-        db.close();
-    }
-}
-const baselineJobs = new Map();
-/** Keep historical aggregation off the Gateway event loop; serialize writers per store. */
-export function refreshInsideOutBaselinesAsync(path, options = {}) {
-    const settings = { ...options, now: options.now ?? Date.now() };
-    const job = (baselineJobs.get(path) ?? Promise.resolve()).catch(() => { }).then(() => {
-        if (!existsSync(path))
-            return { snapshots: 0, comparisons: 0 };
-        return new Promise((resolve, reject) => {
-            const worker = new Worker(`
-        const { parentPort, workerData } = require("node:worker_threads");
-        // tsx's CLI preload only registers on the main thread. Source-mode
-        // development needs explicit registration; compiled installs do not.
-        if (workerData.module.endsWith(".ts")) require("node:module").createRequire(workerData.module)("tsx/esm/api").register();
-        import(workerData.module).then(({ refreshInsideOutBaselines }) => {
-          parentPort.postMessage(refreshInsideOutBaselines(workerData.path, workerData.options));
-        }).catch(error => { throw error; });
-      `, { eval: true, workerData: { module: import.meta.url, path, options: settings } });
-            let result;
-            worker.once("message", (value) => { result = value; });
-            worker.once("error", reject);
-            // Resolve only after the worker closes its database and exits.
-            worker.once("exit", code => {
-                if (code === 0 && result)
-                    resolve(result);
-                else
-                    reject(new Error(`Inside Out baseline worker exited without a result (code ${code})`));
-            });
-        });
-    }).finally(() => { if (baselineJobs.get(path) === job)
-        baselineJobs.delete(path); });
-    baselineJobs.set(path, job);
-    return job;
 }
 export function reportInsideOutBaselines(path, options = {}) {
     if (!existsSync(path))
@@ -409,9 +322,10 @@ export function reportInsideOut(path, options = {}) {
         const where = `WHERE (? IS NULL OR session_id=?) AND (? IS NULL OR sender_id=?) AND (? IS NULL OR target_at>=?)${options.emotion ? ` AND ${options.emotion}>=?` : ""}${options.personId ? " AND person_id=?" : ""}`;
         const params = [options.sessionId ?? null, options.sessionId ?? null, options.sender ?? null, options.sender ?? null, options.since ?? null, options.since ?? null,
             ...(options.emotion ? [min] : []), ...(options.personId ? [options.personId] : [])];
+        const deviation = options.personal ? deviationReader(db) : undefined;
         if (!options.summary)
             return db.prepare(`SELECT * FROM inside_out ${where} ORDER BY target_at,interaction_id`).all(...params)
-                .map((row) => options.personal ? { ...row, personal_deviation: personalDeviation(db, row, options.deviationHistory) } : row);
+                .map((row) => deviation ? { ...row, personal_deviation: deviation(row, options.deviationHistory) } : row);
         const bucket = options.bucket === "week" ? "date(target_at/1000,'unixepoch','-6 days','weekday 1')" : "date(target_at/1000,'unixepoch')";
         return db.prepare(`SELECT human_key,channel,rubric,model,${bucket} bucket,count(*) interactions,
       ${INSIDE_OUT_EMOTIONS.map(e => `avg(${e}) ${e}`).join(",")} FROM inside_out ${where} AND error IS NULL

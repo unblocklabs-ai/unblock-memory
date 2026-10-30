@@ -468,11 +468,11 @@ or raw exceptions; exact query text is not retained by this telemetry.
 ## Skill Whisperer
 
 
-Skill Whisperer is a default-enabled semantic reminder for user turns. Configure one
-isolated `skills` corpus and authorize
-`plugins.entries.unblock-memory.hooks.allowConversationAccess`. The feature
-emits no hints without a configured skills corpus; set `skillWhisperer.enabled`
-to `false` to disable it. It
+Skill Whisperer is a semantic reminder for user turns. It turns on by default once
+you configure one isolated `skills` corpus and authorize
+`plugins.entries.unblock-memory.hooks.allowConversationAccess`. Without a skills
+corpus it stays inactive: no prompt hook is registered and diagnostics report it
+disabled. Set `skillWhisperer.enabled` to `false` to opt out. It
 embeds the current prompt plus the configured number of prior user/assistant
 messages, compares it with each configured skill's frontmatter `name` and
 `description`. With TypeSafe enabled and a key available, the top three valid
