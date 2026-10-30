@@ -2,6 +2,7 @@ import { type ExtractionConfig } from "./extraction-config.js";
 import { type ResponseAuditConfig } from "./response-config.js";
 import { type PeoplePrimerConfig } from "./people-primer-config.js";
 import { type InsideOutConfig } from "./inside-out.js";
+import { type SafetyWhispererConfig } from "./safety-config.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -77,6 +78,7 @@ export type UnblockMemoryConfig = {
             apiKeyFile?: string;
         };
     };
+    safetyWhisperer: SafetyWhispererConfig;
 };
 export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];
 export declare function resolveConfig(value: unknown): UnblockMemoryConfig;

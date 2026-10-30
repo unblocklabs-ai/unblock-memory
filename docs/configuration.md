@@ -16,6 +16,7 @@ settings; a rotated credential file is reread without a restart.
 | Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | Exclude failed candidates; successful siblings may qualify; no vector fallback |
 | Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; recall/deadline failures still suppress the turn |
 | Complementary hints | Enabled Memory Whisperer + `complementaryHints` | No additional judgment; base hints also require a key | Keep baseline hints unless the total deadline expires |
+| Safety Whisperer | `safetyWhisperer.enabled`, at least one scenario, host hooks (conversation access and prompt injection) | Could not check: the turn proceeds without safety prompts (fails open) | Fails open; recorded as could-not-check, never as no match |
 | People store/tools | `people.enabled` | Available; automatic save review needs primer/key or verified manual alternative | Storage/inspection still available |
 | People Whisperer | People + `people.whisperer.enabled`, host hooks, eligible person/dossier, no prior thread receipt | Unchanged local lookup | Unchanged local lookup |
 | People Primer / automatic dossier save review | People + `peoplePrimer.enabled`, approved corpora | No judgment; save requires source-specific manual verification | No automatic save; verify/retry instead |
@@ -215,7 +216,7 @@ contract; these tables explain their effects.
 | `typesafe.enabled` | `true` | Shared plugin provider gate; no feature is opted in merely by adding a key |
 | `typesafe.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
 | `typesafe.apiKeyFile` | Unset | Absolute raw-key or dotenv file, reread at credential resolution; explicit missing file never falls back to a different key |
-| `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` instead** |
+| `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
 | `skillWhisperer.enabled` | `false` | Requires explicit skills corpus and appropriate host hook access; fixed 3-second total deadline |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for TypeSafe shortlist admission |
@@ -230,6 +231,18 @@ contract; these tables explain their effects.
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
 | `memoryWhisperer.timeoutMs` | `3000` | 1–10,000 total whisper deadline, not just the provider timeout |
 | `memoryWhisperer.complementaryHints` | `false` | Optional extra redundancy judgment; does not expand retrieval or enable the feature |
+| `safetyWhisperer.enabled` | `false` | Requires at least one scenario, a TypeSafe key and host hooks; see [Safety Whisperer](#safety-whisperer) |
+| `safetyWhisperer.historyMessages` | `6` | 0–20 earlier visible messages, whole messages only, for resolving follow-ups |
+| `safetyWhisperer.timeoutMs` | `3000` | 1–10,000 total deadline (credential and request); the host hook timeout must exceed the slowest enabled whisperer |
+| `safetyWhisperer.excludedChannels` | `[]` | Up to 500 `{ provider, accountId, channelId, name? }`, matched case-insensitively; skips every scenario there |
+| `safetyWhisperer.scenarios` | `[]` | Up to 20; unique `id` of letters, digits, `.`, `_` or `-` |
+| `safetyWhisperer.scenarios[].instructions` | Required | Up to 2,000 characters: what the scenario covers, with exclusions; sent to TypeSafe |
+| `safetyWhisperer.scenarios[].flaggedPrompt` | Required | Up to 2,000 characters, appended for matching unapproved requests; never sent to TypeSafe |
+| `safetyWhisperer.scenarios[].minProbability` | `0.4` | 0–1 minimum yes-probability that the current request is covered |
+| `safetyWhisperer.scenarios[].approvedRequestors` | `[]` | Up to 500 `{ provider, accountId, senderId, name? }`; `senderId` must match exactly; skip this scenario for them |
+| `safetyWhisperer.scenarios[].excludedChannels` | `[]` | Up to 500 channels where only this scenario is skipped |
+| `safetyWhisperer.scenarios[].agentIds` | Unset (every agent) | Non-empty list limits the scenario to these agents when one config serves several; normalized like OpenClaw agent IDs (lowercase) |
+| `safetyWhisperer.scenarios[].enabled` | `true` | Disabled scenarios are never sent to TypeSafe |
 
 No configured plugin credential means fallback to **`TYPESAFE_API_KEY` only** in
 the Gateway environment. Unlike QMD's resolver, the plugin does not read a
@@ -364,12 +377,164 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Cluster review | Up to 6 eligible complete sampled chunks, each at most 2,000 characters; conclusions only concern the sample |
 | Response audit | Approved visible request/answer/context/feedback and bounded later response evidence, separated by assessment stage; optional current-index whole-short-document evidence from approved file corpora |
 | Inside Out | Target human reply, nearest assistant text and bounded preceding visible history; channel-scoped speaker identity keys |
+| Safety check | The complete current human message without OpenClaw's conversation-info header; the thread starter, replied-to message and channel messages since the last reply that arrived with it, which can include other people's names and message IDs; up to `historyMessages` earlier visible messages; and each eligible scenario's `instructions`. No sender, account or channel IDs from that header, approval lists or flagged prompts. A message wrapper Safety Whisperer does not recognize (anything other than Slack's) is sent whole, minus that header. |
 | Standalone QMD query | Query, optional intent, selected excerpts, source paths and evaluation time; separate process/SDK credentials and collection scope |
 
 Omitting tool-result/thinking/system fields does not remove their content if it
 was quoted in ordinary visible text. Provider judgments are advisory; probability
 or score is not proof. Enabling a feature approves only that feature's documented processing.
 
+
+## Safety Whisperer
+
+An optional, interim guardrail for agents that serve several people. Before the
+main model runs on a human turn, it checks the current message against scenarios
+you define, such as questions about one person's salary. When a requestor who is
+not approved for a scenario asks something it covers, that scenario's
+`flaggedPrompt` is appended next to their message for that turn.
+
+**This is a prompt-level guardrail, not access control.** The classifier can miss
+a request and the agent can ignore an injected instruction. It does not remove
+sensitive information already available in context, memory or tools. An approved
+requestor is not an approved audience: asking in a shared channel can still expose
+an answer to everyone there. Use separate agents and real data-access controls for
+hard boundaries.
+
+```json
+{
+  "safetyWhisperer": {
+    "enabled": true,
+    "excludedChannels": [
+      { "name": "#leadership", "provider": "slack", "accountId": "work", "channelId": "C_LEADERSHIP" }
+    ],
+    "scenarios": [
+      {
+        "id": "individual-salaries",
+        "instructions": "Requests about a specific individual employee's salary, pay or compensation, including colloquial phrasing such as how much someone makes or earns. Exclude vendors and contractors.",
+        "approvedRequestors": [
+          { "name": "Dani", "provider": "slack", "accountId": "work", "senderId": "U_DANI" }
+        ],
+        "excludedChannels": [
+          { "name": "#people-ops", "provider": "slack", "accountId": "work", "channelId": "C_PEOPLE_OPS" }
+        ],
+        "flaggedPrompt": "This requestor is not approved to access this information. Kindly tell them that; do not disclose the requested information."
+      }
+    ]
+  }
+}
+```
+
+The plugin entry also needs `hooks.allowConversationAccess: true`, and
+`allowPromptInjection` must not be `false`; see [host controls](#host-controls).
+
+### How each turn is checked
+
+1. Only user-triggered turns are checked, every time: there is no cooldown. A
+   prompt rebuild for the same run reuses that run's result. Messages steered
+   into a run that is already working are not checked; see
+   [messages sent while the agent works](#messages-sent-while-the-agent-works).
+2. A global `excludedChannels` match skips every scenario. A scenario's own
+   `excludedChannels` skip only that scenario. Thread replies and forum topics
+   use their channel.
+3. Disabled scenarios, scenarios limited to other `agentIds`, and scenarios that
+   approve this requestor are dropped.
+4. If none remain, no request is made. Otherwise one TypeSafe request asks one
+   independent yes/no question per remaining scenario. It includes the complete
+   current message, the channel context that arrived with it (thread starter,
+   replied-to message, chat history since the agent's last reply) and up to
+   `historyMessages` earlier visible messages. A follow-up like "What about
+   Sally?" or "answer the question above" is therefore judged in context, while
+   the current message is judged, not whether an earlier one mentioned the topic.
+5. Every scenario scoring at least its `minProbability` adds its `flaggedPrompt`
+   in `<safety>` tags, last in the shared `<unblock_memory>` block after the
+   human message.
+
+### Messages sent while the agent works
+
+OpenClaw's default queue mode, `steer`, adds a message sent during an active run
+to that run without building a new prompt, so the message is never checked. The
+same applies when a person types `/queue steer` in a session. For agents that
+rely on Safety Whisperer, set `messages.queue.mode` (and any
+`messages.queue.byChannel` entries) to `followup` or `collect`; `memory_diagnostics`
+and the Gateway log warn with `queue_mode_steer` until then. In `collect` mode,
+queued messages from different people carry no single sender, so none of them is
+approved.
+
+### Identity
+
+Approval and exclusions compare `provider`, `accountId`, and `senderId` or
+`channelId` values from the host's trusted turn metadata. `senderId` must match
+exactly. `provider`, `accountId` and `channelId` match case-insensitively, because
+OpenClaw lowercases them in places. Names are labels only; display names, message
+text and identity claims never count. Missing identity never approves anyone and
+never excludes a channel, so turns without a sender ID, such as CLI or webchat,
+are treated as unapproved. Email-based approval is not supported.
+
+For Slack:
+
+- `provider` is `slack`.
+- `accountId` is the OpenClaw Slack account key, or `default` when the channel
+  has one account.
+- `senderId` is the person's member ID (`U…`): in their Slack profile, choose
+  **Copy member ID**.
+- `channelId` is the channel's ID (`C…` or `G…`), shown at the bottom of the
+  channel details.
+
+Some runtimes do not pass sender identity to plugins; OpenClaw's Codex
+app-server harness is one. There, every requestor is treated as unapproved,
+exclusions may not apply, and `memory_diagnostics` counts `missing_identity`;
+the first such turn is also logged.
+
+### When the check cannot run
+
+Safety Whisperer **fails open**: if the check cannot complete, the turn proceeds
+with no safety prompt. A TypeSafe outage or missing key therefore turns the
+guardrail off. The exception is a message too large to check: the requestor
+controls its size, so every eligible scenario's `flaggedPrompt` is added instead.
+`memory_diagnostics` reports each outcome under `whisperers.safety`, keeping
+could-not-check separate from no match:
+
+| Outcome | Meaning |
+| --- | --- |
+| `flagged` | At least one scenario matched; `matchedScenarios` counts matches by scenario ID |
+| `no_match` | Checked; no scenario matched |
+| `excluded` / `no_scenarios` | Skipped by a global exclusion, or nothing remained after filtering; no request |
+| `empty_request` | The current message had no text, such as an attachment alone; not checked |
+| `missing_key` / `typesafe_disabled` | Could not check: no credential, or TypeSafe disabled |
+| `input_too_large` | Not checked: the current message exceeds the roughly 24k-token budget. It is never truncated; every eligible `flaggedPrompt` is added |
+| `timed_out` / `failed` | Could not check: deadline, provider error or no usable answer |
+| `partial_response` | Counted with `flagged`: some answers were unusable, and the confident matches were still added |
+| `missing_identity` | Counted with the turn's outcome: the host passed no provider, account or sender ID |
+| `cancelled` | The session ended or the Gateway stopped during the check |
+
+Warnings include the outcome, error code, HTTP status and scenario count, never
+message text; a missing key is logged once until it returns.
+`memory_diagnostics` also reports `safety.active: false` with a `reason` when
+settings or host controls prevent checks (`typesafe_disabled`,
+`conversation_access_not_allowed`, `prompt_injection_not_allowed`,
+`no_enabled_scenarios`), and a `warnings` list:
+
+- `host_hook_timeout_below_whisperer_timeouts`: the host's `before_prompt_build`
+  timeout is shorter than the slowest enabled whisperer (`slowestWhispererMs`).
+  The host times out the plugin's whole contribution, so a slow Memory Whisperer
+  turn can drop a safety prompt even after diagnostics counted it as `flagged`.
+- `queue_mode_steer`: see
+  [messages sent while the agent works](#messages-sent-while-the-agent-works).
+
+The Gateway logs this status at startup when the feature is inactive or has a
+warning.
+
+### Writing scenarios
+
+`instructions` are the classifier's entire definition of a scenario. Name the
+subject, its synonyms and colloquial phrasing, and what is excluded. In the
+source checkout's `eval/safety-whisperer/` cases, adding "pay … including how much
+someone makes or earns" raised a compound request ("What does Bob make, and is he
+on medical leave?") from 0.06 to 0.45–0.48 and lowered "When is payday?" from 0.45
+to 0.18–0.21. With that wording, the 0.4 default `minProbability` made no errors
+across 22 cases, while 0.5 missed the compound request. Lower it to catch more
+borderline requests, or raise it for fewer false refusals. Test your own scenarios
+there before relying on them.
 
 ## Inside Out
 

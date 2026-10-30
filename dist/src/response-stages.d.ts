@@ -51,7 +51,7 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         taskType: {
             type: "choice";
             confidence: number;
-            choice: "action" | "question" | "artifact" | "discussion" | "other";
+            choice: "action" | "question" | "other" | "artifact" | "discussion";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;

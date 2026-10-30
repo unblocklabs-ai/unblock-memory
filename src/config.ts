@@ -3,6 +3,7 @@ import { resolveExtraction, type ExtractionConfig } from "./extraction-config.js
 import { resolveResponseAudit, type ResponseAuditConfig } from "./response-config.js";
 import { resolvePeoplePrimer, type PeoplePrimerConfig } from "./people-primer-config.js";
 import { resolveInsideOut, type InsideOutConfig } from "./inside-out.js";
+import { resolveSafetyWhisperer, type SafetyWhispererConfig } from "./safety-config.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -78,6 +79,7 @@ export type UnblockMemoryConfig = {
     timeoutMs: number;
     api: { endpoint: string; apiKeyFile?: string };
   };
+  safetyWhisperer: SafetyWhispererConfig;
 };
 
 export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
@@ -404,7 +406,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -501,5 +503,6 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     evidenceReview,
     responseAudit: resolveResponseAudit(config.responseAudit, corpora),
     insideOut: resolveInsideOut(config.insideOut),
-    memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora), typesafe: resolveTypeSafe(config.typesafe) };
+    memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
+    safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer), typesafe: resolveTypeSafe(config.typesafe) };
 }

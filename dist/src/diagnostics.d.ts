@@ -1,11 +1,13 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
-type Whisperer = "skill" | "memory";
-type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "recall_not_needed" | "queries_generated" | "judge_candidate_failed" | "input_too_large";
+type Whisperer = "skill" | "memory" | "safety";
+type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "recall_not_needed" | "queries_generated" | "judge_candidate_failed" | "input_too_large" | "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export declare class WhispererDiagnostics {
     #private;
     static shared(): WhispererDiagnostics;
     record(agentId: string, whisperer: Whisperer, outcome: Outcome): void;
+    /** Scenario IDs are operator configuration, not conversation content. */
+    recordSafetyMatch(agentId: string, scenarioId: string): void;
     measureMemory(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void;
     measureSearch(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void;
     snapshot(agentId: string): {
@@ -26,6 +28,13 @@ export declare class WhispererDiagnostics {
             queries_generated?: number | undefined;
             judge_candidate_failed?: number | undefined;
             input_too_large?: number | undefined;
+            excluded?: number | undefined;
+            no_scenarios?: number | undefined;
+            empty_request?: number | undefined;
+            no_match?: number | undefined;
+            flagged?: number | undefined;
+            missing_identity?: number | undefined;
+            partial_response?: number | undefined;
         };
         memory: {
             cancelled?: number | undefined;
@@ -44,6 +53,41 @@ export declare class WhispererDiagnostics {
             queries_generated?: number | undefined;
             judge_candidate_failed?: number | undefined;
             input_too_large?: number | undefined;
+            excluded?: number | undefined;
+            no_scenarios?: number | undefined;
+            empty_request?: number | undefined;
+            no_match?: number | undefined;
+            flagged?: number | undefined;
+            missing_identity?: number | undefined;
+            partial_response?: number | undefined;
+        };
+        safety: {
+            matchedScenarios: {
+                [k: string]: number;
+            };
+            cancelled?: number | undefined;
+            unavailable?: number | undefined;
+            rejected?: number | undefined;
+            failed?: number | undefined;
+            timed_out?: number | undefined;
+            missing_key?: number | undefined;
+            typesafe_disabled?: number | undefined;
+            no_candidates?: number | undefined;
+            cooldown?: number | undefined;
+            emitted?: number | undefined;
+            payload_limit?: number | undefined;
+            redundancy_unavailable?: number | undefined;
+            recall_not_needed?: number | undefined;
+            queries_generated?: number | undefined;
+            judge_candidate_failed?: number | undefined;
+            input_too_large?: number | undefined;
+            excluded?: number | undefined;
+            no_scenarios?: number | undefined;
+            empty_request?: number | undefined;
+            no_match?: number | undefined;
+            flagged?: number | undefined;
+            missing_identity?: number | undefined;
+            partial_response?: number | undefined;
         };
         telemetry: {
             scope: string;

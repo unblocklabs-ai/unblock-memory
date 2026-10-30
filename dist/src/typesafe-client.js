@@ -5,6 +5,13 @@ export const TYPESAFE_MODEL = "jev-1.13.0";
 export const TYPESAFE_NOUL_SCHEMA = Type.Object({
     type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
 });
+/** A conservative estimate of serialized size, not Jev's tokenizer. Non-ASCII is budgeted separately. */
+export function estimateJevTokens(value) {
+    let n = 0;
+    for (const c of JSON.stringify(value))
+        n += c.codePointAt(0) < 128 ? 1 / 3 : 2;
+    return Math.ceil(n);
+}
 export class TypeSafeRequestError extends Error {
     code;
     status;

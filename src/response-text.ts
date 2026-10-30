@@ -1,5 +1,12 @@
 /** Infer legacy transport sender metadata only to unwrap visible conversation text. */
 export function conversationUserText(raw: string, sender?: unknown) {
+  const parsed = conversationEnvelope(raw, sender);
+  return parsed && { text: parsed.text, contextLimited: parsed.contextLimited };
+}
+
+/** Like conversationUserText, plus the untrusted inbound context (thread starter, reply target,
+ * chat history) that a recognized envelope carries before the current message. */
+export function conversationEnvelope(raw: string, sender?: unknown) {
   let senderId = typeof sender === "string" ? sender : undefined;
   if (senderId === undefined) {
     const header = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/.exec(raw.trim());
@@ -13,14 +20,20 @@ export function conversationUserText(raw: string, sender?: unknown) {
     }
     senderId ??= /^From: [^\r\n]+ \(([^()\r\n]+)\)\r?\n/.exec(raw.trim())?.[1];
   }
-  return responseUserText(raw, senderId ?? "");
+  return userEnvelope(raw, senderId ?? "");
 }
 
 /** Parse only recognized transport envelopes. Ambiguous wrappers are excluded,
  * never flattened into a human's request or used to approve embedded speakers. */
 export function responseUserText(input: string, senderId: string) {
+  const parsed = userEnvelope(input, senderId);
+  return parsed && { text: parsed.text, contextLimited: parsed.contextLimited };
+}
+
+function userEnvelope(input: string, senderId: string): { text: string; contextLimited: boolean; context?: string } | undefined {
   let text = input.trim();
   let contextLimited = false;
+  let context: string | undefined;
   const header = /^Conversation info: ⟦openclaw:ctx⟧\r?\n```json\r?\n([^]*?)\r?\n```\r?\n/.exec(text);
   if (header) {
     let meta: { sender?: { id?: unknown; name?: unknown }; history_truncated?: unknown };
@@ -30,6 +43,7 @@ export function responseUserText(input: string, senderId: string) {
     const markers = [...rest.matchAll(/^System: \[[^\]\r\n]+\] Slack (?:message in [^\r\n]+|DM) from ([^\r\n]+)\r?\n\r?\n/gm)];
     if (markers.length !== 1 || markers[0]![1] !== meta.sender.name) return undefined;
     const marker = markers[0]!;
+    context = rest.slice(0, marker.index).trim() || undefined;
     contextLimited = meta.history_truncated === true || rest.slice(0, marker.index).includes("Chat history since last reply:");
     text = rest.slice(marker.index! + marker[0].length).trim();
     // OpenClaw appends channel metadata after the current Slack message. Only
@@ -52,5 +66,5 @@ export function responseUserText(input: string, senderId: string) {
   }
   // Unrecognized/nested envelopes cannot safely supply the current human text.
   if (!text || text.includes("⟦openclaw:ctx⟧") || /^Chat history since last reply:/m.test(text)) return undefined;
-  return { text, contextLimited };
+  return { text, contextLimited, ...(context ? { context } : {}) };
 }

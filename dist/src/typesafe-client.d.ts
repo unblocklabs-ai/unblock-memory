@@ -5,6 +5,8 @@ export declare const TYPESAFE_NOUL_SCHEMA: Type.TObject<{
     type: Type.TLiteral<"noul">;
     noul: Type.TNumber;
 }>;
+/** A conservative estimate of serialized size, not Jev's tokenizer. Non-ASCII is budgeted separately. */
+export declare function estimateJevTokens(value: unknown): number;
 export declare class TypeSafeRequestError extends Error {
     readonly code: "timeout" | "cancelled" | "http_error" | "invalid_response" | "network_error";
     readonly status?: number | undefined;

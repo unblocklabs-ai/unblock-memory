@@ -6,7 +6,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import { openMemoryDatabase } from "./memory-database.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
-import { requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
+import { estimateJevTokens, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
 import { readInsideOutSources, type InsideOutSource } from "./inside-out-sources.js";
 
 const INSIDE_OUT_EMOTIONS = ["joy", "sadness", "fear", "anger", "disgust", "surprise"] as const;
@@ -52,13 +52,6 @@ export function resolveInsideOut(value: unknown): InsideOutConfig {
 
 type Message = { id: string; role: "user" | "assistant"; text: string; human?: string };
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-// An estimate, not Jev's tokenizer. Non-ASCII is budgeted separately; whole messages stay intact.
-function tokens(value: unknown): number {
-  let n = 0;
-  for (const c of JSON.stringify(value)) n += c.codePointAt(0)! < 128 ? 1 / 3 : 2;
-  return Math.ceil(n);
-}
-
 function humanIdentity(source: InsideOutSource, message: NonNullable<InsideOutSource["events"][number]["message"]>) {
   const meta = message.__openclaw, identity = meta?.senderIdentity;
   const channel = meta?.transport?.channel ?? identity?.pluginId ?? message.sourceChannel ?? source.channel;
@@ -104,11 +97,11 @@ function* interactions(source: InsideOutSource, budget: number, cached: (id: str
     const id = assistant >= 0 ? hash([source.sessionId, message.id]) : "";
     if (assistant >= 0 && !cached(id)) {
       const selected = [{ message: history[assistant]!, position: assistant }];
-      let size = tokens({ history: selected.map(s => s.message), target: message });
+      let size = estimateJevTokens({ history: selected.map(s => s.message), target: message });
       const oversized = size > budget;
       for (let i = history.length - 1; !oversized && i >= 0; i--) {
         if (i === assistant) continue;
-        const cost = tokens(history[i]) + 2;
+        const cost = estimateJevTokens(history[i]) + 2;
         if (size + cost > budget) break;
         selected.push({ message: history[i]!, position: i }); size += cost;
       }
