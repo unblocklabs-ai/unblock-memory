@@ -144,7 +144,7 @@ function resolveTypeSafe(value: unknown): UnblockMemoryConfig["typesafe"] {
 }
 
 const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
-  enabled: false,
+  enabled: true,
   historyMessages: 5,
   minScore: 0.5,
   cooldownTurns: 10,
@@ -460,7 +460,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       ["enabled", "historyMessages", "minScore", "cooldownTurns"],
       "skillWhisperer",
     );
-    const enabled = value.enabled ?? false;
+    const enabled = value.enabled ?? DEFAULT_SKILL_WHISPERER.enabled;
     const historyMessages = value.historyMessages ?? 5;
     const minScore = value.minScore ?? 0.5;
     const cooldownTurns = value.cooldownTurns ?? 10;
@@ -492,10 +492,11 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     }
     skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns };
   }
+  // Default-on means "on once skills exist": without a skills corpus it could never
+  // hint, so it registers no prompt hook and reports inactive. Host-applied schema
+  // defaults are indistinguishable from an explicit true, so this never throws.
   if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
-    throw new Error(
-      'unblock-memory enabled skillWhisperer requires a corpus named "skills" with kind "skills"',
-    );
+    skillWhisperer = { ...skillWhisperer, enabled: false };
   }
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
     extraction: resolveExtraction(config.extraction, corpora),

@@ -26,8 +26,11 @@ settings; a rotated credential file is reread without a restart.
 | Inside Out | `insideOut.enabled`; opts in all retained channels | No inference | Failed reviews are recorded and retried; successes stay cached |
 | Clustering | Configured local `analysis.executable` | Unchanged | Unchanged; worker failures do not disable ordinary search |
 
-Whisperers, people storage, the primer and audits default off. `typesafe.enabled` defaults true but does not
-enable any feature; `sentimentEnabled` defaults true only **within an enabled
+Skill Whisperer turns on by default once a `skills` corpus is configured; without
+one it registers no hook and reports inactive.
+Memory/People Whisperers, people storage, the primer and audits default off.
+`typesafe.enabled` defaults true but does not enable those opt-in features;
+`sentimentEnabled` defaults true only **within an enabled
 response audit**. `peoplePrimer` controls automatic dossier-save review;
 `evidenceReview` is a different advisory tool. Disabling people injection does
 not disable people tools/storage or erase dossiers.
@@ -217,7 +220,7 @@ contract; these tables explain their effects.
 | `typesafe.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
 | `typesafe.apiKeyFile` | Unset | Absolute raw-key or dotenv file, reread at credential resolution; explicit missing file never falls back to a different key |
 | `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
-| `skillWhisperer.enabled` | `false` | Requires explicit skills corpus and appropriate host hook access; fixed 3-second total deadline |
+| `skillWhisperer.enabled` | `true` | Active only with a `skills` corpus (otherwise resolved to `false`, with no hook or host warning) and appropriate host hook access; fixed 3-second total deadline; `false` opts out |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for TypeSafe shortlist admission |
 | `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |
@@ -549,15 +552,18 @@ change memories, retrieval, prompts, or dossiers.
     "enabled": true,
     "intervalMinutes": 1440,
     "maxInteractions": 100,
-    "maxContextTokens": 30000
+    "maxContextTokens": 30000,
+    "baselineMinInteractions": 20
   }
 }
 ```
 
 Defaults: disabled; daily cadence; at most 100 attempted reviews per run; estimated
 30,000-token context budget, leaving room for questions under Jev's 32k
-state-plus-longest-question limit. `intervalMinutes: 0` is manual-only. The shared
-`typesafe` settings supply Jev credentials and request timeout.
+state-plus-longest-question limit. `intervalMinutes: 0` makes inference manual-only;
+local baselines still refresh daily and on Gateway startup when Inside Out is enabled.
+`baselineMinInteractions` defaults to 20 (1–10,000) for each comparison population.
+The shared `typesafe` settings supply Jev credentials and request timeout.
 
 **Enabling this approves sending visible human/assistant conversation text across
 all retained channels to TypeSafe.** System messages, tool bodies, thinking blocks,
@@ -582,11 +588,15 @@ openclaw memory-emotions link-people --agent main
 openclaw memory-emotions link-people --agent main --repair-identities
 openclaw memory-emotions run --agent main --session SESSION_ID
 openclaw memory-emotions export --agent main --session SESSION_ID
+openclaw memory-emotions baseline-refresh --agent main
+openclaw memory-emotions baselines --agent main --person PERSON_ID
+openclaw memory-emotions export --agent main --person PERSON_ID --deviation-history
+openclaw memory-emotions baseline-refresh --agent main --recompare
 ```
 
 `run` handles backfill and new interactions through the same bounded pass. Repeat
-it until `reviewed` and `failed` are zero to finish backfill. Gateway startup also
-runs one pass, then repeats at the configured interval. Successful results are
+it until `reviewed` and `failed` are zero to finish backfill. With automatic inference
+enabled, Gateway startup also runs one pass, then repeats at the configured interval. Successful results are
 cached; new interactions take priority over retries. Request failures retry after
 an hour when the pass has remaining capacity, or immediately with `--retry`.
 Oversized context failures require explicit `--retry`, for example after increasing
@@ -645,12 +655,108 @@ changed or removed mappings; by default it never reads transcripts. Its explicit
 `--repair-identities` option reads sources owning unlinked reviews and repairs
 their channel, sender ID and human key from persisted metadata before linking.
 Neither mode calls Jev or changes scores, timestamps, review IDs or checkpoints.
-Unmatched identities stay null. Exports include `person_id`.
+Unmatched identities stay null. Exports include `person_id` and `personal_deviation`.
 `export` emits all matching rows as JSON, including errors. `report` averages
 successful rows by human, UTC day/week, rubric, and model; counts are the denominator.
-Both accept `--session`, `--sender`, `--since YYYY-MM-DD`, `--emotion`, and `--min`. `--sender`
+Both accept `--person`, `--session`, `--sender`, `--since YYYY-MM-DD`, `--emotion`, and `--min`. `--sender`
 matches exact sender IDs across channels; use exported `human_key` for precise
 account-specific analysis. These commands are read-only and never invoke Jev.
+
+### Person-relative baselines and deviations
+
+Inside Out keeps analytics beside PeopleSQL in the same `unblock-memory.sqlite`,
+linked by its existing `person_id`. `person_emotion_baselines` holds one snapshot
+per person, rubric, model and completed week; `inside_out_deviations` holds
+individual assessments. They are separate from dossier fields, recognition blurbs
+and searchable memory. PeopleSQL identities must already exist; Inside Out does not
+create people or guess links. Statistics are per agent's retained grades, not
+fleet-wide aggregates.
+
+Weeks run Monday 00:00 UTC to the next Monday, with an exclusive end. Each stored
+week keeps, per emotion, the exact sample count, sum, minimum and maximum, plus the
+distribution in 0.01-wide bins (at most 101 values), so a snapshot stays small
+however much history accumulates. Reports show weekly and cumulative sample counts,
+mean, minimum, maximum, p10, median, p90 and the binned distribution; cumulative
+values are computed from all earlier stored weeks when read. Means, minimums and
+maximums are exact; quantiles use bin values. Completed empty weeks are logged with
+zero weekly observations. Rubrics and models have separate populations.
+
+For each graded reply, `personal_deviation` compares its raw probabilities to that
+person's **preceding completed weeks**, excluding the reply's entire current week
+and future interactions. Both cumulative history and the immediately preceding
+week are reported. Each emotion includes:
+
+- `delta`: signed difference from the person's exact baseline mean.
+- `percentile`: empirical rank from 0 to 1 within 0.01-wide bins; grades in the
+  same bin are ties and take the midpoint.
+- `unusualness`: `abs(2 * percentile - 1)`, from 0 at the middle to 1 at the extremes.
+  This is a rank-derived signal, **not a probability or emotional intensity**.
+
+For example, a joy probability of 0.8 can be routine for someone whose prior grades
+are consistently 0.8, and unusual for someone whose prior grades are 0.1. This does
+not establish their personality, mental state, or the agent's quality. Counts below
+`baselineMinInteractions` produce `insufficient_history` with null emotion metrics,
+independently for weekly and cumulative comparisons. Unlinked people, missing or
+future timestamps and failed grades have explicit statuses; they are never neutral
+scores. Exports before the first local assessment show `not_compared`.
+
+`run` refreshes snapshots after grading new replies. Both grading and daily local
+refreshes update exact PeopleSQL links before aggregating or assessing new replies.
+Historical aggregation runs in a worker thread and commits in short batches, so the
+Gateway event loop stays responsive and other writers to `unblock-memory.sqlite`
+wait for one batch at most, never a whole refresh. Gateway shutdown cancels an
+active refresh; the next one resumes, and repeating a refresh never duplicates
+records. If the refresh after grading fails, `run` still returns its counts with a
+`baselineError` (the Gateway logs a warning); saved grades are unaffected.
+`link-people` also refreshes analytics. `baseline-refresh` does this without loading
+transcripts, calling Jev, or requiring TypeSafe credentials. `baselines` reads
+weekly snapshots, newest first, with optional `--person`, `--since YYYY-MM-DD`
+(inclusive UTC week-end) and `--limit` (1–1,000 weeks, default 100).
+
+Snapshots always reflect the currently linked grades. A late historical grade, a
+retry, a relink or removed identity evidence rewrites the affected week and every
+later week of that population in place, and a population with no linked grades left
+loses its snapshots; earlier revisions are not kept. A snapshot `id` addresses its
+whole cumulative population, so returning to an earlier population restores the
+earlier `id`.
+
+Normal refreshes preserve an existing assessment of the same grade. Late historical
+grades change snapshots but do not silently rewrite earlier comparisons.
+Use `baseline-refresh --recompare` to append changed assessments after backfill,
+identity or sample-policy changes; `export --deviation-history` includes the earlier
+results and marks which match the current grade. Repeating an unchanged refresh
+adds no duplicate records. Previously sparse or future-dated assessments also need
+explicit re-comparison when their circumstances change.
+
+`computed_at` and `assessedAt` record when these calculations actually occurred.
+A backfilled comparison uses retained evidence from earlier interaction weeks, but
+does not pretend that evidence had already been graded at the historical send time.
+Baseline calculation requires no additional model calls and changes no raw emotion
+judgments, dossiers, prompt injection, clustering or memory creation.
+
+### Deleting a person's emotion data
+
+```bash
+openclaw memory-emotions purge --agent main --person PERSON_ID
+openclaw memory-emotions purge --agent main --person PERSON_ID --grades
+```
+
+`purge` deletes one person's weekly snapshots and their whole assessment history,
+including assessments recorded while a reply was linked to them, and prints what it
+removed. It makes no Jev calls.
+
+- **Without `--grades`**, their raw grades stay, so the next refresh rebuilds
+  current snapshots and assessments from replies still linked to them. Use this
+  after correcting a misattributed identity.
+- **With `--grades`**, it also erases the six probabilities of every reply currently
+  linked to that person and unlinks it. Each row stays as a tombstone with the error
+  `Purged by operator`, so `run` (including `--retry`) never sends that reply to Jev
+  again, `link-people` never relinks it, and refreshes skip it. This cannot be
+  undone; run `link-people` first so every reply from that person is linked.
+
+Purging removes existing data only. While Inside Out stays enabled and the person's
+identity remains in PeopleSQL, their new replies are graded and start a new
+baseline. Soft-deleting a person in PeopleSQL does not remove Inside Out data.
 
 ## Storage, upgrades and recovery
 

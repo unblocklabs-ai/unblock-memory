@@ -54,6 +54,7 @@ test("People links are stored on new reviews and backfilled on legacy rows witho
   t.after(() => db.close());
   db.exec("DROP INDEX inside_out_person_time; ALTER TABLE inside_out DROP COLUMN person_id");
   const before = reportInsideOut(storePath).map(row => ({ ...row }));
+  assert.deepEqual(reportInsideOut(storePath, { personId: first, personal: true }), [], "legacy unlinked rows remain readable without migration");
   assert.deepEqual(linkInsideOutPeople(storePath), { updated: 2, linked: 2, unlinked: 2 });
   assert.deepEqual(reportInsideOut(storePath).map(({ person_id: _person, ...row }) => row), before,
     "backfill changes only person links, not judgments or their original provenance");
@@ -270,6 +271,12 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     const { Command } = await import(${JSON.stringify(pathToFileURL(commander).href)});
     const { registerInsideOut } = await import(${JSON.stringify(new URL("../src/inside-out-runtime.ts", import.meta.url).href)});
     const { resolveConfig } = await import(${JSON.stringify(new URL("../src/config.ts", import.meta.url).href)});
+    const { PeopleStore } = await import(${JSON.stringify(new URL("../src/people-store.ts", import.meta.url).href)});
+    Date.now = () => ${time + 14 * 86400_000};
+    const people = new PeopleStore(${JSON.stringify(join(state, "agents/main/unblock-memory/unblock-memory.sqlite"))}, {maxOpenTodos:100,maxBlurbChars:1000});
+    const person = people.upsertIdentity({provider:"telegram",accountScope:"account",externalId:"bek"}).person.id;
+    people.upsertIdentity({provider:"discord",accountScope:"account",externalId:"bek"});
+    people.close();
     let calls = 0, channel = "telegram";
     globalThis.fetch = async (_url,init) => {
       if (JSON.parse(JSON.parse(init.body).state.target.human)[0] !== channel) throw new Error("Wrong session uploaded");
@@ -284,9 +291,50 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     await program.parseAsync(["node","openclaw","memory-emotions","export","--session","archived","--emotion","joy","--min","0.5"]);
     channel = "discord";
     await program.parseAsync(["node","openclaw","memory-emotions","run","--session","live"]);
+    await program.parseAsync(["node","openclaw","memory-emotions","baseline-refresh"]);
+    await program.parseAsync(["node","openclaw","memory-emotions","baselines","--person",person]);
+    await program.parseAsync(["node","openclaw","memory-emotions","export","--person",person,"--deviation-history"]);
     hooks.gateway_start();
     await new Promise(setImmediate);
     await hooks.gateway_stop();
+    // A first large historical refresh must leave the Gateway event loop free,
+    // and stop must cancel it without leaving the shared store locked.
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(${JSON.stringify(join(state, "agents/main/unblock-memory/unblock-memory.sqlite"))});
+    const seed = db.prepare("SELECT * FROM inside_out WHERE person_id=? LIMIT 1").get(person);
+    const insert = db.prepare("INSERT INTO inside_out (" + Object.keys(seed).join(",") + ") VALUES (" + Object.keys(seed).map(()=>"?").join(",") + ")");
+    db.exec("BEGIN");
+    for (let i=0;i<2000;i++) {
+      const row = {...seed,interaction_id:"bulk-"+i,message_id:"bulk-"+i,
+        target_at:${time} - 52*7*86400_000 + Math.floor(i/40)*7*86400_000};
+      for (const emotion of ${JSON.stringify(emotions)}) row[emotion]=((i*997)%2000+1)/2001;
+      insert.run(...Object.values(row));
+    }
+    db.exec("COMMIT");
+    // Manual inference and disabled TypeSafe still publish local statistics on
+    // startup. Advancing one UTC week must produce a new empty-week snapshot.
+    Date.now = () => ${time + 21 * 86400_000};
+    registerInsideOut({config:{},registerCli:()=>{},on:(name,fn)=>hooks[name]=fn,
+      logger:{warn:text=>{throw new Error(text)}}}, resolveConfig({insideOut:{enabled:true,intervalMinutes:0},typesafe:{enabled:false}}));
+    hooks.gateway_start();
+    await new Promise(setImmediate);
+    if (db.prepare("SELECT count(*) n FROM inside_out_deviations WHERE interaction_id LIKE 'bulk-%'").get().n !== 0)
+      throw new Error("Gateway startup synchronously completed historical comparisons before yielding");
+    await hooks.gateway_stop();
+    db.exec("PRAGMA busy_timeout=0; CREATE TABLE stop_probe(x); DROP TABLE stop_probe;");
+    await program.parseAsync(["node","openclaw","memory-emotions","baseline-refresh"]);
+    if (db.prepare("SELECT count(*) n FROM inside_out_deviations WHERE interaction_id LIKE 'bulk-%'").get().n !== 2000)
+      throw new Error("The next refresh did not complete the cancelled historical pass");
+    const sample = JSON.parse(db.prepare("SELECT result_json FROM inside_out_deviations WHERE interaction_id='bulk-1000'").get().result_json);
+    const score = db.prepare("SELECT joy FROM inside_out WHERE interaction_id='bulk-1000'").get().joy;
+    // Percentiles rank within 0.01-wide bins: same-bin grades are ties.
+    const bin = value => Math.round(value*100);
+    const population = db.prepare("SELECT joy FROM inside_out WHERE person_id=? AND target_at<?").all(person,sample.baselineEnd).map(r => bin(r.joy));
+    const expectedRank = (population.filter(b => b<bin(score)).length+population.filter(b => b===bin(score)).length/2)/population.length;
+    if (sample.cumulative.count !== population.length || Math.abs(sample.cumulative.emotions.joy.percentile-expectedRank)>1e-12)
+      throw new Error("Large-history percentile did not match the preceding binned population");
+    db.close();
+    await program.parseAsync(["node","openclaw","memory-emotions","baselines","--person",person,"--limit","1"]);
     process.stdout.write(JSON.stringify({output,calls}));
   `);
   const cli = await promisify(execFile)(process.execPath, ["--import", import.meta.resolve("tsx"), cliPath], {
@@ -297,6 +345,14 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   assert.equal(cliResult.output[1].length, 1);
   assert.equal(cliResult.output[2].length, 4);
   assert.equal(cliResult.output[3].reviewed, 4);
+  assert.deepEqual(cliResult.output[4], { snapshots: 0, comparisons: 0 });
+  assert.ok(cliResult.output[5].some((s: { cumulative: { joy: { count: number } } }) => s.cumulative.joy.count === 3));
+  assert.equal(cliResult.output[6].length, 3, "the person filter follows exact PeopleSQL links");
+  assert.ok(cliResult.output[6].every((r: { personal_deviation: { history: unknown[] } }) => r.personal_deviation.history.length === 1));
+  assert.ok(cliResult.output[7].comparisons >= 1, "the refresh after a cancelled stop completes the remaining work");
+  assert.equal(cliResult.output[8][0].week_end - cliResult.output[5][0].week_end, 7 * 86400_000,
+    "manual-only startup publishes the next completed week without inference");
+  assert.equal(cliResult.output[8][0].weekly.joy.count, 0);
   assert.equal(cliResult.calls, 8, "reports and the cached background pass do not repeat inference");
   // Evolve the real SDK-written store after the old SDK writer has finished.
   const evolved = new DatabaseSync(options.databasePath);

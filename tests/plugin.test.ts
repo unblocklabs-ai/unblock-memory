@@ -101,8 +101,10 @@ test("registers exactly the clean memory tool contract and validates every tool 
     names: string[];
     factory: (ctx: OpenClawPluginToolContext) => Tool | null;
   }> = [];
+  const hooks: string[] = [];
   const api = {
     pluginConfig: {},
+    on(name: string) { hooks.push(name); },
     registerCli() {},
     registerGatewayMethod() {},
     registerMemoryCapability() {},
@@ -140,6 +142,9 @@ test("registers exactly the clean memory tool contract and validates every tool 
       ),
     ),
   );
+  // A default install has no skills corpus, so no whisperer may ask the host for
+  // conversation access (non-bundled plugins would log a blocked-hook warning).
+  assert.equal(hooks.includes("before_prompt_build"), false);
 
   const context = {
     agentId: "bill",

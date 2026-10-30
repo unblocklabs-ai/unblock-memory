@@ -110,7 +110,7 @@ Everything below is off until you configure it.
 | Feature | What it does |
 | --- | --- |
 | [Session indexing](docs/retrieval.md#sessions) | Makes past conversations searchable. Group and channel chats by default; DMs only if you add them. |
-| [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill for a user message. Never runs it. Works without TypeSafe. |
+| [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill for a user message. Never runs it. Turns on when you add a `skills` corpus; works without TypeSafe. |
 | [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to two relevant past excerpts before the agent replies. Needs TypeSafe and a self-hosted query-generation API. |
 | [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if TypeSafe is unavailable. |
 | [People dossiers](docs/peoplesql.md) | Lets the agent keep a short, evidence-backed note about each person it works with. |
@@ -120,7 +120,7 @@ Everything below is off until you configure it.
 | [Clustering and curation](docs/retrieval.md#memory-analysis) | Groups related memories so the agent can spot duplicates and maintain its knowledge. Needs a local analysis worker. |
 | [Quality and claim review](docs/retrieval.md#review-and-diagnostics) | Flags noisy indexed content and checks whether a claim is supported by its sources. Advisory only. |
 | [Response audit](docs/response-audit.md) | Operator-only grading of reply quality and sentiment in approved Slack conversations. |
-| [Inside Out](docs/configuration.md#inside-out) | Operator-only scores for six emotions in human replies, with reports. Never changes memory or prompts. |
+| [Inside Out](docs/configuration.md#inside-out) | Operator-only scores for six emotions in human replies, compared with each person's own weekly baseline, with reports. Never changes memory or prompts. |
 
 Whisperers also need conversation-hook and prompt-injection permissions on the
 plugin entry; see [host controls](docs/configuration.md#host-controls). Each
