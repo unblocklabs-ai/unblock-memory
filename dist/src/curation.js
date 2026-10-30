@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { openMemoryDatabase } from "./memory-database.js";
+import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 const TEMPORAL_BASES = ["path", "frontmatter", "session", "agent_verified"];
 const MAINTENANCE_TASK_TYPES = ["ambiguous_event_time", "exact_duplicate", "quality_review"];
 const MAINTENANCE_STATUSES = ["pending", "resolved", "deferred", "irrelevant"];
@@ -159,12 +159,10 @@ export class CurationStore {
     `).all(status, limit).map((row) => task(row));
     }
     updateTask(params) {
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const row = this.#db.prepare("SELECT * FROM maintenance_tasks WHERE id = ?")
                 .get(params.id);
             if (!row) {
-                this.#db.exec("COMMIT");
                 return undefined;
             }
             const now = new Date().toISOString();
@@ -208,13 +206,8 @@ export class CurationStore {
         WHERE id = ?
       `).run(params.status, params.note ?? null, now, params.id);
             const updated = task(this.#db.prepare("SELECT * FROM maintenance_tasks WHERE id = ?").get(params.id));
-            this.#db.exec("COMMIT");
             return updated;
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     updateAnnotationLocation(params) {
         this.#db.prepare(`

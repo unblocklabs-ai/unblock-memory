@@ -27,6 +27,16 @@ const REQUIRED_COLUMNS = {
     session_transcript_active_events: ["session_id", "active_position", "event_seq", "message_position"],
     transcript_rewrite_watermarks: ["session_id", "generation"],
 };
+function windowMetadata(window) {
+    return {
+        sessionId: window.sessionId,
+        provider: window.provider ?? undefined,
+        chatType: window.chatType,
+        accountId: window.accountId ?? undefined,
+        conversationId: window.conversationId ?? undefined,
+        startedAt: window.startedAt,
+    };
+}
 function projectionKey(params) {
     return JSON.stringify([PROJECTOR_VERSION, params.databasePath, params.agentId,
         params.agentName, params.timezone, [...params.chatTypes].sort()]);
@@ -122,14 +132,7 @@ function readSnapshot(params) {
         const changed = new Set();
         const unavailable = new Set();
         for (const window of windows) {
-            const metadata = {
-                sessionId: window.sessionId,
-                provider: window.provider ?? undefined,
-                chatType: window.chatType,
-                accountId: window.accountId ?? undefined,
-                conversationId: window.conversationId ?? undefined,
-                startedAt: window.startedAt,
-            };
+            const metadata = windowMetadata(window);
             const previous = params.previousManifest.sessions[window.sessionId];
             const documentPath = sessionDocumentPath(metadata);
             const sourceFingerprint = JSON.stringify(window);
@@ -230,7 +233,7 @@ async function remove(path) {
         throw error;
     }
 }
-function projectionHash(content) {
+export function projectionHash(content) {
     return createHash("sha256").update(content).digest("hex");
 }
 export function sessionMetadataByPath(manifest) {
@@ -259,14 +262,7 @@ export async function syncSessionProjections(params) {
     for (const window of snapshot.windows) {
         const previous = previousManifest.sessions[window.sessionId];
         const events = snapshot.events.get(window.sessionId);
-        const metadata = {
-            sessionId: window.sessionId,
-            provider: window.provider ?? undefined,
-            chatType: window.chatType,
-            accountId: window.accountId ?? undefined,
-            conversationId: window.conversationId ?? undefined,
-            startedAt: window.startedAt,
-        };
+        const metadata = windowMetadata(window);
         const documentPath = sessionDocumentPath(metadata);
         if (snapshot.unavailable.has(window.sessionId)) {
             counts.failed += 1;

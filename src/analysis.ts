@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
+import { chunkFingerprint } from "./curation.js";
 
 const DEFAULT_CLUSTER_LIMIT = 20;
 const MAX_CLUSTER_LIMIT = 50;
@@ -127,6 +128,7 @@ type RunRow = {
   embedding_fingerprint: string;
   dimensions: number;
   stale_at: string | null;
+  params_json: string;
 };
 
 type ClusterRow = {
@@ -325,7 +327,7 @@ export function runAnalysisWorker(params: {
 
 function latestRun(db: AnalysisDatabase): RunRow | undefined {
   return db.prepare(`
-    SELECT id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, stale_at
+    SELECT id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, stale_at, params_json
     FROM memory_analysis_runs
     WHERE completed_at IS NOT NULL
     ORDER BY completed_at DESC, created_at DESC, id DESC
@@ -338,13 +340,7 @@ export function latestAnalysisRunId(db: AnalysisDatabase): string | undefined {
 }
 
 export function latestAnalysisCollections(db: AnalysisDatabase): readonly string[] | undefined {
-  const row = db.prepare(`
-    SELECT params_json
-    FROM memory_analysis_runs
-    WHERE completed_at IS NOT NULL
-    ORDER BY completed_at DESC, created_at DESC, id DESC
-    LIMIT 1
-  `).get<{ params_json: string }>();
+  const row = latestRun(db);
   if (!row) return undefined;
   try {
     const collections = (JSON.parse(row.params_json) as { collections?: unknown }).collections;
@@ -433,12 +429,9 @@ function members(
   runId: string,
   clusterId: number,
   limit: number,
-  offset = 0,
-  sort: MemoryClusterSort = "representative",
-  maxExcerptBytes = MAX_EXCERPT_BYTES,
-  maxTotalBytes = MAX_TOTAL_EXCERPT_BYTES,
-  maxTotalAliases = MAX_TOTAL_ALIASES,
-  temporal: TemporalReadOptions = {},
+  offset: number,
+  sort: MemoryClusterSort,
+  temporal: TemporalReadOptions,
 ): MemoryAnalysisMember[] {
   const score = clusterId === -1 ? "m.outlier_score" : "m.probability";
   const order = {
@@ -521,11 +514,11 @@ function members(
     limit,
     offset,
   );
-  let remaining = maxTotalBytes;
-  let remainingAliases = maxTotalAliases;
+  let remaining = MAX_TOTAL_EXCERPT_BYTES;
+  let remainingAliases = MAX_TOTAL_ALIASES;
   return rows.map((row, index) => {
     const remainingRows = rows.length - index;
-    const excerptBudget = Math.min(maxExcerptBytes, Math.floor(remaining / remainingRows));
+    const excerptBudget = Math.min(MAX_EXCERPT_BYTES, Math.floor(remaining / remainingRows));
     const fullText = row.doc.slice(row.pos, row.pos + row.chunk_len);
     const text = byteSlice(fullText, excerptBudget);
     remaining -= Buffer.byteLength(text);
@@ -548,7 +541,7 @@ function members(
       eventTime: row.event_time,
       eventTimeBasis: row.event_time_basis,
       eventTimeSource: `qmd://${row.event_collection}/${row.event_path}`,
-      contentFingerprint: createHash("sha256").update(fullText).digest("hex"),
+      contentFingerprint: chunkFingerprint(fullText),
       text,
       sourcePaths: aliases,
     };
@@ -611,11 +604,10 @@ function toSummary(
   db: AnalysisDatabase,
   run: RunRow,
   row: ClusterRow,
-  includePreview: boolean,
-  previewBytes = 600,
+  previewBytes = 0,
   aliasLimit = MAX_TOTAL_ALIASES,
 ): MemoryClusterSummary {
-  const preview = includePreview
+  const preview = previewBytes > 0
     ? clusterPreview(db, run.id, row.cluster_id, previewBytes, aliasLimit)
     : undefined;
   return {
@@ -672,7 +664,7 @@ export function readClusters(
   let remainingAliases = MAX_TOTAL_ALIASES;
   const clusters = rows.map((row) => {
     const previewBytes = Math.min(600, remainingBytes);
-    const summary = toSummary(db, run, row, previewBytes > 0, previewBytes, remainingAliases);
+    const summary = toSummary(db, run, row, previewBytes, remainingAliases);
     remainingBytes -= Buffer.byteLength(summary.preview?.text ?? "");
     remainingAliases -= summary.preview?.sourcePaths.length ?? 0;
     return summary;
@@ -683,7 +675,7 @@ export function readClusters(
     runId: run.id,
     ...readMetadata(run),
     clusters,
-    noise: noise ? toSummary(db, run, noise, false) : null,
+    noise: noise ? toSummary(db, run, noise) : null,
   };
 }
 
@@ -736,18 +728,7 @@ export function readCluster(
   const limit = Math.max(1, Math.min(MAX_MEMBER_LIMIT, Math.floor(requestedLimit)));
   const offset = Math.max(0, Math.floor(requestedOffset));
   const total = availableSize(db, run.id, clusterId);
-  const pageMembers = members(
-    db,
-    run.id,
-    clusterId,
-    limit,
-    offset,
-    sort,
-    MAX_EXCERPT_BYTES,
-    MAX_TOTAL_EXCERPT_BYTES,
-    MAX_TOTAL_ALIASES,
-    temporal,
-  );
+  const pageMembers = members(db, run.id, clusterId, limit, offset, sort, temporal);
   const nextOffset = offset + pageMembers.length;
   const hasMore = nextOffset < total;
   return {

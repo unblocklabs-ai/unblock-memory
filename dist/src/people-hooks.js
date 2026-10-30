@@ -1,7 +1,5 @@
 import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
-function nonBlank(value) {
-    return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
+import { nonBlank } from "./guards.js";
 function identifier(value) {
     if (typeof value === "number" && Number.isFinite(value))
         return String(value);
@@ -101,10 +99,9 @@ export function registerPeopleHooks(api, stores, config) {
         const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
         const mappedThreadKey = threadByRun.get(runId);
         const pendingThreadKey = mappedThreadKey ? undefined : pendingThreadByIdentity.get(identityKey);
-        if (!mappedThreadKey && pendingThreadByIdentity.has(identityKey)) {
+        if (!mappedThreadKey)
             pendingThreadByIdentity.delete(identityKey);
-        }
-        const threadKey = mappedThreadKey ?? pendingThreadKey ?? undefined;
+        const threadKey = mappedThreadKey ?? pendingThreadKey;
         if (!threadKey)
             return;
         if (typeof pendingThreadKey === "string") {

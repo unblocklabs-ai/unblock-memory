@@ -1,19 +1,16 @@
-import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 import { prepareQueryConversation, QUERY_CONTRACT, QueryInputBudgetError, type QueryConversation } from "./query-contract.js";
+import { jsonHash } from "./json-hash.js";
+import { record } from "./guards.js";
 
 // Window/tokenizer changes must never reuse a previous recipe's checkpoints.
 export const TRAINING_PREPARATION = `${QUERY_CONTRACT.version}-visible-history-${QUERY_CONTRACT.revision}`;
 export type TrainingInput = QueryConversation;
 export type TrainingExample = { seq: number; timestamp: number; input: TrainingInput; inputHash: string; contextLimited: boolean };
 type Row = { seq: number; eventJson: string; createdAt: number };
-export const trainingHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
 
 /** The following answer establishes eligibility, but is never part of that example's input. */
 export function trainingExamples(rows: Iterable<Row>, renew?: () => void) {
@@ -68,7 +65,7 @@ export function trainingExamples(rows: Iterable<Row>, renew?: () => void) {
       // A delayed database append must not move the historical retrieval boundary forward.
       const timestamp = Number.isFinite(eventTime) ? Math.min(row.createdAt, eventTime) : row.createdAt;
       pending = { seq: row.seq, timestamp, input,
-        inputHash: trainingHash([TRAINING_PREPARATION, input]), contextLimited };
+        inputHash: jsonHash([TRAINING_PREPARATION, input]), contextLimited };
       remember("user", visible.text);
       continue;
     }

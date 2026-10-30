@@ -1,16 +1,17 @@
 import { join, dirname } from "node:path";
-import { resolveAgentDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { resolveAgentDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { dateOption } from "./date-option.js";
 import { linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
+import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 export function registerInsideOut(api, config) {
     const paths = (cfg, agentId) => {
         if (!listAgentIds(cfg).includes(agentId))
             throw new Error("Unknown Inside Out agent");
         const agentDir = resolveAgentDir(cfg, agentId);
-        return { agentId, databasePath: join(agentDir, "openclaw-agent.sqlite"), sessionsDir: join(dirname(agentDir), "sessions"),
-            storePath: join(resolveStateDir(), "agents", agentId, "unblock-memory", MEMORY_DATABASE) };
+        return { agentId, databasePath: agentTranscriptDatabase(cfg, agentId), sessionsDir: join(dirname(agentDir), "sessions"),
+            storePath: join(agentStateDir(agentId), MEMORY_DATABASE) };
     };
     api.registerCli(({ program, config: cfg }) => {
         const root = program.command("memory-emotions").description("Inside Out: review human replies and analyze emotion probabilities");

@@ -1,16 +1,14 @@
-import { createHash } from "node:crypto";
-import { Type, type Static } from "typebox";
+import type { Static } from "typebox";
 import { Value } from "typebox/value";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { PeoplePrimerConfig } from "./people-primer-config.js";
 import type { PeopleStore } from "./people-store.js";
-import { requestTypeSafe, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
-import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
+import { requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_ANSWERS_SCHEMA as answerSchema } from "./typesafe-client.js";
 import { abortable } from "./abortable.js";
+import { jsonHash } from "./json-hash.js";
 
 const VERSION = "people-primer-background-v4";
 const MAX_EXCERPT_CHARS = 6000;
-const answerSchema = Type.Object({ answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA) });
 
 function questionsFor(name: string, agent: string) {
   return [
@@ -112,7 +110,7 @@ export async function primePersonDossier(params: {
             false: "Only a topic/name match, activity summary, behavioral profile, ambiguous attribution or no explicit background answer." },
         }])),
       };
-      const key = createHash("sha256").update(JSON.stringify([VERSION, TYPESAFE_REVIEW_MODEL, person.id, state, questions])).digest("hex");
+      const key = jsonHash([VERSION, TYPESAFE_MODEL, person.id, state, questions]);
       const expectedKeys = Object.keys(questions);
       const valid = (value: unknown): value is Static<typeof answerSchema> => Value.Check(answerSchema, value) &&
         Object.keys(value.answers).length === expectedKeys.length && expectedKeys.every(k => Object.hasOwn(value.answers, k));

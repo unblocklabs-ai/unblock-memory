@@ -1,12 +1,13 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { MEMORY_DATABASE, openMemoryDatabase } from "./memory-database.js";
+import { immediateTransaction, MEMORY_DATABASE, openMemoryDatabase } from "./memory-database.js";
 import { resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
+import { agentStateDir } from "./agent-paths.js";
 const BASELINE_DOSSIER_CATEGORIES = [
     "role",
     "priorities",
@@ -154,8 +155,11 @@ export class PeopleStore {
         this.#maxBlurbChars = options.maxBlurbChars;
         try {
             this.#migrate();
+            // The second index serves cross-scope matches (inside-out-store PERSON_MATCH).
             this.#db.exec(`CREATE INDEX IF NOT EXISTS person_identities_person
-        ON person_identities(person_id, provider, account_scope, external_id)`);
+        ON person_identities(person_id, provider, account_scope, external_id);
+        CREATE INDEX IF NOT EXISTS person_identities_provider_external
+        ON person_identities(provider, external_id)`);
         }
         catch (error) {
             this.#db.close();
@@ -207,8 +211,7 @@ export class PeopleStore {
         const externalId = required(input.externalId, "externalId");
         const directorySync = input.syncedAt !== undefined;
         const now = input.seenAt ?? input.syncedAt ?? new Date().toISOString();
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const existing = this.#identityRow(provider, accountScope, externalId);
             const personId = existing?.person_id ?? randomUUID();
             if (existing) {
@@ -216,7 +219,6 @@ export class PeopleStore {
                     .prepare("SELECT * FROM people WHERE id = ?")
                     .get(personId);
                 if (existingPerson.status !== "active") {
-                    this.#db.exec("COMMIT");
                     return { person: person(existingPerson), identity: identity(existing), created: false };
                 }
             }
@@ -289,13 +291,8 @@ export class PeopleStore {
                 .prepare("SELECT * FROM people WHERE id = ?")
                 .get(personId);
             const identityRow = this.#identityRow(provider, accountScope, externalId);
-            this.#db.exec("COMMIT");
             return { person: person(personRow), identity: identity(identityRow), created: !existing };
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     findPersonByIdentity(provider, accountScope, externalId) {
         const row = this.#db
@@ -330,11 +327,9 @@ export class PeopleStore {
         const name = required(input.name, "company name");
         const primaryDomain = optional(input.primaryDomain);
         const now = new Date().toISOString();
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const target = this.#db.prepare("SELECT id FROM people WHERE id = ?").get(personId);
             if (!target) {
-                this.#db.exec("COMMIT");
                 return undefined;
             }
             let row = this.#db
@@ -359,13 +354,8 @@ export class PeopleStore {
             this.#db
                 .prepare("UPDATE people SET company_id = ?, updated_at = ? WHERE id = ?")
                 .run(row.id, now, personId);
-            this.#db.exec("COMMIT");
             return company(row);
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     listActivePeople(limit = 50, offset = 0) {
         return this.#db
@@ -387,8 +377,7 @@ export class PeopleStore {
         this.#db
             .prepare("UPDATE people SET injection_enabled = ?, updated_at = ? WHERE id = ?")
             .run(Number(enabled), now, personId);
-        const row = this.#db.prepare("SELECT * FROM people WHERE id = ?").get(personId);
-        return row ? person(row) : undefined;
+        return this.getPerson(personId);
     }
     validateDossier(input) {
         const dossier = Value.Parse(PERSON_DOSSIER_WRITE_SCHEMA, input);
@@ -401,16 +390,16 @@ export class PeopleStore {
             .get(personId);
         return row?.id ?? null;
     }
+    /** Returns undefined when the person does not exist. */
     replaceDossier(personId, reasonInput, input, expectedRevision) {
         const dossier = this.validateDossier(input);
         const dossierJson = serializeDossier(dossier);
         const reason = dossierReason(reasonInput);
         const reviewedAt = new Date().toISOString();
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const target = this.#db.prepare("SELECT id, status FROM people WHERE id = ?").get(personId);
             if (!target)
-                throw new Error(`person not found: ${personId}`);
+                return undefined;
             if (expectedRevision !== undefined &&
                 (target.status !== "active" || this.getDossierRevision(personId) !== expectedRevision)) {
                 throw new DossierConflictError();
@@ -437,24 +426,17 @@ export class PeopleStore {
           VALUES (?, ?, 'replace', ?, ?, ?, ?)
         `)
                 .run(randomUUID(), personId, existing?.dossier_json ?? null, dossierJson, reason, reviewedAt);
-            this.#db.exec("COMMIT");
             return dossier;
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     deleteDossier(personId, reasonInput) {
         const reason = dossierReason(reasonInput);
         const changedAt = new Date().toISOString();
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const existing = this.#db
                 .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
                 .get(personId);
             if (!existing) {
-                this.#db.exec("COMMIT");
                 return false;
             }
             parseDossierJson(existing.dossier_json);
@@ -466,13 +448,8 @@ export class PeopleStore {
           VALUES (?, ?, 'delete', ?, NULL, ?, ?)
         `)
                 .run(randomUUID(), personId, existing.dossier_json, reason, changedAt);
-            this.#db.exec("COMMIT");
             return true;
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     getWhisperReceipt(threadKey, personId) {
         const row = this.#db
@@ -571,8 +548,7 @@ export class PeopleStore {
     }
     softDeletePerson(personId) {
         const now = new Date().toISOString();
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const changed = this.#db
                 .prepare(`
         UPDATE people SET status = 'unavailable', injection_enabled = 0,
@@ -580,7 +556,6 @@ export class PeopleStore {
       `)
                 .run(now, personId);
             if (changed.changes === 0) {
-                this.#db.exec("COMMIT");
                 return undefined;
             }
             this.#upsertTodoRow({
@@ -589,18 +564,12 @@ export class PeopleStore {
                 context: { personId },
             }, now);
             const updated = this.getPerson(personId);
-            this.#db.exec("COMMIT");
             return updated;
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     restorePerson(personId) {
         const now = new Date().toISOString();
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const changed = this.#db
                 .prepare(`
         UPDATE people SET status = 'active', injection_enabled = 0, updated_at = ?
@@ -608,17 +577,11 @@ export class PeopleStore {
       `)
                 .run(now, personId);
             if (changed.changes === 0) {
-                this.#db.exec("COMMIT");
                 return undefined;
             }
             const restored = this.getPerson(personId);
-            this.#db.exec("COMMIT");
             return restored;
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     resolveTodoByKey(deduplicationKey, note) {
         const now = new Date().toISOString();
@@ -633,16 +596,10 @@ export class PeopleStore {
         const deduplicationKey = required(input.deduplicationKey, "deduplicationKey");
         const kind = required(input.kind, "kind");
         const now = new Date().toISOString();
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             const row = this.#upsertTodoRow({ deduplicationKey, kind, context: input.context }, now);
-            this.#db.exec("COMMIT");
             return todo(row);
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
     listTodos(limit = 100) {
         const bounded = Math.max(1, Math.min(100, Math.floor(limit)));
@@ -661,12 +618,14 @@ export class PeopleStore {
         const row = this.#db
             .prepare("SELECT * FROM people_todos WHERE deduplication_key = ?")
             .get(input.deduplicationKey);
-        if (row?.status === "resolved") {
+        if (!row || row.status === "resolved") {
             const count = this.#db
                 .prepare("SELECT COUNT(*) AS count FROM people_todos WHERE status = 'open'")
                 .get();
             if (count.count >= this.#maxOpenTodos)
                 return this.#incrementOverflowTodo(now);
+        }
+        if (row?.status === "resolved") {
             this.#db
                 .prepare(`
         UPDATE people_todos
@@ -687,11 +646,6 @@ export class PeopleStore {
                 .run(contextJson, now, row.id);
             return this.#db.prepare("SELECT * FROM people_todos WHERE id = ?").get(row.id);
         }
-        const count = this.#db
-            .prepare("SELECT COUNT(*) AS count FROM people_todos WHERE status = 'open'")
-            .get();
-        if (count.count >= this.#maxOpenTodos)
-            return this.#incrementOverflowTodo(now);
         const id = randomUUID();
         this.#db
             .prepare(`
@@ -758,8 +712,7 @@ export class PeopleStore {
         }
     }
     #migrate() {
-        this.#db.exec("BEGIN IMMEDIATE");
-        try {
+        return immediateTransaction(this.#db, () => {
             // Re-read under the write lock so concurrent first opens cannot both migrate.
             const version = this.#db.prepare("SELECT version FROM memory_schema WHERE component='people'").get()?.version
                 ?? this.#db.prepare("PRAGMA user_version").get()?.user_version ?? 0;
@@ -767,7 +720,6 @@ export class PeopleStore {
                 throw new Error(`unsupported PeopleSQL schema version: ${version}`);
             if (version === 4) {
                 this.#db.prepare("INSERT OR IGNORE INTO memory_schema VALUES ('people',4)").run();
-                this.#db.exec("COMMIT");
                 return;
             }
             if (version === 2) {
@@ -881,12 +833,7 @@ export class PeopleStore {
         INSERT INTO memory_schema VALUES ('people',4)
           ON CONFLICT(component) DO UPDATE SET version=excluded.version;
       `);
-            this.#db.exec("COMMIT");
-        }
-        catch (error) {
-            this.#db.exec("ROLLBACK");
-            throw error;
-        }
+        });
     }
 }
 export class PeopleStores {
@@ -904,7 +851,7 @@ export class PeopleStores {
         const canonicalAgentId = normalized.value;
         let store = this.#stores.get(canonicalAgentId);
         if (!store) {
-            store = new PeopleStore(join(this.#stateRoot, "agents", canonicalAgentId, "unblock-memory", MEMORY_DATABASE), this.#options);
+            store = new PeopleStore(join(agentStateDir(canonicalAgentId, this.#stateRoot), MEMORY_DATABASE), this.#options);
             this.#stores.set(canonicalAgentId, store);
         }
         return store;

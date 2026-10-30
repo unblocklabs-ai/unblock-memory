@@ -21,7 +21,12 @@ import { resolveTimezone } from "./session-projector.js";
 import { searchMemory } from "./memory-search.js";
 import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
 import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
+function managerUnavailable(error) {
+    return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+}
+const ISO_TIMESTAMP_PATTERN = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$";
 const searchParameters = Type.Object({
     bm25Query: Type.String({ pattern: "\\S", description: "Distinctive names, identifiers and keywords for BM25 retrieval." }),
     vectorQuery: Type.String({ pattern: "\\S", description: "Natural-language question describing the information needed; also the intent used to judge usefulness." }),
@@ -31,11 +36,11 @@ const searchParameters = Type.Object({
     sessionFilter: Type.Optional(Type.Object({
         startedFrom: Type.Optional(Type.String({
             description: "Inclusive lower bound on session start time, not message or claim dates (ISO 8601).",
-            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+            pattern: ISO_TIMESTAMP_PATTERN,
         })),
         startedTo: Type.Optional(Type.String({
             description: "Inclusive upper bound on session start time, not message or claim dates (ISO 8601).",
-            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+            pattern: ISO_TIMESTAMP_PATTERN,
         })),
         provider: Type.Optional(Type.String({ pattern: "\\S" })),
         chatType: Type.Optional(Type.Union([Type.Literal("channel"), Type.Literal("group"), Type.Literal("direct")])),
@@ -128,8 +133,7 @@ function createSearchTool(runtime, ctx, typesafe, diagnostics) {
                 measurement.otherMs = Math.max(0, measurement.elapsedMs - measurement.setupMs -
                     (measurement.retrievalMs ?? 0) - (measurement.candidatePrepMs ?? 0) - (measurement.judgeMs ?? 0));
                 if (signal?.aborted)
-                    measurement.outcome = signal.reason instanceof Error && signal.reason.name === "TimeoutError"
-                        ? "timed_out" : "cancelled";
+                    measurement.outcome = abortedByTimeout(signal) ? "timed_out" : "cancelled";
                 diagnostics.measureSearch(active.agentId, measurement);
             }
         },
@@ -149,7 +153,7 @@ function createGetTool(runtime, ctx) {
             const path = untrimmedPath.trim();
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
-                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+                return managerUnavailable(error);
             return jsonResult(await manager.readFile({
                 relPath: path,
                 from,
@@ -218,7 +222,7 @@ function createReclusterTool(runtime, ctx) {
             const options = Value.Parse(reclusterParameters, params);
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
-                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+                return managerUnavailable(error);
             try {
                 return jsonResult(await manager.recluster(options, signal));
             }
@@ -247,7 +251,7 @@ function createListClustersTool(runtime, ctx) {
             const { limit } = Value.Parse(listClustersParameters, params);
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
-                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+                return managerUnavailable(error);
             return jsonResult(await manager.listClusters(limit));
         },
     };
@@ -277,7 +281,7 @@ function createFetchClusterTool(runtime, ctx) {
             const { clusterId, topK, offset, sort } = Value.Parse(fetchClusterParameters, params);
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
-                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+                return managerUnavailable(error);
             return jsonResult(await manager.fetchCluster({ clusterId, topK, offset, sort }));
         },
     };
@@ -338,14 +342,12 @@ function createListMaintenanceTool(runtime, ctx) {
             const options = Value.Parse(listMaintenanceParameters, params);
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
-                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+                return managerUnavailable(error);
             return jsonResult({ status: "ok", tasks: await manager.listMaintenanceTasks(options) });
         },
     };
 }
-const isoTimestamp = Type.String({
-    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
-});
+const isoTimestamp = Type.String({ pattern: ISO_TIMESTAMP_PATTERN });
 const updateMaintenanceParameters = Type.Object({
     taskId: Type.String({ pattern: "\\S" }),
     action: Type.Union([
@@ -379,7 +381,7 @@ function createUpdateMaintenanceTool(runtime, ctx) {
             const { taskId, action, note, annotation } = Value.Parse(updateMaintenanceParameters, params);
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager)
-                return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
+                return managerUnavailable(error);
             const updated = manager.updateMaintenanceTask({
                 id: taskId,
                 status: action === "resolve" ? "resolved" : action === "defer" ? "deferred" : "irrelevant",

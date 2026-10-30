@@ -1,12 +1,11 @@
-import { createHash } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageTokens, extractionOverhead } from "./extraction-model.js";
 import { readExtractionPage } from "./extraction-source.js";
+import { jsonHash } from "./json-hash.js";
 const PREFIX = "unblock-extraction:v1:";
 const bookmarkSchema = Type.Object({ before: Type.Union([Type.Null(), Type.String()]), fence: Type.String(),
     index: Type.Integer({ minimum: 0 }), offset: Type.Integer({ minimum: 0 }), id: Type.String(), hash: Type.String() });
-function digest(message) { return createHash("sha256").update(JSON.stringify(message)).digest("hex"); }
 function fragment(message, start, end) {
     const sourceMessageId = message.sourceMessageId ?? message.id, offset = (message.textOffset ?? 0) + start;
     return { ...message, sourceMessageId, textOffset: offset,
@@ -91,7 +90,7 @@ export async function readExtractionChunk(params) {
             return page;
         if ((page.entryCount && page.cursor === before) || (!page.entryCount && page.hasMore))
             throw new Error("Transcript reader made no progress");
-        if (resume && (!page.messages[resume.index] || page.messages[resume.index].id !== resume.id || digest(page.messages[resume.index]) !== resume.hash)) {
+        if (resume && (!page.messages[resume.index] || page.messages[resume.index].id !== resume.id || jsonHash(page.messages[resume.index]) !== resume.hash)) {
             throw new Error("Partial extraction source changed");
         }
         entryCount += page.entryCount;
@@ -99,7 +98,7 @@ export async function readExtractionChunk(params) {
             const next = page.messages[index];
             return { kind: "page", messages, newIds, entryCount, fence: startingFence ?? page.cursor,
                 exhausted: !next && !page.hasMore,
-                cursor: next ? PREFIX + JSON.stringify({ before, fence: page.cursor, index, offset, id: next.id, hash: digest(next) }) : page.cursor };
+                cursor: next ? PREFIX + JSON.stringify({ before, fence: page.cursor, index, offset, id: next.id, hash: jsonHash(next) }) : page.cursor };
         };
         for (let i = resume?.index ?? 0; i < page.messages.length; i++) {
             const message = page.messages[i];

@@ -1,7 +1,7 @@
 import type { UnblockMemoryConfig } from "./config.js";
 import type { QueryLane, QueryPair } from "./query-contract.js";
 import { collectTraining } from "./training.js";
-import { trainingHash, type TrainingInput } from "./training-input.js";
+import type { TrainingInput } from "./training-input.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_MODEL,
@@ -9,6 +9,7 @@ import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAININ
 import { historicalTrainingSearch, historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import type { QueryEvaluation, TrainingStore, TrainingStepResults, TrainingSourceExample } from "./training-store.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
+import { jsonHash } from "./json-hash.js";
 
 type Source = { databasePath: string; agentId: string; stateDir: string };
 type Options = { maxExamples?: number; dryRun?: boolean; threshold?: number };
@@ -135,7 +136,7 @@ export function selectTrainingQueries(queries: readonly QueryEvaluation[]): Quer
 }
 
 export async function evaluateTrainingQueries(source: Source, store: TrainingStore, config: UnblockMemoryConfig, runtime: unknown,
-  options: Options & { maxCalls?: number; maxInputBytes?: number; concurrency?: number }, createSearch = historicalTrainingSearch) {
+  options: Options & { maxCalls?: number; maxInputBytes?: number; concurrency?: number }, createSearch?: typeof historicalTrainingSearch) {
   bounds(options);
   const corpus = config.corpora.find(c => c.kind === "sessions");
   if (!corpus) throw new Error("Training retrieval requires a configured sessions corpus");
@@ -180,11 +181,12 @@ export async function evaluateTrainingQueries(source: Source, store: TrainingSto
     }
     if (options.maxExamples !== undefined && result.examples >= options.maxExamples) return;
     store.renew();
-    let snapshot: Awaited<ReturnType<typeof createSearch>>;
+    let snapshot: Awaited<ReturnType<typeof historicalTrainingSearch>>;
     try {
-      snapshot = createSearch === historicalTrainingSearch
-        ? await (await (historicalSource ??= historicalTrainingSource(source.stateDir, corpus.chatTypes)))(example.timestamp)
-        : await createSearch(source.stateDir, corpus.chatTypes, example.timestamp);
+      // By default one source capture serves the whole run; an injected search owns its own capture.
+      snapshot = createSearch
+        ? await createSearch(source.stateDir, corpus.chatTypes, example.timestamp)
+        : await (await (historicalSource ??= historicalTrainingSource(source.stateDir, corpus.chatTypes)))(example.timestamp);
     }
     catch (error) {
       if (!(error instanceof HistoricalCorpusUnavailableError)) throw error;
@@ -210,7 +212,7 @@ export async function evaluateTrainingQueries(source: Source, store: TrainingSto
       const problems = new Set<string>();
       const judge = (hit: TrainingStepResults["retrieve"]["hits"][number]) => {
         const request = contextJudgeRequest(input, snapshot.maxDate, hit);
-        const identity = trainingHash([CONTEXT_JUDGE_VERSION, request]);
+        const identity = jsonHash([CONTEXT_JUDGE_VERSION, request]);
         let pending = judgments.get(identity);
         if (!pending) {
           pending = (async () => {
@@ -325,7 +327,7 @@ export function* exportQueryTraining(store: TrainingStore, threshold = TRAINING_
     const provenance = [...evaluation.teacherIds, ...evaluation.queries.flatMap(q => [q.retrievalId, ...q.judgments])];
     yield { stage: "query-training", input: JSON.parse(source.inputJson) as TrainingInput, inputHash: source.inputHash,
       recallProbability: source.recallProbability, threshold, target: selected, targetPolicy: TARGET_POLICY,
-      source: store.sourceDetails(source.id), evaluation: { ...evaluation, selected, review: [] }, splitGroup: trainingHash(source.sessionId),
+      source: store.sourceDetails(source.id), evaluation: { ...evaluation, selected, review: [] }, splitGroup: jsonHash(source.sessionId),
       provenance: [...new Set(provenance)].map(id => store.stepRecord(id)) };
   }
 }

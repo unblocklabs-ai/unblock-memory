@@ -1,6 +1,7 @@
 import { closeSync, constants, existsSync, fchmodSync, lstatSync, mkdirSync, openSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+// Loaded by the Inside Out baseline worker (see inside-out-store.ts): keep this module free of `openclaw`.
 export const MEMORY_DATABASE = "unblock-memory.sqlite";
 const legacyStores = [
     { file: "curation.sqlite", component: "curation", tables: [
@@ -63,6 +64,19 @@ export function openMemoryDatabase(path) {
     }
     catch (error) {
         db.close();
+        throw error;
+    }
+}
+/** Runs synchronous writes atomically; never pass an async callback. */
+export function immediateTransaction(db, fn) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+        const result = fn();
+        db.exec("COMMIT");
+        return result;
+    }
+    catch (error) {
+        db.exec("ROLLBACK");
         throw error;
     }
 }
@@ -159,6 +173,9 @@ function consolidate(db, directory) {
             db.exec(`DETACH DATABASE ${identifier(alias)}`);
     }
 }
+export function tableExists(db, name) {
+    return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name));
+}
 /** File existence no longer tells us which feature has initialized its tables. */
 export function hasMemoryTable(path, table) {
     if (!existsSync(path) && !(basename(path) === MEMORY_DATABASE &&
@@ -166,7 +183,7 @@ export function hasMemoryTable(path, table) {
         return false;
     const db = openMemoryDatabase(path);
     try {
-        return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(table));
+        return tableExists(db, table);
     }
     finally {
         db.close();

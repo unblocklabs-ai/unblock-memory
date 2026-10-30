@@ -1,6 +1,7 @@
 import { inspectReadOnlyChannelAccount } from "openclaw/plugin-sdk/directory-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { PeopleStore } from "./people-store.js";
+import { record } from "./guards.js";
 
 type SlackDirectoryEntry = {
   id: string;
@@ -28,12 +29,6 @@ type SlackRequest = (
 
 function text(value: unknown, maxLength: number): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, maxLength) : undefined;
-}
-
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function slackToken(account: Record<string, unknown>): string | undefined {

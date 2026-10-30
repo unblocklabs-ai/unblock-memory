@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
-import { openMemoryDatabase } from "./memory-database.js";
-import { PURGED_GRADE, baselineFingerprint, purgeEmotionProfile, refreshEmotionBaselines, tableExists } from "./emotion-baselines.js";
+import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
+import { PURGED_GRADE, baselineFingerprint, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
 
 // Imported by the baseline worker with plain Node resolution: host SDK aliases do not
 // reach worker threads, so this module and its imports must stay free of `openclaw`.
@@ -53,11 +53,9 @@ export function linkInsideOutPeople(path: string) {
         WHERE e.person_id IS NOT ${person} AND e.error IS NOT ?`).all(PURGED_GRADE);
       const link = db.prepare("UPDATE inside_out SET person_id=? WHERE rowid=? AND error IS NOT ?");
       for (let start = 0; start < changes.length; start += 500) {
-        db.exec("BEGIN IMMEDIATE");
-        try {
+        immediateTransaction(db, () => {
           for (const change of changes.slice(start, start + 500)) updated += Number(link.run(change.person_id, change.id, PURGED_GRADE).changes);
-          db.exec("COMMIT");
-        } catch (error) { db.exec("ROLLBACK"); throw error; }
+        });
       }
     }
     const counts = db.prepare(`SELECT count(person_id) linked,count(*)-count(person_id) unlinked FROM inside_out`).get()!;

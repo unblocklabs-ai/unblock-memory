@@ -10,14 +10,16 @@ function expandHome(value) {
 function collectionName(source) {
     return `source-${createHash("sha256").update(source).digest("hex").slice(0, 12)}`;
 }
+/** Whether a `relative()` result escapes its base directory. */
+function escapes(relativePath) {
+    return relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath);
+}
 function assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root) {
     if (isAbsolute(expandHome(configuredPath)))
         return;
     const workspace = resolve(workspaceDir);
-    const rootRelative = relative(workspace, root);
-    if (rootRelative === ".." || rootRelative.startsWith(`..${sep}`) || isAbsolute(rootRelative)) {
+    if (escapes(relative(workspace, root)))
         return;
-    }
     let current = root;
     while (current !== workspace) {
         if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
@@ -32,25 +34,12 @@ function assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, roo
 export function resolveSource(workspaceDir, configuredPath, corpus = "memory") {
     const expanded = expandHome(configuredPath);
     const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(workspaceDir, expanded);
-    if (existsSync(absolute)) {
-        const stat = statSync(absolute);
-        const root = stat.isDirectory() ? absolute : dirname(absolute);
-        const pattern = stat.isDirectory() ? "**/*.md" : basename(absolute);
-        assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
-        return {
-            collection: collectionName(absolute),
-            corpus,
-            configuredPath,
-            kind: "files",
-            root,
-            pattern,
-            watchPath: absolute,
-        };
-    }
+    const exists = existsSync(absolute);
     const magicIndex = absolute.search(GLOB_MAGIC);
-    if (magicIndex < 0) {
-        const isExactMarkdownFile = basename(absolute).toLowerCase().endsWith(".md");
-        const root = isExactMarkdownFile ? dirname(absolute) : absolute;
+    if (exists || magicIndex < 0) {
+        // An existing path is taken literally; a missing one is a file only when it names Markdown.
+        const isFile = exists ? !statSync(absolute).isDirectory() : basename(absolute).toLowerCase().endsWith(".md");
+        const root = isFile ? dirname(absolute) : absolute;
         assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
         return {
             collection: collectionName(absolute),
@@ -58,7 +47,7 @@ export function resolveSource(workspaceDir, configuredPath, corpus = "memory") {
             configuredPath,
             kind: "files",
             root,
-            pattern: isExactMarkdownFile ? basename(absolute) : "**/*.md",
+            pattern: isFile ? basename(absolute) : "**/*.md",
             watchPath: absolute,
         };
     }
@@ -110,21 +99,14 @@ export function resolveConfiguredSkillPath(workspaceDir, inputPath, sources) {
     catch {
         return undefined;
     }
-    for (const source of sources) {
-        if (source.kind !== "skills")
-            continue;
-        const relativePath = relative(source.root, target);
-        if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath))
-            continue;
-        if (picomatch.isMatch(relativePath.split(sep).join("/"), source.pattern, { dot: true }))
-            return canonicalTarget;
-    }
-    return undefined;
+    return sources.some((source) => source.kind === "skills" && sourceMatchesPath(source, target))
+        ? canonicalTarget
+        : undefined;
 }
 export function sourceMatchesPath(source, inputPath) {
     const target = resolve(inputPath);
     const relativePath = relative(source.root, target);
-    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath))
+    if (escapes(relativePath))
         return false;
     return picomatch.isMatch(relativePath.split(sep).join("/"), source.pattern, { dot: true });
 }
@@ -140,16 +122,14 @@ export function parseSafeVirtualPath(virtualPath, sources) {
     if (!picomatch.isMatch(portableRelativePath, source.pattern, { dot: true }))
         return undefined;
     const target = resolve(source.root, relativePath);
-    if (relative(source.root, target).startsWith(`..${sep}`) || relative(source.root, target) === "..") {
+    if (escapes(relative(source.root, target)))
         return undefined;
-    }
     if (!target.toLowerCase().endsWith(".md"))
         return undefined;
     try {
         const realRoot = realpathSync(source.root);
         const realTarget = realpathSync(target);
-        const rel = relative(realRoot, realTarget);
-        if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel))
+        if (escapes(relative(realRoot, realTarget)))
             return undefined;
     }
     catch {

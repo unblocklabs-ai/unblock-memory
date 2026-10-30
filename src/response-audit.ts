@@ -1,23 +1,22 @@
-import { createHash } from "node:crypto";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { ResolvedSource } from "./sources.js";
 import { abortable } from "./abortable.js";
-import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader, type ResponseEpisode } from "./response-episodes.js";
 import { RESPONSE_RUBRIC_VERSION, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity } from "./response-judge.js";
 import { ResponseAuditStore, type ResponseResult } from "./response-store.js";
 import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
 import { ResponsePeople } from "./response-identity.js";
-import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
+import { jsonHash } from "./json-hash.js";
 
 export function responseCohort(config: UnblockMemoryConfig["responseAudit"]) {
-  return RESPONSE_RUBRIC_VERSION + ":" + createHash("sha256").update(JSON.stringify({
+  return RESPONSE_RUBRIC_VERSION + ":" + jsonHash({
     extractor: RESPONSE_EXTRACTOR_VERSION, historyMessages: config.historyMessages,
     stages: RESPONSE_STAGE_VERSIONS,
     sentimentEnabled: config.sentimentEnabled,
     senderIds: [...config.senderIds].sort(), chatTypes: [...config.chatTypes].sort(), memoryCorpora: [...config.memoryCorpora].sort(),
-  })).digest("hex").slice(0, 16);
+  }).slice(0, 16);
 }
 
 export type ResponseAuditOptions = {
@@ -88,7 +87,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
       coverage.extractedSessions++;
       if (tracked.has(session)) coverage.reconciledSessions++;
       for (const key of Object.keys(snapshot.coverage) as (keyof typeof snapshot.coverage)[]) coverage[key] += snapshot.coverage[key];
-      const episodes = snapshot.episodes.filter(e => e.timestamp >= now - config.responseAudit.lookbackDays * 86400_000);
+      const episodes = snapshot.episodes.filter(e => e.timestamp >= since);
       coverage.outsideLookback += snapshot.episodes.length - episodes.length;
       store?.observe(cohort, session, snapshot.episodes);
       store?.checkpointSave(cohort, session, snapshot.revision, snapshot.coverage);
@@ -108,9 +107,9 @@ export async function auditResponses(options: ResponseAuditOptions) {
             try {
               const approved = options.sources.filter(s => config.responseAudit.memoryCorpora.includes(s.corpus));
               const candidates = responseMemoryCandidates(options.indexPath, approved, e);
-              const memoryKey = createHash("sha256").update(JSON.stringify([TYPESAFE_REVIEW_MODEL, RESPONSE_STAGE_VERSIONS.memory,
+              const memoryKey = jsonHash([TYPESAFE_MODEL, RESPONSE_STAGE_VERSIONS.memory,
                 e.id, e.session, e.senderId, e.request, e.answer, e.feedback, candidates,
-                [...config.responseAudit.memoryCorpora].sort()])).digest("hex");
+                [...config.responseAudit.memoryCorpora].sort()]);
               let judged = store!.stage(cohort, e, "memory", memoryKey);
               if (judged) coverage.stageCacheHits++;
               else {

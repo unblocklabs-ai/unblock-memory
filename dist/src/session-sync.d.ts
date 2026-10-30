@@ -46,6 +46,7 @@ type ProjectionOptions = {
 };
 export declare function unchangedSessionSync(params: ProjectionOptions, indexPath: string): Promise<SessionSyncResult | undefined>;
 export declare function readSessionManifest(path: string): Promise<SessionManifest>;
+export declare function projectionHash(content: string): string;
 export declare function sessionMetadataByPath(manifest: SessionManifest): Map<string, SessionMetadata>;
 export declare function syncSessionProjections(params: ProjectionOptions & {
     force?: boolean;

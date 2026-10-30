@@ -153,7 +153,8 @@ export declare class PeopleStore {
         }[];
     };
     getDossierRevision(personId: string): string | null;
-    replaceDossier(personId: string, reasonInput: string, input: unknown, expectedRevision?: string | null): PersonDossier;
+    /** Returns undefined when the person does not exist. */
+    replaceDossier(personId: string, reasonInput: string, input: unknown, expectedRevision?: string | null): PersonDossier | undefined;
     deleteDossier(personId: string, reasonInput: string): boolean;
     getWhisperReceipt(threadKey: string, personId: string): {
         runId: string;

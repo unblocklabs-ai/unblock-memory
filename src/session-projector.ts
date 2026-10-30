@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ChatType } from "./config.js";
 import { projectLoggieMessage } from "./loggie-projection.js";
 import { applyProposal, parseAttachments, parseInternalMessage } from "./session-noise.js";
+import { nonBlank, record } from "./guards.js";
 
 export type SessionMetadata = {
   sessionId: string;
@@ -54,16 +55,6 @@ export type SessionContextSpans = {
 
 const MESSAGE_HEADING =
   /^## (User|Assistant) — (.+) — (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S.*)$/u;
-
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
 
 function timestamp(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -119,12 +110,12 @@ export function projectMessage(row: SessionProjectionInput["events"][number], in
   const metadata = record(message.__openclaw);
   const speaker = role === "assistant"
     ? input.agentName
-    : nonEmptyString(metadata?.senderName) ??
-      nonEmptyString(metadata?.senderUsername) ??
-      nonEmptyString(metadata?.senderId) ??
-      nonEmptyString(message.senderName) ??
-      nonEmptyString(message.senderLabel) ??
-      nonEmptyString(message.senderId) ??
+    : nonBlank(metadata?.senderName) ??
+      nonBlank(metadata?.senderUsername) ??
+      nonBlank(metadata?.senderId) ??
+      nonBlank(message.senderName) ??
+      nonBlank(message.senderLabel) ??
+      nonBlank(message.senderId) ??
       "User";
   if (role === "user" && speaker !== "User") {
     text = text.replace(/^From:[^\n]*\n/u, "").trim();

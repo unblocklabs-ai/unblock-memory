@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto";
 import type { ResponseEpisode } from "./response-episodes.js";
 import { RESPONSE_EXTRACTOR_VERSION } from "./response-episodes.js";
 import { judgeResponse, judgeResponseFollowup, RESPONSE_STAGE_VERSIONS, type ResponseStages } from "./response-judge.js";
-import { TYPESAFE_REVIEW_MODEL } from "./typesafe-review.js";
+import { TYPESAFE_MODEL } from "./typesafe-client.js";
 import type { ResponseAuditStore } from "./response-store.js";
+import { jsonHash } from "./json-hash.js";
 
 export async function assessResponseStages(store: ResponseAuditStore, cohort: string, e: ResponseEpisode,
   params: { apiKey: string; timeoutMs: number; signal: AbortSignal }, sentimentEnabled: boolean,
@@ -12,8 +12,8 @@ export async function assessResponseStages(store: ResponseAuditStore, cohort: st
   const feedback = { ...original, feedback: e.feedback };
   const evidence = { quality: original, feedback, sentiment: feedback, retrospective: { ...feedback, followup: e.followup } };
   const keys = Object.fromEntries(Object.keys(evidence).map(stage => [stage,
-    createHash("sha256").update(JSON.stringify([RESPONSE_EXTRACTOR_VERSION, TYPESAFE_REVIEW_MODEL, RESPONSE_STAGE_VERSIONS[stage as keyof typeof evidence],
-      e.id, e.session, e.senderId, e.thread, evidence[stage as keyof typeof evidence]])).digest("hex"),
+    jsonHash([RESPONSE_EXTRACTOR_VERSION, TYPESAFE_MODEL, RESPONSE_STAGE_VERSIONS[stage as keyof typeof evidence],
+      e.id, e.session, e.senderId, e.thread, evidence[stage as keyof typeof evidence]]),
   ])) as Record<keyof ResponseStages, string>;
   const cache = {
     quality: store.stage(cohort, e, "quality", keys.quality),

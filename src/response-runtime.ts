@@ -1,7 +1,7 @@
 import { hasMemoryTable, MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { resolveAgentDir, resolveAgentWorkspaceDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import type { UnblockMemoryConfig } from "./config.js";
@@ -10,14 +10,15 @@ import { auditResponses, responseCohort } from "./response-audit.js";
 import { ResponseAuditStore } from "./response-store.js";
 import type { ResponseReviewStatus } from "./response-reviews.js";
 import { dateOption } from "./date-option.js";
+import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
 export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMemoryConfig) {
   const options = (cfg: OpenClawConfig, id: string) => {
     const normalized = normalizeAgentIdStrict(id);
     if (!normalized.ok || !listAgentIds(cfg).includes(normalized.value)) throw new Error("Unknown response-audit agent");
     const agentId = normalized.value;
-    const state = join(resolveStateDir(), "agents", agentId, "unblock-memory");
-    return { agentId, config, databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
+    const state = agentStateDir(agentId);
+    return { agentId, config, databasePath: agentTranscriptDatabase(cfg, agentId),
       storePath: join(state, MEMORY_DATABASE), indexPath: join(state, "index.sqlite"),
       peoplePath: join(state, MEMORY_DATABASE),
       sources: resolveSources(resolveAgentWorkspaceDir(cfg, agentId), config.corpora.filter(c => c.kind === "files")

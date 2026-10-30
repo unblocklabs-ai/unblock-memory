@@ -3,7 +3,6 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import {
-  resolveAgentDir,
   resolveAgentWorkspaceDir,
   resolveStateDir,
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
@@ -17,6 +16,7 @@ import { resolveTimezone } from "./session-projector.js";
 import { unchangedSessionSync, type SessionSyncResult } from "./session-sync.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
 import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
+import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
 export type SessionSyncStatus =
   | { status: "idle" }
@@ -164,7 +164,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         error: 'memory session sync requires a configured "sessions" corpus',
       };
     }
-    const directory = this.#sessionSyncDirectory(params.agentId);
+    const directory = this.#stateDir(params.agentId);
     const statusPath = join(directory, "session-sync-status.json");
     const running = activeSessionSyncs.get(directory);
     if (running) return { status: "already_running", startedAt: running };
@@ -228,7 +228,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   }
 
   async sessionSyncStatus(agentId: string): Promise<SessionSyncStatus> {
-    const directory = this.#sessionSyncDirectory(agentId);
+    const directory = this.#stateDir(agentId);
     const statusPath = join(directory, "session-sync-status.json");
     const status = await readJson<SessionSyncState>(statusPath);
     const running = activeSessionSyncs.get(directory);
@@ -274,7 +274,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   async #createManager(cfg: OpenClawConfig, agentId: string): Promise<QmdMemoryManager> {
     const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-    const stateDir = join(this.#stateRoot, "agents", agentId, "unblock-memory");
+    const stateDir = this.#stateDir(agentId);
     const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files" || corpus.kind === "skills");
     const sessions = this.#sessionConfig(cfg, agentId);
     const sources = resolveSources(workspaceDir, fileCorpora);
@@ -305,20 +305,20 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   #sessionConfig(cfg: OpenClawConfig, agentId: string): ManagerSessionConfig | undefined {
     const corpus = this.#corpora.find(corpus => corpus.kind === "sessions");
     if (!corpus) return;
-    const stateDir = this.#sessionSyncDirectory(agentId);
+    const stateDir = this.#stateDir(agentId);
     const source = resolveSessionSource(join(stateDir, "sessions"), corpus.chatTypes);
     return {
       agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
       chatTypes: corpus.chatTypes, maxExpandedTokens: corpus.maxExpandedTokens,
       collection: source.collection, outputDir: source.root,
-      databasePath: join(resolveAgentDir(cfg, agentId), "openclaw-agent.sqlite"),
+      databasePath: agentTranscriptDatabase(cfg, agentId),
       manifestPath: join(stateDir, "sessions-manifest.json"),
       timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
     };
   }
 
-  #sessionSyncDirectory(agentId: string): string {
-    return join(this.#stateRoot, "agents", agentId, "unblock-memory");
+  #stateDir(agentId: string): string {
+    return agentStateDir(agentId, this.#stateRoot);
   }
 
 }

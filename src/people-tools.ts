@@ -8,7 +8,7 @@ import { Value } from "typebox/value";
 import type { UnblockMemoryConfig } from "./config.js";
 import { renderPeopleWhisper } from "./people-hooks.js";
 import { DossierConflictError, PERSON_DOSSIER_WRITE_SCHEMA, type PeopleStores } from "./people-store.js";
-import { getContext } from "./tool-context.js";
+import { getContext, runtimeConfig } from "./tool-context.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import { reviewPersonDossier } from "./people-dossier-review.js";
 import {
@@ -311,12 +311,10 @@ function createUpdateTool(stores: PeopleStores, config: UnblockMemoryConfig, run
           : "TypeSafe background review passed (person-background-v2)";
         try {
           const dossier = store.replaceDossier(input.personId, `${input.reason}\n${audit}`, proposed, revision);
+          if (!dossier) return jsonResult({ status: "not_found" });
           return jsonResult({ status: "ok", saved: true, verification: review.status === "manual" ? "manual" : "typesafe", dossier, review });
         } catch (error) {
           if (error instanceof DossierConflictError) return jsonResult({ status: "conflict", saved: false, reason: error.message });
-          if (error instanceof Error && error.message.startsWith("person not found:")) {
-            return jsonResult({ status: "not_found" });
-          }
           throw error;
         }
       }
@@ -404,7 +402,7 @@ export function registerPeopleTools(
         stores,
         directoryReader ??
           createOpenClawSlackDirectory({
-            getConfig: () => ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config,
+            getConfig: () => runtimeConfig(ctx),
           }),
         ctx,
       ),

@@ -95,8 +95,8 @@ export declare class WhispererDiagnostics {
                 [k: string]: {
                     calls: number;
                     outcomes: {
-                        ok?: number | undefined;
                         cancelled?: number | undefined;
+                        ok?: number | undefined;
                         partial?: number | undefined;
                         skipped?: number | undefined;
                         failed?: number | undefined;
@@ -104,7 +104,7 @@ export declare class WhispererDiagnostics {
                         timed_out?: number | undefined;
                     };
                     slowestRecent: {
-                        outcome: "ok" | "cancelled" | "partial" | "skipped" | "failed" | "empty" | "timed_out";
+                        outcome: "cancelled" | "ok" | "partial" | "skipped" | "failed" | "empty" | "timed_out";
                         setupMs?: number | undefined;
                         queueWaitMs?: number | undefined;
                         metadataMs?: number | undefined;

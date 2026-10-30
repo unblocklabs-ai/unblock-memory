@@ -349,6 +349,27 @@ test("the refresh fingerprint changes with every input a refresh reads", async (
     { snapshots: 0, comparisons: 60 });
 });
 
+// The worker resolves imports with plain Node, without the host's `openclaw` aliases. This
+// checkout has openclaw installed, so the worker tests above would still pass if one slipped in.
+test("the baseline worker's import graph stays free of openclaw", () => {
+  const visited = new Set<string>();
+  const pending = [new URL("../src/inside-out-store.ts", import.meta.url)];
+  for (let file = pending.pop(); file; file = pending.pop()) {
+    if (visited.has(file.href)) continue;
+    visited.add(file.href);
+    // Runtime imports only: `import type` is erased before the worker loads anything.
+    const imports = readFileSync(file, "utf8").matchAll(
+      /^(?:import|export)\s+(?!type\s)(?:[\w$*{},\s]+?\s+from\s+)?["']([^"']+)["']|\bimport\(\s*["']([^"']+)["']\s*\)/gm);
+    for (const match of imports) {
+      const specifier = match[1] ?? match[2]!;
+      assert.ok(!specifier.startsWith("openclaw"), `${file.pathname} imports ${specifier}`);
+      if (specifier.startsWith(".")) pending.push(new URL(specifier.replace(/\.js$/, ".ts"), file));
+    }
+  }
+  // json-hash is reached only through emotion-baselines, so this proves the walk is transitive.
+  assert.ok([...visited].some(href => href.endsWith("/src/json-hash.ts")), "followed the worker's transitive imports");
+});
+
 test("terminating a worker mid-transaction rolls back and releases the shared store", async () => {
   const path = join(await mkdtemp(join(tmpdir(), "emotion-terminate-")), "store.sqlite");
   const db = new DatabaseSync(path);
