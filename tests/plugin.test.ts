@@ -438,3 +438,22 @@ test("session sync tools accept and report status without awaiting cold initiali
 
   releaseManager();
 });
+
+test("an explicit Skill Whisperer enable without a skills corpus warns instead of failing silently", () => {
+  // Host-applied manifest defaults carry no `enabled`, so only an operator's true can warn.
+  const cases: [Record<string, unknown>, boolean][] = [
+    [{ skillWhisperer: { enabled: true } }, true],
+    [{}, false],
+    [{ skillWhisperer: { historyMessages: 5, minScore: 0.5, cooldownTurns: 10 } }, false],
+  ];
+  for (const [pluginConfig, warned] of cases) {
+    const warnings: string[] = [], hooks: string[] = [];
+    registerUnblockMemory({
+      pluginConfig, on(name: string) { hooks.push(name); },
+      registerCli() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
+      logger: { warn(message: string) { warnings.push(message); }, info() {}, debug() {}, error() {} },
+    } as unknown as OpenClawPluginApi);
+    assert.equal(warnings.some(w => w.includes('no corpus has kind "skills"')), warned, JSON.stringify(pluginConfig));
+    assert.equal(hooks.includes("before_prompt_build"), false);
+  }
+});

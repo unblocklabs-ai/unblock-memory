@@ -472,7 +472,8 @@ Skill Whisperer is a semantic reminder for user turns. It turns on by default on
 you configure one isolated `skills` corpus and authorize
 `plugins.entries.unblock-memory.hooks.allowConversationAccess`. Without a skills
 corpus it stays inactive: no prompt hook is registered and diagnostics report it
-disabled. Set `skillWhisperer.enabled` to `false` to opt out. It
+disabled; an explicit `skillWhisperer.enabled: true` without one logs a warning.
+Set `skillWhisperer.enabled` to `false` to opt out. It
 embeds the current prompt plus the configured number of prior user/assistant
 messages, compares it with each configured skill's frontmatter `name` and
 `description`. With TypeSafe enabled and a key available, the top three valid

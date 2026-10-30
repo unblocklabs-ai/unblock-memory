@@ -220,7 +220,7 @@ contract; these tables explain their effects.
 | `typesafe.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
 | `typesafe.apiKeyFile` | Unset | Absolute raw-key or dotenv file, reread at credential resolution; explicit missing file never falls back to a different key |
 | `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
-| `skillWhisperer.enabled` | `true` | Active only with a `skills` corpus (otherwise resolved to `false`, with no hook or host warning) and appropriate host hook access; fixed 3-second total deadline; `false` opts out |
+| `skillWhisperer.enabled` | `true` with a `skills` corpus, else `false` | Needs appropriate host hook access; fixed 3-second total deadline; `false` opts out. An explicit `true` without a skills corpus logs a warning and stays inactive |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for TypeSafe shortlist admission |
 | `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |
@@ -706,12 +706,17 @@ Historical aggregation runs in a worker thread and commits in short batches, so 
 Gateway event loop stays responsive and other writers to `unblock-memory.sqlite`
 wait for one batch at most, never a whole refresh. Gateway shutdown cancels an
 active refresh; the next one resumes, and repeating a refresh never duplicates
-records. If the refresh after grading fails, `run` still returns its counts with a
+records. The Gateway skips a refresh when nothing it reads (grades, links, people,
+stored results, the current week or settings) has changed since its previous one.
+People links are matched with a read, and only changed links are written, in short
+batches. If the refresh after grading fails, `run` still returns its counts with a
 `baselineError` (the Gateway logs a warning); saved grades are unaffected.
 `link-people` also refreshes analytics. `baseline-refresh` does this without loading
 transcripts, calling Jev, or requiring TypeSafe credentials. `baselines` reads
 weekly snapshots, newest first, with optional `--person`, `--since YYYY-MM-DD`
-(inclusive UTC week-end) and `--limit` (1–1,000 weeks, default 100).
+(weeks whose last day, a Sunday, is on or after that UTC date) and `--limit`
+(1–1,000 weeks, default 100). It reads from one consistent snapshot, even while a
+refresh is writing.
 
 Snapshots always reflect the currently linked grades. A late historical grade, a
 retry, a relink or removed identity evidence rewrites the affected week and every
@@ -725,8 +730,9 @@ grades change snapshots but do not silently rewrite earlier comparisons.
 Use `baseline-refresh --recompare` to append changed assessments after backfill,
 identity or sample-policy changes; `export --deviation-history` includes the earlier
 results and marks which match the current grade. Repeating an unchanged refresh
-adds no duplicate records. Previously sparse or future-dated assessments also need
-explicit re-comparison when their circumstances change.
+adds no duplicate records. A `future_time` assessment is redone automatically once
+the reply's time has passed. Previously sparse assessments need explicit
+re-comparison after backfill adds earlier history.
 
 `computed_at` and `assessedAt` record when these calculations actually occurred.
 A backfilled comparison uses retained evidence from earlier interaction weeks, but
@@ -751,8 +757,12 @@ removed. It makes no Jev calls.
 - **With `--grades`**, it also erases the six probabilities of every reply currently
   linked to that person and unlinks it. Each row stays as a tombstone with the error
   `Purged by operator`, so `run` (including `--retry`) never sends that reply to Jev
-  again, `link-people` never relinks it, and refreshes skip it. This cannot be
-  undone; run `link-people` first so every reply from that person is linked.
+  again, `link-people` never relinks it, and refreshes skip it. Purge refreshes
+  People links first, so replies linked since the last refresh are included. This
+  cannot be undone.
+
+A refresh already running when `purge` commits rechecks every grade before writing,
+so it cannot restore the purged data.
 
 Purging removes existing data only. While Inside Out stays enabled and the person's
 identity remains in PeopleSQL, their new replies are graded and start a new
