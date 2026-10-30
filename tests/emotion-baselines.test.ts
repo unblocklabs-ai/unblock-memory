@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { resolveConfig } from "../src/config.js";
 import { PeopleStore } from "../src/people-store.js";
-import { deviationReader } from "../src/emotion-baselines.js";
+import { Worker } from "node:worker_threads";
+import { baselineFingerprint, deviationReader, refreshEmotionBaselines } from "../src/emotion-baselines.js";
 import { runInsideOut, reportInsideOut, refreshInsideOutBaselines, reportInsideOutBaselines, linkInsideOutPeople,
   purgeInsideOutPerson, refreshInsideOutBaselinesAsync } from "../src/inside-out.js";
 import { openInsideOutStore } from "../src/inside-out-store.js";
@@ -149,6 +150,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   // never substitutes the last populated week for the preceding calendar week.
   now = firstWeek + 5 * week + 86400_000;
   refreshInsideOutBaselines(path);
+  assert.equal(deviation("future").status, "ok", "future_time described the clock; once due, a normal refresh compares it");
   const emptyWeek = reportInsideOutBaselines(path, { personId: expressive })
     .find(s => s.model === "jev-test" && s.week_start === firstWeek + 3 * week)!;
   assert.equal(emptyWeek.weekly.joy.count, 0);
@@ -276,6 +278,95 @@ test("snapshots stay bounded, are replaced rather than duplicated, and commit in
   assert.ok(Math.abs(latest!.cumulative.sadness.mean! - Number(raw.mean)) < 1e-12, "means use exact sums, not bin centres");
   assert.equal(latest!.cumulative.sadness.min, raw.min);
   assert.equal(latest!.cumulative.sadness.max, raw.max);
+  // week_end is the exclusive next Monday: --since a Monday excludes the week that ended the day before.
+  assert.equal(reportInsideOutBaselines(path, { since: FIRST_WEEK + 29 * WEEK }).length, 1);
+  assert.equal(reportInsideOutBaselines(path, { since: FIRST_WEEK + 29 * WEEK - 86400_000 }).length, 2);
+
+  // Relinking reads matches first and writes only changes, in short batches.
+  db.exec("UPDATE inside_out SET person_id=NULL");
+  transactions = 0;
+  assert.equal(linkInsideOutPeople(path).updated, 3000);
+  assert.ok(transactions >= 6, `3,000 relinks commit in batches of at most 500 (${transactions})`);
+  transactions = 0;
+  assert.equal(linkInsideOutPeople(path).updated, 0);
+  assert.equal(transactions, 0, "an unchanged link pass takes no write lock");
+});
+
+test("a refresh never writes back a person purged after it read their grades", async t => {
+  const { path, ids: [one, two], now } = await gradedStore([{ account: "one", grades: 60, weeks: 3 }, { account: "two", grades: 60, weeks: 3 }]);
+  purgeInsideOutPerson(path, "nobody");
+  const db = openInsideOutStore(path);
+  t.after(() => db.close());
+  const exec = DatabaseSync.prototype.exec;
+  let raced = false;
+  // The refresh's first write batch starts only after all reads: purge exactly then, from another connection.
+  t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+    if (this === db && sql === "BEGIN IMMEDIATE" && !raced) { raced = true; purgeInsideOutPerson(path, one!, { grades: true }); }
+    return exec.call(this, sql);
+  });
+  const result = refreshEmotionBaselines(db, { minInteractions: 20, now });
+  assert.equal(raced, true);
+  assert.deepEqual(result, { snapshots: 3, comparisons: 60 }, "only the untouched person is written");
+  assert.equal(db.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(one)?.n, 0);
+  assert.equal(db.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(one)?.n, 0);
+  assert.equal(db.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(two)?.n, 3);
+});
+
+test("purging grades first links replies whose identity arrived after the last refresh", async () => {
+  const { path, ids: [one] } = await gradedStore([{ account: "one", grades: 60, weeks: 3 }]);
+  const db = new DatabaseSync(path);
+  db.exec("UPDATE inside_out SET person_id=NULL WHERE rowid % 2 = 0");
+  db.close();
+  assert.equal(purgeInsideOutPerson(path, one!, { grades: true }).grades, 60);
+});
+
+test("the refresh fingerprint changes with every input a refresh reads", async () => {
+  const { path, ids: [one], now } = await gradedStore([{ account: "one", grades: 60, weeks: 3 }]);
+  refreshInsideOutBaselines(path, { now });
+  const db = openInsideOutStore(path);
+  const print = (overrides: { now?: number; minInteractions?: number } = {}) => baselineFingerprint(db, { minInteractions: 20, now, ...overrides });
+  const initial = print();
+  assert.equal(print(), initial);
+  assert.notEqual(print({ now: now + WEEK }), initial, "a new week can add a snapshot");
+  assert.notEqual(print({ minInteractions: 21 }), initial);
+  const changed = (sql: string, ...params: (string | number)[]) => {
+    const before = print();
+    db.prepare(sql).run(...params);
+    assert.notEqual(print(), before, sql);
+  };
+  changed("UPDATE inside_out SET reviewed_at=reviewed_at+1 WHERE rowid=1");
+  changed("UPDATE inside_out SET person_id=NULL WHERE rowid=2");
+  changed("UPDATE inside_out SET error='x' WHERE rowid=3");
+  changed("UPDATE inside_out SET target_at=? WHERE rowid=4", now + 86400_000);
+  changed("DELETE FROM inside_out_deviations WHERE rowid=1");
+  changed("DELETE FROM person_emotion_baselines WHERE person_id=? AND week_start=?", one!, FIRST_WEEK);
+  db.close();
+  // In-process async refreshes skip unchanged inputs; explicit re-comparison never skips.
+  const fresh = await gradedStore([{ account: "one", grades: 60, weeks: 3 }]);
+  assert.deepEqual(await refreshInsideOutBaselinesAsync(fresh.path, { now: fresh.now }), { snapshots: 3, comparisons: 60 });
+  assert.deepEqual(await refreshInsideOutBaselinesAsync(fresh.path, { now: fresh.now }), { snapshots: 0, comparisons: 0 });
+  assert.deepEqual(await refreshInsideOutBaselinesAsync(fresh.path, { now: fresh.now, minInteractions: 61, recompare: true }),
+    { snapshots: 0, comparisons: 60 });
+});
+
+test("terminating a worker mid-transaction rolls back and releases the shared store", async () => {
+  const path = join(await mkdtemp(join(tmpdir(), "emotion-terminate-")), "store.sqlite");
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(x)");
+  const worker = new Worker(`
+    const { DatabaseSync } = require("node:sqlite"), { parentPort, workerData } = require("node:worker_threads");
+    const db = new DatabaseSync(workerData);
+    db.exec("BEGIN IMMEDIATE; INSERT INTO t VALUES (1)");
+    parentPort.postMessage("locked");
+    for (;;) {}
+  `, { eval: true, workerData: path });
+  await new Promise(resolve => worker.once("message", resolve));
+  db.exec("PRAGMA busy_timeout=0");
+  assert.throws(() => db.exec("INSERT INTO t VALUES (2)"), /locked/);
+  await worker.terminate();
+  db.exec("INSERT INTO t VALUES (3)");
+  assert.deepEqual(db.prepare("SELECT x FROM t").all().map(row => row.x), [3]);
+  db.close();
 });
 
 test("purging without grades removes derived history; the next refresh rebuilds only from current links", async () => {

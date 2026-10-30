@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { stripReasoningTagsFromText } from "openclaw/plugin-sdk/text-chunking";
@@ -7,7 +6,7 @@ import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
 import { estimateJevTokens, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
 import { readInsideOutSources, type InsideOutSource } from "./inside-out-sources.js";
-import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHistory } from "./emotion-baselines.js";
+import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHistory, hash, tableExists } from "./emotion-baselines.js";
 import { PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 
 export { linkInsideOutPeople, purgeInsideOutPerson, refreshInsideOutBaselines, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
@@ -53,7 +52,6 @@ export function resolveInsideOut(value: unknown): InsideOutConfig {
 }
 
 type Message = { id: string; role: "user" | "assistant"; text: string; human?: string };
-const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 function humanIdentity(source: InsideOutSource, message: NonNullable<InsideOutSource["events"][number]["message"]>) {
   const meta = message.__openclaw, identity = meta?.senderIdentity;
   const channel = meta?.transport?.channel ?? identity?.pluginId ?? message.sourceChannel ?? source.channel;
@@ -157,7 +155,7 @@ export async function runInsideOut(options: { agentId: string; databasePath: str
     baselineError?: string } = { reviewed: 0, cached: 0, failed: 0, sources: 0, skippedSources: 0, errors: [] };
   try {
     store = openInsideOutStore(storePath);
-    const person = store.prepare("SELECT 1 FROM sqlite_schema WHERE name='person_identities'").get()
+    const person = tableExists(store, "person_identities")
       ? store.prepare(`SELECT (${PERSON_MATCH}) person_id FROM (SELECT ? channel,? human_key,? sender_id) e`)
       : undefined;
     const existing = store.prepare("SELECT 1 FROM inside_out WHERE interaction_id=? AND rubric=?");
@@ -267,7 +265,7 @@ export function reportInsideOut(path: string, options: { summary?: boolean; send
   if (!existsSync(path)) return [];
   const db = new DatabaseSync(path, { readOnly: true });
   try {
-    if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE name='inside_out'").get()) return [];
+    if (!tableExists(db, "inside_out")) return [];
     if (options.personId && !db.prepare("SELECT 1 FROM pragma_table_info('inside_out') WHERE name='person_id'").get()) return [];
     const where = `WHERE (? IS NULL OR session_id=?) AND (? IS NULL OR sender_id=?) AND (? IS NULL OR target_at>=?)${options.emotion ? ` AND ${options.emotion}>=?` : ""}${options.personId ? " AND person_id=?" : ""}`;
     const params = [options.sessionId ?? null, options.sessionId ?? null, options.sender ?? null, options.sender ?? null, options.since ?? null, options.since ?? null,

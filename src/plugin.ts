@@ -577,6 +577,11 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     api.on("gateway_stop", () => peopleStores.closeAll());
   }
   const diagnostics = WhispererDiagnostics.shared();
+  // The manifest sets no default for `enabled`, so true here was written by the operator.
+  const skillSettings = (api.pluginConfig as { skillWhisperer?: { enabled?: unknown } } | undefined)?.skillWhisperer;
+  if (skillSettings?.enabled === true && !config.skillWhisperer.enabled) {
+    api.logger.warn('unblock-memory skillWhisperer.enabled is true but no corpus has kind "skills"; Skill Whisperer is inactive');
+  }
   registerWhispererPrompt(api, {
     memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe, diagnostics),
     skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics),

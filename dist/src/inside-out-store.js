@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { openMemoryDatabase } from "./memory-database.js";
-import { PURGED_GRADE, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
+import { PURGED_GRADE, baselineFingerprint, purgeEmotionProfile, refreshEmotionBaselines, tableExists } from "./emotion-baselines.js";
 // Imported by the baseline worker with plain Node resolution: host SDK aliases do not
 // reach worker threads, so this module and its imports must stay free of `openclaw`.
 const SCHEMA = `CREATE TABLE IF NOT EXISTS inside_out (
@@ -38,15 +38,31 @@ export function openInsideOutStore(path) {
         throw error;
     }
 }
-/** Refresh People links without loading transcripts or calling Jev. Known accounts stay exact. Purged grades stay unlinked. */
+/**
+ * Refresh People links without loading transcripts or calling Jev. Known accounts stay exact.
+ * Purged grades stay unlinked. Matching is a read; only changed links are written, in short batches.
+ */
 export function linkInsideOutPeople(path) {
     const db = openInsideOutStore(path);
     try {
         let updated = 0;
-        if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name='person_identities'").get()) {
+        if (tableExists(db, "person_identities")) {
             const person = `(${PERSON_MATCH})`;
-            updated = Number(db.prepare(`UPDATE inside_out AS e SET person_id=${person}
-        WHERE person_id IS NOT ${person} AND error IS NOT ?`).run(PURGED_GRADE).changes);
+            const changes = db.prepare(`SELECT e.rowid id,${person} person_id FROM inside_out e
+        WHERE e.person_id IS NOT ${person} AND e.error IS NOT ?`).all(PURGED_GRADE);
+            const link = db.prepare("UPDATE inside_out SET person_id=? WHERE rowid=? AND error IS NOT ?");
+            for (let start = 0; start < changes.length; start += 500) {
+                db.exec("BEGIN IMMEDIATE");
+                try {
+                    for (const change of changes.slice(start, start + 500))
+                        updated += Number(link.run(change.person_id, change.id, PURGED_GRADE).changes);
+                    db.exec("COMMIT");
+                }
+                catch (error) {
+                    db.exec("ROLLBACK");
+                    throw error;
+                }
+            }
         }
         const counts = db.prepare(`SELECT count(person_id) linked,count(*)-count(person_id) unlinked FROM inside_out`).get();
         return { updated, linked: Number(counts.linked), unlinked: Number(counts.unlinked) };
@@ -57,52 +73,70 @@ export function linkInsideOutPeople(path) {
 }
 /** Rebuild local statistics from existing grades, refreshing exact People links first unless the caller just did. */
 export function refreshInsideOutBaselines(path, options = {}) {
+    return refreshWithFingerprint(path, options).result;
+}
+/**
+ * Worker entry, also behind the synchronous API. `unless`: the fingerprint left by this store's
+ * previous refresh; unchanged inputs skip the pass.
+ * @public loaded by name from the worker thread
+ */
+export function refreshWithFingerprint(path, options) {
     if (!existsSync(path))
-        return { snapshots: 0, comparisons: 0 };
+        return { result: { snapshots: 0, comparisons: 0 } };
     if (options.link !== false)
         linkInsideOutPeople(path);
     const db = openInsideOutStore(path);
     try {
-        return refreshEmotionBaselines(db, { ...options, minInteractions: options.minInteractions ?? 20 });
+        const settings = { ...options, minInteractions: options.minInteractions ?? 20, now: options.now ?? Date.now() };
+        if (!options.recompare && options.unless && baselineFingerprint(db, settings) === options.unless) {
+            return { result: { snapshots: 0, comparisons: 0 }, fingerprint: options.unless };
+        }
+        const result = refreshEmotionBaselines(db, settings);
+        return { result, fingerprint: baselineFingerprint(db, settings) };
     }
     finally {
         db.close();
     }
 }
 const baselineJobs = new Map();
+const fingerprints = new Map();
 /**
- * Keep historical aggregation off the Gateway event loop; serialize refreshes per store.
- * Aborting skips queued work and terminates a running worker: SQLite rolls back its open
- * batch, committed batches are idempotent, and the next refresh resumes.
+ * Keep historical aggregation off the Gateway event loop; serialize refreshes per store, and skip
+ * one whose inputs have not changed since this process's previous refresh of that store.
+ * Aborting skips queued work and terminates a running worker. Its connection closes with the
+ * worker, so SQLite rolls back the open batch; committed batches are idempotent and the next refresh resumes.
  */
 export function refreshInsideOutBaselinesAsync(path, options = {}, signal) {
-    const settings = { ...options, now: options.now ?? Date.now() };
     const job = (baselineJobs.get(path) ?? Promise.resolve()).catch(() => { }).then(() => {
         signal?.throwIfAborted();
         if (!existsSync(path))
             return { snapshots: 0, comparisons: 0 };
+        const settings = { ...options, now: options.now ?? Date.now(), unless: fingerprints.get(path) };
         return new Promise((resolve, reject) => {
             const worker = new Worker(`
         const { parentPort, workerData } = require("node:worker_threads");
         // tsx's CLI preload only registers on the main thread. Source-mode
         // development needs explicit registration; compiled installs do not.
         if (workerData.module.endsWith(".ts")) require("node:module").createRequire(workerData.module)("tsx/esm/api").register();
-        import(workerData.module).then(({ refreshInsideOutBaselines }) => {
-          parentPort.postMessage(refreshInsideOutBaselines(workerData.path, workerData.options));
+        import(workerData.module).then(({ refreshWithFingerprint }) => {
+          parentPort.postMessage(refreshWithFingerprint(workerData.path, workerData.options));
         }).catch(error => { throw error; });
       `, { eval: true, workerData: { module: import.meta.url, path, options: settings } });
-            let result, aborted = false;
+            let outcome, aborted = false;
             const abort = () => { aborted = true; void worker.terminate(); };
             signal?.addEventListener("abort", abort, { once: true });
-            worker.once("message", (value) => { result = value; });
+            worker.once("message", (value) => { outcome = value; });
             worker.once("error", reject);
             // Settle only after the worker closes its database and exits.
             worker.once("exit", code => {
                 signal?.removeEventListener("abort", abort);
                 if (aborted)
                     reject(signal.reason);
-                else if (code === 0 && result)
-                    resolve(result);
+                else if (code === 0 && outcome) {
+                    if (outcome.fingerprint)
+                        fingerprints.set(path, outcome.fingerprint);
+                    resolve(outcome.result);
+                }
                 else
                     reject(new Error(`Inside Out baseline worker exited without a result (code ${code})`));
             });
@@ -121,12 +155,15 @@ export function purgeInsideOutPerson(path, personId, options = {}) {
     // Never create Inside Out tables in a store that has none.
     const probe = openMemoryDatabase(path);
     try {
-        if (!probe.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='inside_out'").get())
+        if (!tableExists(probe, "inside_out"))
             return { baselines: 0, assessments: 0, grades: 0 };
     }
     finally {
         probe.close();
     }
+    // Erasing grades must cover replies linked to this person since the last refresh.
+    if (options.grades)
+        linkInsideOutPeople(path);
     const db = openInsideOutStore(path);
     try {
         return purgeEmotionProfile(db, personId, options);

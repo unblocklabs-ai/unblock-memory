@@ -4,6 +4,8 @@ export declare const INSIDE_OUT_EMOTIONS: readonly ["joy", "sadness", "fear", "a
 export declare const PURGED_GRADE = "Purged by operator";
 type Emotion = typeof INSIDE_OUT_EMOTIONS[number];
 type Row = Record<string, SQLOutputValue>;
+export declare const hash: (value: unknown) => string;
+export declare const tableExists: (db: DatabaseSync, name: string) => boolean;
 type Statistics = {
     count: number;
     mean: number | null;
@@ -89,7 +91,10 @@ export declare function deviationReader(db: DatabaseSync): (row: Row, history?: 
     }[];
     status: "not_compared";
 };
-/** Weekly snapshots, newest first; cumulative statistics are prefix sums of each population's stored weeks. */
+/**
+ * Weekly snapshots, newest first; cumulative statistics are prefix sums of each population's stored weeks.
+ * `since` keeps weeks whose last day is on or after that UTC date (`week_end` is the exclusive next Monday).
+ */
 export declare function emotionBaselineHistory(db: DatabaseSync, options?: {
     personId?: string;
     since?: number;
@@ -106,6 +111,14 @@ export declare function emotionBaselineHistory(db: DatabaseSync, options?: {
     weekly: Summary;
     cumulative: Summary;
 }[];
+/**
+ * Changes whenever a refresh input could: grades, links, people, stored results, the current week,
+ * grades crossing `now`, or settings. Equal fingerprints mean a refresh would write nothing.
+ */
+export declare function baselineFingerprint(db: DatabaseSync, options: {
+    minInteractions: number;
+    now: number;
+}): string;
 /**
  * Delete one person's baselines and assessment history. With `grades`, also erase their six
  * probabilities and person link, keeping a tombstone so the reply is never sent to Jev again.
