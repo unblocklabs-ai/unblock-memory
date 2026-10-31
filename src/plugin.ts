@@ -137,7 +137,6 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
             Object.assign(measurement, { retrievalMs, candidates, eligible });
           },
         });
-        measurement.judgeMs = search.judgeMs;
         measurement.requestsSucceeded = search.requestsSucceeded;
         measurement.requestsFailed = search.requestsFailed;
         measurement.fallbackKeyUnavailable = Number(search.fallbackReason === "key_unavailable");

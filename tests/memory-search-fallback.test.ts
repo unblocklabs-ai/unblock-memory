@@ -102,6 +102,7 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
     t.after(() => { if (previous === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = previous; });
     type Tool = { execute(id: string, params: unknown): Promise<{ details: Record<string, unknown> }> };
     let factory: ((ctx: OpenClawPluginToolContext) => Tool) | undefined;
+    let diagnosticsFactory: typeof factory;
     registerUnblockMemory({
       pluginConfig: { typesafe: credential === "disabled" ? { enabled: false, apiKey: "ignored" }
         : credential === "unreadable" ? { apiKeyFile: "/dev/null/not-a-file" } : {} },
@@ -111,9 +112,11 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
       },
       registerTool(candidate: typeof factory, params: { names: string[] }) {
         if (params.names.includes("memory_search")) factory = candidate;
+        if (params.names.includes("memory_diagnostics")) diagnosticsFactory = candidate;
       },
     } as unknown as OpenClawPluginApi);
-    const result = await factory!({ agentId: `fallback-${credential}`, config: {} } as OpenClawPluginToolContext)
+    const context = { agentId: `fallback-${credential}`, config: {} } as OpenClawPluginToolContext;
+    const result = await factory!(context)
       .execute("search", { bm25Query: queries.lex, vectorQuery: queries.vec, minUsefulness: 1 });
     assert.equal(result.details.rankingMode, "retrieval");
     assert.equal(result.details.scoreMeaning, "retrieval_rank");
@@ -127,6 +130,11 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
     assert.equal(results[0]!.vectorScore, undefined, "raw lane scores are not mislabeled vector similarities");
     assert.equal(results[0]!.textScore, undefined);
     assert.equal(providerCalls, 0, "missing, disabled or unreadable keys never reach the provider");
+    const diagnostics = await diagnosticsFactory!(context).execute("diagnostics", {}) as { details: {
+      whisperers: { telemetry: { operations: { memorySearch: { measurements: { judgeMs: { samples: number } } } } } };
+    } };
+    assert.equal(diagnostics.details.whisperers.telemetry.operations.memorySearch.measurements.judgeMs.samples, 0,
+      "skipped judging must not add zero-duration samples to provider latency percentiles");
   });
 }
 

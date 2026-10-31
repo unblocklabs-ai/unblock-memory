@@ -100,7 +100,6 @@ function createSearchTool(runtime, ctx, typesafe, diagnostics) {
                         Object.assign(measurement, { retrievalMs, candidates, eligible });
                     },
                 });
-                measurement.judgeMs = search.judgeMs;
                 measurement.requestsSucceeded = search.requestsSucceeded;
                 measurement.requestsFailed = search.requestsFailed;
                 measurement.fallbackKeyUnavailable = Number(search.fallbackReason === "key_unavailable");

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { setImmediate } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,7 +60,9 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   ];
   qmd.internal.ensureVecTable(2);
   const model = qmd.internal.llm!.embedModelName;
+  await mkdir(sessions.root, { recursive: true });
   for (const [index, doc] of docs.entries()) {
+    await writeFile(join(doc.collection === files.collection ? files.root : sessions.root, doc.path), doc.text);
     const hash = `search-e2e-${index}`;
     qmd.internal.insertContent(hash, doc.text, "2026-10-10");
     qmd.internal.insertDocument(doc.collection, doc.path, "Evidence", hash, "2026-10-10", "2026-10-10");
@@ -82,6 +84,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   type Tool = { execute(id: string, input: unknown, signal?: AbortSignal): Promise<unknown> };
   let factory: ((context: OpenClawPluginToolContext) => Tool | null) | undefined;
   let diagnosticsFactory: typeof factory;
+  let getFactory: typeof factory;
   const api = {
     pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
     registerCli() {}, registerGatewayMethod() {},
@@ -91,6 +94,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
     registerTool(candidate: typeof factory, options: { names: string[] }) {
       if (options.names.includes("memory_search")) factory = candidate;
       if (options.names.includes("memory_diagnostics")) diagnosticsFactory = candidate;
+      if (options.names.includes("memory_get")) getFactory = candidate;
     },
   } as unknown as OpenClawPluginApi;
   registerUnblockMemory(api);
@@ -98,7 +102,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   const tool = factory!(context)!;
   const diagnostics = diagnosticsFactory!(context)!;
   const judged: string[] = [];
-  let fail = false;
+  let provider: "partial" | "failed" | "healthy" = "partial";
   t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof fetch>) => {
     assert.equal(url, "https://api.typesafe.ai/v1/systemone", "no query generation service");
     const request = JSON.parse(String(init?.body));
@@ -108,7 +112,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
     const path: string = request.state.candidates[0].sourcePath;
     assert.ok(!path.endsWith("direct.md"), "session filter applies before external judging");
     judged.push(path);
-    if (fail || path.endsWith("channel.md")) return new Response(null, { status: 529 });
+    if (provider === "failed" || (provider === "partial" && path.endsWith("channel.md"))) return new Response(null, { status: 529 });
     const noul = path.endsWith("semantic.md") ? 0.956 : path.endsWith("keyword.md") ? 0.854 : 0.1;
     return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul } } });
   });
@@ -122,15 +126,24 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   assert.equal(embeddings.length, 1);
   assert.ok(embeddings[0]!.endsWith(input.vectorQuery));
   assert.match(result.details.warning, /partial/);
-  fail = true;
+  provider = "failed";
   const failed = await tool.execute("failed", { ...input, minUsefulness: 1 }) as { details: {
-    results: { path: string; score: number }[]; warning: string; rankingMode: string; minUsefulnessApplied: boolean;
+    results: { path: string; score: number; startLine: number; endLine: number }[];
+    warning: string; rankingMode: string; minUsefulnessApplied: boolean;
   } };
   assert.equal(failed.details.results.length, 2);
   assert.ok(failed.details.results.every(hit => !hit.path.endsWith("direct.md")));
   assert.equal(failed.details.rankingMode, "retrieval");
   assert.equal(failed.details.minUsefulnessApplied, false);
   assert.match(failed.details.warning, /unjudged/);
+  for (const hit of failed.details.results) {
+    const read = await getFactory!(context)!.execute("read-fallback", {
+      path: hit.path, from: hit.startLine, lines: hit.endLine - hit.startLine + 1,
+    }) as { details: { status: string; text: string } };
+    assert.equal(read.details.status, "ok");
+    const expected = docs.find(doc => hit.path.endsWith(`/${doc.path}`))!;
+    assert.ok(read.details.text.includes(expected.text), "fallback references resolve to the exact indexed evidence");
+  }
   const snapshot = await diagnostics.execute("diagnostics", {}) as { details: {
     whisperers: { telemetry: { operations: Record<string, {
       calls: number; outcomes: Record<string, number>;
@@ -195,4 +208,16 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   assert.equal(cancelledSearch.measurements.retrievalMs!.samples, 4);
   assert.equal(cancelledSearch.measurements.vectorMs!.samples, 3, "queued cancellation never entered vector retrieval");
   assert.equal(cancelledSearch.measurements.judgeMs!.samples, 2, "unexecuted ranking is absent, not zero");
+
+  provider = "healthy";
+  const recovered = await tool.execute("recovered", { ...input, minUsefulness: 0.9 }) as { details: {
+    rankingMode: string; minUsefulnessApplied: boolean; warning?: string; fallbackReason?: string;
+    results: { path: string; score: number }[];
+  } };
+  assert.equal(recovered.details.rankingMode, "typesafe_usefulness");
+  assert.equal(recovered.details.minUsefulnessApplied, true);
+  assert.equal(recovered.details.warning, undefined);
+  assert.equal(recovered.details.fallbackReason, undefined);
+  assert.deepEqual(recovered.details.results.map(hit => [hit.path.split("/").at(-1), hit.score]), [["semantic.md", 0.96]],
+    "the next healthy call restores usefulness ranking and its threshold without reinitializing the tool");
 });

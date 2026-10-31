@@ -18,7 +18,7 @@ it, explicit search returns labeled local search leads.
    openclaw plugins install npm:@unblocklabs/unblock-memory
    ```
 
-2. Save your TypeSafe key in a private file (`chmod 600`), for example
+2. For usefulness ranking, save your TypeSafe key in a private file (`chmod 600`), for example
    `~/.openclaw/secrets/unblock-memory-typesafe.env`:
 
    ```dotenv
@@ -96,8 +96,8 @@ See [search and read](docs/retrieval.md#search-and-read) for every parameter.
 
 **What leaves your machine:** indexing, embeddings, storage and `memory_get` run
 locally. `memory_search` sends the search question and candidate passages, with
-their paths and dates, to TypeSafe for scoring when available. Optional TypeSafe features send
-only what their own settings approve; see
+their paths and dates, to TypeSafe for scoring when available. Optional TypeSafe
+features send only what their own settings approve; see
 [TypeSafe data scope](docs/configuration.md#typesafe-data-scope).
 
 **On by default:** search and read over the `memory` corpus, and a

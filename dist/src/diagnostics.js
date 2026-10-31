@@ -4,7 +4,7 @@ export class WhispererDiagnostics {
     static shared() {
         const scope = globalThis;
         // Bump the version whenever the shape changes so an older loaded copy is never reused.
-        const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v2");
+        const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v3");
         return (scope[symbol] ??= new WhispererDiagnostics());
     }
     #agents = new Map();

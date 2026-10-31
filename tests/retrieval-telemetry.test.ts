@@ -7,9 +7,9 @@ import { QmdMemoryManager } from "../src/manager.js";
 import { RetrievalTelemetry } from "../src/retrieval-telemetry.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
 
-test("hot upgrades replace v1 shared telemetry and retain degraded measurements", () => {
+test("hot upgrades replace v2 shared telemetry and retain degraded measurements", () => {
   const scope = globalThis as typeof globalThis & { [key: symbol]: unknown };
-  const legacy = Symbol.for("unblock-memory.whisperer-diagnostics.v1");
+  const legacy = Symbol.for("unblock-memory.whisperer-diagnostics.v2");
   const previous = scope[legacy];
   const stale = { measureSearch() { throw new Error("legacy telemetry reused"); } };
   scope[legacy] = stale;
