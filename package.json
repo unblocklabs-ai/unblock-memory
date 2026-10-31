@@ -48,7 +48,7 @@
   },
   "dependencies": {
     "@huggingface/tokenizers": "0.2.0",
-    "@unblocklabs/qmd": "3.0.0",
+    "@unblocklabs/qmd": "3.0.2",
     "chokidar": "5.0.0",
     "js-tiktoken": "1.0.21",
     "picomatch": "^4.0.5",
@@ -96,5 +96,9 @@
       "publishToClawHub": false,
       "publishToNpm": true
     }
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": "1.32.0",
+    "hono": "4.13.11"
   }
 }
