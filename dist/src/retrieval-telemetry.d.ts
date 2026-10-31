@@ -1,7 +1,7 @@
 import { type RetrievalTimings } from "./retrieval-timing.js";
 type RetrievalOperation = "vector" | "memoryWhisperer" | "memorySearch";
-type RetrievalOutcome = "ok" | "partial" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped";
-declare const fields: readonly ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "setupMs", "queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs", "vectorIndexCheckMs", "vectorScopeMs", "embeddingMs", "vectorScanMs", "hydrationMs", "vectorMappingMs", "vectorOtherMs", "passageMs", "candidatePrepMs", "retrievalOtherMs", "otherMs", "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars"];
+type RetrievalOutcome = "ok" | "partial" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped" | "degraded";
+declare const fields: readonly ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "setupMs", "queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs", "vectorIndexCheckMs", "vectorScopeMs", "embeddingMs", "vectorScanMs", "hydrationMs", "vectorMappingMs", "vectorOtherMs", "passageMs", "candidatePrepMs", "retrievalOtherMs", "otherMs", "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars", "requestsSucceeded", "requestsFailed", "fallbackKeyUnavailable", "fallbackAllJudgmentsFailed"];
 type Field = typeof fields[number];
 export type RetrievalObservation = {
     outcome: RetrievalOutcome;
@@ -24,6 +24,7 @@ export declare class RetrievalTelemetry {
                     failed?: number | undefined;
                     empty?: number | undefined;
                     timed_out?: number | undefined;
+                    degraded?: number | undefined;
                 };
                 slowestRecent: {
                     outcome: RetrievalOutcome;
@@ -55,6 +56,10 @@ export declare class RetrievalTelemetry {
                     eligible?: number | undefined;
                     results?: number | undefined;
                     contextChars?: number | undefined;
+                    requestsSucceeded?: number | undefined;
+                    requestsFailed?: number | undefined;
+                    fallbackKeyUnavailable?: number | undefined;
+                    fallbackAllJudgmentsFailed?: number | undefined;
                 }[];
                 measurements: {
                     [k: string]: {

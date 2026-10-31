@@ -13,12 +13,18 @@ export type MemorySearchObservation = RetrievalTimings & {
     requestsSucceeded: number;
     requestsFailed: number;
 };
+export type MemoryRanking = {
+    rankingMode: "typesafe_usefulness" | "retrieval";
+    fallbackReason?: "key_unavailable" | "all_judgments_failed";
+};
 /** Both entry points use the same complete passages and independent usefulness judgments. */
 export declare function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
-    apiKey: string;
+    apiKey?: string;
     timeoutMs: number;
     conversation: QueryConversation;
     asOf?: string;
+    /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
+    allowRetrievalFallback?: boolean;
     minUsefulness?: number;
     excludedPassages?: ReadonlyMap<string, number>;
     onCandidates?: (observation: MemorySearchObservation) => void;
@@ -27,6 +33,6 @@ export declare function searchMemory(manager: MemoryCandidateManager, queries: Q
         elapsedMs: number;
         error?: unknown;
     }) => void;
-}): Promise<MemorySearchObservation & {
+}): Promise<MemorySearchObservation & MemoryRanking & {
     results: CorpusMemorySearchResult[];
 }>;

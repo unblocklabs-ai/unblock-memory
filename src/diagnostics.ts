@@ -11,7 +11,7 @@ export class WhispererDiagnostics {
   static shared(): WhispererDiagnostics {
     const scope = globalThis as typeof globalThis & { [key: symbol]: unknown };
     // Bump the version whenever the shape changes so an older loaded copy is never reused.
-    const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v2");
+    const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v3");
     return (scope[symbol] ??= new WhispererDiagnostics()) as WhispererDiagnostics;
   }
   #agents = new Map<string, { counts: Record<Whisperer, Partial<Record<Outcome, number>>>; safetyScenarios: Map<string, number>;

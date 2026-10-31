@@ -61,9 +61,10 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
                         failed?: number | undefined;
                         empty?: number | undefined;
                         timed_out?: number | undefined;
+                        degraded?: number | undefined;
                     };
                     slowestRecent: {
-                        outcome: "cancelled" | "ok" | "partial" | "skipped" | "failed" | "empty" | "timed_out";
+                        outcome: "cancelled" | "ok" | "partial" | "skipped" | "failed" | "empty" | "timed_out" | "degraded";
                         setupMs?: number | undefined;
                         queueWaitMs?: number | undefined;
                         metadataMs?: number | undefined;
@@ -92,6 +93,10 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
                         eligible?: number | undefined;
                         results?: number | undefined;
                         contextChars?: number | undefined;
+                        requestsSucceeded?: number | undefined;
+                        requestsFailed?: number | undefined;
+                        fallbackKeyUnavailable?: number | undefined;
+                        fallbackAllJudgmentsFailed?: number | undefined;
                     }[];
                     measurements: {
                         [k: string]: {

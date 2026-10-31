@@ -11,7 +11,7 @@ settings; a rotated credential file is reread without a restart.
 
 | Feature | Required settings/dependencies | TypeSafe disabled / no key | Provider or unreadable-key failure |
 | --- | --- | --- | --- |
-| `memory_search` | Installed/enabled memory slot; configured corpora; TypeSafe key | Explicit unavailable error | Successful judged siblings returned with a partial warning; total failure is an error; no vector fallback |
+| `memory_search` | Installed/enabled memory slot; configured corpora | Local retrieval-ranked leads with degraded warning | Successful judged siblings returned with a partial warning; total judging failure or unreadable key uses local retrieval fallback |
 | `memory_get` | Installed/enabled memory slot; configured corpora | Unchanged local indexed reads | Unchanged; its own indexing errors still matter |
 | Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | Exclude failed candidates; successful siblings may qualify; no vector fallback |
 | Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; recall/deadline failures still suppress the turn |

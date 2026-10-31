@@ -48,7 +48,7 @@ const searchParameters = Type.Object({
         conversationId: Type.Optional(Type.String({ pattern: "\\S" })),
     }, { additionalProperties: false, description: "Restricts session documents only; selected file corpora remain eligible. Not an audience access control." })),
     maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum hits; default 5." })),
-    minUsefulness: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Minimum TypeSafe usefulness probability; default 0.7. Not confidence in factual truth." })),
+    minUsefulness: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Minimum TypeSafe usefulness probability; default 0.7. Not confidence in factual truth. Not applied to unjudged retrieval fallback." })),
 }, { additionalProperties: false });
 const getParameters = Type.Object({
     path: Type.String({ pattern: "\\S" }),
@@ -66,7 +66,7 @@ function createSearchTool(runtime, ctx, typesafe, diagnostics) {
     return {
         name: "memory_search",
         label: "Memory Search",
-        description: "Search this agent's configured memory corpora with BM25 and vector queries, then TypeSafe usefulness ranking. Supply keywords in bm25Query and the information needed in vectorQuery; no query generation or recall gate runs. Queries and candidate passages are sent to TypeSafe. Skills are excluded. Session snippets are message arrays; file snippets are strings. Inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
+        description: "Search this agent's configured memory corpora with BM25 and vector queries, then TypeSafe usefulness ranking. If TypeSafe is unavailable, returns retrieval-ranked leads with a warning; retrieval scores are not usefulness probabilities and minUsefulness is not applied. Supply keywords in bm25Query and the information needed in vectorQuery; no query generation or recall gate runs. Queries and candidate passages are sent to TypeSafe when available. Skills are excluded. Session snippets are message arrays; file snippets are strings. Inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
         parameters: searchParameters,
         async execute(_toolCallId, params, signal) {
             const started = performance.now();
@@ -78,11 +78,12 @@ function createSearchTool(runtime, ctx, typesafe, diagnostics) {
                 // Reject oversized explicit inputs before credential resolution or any service call.
                 prepareQueryConversation([], queries.lex);
                 const { conversation } = prepareQueryConversation([], queries.vec);
-                const apiKey = await resolveTypeSafeApiKey(typesafe);
-                if (!apiKey) {
-                    measurement.outcome = "skipped";
-                    return jsonResult({ results: [], error: "TypeSafe API key not configured or TypeSafe disabled" });
+                let apiKey;
+                try {
+                    apiKey = await resolveTypeSafeApiKey(typesafe);
                 }
+                catch { /* Explicit search can still return local evidence; never expose credential errors. */ }
+                signal?.throwIfAborted();
                 const { manager, error } = await runtime.getMemorySearchManager(active);
                 measurement.setupMs = performance.now() - started;
                 if (!manager)
@@ -92,27 +93,33 @@ function createSearchTool(runtime, ctx, typesafe, diagnostics) {
                     sessionFilter,
                     maxResults,
                     minUsefulness,
-                    apiKey, timeoutMs: typesafe.timeoutMs, conversation,
+                    apiKey, timeoutMs: typesafe.timeoutMs, conversation, allowRetrievalFallback: true,
                     signal, timings: measurement,
                     requestContext: active.requestContext,
                     onCandidates: ({ retrievalMs, candidates, eligible }) => {
                         Object.assign(measurement, { retrievalMs, candidates, eligible });
                     },
                 });
-                measurement.judgeMs = search.judgeMs;
+                measurement.requestsSucceeded = search.requestsSucceeded;
+                measurement.requestsFailed = search.requestsFailed;
+                measurement.fallbackKeyUnavailable = Number(search.fallbackReason === "key_unavailable");
+                measurement.fallbackAllJudgmentsFailed = Number(search.fallbackReason === "all_judgments_failed");
                 measurement.results = search.results.length;
                 measurement.contextChars = search.results.reduce((sum, hit) => sum + hit.snippet.length, 0);
-                if (search.eligible && !search.requestsSucceeded)
-                    return jsonResult({ results: [], error: "All memory usefulness judgments failed" });
-                measurement.outcome = search.requestsFailed ? "partial" : search.results.length ? "ok" : "empty";
+                measurement.outcome = search.rankingMode === "retrieval" ? "degraded" : search.requestsFailed ? "partial" : search.results.length ? "ok" : "empty";
                 // Compact only the public tool response; internal ranking and consumers keep
                 // full-precision scores and the host's source/citation compatibility fields.
                 const payload = {
-                    ...(search.requestsFailed ? { warning: `${search.requestsFailed} candidate usefulness judgments failed; results are partial` } : {}),
-                    results: search.results.map(({ source: _source, citation: _citation, session, sessionMessages, ...result }) => ({
+                    rankingMode: search.rankingMode,
+                    scoreMeaning: search.rankingMode === "retrieval" ? "retrieval_rank" : "usefulness_probability",
+                    minUsefulnessApplied: search.rankingMode !== "retrieval",
+                    ...(search.fallbackReason ? { fallbackReason: search.fallbackReason,
+                        warning: "TypeSafe usefulness ranking unavailable; returning unjudged retrieval-ranked leads. Scores are retrieval ranks, not usefulness probabilities; minUsefulness was not applied. Verify evidence with memory_get." }
+                        : search.requestsFailed ? { warning: `${search.requestsFailed} candidate usefulness judgments failed; results are partial` } : {}),
+                    results: search.results.map(({ source: _source, citation: _citation, vectorScore: _vectorScore, textScore: _textScore, session, sessionMessages, ...result }) => ({
                         ...result,
                         snippet: result.corpus === "sessions" ? sessionMessages ?? [{ body: result.snippet, partial: true }] : result.snippet,
-                        score: Number(result.score.toFixed(2)),
+                        score: search.rankingMode === "retrieval" ? result.score : Number(result.score.toFixed(2)),
                         ...(session ? { session: { ...session, startedAt: new Date(session.startedAt).toISOString() } } : {}),
                     })),
                 };

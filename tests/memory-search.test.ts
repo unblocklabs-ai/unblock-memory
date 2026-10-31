@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { setImmediate } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,39 @@ import { registerUnblockMemory } from "../src/plugin.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { QmdMemoryManager } from "../src/manager.js";
 import { resolveSource, resolveSessionSource } from "../src/sources.js";
+import { searchMemory } from "../src/memory-search.js";
+
+test("fallback ranks a real vector-only top match above a full lexical candidate lane", async t => {
+  const root = await mkdtemp(join(tmpdir(), "memory-fallback-order-"));
+  const source = resolveSource(root, "*.md", "memory");
+  const qmd = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {
+    [source.collection]: { path: source.root, pattern: source.pattern },
+  } } });
+  qmd.internal.ensureVecTable(2);
+  const model = qmd.internal.llm!.embedModelName;
+  for (let i = 0; i < 7; i++) {
+    const semantic = i === 6;
+    const text = semantic ? "Bek approved the international expansion budget." : `Clutterkeyword unrelated planning detail ${i}.`;
+    const hash = `fallback-order-${i}`;
+    qmd.internal.insertContent(hash, text, "2026-10-10");
+    qmd.internal.insertDocument(source.collection, `${semantic ? "semantic" : `lexical-${i}`}.md`, "Evidence", hash, "2026-10-10", "2026-10-10");
+    qmd.internal.insertEmbedding(hash, 0, 0, new Float32Array(semantic ? [1, 0] : [0, 1]), model, "2026-10-10", 1, undefined, text.length);
+  }
+  t.mock.method(qmd.internal.llm!, "embed", async () => ({ embedding: [1, 0], model }));
+  const manager = new QmdMemoryManager({ dbPath: qmd.dbPath, workspaceDir: root, sources: [source], storeFactory: async () => qmd });
+  t.after(() => manager.close());
+  const queries = { lex: "Clutterkeyword", vec: "Who approved the international expansion budget?" };
+  const candidates = await manager.searchCandidates(queries, {});
+  assert.equal(candidates.length, 7);
+  assert.ok(candidates.slice(0, 6).every(hit => hit.path.includes("lexical-")), "discovery appends vector-only hits after lexical hits");
+  assert.ok(candidates[6]!.path.endsWith("semantic.md"));
+  assert.equal(candidates[6]!.score, 1, "semantic source is vector lane rank one");
+  const result = await searchMemory(manager, queries, { apiKey: undefined, timeoutMs: 10,
+    conversation: { history: [], currentRequest: queries.vec }, allowRetrievalFallback: true, maxResults: 5 });
+  assert.equal(result.results.length, 5);
+  assert.ok(result.results.slice(0, 2).some(hit => hit.path.endsWith("semantic.md")), "vector rank one competes before truncation");
+  assert.ok(result.results.every((hit, index) => !index || result.results[index - 1]!.score >= hit.score));
+});
 
 test("explicit two-query search retrieves, scopes, deduplicates and judges real indexed evidence without generation or recall gating", async t => {
   const root = await mkdtemp(join(tmpdir(), "memory-search-e2e-"));
@@ -27,7 +60,9 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   ];
   qmd.internal.ensureVecTable(2);
   const model = qmd.internal.llm!.embedModelName;
+  await mkdir(sessions.root, { recursive: true });
   for (const [index, doc] of docs.entries()) {
+    await writeFile(join(doc.collection === files.collection ? files.root : sessions.root, doc.path), doc.text);
     const hash = `search-e2e-${index}`;
     qmd.internal.insertContent(hash, doc.text, "2026-10-10");
     qmd.internal.insertDocument(doc.collection, doc.path, "Evidence", hash, "2026-10-10", "2026-10-10");
@@ -49,6 +84,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   type Tool = { execute(id: string, input: unknown, signal?: AbortSignal): Promise<unknown> };
   let factory: ((context: OpenClawPluginToolContext) => Tool | null) | undefined;
   let diagnosticsFactory: typeof factory;
+  let getFactory: typeof factory;
   const api = {
     pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
     registerCli() {}, registerGatewayMethod() {},
@@ -58,6 +94,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
     registerTool(candidate: typeof factory, options: { names: string[] }) {
       if (options.names.includes("memory_search")) factory = candidate;
       if (options.names.includes("memory_diagnostics")) diagnosticsFactory = candidate;
+      if (options.names.includes("memory_get")) getFactory = candidate;
     },
   } as unknown as OpenClawPluginApi;
   registerUnblockMemory(api);
@@ -65,7 +102,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   const tool = factory!(context)!;
   const diagnostics = diagnosticsFactory!(context)!;
   const judged: string[] = [];
-  let fail = false;
+  let provider: "partial" | "failed" | "healthy" = "partial";
   t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof fetch>) => {
     assert.equal(url, "https://api.typesafe.ai/v1/systemone", "no query generation service");
     const request = JSON.parse(String(init?.body));
@@ -75,7 +112,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
     const path: string = request.state.candidates[0].sourcePath;
     assert.ok(!path.endsWith("direct.md"), "session filter applies before external judging");
     judged.push(path);
-    if (fail || path.endsWith("channel.md")) return new Response(null, { status: 529 });
+    if (provider === "failed" || (provider === "partial" && path.endsWith("channel.md"))) return new Response(null, { status: 529 });
     const noul = path.endsWith("semantic.md") ? 0.956 : path.endsWith("keyword.md") ? 0.854 : 0.1;
     return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul } } });
   });
@@ -89,10 +126,24 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   assert.equal(embeddings.length, 1);
   assert.ok(embeddings[0]!.endsWith(input.vectorQuery));
   assert.match(result.details.warning, /partial/);
-  fail = true;
-  const failed = await tool.execute("failed", { ...input, minUsefulness: 0 }) as { details: { results: unknown[]; error: string } };
-  assert.deepEqual(failed.details.results, []);
-  assert.match(failed.details.error, /judgments failed/);
+  provider = "failed";
+  const failed = await tool.execute("failed", { ...input, minUsefulness: 1 }) as { details: {
+    results: { path: string; score: number; startLine: number; endLine: number }[];
+    warning: string; rankingMode: string; minUsefulnessApplied: boolean;
+  } };
+  assert.equal(failed.details.results.length, 2);
+  assert.ok(failed.details.results.every(hit => !hit.path.endsWith("direct.md")));
+  assert.equal(failed.details.rankingMode, "retrieval");
+  assert.equal(failed.details.minUsefulnessApplied, false);
+  assert.match(failed.details.warning, /unjudged/);
+  for (const hit of failed.details.results) {
+    const read = await getFactory!(context)!.execute("read-fallback", {
+      path: hit.path, from: hit.startLine, lines: hit.endLine - hit.startLine + 1,
+    }) as { details: { status: string; text: string } };
+    assert.equal(read.details.status, "ok");
+    const expected = docs.find(doc => hit.path.endsWith(`/${doc.path}`))!;
+    assert.ok(read.details.text.includes(expected.text), "fallback references resolve to the exact indexed evidence");
+  }
   const snapshot = await diagnostics.execute("diagnostics", {}) as { details: {
     whisperers: { telemetry: { operations: Record<string, {
       calls: number; outcomes: Record<string, number>;
@@ -103,9 +154,10 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   const operations = snapshot.details.whisperers.telemetry.operations;
   assert.equal(operations.memorySearch?.calls, 2);
   assert.equal(operations.memorySearch!.outcomes.partial, 1);
-  assert.equal(operations.memorySearch!.outcomes.failed, 1);
+  assert.equal(operations.memorySearch!.outcomes.degraded, 1);
+  assert.equal(operations.memorySearch!.measurements.fallbackAllJudgmentsFailed!.total, 1);
   assert.equal(operations.memorySearch!.measurements.elapsedMs!.samples, 2);
-  assert.equal(operations.memorySearch!.measurements.results!.total, 2);
+  assert.equal(operations.memorySearch!.measurements.results!.total, 4);
   assert.equal(operations.memorySearch!.measurements.retrievalMs!.samples, 2);
   assert.equal(operations.memorySearch!.measurements.judgeMs!.samples, 2);
   for (const stage of ["setupMs", "queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs",
@@ -125,7 +177,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   const finalSnapshot = await diagnostics.execute("diagnostics", {}) as typeof snapshot;
   const finalOperations = finalSnapshot.details.whisperers.telemetry.operations;
   assert.equal(finalOperations.memorySearch!.calls, 5, "one observation per tool invocation, even on early failures");
-  assert.deepEqual(finalOperations.memorySearch!.outcomes, { partial: 1, failed: 2, skipped: 1, cancelled: 1 });
+  assert.deepEqual(finalOperations.memorySearch!.outcomes, { partial: 1, degraded: 1, failed: 1, skipped: 1, cancelled: 1 });
   assert.equal(finalOperations.memorySearch!.measurements.elapsedMs!.samples, 5);
 
   // A native embedding can outlive cancellation. Keep partial timing, send no
@@ -156,4 +208,16 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   assert.equal(cancelledSearch.measurements.retrievalMs!.samples, 4);
   assert.equal(cancelledSearch.measurements.vectorMs!.samples, 3, "queued cancellation never entered vector retrieval");
   assert.equal(cancelledSearch.measurements.judgeMs!.samples, 2, "unexecuted ranking is absent, not zero");
+
+  provider = "healthy";
+  const recovered = await tool.execute("recovered", { ...input, minUsefulness: 0.9 }) as { details: {
+    rankingMode: string; minUsefulnessApplied: boolean; warning?: string; fallbackReason?: string;
+    results: { path: string; score: number }[];
+  } };
+  assert.equal(recovered.details.rankingMode, "typesafe_usefulness");
+  assert.equal(recovered.details.minUsefulnessApplied, true);
+  assert.equal(recovered.details.warning, undefined);
+  assert.equal(recovered.details.fallbackReason, undefined);
+  assert.deepEqual(recovered.details.results.map(hit => [hit.path.split("/").at(-1), hit.score]), [["semantic.md", 0.96]],
+    "the next healthy call restores usefulness ranking and its threshold without reinitializing the tool");
 });

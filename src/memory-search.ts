@@ -18,13 +18,20 @@ export type MemorySearchObservation = RetrievalTimings & {
   requestsSucceeded: number; requestsFailed: number;
 };
 
+export type MemoryRanking = {
+  rankingMode: "typesafe_usefulness" | "retrieval";
+  fallbackReason?: "key_unavailable" | "all_judgments_failed";
+};
+
 /** Both entry points use the same complete passages and independent usefulness judgments. */
 export async function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
-  apiKey: string; timeoutMs: number; conversation: QueryConversation; asOf?: string;
+  apiKey?: string; timeoutMs: number; conversation: QueryConversation; asOf?: string;
+  /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
+  allowRetrievalFallback?: boolean;
   minUsefulness?: number; excludedPassages?: ReadonlyMap<string, number>;
   onCandidates?: (observation: MemorySearchObservation) => void;
   onJudgment?: (event: { candidateIndex: number; elapsedMs: number; error?: unknown }) => void;
-}): Promise<MemorySearchObservation & { results: CorpusMemorySearchResult[] }> {
+}): Promise<MemorySearchObservation & MemoryRanking & { results: CorpusMemorySearchResult[] }> {
   const { signal } = options;
   signal?.throwIfAborted();
   const asOf = options.asOf ?? new Date().toISOString();
@@ -57,6 +64,19 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   } finally { endCandidatePrep(); }
   observation.eligible = candidates.length;
   options.onCandidates?.(observation);
+  const fallback = (reason: NonNullable<MemoryRanking["fallbackReason"]>) => ({
+    ...timings, ...observation, rankingMode: "retrieval" as const, fallbackReason: reason,
+    // Discovery is a lexical-first union, not a ranking. Stable reciprocal-rank
+    // ordering lets strong vector-only hits compete before maxResults truncation.
+    // These original lane scores are not fused ranks or usefulness probabilities.
+    results: [...candidates].sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5),
+  });
+  if (!options.apiKey) {
+    signal?.throwIfAborted();
+    if (options.allowRetrievalFallback) return fallback("key_unavailable");
+    return { ...timings, ...observation, rankingMode: "typesafe_usefulness", results: [] };
+  }
+  const apiKey = options.apiKey;
   const endJudge = startTiming("judgeMs", timings, signal);
   let judged: CorpusMemorySearchResult[];
   try {
@@ -67,7 +87,7 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
           excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
           dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
             ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
-        }, asOf), options);
+        }, asOf), { ...options, apiKey });
         signal?.throwIfAborted();
         observation.requestsSucceeded++;
         options.onJudgment?.({ candidateIndex, elapsedMs: performance.now() - requestStarted });
@@ -84,6 +104,8 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   } finally { endJudge(); }
   signal?.throwIfAborted();
   observation.judgeMs = timings.judgeMs ?? 0;
-  return { ...timings, ...observation, results: judged.filter(hit => hit.score >= (options.minUsefulness ?? 0.7))
+  if (options.allowRetrievalFallback && candidates.length && !observation.requestsSucceeded)
+    return fallback("all_judgments_failed");
+  return { ...timings, ...observation, rankingMode: "typesafe_usefulness", results: judged.filter(hit => hit.score >= (options.minUsefulness ?? 0.7))
     .sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5) };
 }

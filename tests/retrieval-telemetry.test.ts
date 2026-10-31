@@ -5,6 +5,27 @@ import { join } from "node:path";
 import test from "node:test";
 import { QmdMemoryManager } from "../src/manager.js";
 import { RetrievalTelemetry } from "../src/retrieval-telemetry.js";
+import { WhispererDiagnostics } from "../src/diagnostics.js";
+
+test("hot upgrades replace v2 shared telemetry and retain degraded measurements", () => {
+  const scope = globalThis as typeof globalThis & { [key: symbol]: unknown };
+  const legacy = Symbol.for("unblock-memory.whisperer-diagnostics.v2");
+  const previous = scope[legacy];
+  const stale = { measureSearch() { throw new Error("legacy telemetry reused"); } };
+  scope[legacy] = stale;
+  try {
+    const diagnostics = WhispererDiagnostics.shared();
+    assert.notEqual(diagnostics, stale);
+    diagnostics.measureSearch("hot-upgrade-test", { outcome: "degraded", elapsedMs: 1,
+      fallbackAllJudgmentsFailed: 1, requestsFailed: 2 });
+    const op = diagnostics.snapshot("hot-upgrade-test").telemetry.operations.memorySearch;
+    assert.equal(op.outcomes.degraded, 1);
+    assert.equal(op.measurements.fallbackAllJudgmentsFailed.total, 1);
+    assert.equal(op.measurements.requestsFailed.total, 2);
+  } finally {
+    if (previous === undefined) delete scope[legacy]; else scope[legacy] = previous;
+  }
+});
 
 test("retrieval telemetry bounds recent samples and computes percentiles", () => {
   const telemetry = new RetrievalTelemetry();

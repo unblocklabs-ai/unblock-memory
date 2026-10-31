@@ -21,8 +21,16 @@ Example tool input (the `memory` corpus exists by default):
 ```
 
 Results use compact JSON and carry `path`, `startLine`, `endLine`, `snippet`,
-`corpus`, and a usefulness `score` rounded to hundredths. Ranking and threshold
-filtering still use full precision. The constant `source` and top-level `provider`
+`corpus`, and a `score`. With `rankingMode: "typesafe_usefulness"`, this is a
+usefulness probability rounded to hundredths; ranking and threshold filtering
+still use full precision. With `rankingMode: "retrieval"`, the original QMD
+per-lane reciprocal-rank score is preserved without rounding, then sorted highest
+first (discovery order breaks ties); this is not a probability or fused RRF score.
+Discovery is a lexical-first union, so sorting prevents vector-only top matches
+from being buried below the lexical lane before `maxResults` truncation. A hit
+found in both lanes retains its first-discovered score; lane scores are not summed.
+`scoreMeaning` and `minUsefulnessApplied` identify the score contract explicitly.
+The constant `source` and top-level `provider`
 fields are omitted; `path` plus line numbers replace the redundant `citation`.
 Session hits also carry session metadata and, when available,
 `messageTimestamp`: the original timestamp text (including timezone) of the message
@@ -66,17 +74,36 @@ Search snippets are leads. Inspect attribution, qualifications, dates and adjace
 context before relying on a factual claim. An old plan is not proof it happened,
 and memory does not grant permission to act. No results may mean the wrong corpus,
 a high threshold, an unsynced session or an unavailable index—not absence of the fact.
-Search requires enabled TypeSafe and a configured key. It sends the semantic
-query, candidate excerpts, dates, corpus and source paths to TypeSafe. Missing
-credentials and total judging failure include an `error` alongside empty `results`;
-partial judging failure includes a `warning` and only successfully judged results.
+When enabled and configured, TypeSafe receives the semantic query, candidate
+excerpts, dates, corpus and source paths. If disabled, missing/unreadable credentials,
+or **all** eligible usefulness requests fail (including billing HTTP 402, timeouts,
+network or invalid responses), explicit search returns local retrieval-ranked leads.
+The response includes `rankingMode: "retrieval"`, `scoreMeaning: "retrieval_rank"`,
+`minUsefulnessApplied: false`, `fallbackReason` (`key_unavailable` or
+`all_judgments_failed`), and a degraded warning. The requested `minUsefulness` is
+not applied to unjudged scores. Corpus/session restrictions, complete passage
+limits, deduplication, original source links, cancellation and `maxResults` remain
+in force. Read sources with `memory_get` before drawing conclusions.
+
+Partial judging failure returns **only** successfully judged results with a
+warning; retrieval scores are never mixed with usefulness probabilities. Valid
+judgments below `minUsefulness` still return no results, not fallback evidence.
+An empty eligible set is an ordinary empty search when judging is available.
+Automatic Memory Whisperer/People review policies remain strict: this fallback
+is opt-in only for explicit `memory_search`, not automatic context injection.
 Oversized queries are rejected before credentials, retrieval or provider calls.
 Search initialization errors include an `error` alongside empty `results`;
 other failures may surface as tool errors. Investigate them instead of reporting
 “nothing is remembered.”
 `memory_diagnostics` exposes content-free manual-search measurements under
 `whisperers.telemetry.operations.memorySearch`: end-to-end latency, retrieval and
-judging time, candidate/result counts and outcomes (including partial failures).
+judging time, candidate/result counts and outcomes (including `partial` and
+`degraded`). `requestsSucceeded`/`requestsFailed` count individual usefulness
+requests; `fallbackKeyUnavailable` and `fallbackAllJudgmentsFailed` count fallback
+calls by cause. These are numeric, content-free measurements; disabled and missing
+or unreadable keys intentionally share one reason without recording file paths.
+Capture baseline and follow-up snapshots for weekly evaluation; counters reset on
+process recreation and recent percentiles retain only 256 calls.
 These counters are separate from automatic `memoryWhisperer` and internal `vector`
 retrieval; no query or evidence text is recorded.
 

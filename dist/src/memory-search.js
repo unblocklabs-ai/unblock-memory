@@ -46,6 +46,20 @@ export async function searchMemory(manager, queries, options) {
     }
     observation.eligible = candidates.length;
     options.onCandidates?.(observation);
+    const fallback = (reason) => ({
+        ...timings, ...observation, rankingMode: "retrieval", fallbackReason: reason,
+        // Discovery is a lexical-first union, not a ranking. Stable reciprocal-rank
+        // ordering lets strong vector-only hits compete before maxResults truncation.
+        // These original lane scores are not fused ranks or usefulness probabilities.
+        results: [...candidates].sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5),
+    });
+    if (!options.apiKey) {
+        signal?.throwIfAborted();
+        if (options.allowRetrievalFallback)
+            return fallback("key_unavailable");
+        return { ...timings, ...observation, rankingMode: "typesafe_usefulness", results: [] };
+    }
+    const apiKey = options.apiKey;
     const endJudge = startTiming("judgeMs", timings, signal);
     let judged;
     try {
@@ -56,7 +70,7 @@ export async function searchMemory(manager, queries, options) {
                     excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
                     dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
                             ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
-                }, asOf), options);
+                }, asOf), { ...options, apiKey });
                 signal?.throwIfAborted();
                 observation.requestsSucceeded++;
                 options.onJudgment?.({ candidateIndex, elapsedMs: performance.now() - requestStarted });
@@ -78,6 +92,8 @@ export async function searchMemory(manager, queries, options) {
     }
     signal?.throwIfAborted();
     observation.judgeMs = timings.judgeMs ?? 0;
-    return { ...timings, ...observation, results: judged.filter(hit => hit.score >= (options.minUsefulness ?? 0.7))
+    if (options.allowRetrievalFallback && candidates.length && !observation.requestsSucceeded)
+        return fallback("all_judgments_failed");
+    return { ...timings, ...observation, rankingMode: "typesafe_usefulness", results: judged.filter(hit => hit.score >= (options.minUsefulness ?? 0.7))
             .sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5) };
 }

@@ -1,8 +1,9 @@
 import { timingFields } from "./retrieval-timing.js";
 const fields = ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", ...timingFields,
-    "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars"];
+    "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars",
+    "requestsSucceeded", "requestsFailed", "fallbackKeyUnavailable", "fallbackAllJudgmentsFailed"];
 const recentLimit = 256;
-const outcomes = ["ok", "partial", "empty", "failed", "cancelled", "timed_out", "skipped"];
+const outcomes = ["ok", "partial", "empty", "failed", "cancelled", "timed_out", "skipped", "degraded"];
 const boundedAdd = (left, right) => Math.min(Number.MAX_SAFE_INTEGER, left + right);
 /** Only fixed operation/outcome names and nonnegative numbers enter this store. */
 export class RetrievalTelemetry {
