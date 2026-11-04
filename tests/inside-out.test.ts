@@ -23,6 +23,56 @@ const user = (content: string, senderId = "bek", timestamp?: number) => ({ role:
 const assistant = (text: string, extra = {}) => ({ role: "assistant", content: [{ type: "text", text }], ...extra });
 const event = (id: string, message: unknown, timestamp?: string) => ({ type: "message", id, message, timestamp });
 
+test("Inside Out judges visible replies, not replay metadata, and leaves unsafe inputs unassessed", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-visible-"));
+  const databasePath = join(root, "agent.sqlite"), db = createAgentDatabase(databasePath);
+  t.after(() => db.close());
+  const decorated = (text: string, upstreamUserText: string) => {
+    const message = user(text);
+    return { ...message, __openclaw: { ...message.__openclaw, upstreamUserText } };
+  };
+  const literal = "Please explain <conversation_context>this literal tag</conversation_context>.";
+  const legacy = 'Conversation info: ⟦openclaw:ctx⟧\n```json\n{"sender":{"id":"bek","name":"Bek"}}\n```\n' +
+    'PRIVATE_LEGACY_HISTORY\nSystem: [now] Slack DM from Bek\n\nLegacy thanks\n\nContext: ⟦openclaw:ctx⟧\nPRIVATE_CHANNEL_CONTEXT';
+  const scenarios = [
+    { id: "native", messages: [decorated("Original question", "PRIVATE_PRIOR_REPLAY"), assistant("Visible answer"),
+      decorated("Short reply", "<conversation_context>" + "PRIVATE_UPSTREAM ".repeat(7000) +
+        "</conversation_context>\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>PRIVATE_SYSTEM_CONTEXT")] },
+    { id: "legacy", messages: [assistant("Legacy answer"), decorated(legacy, "PRIVATE_LEGACY_REPLAY")] },
+    { id: "oversized", messages: [assistant("Short answer"), decorated("x".repeat(100000), "Incorrect substituted reply")] },
+    { id: "ambiguous", messages: [assistant("Before unsafe boundary"),
+      user("Conversation info: ⟦openclaw:ctx⟧\n```json\nbroken\n```\nPRIVATE_AMBIGUOUS_CONTEXT"),
+      user("No safe preceding assistant"), assistant("After unsafe boundary"), user("Safe follow-up")] },
+    { id: "literal", messages: [assistant("Literal answer"), user(literal)] },
+  ];
+  for (const scenario of scenarios) {
+    insertSession(db, { sessionId: scenario.id, chatType: "direct" });
+    for (const [i, message] of scenario.messages.entries()) {
+      db.prepare("INSERT INTO transcript_events VALUES(?,?,?,?)").run(scenario.id, i + 1,
+        JSON.stringify(event(`${scenario.id}-${i}`, message)), (i + 1) * 1000);
+      db.prepare("INSERT INTO session_transcript_active_events VALUES(?,?,?,?)").run(scenario.id, i, i + 1, i);
+    }
+  }
+  const requests: { target: { text: string }; history: { text: string }[] }[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+    requests.push(JSON.parse(String(init.body)).state);
+    return Response.json({ answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])) });
+  });
+  const storePath = join(root, "unblock-memory.sqlite");
+  await runInsideOut({ agentId: "main", databasePath, storePath, config: cfg() });
+  assert.deepEqual(requests.map(r => r.target.text).sort(), ["Short reply", "Legacy thanks", "Safe follow-up", literal].sort());
+  assert.ok(!JSON.stringify(requests).includes("PRIVATE_"), "replay metadata and transport context never reach Jev");
+  assert.deepEqual(requests.find(r => r.target.text === "Short reply")?.history.map(m => m.text),
+    ["Original question", "Visible answer"]);
+  assert.deepEqual(requests.find(r => r.target.text === "Safe follow-up")?.history.map(m => m.text),
+    ["No safe preceding assistant", "After unsafe boundary"]);
+  const rows = reportInsideOut(storePath);
+  assert.equal(rows.length, 5, "ambiguous replies are not assessed; genuine oversized text remains recorded");
+  const oversized = rows.find(r => r.session_id === "oversized");
+  assert.equal(oversized?.error, "Target reply and preceding assistant exceed context budget");
+  assert.ok(emotions.every(e => oversized?.[e] === null), "oversized inputs receive no fabricated emotion scores");
+});
+
 test("People links are stored on new reviews and backfilled on legacy rows without repeating Jev", async t => {
   const root = await mkdtemp(join(tmpdir(), "inside-out-people-")), sessionsDir = join(root, "sessions");
   await mkdir(sessionsDir);
