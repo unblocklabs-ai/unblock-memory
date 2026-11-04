@@ -20,10 +20,10 @@ export declare class RetrievalTelemetry {
                     cancelled?: number | undefined;
                     ok?: number | undefined;
                     partial?: number | undefined;
-                    skipped?: number | undefined;
-                    failed?: number | undefined;
                     empty?: number | undefined;
+                    failed?: number | undefined;
                     timed_out?: number | undefined;
+                    skipped?: number | undefined;
                     degraded?: number | undefined;
                 };
                 slowestRecent: {

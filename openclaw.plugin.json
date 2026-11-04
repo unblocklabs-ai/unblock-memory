@@ -45,6 +45,9 @@
     "memory_people_sync": { "sideEffecting": true, "optional": true }
   },
   "uiHints": {
+    "myTurn.enabled": { "label": "My Turn", "help": "Opt in to sending recent group/channel conversation text and agent identity to TypeSafe. Appends an advisory NO_REPLY hint only when Jev clearly favors silence. DMs and internal wakes are excluded. Failures never prevent a turn. Requires hook conversation access and prompt injection. Disabled by default." },
+    "myTurn.historyMessages": { "label": "My Turn Message Window", "help": "Recent host-confirmed human messages including the trigger (1-50, default 10). Agent/bot/internal messages and unverified bundled history are excluded. If the trigger cannot be verified human, My Turn skips without affecting the agent turn." },
+    "myTurn.channels": { "label": "My Turn Channel Overrides", "help": "Canonical provider IDs, e.g. slack or imessage. Once My Turn is enabled, omitted providers and omitted enabled flags default on. Set a provider's enabled to false to exclude it." },
     "peoplePrimer.enabled": { "label": "People Background Primer", "help": "Opt in to sending identity, approved excerpts and proposed snippets to TypeSafe. Prepares evidence and checks <=70-word blurbs before replace_dossier saves; disabled/unavailable reviews require explicit manual verification. Existing dossiers are not evidence. Results are accessible to the agent's tool callers." },
     "peoplePrimer.corpora": { "label": "Primer Approved Corpora", "help": "Explicit non-skill corpus allowlist. Sessions includes all indexed conversations; approve only content suitable for this agent's audiences." },
     "responseAudit.enabled": { "label": "Response Quality Audit", "help": "Opt in to background TypeSafe evaluation of approved Slack humans. Operator-only reports; no prompt or memory writes." },
@@ -64,10 +67,10 @@
     },
     "typesafe.enabled": {
       "label": "TypeSafe Judgments",
-      "help": "Shared provider gate for opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Memory search discovers locally and uses TypeSafe to rank usefulness; People Whisperer injection stays local."
+      "help": "Shared provider gate for My Turn, opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Memory search discovers locally and uses TypeSafe to rank usefulness; People Whisperer injection stays local."
     },
     "typesafe.apiKey": { "label": "TypeSafe API Key", "sensitive": true },
-    "typesafe.timeoutMs": { "label": "TypeSafe Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, and Skill Whisperer has a fixed 3-second total budget." },
+    "typesafe.timeoutMs": { "label": "TypeSafe Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, Skill Whisperer has a fixed 3-second total budget, and My Turn has a fixed 1.5-second total budget." },
     "typesafe.apiKeyFile": {
       "label": "TypeSafe Key File",
       "help": "Absolute path to a plaintext API key or a dotenv file containing TYPESAFE_API_KEY. Prefer this over storing a key in config."
@@ -344,6 +347,23 @@
           "maxHints": 2, "cooldownTurns": 10, "timeoutMs": 3000,
           "api": { "endpoint": "http://192.168.1.191:18087" }
         }
+      },
+      "myTurn": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "historyMessages": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+          "channels": {
+            "type": "object",
+            "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]*$" },
+            "additionalProperties": {
+              "type": "object", "additionalProperties": false,
+              "properties": { "enabled": { "type": "boolean", "default": true } }
+            },
+            "default": {}
+          }
+        },
+        "default": { "enabled": false, "historyMessages": 10, "channels": {} }
       },
       "skillWhisperer": {
         "type": "object",

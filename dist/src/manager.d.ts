@@ -57,14 +57,14 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
                         cancelled?: number | undefined;
                         ok?: number | undefined;
                         partial?: number | undefined;
-                        skipped?: number | undefined;
-                        failed?: number | undefined;
                         empty?: number | undefined;
+                        failed?: number | undefined;
                         timed_out?: number | undefined;
+                        skipped?: number | undefined;
                         degraded?: number | undefined;
                     };
                     slowestRecent: {
-                        outcome: "cancelled" | "ok" | "partial" | "skipped" | "failed" | "empty" | "timed_out" | "degraded";
+                        outcome: "cancelled" | "ok" | "partial" | "empty" | "failed" | "timed_out" | "skipped" | "degraded";
                         setupMs?: number | undefined;
                         queueWaitMs?: number | undefined;
                         metadataMs?: number | undefined;

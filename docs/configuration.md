@@ -11,6 +11,7 @@ settings; a rotated credential file is reread without a restart.
 
 | Feature | Required settings/dependencies | TypeSafe disabled / no key | Provider or unreadable-key failure |
 | --- | --- | --- | --- |
+| My Turn | `myTurn.enabled`; conversation access and prompt injection | No hint; normal turn | No hint; normal turn |
 | `memory_search` | Installed/enabled memory slot; configured corpora | Local retrieval-ranked leads with degraded warning | Successful judged siblings returned with a partial warning; total judging failure or unreadable key uses local retrieval fallback |
 | `memory_get` | Installed/enabled memory slot; configured corpora | Unchanged local indexed reads | Unchanged; its own indexing errors still matter |
 | Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | Exclude failed candidates; successful siblings may qualify; no vector fallback |
@@ -28,7 +29,7 @@ settings; a rotated credential file is reread without a restart.
 
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
 one it registers no hook and reports inactive.
-Memory/People Whisperers, people storage, the primer and audits default off.
+My Turn, Memory/People Whisperers, people storage, the primer and audits default off.
 `typesafe.enabled` defaults true but does not enable those opt-in features;
 `sentimentEnabled` defaults true only **within an enabled
 response audit**. `peoplePrimer` controls automatic dossier-save review;
@@ -387,6 +388,81 @@ Omitting tool-result/thinking/system fields does not remove their content if it
 was quoted in ordinary visible text. Provider judgments are advisory; probability
 or score is not proof. Enabling a feature approves only that feature's documented processing.
 
+
+## My Turn
+
+An optional advisor for group/channel conversations. Before an incoming-message
+turn reaches the main model, Jev judges whether this particular agent should
+respond. It uses the agent's configured identity name (falling back to its ID),
+the triggering message, and recent visible conversation text. The agent always
+retains the final say; this does not prevent wakes or guarantee silence.
+
+```json
+{
+  "myTurn": {
+    "enabled": true,
+    "historyMessages": 10,
+    "channels": {
+      "slack": { "enabled": true },
+      "imessage": { "enabled": false }
+    }
+  }
+}
+```
+
+- Default off. Once enabled, omitted providers are enabled. Each channel entry's
+  `enabled` also defaults true. Keys are canonical lowercase OpenClaw provider
+  IDs (`imessage`, not the `imsg` CLI name), not individual room IDs.
+- Only user-triggered turns whose session key confirms a group/channel qualify.
+  DMs (including threaded DMs), unknown or shared-main routes, cron, heartbeats,
+  and host-attributed internal/inter-session input are skipped. Without a run ID,
+  My Turn skips rather than duplicate a decision on prompt rebuilds.
+- `historyMessages` is 1–50, default 10, **including the trigger**. Only
+  host-confirmed human messages are sent, oldest first, with available sender labels.
+  Assistant/agent/bot replies, internal/inter-session input, runtime carriers,
+  context-excluded entries, tools, system messages, images and thinking are excluded.
+  Human authorship requires host `__openclaw.senderIdentity.senderKind: "human"`
+  or `senderIsOwner: true`; explicit bot/agent identity always wins over owner status.
+  Text and the `user` role alone never establish human authorship.
+  Content comes from the visible message body, never storage-only
+  `__openclaw.upstreamUserText` replay prompts, for both the trigger and history.
+- Opaque bundled channel history is omitted because it cannot be filtered reliably
+  by author type. There are no separate Slack/iMessage history fetches. Jev is told
+  that agent replies are absent, so it must not treat their absence as proof that
+  nobody answered a question.
+- The trigger must match the newest transcript message and its host-confirmed
+  human sender. If a host does not expose that metadata at prompt-build time,
+  **My Turn skips the decision entirely**. The original message still reaches
+  the agent normally; unknown authorship never becomes a silence hint.
+- Enabling the feature opts in to external TypeSafe processing of recent text
+  from every enabled provider, including providers added later. Disable providers
+  whose group conversations should not be sent. No other sessions are retrieved.
+- One Noul asks whether the named agent should respond **now**, favoring directed
+  requests, unanswered follow-ups, and expected contributions. Only a response
+  probability `<= 0.2` emits this plugin context, without changing the human message:
+
+  > Your internal Decision API determined that you probably don’t need to respond
+  > to this conversation. If you agree, return exactly NO_REPLY. If it missed a
+  > request or obligation directed at you, respond normally.
+
+- Respond/uncertain results leave the prompt unchanged. The initial threshold is
+  conservative, not a guarantee of classifier accuracy; evaluate it on real chats.
+- Uses shared `typesafe` credentials and enablement. Missing/unreadable key,
+  exhausted credits, any HTTP/network error, invalid result, or timeout leaves the
+  turn unchanged. No retries. The fixed **1.5-second total deadline** also covers
+  credential lookup; a shorter `typesafe.timeoutMs` can end the HTTP request sooner.
+- Input has a conservative 24,000-token estimated budget. Oversized current
+  messages skip inference rather than silently truncate the
+  trigger. Whole older messages are included only while they fit.
+- Prompt rebuilds reuse a run's decision. Newer runs, session teardown, or Gateway
+  shutdown cancel pending work; late results cannot inject a hint into a newer run.
+  Decisions are process-local and bounded, not persisted.
+- Content-free outcome counts appear under `whisperers.myTurn` in
+  `memory_diagnostics`. The hint is ordered before Safety Whisperer context.
+
+Requires `hooks.allowConversationAccess: true` and prompt injection not disabled;
+see [host controls](#host-controls). Host hook timeouts still apply. Messages
+steered into an already-running turn do not rebuild its prompt and are not checked.
 
 ## Safety Whisperer
 

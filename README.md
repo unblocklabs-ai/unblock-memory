@@ -116,6 +116,7 @@ Everything below is off until you configure it.
 | [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill for a user message. Never runs it. Turns on when you add a `skills` corpus; works without TypeSafe. |
 | [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to two relevant past excerpts before the agent replies. Needs TypeSafe and a self-hosted query-generation API. |
 | [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if TypeSafe is unavailable. |
+| [My Turn](docs/configuration.md#my-turn) | Asks Jev whether a group/channel conversation needs this agent's response. Advises `NO_REPLY` only when silence is clearly favored; the agent keeps the final say. Opt-in; failures leave the turn unchanged. |
 | [People dossiers](docs/peoplesql.md) | Lets the agent keep a short, evidence-backed note about each person it works with. |
 | [People Whisperer](docs/peoplesql.md#injection-and-person-state) | Shows the agent its note about a person once per Slack thread. Local lookup, no model call. |
 | [People Primer](docs/peoplesql.md#optional-people-dossier-primer) | Gathers evidence for a person's note and reviews proposed notes before they are saved. |
