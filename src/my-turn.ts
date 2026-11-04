@@ -74,9 +74,9 @@ function humanMessage(message: unknown): HumanMessage | undefined {
   const parsed = messageText(message);
   if (!parsed) return;
   const senderId = nonBlank(meta?.senderId) ?? nonBlank(identity?.id);
-  const raw = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : parsed.text;
-  const speaker = messageSpeaker(raw, senderId);
-  const envelope = conversationEnvelope(raw, speaker.senderId);
+  // Replay metadata can contain a decorated model prompt, not the visible human message.
+  const speaker = messageSpeaker(parsed.text, senderId);
+  const envelope = conversationEnvelope(parsed.text, speaker.senderId);
   if (envelope) return { role: "user", content: envelope.text, ...speaker };
 }
 

@@ -424,6 +424,8 @@ retains the final say; this does not prevent wakes or guarantee silence.
   Human authorship requires host `__openclaw.senderIdentity.senderKind: "human"`
   or `senderIsOwner: true`; explicit bot/agent identity always wins over owner status.
   Text and the `user` role alone never establish human authorship.
+  Content comes from the visible message body, never storage-only
+  `__openclaw.upstreamUserText` replay prompts, for both the trigger and history.
 - Opaque bundled channel history is omitted because it cannot be filtered reliably
   by author type. There are no separate Slack/iMessage history fetches. Jev is told
   that agent replies are absent, so it must not treat their absence as proof that

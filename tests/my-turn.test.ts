@@ -117,9 +117,12 @@ test("disabled providers, DMs, unknown routes and internal wakes never call Jev"
 test("the window includes only verified human messages, including the trigger once", async t => {
   const api = transport(t);
   const h = harness({ enabled: true, historyMessages: 3 });
-  await h.before(event("Thanks!", [
+  const withReplay = (message: ReturnType<typeof human>, upstreamUserText: string) => ({
+    ...message, __openclaw: { ...message.__openclaw, upstreamUserText },
+  });
+  await h.before({ prompt: "Thanks!", messages: [
     human("too old"),
-    human("Friday?", "U_MO"),
+    withReplay(human("Friday?", "U_MO"), "<conversation_context>prior replay secret</conversation_context>"),
     { role: "user", content: "Please confirm.", __openclaw: { senderId: "U_BEK", senderIsOwner: true } },
     { role: "system", content: "system secret" },
     { role: "assistant", content: [{ type: "thinking", thinking: "thinking secret" }, { type: "text", text: "assistant secret" }] },
@@ -136,7 +139,9 @@ test("the window includes only verified human messages, including the trigger on
     { ...human("gateway injection secret"), provider: "openclaw", model: "gateway-injected" },
     { ...human("bot secret"), __openclaw: { senderIsOwner: true, senderIdentity: { senderKind: "bot" } } },
     { ...human("other agent secret"), __openclaw: { senderIdentity: { type: "agent", senderKind: "human" } } },
-  ]), context());
+    withReplay(human("Thanks!"), "<conversation_context>current replay secret</conversation_context>\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>system secret"),
+  ] }, context());
   assert.deepEqual(api.bodies[0].state.history, [
     { role: "user", content: "Friday?", senderId: "U_MO" }, { role: "user", content: "Please confirm.", senderId: "U_BEK" },
   ]);
@@ -166,6 +171,13 @@ test("unverified bundled context is omitted and oversized human input skips inst
   assert.deepEqual(api.bodies[0].state.history, [{ role: "user", content: "Previous question.", senderId: "U_BEK", senderName: "Bek" }]);
   assert.equal(await h.before(event("x".repeat(80_000)), context()), undefined);
   assert.equal(api.fetch.mock.callCount(), 1);
+  const short = human("Short visible reply");
+  assert.ok(await h.before({ prompt: "Short visible reply", messages: [
+    { ...short, __openclaw: { ...short.__openclaw,
+      upstreamUserText: "<conversation_context>" + "private replay secret ".repeat(5000) + "</conversation_context>" } },
+  ] }, context()), "large replay metadata must not make a short human reply exceed the input budget");
+  assert.equal(api.fetch.mock.callCount(), 2);
+  assert.equal(api.bodies[1].state.currentMessage.content, "Short visible reply");
 });
 
 test("unverified and non-human triggers skip My Turn, not delivery of the original message", async t => {
