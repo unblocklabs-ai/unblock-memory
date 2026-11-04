@@ -220,7 +220,7 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 1440,
-                  "default": 60,
+                  "default": 5,
                   "description": "Check for session changes every N minutes while the Gateway runs; unchanged sessions skip indexing. 0 disables automatic sync. First check is after one interval."
                 },
                 "chatTypes": {

@@ -283,7 +283,7 @@ function resolveCorpora(value: unknown): readonly CorpusConfig[] {
           `unblock-memory corpus sessions chatTypes must contain channel, group, or direct`,
         );
       }
-      const syncIntervalMinutes = corpus.syncIntervalMinutes ?? 60;
+      const syncIntervalMinutes = corpus.syncIntervalMinutes ?? 5;
       if (typeof syncIntervalMinutes !== "number" || !Number.isInteger(syncIntervalMinutes) ||
         syncIntervalMinutes < 0 || syncIntervalMinutes > 1440) {
         throw new Error("unblock-memory corpus sessions syncIntervalMinutes must be an integer between 0 and 1440");

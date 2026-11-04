@@ -107,7 +107,7 @@ Use the README's host wrapper and [host controls](#host-controls) separately.
 {
   "corpora": [
     { "name": "memory", "kind": "files", "paths": ["MEMORY.md", "USER.md", "memory/**/*.md"] },
-    { "name": "sessions", "kind": "sessions", "chatTypes": ["channel", "group", "direct"], "syncIntervalMinutes": 60 }
+    { "name": "sessions", "kind": "sessions", "chatTypes": ["channel", "group", "direct"], "syncIntervalMinutes": 5 }
   ]
 }
 ```
@@ -208,7 +208,7 @@ contract; these tables explain their effects.
 | `corpora[].paths` | Required for files/skills | Nonempty exact-file/directory/glob list; workspace-relative, absolute or `~/`; directory means recursive Markdown; does not grant host write trust |
 | `corpora[sessions].chatTypes` | `['channel','group']` | Nonempty subset of channel/group/direct; DMs require `direct` |
 | `corpora[sessions].maxExpandedTokens` | `500` | 1–10,000; internal host vector retrieval expands a full turn/message when it fits. Public search and Whisperer share the fixed 1,200-character complete-passage renderer with training. |
-| `corpora[sessions].syncIntervalMinutes` | `60` | 0–1,440; zero manual-only; first scheduled sync after one interval; requires running Gateway |
+| `corpora[sessions].syncIntervalMinutes` | `5` | 0–1,440; zero manual-only; first scheduled sync after one interval; requires running Gateway |
 | `keepEmbeddingModelWarm` | `true` | Retain embedding model/context after first use; false allows five-minute idle disposal |
 | `analysis.executable` | Unset | Optional absolute local worker path; enables ability to recluster, not automatic scheduling |
 
