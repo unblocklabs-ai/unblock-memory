@@ -218,12 +218,12 @@ metadata. The projected file modification time matches the session
 start time for meaningful chronological cluster reads. Session results include
 provider, chat type, conversation identity, and start time as an ISO 8601 timestamp. They
 participate in the same search and clustering index as file memory. The plugin
-automatically checks each configured agent's sessions every 60 minutes while
+automatically checks each configured agent's sessions every 5 minutes while
 the Gateway runs. Set `syncIntervalMinutes` on the `sessions` corpus to an integer
 from `1` to `1440`, or `0` for manual-only syncing. For example:
 
 ```json
-{ "name": "sessions", "kind": "sessions", "syncIntervalMinutes": 60 }
+{ "name": "sessions", "kind": "sessions", "syncIntervalMinutes": 5 }
 ```
 
 The first refresh runs after one interval, not during startup. Restart the
@@ -241,7 +241,7 @@ are remembered. Index changes, missing projections, changed projection settings,
 QMD upgrades and incomplete runs invalidate the skip checkpoint; `force: true`
 bypasses both gates. `memory_sync_status` reports `lastCheckedAt`, `lastIndexedAt`
 and `skipReason` (`no_changes` or `no_indexable_changes`) separately. Existing
-explicit intervals remain unchanged on upgrade; set them to `60` for hourly checks.
+explicit intervals remain unchanged on upgrade; set them to `5` for five-minute checks.
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
 equivalent configured OpenClaw state directory). Durable agent-supplied event
