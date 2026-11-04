@@ -197,6 +197,8 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     user("Thank you.", "bek", time + 8000)];
   // Offline SDK writers create genuine v19 projections and zstd archive blobs in an isolated state dir.
   const script = `
+    // Keep SDK retention relative to the fixture, not the date the test is run.
+    Date.now = () => ${time};
     globalThis.fetch = () => { throw new Error("Fixture must stay offline"); };
     const store = await import(${JSON.stringify(import.meta.resolve("openclaw/plugin-sdk/session-store-runtime"))});
     const transcript = await import(${JSON.stringify(import.meta.resolve("openclaw/plugin-sdk/session-transcript-runtime"))});
@@ -268,11 +270,11 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   const commander = createRequire(import.meta.resolve("openclaw/plugin-sdk/session-store-runtime")).resolve("commander");
   const cliPath = join(root, "cli-fixture.mjs");
   await writeFile(cliPath, `
+    Date.now = () => ${time + 14 * 86400_000};
     const { Command } = await import(${JSON.stringify(pathToFileURL(commander).href)});
     const { registerInsideOut } = await import(${JSON.stringify(new URL("../src/inside-out-runtime.ts", import.meta.url).href)});
     const { resolveConfig } = await import(${JSON.stringify(new URL("../src/config.ts", import.meta.url).href)});
     const { PeopleStore } = await import(${JSON.stringify(new URL("../src/people-store.ts", import.meta.url).href)});
-    Date.now = () => ${time + 14 * 86400_000};
     const people = new PeopleStore(${JSON.stringify(join(state, "agents/main/unblock-memory/unblock-memory.sqlite"))}, {maxOpenTodos:100,maxBlurbChars:1000});
     const person = people.upsertIdentity({provider:"telegram",accountScope:"account",externalId:"bek"}).person.id;
     people.upsertIdentity({provider:"discord",accountScope:"account",externalId:"bek"});
