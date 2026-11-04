@@ -573,8 +573,12 @@ expressed emotion, not intensity; several emotions can be present, and they need
 not sum to one. High sadness need not mean the agent caused it.
 
 Each request contains chronological visible `history` and a separate `target`
-human reply. Six Noul questions judge only `target.text`, using history to interpret
-tone and speaker attribution. Short yes/no criteria define each emotion; subtle
+human reply. Both use visible message content, never storage-only
+`__openclaw.upstreamUserText` replay prompts. Recognized transport envelopes are
+unwrapped; ambiguous envelopes are excluded and break the history chain.
+Existing grades remain cached; this does not automatically regrade historical
+successes or retry oversized failures. Six Noul questions judge only `target.text`,
+using history to interpret tone and speaker attribution. Short yes/no criteria define each emotion; subtle
 emotion counts without requiring explicit emotion words. Raw tool-result messages
 and tool-call blocks never enter either field; visible assistant text explaining a
 tool's findings remains conversation text. The rubric is `emotion-presence-v2`.

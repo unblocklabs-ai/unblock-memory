@@ -22,7 +22,6 @@ type InsideOutEvent = {
         __openclaw?: {
             senderId?: string;
             senderIsOwner?: boolean;
-            upstreamUserText?: string;
             senderIdentity?: {
                 id?: string;
                 senderKind?: string;

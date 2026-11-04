@@ -96,7 +96,13 @@ function* interactions(source, budget, cached, after) {
                     history = [];
                 thread = String(nextThread);
             }
-            text = conversationUserText(meta?.upstreamUserText ?? text, meta?.senderId)?.text ?? text;
+            // Replay metadata can contain the decorated model prompt, not the human reply.
+            const visible = conversationUserText(text, meta?.senderId);
+            if (!visible) {
+                history = [];
+                continue;
+            }
+            text = visible.text;
         }
         if (!text)
             continue;

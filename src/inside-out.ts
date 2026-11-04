@@ -89,7 +89,10 @@ function* interactions(source: InsideOutSource, budget: number, cached: (id: str
         if (thread !== undefined && thread !== String(nextThread)) history = [];
         thread = String(nextThread);
       }
-      text = conversationUserText(meta?.upstreamUserText ?? text, meta?.senderId)?.text ?? text;
+      // Replay metadata can contain the decorated model prompt, not the human reply.
+      const visible = conversationUserText(text, meta?.senderId);
+      if (!visible) { history = []; continue; }
+      text = visible.text;
     }
     if (!text) continue;
     const { channel, sender, human } = humanIdentity(source, m);

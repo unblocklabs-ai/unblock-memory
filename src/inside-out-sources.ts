@@ -12,7 +12,7 @@ type InsideOutEvent = {
   message?: { role: string; content?: unknown; timestamp?: number; channel?: string; provider?: string; model?: string;
     sourceChannel?: string; senderId?: string;
     openclawDeliveryMirror?: unknown; openclawMessageToolMirror?: unknown;
-    provenance?: { kind?: string }; __openclaw?: { senderId?: string; senderIsOwner?: boolean; upstreamUserText?: string;
+    provenance?: { kind?: string }; __openclaw?: { senderId?: string; senderIsOwner?: boolean;
       senderIdentity?: { id?: string; senderKind?: string; type?: string; pluginId?: string; accountId?: string };
       transport?: { channel?: string; threadId?: string | number } } };
 };
