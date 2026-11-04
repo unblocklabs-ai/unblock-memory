@@ -4,6 +4,7 @@ import { resolveResponseAudit } from "./response-config.js";
 import { resolvePeoplePrimer } from "./people-primer-config.js";
 import { resolveInsideOut } from "./inside-out.js";
 import { resolveSafetyWhisperer } from "./safety-config.js";
+import { resolveMyTurn } from "./my-turn.js";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
@@ -298,7 +299,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -376,6 +377,7 @@ export function resolveConfig(value) {
         skillWhisperer = { ...skillWhisperer, enabled: false };
     }
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
+        myTurn: resolveMyTurn(config.myTurn),
         extraction: resolveExtraction(config.extraction, corpora),
         qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
         evidenceReview,

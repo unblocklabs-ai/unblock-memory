@@ -3,6 +3,7 @@ import { type ResponseAuditConfig } from "./response-config.js";
 import { type PeoplePrimerConfig } from "./people-primer-config.js";
 import { type InsideOutConfig } from "./inside-out.js";
 import { type SafetyWhispererConfig } from "./safety-config.js";
+import { type MyTurnConfig } from "./my-turn.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -25,6 +26,7 @@ type SessionCorpusConfig = {
 export type CorpusConfig = FileCorpusConfig | SkillCorpusConfig | SessionCorpusConfig;
 export declare const DEFAULT_CORPORA: readonly FileCorpusConfig[];
 export type UnblockMemoryConfig = {
+    myTurn: MyTurnConfig;
     extraction: ExtractionConfig;
     corpora: readonly CorpusConfig[];
     keepEmbeddingModelWarm: boolean;

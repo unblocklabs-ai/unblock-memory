@@ -1,6 +1,6 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 
-type Whisperer = "skill" | "memory" | "safety";
+type Whisperer = "skill" | "memory" | "safety" | "myTurn";
 type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" |
   "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" |
   "recall_not_needed" | "queries_generated" | "judge_candidate_failed" | "input_too_large" |
@@ -11,7 +11,7 @@ export class WhispererDiagnostics {
   static shared(): WhispererDiagnostics {
     const scope = globalThis as typeof globalThis & { [key: symbol]: unknown };
     // Bump the version whenever the shape changes so an older loaded copy is never reused.
-    const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v3");
+    const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v4");
     return (scope[symbol] ??= new WhispererDiagnostics()) as WhispererDiagnostics;
   }
   #agents = new Map<string, { counts: Record<Whisperer, Partial<Record<Outcome, number>>>; safetyScenarios: Map<string, number>;
@@ -21,7 +21,7 @@ export class WhispererDiagnostics {
     let entry = this.#agents.get(agentId);
     if (!entry) {
       if (this.#agents.size >= 100) this.#agents.delete(this.#agents.keys().next().value!);
-      entry = { counts: { skill: {}, memory: {}, safety: {} }, safetyScenarios: new Map(), telemetry: new RetrievalTelemetry() };
+      entry = { counts: { skill: {}, memory: {}, safety: {}, myTurn: {} }, safetyScenarios: new Map(), telemetry: new RetrievalTelemetry() };
       this.#agents.set(agentId, entry);
     }
     return entry;
@@ -50,6 +50,7 @@ export class WhispererDiagnostics {
   snapshot(agentId: string) {
     const entry = this.#agents.get(agentId);
     return { skill: { ...entry?.counts.skill }, memory: { ...entry?.counts.memory },
+      myTurn: { ...entry?.counts.myTurn },
       safety: { ...entry?.counts.safety, matchedScenarios: Object.fromEntries(entry?.safetyScenarios ?? []) },
       telemetry: entry?.telemetry.snapshot() ?? new RetrievalTelemetry().snapshot(),
       scope: "process lifetime; up to 100 agents" };

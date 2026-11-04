@@ -1,4 +1,4 @@
-const ORDER = ["memory", "skill", "people", "safety"];
+const ORDER = ["memory", "skill", "people", "myTurn", "safety"];
 /** One host contribution keeps every whisperer after the user in a stable order; safety stays closest to the reply. */
 export function registerWhispererPrompt(api, whisperers) {
     const ordered = ORDER.flatMap(name => whisperers[name] ? [{ name, handler: whisperers[name] }] : []);

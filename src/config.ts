@@ -4,6 +4,7 @@ import { resolveResponseAudit, type ResponseAuditConfig } from "./response-confi
 import { resolvePeoplePrimer, type PeoplePrimerConfig } from "./people-primer-config.js";
 import { resolveInsideOut, type InsideOutConfig } from "./inside-out.js";
 import { resolveSafetyWhisperer, type SafetyWhispererConfig } from "./safety-config.js";
+import { resolveMyTurn, type MyTurnConfig } from "./my-turn.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -43,6 +44,7 @@ export const DEFAULT_CORPORA: readonly FileCorpusConfig[] = [
 ];
 
 export type UnblockMemoryConfig = {
+  myTurn: MyTurnConfig;
   extraction: ExtractionConfig;
   corpora: readonly CorpusConfig[];
   keepEmbeddingModelWarm: boolean;
@@ -406,7 +408,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -499,6 +501,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     skillWhisperer = { ...skillWhisperer, enabled: false };
   }
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
+    myTurn: resolveMyTurn(config.myTurn),
     extraction: resolveExtraction(config.extraction, corpora),
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,

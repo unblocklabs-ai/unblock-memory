@@ -50,7 +50,7 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
         const result = { status: "ok", credential,
           enabled: { skill: config.skillWhisperer.enabled, memory: config.memoryWhisperer.enabled && config.typesafe.enabled,
             complementaryHints: config.memoryWhisperer.complementaryHints, qualityAudit: config.qualityAudit.enabled, evidenceReview: config.evidenceReview.enabled,
-            safety: config.safetyWhisperer.enabled },
+            safety: config.safetyWhisperer.enabled, myTurn: config.myTurn.enabled && config.typesafe.enabled },
           safety: safetyStatus(api.config, config),
           whisperers: diagnostics.snapshot(active.agentId) };
         try {

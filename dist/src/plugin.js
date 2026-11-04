@@ -9,6 +9,7 @@ import { registerPeoplePrimerTool } from "./people-primer-tool.js";
 import { QmdMemoryRuntime } from "./runtime.js";
 import { registerSkillWhisperer } from "./skill-whisperer.js";
 import { registerSafetyWhisperer } from "./safety-whisperer.js";
+import { registerMyTurn } from "./my-turn.js";
 import { registerMemoryWhisperer } from "./memory-whisperer.js";
 import { registerWhispererPrompt } from "./whisperer-prompt.js";
 import { getContext } from "./tool-context.js";
@@ -512,6 +513,7 @@ export function registerUnblockMemory(api) {
         memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe, diagnostics),
         skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics),
         people: peopleWhisperer,
+        myTurn: registerMyTurn(api, config.myTurn, config.typesafe, diagnostics),
         safety: registerSafetyWhisperer(api, config, diagnostics),
     });
     api.registerTool((ctx) => createSearchTool(runtime, ctx, config.typesafe, diagnostics), { names: ["memory_search"] });

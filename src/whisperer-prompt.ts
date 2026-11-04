@@ -1,6 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 
-const ORDER = ["memory", "skill", "people", "safety"] as const;
+const ORDER = ["memory", "skill", "people", "myTurn", "safety"] as const;
 
 /** One host contribution keeps every whisperer after the user in a stable order; safety stays closest to the reply. */
 export function registerWhispererPrompt(
