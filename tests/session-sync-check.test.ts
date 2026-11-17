@@ -52,7 +52,7 @@ test("quiet checks avoid manager initialization, persist empty sessions, and res
   assert.equal(quiet?.lastIndexedAt, first.result.lastIndexedAt);
   assert.equal((await f.run()).result.embedded, 0);
   assert.equal(f.calls(), 1);
-  const cfg = { agents: { defaults: { userTimezone: "UTC" }, list: [{ id: "main", agentDir: f.root, workspace: f.root }] } };
+  const cfg = { agents: { defaults: { userTimezone: "UTC" }, entries: { main: { agentDir: f.root, workspace: f.root } } } };
   const runtime = new QmdMemoryRuntime([{ name: "sessions", kind: "sessions", chatTypes: ["channel", "group"],
     maxExpandedTokens: 500, syncIntervalMinutes: 60 }], { stateRoot: f.root });
   let managerCalls = 0;

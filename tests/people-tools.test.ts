@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { normalizeToolParameterSchema } from "@openclaw/ai/internal/openai";
+import { normalizeToolParameterSchema } from "@openclaw/ai/internal/tool-schema";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

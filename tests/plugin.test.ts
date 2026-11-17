@@ -80,7 +80,6 @@ test("flush plan honors disable, thresholds, model, and agent timezone", () => {
           memoryFlush: {
             softThresholdTokens: 1234,
             forceFlushTranscriptBytes: "3mb",
-            model: "local/fast",
           },
         },
       },
@@ -93,7 +92,13 @@ test("flush plan honors disable, thresholds, model, and agent timezone", () => {
   assert.equal(plan?.relativePath, "memory/2026-08-23.md");
   assert.equal(plan?.softThresholdTokens, 1234);
   assert.equal(plan?.forceFlushTranscriptBytes, 3 * 1024 * 1024);
-  assert.equal(plan?.model, "local/fast");
+  assert.equal(plan?.model, undefined);
+
+  // Older hosts still pass this field. Updating only the plugin must not reroute flushes.
+  const legacyFlush = { ...configured.agents.defaults.compaction.memoryFlush, model: " local/fast " };
+  assert.equal(resolveFlushPlan({ cfg: {
+    agents: { defaults: { compaction: { memoryFlush: legacyFlush } } },
+  } })?.model, "local/fast");
 });
 
 test("registers exactly the clean memory tool contract and validates every tool at execution", async () => {

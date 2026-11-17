@@ -17,7 +17,7 @@ function harness(myTurn: unknown = { enabled: true }, typesafe: unknown = creden
   const hooks = new Map<string, ((...args: never[]) => unknown)[]>();
   const warnings: string[] = [];
   const api = {
-    config: { agents: { list: [{ id: "bill", identity: { name: "Bill" } }] },
+    config: { agents: { entries: { bill: { identity: { name: "Bill" } } } },
       messages: { queue: { mode: "followup" } },
       plugins: { entries: { "unblock-memory": { hooks: { allowConversationAccess: true } } } } },
     pluginConfig: { myTurn, typesafe, ...(safetyWhisperer ? { safetyWhisperer } : {}) },
@@ -103,7 +103,7 @@ test("disabled providers, DMs, unknown routes and internal wakes never call Jev"
     { sessionKey: "agent:bill:imessage:group:chat1", messageProvider: "imessage" },
     { messageProvider: "imessage" }, { messageProvider: undefined }, { runId: undefined },
     { trigger: "cron" }, { trigger: "heartbeat" },
-    { inputProvenance: { kind: "internal_system" } }, { inputProvenance: { kind: "inter_session" } },
+    { inputProvenance: { kind: "internal_system" as const } }, { inputProvenance: { kind: "inter_session" as const } },
   ]) assert.equal(await h.before(event(), context(overrides)), undefined, JSON.stringify(overrides));
   assert.equal(api.fetch.mock.callCount(), 0);
   // Unlisted providers are on, as are provider entries without an enabled flag.

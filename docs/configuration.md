@@ -332,9 +332,14 @@ storage, `NO_REPLY` is appropriate. The date uses
 `agents.defaults.userTimezone`, otherwise the system timezone.
 
 Supported host settings: `enabled`, `softThresholdTokens` (default 4,000),
-`forceFlushTranscriptBytes` (default 2 MiB), and optional `model`. The plugin
+`forceFlushTranscriptBytes` (default 2 MiB). The plugin
 plan has a fixed 20,000-token reserve floor and supplies its own prompts; custom
 host `memoryFlush.prompt` / `systemPrompt` are not used by this resolver.
+
+OpenClaw 2026.11.5 and later use the session model and its normal fallbacks
+for flushes. If you previously set `memoryFlush.model` to keep flushes local,
+check that the session model and fallbacks are local before upgrading. On older
+hosts, the plugin still honors a configured flush model.
 
 Disable this plan with this **host config fragment**:
 

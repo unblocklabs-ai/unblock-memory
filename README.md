@@ -9,6 +9,7 @@ keyword or vector similarity.
 ## Quick start
 
 **Requirements:** Node.js 22+ and OpenClaw 2026.8.1-beta.3 or later.
+Use the Node version required by your OpenClaw release.
 A [TypeSafe](https://docs.typesafe.ai) API key enables usefulness ranking; without
 it, explicit search returns labeled local search leads.
 
