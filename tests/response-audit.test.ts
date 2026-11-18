@@ -502,9 +502,19 @@ test("uncertain or unassessable grades do not become score means, and retry back
   result.quality.deliverableFit.confidence = 0.4;
   const retrospective = await judgeResponseFollowup(e, { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal });
   retrospective.judgment!.correction.noul = 0.95;
-  store.save(cohort, e, { ...result, retrospective,
+  const evaluated = { ...result, retrospective,
     references: { sessionId: "s", request: [1], answer: [2], feedback: [3], followup: [4], inputHash: e.inputHash },
-    agentModel: e.model, contextLimited: false, memorySearchCalls: 0, memory: { status: "not_requested", candidates: [] } }, Date.now());
+    agentModel: e.model, contextLimited: false, memorySearchCalls: 0, memory: { status: "not_requested" as const, candidates: [] } };
+  store.save(cohort, e, evaluated, Date.now());
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 0);
+  store.stage(cohort, e, "quality", "failed-stage");
+  store.stageBegin(["failed-stage"], Date.now());
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 1, "a linked failed stage remains unfinished despite a saved aggregate");
+  store.stageSave("failed-stage", result.quality, Date.now());
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 0);
+  store.save(cohort, e, { ...evaluated, memory: { status: "unavailable", candidates: [] } }, Date.now());
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 1, "unavailable optional analysis must remain unresolved");
+  store.save(cohort, e, evaluated, Date.now());
   const independent = store.report(cohort, 0).groups[0]!;
   assert.equal(independent.assessable, 1);
   assert.equal(independent.fulfillmentScored, 1);
@@ -520,8 +530,13 @@ test("uncertain or unassessable grades do not become score means, and retry back
     assert.equal(store.needsJudgment(cohort, e, now), true);
     store.attempted(cohort, e, now);
     assert.equal(store.needsJudgment(cohort, e, now + 1), false);
+    assert.equal(store.unresolvedWork(cohort, e.timestamp, e.timestamp + 1), 1, "backoff is still unfinished work");
   }
   assert.equal(store.needsJudgment(cohort, e, 10_000_000), false);
+  assert.equal(store.pendingWork(cohort, 0, 10_000_000), 0);
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 1, "retry exhaustion must not look complete");
+  assert.equal(store.unresolvedWork("other-cohort", 0, Number.MAX_SAFE_INTEGER), 0);
+  assert.equal(store.unresolvedWork(cohort, 0, e.timestamp), 0, "review windows remain isolated");
 });
 
 test("performance deltas require like cohorts and per-dimension samples, with visible failure reasons", async t => {

@@ -143,6 +143,14 @@ export class ResponseAuditStore {
     return Number(this.#db.prepare(`SELECT COUNT(*) n FROM response_results WHERE cohort=? AND active=1 AND episode_at>=?
       AND status!='ok' AND attempts<3 AND (attempted_at IS NULL OR attempted_at<=?)`).get(cohort, since, now - 600_000)!.n);
   }
+  /** Retry eligibility is not completion: include backoff and exhausted work. */
+  unresolvedWork(cohort: string, since: number, until: number) {
+    return Number(this.#db.prepare(`SELECT COUNT(*) n FROM response_results r WHERE cohort=? AND active=1
+      AND episode_at>=? AND episode_at<? AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable' OR EXISTS (
+        SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
+        WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash AND (s.status IS NULL OR s.status!='ok')))`)
+      .get(cohort, since, until)!.n);
+  }
   stage<K extends keyof ResponseStages>(cohort: string, e: ResponseEpisode, stage: K, key: string): ResponseStages[K] | undefined {
     this.#db.prepare("INSERT OR IGNORE INTO response_stages(key,stage) VALUES(?,?)").run(key, stage);
     this.#db.prepare(`INSERT INTO response_stage_links VALUES(?,?,?,?,?) ON CONFLICT(cohort,episode_id,stage)

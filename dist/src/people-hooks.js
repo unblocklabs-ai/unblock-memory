@@ -1,5 +1,6 @@
 import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { nonBlank } from "./guards.js";
+import { renderPeopleDossier } from "./people-background.js";
 function identifier(value) {
     if (typeof value === "number" && Number.isFinite(value))
         return String(value);
@@ -112,18 +113,21 @@ export function registerPeopleHooks(api, stores, config) {
             const person = store.findPersonByIdentity("slack", accountScope, externalId);
             if (!person || person.status !== "active" || !person.injectionEnabled)
                 return;
-            const previous = store.getWhisperReceipt(threadKey, person.id);
+            // Refresh on every user turn, including reused/compacted Slack threads.
+            // A retry of this exact run replays the same snapshot.
+            const receiptKey = JSON.stringify([threadKey, runId]);
+            const previous = store.getWhisperReceipt(receiptKey, person.id);
             if (previous) {
                 return previous.runId === runId ? peopleContext(previous.contribution) : undefined;
             }
-            const blurb = store.getDossierBlurb(person.id);
-            const contribution = blurb
-                ? renderPeopleWhisper(blurb, config.whisperer.maxChars)
-                : undefined;
+            const dossier = store.getDossier(person.id);
+            const text = dossier && !store.isDossierVerified(person.id)
+                ? undefined : dossier ? renderPeopleDossier(dossier.dossier) : undefined;
+            const contribution = text ? renderPeopleWhisper(text, config.whisperer.maxChars) : undefined;
             if (!contribution)
                 return;
             const receipt = store.recordWhisperReceipt({
-                threadKey,
+                threadKey: receiptKey,
                 personId: person.id,
                 runId,
                 contribution,

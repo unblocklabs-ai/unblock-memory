@@ -35,6 +35,8 @@ export class AgentTranscriptReader {
     #compressed;
     #cold;
     #utf8Storage;
+    #indexed;
+    #classified;
     constructor(db, agentId, errorMessage) {
         this.db = db;
         const version = agentTranscriptSchemaVersion(db, errorMessage);
@@ -59,6 +61,11 @@ export class AgentTranscriptReader {
         this.#cold = columns("session_transcript_cold_archives").has("session_id");
         if (version >= 20 && !this.#cold)
             throw new Error("Unsupported transcript cold-storage capabilities");
+        const index = columns("session_transcript_index_state");
+        this.#indexed = ["session_id", "indexed_seq", "needs_rebuild"].every(name => index.has(name));
+        if ((version >= 25 || index.size > 0) && !this.#indexed)
+            throw new Error("Unsupported transcript index capabilities");
+        this.#classified = columns("session_transcript_active_events").has("context_eligible");
     }
     /** Include storage availability in incremental fingerprints, not just hot row counts. */
     coldSql(sessionIdExpression) {
@@ -74,6 +81,15 @@ export class AgentTranscriptReader {
             return { kind: "unreadable" };
         if (this.#cold && this.db.prepare("SELECT 1 FROM session_transcript_cold_archives WHERE session_id=?").get(sessionId)) {
             return { kind: "cold" };
+        }
+        if (this.#indexed) {
+            const state = this.db.prepare("SELECT indexed_seq,needs_rebuild FROM session_transcript_index_state WHERE session_id=?").get(sessionId);
+            const latest = this.db.prepare("SELECT COALESCE(MAX(seq),0) seq FROM transcript_events WHERE session_id=?").get(sessionId);
+            if (!state || state.needs_rebuild !== 0 || state.indexed_seq !== latest.seq)
+                return { kind: "unreadable" };
+        }
+        if (this.#classified && this.db.prepare("SELECT 1 FROM session_transcript_active_events WHERE session_id=? AND context_eligible IS NULL LIMIT 1").get(sessionId)) {
+            return { kind: "unreadable" };
         }
         const maxEvents = limits.maxEvents ?? 50_000, maxBytes = limits.maxBytes ?? 64 * 1024 * 1024;
         const maxSeq = limits.maxSeq ?? Number.MAX_SAFE_INTEGER;

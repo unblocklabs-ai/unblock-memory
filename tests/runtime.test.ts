@@ -92,7 +92,7 @@ test("schedules configured agents after the interval, retries failures, and stop
     if (agentId === "first") throw new Error("cannot start");
     return { status: "already_running", startedAt: "now" };
   });
-  const cfg = { agents: { list: [{ id: "first" }, { id: "second" }] } };
+  const cfg = { agents: { entries: { first: {}, second: {} } } };
   runtime.startSessionSyncSchedule(cfg, (error) => errors.push(error));
   runtime.startSessionSyncSchedule(cfg, (error) => errors.push(error));
   t.mock.timers.tick(15 * 60_000 - 1);

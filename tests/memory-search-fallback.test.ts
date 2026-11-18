@@ -106,7 +106,7 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
     registerUnblockMemory({
       pluginConfig: { typesafe: credential === "disabled" ? { enabled: false, apiKey: "ignored" }
         : credential === "unreadable" ? { apiKeyFile: "/dev/null/not-a-file" } : {} },
-      registerCli() {}, registerGatewayMethod() {},
+      registerCli() {}, registerService() {}, on() {}, registerGatewayMethod() {},
       registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
         Object.defineProperty(runtime, "getMemorySearchManager", { value: async () => ({ manager }) });
       },

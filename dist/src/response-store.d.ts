@@ -59,6 +59,8 @@ export declare class ResponseAuditStore {
         due: number;
     };
     pendingWork(cohort: string, since: number, now: number): number;
+    /** Retry eligibility is not completion: include backoff and exhausted work. */
+    unresolvedWork(cohort: string, since: number, until: number): number;
     stage<K extends keyof ResponseStages>(cohort: string, e: ResponseEpisode, stage: K, key: string): ResponseStages[K] | undefined;
     stageBegin(keys: string[], now: number): void;
     stageSave<K extends keyof ResponseStages>(key: string, result: ResponseStages[K], now: number): void;

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -238,7 +238,8 @@ test("session-scoped passes skip unchanged payloads and resume bounded appends, 
 });
 
 test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies, archives, caching and reports", async t => {
-  const root = await mkdtemp(join(tmpdir(), "inside-out-sdk-"));
+  // The SDK archive owner compares canonical database paths; macOS /var is an alias.
+  const root = await realpath(await mkdtemp(join(tmpdir(), "inside-out-sdk-")));
   const state = join(root, "state"), time = Date.UTC(2026, 9, 2, 12, 0, 0, 250);
   const messages = [user("Please help."), assistant("<details><summary>Update</summary>Here you go.</details>"),
     user("Great!", "bek", time + 2000), user("Also this, please.", "bek", time + 3000),
@@ -406,10 +407,12 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     "manual-only startup publishes the next completed week without inference");
   assert.equal(cliResult.output[8][0].weekly.joy.count, 0);
   assert.equal(cliResult.calls, 8, "reports and the cached background pass do not repeat inference");
-  // Evolve the real SDK-written store after the old SDK writer has finished.
+  // Older writers need the compression transition; the current SDK writes it natively.
   const evolved = new DatabaseSync(options.databasePath);
   try {
-    compressAgentTranscripts(evolved);
+    if (!evolved.prepare("PRAGMA table_info(transcript_events)").all().some(column => column.name === "event_zstd")) {
+      compressAgentTranscripts(evolved);
+    }
     // Force a reread; unchanged metadata alone would not prove decoding works.
     evolved.exec("UPDATE transcript_rewrite_watermarks SET generation='compressed-fixture'");
     const reread = await runInsideOut({ ...options, config: cfg() });
@@ -419,14 +422,25 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     const last = evolved.prepare(`SELECT max(e.seq) seq,max(a.active_position) position FROM transcript_events e
       JOIN session_transcript_active_events a ON a.session_id=e.session_id AND a.event_seq=e.seq
       WHERE e.session_id='live'`).get()!;
-    for (const [i, message] of [assistant("New compressed answer."), user("That makes me happy!", "bek", time + 21_000)].entries()) {
-      const bytes = Buffer.from(JSON.stringify(event(`compressed-${i}`, message, new Date(time + 20_000 + i * 1000).toISOString())));
-      const seq = Number(last.seq) + i + 1, position = Number(last.position) + i + 1;
-      evolved.prepare(`INSERT INTO transcript_events(session_id,seq,event_json,created_at,event_zstd,event_utf8_bytes)
-        VALUES('live',?,NULL,?,?,?)`).run(seq, time + 20_000 + i * 1000, zstdCompressSync(bytes), bytes.byteLength);
-      evolved.prepare(`INSERT INTO session_transcript_active_events(session_id,active_position,event_seq,message_position)
-        VALUES('live',?,?,?)`).run(position, seq, position);
-    }
+    // The SDK owns payload/navigation encoding. Large whitespace compresses while
+    // preserving the visible messages after the reader's normal trimming.
+    const appendedMessages = [assistant("New compressed answer." + " ".repeat(100_000)),
+      user("That makes me happy!" + " ".repeat(100_000), "bek", time + 21_000)];
+    const appendPath = join(root, "append-fixture.mjs");
+    await writeFile(appendPath, `
+      Date.now = () => ${time + 22_000};
+      const transcript = await import(${JSON.stringify(import.meta.resolve("openclaw/plugin-sdk/session-transcript-runtime"))});
+      for (const [i,message] of ${JSON.stringify(appendedMessages)}.entries()) {
+        const result = await transcript.appendSessionTranscriptMessageByIdentity({agentId:"main",sessionId:"live",
+          sessionKey:"agent:main:discord:direct:bek",eventId:"compressed-"+i,now:${time + 20_000}+i*1000,message});
+        if (!result?.appended) throw new Error("SDK did not append compressed fixture message");
+      }
+    `);
+    await promisify(execFile)(process.execPath, [appendPath], {
+      cwd: root, env: { ...process.env, OPENCLAW_STATE_DIR: state }, timeout: 45_000,
+    });
+    assert.equal(evolved.prepare("SELECT count(*) n FROM transcript_events WHERE session_id='live' AND seq>? AND event_zstd IS NOT NULL")
+      .get(last.seq!)!.n, 2);
     const fresh = await runInsideOut({ ...options, config: cfg() });
     assert.deepEqual("errors" in fresh && fresh.errors, []);
     assert.equal("reviewed" in fresh && fresh.reviewed, 1);
@@ -436,7 +450,10 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     const compressedRows = reportInsideOut(options.storePath);
     assert.equal(compressedRows.length, 9);
     assert.ok(compressedRows.some(row => row.message_id === "compressed-1" && row.joy === 0.85));
-    evolved.prepare("INSERT INTO session_transcript_cold_archives VALUES ('live')").run();
+    // A valid cold marker with an unavailable archive must remain a source gap.
+    evolved.prepare(`INSERT INTO session_transcript_cold_archives
+      (session_id,generation,archive_name,archive_sha256,event_count,raw_bytes,archive_bytes,last_seq,archived_at,storage)
+      VALUES ('live','fixture','missing.jsonl.zst',?,1,0,0,?,?,'file')`).run("0".repeat(64), Number(last.seq) + 2, time);
     const cold = await runInsideOut({ ...options, config: cfg(), sessionId: "live" });
     assert.ok("errors" in cold && cold.errors.length);
     assert.deepEqual(reportInsideOut(options.storePath), compressedRows);

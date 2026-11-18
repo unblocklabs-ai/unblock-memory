@@ -24,6 +24,7 @@ import { prepareQueryConversation, QueryInputBudgetError } from "./query-contrac
 import { resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
+import { registerPeopleLearning, registerPeopleLearningCli } from "./people-learning-runtime.js";
 function managerUnavailable(error) {
     return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
 }
@@ -461,6 +462,7 @@ export function resolveFlushPlan(params = {}) {
 }
 export function registerUnblockMemory(api) {
     const config = resolveConfig(api.pluginConfig);
+    registerPeopleLearningCli(api, config);
     registerResponseAudit(api, config);
     registerInsideOut(api, config);
     registerMemoryTraining(api, config);
@@ -493,11 +495,13 @@ export function registerUnblockMemory(api) {
         api.on("gateway_stop", () => runtime.stopSessionSyncSchedule());
     }
     let peopleWhisperer;
+    const peopleStores = new PeopleStores({
+        maxOpenTodos: config.people.todos.maxOpen,
+        maxBlurbChars: config.people.whisperer.maxChars,
+    });
+    // Always reconcile so disabling PeopleSQL also disables previously owned jobs.
+    registerPeopleLearning(api, config, peopleStores);
     if (config.people.enabled) {
-        const peopleStores = new PeopleStores({
-            maxOpenTodos: config.people.todos.maxOpen,
-            maxBlurbChars: config.people.whisperer.maxChars,
-        });
         peopleWhisperer = registerPeopleHooks(api, peopleStores, config.people);
         registerPeopleTools(api, peopleStores, config, runtime);
         registerPeoplePrimerTool(api, runtime, peopleStores, config);

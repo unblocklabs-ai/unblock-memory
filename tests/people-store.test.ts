@@ -5,8 +5,45 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { PeopleStore, PeopleStores } from "../src/people-store.js";
+import { renderPeopleDossier } from "../src/people-background.js";
 
 const options = { maxOpenTodos: 2, maxBlurbChars: 1200 };
+
+test("persists scoped preferences, expires provisional lessons, and rejects unbounded inferred claims", async () => {
+  const store = new PeopleStore(await temporaryPath(), options);
+  try {
+    const person = store.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U123" }).person;
+    const dossier: import("../src/people-store.js").PersonDossier = {
+      schemaVersion: 1, blurb: "Mira leads ExampleCo.", sections: [
+        { category: "preferences", claims: [{ statement: "Give the recommendation first.", scope: "Status updates", reviewedAt: "2026-11-16T12:00:00Z",
+          epistemicType: "reported", evidence: [{ source: "manual", locator: "Slack default/U123 message 1" }] }] },
+        { category: "workingStyle", claims: [{ statement: "Offer one next step when progress is blocked.", scope: "Mira's blocked requests",
+          epistemicType: "agent_assessment", reviewedAt: "2026-11-16T12:00:00Z", expiresAt: "2026-11-23T12:00:00Z",
+          evidence: [{ source: "manual", locator: "Slack default/U123 exchange 2" }] }] },
+      ],
+    };
+    store.replaceDossier(person.id, "Verified feedback and a limited trial", dossier);
+    const saved = store.getDossier(person.id)!.dossier;
+    const unreviewedLegacy = structuredClone(saved);
+    delete unreviewedLegacy.sections[0]!.claims[0]!.reviewedAt;
+    assert.doesNotMatch(renderPeopleDossier(unreviewedLegacy, Date.parse("2026-11-17T00:00:00Z")), /Give the recommendation first/);
+    assert.match(renderPeopleDossier(saved, Date.parse("2026-11-17T00:00:00Z")), /Provisional agent lesson/);
+    const afterExpiry = renderPeopleDossier(saved, Date.parse("2026-11-24T00:00:00Z"));
+    assert.match(afterExpiry, /Give the recommendation first.*Scope: Status updates/);
+    assert.doesNotMatch(afterExpiry, /Offer one next step/);
+    const claim = dossier.sections[1]!.claims[0]!;
+    delete claim.expiresAt;
+    assert.throws(() => store.replaceDossier(person.id, "Unbounded trial", dossier), /expiresAt/);
+    claim.expiresAt = "2027-01-01T00:00:00Z";
+    assert.throws(() => store.replaceDossier(person.id, "Too long", dossier), /30 days/);
+    claim.expiresAt = "2026-11-23T12:00:00Z";
+    dossier.sections[1]!.category = "role";
+    assert.throws(() => store.replaceDossier(person.id, "Inferred title", dossier), /preference\/workingStyle/);
+    store.softDeletePerson(person.id);
+    assert.equal(store.listActivePeople(100).length, 0);
+    assert.equal(store.listActivePeople(100, 0, true).length, 1, "full review includes inactive records without restoring them");
+  } finally { store.close(); }
+});
 
 async function temporaryPath(name = "people.sqlite"): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-people-"));
@@ -839,6 +876,11 @@ test("migrates version 3 to version 4 without changing existing people data", as
     assert.equal(migrated.getPerson(person.id)?.displayName, "Bek");
     assert.deepEqual(migrated.getDossier(person.id)?.dossier, dossier);
     assert.deepEqual(migrated.listDossierChanges(person.id), []);
+    assert.equal(migrated.isDossierVerified(person.id), false);
+    assert.equal(migrated.getDossierRevision(person.id), null);
+    migrated.recordDossierVerification(person.id, null, "Complete validation of original legacy evidence and newer corrections");
+    assert.equal(migrated.isDossierVerified(person.id), true);
+    assert.deepEqual(migrated.getDossier(person.id)?.dossier, dossier, "verification establishes a revision without rewriting the old dossier");
     assert.equal(migrated.deleteDossier(person.id, "No longer useful"), true);
     assert.equal(migrated.listDossierChanges(person.id)[0]?.action, "delete");
     const db = new DatabaseSync(path, { readOnly: true });

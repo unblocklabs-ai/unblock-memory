@@ -260,11 +260,15 @@ the former allows vector fallback; the latter suppresses the hint.
 | --- | --- | --- |
 | `people.enabled` | `false` | Store, Slack identity observation, people tools; independent of injection |
 | `people.whisperer.enabled` | `false` | Exact-identity prompt injection; requires people enabled |
-| `people.whisperer.maxChars` | `1200` | 1–4,000; also the **stored new-dossier blurb character limit even when injection is off**; independent 70-word ceiling remains |
+| `people.whisperer.maxChars` | `1200` | 1–4,000; combined identity/preferences context limit even when injection is off; the identity blurb retains its independent 70-word ceiling |
 | `people.todos.maxOpen` | `1000` | 1–10,000; bounded open data-quality todos with overflow accounting |
+| `people.learning.enabled` | Follows People Whisperer | Private nightly learning and complete weekly validation; [configuration, migration and rollout](people-learning.md) |
+| `people.learning.nightlySchedule` | `10 3 * * *` | Previous completed local day, all conversation types |
+| `people.learning.weeklySchedule` | `0 4 * * 0` | Every assertion for people active in the completed local week, plus legacy bootstrap |
+| `people.learning.agents.<id>` | Inherit | Per-agent opt-outs, schedules and timezone |
 | `peoplePrimer.enabled` | `false` | Requires people enabled + explicit approved corpora; controls evidence primer and automatic save review |
 | `peoplePrimer.corpora` | `[]` | Explicit configured non-skill evidence approvals; sessions means all indexed sessions |
-| `peoplePrimer.hitsPerQuestion` | `30` | 1–40 vector results for each of three questions, before provider grading |
+| `peoplePrimer.hitsPerQuestion` | `30` | 1–40 vector results for each of five identity/interaction questions, before provider grading |
 | `peoplePrimer.minScore` | `0.35` | 0–1 vector admission threshold |
 | `peoplePrimer.minUsefulness` | `0.8` | 0.5–1; all background eligibility dimensions must pass |
 | `peoplePrimer.maxEvidencePerQuestion` | `3` | 1–10 selected evidence references per question, **not** a cap on grading work |

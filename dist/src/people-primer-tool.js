@@ -26,7 +26,7 @@ export function registerPeoplePrimerTool(api, runtime, stores, config) {
             return null;
         return {
             name: "memory_people_prime", label: "Prime Person Dossier",
-            description: "Prepare background-only evidence using three identity/organization/agent-relationship questions. Supply draft to review a final <=70-word snippet against indexed citations instead of searching. Requires peoplePrimer opt-in and approved corpora. Sends identity, approved excerpts and optional draft to TypeSafe, never the existing dossier. Advisory; never writes dossiers.",
+            description: "Prepare evidence about identity, organization, agent relationship, explicit interaction preferences and working-style feedback, including newer corrections. Supply draft to review only an identity blurb <=70 words. Dossier writes review all preference claims separately. Requires peoplePrimer and approved corpora; never writes dossiers.",
             parameters,
             async execute(_id, params, signal) {
                 const { personId, agentName: suppliedName, draft } = Value.Parse(parameters, params);

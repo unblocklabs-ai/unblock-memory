@@ -48,6 +48,8 @@ test("quality audit is inert when disabled or an explicit key file is absent", a
         typesafe: { apiKeyFile: join(root, "missing.env") },
       },
       registerCli() {},
+      registerService() {},
+      on() {},
       registerGatewayMethod() {},
       registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
         Object.defineProperty(capability.runtime, "getMemorySearchManager", {
@@ -106,6 +108,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
     pluginConfig: {},
     on(name: string) { hooks.push(name); },
     registerCli() {},
+    registerService() {},
     registerGatewayMethod() {},
     registerMemoryCapability() {},
     registerTool(
@@ -120,6 +123,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
   assert.deepEqual(
     registrations.flatMap((registration) => registration.names),
     [
+      "memory_people_learning",
       "memory_search",
       "memory_get",
       "memory_sync_sessions",
@@ -221,7 +225,9 @@ test("memory search compacts judged results without changing evidence or request
   let getFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   const api = {
     pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
+    on() {},
     registerCli() {},
+    registerService() {},
     registerGatewayMethod() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
       runtime = capability.runtime;
@@ -378,6 +384,7 @@ test("session sync tools accept and report status without awaiting cold initiali
       ],
     },
     registerCli() {},
+    registerService() {},
     registerGatewayMethod() {},
     registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) {
       runtime = capability.runtime;
@@ -398,7 +405,7 @@ test("session sync tools accept and report status without awaiting cold initiali
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;
   }
   assert.ok(runtime);
-  assert.deepEqual(hooks, ["gateway_start", "gateway_stop"]);
+  assert.ok(hooks.includes("gateway_start") && hooks.includes("gateway_stop"));
 
   let releaseManager = () => {};
   const managerGate = new Promise<void>((resolve) => {
@@ -453,7 +460,7 @@ test("an explicit Skill Whisperer enable without a skills corpus warns instead o
     const warnings: string[] = [], hooks: string[] = [];
     registerUnblockMemory({
       pluginConfig, on(name: string) { hooks.push(name); },
-      registerCli() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
+      registerCli() {}, registerService() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
       logger: { warn(message: string) { warnings.push(message); }, info() {}, debug() {}, error() {} },
     } as unknown as OpenClawPluginApi);
     assert.equal(warnings.some(w => w.includes('no corpus has kind "skills"')), warned, JSON.stringify(pluginConfig));

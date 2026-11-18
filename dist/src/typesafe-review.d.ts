@@ -10,6 +10,8 @@ export declare function reviewTypeSafeClaim(params: RequestOptions & {
     personBackground?: {
         name: string;
         agentName: string;
+        kind?: "interaction";
+        inferred?: boolean;
     };
 }): Promise<{
     needsReview: boolean;

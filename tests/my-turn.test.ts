@@ -23,7 +23,7 @@ function harness(myTurn: unknown = { enabled: true }, typesafe: unknown = creden
     pluginConfig: { myTurn, typesafe, ...(safetyWhisperer ? { safetyWhisperer } : {}) },
     logger: { warn(message: string) { warnings.push(message); } },
     on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, [...hooks.get(name) ?? [], handler]); },
-    registerCli() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
+    registerCli() {}, registerService() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
   } as unknown as OpenClawPluginApi;
   registerUnblockMemory(api);
   const before = hooks.get("before_prompt_build")?.[0] as PromptHook | undefined;
@@ -103,7 +103,7 @@ test("disabled providers, DMs, unknown routes and internal wakes never call Jev"
     { sessionKey: "agent:bill:imessage:group:chat1", messageProvider: "imessage" },
     { messageProvider: "imessage" }, { messageProvider: undefined }, { runId: undefined },
     { trigger: "cron" }, { trigger: "heartbeat" },
-    { inputProvenance: { kind: "internal_system" } }, { inputProvenance: { kind: "inter_session" } },
+    { inputProvenance: { kind: "internal_system" as const } }, { inputProvenance: { kind: "inter_session" as const } },
   ]) assert.equal(await h.before(event(), context(overrides)), undefined, JSON.stringify(overrides));
   assert.equal(api.fetch.mock.callCount(), 0);
   // Unlisted providers are on, as are provider entries without an enabled flag.

@@ -60,7 +60,7 @@ test("all eligible shortlist hits are graded, cross-question spans deduplicate, 
     return Array.from({ length: 30 }, (_, i) => hit({ path: `qmd://memory/${i}.md`, snippet: `Mira leads team ${i}.` }));
   } });
   assert.equal(result.status, "ok");
-  assert.equal(searches, 3);
+  assert.equal(searches, 5);
   assert.equal(requests.length, 30, "not just five final evidence items");
   assert.equal(result.stats?.uniqueCandidates, 30);
   assert.equal(result.questions?.[0].qualifying, 30);
@@ -68,7 +68,7 @@ test("all eligible shortlist hits are graded, cross-question spans deduplicate, 
   assert.equal(result.questions?.[0].coverage, "evidence_found");
   assert.equal(result.evidence?.length, 3, "shared excerpts are not repeated across questions");
   assert.equal(result.questions?.[0].evidence[0].evidenceId, result.evidence?.[0].id);
-  assert.equal(Object.keys(requests[0].questions).length, 7);
+  assert.equal(Object.keys(requests[0].questions).length, 9);
   assert.equal(JSON.stringify(requests[0]).includes("qmd://"), false);
   assert.equal(f.store.getDossier(f.personId), undefined);
 });

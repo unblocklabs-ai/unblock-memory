@@ -2,7 +2,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { Person, PersonDossier } from "./people-store.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import type { getContext } from "./tool-context.js";
-/** Review the injected blurb using only exact indexed references already on its claims. */
+/** Review every saved assertion against its own evidence, including interaction lessons. */
 export declare function reviewPersonDossier(params: {
     config: UnblockMemoryConfig;
     runtime: QmdMemoryRuntime;
@@ -38,4 +38,8 @@ export declare function reviewPersonDossier(params: {
     status: "unavailable";
     needsReview: boolean;
     reason: string;
+} | {
+    status: "ok";
+    needsReview: boolean;
+    assertionsReviewed: number;
 }>;

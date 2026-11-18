@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import { resolveExtraction } from "./extraction-config.js";
 import { resolveResponseAudit } from "./response-config.js";
 import { resolvePeoplePrimer } from "./people-primer-config.js";
+import { DEFAULT_LEARNING, resolvePeopleLearning } from "./people-learning-config.js";
 import { resolveInsideOut } from "./inside-out.js";
 import { resolveSafetyWhisperer } from "./safety-config.js";
 import { resolveMyTurn } from "./my-turn.js";
@@ -20,6 +21,7 @@ export const DEFAULT_PEOPLE_CONFIG = {
     enabled: false,
     whisperer: { enabled: false, maxChars: 1200 },
     todos: { maxOpen: 1000 },
+    learning: DEFAULT_LEARNING,
 };
 const DEFAULT_TYPESAFE_CONFIG = {
     enabled: true,
@@ -261,7 +263,7 @@ function resolvePeople(value) {
         throw new Error("unblock-memory people must be an object");
     }
     const people = value;
-    assertOnlyKeys(people, ["enabled", "whisperer", "todos"], "people");
+    assertOnlyKeys(people, ["enabled", "whisperer", "todos", "learning"], "people");
     const enabled = people.enabled ?? false;
     if (typeof enabled !== "boolean")
         throw new Error("unblock-memory people.enabled must be a boolean");
@@ -283,6 +285,7 @@ function resolvePeople(value) {
     assertOnlyKeys(todosRecord, ["maxOpen"], "people.todos");
     return {
         enabled,
+        learning: resolvePeopleLearning(people.learning, enabled && whispererEnabled),
         whisperer: {
             enabled: whispererEnabled,
             maxChars: positiveInteger(whispererRecord.maxChars, DEFAULT_PEOPLE_CONFIG.whisperer.maxChars, "people.whisperer.maxChars", 4000),

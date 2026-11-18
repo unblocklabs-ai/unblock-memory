@@ -106,7 +106,7 @@ test("directory sync repairs already-enriched ID names and primer searches the h
     apiKey: "unused", signal: new AbortController().signal,
     search: async query => { queries.push(query); return []; },
   });
-  assert.equal(queries.length, 3);
+  assert.equal(queries.length, 5);
   assert.ok(queries.every(query => query.includes("Mira Example") && !query.includes("U123")));
   assert.equal((await syncSlackDirectory({ store, reader, accountId: "workspace", limit: 10 })).unchanged, 1);
 });
@@ -140,7 +140,7 @@ test("preserves Slack flags through ingestion and excludes bots and deactivated 
       config: config.peoplePrimer, apiKey: "fake-key", signal: new AbortController().signal,
       search: async () => { searches++; return []; },
     });
-    assert.equal(searches, id === "bot" || id === "gone" ? 0 : 3);
+    assert.equal(searches, id === "bot" || id === "gone" ? 0 : 5);
     assert.equal(result.status, id === "gone" ? "not_found" : id === "bot" ? "unavailable" : "ok");
   }
   members = [{ id: "bot" }];

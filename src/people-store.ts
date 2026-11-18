@@ -7,7 +7,7 @@ import { resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-fou
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
+import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS, renderPeopleDossier } from "./people-background.js";
 import { agentStateDir } from "./agent-paths.js";
 
 const BASELINE_DOSSIER_CATEGORIES = [
@@ -52,6 +52,9 @@ const claimSchema = Type.Object(
     confidence: Type.Optional(
       Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
     ),
+    scope: Type.Optional(Type.String({ pattern: "\\S", maxLength: 200 })),
+    reviewedAt: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
+    expiresAt: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
   },
   { additionalProperties: false },
 );
@@ -78,12 +81,12 @@ const PERSON_DOSSIER_SCHEMA = Type.Object(
 export const PERSON_DOSSIER_WRITE_SCHEMA = Type.Object({
   ...PERSON_DOSSIER_SCHEMA.properties,
   sections: Type.Array(Type.Object({
-    category: Type.Enum(["role", "relationship"]),
+    category: Type.Enum(["role", "relationship", "preferences", "workingStyle"]),
     claims: Type.Array(Type.Object({
       ...claimSchema.properties,
-      epistemicType: Type.Enum(["observed", "reported"]),
+      epistemicType: Type.Enum(["observed", "reported", "agent_assessment"]),
     }, { additionalProperties: false }), { minItems: 1, maxItems: 100 }),
-  }, { additionalProperties: false }), { maxItems: 2 }),
+  }, { additionalProperties: false }), { maxItems: 4 }),
 }, { additionalProperties: false });
 
 export type PersonDossier = Static<typeof PERSON_DOSSIER_SCHEMA>;
@@ -326,6 +329,7 @@ export class PeopleStore {
   readonly #maxOpenTodos: number;
   readonly #maxBlurbChars: number;
   #primerCacheReady = false;
+  #dossierVerificationReady = false;
 
   constructor(path: string, options: { maxOpenTodos: number; maxBlurbChars: number }) {
     this.#db = openMemoryDatabase(path);
@@ -593,15 +597,15 @@ export class PeopleStore {
     });
   }
 
-  listActivePeople(limit = 50, offset = 0): Person[] {
+  listActivePeople(limit = 50, offset = 0, includeInactive = false): Person[] {
     return this.#db
       .prepare(`
       SELECT * FROM people
-      WHERE status = 'active'
+      WHERE (? OR status = 'active')
       ORDER BY last_seen_at DESC, id
       LIMIT ? OFFSET ?
     `)
-      .all(limit, offset)
+      .all(includeInactive ? 1 : 0, limit, offset)
       .map((row) => person(row as PersonRow));
   }
 
@@ -633,6 +637,42 @@ export class PeopleStore {
     const row = this.#db.prepare("SELECT id FROM person_dossier_changes WHERE person_id = ? ORDER BY rowid DESC LIMIT 1")
       .get(personId) as { id: string } | undefined;
     return row?.id ?? null;
+  }
+
+  isDossierVerified(personId: string): boolean {
+    this.#ensureDossierVerification();
+    const row = this.#db.prepare("SELECT revision FROM person_dossier_verification WHERE person_id=?").get(personId);
+    return !!row && row.revision === this.getDossierRevision(personId);
+  }
+
+  recordDossierVerification(personId: string, revision: string | null, verification: string): void {
+    this.#ensureDossierVerification();
+    immediateTransaction(this.#db, () => {
+      if (this.getDossierRevision(personId) !== revision) throw new DossierConflictError();
+      if (revision === null) {
+        const existing = this.#db.prepare("SELECT dossier_json FROM person_dossiers WHERE person_id=?").get(personId);
+        if (!existing) throw new DossierConflictError();
+        // Pre-v4 dossiers have no change revision. Establish a baseline snapshot
+        // without rewriting their data or pretending the old write happened now.
+        revision = randomUUID();
+        this.#db.prepare(`INSERT INTO person_dossier_changes
+          (id,person_id,action,before_dossier_json,after_dossier_json,reason,changed_at)
+          VALUES (?,?,'replace',?,?,?,?)`).run(revision, personId, existing.dossier_json!, existing.dossier_json!,
+            "Legacy baseline after complete source validation", new Date().toISOString());
+      }
+      this.#db.prepare(`INSERT INTO person_dossier_verification VALUES (?,?,?,?) ON CONFLICT(person_id) DO UPDATE SET
+        revision=excluded.revision,verification=excluded.verification,verified_at=excluded.verified_at`)
+        .run(personId, revision, verification, new Date().toISOString());
+    });
+  }
+
+  #ensureDossierVerification(): void {
+    if (this.#dossierVerificationReady) return;
+    this.#db.exec(`CREATE TABLE IF NOT EXISTS person_dossier_verification (
+      person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
+      revision TEXT NOT NULL, verification TEXT NOT NULL, verified_at TEXT NOT NULL
+    ) STRICT`);
+    this.#dossierVerificationReady = true;
   }
 
   /** Returns undefined when the person does not exist. */
@@ -1003,6 +1043,24 @@ export class PeopleStore {
     }
     if (backgroundWordCount(dossier.blurb) > PEOPLE_BACKGROUND_MAX_WORDS) {
       throw new Error(`dossier blurb must not exceed ${PEOPLE_BACKGROUND_MAX_WORDS} words`);
+    }
+    for (const section of dossier.sections) for (const claim of section.claims) {
+      if (["preferences", "workingStyle"].includes(section.category) && (!claim.reviewedAt || !claim.scope)) {
+        throw new Error("Interaction claims require explicit scope and reviewedAt after source verification");
+      }
+      for (const date of [claim.reviewedAt, claim.expiresAt]) {
+        if (date !== undefined && !Number.isFinite(Date.parse(date))) throw new Error("Invalid claim review/expiry date");
+      }
+      if (claim.epistemicType === "agent_assessment") {
+        if (!["preferences", "workingStyle"].includes(section.category) || !claim.reviewedAt || !claim.expiresAt) {
+          throw new Error("Agent lessons require a preference/workingStyle section, reviewedAt and expiresAt");
+        }
+        const lifetime = Date.parse(claim.expiresAt) - Date.parse(claim.reviewedAt);
+        if (lifetime <= 0 || lifetime > 30 * 86400000) throw new Error("Agent lessons must expire within 30 days of review");
+      }
+    }
+    if (renderPeopleDossier(dossier).length > this.#maxBlurbChars) {
+      throw new Error(`Combined people context must not exceed ${this.#maxBlurbChars} characters`);
     }
   }
 

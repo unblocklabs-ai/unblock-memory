@@ -16,6 +16,8 @@ export declare function reviewIndexedClaim(params: {
     personBackground?: {
         name: string;
         agentName: string;
+        kind?: "interaction";
+        inferred?: boolean;
     };
     read?: <T>(run: () => T) => Promise<T>;
 }): Promise<{

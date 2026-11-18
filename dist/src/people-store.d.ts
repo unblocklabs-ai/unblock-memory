@@ -13,14 +13,17 @@ declare const PERSON_DOSSIER_SCHEMA: Type.TObject<{
             }>>;
             epistemicType: Type.TUnion<[Type.TLiteral<"observed">, Type.TLiteral<"reported">, Type.TLiteral<"inferred">, Type.TLiteral<"agent_assessment">]>;
             confidence: Type.TOptional<Type.TUnion<[Type.TLiteral<"low">, Type.TLiteral<"medium">, Type.TLiteral<"high">]>>;
+            scope: Type.TOptional<Type.TString>;
+            reviewedAt: Type.TOptional<Type.TString>;
+            expiresAt: Type.TOptional<Type.TString>;
         }>>;
     }>>;
 }>;
 export declare const PERSON_DOSSIER_WRITE_SCHEMA: Type.TObject<{
     sections: Type.TArray<Type.TObject<{
-        category: Type.TEnum<["role", "relationship"]>;
+        category: Type.TEnum<["role", "relationship", "preferences", "workingStyle"]>;
         claims: Type.TArray<Type.TObject<{
-            epistemicType: Type.TEnum<["observed", "reported"]>;
+            epistemicType: Type.TEnum<["observed", "reported", "agent_assessment"]>;
             statement: Type.TString;
             evidence: Type.TArray<Type.TObject<{
                 source: Type.TUnion<[Type.TLiteral<"session">, Type.TLiteral<"memory">, Type.TLiteral<"directory">, Type.TLiteral<"manual">]>;
@@ -28,6 +31,9 @@ export declare const PERSON_DOSSIER_WRITE_SCHEMA: Type.TObject<{
                 observedAt: Type.TOptional<Type.TString>;
             }>>;
             confidence: Type.TOptional<Type.TUnion<[Type.TLiteral<"low">, Type.TLiteral<"medium">, Type.TLiteral<"high">]>>;
+            scope: Type.TOptional<Type.TString>;
+            reviewedAt: Type.TOptional<Type.TString>;
+            expiresAt: Type.TOptional<Type.TString>;
         }>>;
     }>>;
     schemaVersion: Type.TLiteral<1>;
@@ -132,27 +138,32 @@ export declare class PeopleStore {
         name: string;
         primaryDomain?: string;
     }): Company | undefined;
-    listActivePeople(limit?: number, offset?: number): Person[];
+    listActivePeople(limit?: number, offset?: number, includeInactive?: boolean): Person[];
     findIdentity(provider: string, accountScope: string, externalId: string): PersonIdentity | undefined;
     setInjection(personId: string, enabled: boolean): Person | undefined;
     validateDossier(input: unknown): {
         schemaVersion: 1;
         blurb: string;
         sections: {
-            category: "role" | "relationship";
+            category: "role" | "preferences" | "workingStyle" | "relationship";
             claims: {
                 confidence?: "low" | "medium" | "high" | undefined;
+                scope?: string | undefined;
+                reviewedAt?: string | undefined;
+                expiresAt?: string | undefined;
                 statement: string;
                 evidence: {
                     observedAt?: string | undefined;
                     source: "manual" | "session" | "memory" | "directory";
                     locator: string;
                 }[];
-                epistemicType: "observed" | "reported";
+                epistemicType: "observed" | "reported" | "agent_assessment";
             }[];
         }[];
     };
     getDossierRevision(personId: string): string | null;
+    isDossierVerified(personId: string): boolean;
+    recordDossierVerification(personId: string, revision: string | null, verification: string): void;
     /** Returns undefined when the person does not exist. */
     replaceDossier(personId: string, reasonInput: string, input: unknown, expectedRevision?: string | null): PersonDossier | undefined;
     deleteDossier(personId: string, reasonInput: string): boolean;

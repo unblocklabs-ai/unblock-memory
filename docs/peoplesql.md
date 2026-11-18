@@ -1,9 +1,14 @@
 # People dossiers and whispering
 
+This local build extends the upstream recognition-only policy with scoped
+interaction preferences and expiring agent lessons. The [people-learning
+reference](people-learning.md) and packaged skill define the extended behavior.
+
+
 [Overview](../README.md) · [Configuration and credentials](configuration.md)
 
 PeopleSQL stores identity, dossier and change history. The agent authors a brief
-recognition snippet; People Whisperer injects only its saved blurb. Enable the
+recognition snippet and scoped interaction claims; People Whisperer supplies both. Enable the
 store with `people.enabled`; enable injection separately with
 `people.whisperer.enabled`. The optional `peoplePrimer` approves evidence preparation
 and automatic save review, not a maintenance scheduler. For independent setup
@@ -48,7 +53,7 @@ Primer and dossier-save requests use `peoplePrimer.timeoutMs`, not
 
 Three default questions cover explicit role/organization, enduring organizational
 background, and the person's relationship to the agent (not its business mission).
-Preferences, working styles, priorities, feedback and task history are excluded.
+Two additional questions cover explicit ongoing interaction preferences and working-style feedback, including corrections. Unrelated priorities, tasks and personality speculation are excluded.
 Each uses QMD vector search (no query expansion) for up to 30 hits, configurable
 up to 40. All unique eligible hits above the vector threshold are graded, not just
 the final top three. Complete excerpts over 6,000 characters are counted and skipped,
@@ -72,10 +77,10 @@ Memory evidence never grants permissions or establishes that an old request is
 still open.
 
 `memory_people_update({ action: "replace_dossier", personId, dossier, reason,
-agentName? })` automatically checks the proposed blurb before saving. Exact
-`qmd://path#Lstart-Lend` claim evidence locators supply up to three indexed ranges
+agentName? })` automatically checks the identity blurb and every proposed claim before saving. Exact
+`qmd://path#Lstart-Lend` claim evidence locators supply up to three indexed ranges per assertion
 from the primer's approved corpora (120 lines each, 6,000 characters total).
-Support confidence and background-only/explicit-support probabilities must all
+Support confidence and category-eligibility/explicit-support probabilities must all
 be >=0.9. `needs_review` or `review_unavailable` leaves the dossier and history
 unchanged; missing keys and failures never count as approval. A concurrent dossier
 edit/deletion returns `conflict` instead of overwriting the newer change.
@@ -132,14 +137,17 @@ guarantee coverage beyond 200 entries, and sync does not reactivate unavailable 
 The agent owns dossier generation and refresh. It can list people, inspect one
 person's current dossier, search ordinary memory and sessions with
 `memory_search`/`memory_get`, and replace the dossier when that would improve a
-future conversation. The plugin owns no dossier-maintenance workflow or refresh
-schedule. A dossier's `reviewedAt` value records its last successful write; it
-is not scheduling state. Dossier generation belongs to the agent; prompt injection
+future conversation. With People Whisperer enabled, the plugin schedules private
+[nightly learning and complete weekly validation](people-learning.md) by default.
+A dossier's `reviewedAt` value records its last successful write, not scheduling
+state. Dossier generation and evidence-backed interaction learning belong to the agent; prompt injection
 performs no model call. The optional primer grades evidence and reviews draft snippets.
-The goal is recognition, not a behavioral profile: one short paragraph of at most
-70 words identifying the person and their enduring organization/agent relationship.
-New writes allow only `role`/`relationship` sections and explicit `observed`/`reported`
-claims; priorities, preferences and inferred profiles belong outside dossiers.
+The identity blurb is one paragraph of at most 70 words. New writes also allow
+`preferences` and `workingStyle` sections for concrete ongoing interaction feedback,
+alongside `role` and `relationship`. Interaction claims require scope and an actual
+reviewedAt. Explicit facts use `observed`/`reported`; provisional agent-derived
+interaction lessons use `agent_assessment` with an expiry within 30 days of review.
+Psychological profiles, permission grants and unrelated task history stay excluded.
 Legacy dossiers remain readable, but must be deliberately rewritten by the agent
 before replacement. No automatic destructive migration or blanket deletion occurs.
 
@@ -152,17 +160,17 @@ after dossier snapshots. List small newest-first summaries with
 then fetch one exact diff with
 `memory_people_inspect({ view: "dossier_change", personId, changeId })`. List
 responses include `nextOffset`, so all history remains reachable without loading
-many dossiers into one tool result. Because the injected snippet is the dossier's
-`blurb`, its changes are included in the same history. A complete new serialized
+many dossiers into one tool result. Changes to the injected blurb and interaction
+claims are included in the same history. A complete new serialized
 dossier is capped at 64 KiB; larger legacy dossiers remain readable and repairable.
 
 ## Injection and person state
 
 Set `people.whisperer.enabled` to inject context. For each exact Slack sender,
-the plugin appends that person's stored dossier blurb inside `<people>` in the
+the plugin appends that person's identity blurb and verified, unexpired interaction claims inside `<people>` in the
 shared `<unblock_memory>` block, after memory and skill hints when present. The
-blurb is bounded by `maxChars` and injected
-once per `(Slack thread, person)`. Receipts are durable across retries and
+combined context is bounded by `maxChars` and injected
+on every user turn for the exact person. Receipts are durable across retries and
 Gateway restarts, while different people in one thread are handled independently.
 Unthreaded DMs use their OpenClaw session as the conversational scope. Unknown,
 unavailable, disabled, or dossierless people produce no context. Injection
@@ -195,7 +203,7 @@ call; People Whisperer itself imposes no evidence-window limit.
 | Action | Effect | Preserved / follow-up |
 | --- | --- | --- |
 | `set_injection` with `enabled:false` | Pause future injection for this person | Person, dossier and history remain |
-| `replace_dossier` | Save a verified full replacement | Prior snapshot/reason remain in history; existing thread receipts are not reset |
+| `replace_dossier` | Save a verified full replacement | Prior snapshot/reason remain in history; next user turn receives current context |
 | `delete_dossier` | Remove the current dossier | Person and transactional before/after history remain; no new blurb injection |
 | `soft_delete_person` | Mark unavailable and turn injection off | Identity/dossier/history remain; creates a review todo |
 | `restore_person` | Mark active again | Injection stays **off**; inspect and explicitly re-enable if appropriate |
@@ -221,10 +229,10 @@ None of these operations erases raw memory or dossier history.
 
 `memory_people_inspect`'s `injectionEligible` and `contribution` are a
 **record-level preview**, not proof that a hook will inject: they do not account
-for the global whisperer switch, host permissions or an existing thread receipt.
-Changing a dossier or restarting the Gateway does not re-inject it in an already
-served thread. A same-run retry replays its saved contribution; a different thread
-can receive the current blurb. Do not delete receipts as routine troubleshooting.
+for the global whisperer switch, host permissions or a same-run receipt.
+Every new user turn receives the current blurb and eligible interaction claims,
+including reused Slack threads after compaction/reset. A retry of the same run
+replays its saved snapshot. Do not delete receipts as routine troubleshooting.
 
 For agent research/write steps and the dossier schema, use the packaged
 [People Whisperer skill](../skills/people-whisperer/SKILL.md). If the agent has a

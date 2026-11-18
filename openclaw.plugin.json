@@ -24,7 +24,8 @@
       "memory_people_inspect",
       "memory_people_update",
       "memory_people_prime",
-      "memory_people_sync"
+      "memory_people_sync",
+      "memory_people_learning"
     ]
   },
   "toolMetadata": {
@@ -42,7 +43,8 @@
     "memory_people_inspect": { "replaySafe": true },
     "memory_people_update": { "sideEffecting": true },
     "memory_people_prime": { "sideEffecting": true },
-    "memory_people_sync": { "sideEffecting": true, "optional": true }
+    "memory_people_sync": { "sideEffecting": true, "optional": true },
+    "memory_people_learning": { "sideEffecting": true }
   },
   "uiHints": {
     "myTurn.enabled": { "label": "My Turn", "help": "Opt in to sending recent group/channel conversation text and agent identity to TypeSafe. Appends an advisory NO_REPLY hint only when Jev clearly favors silence. DMs and internal wakes are excluded. Failures never prevent a turn. Requires hook conversation access and prompt injection. Disabled by default." },
@@ -109,9 +111,10 @@
     },
     "people.whisperer.enabled": {
       "label": "People Whisperer",
-      "help": "Inject an active, injection-enabled person's saved blurb once per Slack thread/person, with durable receipts. Requires people.enabled and host hook permissions; no model call."
+      "help": "Supply identity, scoped preferences and unexpired agent lessons on every Slack user turn. Enables private nightly learning and weekly validation by default. Same-run retries replay their snapshot."
     },
-    "people.whisperer.maxChars": { "label": "People Blurb Character Limit", "help": "Also limits newly saved dossier blurbs when injection is off. The separate 70-word ceiling still applies." },
+    "people.whisperer.maxChars": { "label": "People Context Character Limit", "help": "Combined identity and interaction context limit. Identity blurb remains at most 70 words." },
+    "people.learning.enabled": { "label": "People Learning", "help": "Defaults on with People Whisperer. Private nightly dreaming at 03:10 and complete weekly validation Sunday at 04:00 in the agent timezone. Does not grant external-analysis or corpus approvals." },
     "analysis.executable": {
       "label": "Memory Analysis Worker",
       "help": "Optional absolute path to the locally installed unblock-memory-analysis executable."
@@ -292,6 +295,32 @@
               "maxOpen": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
             },
             "default": { "maxOpen": 1000 }
+          },
+          "learning": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "nightly": { "type": "boolean", "default": true },
+              "weekly": { "type": "boolean", "default": true },
+              "nightlySchedule": { "type": "string", "default": "10 3 * * *" },
+              "weeklySchedule": { "type": "string", "default": "0 4 * * 0" },
+              "timezone": { "type": "string" },
+              "legacyJobIds": { "type": "array", "items": { "type": "string" } },
+              "agents": {
+                "type": "object",
+                "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]*$" },
+                "additionalProperties": {
+                  "type": "object", "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "nightly": { "type": "boolean" }, "weekly": { "type": "boolean" },
+                    "nightlySchedule": { "type": "string" }, "weeklySchedule": { "type": "string" },
+                    "timezone": { "type": "string" },
+                    "legacyJobIds": { "type": "array", "items": { "type": "string" } }
+                  }
+                }
+              }
+            }
           }
         },
         "default": {

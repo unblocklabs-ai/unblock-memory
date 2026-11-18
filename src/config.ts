@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import { resolveExtraction, type ExtractionConfig } from "./extraction-config.js";
 import { resolveResponseAudit, type ResponseAuditConfig } from "./response-config.js";
 import { resolvePeoplePrimer, type PeoplePrimerConfig } from "./people-primer-config.js";
+import { DEFAULT_LEARNING, resolvePeopleLearning, type PeopleLearningConfig } from "./people-learning-config.js";
 import { resolveInsideOut, type InsideOutConfig } from "./inside-out.js";
 import { resolveSafetyWhisperer, type SafetyWhispererConfig } from "./safety-config.js";
 import { resolveMyTurn, type MyTurnConfig } from "./my-turn.js";
@@ -64,6 +65,7 @@ export type UnblockMemoryConfig = {
     enabled: boolean;
     whisperer: { enabled: boolean; maxChars: number };
     todos: { maxOpen: number };
+    learning: PeopleLearningConfig;
   };
   skillWhisperer: {
     enabled: boolean;
@@ -88,6 +90,7 @@ export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
   enabled: false,
   whisperer: { enabled: false, maxChars: 1200 },
   todos: { maxOpen: 1000 },
+  learning: DEFAULT_LEARNING,
 };
 
 const DEFAULT_TYPESAFE_CONFIG: UnblockMemoryConfig["typesafe"] = {
@@ -354,7 +357,7 @@ function resolvePeople(value: unknown): UnblockMemoryConfig["people"] {
     throw new Error("unblock-memory people must be an object");
   }
   const people = value as Record<string, unknown>;
-  assertOnlyKeys(people, ["enabled", "whisperer", "todos"], "people");
+  assertOnlyKeys(people, ["enabled", "whisperer", "todos", "learning"], "people");
 
   const enabled = people.enabled ?? false;
   if (typeof enabled !== "boolean")
@@ -380,6 +383,7 @@ function resolvePeople(value: unknown): UnblockMemoryConfig["people"] {
 
   return {
     enabled,
+    learning: resolvePeopleLearning(people.learning, enabled && whispererEnabled),
     whisperer: {
       enabled: whispererEnabled,
       maxChars: positiveInteger(

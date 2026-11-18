@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { normalizeToolParameterSchema } from "@openclaw/ai/internal/openai";
+import { normalizeToolParameterSchema } from "@openclaw/ai/internal/tool-schema";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ import { reviewIndexedClaim } from "../src/evidence-review.js";
 import { reviewFixture } from "./helpers/review-store.js";
 
 const peopleConfig: UnblockMemoryConfig["people"] = {
+  learning: { enabled: false },
   enabled: true,
   whisperer: { enabled: true, maxChars: 1200 },
   todos: { maxOpen: 10 },
@@ -111,6 +112,33 @@ const dossier = {
 
 const manualVerification = "Verified every assertion and background-only eligibility against Mira's explicit original operator note.";
 
+test("reviews every preference and stored role assertion, even when the identity blurb passes", async t => {
+  const h = await writeHarness(t);
+  const proposed = structuredClone(h.input.dossier) as import("../src/people-store.js").PersonDossier;
+  proposed.sections.push({ category: "preferences", claims: [{
+    statement: "Start with the recommendation.", scope: "Updates to Mira",
+    epistemicType: "reported", evidence: proposed.sections[0]!.claims[0]!.evidence,
+    reviewedAt: "2026-11-16T12:00:00Z",
+  }] });
+  const before = h.store.getDossier(h.person.id);
+  const requests: { state: { claim: string; person?: { kind?: string } } }[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)); requests.push(request);
+    return backgroundResponse(request.state.person?.kind === "interaction");
+  });
+  assert.equal((await h.write({ dossier: proposed })).status, "needs_review");
+  assert.equal(requests.length, 2);
+  assert.match(requests[1]!.state.claim, /Start with the recommendation.*Scope/);
+  assert.deepEqual(h.store.getDossier(h.person.id), before);
+
+  proposed.sections.pop();
+  proposed.sections[0]!.claims.push({ ...proposed.sections[0]!.claims[0]!, statement: "Mira is also the CFO." });
+  requests.length = 0;
+  await h.write({ dossier: proposed });
+  assert.equal(requests.length, 2, "claims outside the injected blurb must also be checked");
+  assert.equal(requests[1]!.state.claim, "Mira is also the CFO.");
+});
+
 async function writeHarness(t: test.TestContext) {
   const f = await reviewFixture(); t.after(f.close);
   const note = await f.insert("# Mira\nMira is the founder of ExampleCo.");
@@ -158,7 +186,7 @@ test("dossier update reviews indexed blurb and saves once only on a passing judg
   assert.deepEqual(h.calls[0]?.personBackground, { name: "Mira", agentName: "Bill" });
   assert.deepEqual(h.calls[0]?.citations, [{ path: h.calls[0]!.citations[0]!.path, from: 2, lines: 1 }]);
   assert.equal(h.store.listDossierChanges(h.person.id).length, 2);
-  assert.match(h.store.listDossierChanges(h.person.id)[0]!.reason, /TypeSafe background review passed/);
+  assert.match(h.store.listDossierChanges(h.person.id)[0]!.reason, /TypeSafe review passed for every dossier assertion/);
 });
 
 test("rejected, failed and unapproved reviews preserve dossier and history", async t => {
@@ -210,7 +238,7 @@ test("manual verification cannot bypass shape limits, and invalid inputs do not 
   const h = await writeHarness(t);
   for (const manual of [undefined, manualVerification]) {
     await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, blurb: "word ".repeat(71) } }), /70 words/);
-    await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, sections: [{ ...dossier.sections[0], category: "preferences" }] } }));
+    await assert.rejects(h.write({ manualVerification: manual, dossier: { ...dossier, sections: [{ ...dossier.sections[0], category: "openLoops" }] } }));
   }
   await assert.rejects(h.write({ manualVerification: " " }));
   assert.equal(h.calls.length, 0);
@@ -391,6 +419,7 @@ test("person selectors survive OpenClaw model schema normalization", async () =>
     assert.deepEqual(Object.keys(normalized.properties ?? {}).sort(), [
       "changeId",
       "identity",
+      "includeInactive",
       "limit",
       "offset",
       "personId",
@@ -420,8 +449,8 @@ test("person selectors survive OpenClaw model schema normalization", async () =>
     );
 
     const section = update.properties?.dossier?.properties?.sections?.items;
-    assert.deepEqual(section?.properties?.category?.enum, ["role", "relationship"]);
-    assert.deepEqual(section?.properties?.claims?.items?.properties?.epistemicType?.enum, ["observed", "reported"]);
+    assert.deepEqual(section?.properties?.category?.enum, ["role", "relationship", "preferences", "workingStyle"]);
+    assert.deepEqual(section?.properties?.claims?.items?.properties?.epistemicType?.enum, ["observed", "reported", "agent_assessment"]);
 
     await assert.rejects(
       inspect.execute("call", {

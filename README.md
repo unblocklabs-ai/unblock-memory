@@ -118,7 +118,7 @@ Everything below is off until you configure it.
 | [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if TypeSafe is unavailable. |
 | [My Turn](docs/configuration.md#my-turn) | Asks Jev whether a group/channel conversation needs this agent's response. Advises `NO_REPLY` only when silence is clearly favored; the agent keeps the final say. Opt-in; failures leave the turn unchanged. |
 | [People dossiers](docs/peoplesql.md) | Lets the agent keep a short, evidence-backed note about each person it works with. |
-| [People Whisperer](docs/peoplesql.md#injection-and-person-state) | Shows the agent its note about a person once per Slack thread. Local lookup, no model call. |
+| [People Whisperer](docs/peoplesql.md#injection-and-person-state) | Supplies identity, scoped preferences and unexpired lessons on each Slack user turn. Includes [private nightly learning and weekly validation](docs/people-learning.md) by default. |
 | [People Primer](docs/peoplesql.md#optional-people-dossier-primer) | Gathers evidence for a person's note and reviews proposed notes before they are saved. |
 | [Session memory extraction](docs/extraction.md) | Pulls lasting facts from past conversations, checks each against exact quotes, and can make them searchable. Starts in shadow mode. |
 | [Clustering and curation](docs/retrieval.md#memory-analysis) | Groups related memories so the agent can spot duplicates and maintain its knowledge. Needs a local analysis worker. |

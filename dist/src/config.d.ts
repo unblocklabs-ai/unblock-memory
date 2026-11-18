@@ -1,6 +1,7 @@
 import { type ExtractionConfig } from "./extraction-config.js";
 import { type ResponseAuditConfig } from "./response-config.js";
 import { type PeoplePrimerConfig } from "./people-primer-config.js";
+import { type PeopleLearningConfig } from "./people-learning-config.js";
 import { type InsideOutConfig } from "./inside-out.js";
 import { type SafetyWhispererConfig } from "./safety-config.js";
 import { type MyTurnConfig } from "./my-turn.js";
@@ -60,6 +61,7 @@ export type UnblockMemoryConfig = {
         todos: {
             maxOpen: number;
         };
+        learning: PeopleLearningConfig;
     };
     skillWhisperer: {
         enabled: boolean;

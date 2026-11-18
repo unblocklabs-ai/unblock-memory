@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import type { UnblockMemoryConfig } from "./config.js";
 import { renderPeopleWhisper } from "./people-hooks.js";
+import { renderPeopleDossier } from "./people-background.js";
 import { DossierConflictError, PERSON_DOSSIER_WRITE_SCHEMA, type PeopleStores } from "./people-store.js";
 import { getContext, runtimeConfig } from "./tool-context.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
@@ -58,6 +59,7 @@ const inspectParameters = Type.Union([
   Type.Object(
     {
       view: Type.Literal("people"),
+      includeInactive: Type.Optional(Type.Boolean({ description: "Include unavailable/archived people for a complete dossier audit; never reactivate them." })),
       limit: Type.Optional(
         Type.Integer({
           minimum: 1,
@@ -128,7 +130,7 @@ const updateParameters = Type.Union([
       reason: Type.String({ pattern: "\\S", maxLength: 500 }),
       agentName: Type.Optional(Type.String({ pattern: "\\S", maxLength: 100 })),
       manualVerification: Type.Optional(Type.String({ pattern: "\\S", maxLength: 400,
-        description: "Explicit attestation that you verified every blurb assertion and background-only eligibility. Explain the original sources and any correction/override. Skips TypeSafe; recorded as manual, never a provider pass. Do not use merely to bypass a failed check." })),
+        description: "Source-specific attestation that you checked every saved claim, its scope and any newer corrections. Distinguish explicit preferences from provisional agent lessons. Skips TypeSafe; recorded as manual. Never use as a blind retry switch." })),
     },
     { additionalProperties: false },
   ),
@@ -205,7 +207,7 @@ function personView(
   const dossier = store.getDossier(person.id);
   const contribution =
     person.status === "active" && person.injectionEnabled && dossier
-      ? renderPeopleWhisper(dossier.dossier.blurb, maxChars)
+      ? renderPeopleWhisper(renderPeopleDossier(dossier.dossier), maxChars)
       : undefined;
   return {
     status: "ok" as const,
@@ -240,7 +242,7 @@ function createInspectTool(
       if (input.view === "people") {
         const limit = input.limit ?? 50;
         const offset = input.offset ?? 0;
-        const people = store.listActivePeople(limit, offset).map((person) => {
+        const people = store.listActivePeople(limit, offset, input.includeInactive ?? false).map((person) => {
           const dossierReviewedAt = store.getDossierReviewedAt(person.id);
           return {
             person,
@@ -284,7 +286,7 @@ function createUpdateTool(stores: PeopleStores, config: UnblockMemoryConfig, run
     name: "memory_people_update",
     label: "Update People Memory",
     description:
-      "Replace a background-only dossier (blurb <=70 words, role/relationship sections, observed/reported facts). Uses peoplePrimer approval to review the blurb against claim evidence qmd://path#Lstart-Lend before saving; blocked/unavailable reviews leave it unchanged. Use explicit manualVerification only after verifying original sources yourself. Also deletes dossiers or updates injection, company, todo and person status. Restoring a person leaves injection off; dossier changes do not reset thread receipts.",
+      "Curate ongoing interaction feedback during nightly dreaming for the exact person. Replace a complete dossier: identity blurb <=70 words; role/relationship, preferences and workingStyle sections. Cite original evidence for every claim; preserve verified existing claims and their scope. Agent-assessed lessons require reviewedAt and expiresAt within 30 days. Automatic review checks every statement; use source-specific manualVerification only after checking original sources yourself. Delete contradicted/stale claims with a reason. Context refreshes on the next user turn.",
     parameters: updateParameters,
     async execute(_toolCallId: string, raw: unknown, signal?: AbortSignal) {
       const input = Value.Parse(updateParameters, raw);
@@ -308,11 +310,13 @@ function createUpdateTool(stores: PeopleStores, config: UnblockMemoryConfig, run
         }
         const audit = review.status === "manual"
           ? `Manual verification: ${review.note}`
-          : "TypeSafe background review passed (person-background-v2)";
+          : "TypeSafe review passed for every dossier assertion (person-interaction-v1)";
         try {
           const dossier = store.replaceDossier(input.personId, `${input.reason}\n${audit}`, proposed, revision);
           if (!dossier) return jsonResult({ status: "not_found" });
-          return jsonResult({ status: "ok", saved: true, verification: review.status === "manual" ? "manual" : "typesafe", dossier, review });
+          const changeId = store.getDossierRevision(input.personId)!;
+          store.recordDossierVerification(input.personId, changeId, audit);
+          return jsonResult({ status: "ok", saved: true, changeId, verification: review.status === "manual" ? "manual" : "typesafe", dossier, review });
         } catch (error) {
           if (error instanceof DossierConflictError) return jsonResult({ status: "conflict", saved: false, reason: error.message });
           throw error;

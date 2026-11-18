@@ -87,7 +87,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   let getFactory: typeof factory;
   const api = {
     pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
-    registerCli() {}, registerGatewayMethod() {},
+    registerCli() {}, registerService() {}, on() {}, registerGatewayMethod() {},
     registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
       Object.defineProperty(runtime, "getMemorySearchManager", { value: async () => ({ manager }) });
     },

@@ -121,19 +121,19 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
     };
     feedback: {
-        feedbackType: {
+        target: {
             type: "choice";
             confidence: number;
-            choice: "mixed" | "unrelated" | "unclear" | "acceptance" | "correction" | "continuation";
+            choice: "delivery" | "mixed" | "unclear" | "current_answer" | "earlier_behavior" | "proactive_action" | "external" | "new_work";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
         };
-        target: {
+        feedbackType: {
             type: "choice";
             confidence: number;
-            choice: "delivery" | "mixed" | "unclear" | "current_answer" | "earlier_behavior" | "proactive_action" | "external" | "new_work";
+            choice: "mixed" | "unrelated" | "unclear" | "acceptance" | "correction" | "continuation";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;

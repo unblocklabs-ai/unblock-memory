@@ -10,7 +10,7 @@ export async function reviewIndexedClaim(params: {
   db: QMDStore["internal"]["db"]; sources: readonly ResolvedSource[];
   claim: string; citations: readonly EvidenceCitation[];
   apiKey: string; timeoutMs: number; signal: AbortSignal;
-  personBackground?: { name: string; agentName: string };
+  personBackground?: { name: string; agentName: string; kind?: "interaction"; inferred?: boolean };
   read?: <T>(run: () => T) => Promise<T>;
 }) {
   const unavailable = (reason: string) => ({ status: "unavailable" as const, verdict: "insufficient_evidence" as const, needsReview: true, reason });
@@ -48,7 +48,7 @@ export async function reviewIndexedClaim(params: {
     }
     return { status: "ok" as const, ...judgment,
       evidence: evidence.map(({ text: _text, ...citation }) => citation),
-      policy: `${TYPESAFE_MODEL}:${params.personBackground ? "person-background-v2" : "claim-v1"}`,
+      policy: `${TYPESAFE_MODEL}:${params.personBackground?.kind === "interaction" ? "person-interaction-v1" : params.personBackground ? "person-background-v2" : "claim-v1"}`,
       scope: "Advisory support check against cited indexed excerpts only, not current truth or authorization to write. Verify original sources and identity before promotion." };
   });
 }

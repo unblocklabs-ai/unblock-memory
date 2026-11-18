@@ -57,6 +57,7 @@ test("keeps PeopleSQL off by default and validates its bounded controls", () => 
       enabled: true,
       whisperer: { enabled: true, maxChars: 800 },
       todos: { maxOpen: 20 },
+      learning: { ...DEFAULT_PEOPLE_CONFIG.learning, enabled: true },
     },
   );
   assert.throws(() => resolveConfig({ people: true }), /people must be an object/);
