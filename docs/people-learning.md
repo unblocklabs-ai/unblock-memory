@@ -110,7 +110,7 @@ review-only. No restoration or injection-permission changes occur.
 
 ## Scheduling and migration
 
-Validated against the installed **OpenClaw 2026.10.6** SDK (Node 24.22.1).
+Validated against the installed **OpenClaw 2026.11.5** SDK (Node 24.22.1).
 Its installed-plugin service context exposes `getCron()`. The runtime forwards
 full cron declarations through the host normalizer, including `agentId`,
 `agentTurn.message`, `delivery.mode` and `declarationKey`, despite narrower
@@ -210,14 +210,13 @@ analysis attempts.
 
 ## Later fleet rollout
 
-1. Build and pack this unreleased checkout on Node 24.22.1 with the supported
-   OpenClaw SDK: `npm ci && npm run build && npm run typecheck && npm test && npm pack`.
-   Assign a new release version before fleet distribution; do not republish this
-   development artifact over the existing 0.10.4 release. Review/publish separately;
-   this task does not deploy.
+1. Use release `0.12.0`, or build its exact tagged source on Node 24.22.1 with the
+   supported OpenClaw SDK:
+   `npm ci && npm run build && npm run typecheck && npm test && npm pack`.
+   Package publication and fleet deployment are separate operations.
 2. Back up every target agent's `unblock-memory.sqlite`, legacy people database
    if present, and the host scheduler state. Keep the prior package for rollback.
-3. Upgrade target hosts to OpenClaw 2026.10.6 or a requalified compatible version.
+3. Upgrade target hosts to OpenClaw 2026.11.5 or a requalified compatible version.
    Install the reviewed tarball with `openclaw plugins install /absolute/path/package.tgz`.
 4. Merge the People Whisperer settings above into
    `plugins.entries.unblock-memory.config`. Preserve existing hook permissions,

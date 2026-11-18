@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi, OpenClawPluginService, OpenClawPluginToolFactory } from "openclaw/plugin-sdk/plugin-entry";
@@ -16,6 +16,20 @@ import { registerPeopleLearning } from "../src/people-learning-runtime.js";
 import { createAgentDatabase, insertSession, compressAgentTranscripts } from "./helpers/session-database.js";
 import { record } from "../src/guards.js";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+// SDK-backed fixtures keep cron mutation and persisted message shapes honest.
+// These private imports are test-only and requalified with the pinned host SDK.
+const sdkDist = fileURLToPath(new URL("../", import.meta.resolve("openclaw/plugin-sdk/plugin-entry")));
+const sdkJobsFile = readdirSync(sdkDist).find(name => /^jobs-.*\.mjs$/u.test(name) &&
+  readFileSync(join(sdkDist, name), "utf8").includes("function applyJobPatch("))!;
+const sdkJobs = await import(pathToFileURL(join(sdkDist, sdkJobsFile)).href) as {
+  n(job: Job, patch: Parameters<PeopleCron["update"]>[1]): void;
+};
+const sdkUserFile = readdirSync(sdkDist).find(name => /^session-transcript-rewrite-effects-.*\.mjs$/u.test(name))!;
+const sdkUser = await import(pathToFileURL(join(sdkDist, sdkUserFile)).href) as {
+  o(params: Record<string, unknown>): Record<string, unknown>;
+};
 
 const enabled = () => resolveConfig({ people: { enabled: true, whisperer: { enabled: true } } });
 const cfg: OpenClawConfig = { agents: { defaults: { userTimezone: "Pacific/Auckland" }, entries: { alpha: {}, beta: {} } } };
@@ -80,7 +94,7 @@ function hostCron(seed: Job[] = []) {
       const job = jobs.find(j => j.id === id);
       assert.ok(job, "update must target an existing job");
       assert.ok(!("declarationKey" in patch), "declaration keys are set at creation");
-      Object.assign(job, structuredClone(patch));
+      sdkJobs.n(job, structuredClone(patch));
       writes.push(`update:${id}`);
       return job;
     },
@@ -249,12 +263,10 @@ test("stored external-user metadata preserves attachment gaps and fences exclude
   const f = fixture(); t.after(() => { f.db.close(); f.stores.closeAll(); }); f.add("dm", "workspace", "direct");
   const replace = (seq: number, message: unknown) => f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='dm' AND seq=?")
     .run(JSON.stringify({ type: "message", message }), seq);
-  const externalUser = (content: string, { senderId = "U1", accountId = "workspace", withAttachment = false } = {}) => ({
-    role: "user", content, provenance: { kind: "external_user" },
-    __openclaw: { senderId, senderIdentity: { id: senderId, senderKind: "human" },
-      transport: { channel: "slack", accountId, conversationRef: "conversation-dm" },
-      ...(withAttachment ? { media: [{ path: "/private/requirements.pdf", contentType: "application/pdf", kind: "document" }] } : {}),
-    },
+  const externalUser = (content: string, { senderId = "U1", accountId = "workspace", withAttachment = false } = {}) => sdkUser.o({
+    text: content, provenance: { kind: "external_user" }, sender: { id: senderId, identity: { id: senderId, senderKind: "human" } },
+    transport: { channel: "slack", accountId, conversationRef: "conversation-dm" },
+    ...(withAttachment ? { media: [{ path: "/private/requirements.pdf", contentType: "application/pdf", kind: "document" }] } : {}),
   });
   const request = "Follow the attached requirements";
   replace(1, externalUser(request));

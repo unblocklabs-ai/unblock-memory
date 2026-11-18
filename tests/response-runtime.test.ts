@@ -47,7 +47,7 @@ test("scheduler waits for its interval, prevents overlap, and cancels in-flight 
     db.prepare("INSERT INTO session_transcript_active_events VALUES(?,?,?,?)").run("s", i, i, i);
   }
   const hooks = new Map<string, () => void | Promise<void>>();
-  const api = { config: { agents: { list: [{ id: "main", agentDir, workspace: root }] } }, registerCli() {},
+  const api = { config: { agents: { entries: { main: { agentDir, workspace: root } } } }, registerCli() {},
     on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); }, logger: { warn() {} } } as unknown as OpenClawPluginApi;
   let started!: () => void, calls = 0;
   const ready = new Promise<void>(resolve => { started = resolve; });
@@ -109,7 +109,7 @@ test("Gateway restart catches up safely without credentials; absent, empty and u
     let warnings = 0;
     let warned!: () => void;
     const warning = new Promise<void>(resolve => { warned = resolve; });
-    const api = { config: { agents: { list: [{ id, workspace: root }] } }, registerCli() {},
+    const api = { config: { agents: { entries: { [id]: { workspace: root } } } }, registerCli() {},
       on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); },
       logger: { warn() { warnings++; warned(); } } } as unknown as OpenClawPluginApi;
     registerResponseAudit(api, resolveConfig({ typesafe: { apiKeyFile },
@@ -149,7 +149,7 @@ test("an unwritable audit store cannot fail Gateway start/stop or starve other a
   t.after(() => { if (previous === undefined) delete process.env.OPENCLAW_STATE_DIR; else process.env.OPENCLAW_STATE_DIR = previous; });
   const hooks = new Map<string, () => void | Promise<void>>();
   let warnings = 0;
-  const api = { config: { agents: { list: [{ id: "broken" }, { id: "healthy" }] } }, registerCli() {},
+  const api = { config: { agents: { entries: { broken: {}, healthy: {} } } }, registerCli() {},
     on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); },
     logger: { warn() { warnings++; } } } as unknown as OpenClawPluginApi;
   registerResponseAudit(api, resolveConfig({ responseAudit: { enabled: true, senderIds: ["owner"] } }));

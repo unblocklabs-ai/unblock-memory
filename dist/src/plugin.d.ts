@@ -3,12 +3,12 @@ export declare function resolveFlushPlan(params?: {
     cfg?: OpenClawConfig;
     nowMs?: number;
 }): {
-    softThresholdTokens: number;
-    forceFlushTranscriptBytes: number;
-    reserveTokensFloor: number;
-    model: string | undefined;
     prompt: string;
     systemPrompt: string;
     relativePath: string;
+    model?: string | undefined;
+    softThresholdTokens: number;
+    forceFlushTranscriptBytes: number;
+    reserveTokensFloor: number;
 } | null;
 export declare function registerUnblockMemory(api: OpenClawPluginApi): void;

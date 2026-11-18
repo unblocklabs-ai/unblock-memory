@@ -447,6 +447,9 @@ export function resolveFlushPlan(params = {}) {
     const configured = params.cfg?.agents?.defaults?.compaction?.memoryFlush;
     if (configured?.enabled === false)
         return null;
+    // 2026.11.5+ owns model selection; preserve explicit overrides on older hosts.
+    const legacyModel = configured && "model" in configured && typeof configured.model === "string"
+        ? configured.model.trim() : "";
     const nowMs = params.nowMs ?? Date.now();
     const date = formatDateInTimezone(nowMs, resolveTimezone(params.cfg?.agents?.defaults?.userTimezone?.trim()));
     const target = `memory/${date}.md`;
@@ -454,7 +457,7 @@ export function resolveFlushPlan(params = {}) {
         softThresholdTokens: nonNegativeInteger(configured?.softThresholdTokens, 4000),
         forceFlushTranscriptBytes: parseByteSize(configured?.forceFlushTranscriptBytes) ?? 2 * 1024 * 1024,
         reserveTokensFloor: 20_000,
-        model: configured?.model?.trim() || undefined,
+        ...(legacyModel ? { model: legacyModel } : {}),
         prompt: `Pre-compaction memory flush. Store durable memories only in ${target}. If it exists, append; never overwrite it or bootstrap files. Do not create timestamped variants. If nothing is durable, reply NO_REPLY.`,
         systemPrompt: `Capture durable memories in ${target}; append only and do not overwrite bootstrap files. Usually NO_REPLY is correct.`,
         relativePath: target,
