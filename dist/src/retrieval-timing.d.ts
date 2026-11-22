@@ -1,6 +1,6 @@
 import type { VectorSearchTrace } from "@unblocklabs/qmd";
 export declare const timingFields: readonly ["setupMs", "queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs", "vectorIndexCheckMs", "vectorScopeMs", "embeddingMs", "vectorScanMs", "hydrationMs", "vectorMappingMs", "vectorOtherMs", "passageMs", "candidatePrepMs", "retrievalOtherMs", "otherMs"];
-type TimingField = typeof timingFields[number] | "retrievalMs" | "judgeMs";
+type TimingField = typeof timingFields[number] | "retrievalMs" | "judgeMs" | "generationMs";
 export type RetrievalTimings = Partial<Record<TimingField | "metadataReloads" | "vectorScanAttempts", number>>;
 /** Freeze in-flight duration at abort, without changing the work's cancellation behavior. */
 export declare function startTiming(field: TimingField, timings?: RetrievalTimings, signal?: AbortSignal): () => void;

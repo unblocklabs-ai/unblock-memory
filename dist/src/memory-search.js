@@ -48,9 +48,8 @@ export async function searchMemory(manager, queries, options) {
     options.onCandidates?.(observation);
     const fallback = (reason) => ({
         ...timings, ...observation, rankingMode: "retrieval", fallbackReason: reason,
-        // Discovery is a lexical-first union, not a ranking. Stable reciprocal-rank
-        // ordering lets strong vector-only hits compete before maxResults truncation.
-        // These original lane scores are not fused ranks or usefulness probabilities.
+        // Stable retrieval-score ordering (fused RRF scores from discovery) before maxResults truncation.
+        // These retrieval scores are not TypeSafe usefulness probabilities.
         results: [...candidates].sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5),
     });
     if (!options.apiKey) {
@@ -59,11 +58,17 @@ export async function searchMemory(manager, queries, options) {
             return fallback("key_unavailable");
         return { ...timings, ...observation, rankingMode: "typesafe_usefulness", results: [] };
     }
+    const maxJudge = typeof options.maxJudgeCandidates === "number" && Number.isFinite(options.maxJudgeCandidates)
+        ? Math.max(0, Math.floor(options.maxJudgeCandidates))
+        : undefined;
+    const judgePool = maxJudge !== undefined
+        ? [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge)
+        : candidates;
     const apiKey = options.apiKey;
     const endJudge = startTiming("judgeMs", timings, signal);
     let judged;
     try {
-        judged = (await Promise.all(candidates.map(async (hit, candidateIndex) => {
+        judged = (await Promise.all(judgePool.map(async (hit, candidateIndex) => {
             const requestStarted = performance.now();
             try {
                 const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(options.conversation, {
@@ -92,7 +97,7 @@ export async function searchMemory(manager, queries, options) {
     }
     signal?.throwIfAborted();
     observation.judgeMs = timings.judgeMs ?? 0;
-    if (options.allowRetrievalFallback && candidates.length && !observation.requestsSucceeded)
+    if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
         return fallback("all_judgments_failed");
     return { ...timings, ...observation, rankingMode: "typesafe_usefulness", results: judged.filter(hit => hit.score >= (options.minUsefulness ?? 0.7))
             .sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5) };

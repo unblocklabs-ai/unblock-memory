@@ -2,7 +2,7 @@ import { timingFields, type RetrievalTimings } from "./retrieval-timing.js";
 
 type RetrievalOperation = "vector" | "memoryWhisperer" | "memorySearch";
 type RetrievalOutcome = "ok" | "partial" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped" | "degraded";
-const fields = ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", ...timingFields,
+const fields = ["elapsedMs", "retrievalMs", "judgeMs", "generationMs", ...timingFields,
   "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars",
   "requestsSucceeded", "requestsFailed", "fallbackKeyUnavailable", "fallbackAllJudgmentsFailed"] as const;
 type Field = typeof fields[number];

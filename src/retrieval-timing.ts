@@ -3,7 +3,7 @@ import type { VectorSearchTiming, VectorSearchTrace } from "@unblocklabs/qmd";
 export const timingFields = ["setupMs", "queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs",
   "vectorIndexCheckMs", "vectorScopeMs", "embeddingMs", "vectorScanMs", "hydrationMs", "vectorMappingMs",
   "vectorOtherMs", "passageMs", "candidatePrepMs", "retrievalOtherMs", "otherMs"] as const;
-type TimingField = typeof timingFields[number] | "retrievalMs" | "judgeMs";
+type TimingField = typeof timingFields[number] | "retrievalMs" | "judgeMs" | "generationMs";
 export type RetrievalTimings = Partial<Record<TimingField | "metadataReloads" | "vectorScanAttempts", number>>;
 
 /** Freeze in-flight duration at abort, without changing the work's cancellation behavior. */

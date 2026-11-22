@@ -25,6 +25,8 @@ export declare function searchMemory(manager: MemoryCandidateManager, queries: Q
     asOf?: string;
     /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
     allowRetrievalFallback?: boolean;
+    /** Cap top retrieval-ranked candidates sent to TypeSafe (after dedup and cooldown filtering). */
+    maxJudgeCandidates?: number;
     minUsefulness?: number;
     excludedPassages?: ReadonlyMap<string, number>;
     onCandidates?: (observation: MemorySearchObservation) => void;

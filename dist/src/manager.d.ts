@@ -84,11 +84,10 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
                         otherMs?: number | undefined;
                         retrievalMs?: number | undefined;
                         judgeMs?: number | undefined;
+                        generationMs?: number | undefined;
                         metadataReloads?: number | undefined;
                         vectorScanAttempts?: number | undefined;
                         elapsedMs?: number | undefined;
-                        gateMs?: number | undefined;
-                        generationMs?: number | undefined;
                         candidates?: number | undefined;
                         eligible?: number | undefined;
                         results?: number | undefined;

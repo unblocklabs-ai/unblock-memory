@@ -156,8 +156,8 @@ const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
 };
 
 const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
-  enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.7,
-  maxHints: 2, cooldownTurns: 10, timeoutMs: 3000,
+  enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5,
+  maxHints: 3, cooldownTurns: 10, timeoutMs: 3000,
   api: { endpoint: "http://192.168.1.191:18087" },
 };
 
@@ -217,7 +217,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   }
   return {
     enabled, complementaryHints, corpora: [...new Set(selected)], cooldownTurns, minUsefulness,
-    maxHints: positiveInteger(config.maxHints, 2, "memoryWhisperer.maxHints", 2),
+    maxHints: positiveInteger(config.maxHints, DEFAULT_MEMORY_WHISPERER.maxHints, "memoryWhisperer.maxHints", 3),
     timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
     api: resolveQueryApi(config.api),
   };

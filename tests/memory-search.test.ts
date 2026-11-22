@@ -10,7 +10,7 @@ import { registerUnblockMemory } from "../src/plugin.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { QmdMemoryManager } from "../src/manager.js";
 import { resolveSource, resolveSessionSource } from "../src/sources.js";
-import { searchMemory } from "../src/memory-search.js";
+import { memoryPassageId, searchMemory } from "../src/memory-search.js";
 
 test("fallback ranks a real vector-only top match above a full lexical candidate lane", async t => {
   const root = await mkdtemp(join(tmpdir(), "memory-fallback-order-"));
@@ -34,14 +34,50 @@ test("fallback ranks a real vector-only top match above a full lexical candidate
   const queries = { lex: "Clutterkeyword", vec: "Who approved the international expansion budget?" };
   const candidates = await manager.searchCandidates(queries, {});
   assert.equal(candidates.length, 7);
-  assert.ok(candidates.slice(0, 6).every(hit => hit.path.includes("lexical-")), "discovery appends vector-only hits after lexical hits");
-  assert.ok(candidates[6]!.path.endsWith("semantic.md"));
-  assert.equal(candidates[6]!.score, 1, "semantic source is vector lane rank one");
+  assert.ok(candidates.slice(0, 2).some(hit => hit.path.endsWith("semantic.md")), "passage-level RRF keeps vector rank one in the top two");
+  assert.ok(candidates.every((hit, index) => !index || candidates[index - 1]!.score >= hit.score), "discovery returns fused RRF order");
+  assert.ok(candidates[0]!.score > candidates.at(-1)!.score, "top-rank/dual-lane hits outrank tail hits");
   const result = await searchMemory(manager, queries, { apiKey: undefined, timeoutMs: 10,
     conversation: { history: [], currentRequest: queries.vec }, allowRetrievalFallback: true, maxResults: 5 });
   assert.equal(result.results.length, 5);
   assert.ok(result.results.slice(0, 2).some(hit => hit.path.endsWith("semantic.md")), "vector rank one competes before truncation");
   assert.ok(result.results.every((hit, index) => !index || result.results[index - 1]!.score >= hit.score));
+});
+
+test("searchMemory respects maxJudgeCandidates after dedup/cooldown while leaving uncapped searches intact", async t => {
+  const hits = Array.from({ length: 16 }, (_, i) => ({
+    path: `qmd://memory/doc-${i}.md`, startLine: 1, endLine: 2,
+    score: (16 - i) / 100, snippet: `candidate passage ${i}`, source: "memory" as const, corpus: "memory",
+  }));
+  // Include a duplicate of top hit doc-1 and shuffle input order to verify dedup/cooldown happen before top-K.
+  const manager = { searchCandidates: async () => [...hits.slice(8), hits[1]!, ...hits.slice(0, 8)] };
+  const judged: string[] = [];
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    judged.push(request.state.candidates[0].excerpt);
+    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.9 } } });
+  });
+  const excludedPassages = new Map([[memoryPassageId(hits[0]!.snippet), 1]]);
+  const capped = await searchMemory(manager, { lex: "k", vec: "v" }, {
+    apiKey: "test", timeoutMs: 100, conversation: { history: [], currentRequest: "v" },
+    maxJudgeCandidates: 6, maxResults: 4, excludedPassages,
+  });
+  assert.equal(capped.eligible, 15);
+  assert.equal(capped.requestsSucceeded, 6);
+  assert.deepEqual(judged, hits.slice(1, 7).map(hit => hit.snippet), "cooled-down and duplicate top hits never consume judge slots");
+  judged.length = 0;
+  const uncapped = await searchMemory(manager, { lex: "k", vec: "v" }, {
+    apiKey: "test", timeoutMs: 100, conversation: { history: [], currentRequest: "v" },
+    maxResults: 20,
+  });
+  assert.equal(uncapped.requestsSucceeded, 16);
+  assert.equal(judged.length, 16);
+  judged.length = 0;
+  const nanCap = await searchMemory(manager, { lex: "k", vec: "v" }, {
+    apiKey: "test", timeoutMs: 100, conversation: { history: [], currentRequest: "v" },
+    maxJudgeCandidates: Number.NaN, maxResults: 20,
+  });
+  assert.equal(nanCap.requestsSucceeded, 16, "non-finite maxJudgeCandidates is ignored rather than coerced to zero");
 });
 
 test("explicit two-query search retrieves, scopes, deduplicates and judges real indexed evidence without generation or recall gating", async t => {

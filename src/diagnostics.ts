@@ -3,7 +3,7 @@ import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 type Whisperer = "skill" | "memory" | "safety" | "myTurn";
 type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" |
   "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" |
-  "recall_not_needed" | "queries_generated" | "judge_candidate_failed" | "input_too_large" |
+  "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" |
   "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
 
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
@@ -11,7 +11,7 @@ export class WhispererDiagnostics {
   static shared(): WhispererDiagnostics {
     const scope = globalThis as typeof globalThis & { [key: symbol]: unknown };
     // Bump the version whenever the shape changes so an older loaded copy is never reused.
-    const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v4");
+    const symbol = Symbol.for("unblock-memory.whisperer-diagnostics.v5");
     return (scope[symbol] ??= new WhispererDiagnostics()) as WhispererDiagnostics;
   }
   #agents = new Map<string, { counts: Record<Whisperer, Partial<Record<Outcome, number>>>; safetyScenarios: Map<string, number>;

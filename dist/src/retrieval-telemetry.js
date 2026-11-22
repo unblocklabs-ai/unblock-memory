@@ -1,5 +1,5 @@
 import { timingFields } from "./retrieval-timing.js";
-const fields = ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", ...timingFields,
+const fields = ["elapsedMs", "retrievalMs", "judgeMs", "generationMs", ...timingFields,
     "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars",
     "requestsSucceeded", "requestsFailed", "fallbackKeyUnavailable", "fallbackAllJudgmentsFailed"];
 const recentLimit = 256;

@@ -173,7 +173,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
       } finally {
         measurement.elapsedMs = performance.now() - started;
         measurement.setupMs ??= measurement.elapsedMs;
-        // Manual search is sequential. Whisperer stages overlap and cannot use this subtraction.
+        // Residual overhead for manual search; whisperer tracks stage timings separately without a whole-run residual.
         measurement.otherMs = Math.max(0, measurement.elapsedMs - measurement.setupMs -
           (measurement.retrievalMs ?? 0) - (measurement.candidatePrepMs ?? 0) - (measurement.judgeMs ?? 0));
         if (signal?.aborted) measurement.outcome = abortedByTimeout(signal) ? "timed_out" : "cancelled";

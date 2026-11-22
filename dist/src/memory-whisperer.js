@@ -1,10 +1,15 @@
 import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
-import { ApiQueryGenerator, QueryApiError, queryConversation } from "./query-generator.js";
-import { judgeTrainingInput, TRAINING_GATE_THRESHOLD } from "./training-gate.js";
+import { ApiQueryGenerator, compactJudgeConversation, fallbackQueries, QueryApiError, queryConversation } from "./query-generator.js";
 import { QueryInputBudgetError } from "./query-contract.js";
 import { searchMemory, memoryPassageId } from "./memory-search.js";
-import { timeStage } from "./retrieval-timing.js";
+import { startTiming, timeStage } from "./retrieval-timing.js";
+const MAX_JUDGE_CANDIDATES = 6;
+const MAX_GENERATION_TIMEOUT_MS = 1_500;
+const MAX_PAYLOAD_CHARS = 5_000;
+function encodeHints(items) {
+    return JSON.stringify(items).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
+}
 export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnostics) {
     if (!config.enabled || !typesafe.enabled)
         return;
@@ -26,7 +31,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         const asOf = new Date().toISOString();
         const measurement = { outcome: "skipped", elapsedMs: 0 };
         let stage = "input", reason = "completed";
-        let recallProbability, queryCount;
+        let queryCount, queryFallback = false;
         let requestsSucceeded = 0, requestsFailed = 0;
         const log = (level, event, fields) => api.logger[level]("unblock-memory memory_whisperer " + JSON.stringify({ event, agentId, runId, sessionId, stage, ...fields }));
         const failureFields = (error) => error instanceof TypeSafeRequestError || error instanceof QueryApiError
@@ -43,8 +48,6 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         }
         const { signal } = state.controller;
         let timedOut = false;
-        let recallRejected = false;
-        let gateFailed = false;
         const timer = setTimeout(() => { timedOut = true; state.controller.abort(); }, config.timeoutMs);
         let onAbort = () => { };
         const aborted = new Promise(resolve => {
@@ -62,152 +65,132 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 diagnostics?.record(agentId, "memory", "missing_key");
                 return;
             }
-            const gateStarted = performance.now();
-            const gateSignal = AbortSignal.any([signal, AbortSignal.timeout(typesafe.timeoutMs)]);
-            // Speculation is intentional: neither model generation nor QMD waits for the recall judgment.
-            const gate = judgeTrainingInput(conversation, apiKey, gateSignal)
-                .then(result => {
+            let queries;
+            stage = "generation";
+            const generationStarted = performance.now();
+            const endGeneration = startTiming("generationMs", measurement, signal);
+            const generationTimeoutMs = Math.min(MAX_GENERATION_TIMEOUT_MS, Math.max(1, Math.floor(config.timeoutMs / 2)));
+            const generationSignal = AbortSignal.any([signal, AbortSignal.timeout(generationTimeoutMs)]);
+            try {
+                queries = await generator.generate(conversation, generationSignal);
                 if (signal.aborted)
-                    return false;
-                measurement.gateMs = performance.now() - gateStarted;
-                recallProbability = result.probability;
-                if (result.probability >= TRAINING_GATE_THRESHOLD)
-                    return true;
-                recallRejected = true;
-                diagnostics?.record(agentId, "memory", "recall_not_needed");
-                state.controller.abort();
-                return false;
-            }).catch(error => {
-                if (!signal.aborted) {
-                    measurement.gateMs = performance.now() - gateStarted;
-                    log("warn", "recall_failed", { stage: "recall", elapsedMs: measurement.gateMs, timeoutMs: typesafe.timeoutMs,
-                        ...failureFields(error instanceof TypeSafeRequestError ? error :
-                            new TypeSafeRequestError("Recall judgment failed", "invalid_response")) });
-                    gateFailed = true;
-                    diagnostics?.record(agentId, "memory", "failed");
-                    state.controller.abort();
-                }
-                return false;
+                    return;
+                diagnostics?.record(agentId, "memory", "queries_generated");
+            }
+            catch (error) {
+                if (signal.aborted)
+                    return;
+                queryFallback = true;
+                queries = fallbackQueries(conversation);
+                log("warn", "generation_fallback", { ...failureFields(error), elapsedMs: performance.now() - generationStarted,
+                    timeoutMs: generationTimeoutMs });
+                diagnostics?.record(agentId, "memory", "generation_fallback");
+            }
+            finally {
+                endGeneration();
+            }
+            queryCount = 2;
+            stage = "retrieval";
+            const { manager } = await timeStage("setupMs", measurement, signal, () => runtime.getMemorySearchManager({ cfg: api.config, agentId }));
+            if (signal.aborted)
+                return;
+            if (!manager) {
+                reason = "unavailable";
+                diagnostics?.record(agentId, "memory", "unavailable");
+                return;
+            }
+            const search = await searchMemory(manager, queries, {
+                corpora, signal, apiKey, timeoutMs: typesafe.timeoutMs, conversation: compactJudgeConversation(conversation),
+                asOf, timings: measurement, minUsefulness: config.minUsefulness, maxResults: 4,
+                maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
+                onCandidates: observation => {
+                    measurement.retrievalMs = observation.retrievalMs;
+                    measurement.candidates = observation.candidates;
+                    measurement.eligible = observation.eligible;
+                    measurement.outcome = "empty";
+                    stage = "judgment";
+                },
+                onJudgment: ({ candidateIndex, elapsedMs, error }) => {
+                    const fields = { stage: "judgment", candidateIndex, elapsedMs, timeoutMs: typesafe.timeoutMs };
+                    if (error !== undefined) {
+                        requestsFailed++;
+                        diagnostics?.record(agentId, "memory", "judge_candidate_failed");
+                        log("warn", "candidate_failed", { ...fields, ...failureFields(error) });
+                    }
+                    else {
+                        requestsSucceeded++;
+                        log("info", "candidate_completed", fields);
+                    }
+                },
             });
-            const retrieveAndJudge = async () => {
-                let queries;
-                stage = "generation";
-                const generationStarted = performance.now();
+            if (signal.aborted || sessions.get(key) !== state)
+                return;
+            measurement.judgeMs = search.judgeMs;
+            if (!search.eligible) {
+                reason = "no_candidates";
+                diagnostics?.record(agentId, "memory", "no_candidates");
+                return;
+            }
+            if (!search.requestsSucceeded) {
+                reason = "all_candidates_failed";
+                measurement.outcome = "failed";
+                diagnostics?.record(agentId, "memory", "failed");
+                return;
+            }
+            const ranked = search.results.map(hit => ({ hit, excerpt: hit.snippet, id: memoryPassageId(hit.snippet) }));
+            let selected = ranked.slice(0, config.maxHints);
+            if (!selected.length) {
+                reason = "rejected";
+                diagnostics?.record(agentId, "memory", "rejected");
+                return;
+            }
+            if (config.complementaryHints && config.maxHints > 1 && ranked.length > 1) {
+                stage = "redundancy";
                 try {
-                    queries = await generator.generate(conversation, signal);
-                    if (signal.aborted)
-                        return;
-                    queryCount = 2;
-                    diagnostics?.record(agentId, "memory", "queries_generated");
+                    const pairs = await reviewMemoryRedundancy({ apiKey, timeoutMs: typesafe.timeoutMs, signal,
+                        excerpts: ranked.map(candidate => candidate.excerpt) });
+                    selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]);
                 }
                 catch (error) {
-                    if (signal.aborted)
-                        return;
-                    reason = "generation_failed";
-                    measurement.outcome = "failed";
-                    log("warn", "generation_failed", { ...failureFields(error), elapsedMs: performance.now() - generationStarted });
-                    diagnostics?.record(agentId, "memory", "failed");
-                    return;
-                }
-                finally {
-                    measurement.generationMs = performance.now() - generationStarted;
-                }
-                stage = "retrieval";
-                const { manager } = await timeStage("setupMs", measurement, signal, () => runtime.getMemorySearchManager({ cfg: api.config, agentId }));
-                if (signal.aborted)
-                    return;
-                if (!manager) {
-                    reason = "unavailable";
-                    diagnostics?.record(agentId, "memory", "unavailable");
-                    return;
-                }
-                const search = await searchMemory(manager, queries, {
-                    corpora, signal, apiKey, timeoutMs: typesafe.timeoutMs, conversation, asOf, timings: measurement,
-                    minUsefulness: config.minUsefulness, maxResults: 4, excludedPassages: state.recent,
-                    onCandidates: observation => {
-                        measurement.retrievalMs = observation.retrievalMs;
-                        measurement.candidates = observation.candidates;
-                        measurement.eligible = observation.eligible;
-                        measurement.outcome = "empty";
-                        stage = "judgment";
-                    },
-                    onJudgment: ({ candidateIndex, elapsedMs, error }) => {
-                        const fields = { stage: "judgment", candidateIndex, elapsedMs, timeoutMs: typesafe.timeoutMs };
-                        if (error !== undefined) {
-                            requestsFailed++;
-                            diagnostics?.record(agentId, "memory", "judge_candidate_failed");
-                            log("warn", "candidate_failed", { ...fields, ...failureFields(error) });
-                        }
-                        else {
-                            requestsSucceeded++;
-                            log("info", "candidate_completed", fields);
-                        }
-                    },
-                });
-                if (signal.aborted || sessions.get(key) !== state)
-                    return;
-                measurement.judgeMs = search.judgeMs;
-                if (!search.eligible) {
-                    reason = "no_candidates";
-                    diagnostics?.record(agentId, "memory", "no_candidates");
-                    return;
-                }
-                if (!await gate || signal.aborted || sessions.get(key) !== state)
-                    return;
-                if (!search.requestsSucceeded) {
-                    reason = "all_candidates_failed";
-                    measurement.outcome = "failed";
-                    diagnostics?.record(agentId, "memory", "failed");
-                    return;
-                }
-                const ranked = search.results.map(hit => ({ hit, excerpt: hit.snippet, id: memoryPassageId(hit.snippet) }));
-                let selected = ranked.slice(0, config.maxHints);
-                if (!selected.length) {
-                    reason = "rejected";
-                    diagnostics?.record(agentId, "memory", "rejected");
-                    return;
-                }
-                if (config.complementaryHints && config.maxHints > 1 && ranked.length > 1) {
-                    stage = "redundancy";
-                    try {
-                        const pairs = await reviewMemoryRedundancy({ apiKey, timeoutMs: typesafe.timeoutMs, signal,
-                            excerpts: ranked.map(candidate => candidate.excerpt) });
-                        selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]);
-                    }
-                    catch (error) {
-                        // Preserve the original useful candidates when the optional refinement is unavailable.
-                        if (!signal.aborted) {
-                            diagnostics?.record(agentId, "memory", "redundancy_unavailable");
-                            log("warn", "redundancy_unavailable", failureFields(error));
-                        }
+                    // Preserve the original useful candidates when the optional refinement is unavailable.
+                    if (!signal.aborted) {
+                        diagnostics?.record(agentId, "memory", "redundancy_unavailable");
+                        log("warn", "redundancy_unavailable", failureFields(error));
                     }
                 }
-                if (signal.aborted || sessions.get(key) !== state)
-                    return;
-                stage = "render";
-                const hints = selected.map(({ hit, excerpt }) => ({
-                    source: hit.path, lines: `${hit.startLine}-${hit.endLine}`, body: excerpt,
-                }));
-                // Bound the complete injected payload, including source metadata.
-                // Preserve exact JSON values while keeping source text inside its prompt tags.
-                const rendered = JSON.stringify(hints).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
-                if (rendered.length > 5000) {
-                    reason = "payload_limit";
-                    diagnostics?.record(agentId, "memory", "payload_limit");
-                    return;
-                }
-                for (const candidate of selected)
-                    state.recent.set(candidate.id, state.turn);
-                diagnostics?.record(agentId, "memory", "emitted");
-                const appendContext = `<memory>\n${rendered}\n</memory>`;
-                measurement.outcome = "ok";
-                reason = "emitted";
-                measurement.results = selected.length;
-                measurement.contextChars = appendContext.length;
-                return { appendContext };
-            };
-            const [, result] = await Promise.all([gate, retrieveAndJudge()]);
-            return result;
+            }
+            if (signal.aborted || sessions.get(key) !== state)
+                return;
+            stage = "render";
+            // Bound the complete injected payload without slicing individual excerpts into misleading prefixes.
+            const emitted = [];
+            const hints = [];
+            let rendered = "";
+            for (const candidate of selected) {
+                const nextHint = {
+                    source: candidate.hit.path, lines: `${candidate.hit.startLine}-${candidate.hit.endLine}`, body: candidate.excerpt,
+                };
+                const nextRendered = encodeHints([...hints, nextHint]);
+                if (nextRendered.length > MAX_PAYLOAD_CHARS)
+                    continue;
+                emitted.push(candidate);
+                hints.push(nextHint);
+                rendered = nextRendered;
+            }
+            if (!emitted.length) {
+                reason = "payload_limit";
+                diagnostics?.record(agentId, "memory", "payload_limit");
+                return;
+            }
+            for (const candidate of emitted)
+                state.recent.set(candidate.id, state.turn);
+            diagnostics?.record(agentId, "memory", "emitted");
+            const appendContext = `<memory>\n${rendered}\n</memory>`;
+            measurement.outcome = "ok";
+            reason = "emitted";
+            measurement.results = emitted.length;
+            measurement.contextChars = appendContext.length;
+            return { appendContext };
         };
         // Prompt rebuilds need the same context, not another retrieval or an empty hook result.
         state.result = (async () => {
@@ -232,14 +215,14 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
             finally {
                 measurement.elapsedMs = performance.now() - started;
                 if (signal.aborted) {
-                    measurement.outcome = gateFailed ? "failed" : recallRejected ? "skipped" : timedOut ? "timed_out" : "cancelled";
-                    reason = gateFailed ? "recall_failed" : recallRejected ? "recall_not_needed" : timedOut ? "deadline" : "cancelled";
+                    measurement.outcome = timedOut ? "timed_out" : "cancelled";
+                    reason = timedOut ? "deadline" : "cancelled";
                 }
                 diagnostics?.measureMemory(agentId, measurement);
-                log("info", "completed", { ...measurement, reason, recallProbability, queryCount, requestsSucceeded, requestsFailed,
+                log("info", "completed", { ...measurement, reason, queryCount, queryFallback, requestsSucceeded, requestsFailed,
                     judgedCandidates: requestsSucceeded, partial: requestsSucceeded > 0 && requestsFailed > 0, timeoutMs: config.timeoutMs,
                     requestTimeoutMs: typesafe.timeoutMs });
-                if (signal.aborted && !recallRejected && !gateFailed)
+                if (signal.aborted)
                     diagnostics?.record(agentId, "memory", timedOut ? "timed_out" : "cancelled");
                 clearTimeout(timer);
                 signal.removeEventListener("abort", onAbort);

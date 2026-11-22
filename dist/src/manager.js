@@ -840,6 +840,7 @@ export class QmdMemoryManager {
                     return this.#allowedPaths(collections, opts.sessionFilter);
                 });
                 const store = await timeStage("storeSetupMs", timings, signal, () => this.#getAnalysisStore());
+                const RRF_K = 60;
                 const hits = new Map();
                 // Serialize native QMD work. Cancellation prevents further queries/collections.
                 for (const lane of ["lex", "vec"]) {
@@ -853,15 +854,33 @@ export class QmdMemoryManager {
                             timings.vectorOtherMs = unaccounted(timings.vectorMs, timings, vectorParts);
                         }
                     }
-                    for (const hit of candidates) {
-                        const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk]);
-                        if (!hits.has(key))
-                            hits.set(key, { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
-                                chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: hit.score });
+                    for (const [index, hit] of candidates.entries()) {
+                        const rank = hit.bm25?.rank ?? hit.vector?.rank ?? index + 1;
+                        const contribution = 1 / (RRF_K + rank);
+                        const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk.trim()]);
+                        const existing = hits.get(key);
+                        if (existing) {
+                            existing.rrfScore += contribution;
+                            existing.topRank = Math.min(existing.topRank, rank);
+                        }
+                        else {
+                            hits.set(key, {
+                                hit: { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
+                                    chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: 0 },
+                                rrfScore: contribution,
+                                topRank: rank,
+                            });
+                        }
                     }
                 }
+                // Passage-level RRF (k=60) with QMD's top-rank bonuses so rank-1 single-lane
+                // hits compete cleanly alongside dual-lane matches before any candidate cap.
+                const fused = [...hits.values()].map(entry => ({
+                    ...entry.hit,
+                    score: entry.rrfScore + (entry.topRank === 1 ? 0.05 : entry.topRank <= 3 ? 0.02 : 0),
+                })).sort((a, b) => b.score - a.score);
                 opts.signal?.throwIfAborted();
-                return timeStage("passageMs", timings, signal, () => this.#renderSearchHits([...hits.values()], store, opts, true));
+                return timeStage("passageMs", timings, signal, () => this.#renderSearchHits(fused, store, opts, true));
             });
         }
         finally {

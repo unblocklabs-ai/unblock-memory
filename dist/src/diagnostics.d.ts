@@ -1,6 +1,6 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 type Whisperer = "skill" | "memory" | "safety" | "myTurn";
-type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "recall_not_needed" | "queries_generated" | "judge_candidate_failed" | "input_too_large" | "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
+type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" | "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export declare class WhispererDiagnostics {
     #private;
@@ -24,8 +24,8 @@ export declare class WhispererDiagnostics {
             unavailable?: number | undefined;
             payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
-            recall_not_needed?: number | undefined;
             queries_generated?: number | undefined;
+            generation_fallback?: number | undefined;
             judge_candidate_failed?: number | undefined;
             input_too_large?: number | undefined;
             excluded?: number | undefined;
@@ -49,8 +49,8 @@ export declare class WhispererDiagnostics {
             unavailable?: number | undefined;
             payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
-            recall_not_needed?: number | undefined;
             queries_generated?: number | undefined;
+            generation_fallback?: number | undefined;
             judge_candidate_failed?: number | undefined;
             input_too_large?: number | undefined;
             excluded?: number | undefined;
@@ -74,8 +74,8 @@ export declare class WhispererDiagnostics {
             unavailable?: number | undefined;
             payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
-            recall_not_needed?: number | undefined;
             queries_generated?: number | undefined;
+            generation_fallback?: number | undefined;
             judge_candidate_failed?: number | undefined;
             input_too_large?: number | undefined;
             excluded?: number | undefined;
@@ -102,8 +102,8 @@ export declare class WhispererDiagnostics {
             unavailable?: number | undefined;
             payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
-            recall_not_needed?: number | undefined;
             queries_generated?: number | undefined;
+            generation_fallback?: number | undefined;
             judge_candidate_failed?: number | undefined;
             input_too_large?: number | undefined;
             excluded?: number | undefined;
@@ -150,11 +150,10 @@ export declare class WhispererDiagnostics {
                         otherMs?: number | undefined;
                         retrievalMs?: number | undefined;
                         judgeMs?: number | undefined;
+                        generationMs?: number | undefined;
                         metadataReloads?: number | undefined;
                         vectorScanAttempts?: number | undefined;
                         elapsedMs?: number | undefined;
-                        gateMs?: number | undefined;
-                        generationMs?: number | undefined;
                         candidates?: number | undefined;
                         eligible?: number | undefined;
                         results?: number | undefined;

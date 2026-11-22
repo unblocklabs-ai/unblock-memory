@@ -23,12 +23,12 @@ Example tool input (the `memory` corpus exists by default):
 Results use compact JSON and carry `path`, `startLine`, `endLine`, `snippet`,
 `corpus`, and a `score`. With `rankingMode: "typesafe_usefulness"`, this is a
 usefulness probability rounded to hundredths; ranking and threshold filtering
-still use full precision. With `rankingMode: "retrieval"`, the original QMD
-per-lane reciprocal-rank score is preserved without rounding, then sorted highest
-first (discovery order breaks ties); this is not a probability or fused RRF score.
-Discovery is a lexical-first union, so sorting prevents vector-only top matches
-from being buried below the lexical lane before `maxResults` truncation. A hit
-found in both lanes retains its first-discovered score; lane scores are not summed.
+still use full precision. With `rankingMode: "retrieval"`, passage-level
+reciprocal rank fusion (RRF, `k = 60`, with QMD's top-rank bonuses) scores
+across the BM25 and vector lanes are preserved without rounding and sorted
+highest first (discovery order breaks ties); this is not a usefulness
+probability. Dual-lane matches combine their per-lane RRF contributions while
+rank-1 single-lane hits remain competitive before `maxResults` truncation.
 `scoreMeaning` and `minUsefulnessApplied` identify the score contract explicitly.
 The constant `source` and top-level `provider`
 fields are omitted; `path` plus line numbers replace the redundant `citation`.
@@ -121,8 +121,8 @@ Both `memorySearch` and `memoryWhisperer` also report per-call stage measurement
 - `passageMs`: rendering merged candidates; `candidatePrepMs`: eligibility checks and deduplication
   before disclosure to TypeSafe. `judgeMs` covers the concurrent candidate judgments, not their sum.
 - `vectorOtherMs` and `retrievalOtherMs` expose time outside measured child stages. `otherMs` accounts
-  for the remaining manual tool execution. Whisperer stages overlap, so no additive whole-run
-  residual is reported for it. Parent durations must not be added to their child durations.
+  for the remaining manual tool execution; Whisperer tracks individual stage timings without a
+  separate whole-run residual. Parent durations must not be added to their child durations.
 
 Each measurement includes lifetime totals/sample counts and p50/p95 over up to 256 recent calls.
 `slowestRecent` contains the five slowest calls **within that same window**, each with its outcome
@@ -309,8 +309,8 @@ or `memory_get`. Enable it in the plugin config with an explicit corpus allowlis
   "memoryWhisperer": {
     "enabled": true,
     "corpora": ["knowledge"],
-    "minUsefulness": 0.7,
-    "maxHints": 2,
+    "minUsefulness": 0.5,
+    "maxHints": 3,
     "cooldownTurns": 10,
     "timeoutMs": 3000
   }
@@ -330,41 +330,40 @@ indexing/sync schedule.
 The example is a plugin config fragment; `knowledge` must already be configured.
 For a complete corpus example, use the [configuration profiles](configuration.md#example-profiles).
 
-The initial TypeSafe recall gate is instructed to reject requests constrained to a
-specific date or time window (for example, "what did we talk about 13 days ago?").
-Whisperer's QMD retrieval has no date filters, so topic relevance cannot establish
-that an excerpt belongs to the requested period. Incidental dates, such as a future
-deadline on a topic-based request, do not trigger this exclusion. The gate is shared
-with offline training; this policy is versioned as `historical-recall-v2`.
-
-Using the configured V2 query API, QMD searches its independent `lex` and `vec` queries
-through BM25 and vectors respectively, retrieving ten candidates per backend across
-the complete approved collection scope (not ten per collection). The lexical adapter
+Memory Whisperer runs directly on user turns without a pre-retrieval recall-gate
+classifier (the `historical-recall-v2` gate remains offline-training-only in
+`memory-training`). Using the configured V2 query API — or deterministic local
+`lex`/`vec` query extraction if the query API fails, times out, or has no
+credentials — QMD searches its independent `lex` and `vec` queries through BM25
+and vectors respectively, retrieving ten candidates per backend across the
+complete approved collection scope (not ten per collection) and fusing them via
+passage-level RRF (`k = 60`, with QMD top-rank bonuses). The lexical adapter
 uses literal OR keywords; quotation marks do not enable exact-phrase matching.
-API or generated-output failures skip the hint; there is no direct-vector fallback.
-After query generation Whisperer uses the same discovery, deduplication and
-ranking core as `memory_search`, but judges against the bounded conversation
-rather than the explicit tool's semantic query alone. TypeSafe evaluates one independent
-Noul question per candidate in its own concurrent HTTP request: would a careful
-assistant use a specific factual detail from the excerpt when answering the current
-request? Partial answers and concrete leads count; repeated facts, topic/name matches
-without answer content, unrelated details, and unsupported speculation do not.
+After deduplication and cooldown filtering, Whisperer sends at most the top **six**
+fused candidates to TypeSafe, paired with a compact conversation context (the
+current request plus at most the last two visible messages, bounded to 1,500
+characters). TypeSafe evaluates one independent Noul question per candidate in
+its own concurrent HTTP request: would a careful assistant use a specific factual
+detail from the excerpt when answering the current request? Partial answers and
+concrete leads count; repeated facts, topic/name matches without answer content,
+unrelated details, and unsupported speculation do not.
 This is the sole versioned Memory Whisperer usefulness prompt, shared by runtime
 and offline training. Generated queries, ranks, retrieval scores, and other candidates
 are never included in the passage judge's state.
-`minUsefulness` defaults to `0.7` and
+`minUsefulness` defaults to `0.5` and
 thresholds the probability of yes, not a calibrated guarantee of accuracy.
 Explicit configured thresholds are preserved. Evaluate it on your own conversations.
 
-**Privacy and budgets:** training and runtime prepare the same visible conversation:
-at most 8,192 pinned-LFM tokens and 24,000 UTF-8 bytes after serialization. The whole
+**Privacy and budgets:** query generation prepares the visible conversation up to
+8,192 pinned-LFM tokens and 24,000 UTF-8 bytes after serialization. The whole
 current request and most recent whole messages are retained; an oversized current
-request skips automatic memory before query generation or the TypeSafe recall gate.
+request skips automatic memory before query generation or retrieval.
 Diagnostics count `input_too_large`; completed logs report `outcome: "skipped"` and
-`reason: "input_too_large"`, without recording the input. The judge receives that
-conversation plus one complete 1,200-character excerpt, its corpus/source path, all represented message timestamps,
-and the request's evaluation time per HTTP request. A v2 query pair can therefore
-produce up to twenty passage requests before deduplication and eligibility filtering.
+`reason: "input_too_large"`, without recording the input. Each TypeSafe usefulness
+request receives the compacted conversation (at most 1,500 characters across the
+current request and up to two prior visible messages) plus one complete
+1,200-character excerpt, its corpus/source path, all represented message timestamps,
+and the request's evaluation time, capped at six candidate requests per turn.
 Dates record when source messages were said, without inferring event dates.
 Session excerpts retain a complete turn or message when it fits,
 otherwise the complete matched chunk. Chunks exceeding the excerpt budget are
@@ -376,9 +375,9 @@ already have compacted the available context. System messages, thinking blocks,
 images, and tool-result messages are omitted;
 anything quoted in ordinary user/assistant text can still be transmitted.
 
-At most two qualifying excerpts are appended after the current user prompt via
-`appendContext`, as a JSON array inside `<memory>` tags within one `<unblock_memory>`
-block. Each entry contains
+At most three qualifying excerpts (default `maxHints: 3`, configurable `1–3`) are
+appended after the current user prompt via `appendContext`, as a JSON array inside
+`<memory>` tags within one `<unblock_memory>` block. Each entry contains
 only `source` (the QMD path), `lines` (for example, `27-30`), and `body` (the verbatim
 excerpt). No instruction paragraph or required `memory_get` call is
 added. This is still part of the same user message, not a separate message.
@@ -387,7 +386,10 @@ and overlapping source lines; recently injected content has a ten-user-turn cool
 by default. Cooldown state is in memory and resets on session end or Gateway restart.
 Memory and Skill Whisperer reuse their result when the host rebuilds the same run's
 prompt, without repeating retrieval or advancing cooldown.
-The complete hint payload is capped at 5,000 characters plus the wrapper tags.
+The complete hint payload is capped at 5,000 characters plus the wrapper tags;
+when multiple selected hints exceed that limit after JSON escaping, Memory
+Whisperer emits the highest-ranked complete hints that fit rather than slicing
+excerpts or dropping everything, and only records cooldown for emitted hints.
 
 All whisperer contributions share that appended block, in this order: `<memory>`,
 `<skill>`, then `<people>` when People Whisperer has an eligible blurb. Empty sections
@@ -441,56 +443,59 @@ between that private worker protocol and the HTTP API below.
 `POST /generate` accepts `{id, conversation: {history, currentRequest}}` and returns
 `{response: {id, text}}`, where `text` is JSON with exactly two nonempty strings,
 `lex` and `vec`. The request ID must match. Redirects, malformed/oversized responses,
-missing credentials and HTTP failures skip hints; no retries or local fallback.
+missing credentials, timeouts (capped at half the whisperer deadline, up to 1.5s),
+and HTTP failures log `generation_fallback` and fall back to deterministic local
+`lex`/`vec` extraction rather than aborting retrieval; all fallback hits still pass
+through TypeSafe usefulness judging.
 Turn cancellation aborts HTTP and prevents late hints; already-running server-side
 generation may finish independently. Gateway shutdown does not stop the shared API.
 Old `mlx` config is accepted but ignored; remove it after migrating.
 
-Two branches start together: TypeSafe's historical-recall judgment and API
-generation requesting exactly one `{"lex":"keywords","vec":"semantic query"}` object.
-Generation uses visible user/assistant text,
-the exact model prompt/template, greedy decoding and a 256-token output ceiling.
-It keeps the whole current request, drops oldest whole history messages to fit a
-shared 8,192-token and 24,000-byte input budgets, and excludes oversized/ambiguous
-inputs. The old fixed `historyMessages` limit is not used by memory input preparation.
+Query generation requests one `{"lex":"keywords","vec":"semantic query"}` object
+using visible user/assistant text, the exact model prompt/template, greedy decoding,
+and a 256-token output ceiling. It keeps the whole current request, drops oldest
+whole history messages to fit the shared 8,192-token and 24,000-byte input budgets,
+and excludes oversized/ambiguous inputs. The old fixed `historyMessages` limit is
+not used by memory input preparation.
 
 The `lex` query retrieves ten BM25 matches and `vec` retrieves ten vector matches
-across the approved scope. All unique eligible passages proceed to the shared usefulness
-judge, with one HTTP request per passage, all launched together, without a merged
-passage-count cap or groups of eight. Each request contains the original conversation
-and only its own passage. Successful judgments remain eligible if another
+across the approved scope, then fuses them with passage-level RRF (`k = 60` plus
+QMD top-rank bonuses). After deduplication and cooldown filtering, up to the top
+**six** fused passages proceed to the shared usefulness judge, with one HTTP request
+per passage launched concurrently. Each request contains the compacted conversation
+(up to 1,500 characters across the current request and at most two prior visible
+messages) and only its own passage. Successful judgments remain eligible if another
 request times out, fails HTTP/network delivery, or returns invalid answers. Scores
 stay paired with their original passages; failed candidates are excluded, not scored
-as zero. If all requests fail, nothing is injected. Recall approval, the total
-deadline, and session cancellation still apply to every result. No retries are
-added to the latency-sensitive hook.
-The 1,200-character complete-excerpt limit, corpus checks, citations, cooldown and
-two-hint/5,000-character injection budget still apply. The judge sees only the
-original conversation and passages, never generated queries or retrieval scores.
-This can send more passages to TypeSafe than the legacy eight-candidate path.
+as zero. If all requests fail, nothing is injected. The total deadline and session
+cancellation still apply to every result. No retries are added to the
+latency-sensitive hook.
+The 1,200-character complete-excerpt limit, corpus checks, citations, cooldown, and
+three-hint/5,000-character complete-hint packing budget still apply. The judge sees
+only the compacted conversation and passages, never generated queries or retrieval
+scores.
 
-Recall probability below 0.7 discards/cancels the speculative branch immediately;
-no results are used until recall is approved. A recall error also emits no hint.
 Query output requires exactly the two nonempty string fields `lex` and `vec`;
-surrounding whitespace is trimmed. Old query arrays are not accepted. Unparseable or
-unavailable v2 output skips automatic memory for that turn rather than switching to
-untrained queries. Successful output still requires recall approval and passage judgments.
-Nothing changes in manual `memory_search`. The default total deadline remains
-three seconds; measure the full path before choosing a larger explicit budget.
+surrounding whitespace is trimmed. Old query arrays are not accepted. Unparseable,
+timed-out, or unavailable v2 output falls back to deterministic local `lex`/`vec`
+queries for that turn and still requires TypeSafe passage judgments.
+Nothing changes in manual `memory_search` beyond passage-level RRF scoring in
+shared candidate discovery. The default total deadline remains three seconds;
+measure the full path before choosing a larger explicit budget.
 Already-running native retrieval may finish after cancellation, but cannot inject.
 
-Diagnostics distinguish `queries_generated`, `failed`,
-`recall_not_needed`, and `judge_candidate_failed`. Gateway logs prefixed
+Diagnostics distinguish `queries_generated`, `generation_fallback`, `failed`,
+and `judge_candidate_failed`. Gateway logs prefixed
 `unblock-memory memory_whisperer` contain structured JSON with agent/run/session
 IDs, candidate index, elapsed time, request timeout, and safe
 failure codes (`timeout`, `cancelled`, `http_error`, `network_error`,
-`invalid_response`; HTTP failures include the status). Unexpected local errors
-identify the failed stage without dumping the exception. A single completion
-record per run includes its outcome/reason, available stage timings, recall
-probability, query/candidate counts, `requestsSucceeded`/`requestsFailed`, partial-result
-flag, and emitted hint count. Prompt rebuilds reuse the result without duplicate
-logs. Logs never include queries, prompts, excerpts, credentials, provider bodies,
-or raw exceptions; exact query text is not retained by this telemetry.
+`invalid_response`, `credentials`, `unavailable`; HTTP failures include the status).
+Unexpected local errors identify the failed stage without dumping the exception.
+A single completion record per run includes its outcome/reason, available stage
+timings, query/candidate counts, `queryFallback` flag, `requestsSucceeded`/`requestsFailed`,
+partial-result flag, and emitted hint count. Prompt rebuilds reuse the result without
+duplicate logs. Logs never include queries, prompts, excerpts, credentials, provider
+bodies, or raw exceptions; exact query text is not retained by this telemetry.
 
 ## Skill Whisperer
 

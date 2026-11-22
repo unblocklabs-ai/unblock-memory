@@ -1,7 +1,7 @@
 import { type RetrievalTimings } from "./retrieval-timing.js";
 type RetrievalOperation = "vector" | "memoryWhisperer" | "memorySearch";
 type RetrievalOutcome = "ok" | "partial" | "empty" | "failed" | "cancelled" | "timed_out" | "skipped" | "degraded";
-declare const fields: readonly ["elapsedMs", "retrievalMs", "judgeMs", "gateMs", "generationMs", "setupMs", "queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs", "vectorIndexCheckMs", "vectorScopeMs", "embeddingMs", "vectorScanMs", "hydrationMs", "vectorMappingMs", "vectorOtherMs", "passageMs", "candidatePrepMs", "retrievalOtherMs", "otherMs", "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars", "requestsSucceeded", "requestsFailed", "fallbackKeyUnavailable", "fallbackAllJudgmentsFailed"];
+declare const fields: readonly ["elapsedMs", "retrievalMs", "judgeMs", "generationMs", "setupMs", "queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs", "vectorIndexCheckMs", "vectorScopeMs", "embeddingMs", "vectorScanMs", "hydrationMs", "vectorMappingMs", "vectorOtherMs", "passageMs", "candidatePrepMs", "retrievalOtherMs", "otherMs", "metadataReloads", "vectorScanAttempts", "candidates", "eligible", "results", "contextChars", "requestsSucceeded", "requestsFailed", "fallbackKeyUnavailable", "fallbackAllJudgmentsFailed"];
 type Field = typeof fields[number];
 export type RetrievalObservation = {
     outcome: RetrievalOutcome;
@@ -47,11 +47,10 @@ export declare class RetrievalTelemetry {
                     otherMs?: number | undefined;
                     retrievalMs?: number | undefined;
                     judgeMs?: number | undefined;
+                    generationMs?: number | undefined;
                     metadataReloads?: number | undefined;
                     vectorScanAttempts?: number | undefined;
                     elapsedMs?: number | undefined;
-                    gateMs?: number | undefined;
-                    generationMs?: number | undefined;
                     candidates?: number | undefined;
                     eligible?: number | undefined;
                     results?: number | undefined;

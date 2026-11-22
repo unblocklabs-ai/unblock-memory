@@ -15,7 +15,7 @@ settings; a rotated credential file is reread without a restart.
 | `memory_search` | Installed/enabled memory slot; configured corpora | Local retrieval-ranked leads with degraded warning | Successful judged siblings returned with a partial warning; total judging failure or unreadable key uses local retrieval fallback |
 | `memory_get` | Installed/enabled memory slot; configured corpora | Unchanged local indexed reads | Unchanged; its own indexing errors still matter |
 | Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | Exclude failed candidates; successful siblings may qualify; no vector fallback |
-| Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; recall/deadline failures still suppress the turn |
+| Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; deadline failures still suppress the turn; query-API failures fall back to deterministic local queries before TypeSafe judging |
 | Complementary hints | Enabled Memory Whisperer + `complementaryHints` | No additional judgment; base hints also require a key | Keep baseline hints unless the total deadline expires |
 | Safety Whisperer | `safetyWhisperer.enabled`, at least one scenario, host hooks (conversation access and prompt injection) | Could not check: the turn proceeds without safety prompts (fails open) | Fails open; recorded as could-not-check, never as no match |
 | People store/tools | `people.enabled` | Available; automatic save review needs primer/key or verified manual alternative | Storage/inspection still available |
@@ -42,7 +42,7 @@ All plugin TypeSafe features use `plugins.entries.unblock-memory.config.typesafe
 
 Candidate scoring uses **one HTTP request per candidate**, with ranking done in code.
 Related questions about the same candidate can share a request (for example, quality
-noise and evidence). Memory Whisperer launches all eligible candidate requests together;
+noise and evidence). Memory Whisperer launches up to six top fused eligible candidate requests together;
 the shared account's request/token limits still apply across simultaneous conversations
 and nodes. There is no automatic retry in the latency-sensitive whisperers.
 
@@ -228,10 +228,10 @@ contract; these tables explain their effects.
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, TypeSafe key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
 | `memoryWhisperer.api.endpoint` | `http://192.168.1.191:18087` | Resident V2 query-model API base URL. Override with `http://127.0.0.1:18087` for a node hosting its own API (e.g. Theo). |
-| `memoryWhisperer.api.apiKeyFile` | unset | Absolute path to a file containing the API bearer token. Missing credentials/API failure skips the hint; no local-model fallback. |
+| `memoryWhisperer.api.apiKeyFile` | unset | Absolute path to a file containing the API bearer token. Missing credentials, timeouts, or API failures fall back to deterministic local queries before TypeSafe judging. |
 | `memoryWhisperer.mlx` | unset | Deprecated: old absolute `{pythonPath, modelPath}` values are accepted but ignored for upgrade compatibility. Remove after configuring `api`. |
-| `memoryWhisperer.minUsefulness` | `0.7` | 0–1, minimum Noul yes-probability per candidate; explicit overrides are preserved |
-| `memoryWhisperer.maxHints` | `2` | 1–2 |
+| `memoryWhisperer.minUsefulness` | `0.5` | 0–1, minimum Noul yes-probability per candidate; explicit overrides are preserved |
+| `memoryWhisperer.maxHints` | `3` | 1–3 |
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
 | `memoryWhisperer.timeoutMs` | `3000` | 1–10,000 total whisper deadline, not just the provider timeout |
 | `memoryWhisperer.complementaryHints` | `false` | Optional extra redundancy judgment; does not expand retrieval or enable the feature |
@@ -381,7 +381,7 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Feature | Evidence sent when explicitly enabled/approved |
 | --- | --- |
 | Skill selection | Bounded visible current/recent conversation + shortlisted skill names/descriptions; not skill procedures or source-path fields |
-| Memory hints | Same 8,192-token/24,000-byte visible conversation as training goes to the configured query API and recall gate; one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per passage judgment. V2 retrieves at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
+| Memory hints | Same 8,192-token/24,000-byte visible conversation as training goes to the configured query API (when available); TypeSafe passage judging receives the compacted conversation (current request plus at most two prior visible messages, bounded to 1,500 characters) plus one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per candidate, capped at the top 6 RRF-fused eligible passages from at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
 | Complementarity | Up to 4 already-qualified excerpts for pairwise redundancy checks |
 | People primer | Person identity, agent name, approved retrieved excerpts and source/session metadata; all indexed sessions eligible if approved, not just the current chat |
 | Dossier save/draft review | Proposed blurb, person/agent names and 1–3 exact approved indexed evidence ranges, at most 6,000 characters total; existing dossier is not evidence |
