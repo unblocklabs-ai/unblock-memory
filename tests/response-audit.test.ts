@@ -67,6 +67,20 @@ test("recognized envelopes expose only current human text and preserve ordinary 
   assert.deepEqual(responseUserText(wrapped("Current request"), "owner"), { text: "Current request", contextLimited: true });
   const dmWrapped = wrapped("Current request").replace("Slack message in #test", "Slack DM");
   assert.deepEqual(responseUserText(dmWrapped, "owner"), { text: "Current request", contextLimited: true });
+  // OpenClaw 2026.10+/11+ prefixed upstreamUserText, Recent chat history, and batched edit system lines stay verifiable.
+  const prefixedEdited = '[OpenClaw conversation info: sender={"id":"owner","name":"Bek"}]\n' +
+    'Conversation info: ⟦openclaw:ctx⟧\n```json\n{"sender":{"id":"owner","name":"Bek"}}\n```\n\n' +
+    'Recent chat history: ⟦openclaw:ctx⟧\nPRIVATE EMBEDDED HISTORY\n\n' +
+    'System: [2026-09-10 10:26:38 EDT] Slack message in #test from Bek\n' +
+    'System: [2026-09-10 10:26:38 EDT] Slack message edited in #test.\n\nCurrent request';
+  assert.deepEqual(responseUserText(prefixedEdited, "owner"), { text: "Current request", contextLimited: true });
+  assert.equal(responseUserText(prefixedEdited, "stranger"), undefined);
+  // Two adjacent Slack message markers in one block must remain rejected as ambiguous.
+  assert.equal(responseUserText(prefixedEdited.replace("Slack message edited in #test.", "Slack message in #test from Other"), "owner"), undefined);
+  assert.equal(responseUserText(prefixedEdited.replace("Slack message edited in #test.", "Slack DM from Bek"), "owner"), undefined);
+  // Bare From header with no body must still enforce sender verification and never leak as human text.
+  assert.equal(responseUserText("From: Other (stranger)\n", "owner"), undefined);
+  assert.equal(responseUserText("From: Bek (owner)\n", "owner"), undefined);
   const channelContext = "\n\nContext: ⟦openclaw:ctx⟧\nPRIVATE CHANNEL CONTEXT";
   for (const envelope of [wrapped("Current request"), dmWrapped]) {
     const contextual = envelope + channelContext;

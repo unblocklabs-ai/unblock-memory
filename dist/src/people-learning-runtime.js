@@ -135,32 +135,80 @@ function reviewCohort(manifest) {
 function analysisBasis(config, manifest) {
     return jsonHash([responseCohort(config.responseAudit), config.responseAudit.lookbackDays, manifest]);
 }
+const STARTUP_RETRY_DELAY_MS = 5_000;
+const RETRY_DELAY_MS = 60_000;
+const MAX_QUIET_STARTUP_RETRIES = 8;
+function isStartupPrepError(error) {
+    return /not completed startup inspection and preparation/i.test(String(error));
+}
 export function registerPeopleLearning(api, initial, stores) {
     let cfg = api.config, config = initial, stateRoot = resolveStateDir(), live = false;
-    let jobs = [], reconciliation;
+    let jobs = [], reconciliation, followUp;
+    let rerun = false, startupRetries = 0;
     let getCron;
     let generation = 0;
     let scheduler;
+    let retryTask;
+    const clearRetry = () => { retryTask?.cancel?.(); retryTask = undefined; };
+    const scheduleRetry = (delayMs) => {
+        clearRetry();
+        if (!live || !scheduler || scheduler.signal?.aborted)
+            return;
+        try {
+            retryTask = scheduler.schedule({ id: "people-learning-reconcile", delayMs, run: reconcile });
+        }
+        catch {
+            // Host scheduler can close concurrently during gateway shutdown or reload.
+        }
+    };
     const reconcile = () => {
         if (!live)
             return Promise.resolve();
-        if (reconciliation)
-            return reconciliation.then(() => live ? reconcile() : undefined);
+        if (reconciliation) {
+            rerun = true;
+            if (!followUp) {
+                const next = () => {
+                    followUp = undefined;
+                    if (!live || !rerun)
+                        return;
+                    rerun = false;
+                    return reconcile();
+                };
+                followUp = reconciliation.then(next, next);
+            }
+            return followUp;
+        }
         const cron = getCron?.();
         if (!cron) {
             api.logger.warn("unblock-memory people learning incomplete: this host does not expose service getCron; upgrade the host");
             return Promise.resolve();
         }
+        rerun = false;
         const version = generation;
         const learning = config.people.enabled && config.people.whisperer.enabled ? config.people.learning
             : { ...config.people.learning, enabled: false, agents: {} };
         reconciliation = reconcilePeopleLearning(cron, cfg, learning, () => live && version === generation)
-            .then(result => { if (live && version === generation)
-            jobs = result; })
+            .then(result => {
+            if (live && version === generation) {
+                jobs = result;
+                startupRetries = 0;
+                clearRetry();
+            }
+        })
             .catch(error => {
+            if (!live || version !== generation)
+                return;
+            rerun = false;
+            if (isStartupPrepError(error) && scheduler && !scheduler.signal?.aborted && startupRetries < MAX_QUIET_STARTUP_RETRIES) {
+                startupRetries++;
+                if (startupRetries === 1) {
+                    api.logger.info?.("unblock-memory people learning scheduling deferred until agent startup preparation completes");
+                }
+                scheduleRetry(STARTUP_RETRY_DELAY_MS);
+                return;
+            }
             api.logger.warn(`unblock-memory people learning scheduling incomplete: ${String(error)}`);
-            if (live)
-                scheduler?.schedule({ id: "people-learning-reconcile", delayMs: 60_000, run: reconcile });
+            scheduleRetry(RETRY_DELAY_MS);
         })
             .finally(() => { reconciliation = undefined; });
         return reconciliation;
@@ -173,21 +221,35 @@ export function registerPeopleLearning(api, initial, stores) {
             stateRoot = context.stateDir;
             const entry = cfg.plugins?.entries?.["unblock-memory"];
             config = resolveConfig(entry ? entry.config : api.pluginConfig);
+            clearRetry();
             live = true;
             generation++;
+            startupRetries = 0;
+            rerun = false;
             getCron = context.getCron?.bind(context);
             scheduler = context.scheduler;
             void reconcile();
         },
-        async stop() { live = false; generation++; await reconciliation; jobs = []; },
+        async stop() {
+            live = false;
+            const stopVersion = ++generation;
+            rerun = false;
+            startupRetries = 0;
+            clearRetry();
+            await reconciliation?.catch(() => { });
+            await followUp?.catch(() => { });
+            if (stopVersion === generation)
+                jobs = [];
+        },
     });
     api.on("gateway_start", () => reconcile());
     api.on("cron_reconciled", (_event, context) => {
         if (context.config) {
+            const entry = context.config.plugins?.entries?.["unblock-memory"];
+            const nextConfig = resolveConfig(entry ? entry.config : api.pluginConfig);
             generation++;
             cfg = context.config;
-            const entry = cfg.plugins?.entries?.["unblock-memory"];
-            config = resolveConfig(entry ? entry.config : api.pluginConfig);
+            config = nextConfig;
         }
         return reconcile();
     });

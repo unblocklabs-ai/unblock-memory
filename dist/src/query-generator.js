@@ -2,12 +2,12 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { abortable, abortedByTimeout } from "./abortable.js";
 import { messageText } from "./whisperer-context.js";
-import { conversationUserText } from "./response-text.js";
+import { CONVERSATION_INFO, queryUserText } from "./response-text.js";
 import { parseQueryPair, prepareQueryConversation } from "./query-contract.js";
-import { record } from "./guards.js";
+import { nonBlank, record } from "./guards.js";
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
-export function queryConversation(prompt, messages) {
-    const currentRequest = conversationUserText(prompt)?.text ?? "";
+export function queryConversation(prompt, messages, currentUserMessage) {
+    const currentRequest = queryUserText(currentUserMessage !== undefined ? currentUserMessage : prompt) ?? "";
     const visible = [];
     const assistantTexts = new Map();
     for (const item of messages) {
@@ -31,11 +31,17 @@ export function queryConversation(prompt, messages) {
             (mirror && record(message.openclawDeliveryMirror)?.kind === "channel-final-suppressed")))
             continue;
         const text = messageText(message);
-        const raw = text?.role === "user" && typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : text?.text;
-        const content = text?.role === "user" && raw ? conversationUserText(raw, meta?.senderId ?? message.senderId)?.text : raw;
+        const sender = nonBlank(meta?.senderId) ?? nonBlank(message.senderId);
+        const upstream = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : undefined;
+        const content = text?.role === "user"
+            ? (upstream ? queryUserText(upstream, sender) : undefined) ??
+                // Fall back to canonical message.content only when upstreamUserText is absent or has a decorated non-envelope prefix,
+                // never to bypass a rejected Conversation info envelope.
+                (upstream && CONVERSATION_INFO.test(upstream.trim()) ? undefined : (text.text ? queryUserText(text.text, sender) : undefined))
+            : text?.text;
         if (message.role === "user") {
             assistantTexts.clear();
-            if (!content || /^(?:\[OpenClaw heartbeat poll\]|\[Queued messages while agent was busy\]|\[Subagent Context\]|<relevant-memories>)/.test(content)) {
+            if (!content || /^(?:\[cron:|\[OpenClaw heartbeat poll\]|\[Inter-session message\]|\[Queued messages while agent was busy\]|\[Subagent Context\]|<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>|<relevant-memories>|<unblock_memory>|<conversation_context>)/.test(content)) {
                 visible.length = 0;
                 continue;
             }
@@ -50,7 +56,8 @@ export function queryConversation(prompt, messages) {
         }
         visible.push({ role: text.role, content });
     }
-    if (visible.at(-1)?.role === "user" && visible.at(-1)?.content === currentRequest)
+    const last = visible.at(-1);
+    if (last?.role === "user" && last.content.replaceAll("\r\n", "\n") === currentRequest.replaceAll("\r\n", "\n"))
         visible.pop();
     return prepareQueryConversation(visible, currentRequest).conversation;
 }

@@ -4,6 +4,8 @@ export declare function conversationUserText(raw: string, sender?: unknown): {
     text: string;
     contextLimited: boolean;
 } | undefined;
+/** Unwrap human text for recall query generation, including non-Slack OpenClaw inbound envelopes. */
+export declare function queryUserText(raw: string, sender?: unknown): string | undefined;
 /** Like conversationUserText, plus the untrusted inbound context (thread starter, reply target,
  * chat history) that a recognized envelope carries before the current message. */
 export declare function conversationEnvelope(raw: string, sender?: unknown): {

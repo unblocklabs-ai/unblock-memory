@@ -614,3 +614,98 @@ test("weekly checkpoints discover every statement in a newly saved participant d
   assert.doesNotMatch(JSON.stringify(ownedSource), /ALPHA_PRIVATE_BACKLOG/u);
   await service!.stop!({ config: hostConfig, stateDir: f.root, logger: api.logger });
 });
+
+test("startup inspection deferral coalesces boot hooks quietly, retries quickly, and escalates persistent errors", async () => {
+  const root = mkdtempSync(join(tmpdir(), "people-learning-startup-"));
+  const stores = new PeopleStores({ stateRoot: root, maxOpenTodos: 10, maxBlurbChars: 1200 });
+  const hostConfig: OpenClawConfig = { agents: { defaults: { userTimezone: "UTC" }, entries: { alpha: {} } } };
+  const h = hostCron();
+  let mode: "prep" | "ok" | "fatal" = "prep";
+  let listCalls = 0;
+  let releaseFirst: (() => void) | undefined;
+  const firstEntered = new Promise<void>(resolve => {
+    const baseList = h.cron.list.bind(h.cron);
+    h.cron.list = async (input) => {
+      listCalls++;
+      if (listCalls === 1) {
+        resolve();
+        await new Promise<void>(done => { releaseFirst = done; });
+      }
+      if (mode === "prep") throw new Error("Agent main has not completed startup inspection and preparation. Inspection and writable admission continue after the Gateway listener binds.");
+      if (mode === "fatal") throw new Error("cron storage corrupt");
+      return baseList(input);
+    };
+  });
+  let service: OpenClawPluginService | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const infos: string[] = [], warns: string[] = [];
+  const scheduled: { id: string; delayMs: number; run: () => Promise<void> | void; cancelled: boolean }[] = [];
+  let schedulerClosed = false;
+  const api = {
+    config: hostConfig,
+    pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+    logger: { info(m: string) { infos.push(m); }, warn(m: string) { warns.push(m); } },
+    registerService(value: OpenClawPluginService) { service = value; },
+    registerTool() {},
+    on(name: string, handler: (...args: unknown[]) => unknown) { hooks.set(name, handler); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, enabled(), stores);
+  await service!.start({
+    config: hostConfig, stateDir: root, logger: api.logger,
+    getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }),
+    scheduler: {
+      schedule(task: { id: string; delayMs: number; run: () => Promise<void> | void }) {
+        if (schedulerClosed) throw new Error("Plugin service scheduler is closed");
+        const entry = { ...task, cancelled: false };
+        scheduled.push(entry);
+        return { cancel() { entry.cancelled = true; } };
+      },
+    },
+  } as unknown as Parameters<OpenClawPluginService["start"]>[0]);
+  await firstEntered;
+  // Concurrent boot triggers coalesce rather than chaining duplicate warnings.
+  const gw = hooks.get("gateway_start")!({}, {});
+  const cr = hooks.get("cron_reconciled")!({ reason: "boot" }, {});
+  releaseFirst!();
+  await Promise.all([gw, cr]);
+  assert.equal(listCalls, 1, "same-generation boot hooks defer to the scheduled retry instead of hammering immediately");
+  assert.equal(warns.length, 0);
+  assert.equal(infos.length, 1);
+  assert.equal(scheduled.at(-1)?.delayMs, 5_000);
+
+  // Recovery on retry registers jobs cleanly, cancels pending timer, and resets quiet retry budget.
+  const firstTimer = scheduled.at(-1)!;
+  mode = "ok";
+  await firstTimer.run();
+  assert.equal(warns.length, 0);
+  assert.equal(h.jobs.length, 2);
+  assert.equal(firstTimer.cancelled, true);
+
+  // Persistent startup-prep failures escalate to warn + 60s backoff after the quiet budget.
+  mode = "prep";
+  for (let i = 0; i < 8; i++) {
+    await hooks.get("gateway_start")!({}, {});
+    assert.equal(warns.length, 0);
+    assert.equal(scheduled.at(-1)?.delayMs, 5_000);
+  }
+  await hooks.get("gateway_start")!({}, {});
+  assert.equal(warns.length, 1);
+  assert.match(warns[0]!, /startup inspection and preparation/);
+  assert.equal(scheduled.at(-1)?.delayMs, 60_000);
+
+  // Genuine non-startup errors warn immediately with 60s backoff.
+  mode = "ok";
+  await hooks.get("gateway_start")!({}, {});
+  mode = "fatal";
+  await hooks.get("gateway_start")!({}, {});
+  assert.equal(warns.length, 2);
+  assert.match(warns[1]!, /cron storage corrupt/);
+  assert.equal(scheduled.at(-1)?.delayMs, 60_000);
+
+  // Closed scheduler during shutdown/reload never rejects reconcile() or crashes stop().
+  schedulerClosed = true;
+  await hooks.get("gateway_start")!({}, {});
+  assert.equal(warns.length, 3);
+  await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
+  stores.closeAll();
+});

@@ -18,7 +18,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
     const beforePrompt = async (event, context) => {
         const { agentId, runId, sessionId, sessionKey } = context;
         const scope = sessionId || sessionKey;
-        if (context.trigger !== "user" || !agentId || !runId || !scope || !event.prompt.trim())
+        if (context.trigger !== "user" || !agentId || !runId || !scope)
             return;
         const corpora = config.corpora;
         if (!corpora.length)
@@ -27,6 +27,10 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         const previous = sessions.get(key);
         if (previous?.runId === runId)
             return previous.result;
+        const currentUserMessage = typeof event.currentUserMessage === "string" ? event.currentUserMessage : undefined;
+        const rawCurrent = currentUserMessage !== undefined ? currentUserMessage : event.prompt;
+        if (!rawCurrent.replace(/^\s*From: [^\r\n]+ \([^()\r\n]+\)\s*$/, "").trim())
+            return;
         const started = performance.now();
         const asOf = new Date().toISOString();
         const measurement = { outcome: "skipped", elapsedMs: 0 };
@@ -55,7 +59,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
             signal.addEventListener("abort", onAbort, { once: true });
         });
         const run = async () => {
-            const conversation = queryConversation(event.prompt, event.messages);
+            const conversation = queryConversation(event.prompt, event.messages, currentUserMessage);
             stage = "credentials";
             const apiKey = await timeStage("setupMs", measurement, signal, () => resolveTypeSafeApiKey(typesafe));
             if (signal.aborted)
