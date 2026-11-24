@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { setTimeout as delay, setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
-import { historicalPrefix, historicalTrainingSearch, historicalTrainingSource } from "../src/training-retrieval.js";
+import { historicalPrefix, historicalTrainingSearch, historicalTrainingSource, HistoricalCorpusUnavailableError } from "../src/training-retrieval.js";
 import { projectSessionDocument } from "../src/session-projector.js";
 import { resolveSessionSource } from "../src/sources.js";
 import { trainingExamples } from "../src/training-input.js";
@@ -331,4 +331,130 @@ test("run-scoped source evidence survives live writes with isolated cutoff index
     assert.equal(original.internal.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get<{ busy: number }>()!.busy, 0);
   } finally { await failed.close(); }
   assert.equal(closes, 1);
+});
+
+test("missing or unbacked session manifest throws HistoricalCorpusUnavailableError while corrupt manifest stays fatal", async () => {
+  const root = mkdtempSync(join(tmpdir(), "training-missing-manifest-"));
+  const source = resolveSessionSource(join(root, "sessions"), ["direct"]);
+  const original = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {
+    [source.collection]: { path: source.root, pattern: "**/*.md" },
+  } } });
+  const projection = projectSessionDocument({ sessionId: "s", chatType: "direct", agentName: "Bill", timezone: "UTC", startedAt: 10_000,
+    events: [{ createdAt: 20_000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "Historical fact" } }) }],
+  })!;
+  const hash = createHash("sha256").update(projection.content).digest("hex");
+  original.internal.insertContent(hash, projection.content, "now");
+  original.internal.insertDocument(source.collection, "s.md", "Transcript", hash, "now", "now");
+  await original.close();
+
+  // 1. Missing sessions-manifest.json must fail as HistoricalCorpusUnavailableError, never return [].
+  await assert.rejects(
+    historicalTrainingSource(root, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError && /manifest/i.test(error.message),
+  );
+
+  // 2. Corrupt sessions-manifest.json remains fatal (not HistoricalCorpusUnavailableError).
+  const manifestPath = join(root, "sessions-manifest.json");
+  writeFileSync(manifestPath, "{corrupt-json");
+  await assert.rejects(
+    historicalTrainingSource(root, ["direct"]),
+    error => error instanceof Error && !(error instanceof HistoricalCorpusUnavailableError),
+  );
+
+  // 3. Empty manifest while QMD has active session documents is unbacked -> HistoricalCorpusUnavailableError.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: {} }));
+  await assert.rejects(
+    historicalTrainingSource(root, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError,
+  );
+
+  // 4. Pre-cutoff manifest session with mismatched QMD projectionHash cannot prove empty cutoff.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { s: {
+    sessionId: "s", provider: "slack", chatType: "direct", startedAt: 10_000,
+    projectionHash: "0".repeat(64), documentPath: "s.md", messages: projection.messages,
+  } } }));
+  const mismatched = await historicalTrainingSearch(root, ["direct"], 100_000);
+  try {
+    assert.equal(mismatched.report.sessions, 0);
+    assert.equal(mismatched.proven, false);
+    await assert.rejects(mismatched.search("Historical fact", "lex"), error => error instanceof HistoricalCorpusUnavailableError);
+    await assert.rejects(mismatched.search("Historical fact", "vec"), error => error instanceof HistoricalCorpusUnavailableError);
+  } finally { await mismatched.close(); }
+
+  // 5. Backed pre-cutoff session lacking boundary spans cannot prove empty cutoff.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { s: {
+    sessionId: "s", provider: "slack", chatType: "direct", startedAt: 10_000,
+    projectionHash: hash, documentPath: "s.md",
+  } } }));
+  const unspanned = await historicalTrainingSearch(root, ["direct"], 100_000);
+  try {
+    assert.equal(unspanned.report.sessions, 0);
+    assert.equal(unspanned.proven, false);
+    await assert.rejects(unspanned.search("Historical fact", "lex"), error => error instanceof HistoricalCorpusUnavailableError);
+    await assert.rejects(unspanned.search("Historical fact", "vec"), error => error instanceof HistoricalCorpusUnavailableError);
+  } finally { await unspanned.close(); }
+});
+
+test("validly proven empty cutoff returns [] cleanly for both lanes without materializing QMD", async () => {
+  const root = mkdtempSync(join(tmpdir(), "training-proven-empty-"));
+  const source = resolveSessionSource(join(root, "sessions"), ["direct"]);
+  const original = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {
+    [source.collection]: { path: source.root, pattern: "**/*.md" },
+  } } });
+  const projection = projectSessionDocument({ sessionId: "later", chatType: "direct", agentName: "Bill", timezone: "UTC", startedAt: 200_000,
+    events: [{ createdAt: 201_000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "Future evidence" } }) }],
+  })!;
+  const hash = createHash("sha256").update(projection.content).digest("hex");
+  original.internal.insertContent(hash, projection.content, "now");
+  original.internal.insertDocument(source.collection, "later.md", "Transcript", hash, "now", "now");
+  await original.close();
+
+  const manifestPath = join(root, "sessions-manifest.json");
+  // 1. Valid manifest proves session started after cutoff -> empty cutoff returns [] for lex and vec.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { later: {
+    sessionId: "later", provider: "slack", chatType: "direct", startedAt: 200_000,
+    projectionHash: hash, documentPath: "later.md", messages: projection.messages,
+  } } }));
+  const beforeSession = await historicalTrainingSearch(root, ["direct"], 100_000, async () => {
+    assert.fail("Proven empty cutoff must not materialize QMD");
+  });
+  try {
+    assert.equal(beforeSession.report.sessions, 0);
+    assert.equal(beforeSession.proven, true);
+    assert.deepEqual(await beforeSession.search("Future evidence", "lex"), []);
+    assert.deepEqual(await beforeSession.search("Future evidence", "vec"), []);
+  } finally { await beforeSession.close(); }
+
+  // 2. Session started before cutoff, but all valid message spans are at/after cutoff -> proven empty.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { later: {
+    sessionId: "later", provider: "slack", chatType: "direct", startedAt: 50_000,
+    projectionHash: hash, documentPath: "later.md", messages: projection.messages,
+  } } }));
+  const beforeMessages = await historicalTrainingSearch(root, ["direct"], 100_000, async () => {
+    assert.fail("Proven empty message prefix must not materialize QMD");
+  });
+  try {
+    assert.equal(beforeMessages.report.sessions, 0);
+    assert.equal(beforeMessages.proven, true);
+    assert.deepEqual(await beforeMessages.search("Future evidence", "lex"), []);
+    assert.deepEqual(await beforeMessages.search("Future evidence", "vec"), []);
+  } finally { await beforeMessages.close(); }
+
+  // 3. Valid empty manifest paired with an empty QMD sessions collection -> proven empty.
+  const emptyRoot = mkdtempSync(join(tmpdir(), "training-empty-corpus-"));
+  const emptySource = resolveSessionSource(join(emptyRoot, "sessions"), ["direct"]);
+  const emptyStore = await createStore({ dbPath: join(emptyRoot, "index.sqlite"), config: { collections: {
+    [emptySource.collection]: { path: emptySource.root, pattern: "**/*.md" },
+  } } });
+  await emptyStore.close();
+  writeFileSync(join(emptyRoot, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: {} }));
+  const emptySnapshot = await historicalTrainingSearch(emptyRoot, ["direct"], 100_000, async () => {
+    assert.fail("Proven empty corpus must not materialize QMD");
+  });
+  try {
+    assert.equal(emptySnapshot.report.sessions, 0);
+    assert.equal(emptySnapshot.proven, true);
+    assert.deepEqual(await emptySnapshot.search("Anything", "lex"), []);
+    assert.deepEqual(await emptySnapshot.search("Anything", "vec"), []);
+  } finally { await emptySnapshot.close(); }
 });

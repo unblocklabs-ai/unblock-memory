@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,6 +9,7 @@ import { resolveConfig } from "../src/config.js";
 import { registerUnblockMemory } from "../src/plugin.js";
 import { trainingExamples, TrainingTranscriptReader } from "../src/training-input.js";
 import { TrainingStore } from "../src/training-store.js";
+import { writeTrainingExportJsonl } from "../src/training-runtime.js";
 import { collectTraining, runTraining } from "../src/training.js";
 import { judgeTrainingInput } from "../src/training-gate.js";
 import { compressAgentTranscripts, createAgentDatabase, insertSession } from "./helpers/session-database.js";
@@ -415,4 +416,142 @@ test("pre-dispatch 503 Retry-After records failed (retryable without --include-a
     assert.equal(f.store.retry(false, [failedId]), 1);
     assert.equal(f.store.retry(false, [ambiguousId]), 0);
   });
+});
+
+test("finish() rejects non-attempted rows, retry() clears completed_at, and lease fencing guards all mutations", async t => {
+  const f = fixture(t), other = new TrainingStore(f.storePath, "main");
+  const inspect = new DatabaseSync(f.storePath);
+  t.after(() => { other.close(); inspect.close(); });
+  f.add("s", [user("Question"), assistant("Answer")]);
+  await f.store.locked(async () => {
+    collectTraining(f.source, f.store);
+    const job = f.store.pending(1)[0]!;
+    // Reject finishing a pending gate row before start().
+    assert.throws(
+      () => f.store.finish(job.id, 999, { probability: 0.8, model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 10, output_tokens: 0 } }),
+      /gate attempt lost/,
+    );
+    const attempt = f.store.start(job.id);
+    // Reject finishing with a mismatched attempt ID and roll back the gate row to attempted.
+    assert.throws(
+      () => f.store.finish(job.id, attempt + 999, { probability: 0.8, model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 10, output_tokens: 0 } }),
+      /Training attempt lost/,
+    );
+    assert.equal(inspect.prepare("SELECT status FROM training_gates WHERE id=?").get(job.id)!.status, "attempted");
+    // Fail the attempt, verify completed_at is set, then retry() clears completed_at.
+    f.store.finish(job.id, attempt, { status: "failed", error: "http_400" });
+    assert.ok(inspect.prepare("SELECT completed_at FROM training_gates WHERE id=?").get(job.id)!.completed_at !== null);
+    assert.throws(
+      () => f.store.finish(job.id, attempt, { probability: 0.8, model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 10, output_tokens: 0 } }),
+      /gate attempt lost/,
+    );
+    assert.equal(f.store.retry(false, [job.id]), 1);
+    assert.equal(inspect.prepare("SELECT completed_at FROM training_gates WHERE id=?").get(job.id)!.completed_at, null);
+
+    // Also verify retry() clears completed_at on training_steps.
+    const step = f.store.step("retrieve", { query: "q", lane: "lex" });
+    const stepAttempt = f.store.startStep(step.stage, step.id, step.request);
+    f.store.finishStep(step.stage, step.id, stepAttempt, { status: "failed", error: "historical_corpus_unavailable" });
+    assert.ok(inspect.prepare("SELECT completed_at FROM training_steps WHERE id=?").get(step.id)!.completed_at !== null);
+    assert.equal(f.store.retry(false, [step.id]), 1);
+    assert.equal(inspect.prepare("SELECT completed_at FROM training_steps WHERE id=?").get(step.id)!.completed_at, null);
+
+    // Finish gate so we have an active query example for review/saveStep lease tests.
+    const a2 = f.store.start(job.id);
+    f.store.finish(job.id, a2, { probability: 0.9, model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 10, output_tokens: 0 } });
+    const [example] = f.store.queryExamples(0.7);
+    assert.ok(example);
+
+    // Expire lease and take over from another store -> all fenced mutations must reject.
+    inspect.exec("UPDATE training_lock SET expires=0");
+    await other.locked(() => {
+      assert.throws(() => f.store.unavailable("s"), /lease lost/);
+      assert.throws(() => f.store.retry(false, [job.id]), /lease lost/);
+      assert.throws(() => f.store.flagReview(example, "evaluation-unresolved", { steps: [step.id] }), /lease lost/);
+      assert.throws(() => f.store.clearReview(example.id), /lease lost/);
+      const scoreStep = f.store.step("score", { query: "q", lane: "lex" });
+      assert.throws(
+        () => f.store.saveStep("score", scoreStep.id, scoreStep.request, {
+          query: "q", lane: "lex", round: 1, retrievalId: step.id, score: 0.5, maxProbability: 0.5, judgments: [],
+        }),
+        /lease lost/,
+      );
+    });
+  });
+});
+
+test("saveStep() commits local score/evaluate steps and review clears in one atomic transaction", async t => {
+  const f = fixture(t);
+  const inspect = new DatabaseSync(f.storePath);
+  t.after(() => inspect.close());
+  f.add("s", [user("Question"), assistant("Answer")]);
+  await f.store.locked(() => {
+    collectTraining(f.source, f.store);
+    const job = f.store.pending(1)[0]!;
+    f.store.finish(job.id, f.store.start(job.id), { probability: 0.9, model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 10, output_tokens: 0 } });
+    const [example] = f.store.queryExamples(0.7);
+    assert.ok(example);
+
+    // 1. Deterministic score step commits in one transaction and rejects duplicate save.
+    const scoreStep = f.store.step("score", { query: "q", lane: "lex", sourceId: example.id });
+    const scoreResult = { query: "q", lane: "lex" as const, round: 1 as const, retrievalId: "r", score: 0.8, maxProbability: 0.8, judgments: [] };
+    f.store.saveStep("score", scoreStep.id, scoreStep.request, scoreResult);
+    assert.equal(f.store.step("score", { query: "q", lane: "lex", sourceId: example.id }).status, "complete");
+    assert.throws(() => f.store.saveStep("score", scoreStep.id, scoreStep.request, scoreResult), /not pending/);
+
+    // 2. If clearReview fails inside saveStep("evaluate"), BOTH step write and review delete roll back atomically.
+    f.store.flagReview(example, "evaluation-unresolved", { steps: [scoreStep.id] }, "__legacy__");
+    const evalStep = f.store.step("evaluate", { sourceId: example.id, corpusHash: "c1" });
+    const evalResult = {
+      sourceId: example.id, inputHash: example.inputHash, timestamp: example.timestamp, corpusHash: "c1",
+      corpusReport: { sessions: 1, chunks: 1, excluded: 0, truncated: 0, excludedChunks: 0 },
+      teacherIds: [], queries: [scoreResult], selected: { lex: "q", vec: "q" }, review: [],
+    };
+    const attemptsBefore = Number(inspect.prepare("SELECT COUNT(*) n FROM training_step_attempts").get()!.n);
+    assert.throws(
+      () => f.store.saveStep("evaluate", evalStep.id, evalStep.request, evalResult, {
+        sourceId: example.id,
+        scope: "judge-a",
+        matchesLegacyUnresolved: () => { throw new Error("synthetic clear failure"); },
+      }),
+      /synthetic clear failure/,
+    );
+    assert.equal(f.store.step("evaluate", { sourceId: example.id, corpusHash: "c1" }).status, "pending");
+    assert.equal(Number(inspect.prepare("SELECT COUNT(*) n FROM training_step_attempts").get()!.n), attemptsBefore);
+    assert.equal(f.store.reviews().length, 1);
+
+    // 3. Successful saveStep("evaluate") atomically commits completion and clears the matching review.
+    f.store.saveStep("evaluate", evalStep.id, evalStep.request, evalResult, {
+      sourceId: example.id,
+      scope: "judge-a",
+      matchesLegacyUnresolved: () => true,
+    });
+    assert.equal(f.store.step("evaluate", { sourceId: example.id, corpusHash: "c1" }).status, "complete");
+    assert.equal(f.store.reviews().length, 0);
+  });
+});
+
+test("writeTrainingExportJsonl publishes private files atomically without partial outputs or overwrites", () => {
+  const dir = mkdtempSync(join(tmpdir(), "training-export-atomic-"));
+  const failedOutput = join(dir, "failed.jsonl");
+  function* failingRows() {
+    yield { row: 1 };
+    throw new Error("mid-stream export error");
+  }
+  assert.throws(() => writeTrainingExportJsonl(failedOutput, failingRows()), /mid-stream export error/);
+  assert.equal(existsSync(failedOutput), false);
+  assert.deepEqual(readdirSync(dir), []);
+
+  const output = join(dir, "export.jsonl");
+  const rows = writeTrainingExportJsonl(output, [{ row: 1 }, { row: 2 }]);
+  assert.equal(rows, 2);
+  assert.equal(statSync(output).mode & 0o777, 0o600);
+  assert.equal(readFileSync(output, "utf8"), '{"row":1}\n{"row":2}\n');
+  assert.deepEqual(readdirSync(dir), ["export.jsonl"]);
+
+  assert.throws(
+    () => writeTrainingExportJsonl(output, [{ row: 3 }]),
+    error => error instanceof Error && "code" in error && error.code === "EEXIST",
+  );
+  assert.equal(readFileSync(output, "utf8"), '{"row":1}\n{"row":2}\n');
 });

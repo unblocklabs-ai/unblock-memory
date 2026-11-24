@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
+import { createStore } from "@unblocklabs/qmd";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, type QueryFeedback } from "../src/training-models.js";
 import { TrainingStore, type QueryEvaluation } from "../src/training-store.js";
-import { generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, selectTrainingQueries, trainingQueryScore } from "../src/training-queries.js";
+import { currentTrainingCorpusHashes, generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, selectTrainingQueries, trainingQueryScore } from "../src/training-queries.js";
 import { historicalTrainingSearch, HistoricalCorpusUnavailableError, type TrainingHit } from "../src/training-retrieval.js";
 import { resolveConfig } from "../src/config.js";
 import { collectTraining } from "../src/training.js";
@@ -446,5 +447,179 @@ test("a failed legacy Jev evaluation review does not block Liquid, and Liquid su
   });
   await legacyStore.locked(async () => {
     assert.equal([...exportQueryTraining(legacyStore, 0.7, jevJudge)].length, 0);
+  });
+});
+
+test("missing session manifest flags unavailable and never exports zero-score targets", async t => {
+  const f = fixture(t), host = runtime();
+  const qmd = await createStore({ dbPath: join(f.source.stateDir, "index.sqlite"), config: { collections: {} } });
+  await qmd.close();
+  t.mock.method(globalThis, "fetch", async () => { assert.fail("Unavailable manifest must not call TypeSafe"); });
+  await f.store.locked(async () => {
+    f.initialize();
+    await generateTrainingQueries(f.source, f.store, host, options);
+    const evaluated = await evaluateTrainingQueries(f.source, f.store, config, host, {});
+    assert.equal(evaluated.evaluated, 0);
+    assert.equal(evaluated.flagged, 1);
+    assert.equal(f.store.reviews()[0]?.reason, "historical-snapshot-unavailable");
+    assert.equal(f.store.completedEvaluations().length, 0);
+    assert.equal([...exportQueryTraining(f.store)].length, 0);
+    await assert.rejects(
+      currentTrainingCorpusHashes(f.source, f.store, config),
+      error => error instanceof HistoricalCorpusUnavailableError,
+    );
+  });
+});
+
+test("repaired corpus is not blocked by a stale corpus-hash retrieval failure, while unchanged broken corpus still blocks", async t => {
+  const f = fixture(t), host = runtime();
+  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(gradeResponse(0.85))));
+  await f.store.locked(async () => {
+    f.initialize();
+    await generateTrainingQueries(f.source, f.store, host, options);
+
+    // 1. Retrieval fails on broken-v1 (e.g. missing vectors in vec lane).
+    const brokenSearch: typeof historicalTrainingSearch = async (_root, _chats, cutoff) => ({
+      corpusHash: "broken-v1", maxDate: new Date(cutoff).toISOString(),
+      report: { sessions: 1, chunks: 0, excluded: 0, truncated: 0, excludedChunks: 0 }, proven: false,
+      search: async (_query, lane) => {
+        if (lane === "vec") throw new HistoricalCorpusUnavailableError("Historical snapshot has no vectors");
+        return [hit()];
+      },
+      close: async () => {},
+    });
+    const first = await evaluateTrainingQueries(f.source, f.store, config, host, { concurrency: 1 }, brokenSearch);
+    assert.equal(first.evaluated, 0);
+    assert.equal(first.flagged, 1);
+    assert.ok(first.failed > 0);
+    assert.equal(f.store.reviews()[0]?.reason, "evaluation-unresolved");
+    assert.equal([...exportQueryTraining(f.store, 0.7, liquidJudge)].length, 0);
+
+    // 2. Rerunning while corpusHash is STILL broken-v1 stays blocked after hashing without invoking search().
+    const stillBroken: typeof historicalTrainingSearch = async (_root, _chats, cutoff) => ({
+      corpusHash: "broken-v1", maxDate: new Date(cutoff).toISOString(),
+      report: { sessions: 1, chunks: 0, excluded: 0, truncated: 0, excludedChunks: 0 }, proven: false,
+      search: async () => { assert.fail("Unchanged broken corpusHash must remain blocked before search"); },
+      close: async () => {},
+    });
+    const second = await evaluateTrainingQueries(f.source, f.store, config, host, { concurrency: 1, maxExamples: 1 }, stillBroken);
+    assert.equal(second.examples, 0);
+    assert.equal(second.calls, 0);
+    assert.equal(second.flagged, 1);
+    assert.ok(second.blocked > 0);
+
+    // 3. Repairing the corpus to repaired-v2 bypasses the stale broken-v1 retrieval hold and clears review atomically.
+    const repairedSearch = searchFixture(async () => [hit("Repaired evidence")], "repaired-v2");
+    const recovered = await evaluateTrainingQueries(f.source, f.store, config, host, { concurrency: 1 }, repairedSearch);
+    assert.equal(recovered.evaluated, 1);
+    assert.equal(recovered.flagged, 0);
+    assert.equal(f.store.reviews().length, 0);
+
+    const corpusHashes = await currentTrainingCorpusHashes(f.source, f.store, config, 0.7, repairedSearch);
+    const exported = [...exportQueryTraining(f.store, 0.7, liquidJudge, { corpusHashes })];
+    assert.equal(exported.length, 1);
+    assert.equal(exported[0]!.evaluation.corpusHash, "repaired-v2");
+  });
+});
+
+test("export requires matching current-corpus proof and refuses stale or unproven corpora", async t => {
+  const f = fixture(t), host = runtime();
+  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(gradeResponse(0.9))));
+  await f.store.locked(async () => {
+    f.initialize();
+    await generateTrainingQueries(f.source, f.store, host, options);
+    const v1Search = searchFixture(async () => [hit("Corpus v1")], "corpus-v1");
+    assert.equal((await evaluateTrainingQueries(f.source, f.store, config, host, {}, v1Search)).evaluated, 1);
+
+    // Corpus changes to corpus-v2 and a budgeted run stops mid-way without creating a review row.
+    const v2Search = searchFixture(async () => [hit("Corpus v2")], "corpus-v2");
+    const partial = await evaluateTrainingQueries(f.source, f.store, config, host, { maxCalls: 1 }, v2Search);
+    assert.equal(partial.budgetLimited, true);
+    assert.equal(f.store.reviews().length, 0);
+
+    // Current-corpus proof prevents exporting stale corpus-v1 targets.
+    const v2Hashes = await currentTrainingCorpusHashes(f.source, f.store, config, 0.7, v2Search);
+    assert.equal([...exportQueryTraining(f.store, 0.7, liquidJudge, { corpusHashes: v2Hashes })].length, 0);
+
+    // An unproven current snapshot also refuses export.
+    const unprovenSearch: typeof historicalTrainingSearch = async (_root, _chats, cutoff) => ({
+      corpusHash: "corpus-v1", maxDate: new Date(cutoff).toISOString(),
+      report: { sessions: 1, chunks: 0, excluded: 0, truncated: 0, excludedChunks: 0 }, proven: false,
+      search: async () => [], close: async () => {},
+    });
+    const unprovenHashes = await currentTrainingCorpusHashes(f.source, f.store, config, 0.7, unprovenSearch);
+    assert.equal(unprovenHashes.size, 0);
+    assert.equal([...exportQueryTraining(f.store, 0.7, liquidJudge, { corpusHashes: unprovenHashes })].length, 0);
+
+    // Once corpus-v2 completes, export succeeds with matching proof.
+    assert.equal((await evaluateTrainingQueries(f.source, f.store, config, host, {}, v2Search)).evaluated, 1);
+    const exported = [...exportQueryTraining(f.store, 0.7, liquidJudge, { corpusHashes: v2Hashes })];
+    assert.equal(exported.length, 1);
+    assert.equal(exported[0]!.evaluation.corpusHash, "corpus-v2");
+  });
+});
+
+test("provider switchback retains Jev retrieval hold after Liquid recovers on a repaired corpus", async t => {
+  const f = fixture(t), host = runtime();
+  const legacyConfig = resolveConfig({
+    typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone", apiKey: "legacy-key" },
+    corpora: [
+      { name: "memory", kind: "files", paths: ["MEMORY.md"] },
+      { name: "sessions", kind: "sessions", chatTypes: ["direct"] },
+    ],
+  });
+  const jevJudge = memoryJudgeVersion(legacyConfig.typesafe.model, legacyConfig.typesafe.endpoint);
+  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  const legacyStore = new TrainingStore(f.storePath, "main", "jev-1.13.0");
+  t.after(() => legacyStore.close());
+  t.mock.method(globalThis, "fetch", async (url: unknown) => {
+    const model = String(url).includes("systemone") ? "jev-1.13.0" : "liquid/d1.2-ultra-20261116";
+    return new Response(JSON.stringify({ model, answers: { memory_0: { type: "noul", noul: 0.9 } }, usage }));
+  });
+
+  // 1. Jev succeeds on corpus-v1, then fails retrieval on broken corpus-v2.
+  await legacyStore.locked(async () => {
+    collectTraining(f.source, legacyStore);
+    for (const job of legacyStore.pending()) legacyStore.finish(job.id, legacyStore.start(job.id), { probability: 0.9, model: "jev-1.13.0", usage });
+    await generateTrainingQueries(f.source, legacyStore, host, options);
+    const v1Search = searchFixture(async () => [hit("v1")], "corpus-v1");
+    assert.equal((await evaluateTrainingQueries(f.source, legacyStore, legacyConfig, host, { concurrency: 1 }, v1Search)).evaluated, 1);
+
+    const brokenV2: typeof historicalTrainingSearch = async (_root, _chats, cutoff) => ({
+      corpusHash: "corpus-v2", maxDate: new Date(cutoff).toISOString(),
+      report: { sessions: 1, chunks: 0, excluded: 0, truncated: 0, excludedChunks: 0 }, proven: false,
+      search: async (_q, lane) => {
+        if (lane === "vec") throw new HistoricalCorpusUnavailableError("missing vectors");
+        return [hit("v2")];
+      },
+      close: async () => {},
+    });
+    const failedJev = await evaluateTrainingQueries(f.source, legacyStore, legacyConfig, host, { concurrency: 1 }, brokenV2);
+    assert.equal(failedJev.flagged, 1);
+    assert.equal([...exportQueryTraining(legacyStore, 0.7, jevJudge)].length, 0);
+  });
+
+  // 2. Corpus repairs to corpus-v3; Liquid succeeds and exports cleanly.
+  const v3Search = searchFixture(async () => [hit("v3")], "corpus-v3");
+  await f.store.locked(async () => {
+    f.initialize();
+    const done = await evaluateTrainingQueries(f.source, f.store, config, host, { concurrency: 1 }, v3Search);
+    assert.equal(done.evaluated, 1);
+    const v3Hashes = await currentTrainingCorpusHashes(f.source, f.store, config, 0.7, v3Search);
+    assert.equal([...exportQueryTraining(f.store, 0.7, liquidJudge, { corpusHashes: v3Hashes })].length, 1);
+  });
+
+  // 3. Switching back to Jev MUST still hold stale corpus-v1 export until Jev evaluates corpus-v3.
+  await legacyStore.locked(async () => {
+    assert.equal([...exportQueryTraining(legacyStore, 0.7, jevJudge)].length, 0);
+    const recoveredJev = await evaluateTrainingQueries(f.source, legacyStore, legacyConfig, host, { concurrency: 1 }, v3Search);
+    assert.equal(recoveredJev.evaluated, 1);
+    assert.equal(legacyStore.reviews().length, 0);
+    const v3Hashes = await currentTrainingCorpusHashes(f.source, legacyStore, legacyConfig, 0.7, v3Search);
+    const exportedJev = [...exportQueryTraining(legacyStore, 0.7, jevJudge, { corpusHashes: v3Hashes })];
+    assert.equal(exportedJev.length, 1);
+    assert.equal(exportedJev[0]!.evaluation.corpusHash, "corpus-v3");
   });
 });
