@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
-import { PURGED_GRADE, baselineFingerprint, baselineInputFingerprint, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
+import { PURGED_GRADE, baselineFingerprints, baselineInputFingerprint, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
 
 // Imported by the baseline worker with plain Node resolution: host SDK aliases do not
 // reach worker threads, so this module and its imports must stay free of `openclaw`.
@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS inside_out_checkpoints (
   source TEXT NOT NULL, rubric TEXT NOT NULL, session_id TEXT NOT NULL, signature TEXT NOT NULL,
   revision TEXT NOT NULL, last_seq INTEGER NOT NULL,
   PRIMARY KEY(source,rubric)
+) STRICT;
+CREATE TABLE IF NOT EXISTS inside_out_person_generations (
+  person_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
 ) STRICT;`;
 // A missing account may match across scopes only when every candidate names the same person.
 export const PERSON_MATCH = `SELECT min(i.person_id) person_id FROM person_identities i
@@ -88,14 +91,20 @@ export function refreshWithFingerprint(path: string, options: BaselineOptions & 
   try {
     if (options.link !== false) linkInsideOutPeopleInDb(db);
     const settings = { ...options, minInteractions: options.minInteractions ?? 20, now: options.now ?? Date.now() };
-    if (!options.recompare && options.unless && baselineFingerprint(db, settings) === options.unless) {
-      return { result: { snapshots: 0, comparisons: 0 }, fingerprint: options.unless };
+    let beforeInputs: string;
+    if (!options.recompare && options.unless) {
+      const before = baselineFingerprints(db, settings);
+      if (before.fullFingerprint === options.unless) {
+        return { result: { snapshots: 0, comparisons: 0 }, fingerprint: options.unless };
+      }
+      beforeInputs = before.inputFingerprint;
+    } else {
+      beforeInputs = baselineInputFingerprint(db, settings);
     }
-    const beforeInputs = baselineInputFingerprint(db, settings);
     const result = refreshEmotionBaselines(db, settings);
-    const afterInputs = baselineInputFingerprint(db, settings);
-    // Only certify the post-pass fingerprint if grades and People inputs stayed unchanged mid-pass.
-    const fingerprint = afterInputs === beforeInputs ? baselineFingerprint(db, settings) : undefined;
+    const after = baselineFingerprints(db, settings);
+    // Only certify the post-pass fingerprint if grades, People inputs, and purge generations stayed unchanged mid-pass.
+    const fingerprint = after.inputFingerprint === beforeInputs ? after.fullFingerprint : undefined;
     return { result, fingerprint };
   } finally { db.close(); }
 }
