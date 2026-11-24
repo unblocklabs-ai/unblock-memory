@@ -66,7 +66,8 @@ export async function deploy({ apiKey, apply, restart, provider = "codex" }, cli
     // locally, never emit them. Unsupported JSON5/include-only entries fail closed.
     const entry = JSON.parse(initialConfig.toString("utf8")).plugins?.entries?.["unblock-memory"];
     if (!entry || entry.enabled === false) throw new Error("plugin_not_enabled");
-    const current = entry.config?.typesafe ?? {};
+    const targetKey = entry.config?.decisionModel !== undefined ? "decisionModel" : "typesafe";
+    const current = entry.config?.[targetKey] ?? {};
     const secrets = join(dirname(configPath), "secrets");
     const keyFile = join(secrets, target.file);
     safePath(secrets, true); safePath(keyFile);
@@ -77,7 +78,7 @@ export async function deploy({ apiKey, apply, restart, provider = "codex" }, cli
       current.endpoint !== target.endpoint || Object.hasOwn(current, "apiKey") || clearModel;
     const keyChanged = !priorKey?.equals(bytes);
     const patch = JSON.stringify({ plugins: { entries: { "unblock-memory": { config: {
-      typesafe: { enabled: true, endpoint: target.endpoint, ...(clearModel ? { model: null } : {}), apiKey: null, apiKeyFile: keyFile },
+      [targetKey]: { enabled: true, endpoint: target.endpoint, ...(clearModel ? { model: null } : {}), apiKey: null, apiKeyFile: keyFile },
     } } } } });
     report.stage = "validate_patch";
     if (configChanged) cli(["config", "patch", "--stdin", "--dry-run", "--json"], patch);
@@ -114,18 +115,19 @@ export async function deploy({ apiKey, apply, restart, provider = "codex" }, cli
     report.stage = "verify";
     cli(["config", "validate", "--json"]);
     const after = JSON.parse(readFileSync(configPath, "utf8")).plugins?.entries?.["unblock-memory"];
-    if (after.config?.typesafe?.apiKeyFile !== keyFile || after.config.typesafe.enabled === false ||
-        after.config.typesafe.endpoint !== target.endpoint ||
-        Object.hasOwn(after.config.typesafe, "apiKey") ||
-        (clearModel ? Object.hasOwn(after.config.typesafe, "model") : after.config.typesafe.model !== current.model)) {
+    const afterSection = after.config?.[targetKey];
+    if (afterSection?.apiKeyFile !== keyFile || afterSection.enabled === false ||
+        afterSection.endpoint !== target.endpoint ||
+        Object.hasOwn(afterSection, "apiKey") ||
+        (clearModel ? Object.hasOwn(afterSection, "model") : afterSection.model !== current.model)) {
       throw new Error("config_mismatch");
     }
     // Check plugin settings outside the intended decision-provider leaves, including audit approvals.
     const strip = value => {
       const copy = structuredClone(value);
-      if (copy.config?.typesafe) {
-        for (const key of ["enabled", "endpoint", "model", "apiKey", "apiKeyFile"]) delete copy.config.typesafe[key];
-        if (!Object.keys(copy.config.typesafe).length) delete copy.config.typesafe;
+      if (copy.config?.[targetKey]) {
+        for (const key of ["enabled", "endpoint", "model", "apiKey", "apiKeyFile"]) delete copy.config[targetKey][key];
+        if (!Object.keys(copy.config[targetKey]).length) delete copy.config[targetKey];
       }
       if (copy.config && !Object.keys(copy.config).length) delete copy.config;
       return copy;

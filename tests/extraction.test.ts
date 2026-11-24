@@ -68,7 +68,7 @@ test("missing quotes, unknown replacement ids and context-only citations never r
 
 test("all three validation dimensions must meet the gate; malformed responses fail closed", async t => {
   let support = 0.98, useful = 0.98, replacement = 0.98;
-  t.mock.method(globalThis, "fetch", async () => Response.json({ answers: { supported: { type: "choice", choice: "supported", probabilities: { supported: support, unsupported: 1-support, contradicted: 0 } },
+  t.mock.method(globalThis, "fetch", async () => Response.json({ answers: { supported: { type: "choice", choice: "supported", confidence: support, probabilities: { supported: support, unsupported: 1-support, contradicted: 0 } },
     ...Object.fromEntries(Object.entries({ useful, replacement }).map(([k,noul]) => [k,{ type: "noul", noul }])) } }));
   const params = { proposal: { ...proposal, replaces: "prior" }, messages, newIds: ["m1"], existing: [{ id: "prior", text: "Bek likes blue." }], apiKey: "test", signal: signal(), thresholds };
   assert.equal((await validateExtractedMemory(params)).accepted, true);
@@ -80,7 +80,7 @@ test("all three validation dimensions must meet the gate; malformed responses fa
   support = 0.8;
   assert.equal((await validateExtractedMemory({ ...params, thresholds: { ...thresholds, minSupport: 0.8, minReplacement: 0.5 } })).accepted, true);
   assert.equal((await validateExtractedMemory({ ...params, thresholds: { ...thresholds, minRetention: 0.1 } })).accepted, false);
-  replacement = NaN; await assert.rejects(validateExtractedMemory(params), /Invalid extraction validation/);
+  replacement = NaN; await assert.rejects(validateExtractedMemory(params), /invalid noul answer/i);
 });
 
 test("citations preserve source formatting; separated spans must be separate quotes", async t => {
@@ -88,7 +88,7 @@ test("citations preserve source formatting; separated spans must be separate quo
   t.mock.method(globalThis, "fetch", async () => {
     calls++;
     return Response.json({ answers: {
-      supported: { type: "choice", choice: "supported", probabilities: { supported: 0.99, unsupported: 0.01, contradicted: 0 } },
+      supported: { type: "choice", choice: "supported", confidence: 0.99, probabilities: { supported: 0.99, unsupported: 0.01, contradicted: 0 } },
       useful: { type: "noul", noul: 0.99 },
     } });
   });

@@ -30,15 +30,15 @@ settings; a rotated credential file is reread without a restart.
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
 one it registers no hook and reports inactive.
 My Turn, Memory/People Whisperers, people storage, the primer and audits default off.
-`typesafe.enabled` defaults true but does not enable those opt-in features;
+`decisionModel.enabled` (deprecated alias `typesafe.enabled`) defaults true but does not enable those opt-in features;
 `sentimentEnabled` defaults true only **within an enabled
 response audit**. `peoplePrimer` controls automatic dossier-save review;
 `evidenceReview` is a different advisory tool. Disabling people injection does
 not disable people tools/storage or erase dossiers.
 
-## Shared TypeSafe credentials
+## Shared decision-model credentials
 
-All plugin TypeSafe features use `plugins.entries.unblock-memory.config.typesafe`:
+All plugin decision-model features use `plugins.entries.unblock-memory.config.decisionModel` (the legacy `typesafe` key remains accepted as a deprecated alias; do not specify both at the same time):
 
 Candidate scoring uses **one HTTP request per candidate**, with ranking done in code.
 Related questions about the same candidate can share a request (for example, quality
@@ -52,7 +52,7 @@ These evidence relationships are deliberately preserved, not split into unrelate
 
 ```json
 {
-  "typesafe": {
+  "decisionModel": {
     "enabled": true,
     "endpoint": "https://codex.unblocklabs.ai/v1/decisions",
     "model": "liquid/d1.2-ultra",
@@ -77,11 +77,11 @@ CODEX_LB_API_KEY="YOUR_CODEX_LB_KEY"
 ```
 
 Credentials are **strictly isolated by provider**:
-- Inline `typesafe.apiKey` or a plaintext `typesafe.apiKeyFile` applies to whichever
+- Inline `decisionModel.apiKey` or a plaintext `decisionModel.apiKeyFile` applies to whichever
   endpoint is configured (so if upgrading an existing node that stored a plaintext or
   inline TypeSafe key, either replace it with a `codex-lb` key or pin
-  `typesafe.endpoint: "https://api.typesafe.ai/v1/systemone"`).
-- Dotenv `typesafe.apiKeyFile` and ambient Gateway environment lookup read
+  `decisionModel.endpoint: "https://api.typesafe.ai/v1/systemone"`).
+- Dotenv `decisionModel.apiKeyFile` and ambient Gateway environment lookup read
   **`CODEX_LB_API_KEY` only** for `https://codex.unblocklabs.ai` and
   **`TYPESAFE_API_KEY` only** for `https://api.typesafe.ai`. A legacy dotenv file
   containing only `TYPESAFE_API_KEY` will never be transmitted to `codex.unblocklabs.ai`.
@@ -233,16 +233,16 @@ contract; these tables explain their effects.
 | `keepEmbeddingModelWarm` | `true` | Retain embedding model/context after first use; false allows five-minute idle disposal |
 | `analysis.executable` | Unset | Optional absolute local worker path; enables ability to recluster, not automatic scheduling |
 
-## TypeSafe and whisperers
+## Decision model and whisperers
 
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
-| `typesafe.enabled` | `true` | Shared plugin provider gate; no feature is opted in merely by adding a key |
-| `typesafe.endpoint` | `https://codex.unblocklabs.ai/v1/decisions` | HTTPS (or loopback HTTP) decision endpoint without credentials, query, or fragment; set `https://api.typesafe.ai/v1/systemone` for TypeSafe Jev |
-| `typesafe.model` | `liquid/d1.2-ultra` (`jev-1.13.0` on `api.typesafe.ai`) | Decision model alias sent in requests; dated `liquid/d1.2-ultra-*` snapshots are rejected on the default Codex LB route |
-| `typesafe.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
-| `typesafe.apiKeyFile` | Unset | Absolute raw-key or provider-scoped dotenv file (`CODEX_LB_API_KEY` for Codex LB, `TYPESAFE_API_KEY` for `api.typesafe.ai`), reread at credential resolution; explicit missing file never falls back to a different key |
-| `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
+| `decisionModel.enabled` | `true` | Shared plugin provider gate (`typesafe.*` accepted as deprecated alias; mutually exclusive); no feature is opted in merely by adding a key |
+| `decisionModel.endpoint` | `https://codex.unblocklabs.ai/v1/decisions` | HTTPS (or loopback HTTP) decision endpoint without credentials, query, or fragment; set `https://api.typesafe.ai/v1/systemone` for TypeSafe Jev |
+| `decisionModel.model` | `liquid/d1.2-ultra` (`jev-1.13.0` on `api.typesafe.ai`) | Decision model alias sent in requests; dated `liquid/d1.2-ultra-*` snapshots are rejected on the default Codex LB route |
+| `decisionModel.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
+| `decisionModel.apiKeyFile` | Unset | Absolute raw-key or provider-scoped dotenv file (`CODEX_LB_API_KEY` for Codex LB, `TYPESAFE_API_KEY` for `api.typesafe.ai`), reread at credential resolution; explicit missing file never falls back to a different key |
+| `decisionModel.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
 | `skillWhisperer.enabled` | `true` with a `skills` corpus, else `false` | Needs appropriate host hook access; fixed 3-second total deadline; `false` opts out. An explicit `true` without a skills corpus logs a warning and stays inactive |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for TypeSafe shortlist admission |

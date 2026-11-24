@@ -66,8 +66,8 @@ test("oversized members are skipped whole; malformed/provider failures do not be
   assert.equal((await reviewClusterIngestion({ ...f.params, clusterId })).status, "unavailable");
   assert.equal(fetch.mock.callCount(), 0);
   f.db.prepare("UPDATE content_vectors SET chunk_len = 100").run();
-  await assert.rejects(reviewClusterIngestion({ ...f.params, clusterId }), /invalid/);
+  await assert.rejects(reviewClusterIngestion({ ...f.params, clusterId }), { code: "invalid_response" });
   fetch.mock.mockImplementation(async () => new Response("private provider body", { status: 500 }));
   await assert.rejects(reviewClusterIngestion({ ...f.params, clusterId }),
-    { message: "TypeSafe HTTP 500", code: "http_error", status: 500 });
+    { message: "Decision model HTTP 500", code: "http_error", status: 500 });
 });

@@ -10,6 +10,7 @@ import { resolveSources } from "../../src/sources.js";
 import { buildSkillWhispererQuery } from "../../src/whisperer-context.js";
 import { cases } from "./cases.js";
 import { selectTypeSafeSkill } from "../../src/typesafe.js";
+import { DEFAULT_DECISIONS_ENDPOINT, LEGACY_SYSTEMONE_ENDPOINT, LEGACY_SYSTEMONE_MODEL } from "@unblocklabs/decisions";
 import { TYPESAFE_MODEL } from "../../src/typesafe-client.js";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -62,8 +63,8 @@ async function main() {
     return;
   }
   const legacy = args.includes("--legacy");
-  const endpoint = legacy ? "https://api.typesafe.ai/v1/systemone" : "https://codex.unblocklabs.ai/v1/decisions";
-  const resolvedModel = legacy ? "jev-1.13.0" : model;
+  const endpoint = legacy ? LEGACY_SYSTEMONE_ENDPOINT : DEFAULT_DECISIONS_ENDPOINT;
+  const resolvedModel = legacy ? LEGACY_SYSTEMONE_MODEL : model;
   const apiKey = (legacy ? process.env.TYPESAFE_API_KEY : process.env.CODEX_LB_API_KEY)?.trim();
   if (!apiKey) throw new Error(`Set ${legacy ? "TYPESAFE_API_KEY" : "CODEX_LB_API_KEY"} using --env-file=.env`);
   const reportDir = resolve(root, "reports", "skill-whisperer", new Date().toISOString().replace(/[:.]/g, "-"));

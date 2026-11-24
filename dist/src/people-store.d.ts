@@ -154,7 +154,7 @@ export declare class PeopleStore {
                 statement: string;
                 evidence: {
                     observedAt?: string | undefined;
-                    source: "manual" | "session" | "memory" | "directory";
+                    source: "session" | "memory" | "directory" | "manual";
                     locator: string;
                 }[];
                 epistemicType: "observed" | "reported" | "agent_assessment";

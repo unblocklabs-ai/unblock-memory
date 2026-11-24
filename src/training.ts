@@ -1,4 +1,4 @@
-import { TypeSafeRequestError, resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { classifyDecisionFailure, resolveTypeSafeApiKey } from "./typesafe-client.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import { TrainingTranscriptReader, type TrainingInput } from "./training-input.js";
 import { judgeTrainingInput, TRAINING_GATE_QUESTIONS } from "./training-gate.js";
@@ -79,12 +79,9 @@ export async function runTraining(source: Source, store: TrainingStore, config: 
           judgment = await judgeTrainingInput(input, key!, AbortSignal.timeout(30_000),
             { endpoint: config.typesafe.endpoint, model: config.typesafe.model });
         } catch (error) {
-          const definite = error instanceof TypeSafeRequestError && error.code === "http_error" &&
-            ((error.status !== undefined && error.status >= 400 && error.status < 500) || error.retryAfter === true);
-          const status = definite ? "failed" : "ambiguous";
-          store.finish(job.id, attempt, { status, error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
-            `http_${error.status}` : "request_or_response_uncertain" });
-          result[status]++;
+          const classified = classifyDecisionFailure(error);
+          store.finish(job.id, attempt, { status: classified.status, error: classified.error });
+          result[classified.status]++;
           // Flag this input for operator review; do not stall untouched inputs or retry it.
           continue;
         }

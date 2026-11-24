@@ -20,14 +20,7 @@ export declare function contextJudgeRequest(input: TrainingInput, asOf: string, 
         }[];
     };
     questions: {
-        memory_0: {
-            type: string;
-            instructions: string;
-            criteria: {
-                true: string;
-                false: string;
-            };
-        };
+        readonly memory_0: import("@unblocklabs/decisions").NoulQuestion;
     };
 };
 export declare function judgeTrainingPassage(request: ReturnType<typeof contextJudgeRequest>, apiKey: string, options?: {
@@ -40,8 +33,5 @@ export declare function judgeTrainingPassage(request: ReturnType<typeof contextJ
         noul: number;
     };
     model: string;
-    usage: {
-        input_tokens: number;
-        output_tokens: number;
-    } | null;
+    usage: import("@unblocklabs/decisions").DecisionUsage | null;
 }>;

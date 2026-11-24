@@ -110,7 +110,11 @@ for (const review of reviews) {
         syncBuiltinESMExports();
         credential.resolve("fake-secret");
         initialization.resolve({ manager });
-        const freshCall = tools(resolveConfig({ ...config, typesafe: { apiKey: "fake-secret" } }), runtime);
+        const freshCall = tools(resolveConfig({
+          decisionModel: { apiKey: "fake-secret" },
+          qualityAudit: { enabled: true, corpora: ["memory"] },
+          evidenceReview: { enabled: true, corpora: ["memory"] },
+        }), runtime);
         assert.equal((await freshCall(review.name, review.params)).status, "ok");
         assert.equal(reviewCalls, 1, "the cancelled call must never dispatch a review later");
         assert.equal(managerCalls, stage === "credentials" ? 1 : 2);

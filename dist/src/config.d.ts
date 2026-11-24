@@ -26,6 +26,14 @@ type SessionCorpusConfig = {
 };
 export type CorpusConfig = FileCorpusConfig | SkillCorpusConfig | SessionCorpusConfig;
 export declare const DEFAULT_CORPORA: readonly FileCorpusConfig[];
+export type DecisionModelPluginConfig = {
+    enabled: boolean;
+    endpoint: string;
+    model: string;
+    apiKey?: string;
+    apiKeyFile?: string;
+    timeoutMs: number;
+};
 export type UnblockMemoryConfig = {
     myTurn: MyTurnConfig;
     extraction: ExtractionConfig;
@@ -34,14 +42,9 @@ export type UnblockMemoryConfig = {
     analysis: {
         executable?: string;
     };
-    typesafe: {
-        enabled: boolean;
-        endpoint: string;
-        model: string;
-        apiKey?: string;
-        apiKeyFile?: string;
-        timeoutMs: number;
-    };
+    decisionModel: DecisionModelPluginConfig;
+    /** @deprecated Alias for decisionModel. */
+    typesafe: DecisionModelPluginConfig;
     qualityAudit: {
         enabled: boolean;
         corpora: readonly string[];

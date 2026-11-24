@@ -79,7 +79,7 @@ test("evidence mutation, invalid answers and cancellation cannot verify a claim"
   fetch.mock.mockImplementation(async () => response("made_up_verdict"));
   await assert.rejects(reviewIndexedClaim(params), /invalid/);
   fetch.mock.mockImplementation(async () => new Response("secret", { status: 500 }));
-  await assert.rejects(reviewIndexedClaim(params), { message: "TypeSafe HTTP 500", code: "http_error", status: 500 });
+  await assert.rejects(reviewIndexedClaim(params), { message: "Decision model HTTP 500", code: "http_error", status: 500 });
   await assert.rejects(reviewIndexedClaim({ ...params, signal: AbortSignal.abort() }));
 });
 
@@ -108,5 +108,5 @@ test("background review requires support and background eligibility, with approv
   await assert.rejects(reviewIndexedClaim({ ...params, claim: "word ".repeat(71) }), /70 words/);
   assert.equal(fetchMock.mock.callCount(), calls);
   fetchMock.mock.mockImplementation(async () => response());
-  await assert.rejects(reviewIndexedClaim(params), /invalid background/);
+  await assert.rejects(reviewIndexedClaim(params), { code: "invalid_response" });
 });

@@ -16,18 +16,20 @@ export declare function reviewTypeSafeClaim(params: RequestOptions & {
         inferred?: boolean;
     };
 }): Promise<{
-    needsReview: boolean;
-    background?: {
-        backgroundOnly: number;
-        explicitSupport: number;
-    } | undefined;
     verdict: "supports" | "contradicts" | "insufficient_evidence";
     confidence: number;
-    probabilities: {
-        supports: number;
-        contradicts: number;
-        insufficient_evidence: number;
+    probabilities: Record<"supports" | "contradicts" | "insufficient_evidence", number>;
+    background: {
+        backgroundOnly: number;
+        explicitSupport: number;
     };
+    needsReview: boolean;
+} | {
+    verdict: "supports" | "contradicts" | "insufficient_evidence";
+    confidence: number;
+    probabilities: Record<"supports" | "contradicts" | "insufficient_evidence", number>;
+    needsReview: boolean;
+    background?: undefined;
 }>;
 /** Directional coverage, not topic similarity. Bounded at six comparisons of four ranked candidates. */
 export declare function reviewMemoryRedundancy(params: RequestOptions & {

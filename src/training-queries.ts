@@ -3,7 +3,7 @@ import type { QueryLane, QueryPair } from "./query-contract.js";
 import { collectTraining } from "./training.js";
 import type { TrainingInput } from "./training-input.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
-import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
+import { classifyDecisionFailure, resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_MODEL,
   TRAINING_TEACHER_VERSION, type QueryFeedback, type TrainingRound } from "./training-models.js";
 import { historicalTrainingSearch, historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
@@ -49,13 +49,16 @@ async function checkpoint<S extends keyof TrainingStepResults>(store: TrainingSt
     if (step.stage === "retrieve" && !(error instanceof HistoricalCorpusUnavailableError)) throw error;
     const hostCode = error && typeof error === "object" && "code" in error && typeof error.code === "string" &&
       /^LLM_[A-Z_]+$/u.test(error.code) ? error.code : undefined;
-    const status = error instanceof HistoricalCorpusUnavailableError || hostCode === "LLM_COMPLETION_NOT_AUTHORIZED" ||
-      (error instanceof TypeSafeRequestError && error.code === "http_error" &&
-        ((error.status !== undefined && error.status >= 400 && error.status < 500) || error.retryAfter === true)) ? "failed" : "ambiguous";
-    store.finishStep(step.stage, step.id, attempt, { status,
-      error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
-        `http_${error.status}` : error instanceof HistoricalCorpusUnavailableError ? "historical_corpus_unavailable" :
-          hostCode ?? "request_or_response_uncertain" });
+    const classified = classifyDecisionFailure(error);
+    const status = error instanceof HistoricalCorpusUnavailableError || hostCode === "LLM_COMPLETION_NOT_AUTHORIZED"
+      ? "failed"
+      : classified.status;
+    store.finishStep(step.stage, step.id, attempt, {
+      status,
+      error: error instanceof HistoricalCorpusUnavailableError
+        ? "historical_corpus_unavailable"
+        : hostCode ?? classified.error,
+    });
     result[status]++;
     return;
   }

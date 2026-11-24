@@ -62,14 +62,7 @@ export declare function memoryUsefulnessRequest(conversation: QueryConversation,
         }[];
     };
     questions: {
-        memory_0: {
-            type: string;
-            instructions: string;
-            criteria: {
-                true: string;
-                false: string;
-            };
-        };
+        readonly memory_0: import("@unblocklabs/decisions").NoulQuestion;
     };
 };
 export declare function judgeMemoryPassage(request: ReturnType<typeof memoryUsefulnessRequest>, params: {
@@ -85,8 +78,5 @@ export declare function judgeMemoryPassage(request: ReturnType<typeof memoryUsef
         noul: number;
     };
     model: string;
-    usage: {
-        input_tokens: number;
-        output_tokens: number;
-    } | null;
+    usage: import("@unblocklabs/decisions").DecisionUsage | null;
 }>;

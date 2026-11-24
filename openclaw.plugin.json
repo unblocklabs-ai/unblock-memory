@@ -67,23 +67,41 @@
       "label": "Approved Audit Corpora",
       "help": "Explicit non-skill corpora approved for external decision-model processing and maintenance results visible to every audience using this agent. Sessions means ALL indexed sessions, not only the current conversation."
     },
-    "typesafe.enabled": {
+    "decisionModel.enabled": {
       "label": "Decision Model Judgments",
-      "help": "Shared provider gate for My Turn, opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Defaults to https://codex.unblocklabs.ai/v1/decisions (routed to OpenRouter Liquid d1.2-ultra); set typesafe.endpoint to https://api.typesafe.ai/v1/systemone to use TypeSafe Jev directly. Memory search discovers locally and uses the configured decision model to rank usefulness; People Whisperer injection stays local."
+      "help": "Shared provider gate for My Turn, opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Defaults to https://codex.unblocklabs.ai/v1/decisions (routed to OpenRouter Liquid d1.2-ultra); set decisionModel.endpoint to https://api.typesafe.ai/v1/systemone to use TypeSafe Jev directly. Memory search discovers locally and uses the configured decision model to rank usefulness; People Whisperer injection stays local."
     },
-    "typesafe.endpoint": {
+    "decisionModel.endpoint": {
       "label": "Decision Model Endpoint",
       "help": "HTTPS (or loopback HTTP) decision API endpoint without credentials, query, or fragment. Defaults to https://codex.unblocklabs.ai/v1/decisions (OpenRouter Liquid d1.2-ultra). Set to https://api.typesafe.ai/v1/systemone to use TypeSafe Jev directly."
     },
-    "typesafe.model": {
+    "decisionModel.model": {
       "label": "Decision Model ID",
       "help": "Model alias sent to the decision endpoint. When omitted, defaults to liquid/d1.2-ultra (or jev-1.13.0 when endpoint is https://api.typesafe.ai/v1/systemone)."
     },
-    "typesafe.apiKey": { "label": "Decision API Key", "sensitive": true },
-    "typesafe.timeoutMs": { "label": "Decision Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, Skill Whisperer has a fixed 3-second total budget, and My Turn has a fixed 1.5-second total budget." },
-    "typesafe.apiKeyFile": {
+    "decisionModel.apiKey": { "label": "Decision API Key", "sensitive": true },
+    "decisionModel.timeoutMs": { "label": "Decision Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, Skill Whisperer has a fixed 3-second total budget, and My Turn has a fixed 1.5-second total budget." },
+    "decisionModel.apiKeyFile": {
       "label": "Decision API Key File",
       "help": "Absolute path to a plaintext API key or a provider-scoped dotenv file (CODEX_LB_API_KEY for codex.unblocklabs.ai, TYPESAFE_API_KEY for api.typesafe.ai). Prefer this over storing a key in config."
+    },
+    "typesafe.enabled": {
+      "label": "Decision Model Judgments (Deprecated Alias)",
+      "help": "Deprecated alias for decisionModel.enabled. Do not set both decisionModel and typesafe."
+    },
+    "typesafe.endpoint": {
+      "label": "Decision Model Endpoint (Deprecated Alias)",
+      "help": "Deprecated alias for decisionModel.endpoint."
+    },
+    "typesafe.model": {
+      "label": "Decision Model ID (Deprecated Alias)",
+      "help": "Deprecated alias for decisionModel.model."
+    },
+    "typesafe.apiKey": { "label": "Decision API Key (Deprecated Alias)", "sensitive": true },
+    "typesafe.timeoutMs": { "label": "Decision Request Timeout (Deprecated Alias)", "help": "Deprecated alias for decisionModel.timeoutMs." },
+    "typesafe.apiKeyFile": {
+      "label": "Decision API Key File (Deprecated Alias)",
+      "help": "Deprecated alias for decisionModel.apiKeyFile."
     },
     "keepEmbeddingModelWarm": {
       "label": "Keep Embedding Model Warm",
@@ -131,6 +149,7 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
+    "not": { "required": ["decisionModel", "typesafe"] },
     "properties": {
       "insideOut": {
         "type": "object", "additionalProperties": false,
@@ -337,6 +356,23 @@
           "todos": { "maxOpen": 1000 }
         }
       },
+      "decisionModel": {
+        "type": "object",
+        "additionalProperties": false,
+        "not": { "required": ["apiKey", "apiKeyFile"] },
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "endpoint": {
+            "type": "string",
+            "pattern": "^(?:https://(?:\\[[0-9A-Fa-f:]+\\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::\\d+)?(?:/[^\\s?#]*)?|http://(?:localhost|127\\.0\\.0\\.1|\\[::1\\])(?::\\d+)?(?:/[^\\s?#]*)?)$",
+            "default": "https://codex.unblocklabs.ai/v1/decisions"
+          },
+          "model": { "type": "string", "pattern": "\\S" },
+          "apiKey": { "type": "string", "pattern": "\\S" },
+          "apiKeyFile": { "type": "string", "pattern": "\\S" },
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1500 }
+        }
+      },
       "typesafe": {
         "type": "object",
         "additionalProperties": false,
@@ -352,8 +388,7 @@
           "apiKey": { "type": "string", "pattern": "\\S" },
           "apiKeyFile": { "type": "string", "pattern": "\\S" },
           "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1500 }
-        },
-        "default": { "enabled": true, "endpoint": "https://codex.unblocklabs.ai/v1/decisions", "timeoutMs": 1500 }
+        }
       },
       "memoryWhisperer": {
         "type": "object",

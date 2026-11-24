@@ -274,9 +274,14 @@ test("same-run prompt rebuilds reuse inference; newer runs and teardown discard 
 
 test("My Turn advice is composed before safety guidance", async t => {
   const api = transport(t);
-  api.fetch.mock.mockImplementation(async () => Response.json({ answers: {
-    should_respond: { type: "noul", noul: 0.1 }, scenario_0: { type: "noul", noul: 0.9 },
-  } }));
+  api.fetch.mock.mockImplementation(async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    return Response.json({
+      answers: body.questions?.should_respond
+        ? { should_respond: { type: "noul", noul: 0.1 } }
+        : { scenario_0: { type: "noul", noul: 0.9 } },
+    });
+  });
   const h = harness({ enabled: true }, credentials, { enabled: true, scenarios: [
     { id: "private", instructions: "Requests for private information", flaggedPrompt: "Do not disclose private information." },
   ] });

@@ -292,7 +292,7 @@ test("gate requires a valid probability, actual model and usage; HTTP rejection 
   });
   for (const bad of [{ ...payload(0.9), usage: undefined }, payload(2), { ...payload(0.5), model: undefined }]) {
     mocked.mock.mockImplementation(async () => new Response(JSON.stringify(bad)));
-    await assert.rejects(judgeTrainingInput({ history: [], currentRequest: "Question" }, "key", AbortSignal.timeout(1000)), /Invalid training gate/);
+    await assert.rejects(judgeTrainingInput({ history: [], currentRequest: "Question" }, "key", AbortSignal.timeout(1000)), { code: "invalid_response" });
   }
 });
 

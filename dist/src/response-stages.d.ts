@@ -12,48 +12,48 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
 }): Promise<{
     retrospective: {
         status: ResponseEpisode["followup"]["status"];
-        judgment: import("typebox").Static<import("typebox").TObject<{
-            answers: import("typebox").TObject<{
-                correction: import("typebox").TObject<{
-                    type: import("typebox").TLiteral<"noul">;
-                    noul: import("typebox").TNumber;
-                }>;
-                deliveryAdmission: import("typebox").TObject<{
-                    type: import("typebox").TLiteral<"noul">;
-                    noul: import("typebox").TNumber;
-                }>;
-                regression: import("typebox").TObject<{
-                    type: import("typebox").TLiteral<"noul">;
-                    noul: import("typebox").TNumber;
-                }>;
-                scopeClarification: import("typebox").TObject<{
-                    type: import("typebox").TLiteral<"noul">;
-                    noul: import("typebox").TNumber;
-                }>;
-                outcome: import("typebox").TObject<{
-                    type: import("typebox").TLiteral<"choice">;
-                    choice: import("typebox").TEnum<("unknown" | "reported_shortfall" | "acknowledged_success")[]>;
-                    confidence: import("typebox").TNumber;
-                    probabilities: import("typebox").TObject<{
-                        [k: string]: import("typebox").TNumber;
-                    }>;
-                }>;
-                reason: import("typebox").TObject<{
-                    type: import("typebox").TLiteral<"choice">;
-                    choice: import("typebox").TEnum<("none_or_unclear" | "missing_requested_work" | "unnecessary_deferral" | "regression" | "incorrect_claim" | "wrong_scope" | "failed_delivery")[]>;
-                    confidence: import("typebox").TNumber;
-                    probabilities: import("typebox").TObject<{
-                        [k: string]: import("typebox").TNumber;
-                    }>;
-                }>;
-            }>;
-        }>>["answers"] | null;
+        judgment: {
+            outcome: {
+                type: "choice";
+                choice: "unknown" | "reported_shortfall" | "acknowledged_success";
+                confidence: number;
+                probabilities: {
+                    [x: string]: number;
+                    [x: number]: number;
+                };
+            };
+            reason: {
+                type: "choice";
+                choice: "none_or_unclear" | "missing_requested_work" | "unnecessary_deferral" | "regression" | "incorrect_claim" | "wrong_scope" | "failed_delivery";
+                confidence: number;
+                probabilities: {
+                    [x: string]: number;
+                    [x: number]: number;
+                };
+            };
+            correction: {
+                type: "noul";
+                noul: number;
+            };
+            deliveryAdmission: {
+                type: "noul";
+                noul: number;
+            };
+            regression: {
+                type: "noul";
+                noul: number;
+            };
+            scopeClarification: {
+                type: "noul";
+                noul: number;
+            };
+        } | null;
     };
     quality: {
         taskType: {
             type: "choice";
+            choice: "question" | "action" | "other" | "artifact" | "discussion";
             confidence: number;
-            choice: "action" | "question" | "other" | "artifact" | "discussion";
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -61,8 +61,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         assessability: {
             type: "choice";
-            confidence: number;
             choice: "assessable" | "not_assessable";
+            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -70,8 +70,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         fitAssessability: {
             type: "choice";
-            confidence: number;
             choice: "assessable" | "not_assessable";
+            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -83,8 +83,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         failureReason: {
             type: "choice";
-            confidence: number;
             choice: "none_or_unclear" | "missing_requested_work" | "wrong_deliverable" | "missed_constraint" | "insufficient_answer_depth" | "unnecessary_deferral";
+            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -93,29 +93,29 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         fulfillment: {
             type: "score";
             confidence: number;
+            score: number;
             probabilities: {
                 "0": number;
                 "1": number;
                 "2": number;
                 "3": number;
             };
-            score: number;
         };
         deliverableFit: {
             type: "score";
             confidence: number;
+            score: number;
             probabilities: {
                 "0": number;
                 "1": number;
                 "2": number;
                 "3": number;
             };
-            score: number;
         };
         consistency: {
             type: "choice";
-            confidence: number;
             choice: "contradicted" | "not_assessable" | "consistent";
+            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -125,8 +125,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
     feedback: {
         target: {
             type: "choice";
-            confidence: number;
             choice: "delivery" | "mixed" | "unclear" | "current_answer" | "earlier_behavior" | "proactive_action" | "external" | "new_work";
+            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -134,8 +134,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         feedbackType: {
             type: "choice";
-            confidence: number;
             choice: "mixed" | "unrelated" | "unclear" | "acceptance" | "correction" | "continuation";
+            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -156,8 +156,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
     } & Partial<{
         sentiment: {
             type: "choice";
-            confidence: number;
             choice: "satisfied" | "dissatisfied" | "mixed" | "neutral" | "unrelated" | "unclear";
+            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
@@ -174,13 +174,13 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         dissatisfactionIntensity: {
             type: "score";
             confidence: number;
+            score: number;
             probabilities: {
                 "0": number;
                 "1": number;
                 "2": number;
                 "3": number;
             };
-            score: number;
         };
     }>;
 }>;

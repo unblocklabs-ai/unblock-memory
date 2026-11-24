@@ -27,7 +27,7 @@ test("quality judgments keep evidence and noise independent and validate exact a
     { noise_0: { type: "noul", noul: 2 }, evidence_0: { type: "noul", noul: 0.97 } },
     { noise_0: { type: "noul", noul: 0.95 }, evidence_0: { type: "score", noul: 0.97 } }]) {
     fetch.mock.mockImplementation(async () => Response.json({ answers }));
-    await assert.rejects(judgeTypeSafeQuality(params), /invalid quality/);
+    await assert.rejects(judgeTypeSafeQuality(params), { code: "invalid_response" });
   }
 });
 const selection = {
@@ -159,14 +159,14 @@ test("model matching restricts suffixes to dated snapshots or jev-latest, scope 
 
 test("HTTP and schema errors never expose provider content or retry", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => new Response("test-secret", { status: 529 }));
-  await assert.rejects(selectTypeSafeSkill(selection), { message: "TypeSafe HTTP 529", code: "http_error", status: 529 });
+  await assert.rejects(selectTypeSafeSkill(selection), { message: "Decision model HTTP 529", code: "http_error", status: 529 });
   assert.equal(fetch.mock.callCount(), 1);
   fetch.mock.mockImplementation(async () => response(2));
-  await assert.rejects(selectTypeSafeSkill(selection), /invalid selection/);
+  await assert.rejects(selectTypeSafeSkill(selection), { code: "invalid_response" });
   fetch.mock.mockImplementation(async () => Response.json({ secret: "test-secret" }));
-  await assert.rejects(selectTypeSafeSkill(selection), /invalid selection/);
+  await assert.rejects(selectTypeSafeSkill(selection), { code: "invalid_response" });
   fetch.mock.mockImplementation(async () => { throw new Error("test-secret network detail"); });
-  await assert.rejects(selectTypeSafeSkill(selection), { message: "TypeSafe request failed", code: "network_error" });
+  await assert.rejects(selectTypeSafeSkill(selection), { message: "Decision model request failed", code: "network_error" });
 });
 
 test("the request deadline aborts slow fetches", async (t) => {
@@ -177,7 +177,7 @@ test("the request deadline aborts slow fetches", async (t) => {
       reject(new Error("secret-bearing transport error"));
     }, { once: true });
   }));
-  await assert.rejects(selectTypeSafeSkill({ ...selection, timeoutMs: 20 }), { message: "TypeSafe request timed out", code: "timeout" });
+  await assert.rejects(selectTypeSafeSkill({ ...selection, timeoutMs: 20 }), { message: "Decision model request timed out", code: "timeout" });
 });
 
 const memoryJudgment = {
@@ -224,7 +224,7 @@ test("memory judgments use Noul probabilities, accept dated Liquid snapshots, an
 
 test("memory requests sanitize failures, do not retry, and honor the provider deadline", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => new Response("test-secret", { status: 529 }));
-  await assert.rejects(judgeMemory(), { message: "TypeSafe HTTP 529", code: "http_error", status: 529 });
+  await assert.rejects(judgeMemory(), { message: "Decision model HTTP 529", code: "http_error", status: 529 });
   assert.equal(fetch.mock.callCount(), 1);
   fetch.mock.mockImplementation(async (...[_url, init]: Parameters<typeof globalThis.fetch>) => new Promise<Response>((_resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("did not abort")), 1000);
@@ -233,17 +233,17 @@ test("memory requests sanitize failures, do not retry, and honor the provider de
       reject(new Error("private transport detail"));
     }, { once: true });
   }));
-  await assert.rejects(judgeMemory({ ...memoryJudgment, timeoutMs: 20 }), { message: "TypeSafe request timed out", code: "timeout" });
+  await assert.rejects(judgeMemory({ ...memoryJudgment, timeoutMs: 20 }), { message: "Decision model request timed out", code: "timeout" });
 });
 
 test("shared transport preserves caller errors for HTTP, cancellation and invalid JSON failures", async t => {
   const params = { apiKey: "test-secret", timeoutMs: 100, signal: new AbortController().signal };
   const callers = [
-    { request: () => selectTypeSafeSkill(selection), error: "TypeSafe HTTP 529", status: true },
-    { request: () => judgeMemory(), error: "TypeSafe HTTP 529", status: true },
+    { request: () => selectTypeSafeSkill(selection), error: "Decision model HTTP 529", status: true },
+    { request: () => judgeMemory(), error: "Decision model HTTP 529", status: true },
     { request: () => judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
-      error: "TypeSafe HTTP 529", status: true },
-    { request: () => requestTypeSafe(params, {}, {}), error: "TypeSafe HTTP 529", status: true },
+      error: "Decision model HTTP 529", status: true },
+    { request: () => requestTypeSafe(params, {}, {}), error: "Decision model HTTP 529", status: true },
   ];
   const fetch = t.mock.method(globalThis, "fetch");
   for (const caller of callers) {
@@ -259,7 +259,7 @@ test("shared transport preserves caller errors for HTTP, cancellation and invali
       assert.equal(cancelled, true);
     }
     fetch.mock.mockImplementation(async () => new Response("test-secret invalid JSON"));
-    await assert.rejects(caller.request(), { message: "TypeSafe returned invalid JSON", code: "invalid_response" });
+    await assert.rejects(caller.request(), { message: "Decision model returned invalid JSON", code: "invalid_response" });
   }
   assert.equal(fetch.mock.callCount(), callers.length * 3);
 });
@@ -271,11 +271,11 @@ test("caller cancellation preserves quality, memory and review abort errors", as
     throw new Error("caller signal was not propagated");
   });
   await assert.rejects(judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
-    { message: "TypeSafe request cancelled", code: "cancelled" });
+    { message: "Decision model request cancelled", code: "cancelled" });
   await assert.rejects(judgeMemory({ ...memoryJudgment, signal: params.signal }),
-    { message: "TypeSafe request cancelled", code: "cancelled" });
+    { message: "Decision model request cancelled", code: "cancelled" });
   assert.equal(fetch.mock.callCount(), 0, "already-aborted requests never reach fetch");
-  await assert.rejects(requestTypeSafe(params, {}, {}), { message: "TypeSafe request cancelled", code: "cancelled" });
+  await assert.rejects(requestTypeSafe(params, {}, {}), { message: "Decision model request cancelled", code: "cancelled" });
   assert.equal(fetch.mock.callCount(), 0, "review must abort before fetch");
 });
 
@@ -286,17 +286,18 @@ test("client distinguishes timeout, first caller cancellation, and body-read fai
       init?.signal?.addEventListener("abort", () => { clearTimeout(keepAlive); reject(new Error("private")); }, { once: true });
     }));
   await assert.rejects(requestTypeSafe({ apiKey: "private", signal: AbortSignal.timeout(10) }, {}, {}),
-    { code: "timeout", message: "TypeSafe request timed out" });
+    { code: "timeout", message: "Decision model request timed out" });
   const controller = new AbortController();
   const cancelled = requestTypeSafe({ apiKey: "private", signal: controller.signal, timeoutMs: 20 }, {}, {});
+  await new Promise(resolve => setImmediate(resolve));
   controller.abort("private reason");
-  await assert.rejects(cancelled, { code: "cancelled", message: "TypeSafe request cancelled" });
+  await assert.rejects(cancelled, { code: "cancelled", message: "Decision model request cancelled" });
   assert.equal(fetch.mock.callCount(), 2);
   fetch.mock.mockImplementation(async () => new Response(new ReadableStream({
     start(controller) { controller.error(new Error("private body detail")); },
   })));
   await assert.rejects(requestTypeSafe({ apiKey: "private" }, {}, {}),
-    { code: "network_error", message: "TypeSafe request failed" });
+    { code: "network_error", message: "Decision model request failed" });
 });
 
 test("quality helper isolates requests and keeps scores aligned despite reversed completion", { timeout: 2000 }, async t => {
@@ -307,6 +308,7 @@ test("quality helper isolates requests and keeps scores aligned despite reversed
   }));
   const quality = judgeTypeSafeQuality({ apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal,
     chunks: [{ text: "first", sourceKind: "files" }, { text: "second", sourceKind: "sessions" }] });
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(pending.length, 2, "both requests start before either completes");
   assert.deepEqual(pending.map(p => p.body.state[0].chunks.map(c => c.text)), [["first"], ["second"]]);
   pending[1].resolve(Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { noise_0: { type: "noul", noul: 0.8 }, evidence_0: { type: "noul", noul: 0.7 } } }));

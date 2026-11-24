@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { DEFAULT_DECISIONS_ENDPOINT, DEFAULT_DECISIONS_MODEL, resolveDecisionConfig, } from "@unblocklabs/decisions";
 import { resolveExtraction } from "./extraction-config.js";
 import { resolveResponseAudit } from "./response-config.js";
 import { resolvePeoplePrimer } from "./people-primer-config.js";
@@ -6,7 +7,6 @@ import { DEFAULT_LEARNING, resolvePeopleLearning } from "./people-learning-confi
 import { resolveInsideOut } from "./inside-out.js";
 import { resolveSafetyWhisperer } from "./safety-config.js";
 import { resolveMyTurn } from "./my-turn.js";
-import { defaultDecisionModel, isLoopbackHostname, TYPESAFE_DEFAULT_ENDPOINT, TYPESAFE_MODEL, } from "./typesafe-client.js";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
@@ -24,10 +24,10 @@ export const DEFAULT_PEOPLE_CONFIG = {
     todos: { maxOpen: 1000 },
     learning: DEFAULT_LEARNING,
 };
-const DEFAULT_TYPESAFE_CONFIG = {
+const DEFAULT_DECISION_MODEL_CONFIG = {
     enabled: true,
-    endpoint: TYPESAFE_DEFAULT_ENDPOINT,
-    model: TYPESAFE_MODEL,
+    endpoint: DEFAULT_DECISIONS_ENDPOINT,
+    model: DEFAULT_DECISIONS_MODEL,
     timeoutMs: 1500,
 };
 const DEFAULT_QUALITY_AUDIT = {
@@ -55,54 +55,38 @@ function resolveQualityAudit(value, corpora) {
     }
     return { enabled, corpora: [...new Set(selected)], minNoise };
 }
-function resolveTypeSafe(value) {
+function resolveDecisionModel(value, label) {
     if (value === undefined)
-        return { ...DEFAULT_TYPESAFE_CONFIG };
+        return { ...DEFAULT_DECISION_MODEL_CONFIG };
     if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("unblock-memory typesafe must be an object");
+        throw new Error(`unblock-memory ${label} must be an object`);
     }
     const config = value;
-    assertOnlyKeys(config, ["enabled", "endpoint", "model", "apiKey", "apiKeyFile", "timeoutMs"], "typesafe");
+    assertOnlyKeys(config, ["enabled", "endpoint", "model", "apiKey", "apiKeyFile", "timeoutMs"], label);
     const enabled = config.enabled ?? true;
     if (typeof enabled !== "boolean")
-        throw new Error("unblock-memory typesafe.enabled must be a boolean");
-    const rawEndpoint = config.endpoint ?? DEFAULT_TYPESAFE_CONFIG.endpoint;
-    if (typeof rawEndpoint !== "string" || /\s/u.test(rawEndpoint) || rawEndpoint.includes("?") || rawEndpoint.includes("#")) {
-        throw new Error("unblock-memory typesafe.endpoint must be an HTTPS (or loopback HTTP) URL without whitespace, query or fragment");
-    }
-    let url;
+        throw new Error(`unblock-memory ${label}.enabled must be a boolean`);
+    const timeoutMs = positiveInteger(config.timeoutMs, DEFAULT_DECISION_MODEL_CONFIG.timeoutMs, `${label}.timeoutMs`, 10_000);
+    let resolved;
     try {
-        url = new URL(rawEndpoint);
+        resolved = resolveDecisionConfig({
+            endpoint: config.endpoint,
+            model: config.model,
+            apiKey: config.apiKey,
+            apiKeyFile: config.apiKeyFile,
+            timeoutMs,
+        });
     }
-    catch {
-        throw new Error("unblock-memory typesafe.endpoint must be an HTTPS (or loopback HTTP) URL");
-    }
-    const allowedProtocol = url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHostname(url.hostname));
-    if (!allowedProtocol || !url.hostname || url.username || url.password || url.search || url.hash) {
-        throw new Error("unblock-memory typesafe.endpoint must be an HTTPS (or loopback HTTP) URL without credentials, query or fragment");
-    }
-    const endpoint = url.href.replace(/\/+$/u, "");
-    for (const key of ["model", "apiKey", "apiKeyFile"]) {
-        if (config[key] !== undefined && (typeof config[key] !== "string" || !config[key].trim())) {
-            throw new Error(`unblock-memory typesafe.${key} must be a non-empty string`);
-        }
-    }
-    const model = typeof config.model === "string"
-        ? config.model.trim()
-        : defaultDecisionModel(endpoint);
-    if (endpoint === TYPESAFE_DEFAULT_ENDPOINT && model.startsWith(`${TYPESAFE_MODEL}-`)) {
-        throw new Error(`unblock-memory typesafe.model must use the alias "${TYPESAFE_MODEL}" for ${TYPESAFE_DEFAULT_ENDPOINT}`);
-    }
-    const apiKey = typeof config.apiKey === "string" ? config.apiKey.trim() : undefined;
-    const apiKeyFile = typeof config.apiKeyFile === "string" ? config.apiKeyFile.trim() : undefined;
-    if (apiKey && apiKeyFile)
-        throw new Error("unblock-memory typesafe accepts apiKey or apiKeyFile, not both");
-    if (apiKeyFile && !isAbsolute(apiKeyFile)) {
-        throw new Error("unblock-memory typesafe.apiKeyFile must be an absolute path");
+    catch (error) {
+        throw new Error(`unblock-memory ${label}: ${error instanceof Error ? error.message : String(error)}`);
     }
     return {
-        enabled, endpoint, model, ...(apiKey ? { apiKey } : {}), ...(apiKeyFile ? { apiKeyFile } : {}),
-        timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_TYPESAFE_CONFIG.timeoutMs, "typesafe.timeoutMs", 10_000),
+        enabled,
+        endpoint: resolved.endpoint,
+        model: resolved.model,
+        ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
+        ...(resolved.apiKeyFile ? { apiKeyFile: resolved.apiKeyFile } : {}),
+        timeoutMs: resolved.timeoutMs,
     };
 }
 const DEFAULT_SKILL_WHISPERER = {
@@ -327,7 +311,10 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"], "config");
+    if (config.decisionModel !== undefined && config.typesafe !== undefined) {
+        throw new Error("unblock-memory accepts decisionModel or typesafe, not both");
+    }
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -404,6 +391,9 @@ export function resolveConfig(value) {
     if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
         skillWhisperer = { ...skillWhisperer, enabled: false };
     }
+    const decisionModel = config.decisionModel !== undefined
+        ? resolveDecisionModel(config.decisionModel, "decisionModel")
+        : resolveDecisionModel(config.typesafe, "typesafe");
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
         myTurn: resolveMyTurn(config.myTurn),
         extraction: resolveExtraction(config.extraction, corpora),
@@ -412,5 +402,7 @@ export function resolveConfig(value) {
         responseAudit: resolveResponseAudit(config.responseAudit, corpora),
         insideOut: resolveInsideOut(config.insideOut),
         memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
-        safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer), typesafe: resolveTypeSafe(config.typesafe) };
+        safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
+        decisionModel,
+        typesafe: decisionModel };
 }

@@ -41,9 +41,12 @@ test("TypeSafe is enabled by default with optional explicit credentials, endpoin
 });
 
 test("manifest schema omits static model default and agrees with runtime endpoint validation", async () => {
+  const dmSchema = manifest.configSchema.properties.decisionModel;
   const tsSchema = manifest.configSchema.properties.typesafe;
+  assert.equal("default" in dmSchema.properties.model, false, "manifest must not inject liquid/d1.2-ultra before endpoint-based inference");
   assert.equal("default" in tsSchema.properties.model, false, "manifest must not inject liquid/d1.2-ultra before endpoint-based inference");
-  assert.equal("model" in tsSchema.default, false, "typesafe.default must not force liquid/d1.2-ultra");
+  assert.equal("default" in dmSchema, false, "decisionModel must not materialize a static object default that conflicts with the deprecated typesafe alias");
+  assert.equal("default" in tsSchema, false, "deprecated typesafe alias must not materialize a static object default");
   const { validateJsonSchemaValue } = await import(import.meta.resolve("openclaw/plugin-sdk/json-schema-runtime")) as {
     validateJsonSchemaValue: (args: {
       schema: Record<string, unknown>;
@@ -66,8 +69,14 @@ test("manifest schema omits static model default and agrees with runtime endpoin
     "http://localhost:8787/v1/decisions",
     "http://[::1]:8787/v1/decisions",
   ]) {
+    assert.equal(validate({ decisionModel: { endpoint: valid } }).ok, true, valid);
     assert.equal(validate({ typesafe: { endpoint: valid } }).ok, true, valid);
   }
+  assert.equal(validate({ decisionModel: { apiKey: "a" }, typesafe: { apiKey: "b" } }).ok, false, "rejects specifying both decisionModel and typesafe");
+  assert.throws(() => resolveConfig({ decisionModel: { apiKey: "a" }, typesafe: { apiKey: "b" } }), /decisionModel or typesafe, not both/);
+  const dmResolved = resolveConfig({ decisionModel: { endpoint: "https://other.example/v1/decisions", model: "custom/m", apiKey: "k" } });
+  assert.deepEqual(dmResolved.decisionModel, dmResolved.typesafe);
+  assert.equal(dmResolved.decisionModel.model, "custom/m");
   for (const invalid of [
     "https://",
     "https://:443/v1/decisions",

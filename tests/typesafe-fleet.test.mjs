@@ -209,3 +209,32 @@ else{let s='';for await(const c of process.stdin)s+=c;const p=JSON.parse(s);if(!
   const publicFile = join(f.root, "public.csv"); writeFileSync(publicFile, "", { mode: 0o644 });
   assert.equal(spawnSync(process.execPath, [resolve("scripts/typesafe-fleet.mjs"), publicFile], { env, encoding: "utf8" }).status, 1);
 });
+
+test("remote deploy patches decisionModel cleanly without adding typesafe on decisionModel-configured hosts", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "decision-fleet-test-")));
+  const configPath = join(root, "openclaw.json");
+  const entry = { enabled: true, config: { decisionModel: { apiKey: "old-secret", timeoutMs: 1234 } } };
+  const config = { plugins: { entries: { "unblock-memory": entry } } };
+  writeFileSync(configPath, JSON.stringify(config));
+  let seenPatch;
+  const cli = (args, input) => {
+    if (args.join(" ") === "config file --json") return JSON.stringify({ path: configPath });
+    if (args[1] === "validate") return "{}";
+    if (args[1] === "patch") {
+      seenPatch = JSON.parse(input).plugins.entries["unblock-memory"].config;
+      assert.equal("typesafe" in seenPatch, false);
+      assert.equal(seenPatch.decisionModel.apiKey, null);
+      if (!args.includes("--dry-run")) {
+        Object.assign(entry.config.decisionModel, seenPatch.decisionModel);
+        delete entry.config.decisionModel.apiKey;
+        writeFileSync(configPath, JSON.stringify(config));
+      }
+      return "{}";
+    }
+    throw new Error("unexpected CLI");
+  };
+  const result = await deploy({ apiKey: key, apply: true, restart: false }, cli);
+  assert.equal(result.status, "configured");
+  assert.equal("typesafe" in entry.config, false);
+  assert.equal(entry.config.decisionModel.endpoint, "https://codex.unblocklabs.ai/v1/decisions");
+});

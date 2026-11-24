@@ -19,8 +19,9 @@ const { ResponseAuditStore } = await imp("response-store");
 const { ResponseTranscriptReader } = await imp("response-episodes");
 const raw = await readFile(`${stateRoot}/openclaw.json`, "utf8");
 const host = JSON.parse(raw);
-const config = resolveConfig({ ...host.plugins.entries["unblock-memory"].config,
-  typesafe: { ...host.plugins.entries["unblock-memory"].config.typesafe, timeoutMs: 10000 },
+const { typesafe: hostTypeSafe, decisionModel: hostDecisionModel, ...restHostConfig } = host.plugins.entries["unblock-memory"].config ?? {};
+const config = resolveConfig({ ...restHostConfig,
+  decisionModel: { ...(hostDecisionModel ?? hostTypeSafe), timeoutMs: 10000 },
   responseAudit: { enabled: true, senderIds: [senderId], chatTypes: ["direct", "channel"], lookbackDays,
     historyMessages: 6, maxEpisodes: 100, intervalMinutes: 0, memoryCorpora: ["memory", "knowledge"] } });
 const options = { agentId: "main", config, databasePath: `${stateRoot}/agents/main/agent/openclaw-agent.sqlite`,

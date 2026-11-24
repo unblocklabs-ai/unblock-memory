@@ -235,18 +235,18 @@ test("quality request cannot see later feedback; schema errors and provider erro
     }
     return Response.json(result);
   });
-  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), /Invalid/);
+  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), { code: "invalid_response" });
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     const result = payload(JSON.parse(String(init.body)));
     result.answers.fulfillment = { type: "score", score: 0, confidence: 0.95, probabilities: { "0": 0, "1": 0, "2": 0, "3": 1 } };
     return Response.json(result);
   });
-  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), /probability distribution/);
+  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), /score distribution/);
   t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {} }));
-  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), /Invalid/);
+  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), { code: "invalid_response" });
   t.mock.method(globalThis, "fetch", async () => { throw new Error("PRIVATE PROVIDER DETAILS"); });
   await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }),
-    { message: "TypeSafe request failed", code: "network_error" });
+    { message: "Decision model request failed", code: "network_error" });
 });
 
 test("audit persists deduplicated results, skips retired active branches and reports denominators", async t => {
@@ -516,6 +516,7 @@ test("memory opportunity judgments isolate concurrent candidates and retain sour
     return new Promise<Response>(resolve => pending.push(resolve));
   });
   const results = judgeMemoryOpportunity(e, candidates, { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal });
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(pending.length, 2);
   pending[1](Response.json({ answers: { candidate_0: { type: "noul", noul: 0.9 } } }));
   pending[0](Response.json({ answers: { candidate_0: { type: "noul", noul: 0.1 } } }));
@@ -776,14 +777,14 @@ test("sentiment schema requires all enabled questions and validates intensity di
     }
     return Response.json(result);
   });
-  await assert.rejects(judgeResponse(e, params), /Invalid response sentiment/);
+  await assert.rejects(judgeResponse(e, params), { code: "invalid_response" });
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     const result = payload(JSON.parse(String(init.body)));
     const intensity = result.answers.dissatisfactionIntensity;
     if (intensity && "score" in intensity) intensity.score = 1;
     return Response.json(result);
   });
-  await assert.rejects(judgeResponse(e, params), /probability distribution/);
+  await assert.rejects(judgeResponse(e, params), /score distribution/);
 });
 
 test("sentiment reporting separates mixed displeasure, overlapping emotions, intensity and unknowns from failure", async t => {

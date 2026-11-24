@@ -11,12 +11,13 @@ const legacy = rawArgs.includes("--legacy");
 const endpointFlag = rawArgs.find(a => a.startsWith("--endpoint="))?.slice("--endpoint=".length);
 const modelFlag = rawArgs.find(a => a.startsWith("--model="))?.slice("--model=".length);
 const { resolveConfig } = await import(pathToFileURL(`${plugin}/dist/src/config.js`));
-const { resolveTypeSafeApiKey, TYPESAFE_DEFAULT_ENDPOINT } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
+const { LEGACY_SYSTEMONE_ENDPOINT, resolveTypeSafeApiKey } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
 const { judgeResponse, responseRubricVersion } = await import(pathToFileURL(`${plugin}/dist/src/response-judge.js`));
-const { typesafe } = resolveConfig({
-  typesafe: {
+const endpointOverride = endpointFlag ?? (legacy ? LEGACY_SYSTEMONE_ENDPOINT : undefined);
+const { decisionModel: typesafe } = resolveConfig({
+  decisionModel: {
     enabled: true,
-    endpoint: endpointFlag ?? (legacy ? "https://api.typesafe.ai/v1/systemone" : TYPESAFE_DEFAULT_ENDPOINT),
+    ...(endpointOverride ? { endpoint: endpointOverride } : {}),
     ...(modelFlag ? { model: modelFlag } : {}),
     apiKeyFile: keyFile,
     timeoutMs: 10000,

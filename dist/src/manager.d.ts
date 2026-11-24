@@ -146,18 +146,30 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         }[];
         policy: string;
         scope: string;
-        needsReview: boolean;
-        background?: {
-            backgroundOnly: number;
-            explicitSupport: number;
-        } | undefined;
         verdict: "supports" | "contradicts" | "insufficient_evidence";
         confidence: number;
-        probabilities: {
-            supports: number;
-            contradicts: number;
-            insufficient_evidence: number;
+        probabilities: Record<"supports" | "contradicts" | "insufficient_evidence", number>;
+        background: {
+            backgroundOnly: number;
+            explicitSupport: number;
         };
+        needsReview: boolean;
+        status: "ok";
+    } | {
+        evidence: {
+            path: string;
+            from: number;
+            lines: number;
+            documentHash: string;
+            excerptHash: string;
+        }[];
+        policy: string;
+        scope: string;
+        verdict: "supports" | "contradicts" | "insufficient_evidence";
+        confidence: number;
+        probabilities: Record<"supports" | "contradicts" | "insufficient_evidence", number>;
+        needsReview: boolean;
+        background?: undefined;
         status: "ok";
     }>;
     reviewCluster(params: Omit<Parameters<typeof reviewClusterIngestion>[0], "db" | "sources" | "read"> & {
