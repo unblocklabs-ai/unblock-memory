@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { zstdCompressSync } from "node:zlib";
-import { PROJECTOR_VERSION, syncSessionProjections, unchangedSessionSync } from "../src/session-sync.js";
+import { PROJECTOR_VERSION, readSessionManifest, syncSessionProjections, unchangedSessionSync } from "../src/session-sync.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 test("refresh retains compressed active history and preserves projections when history goes cold or corrupt", async () => {
@@ -36,6 +36,7 @@ test("refresh retains compressed active history and preserves projections when h
   assert.equal(cold.result.removed, 0);
   assert.equal(await readFile(path, "utf8"), text);
   assert.deepEqual(cold.manifest.sessions.evolved, compressed.manifest.sessions.evolved);
+  assert.equal(typeof cold.manifest.failedSessions?.evolved, "string");
   db.exec("DELETE FROM session_transcript_cold_archives");
   db.prepare("INSERT INTO transcript_events VALUES ('evolved',1,NULL,3000,?,?)")
     .run(zstdCompressSync(Buffer.from(eventJson)), Buffer.byteLength(eventJson) + 1);
@@ -44,6 +45,7 @@ test("refresh retains compressed active history and preserves projections when h
   assert.equal(corrupt.result.failed, 1);
   assert.equal(corrupt.result.removed, 0);
   assert.equal(await readFile(path, "utf8"), text);
+  assert.equal(typeof corrupt.manifest.failedSessions?.evolved, "string");
   db.close();
 });
 
@@ -411,6 +413,7 @@ test("recovered cold window reprojects after a projection config change and part
     assert.equal(partial.result.lastSuccessfulSyncAt, first.result.lastSuccessfulSyncAt);
     assert.equal(partial.manifest.projectionKey, first.manifest.projectionKey);
     assert.equal(partial.manifest.indexSignature, undefined);
+    assert.equal(typeof partial.manifest.failedSessions?.["cold-window"], "string");
     assert.equal(partial.manifest.sessions["cold-window"]!.projectionKey, first.manifest.projectionKey);
     assert.notEqual(partial.manifest.sessions.stable!.projectionKey, first.manifest.projectionKey);
     assert.match(await readFile(coldDocPath, "utf8"), /## Assistant — Theo — 2026-08-25 15:00:00 UTC/u);
@@ -423,11 +426,81 @@ test("recovered cold window reprojects after a projection config change and part
     assert.equal(recovered.result.failed, 0);
     assert.equal(recovered.result.updated, 1);
     assert.equal(recovered.result.unchanged, 1);
+    assert.equal(recovered.manifest.failedSessions, undefined);
     assert.match(await readFile(coldDocPath, "utf8"), /## Assistant — Bill — 2026-08-25 11:00:00 EDT/u);
     assert.notEqual(recovered.manifest.projectionKey, first.manifest.projectionKey);
     assert.ok(recovered.manifest.indexSignature);
     assert.ok((recovered.manifest.lastSuccessfulSyncAt ?? 0) >= (first.manifest.lastSuccessfulSyncAt ?? 0));
     assert.equal((await unchangedSessionSync(nyParams, indexPath))?.skipReason, "no_changes");
+  } finally {
+    db.close();
+  }
+});
+
+test("records brand-new failed/unavailable windows in manifest.failedSessions and clears them once healthy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-failed-sessions-"));
+  const databasePath = join(root, "agent.sqlite");
+  const outputDir = join(root, "sessions");
+  const manifestPath = join(root, "sessions-manifest.json");
+  const indexPath = join(root, "index.sqlite");
+  const db = createAgentDatabase(databasePath, "main", "2026.9.2", 19);
+  insertSession(db, {
+    sessionId: "healthy",
+    chatType: "channel",
+    message: { type: "message", message: { role: "user", content: "Healthy window" } },
+  });
+  insertSession(db, {
+    sessionId: "cold-new",
+    chatType: "channel",
+    message: { type: "message", message: { role: "user", content: "Cold new window" } },
+  });
+  db.exec(`
+    PRAGMA user_version=24;
+    UPDATE schema_meta SET schema_version=24;
+    ALTER TABLE transcript_events ADD COLUMN event_zstd BLOB;
+    ALTER TABLE transcript_events ADD COLUMN event_utf8_bytes INTEGER;
+    CREATE TABLE session_transcript_cold_archives (session_id TEXT PRIMARY KEY);
+    INSERT INTO session_transcript_cold_archives VALUES ('cold-new');
+  `);
+  let indexCalls = 0;
+  const params = {
+    databasePath,
+    outputDir,
+    manifestPath,
+    indexPath,
+    agentId: "main",
+    agentName: "Theo",
+    timezone: "UTC",
+    chatTypes: ["channel"] as const,
+    index: async () => {
+      await writeFile(indexPath, `index-${++indexCalls}`);
+      return 1;
+    },
+    indexReady: async () => true,
+  };
+  try {
+    const first = await syncSessionProjections(params);
+    assert.equal(first.result.failed, 1);
+    assert.equal(first.result.updated, 1);
+    assert.equal(first.manifest.sessions["cold-new"], undefined);
+    assert.equal(typeof first.manifest.failedSessions?.["cold-new"], "string");
+    assert.ok(first.manifest.failedSessions!["cold-new"]!.length > 0);
+
+    const persistedFailed = await readSessionManifest(manifestPath);
+    assert.deepEqual(persistedFailed.failedSessions, first.manifest.failedSessions);
+    assert.equal(await unchangedSessionSync(params, indexPath), undefined);
+
+    // Recover cold-new and re-sync: failedSessions must be cleared.
+    db.exec("DELETE FROM session_transcript_cold_archives");
+    const recovered = await syncSessionProjections(params);
+    assert.equal(recovered.result.failed, 0);
+    assert.equal(recovered.result.updated, 1);
+    assert.ok(recovered.manifest.sessions["cold-new"]);
+    assert.equal(recovered.manifest.failedSessions, undefined);
+
+    const persistedRecovered = await readSessionManifest(manifestPath);
+    assert.equal(persistedRecovered.failedSessions, undefined);
+    assert.equal((await unchangedSessionSync(params, indexPath))?.skipReason, "no_changes");
   } finally {
     db.close();
   }

@@ -1,14 +1,53 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import fs, { mkdir, mkdtemp, readFile, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { FSWatcher } from "chokidar";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { QmdMemoryManager } from "../src/manager.js";
 import { QmdMemoryRuntime, recoverInterruptedSessionSync } from "../src/runtime.js";
+
+function seedSessionSyncLease(
+  lockPath: string,
+  lease: { pid: number; token: string; startedAt: string },
+): void {
+  const db = new DatabaseSync(lockPath);
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS session_sync_lease (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        pid INTEGER NOT NULL,
+        token TEXT NOT NULL,
+        started_at TEXT NOT NULL
+      )
+    `);
+    db.prepare(
+      "INSERT OR REPLACE INTO session_sync_lease (id, pid, token, started_at) VALUES (1, ?, ?, ?)",
+    ).run(lease.pid, lease.token, lease.startedAt);
+  } finally {
+    db.close();
+  }
+}
+
+function readSessionSyncLeaseRows(
+  lockPath: string,
+): Array<{ id: number; pid: number; token: string; started_at: string }> {
+  const db = new DatabaseSync(lockPath, { readOnly: true });
+  try {
+    return db.prepare("SELECT id, pid, token, started_at FROM session_sync_lease").all() as Array<{
+      id: number;
+      pid: number;
+      token: string;
+      started_at: string;
+    }>;
+  } finally {
+    db.close();
+  }
+}
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -397,10 +436,10 @@ test("clears the active registry when the initial status write fails", async () 
   );
 });
 
-test("cross-process lockfile protects a live sync from clobbering or duplication and reclaims dead-PID locks", async (t) => {
+test("cross-process SQLite lease protects a live sync from clobbering or duplication and reclaims dead-PID leases", async (t) => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-xproc-lock-"));
   const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
-  const lockPath = join(stateDir, "session-sync.lock");
+  const lockPath = join(stateDir, "session-sync.lock.sqlite");
   const statusPath = join(stateDir, "session-sync-status.json");
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
 
@@ -411,11 +450,11 @@ test("cross-process lockfile protects a live sync from clobbering or duplication
   assert.ok(child.pid);
 
   const startedAt = "2026-11-24T12:00:00.000Z";
-  await writeFile(lockPath, JSON.stringify({
+  seedSessionSyncLease(lockPath, {
     pid: child.pid,
     token: "process-a-token",
     startedAt,
-  }), { mode: 0o600 });
+  });
   const runningReceipt = {
     status: "running" as const,
     phase: "indexing" as const,
@@ -452,23 +491,23 @@ test("cross-process lockfile protects a live sync from clobbering or duplication
     }
     return true;
   });
-  await writeFile(lockPath, JSON.stringify({
+  seedSessionSyncLease(lockPath, {
     pid: 424_242,
     token: "eperm-owner",
     startedAt,
-  }), { mode: 0o600 });
+  });
   assert.deepEqual(await processB.startSessionSync(active), {
     status: "already_running",
     startedAt,
   });
   killMock.mock.restore();
 
-  // Restore the real child lock, kill the child, and confirm dead-PID reclamation.
-  await writeFile(lockPath, JSON.stringify({
+  // Restore the real child lease, kill the child, and confirm dead-PID reclamation.
+  seedSessionSyncLease(lockPath, {
     pid: child.pid,
     token: "process-a-token",
     startedAt,
-  }), { mode: 0o600 });
+  });
   child.kill("SIGKILL");
   await once(child, "exit");
 
@@ -477,13 +516,17 @@ test("cross-process lockfile protects a live sync from clobbering or duplication
   if (recovered.status === "failed") {
     assert.equal(recovered.error, "session sync interrupted by Gateway restart");
   }
+  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
 
   let lockModeDuringRun: number | undefined;
+  let leasePidDuringRun: number | undefined;
   Object.defineProperty(processB, "getMemorySearchManager", {
     value: async () => ({
       manager: {
         async syncSessions() {
           lockModeDuringRun = (await stat(lockPath)).mode & 0o777;
+          const rows = readSessionSyncLeaseRows(lockPath);
+          leasePidDuringRun = rows[0]?.pid;
           return {
             scanned: 0,
             unchanged: 0,
@@ -506,7 +549,250 @@ test("cross-process lockfile protects a live sync from clobbering or duplication
     "reclaimed session sync completion",
   );
   assert.equal(lockModeDuringRun, 0o600);
-  await assert.rejects(stat(lockPath), { code: "ENOENT" });
+  assert.equal(leasePidDuringRun, process.pid);
+  assert.equal((await stat(lockPath)).mode & 0o777, 0o600);
+  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
+});
+
+test("concurrent contenders recovering from a dead-PID SQLite lease admit strictly one owner", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-lease-race-"));
+  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
+  const lockPath = join(stateDir, "session-sync.lock.sqlite");
+  const statusPath = join(stateDir, "session-sync-status.json");
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+
+  const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+  assert.ok(deadChild.pid);
+  await once(deadChild, "exit");
+
+  const staleStartedAt = "2026-11-24T12:00:00.000Z";
+  seedSessionSyncLease(lockPath, {
+    pid: deadChild.pid,
+    token: "stale-dead-owner",
+    startedAt: staleStartedAt,
+  });
+  await writeFile(statusPath, JSON.stringify({
+    status: "running",
+    phase: "indexing",
+    pid: deadChild.pid,
+    startedAt: staleStartedAt,
+  }), { mode: 0o600 });
+
+  const runtimeModuleUrl = new URL("../src/runtime.ts", import.meta.url).href;
+  const contenderScript = `
+    import { createInterface } from "node:readline";
+    import { QmdMemoryRuntime } from ${JSON.stringify(runtimeModuleUrl)};
+    const runtime = new QmdMemoryRuntime([{
+      name: "sessions",
+      kind: "sessions",
+      chatTypes: ["channel", "group"],
+      maxExpandedTokens: 500,
+      syncIntervalMinutes: 15,
+    }], { stateRoot: ${JSON.stringify(stateRoot)} });
+    let releaseSync;
+    const syncGate = new Promise((resolve) => { releaseSync = resolve; });
+    Object.defineProperty(runtime, "getMemorySearchManager", {
+      value: async () => ({
+        manager: {
+          async syncSessions() {
+            await syncGate;
+            return {
+              scanned: 1,
+              unchanged: 0,
+              updated: 1,
+              removed: 0,
+              skipped: 0,
+              failed: 0,
+              embedded: 0,
+              lastSuccessfulSyncAt: Date.now(),
+            };
+          },
+        },
+      }),
+    });
+    const rl = createInterface({ input: process.stdin });
+    let go;
+    const goGate = new Promise((resolve) => { go = resolve; });
+    rl.on("line", (line) => {
+      if (line === "GO") go();
+      if (line === "RELEASE") releaseSync();
+    });
+    process.stdout.write("READY\\n");
+    await goGate;
+    const result = await runtime.startSessionSync({ cfg: {}, agentId: "main" }, true);
+    process.stdout.write(JSON.stringify({ pid: process.pid, result }) + "\\n");
+    if (result.status === "started") {
+      await syncGate;
+      await runtime.close();
+    }
+    rl.close();
+  `;
+
+  const spawnContender = () => {
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", contenderScript], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, TSX_DISABLE_CACHE: "1" },
+    });
+    t.after(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    let buffer = "";
+    const lines: string[] = [];
+    const waiters: Array<(line: string) => void> = [];
+    child.stdout.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline === -1) break;
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        const waiter = waiters.shift();
+        if (waiter) waiter(line);
+        else lines.push(line);
+      }
+    });
+    const nextLine = (): Promise<string> => {
+      const buffered = lines.shift();
+      if (buffered !== undefined) return Promise.resolve(buffered);
+      return new Promise((resolve, reject) => {
+        const onExit = (code: number | null) => {
+          reject(new Error(`contender exited early (code=${code}): ${stderr}`));
+        };
+        child.once("exit", onExit);
+        waiters.push((line) => {
+          child.off("exit", onExit);
+          resolve(line);
+        });
+      });
+    };
+    return { child, nextLine, getStderr: () => stderr };
+  };
+
+  const contenderA = spawnContender();
+  const contenderB = spawnContender();
+  assert.deepEqual(await Promise.all([contenderA.nextLine(), contenderB.nextLine()]), ["READY", "READY"]);
+
+  contenderA.child.stdin.write("GO\n");
+  contenderB.child.stdin.write("GO\n");
+
+  const outcomes = (await Promise.all([contenderA.nextLine(), contenderB.nextLine()])).map(
+    (line) => JSON.parse(line) as { pid: number; result: { status: string; startedAt?: string } },
+  );
+  const winners = outcomes.filter((outcome) => outcome.result.status === "started");
+  const losers = outcomes.filter((outcome) => outcome.result.status === "already_running");
+  assert.equal(winners.length, 1, `expected strictly 1 started contender, got ${JSON.stringify(outcomes)}`);
+  assert.equal(losers.length, 1, `expected strictly 1 already_running contender, got ${JSON.stringify(outcomes)}`);
+  assert.equal(losers[0]!.result.startedAt, winners[0]!.result.startedAt);
+
+  const activeLease = readSessionSyncLeaseRows(lockPath);
+  assert.equal(activeLease.length, 1);
+  assert.equal(activeLease[0]!.pid, winners[0]!.pid);
+  assert.equal((await stat(lockPath)).mode & 0o777, 0o600);
+
+  contenderA.child.stdin.write("RELEASE\n");
+  contenderB.child.stdin.write("RELEASE\n");
+  const [exitA, exitB] = await Promise.all([
+    once(contenderA.child, "exit"),
+    once(contenderB.child, "exit"),
+  ]);
+  assert.equal(exitA[0], 0, contenderA.getStderr());
+  assert.equal(exitB[0], 0, contenderB.getStderr());
+
+  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
+  const observer = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  t.after(() => observer.close());
+  assert.equal((await observer.sessionSyncStatus(active.agentId)).status, "completed");
+});
+
+test("recoverInterruptedSessionSync immediately recovers a crashed second running receipt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-second-crash-"));
+  const statusPath = join(root, "session-sync-status.json");
+  const firstStartedAt = "2026-11-24T12:00:00.000Z";
+  const secondStartedAt = "2026-11-24T12:05:00.000Z";
+  await writeFile(statusPath, JSON.stringify({
+    status: "running",
+    phase: "indexing",
+    pid: 99_999_998,
+    startedAt: secondStartedAt,
+  }), { mode: 0o600 });
+
+  const recovered = await recoverInterruptedSessionSync(root, statusPath, {
+    status: "running",
+    phase: "projecting",
+    pid: 99_999_999,
+    startedAt: firstStartedAt,
+  });
+  assert.equal(recovered.status, "failed");
+  if (recovered.status === "failed") {
+    assert.equal(recovered.startedAt, secondStartedAt);
+    assert.equal(recovered.error, "session sync interrupted by Gateway restart");
+  }
+  const persisted = JSON.parse(await readFile(statusPath, "utf8")) as { status: string; startedAt: string };
+  assert.equal(persisted.status, "failed");
+  assert.equal(persisted.startedAt, secondStartedAt);
+  assert.deepEqual(readSessionSyncLeaseRows(join(root, "session-sync.lock.sqlite")), []);
+});
+
+test("runtime.close fences an in-flight startSessionSync mid-startup and prevents manager creation after close", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-close-fence-"));
+  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
+  const lockPath = join(stateDir, "session-sync.lock.sqlite");
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+
+  let managerStarts = 0;
+  t.mock.method(QmdMemoryManager.prototype, "start", async () => {
+    managerStarts += 1;
+  });
+  t.mock.method(QmdMemoryManager.prototype, "close", async () => {});
+
+  let writeEntered!: () => void;
+  const queuedWriteStarted = new Promise<void>((resolve) => { writeEntered = resolve; });
+  let releaseWrite!: () => void;
+  const queuedWriteGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+
+  const originalWriteFile = fs.writeFile.bind(fs);
+  let pausedOnce = false;
+  t.mock.method(fs, "writeFile", async (...args: Parameters<typeof fs.writeFile>) => {
+    const [target] = args;
+    if (!pausedOnce && typeof target === "string" && target.includes("session-sync-status.json")) {
+      pausedOnce = true;
+      writeEntered();
+      await queuedWriteGate;
+    }
+    return originalWriteFile(...args);
+  });
+
+  const startPromise = runtime.startSessionSync(active, true);
+  await queuedWriteStarted;
+  // Lock is already held by the in-flight startSessionSync before #activeSessionSyncs registration.
+  assert.equal(readSessionSyncLeaseRows(lockPath).length, 1);
+
+  let closeDone = false;
+  const closePromise = runtime.close().then(() => { closeDone = true; });
+  await delay(20);
+  assert.equal(closeDone, false, "runtime.close() must wait for in-flight startSessionSync");
+
+  releaseWrite();
+  const [startResult] = await Promise.all([startPromise, closePromise]);
+  assert.equal(closeDone, true);
+  assert.deepEqual(startResult, {
+    status: "unavailable",
+    error: "memory runtime is closing",
+  });
+  assert.equal(managerStarts, 0, "no QmdMemoryManager may spawn during or after close");
+  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
+
+  assert.deepEqual(await runtime.getMemorySearchManager(active), {
+    manager: null,
+    error: "memory runtime is closing",
+  });
+  assert.deepEqual(await runtime.startSessionSync(active), {
+    status: "unavailable",
+    error: "memory runtime is closing",
+  });
+  assert.equal(managerStarts, 0);
 });
 
 test("runtime.close drains owned active session syncs before closing managers", async () => {

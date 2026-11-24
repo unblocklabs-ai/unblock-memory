@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { syncSessionProjections, unchangedSessionSync } from "../src/session-sync.js";
+import { readSessionManifest, syncSessionProjections, unchangedSessionSync } from "../src/session-sync.js";
 import { QmdMemoryRuntime } from "../src/runtime.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
@@ -160,7 +160,7 @@ test("excluded DMs do not trigger work and first eligible conversations do", asy
   assert.equal((await f.run()).result.updated, 1);
 });
 
-test("initial sync with failures leaves lastSuccessfulSyncAt unset and never certifies skip", async () => {
+test("initial sync with failures records failedSessions, leaves lastSuccessfulSyncAt unset, never certifies skip, and clears once healthy", async () => {
   const f = await fixture();
   const db = new DatabaseSync(f.params.databasePath);
   db.prepare("UPDATE transcript_events SET event_json = '{broken' WHERE session_id = 'conversation'").run();
@@ -171,5 +171,29 @@ test("initial sync with failures leaves lastSuccessfulSyncAt unset and never cer
   assert.equal(failedFirst.result.lastSuccessfulSyncAt, undefined);
   assert.equal(failedFirst.manifest.lastSuccessfulSyncAt, undefined);
   assert.equal(failedFirst.manifest.indexSignature, undefined);
+  assert.equal(failedFirst.manifest.sessions.conversation, undefined);
+  assert.equal(typeof failedFirst.manifest.failedSessions?.conversation, "string");
+  assert.deepEqual(
+    (await readSessionManifest(f.params.manifestPath)).failedSessions,
+    failedFirst.manifest.failedSessions,
+  );
+  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+
+  const repairedDb = new DatabaseSync(f.params.databasePath);
+  repairedDb.prepare("UPDATE transcript_events SET event_json = ? WHERE session_id = 'conversation'")
+    .run(JSON.stringify({ type: "message", message: { role: "user", content: "Repaired decision." } }));
+  repairedDb.close();
+
+  const repaired = await f.run();
+  assert.equal(repaired.result.failed, 0);
+  assert.equal(repaired.result.updated, 1);
+  assert.equal(repaired.manifest.failedSessions, undefined);
+  assert.equal((await readSessionManifest(f.params.manifestPath)).failedSessions, undefined);
+  assert.equal((await unchangedSessionSync(f.params, f.params.indexPath))?.skipReason, "no_changes");
+
+  // Even with a valid indexSignature and lastSuccessfulSyncAt, non-empty failedSessions must invalidate skip.
+  const tampered = structuredClone(repaired.manifest);
+  tampered.failedSessions = { conversation: "stale-failed-fingerprint" };
+  await writeFile(f.params.manifestPath, JSON.stringify(tampered));
   assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
 });
