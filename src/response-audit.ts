@@ -1,9 +1,16 @@
+import { setImmediate } from "node:timers/promises";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { ResolvedSource } from "./sources.js";
 import { abortable } from "./abortable.js";
 import { decisionModelScope, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader, type ResponseEpisode } from "./response-episodes.js";
-import { responseRubricVersion, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity } from "./response-judge.js";
+import {
+  responseRubricVersion,
+  RESPONSE_STAGE_VERSIONS,
+  judgeMemoryOpportunity,
+  type ResponseJudgeParams,
+  type ResponseJudgment,
+} from "./response-judge.js";
 import { ResponseAuditStore, type ResponseResult } from "./response-store.js";
 import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
@@ -66,7 +73,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
     coverage.sessionLimitReached = sessions.length > 100;
     let stoppedForBudget = false;
     for (const session of sessions.slice(0, 100)) {
-      await new Promise<void>(resolve => setImmediate(resolve));
+      await setImmediate();
       signal.throwIfAborted();
       coverage.sessions++;
       const checkpoint = store?.checkpoint(cohort, session);
@@ -80,13 +87,13 @@ export async function auditResponses(options: ResponseAuditOptions) {
       if ("unchanged" in snapshot) {
         coverage.unchangedSessions++;
         coverage.cachedOrBackoff += work?.total ?? 0;
-        if (checkpoint) for (const key of Object.keys(checkpoint.coverage) as (keyof typeof checkpoint.coverage)[]) coverage[key] += checkpoint.coverage[key];
+        if (checkpoint) addCoverage(coverage, checkpoint.coverage);
         store?.advance(cohort, session);
         continue;
       }
       coverage.extractedSessions++;
       if (tracked.has(session)) coverage.reconciledSessions++;
-      for (const key of Object.keys(snapshot.coverage) as (keyof typeof snapshot.coverage)[]) coverage[key] += snapshot.coverage[key];
+      addCoverage(coverage, snapshot.coverage);
       const episodes = snapshot.episodes.filter(e => e.timestamp >= since);
       coverage.outsideLookback += snapshot.episodes.length - episodes.length;
       store?.observe(cohort, session, snapshot.episodes);
@@ -98,46 +105,49 @@ export async function auditResponses(options: ResponseAuditOptions) {
         if (!store!.needsJudgment(cohort, e, Date.now())) { coverage.cachedOrBackoff++; continue; }
         if (coverage.attempted >= config.responseAudit.maxEpisodes) { coverage.deferredByLimit++; continue; }
         coverage.attempted++;
+        const existing = store!.memoryRetryResult(cohort, e);
         store!.attempted(cohort, e, Date.now());
         try {
-          const params = { apiKey: key!, endpoint: config.typesafe.endpoint, model: config.typesafe.model, timeoutMs: config.typesafe.timeoutMs, signal };
-          const judgment = await abortable(assessResponseStages(store!, cohort, e, params, config.responseAudit.sentimentEnabled, coverage), signal);
-          let memory: ResponseResult["memory"] = { status: "not_requested", candidates: [] };
-          if (judgment.feedback.memoryGap.noul >= 0.8 && config.responseAudit.memoryCorpora.length) {
-            try {
-              const approved = options.sources.filter(s => config.responseAudit.memoryCorpora.includes(s.corpus));
-              const candidates = responseMemoryCandidates(options.indexPath, approved, e);
-              const memoryKey = jsonHash([decisionModelScope(config.typesafe.model, config.typesafe.endpoint), RESPONSE_STAGE_VERSIONS.memory,
-                e.id, e.session, e.senderId, e.request, e.answer, e.feedback, candidates,
-                [...config.responseAudit.memoryCorpora].sort()]);
-              let judged = store!.stage(cohort, e, "memory", memoryKey);
-              if (judged) coverage.stageCacheHits++;
-              else {
-                store!.stageBegin([memoryKey], Date.now()); coverage.stageAttempts++;
-                judged = await abortable(judgeMemoryOpportunity(e, candidates, params), signal);
-                store!.stageSave(memoryKey, judged, Date.now());
+          const params: ResponseJudgeParams = {
+            apiKey: key!, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
+            timeoutMs: config.typesafe.timeoutMs, signal,
+          };
+          const result = existing
+            ? {
+                ...existing,
+                memory: await assessMemoryOpportunity(store!, cohort, e, existing.feedback, options, params, coverage),
               }
-              memory = { status: "checked", candidates: judged };
-            } catch { memory = { status: "unavailable", candidates: [] }; }
-          }
+            : await (async () => {
+                const judgment = await abortable(assessResponseStages(store!, cohort, e, params, config.responseAudit.sentimentEnabled, coverage), signal);
+                const memory = await assessMemoryOpportunity(store!, cohort, e, judgment.feedback, options, params, coverage);
+                return {
+                  ...judgment,
+                  human: people.resolve(e),
+                  references: references(e),
+                  agentModel: e.model,
+                  contextLimited: e.contextLimited,
+                  memorySearchCalls: e.memorySearchCalls,
+                  memory,
+                };
+              })();
           signal.throwIfAborted();
           const fresh = reader.read(session, config.responseAudit, snapshot.revision);
-          if (!fresh || !("unchanged" in fresh) && !fresh.episodes.some(candidate => candidate.id === e.id && candidate.inputHash === e.inputHash)) {
+          if (!fresh || (!("unchanged" in fresh) && !fresh.episodes.some(candidate => candidate.id === e.id && candidate.inputHash === e.inputHash))) {
             coverage.stale++;
             store!.stale(cohort, e);
-            if (fresh !== undefined && (!fresh || !("unchanged" in fresh))) {
+            if (fresh !== undefined) {
               store!.observe(cohort, session, fresh?.episodes ?? []);
               store!.checkpointForget(cohort, session);
             }
             break;
           }
-          store!.save(cohort, e, { ...judgment, human: people.resolve(e), references: references(e), agentModel: e.model,
-            contextLimited: e.contextLimited, memorySearchCalls: e.memorySearchCalls, memory }, Date.now());
-          coverage.evaluated++;
+          store!.save(cohort, e, result, Date.now());
+          if (existing && result.memory.status === "unavailable") coverage.failed++;
+          else coverage.evaluated++;
         } catch { coverage.failed++; if (signal.aborted) throw new Error("Audit cancelled"); }
       }
       // Let stop/cancellation handlers run between bounded synchronous session reads.
-      await new Promise<void>(resolve => setImmediate(resolve));
+      await setImmediate();
       store?.advance(cohort, session);
       if (coverage.attempted >= config.responseAudit.maxEpisodes && session !== sessions.at(-1)) {
         stoppedForBudget = true;
@@ -157,6 +167,46 @@ export async function auditResponses(options: ResponseAuditOptions) {
     if (lease) store?.release(lease);
     store?.close();
     people?.close();
+  }
+}
+
+function addCoverage<T extends Record<string, number>>(target: { [K in keyof T]: number }, delta: T) {
+  for (const key of Object.keys(delta) as (keyof T)[]) target[key] += delta[key];
+}
+
+async function assessMemoryOpportunity(
+  store: ResponseAuditStore,
+  cohort: string,
+  e: ResponseEpisode,
+  feedback: ResponseJudgment["feedback"],
+  options: Pick<ResponseAuditOptions, "config" | "sources" | "indexPath">,
+  params: ResponseJudgeParams,
+  usage: { stageAttempts: number; stageCacheHits: number },
+): Promise<ResponseResult["memory"]> {
+  if (feedback.memoryGap.noul < 0.8 || !options.config.responseAudit.memoryCorpora.length) {
+    return { status: "not_requested", candidates: [] };
+  }
+  try {
+    const approved = options.sources.filter(s => options.config.responseAudit.memoryCorpora.includes(s.corpus));
+    const candidates = responseMemoryCandidates(options.indexPath, approved, e);
+    const memoryKey = jsonHash([
+      decisionModelScope(options.config.typesafe.model, options.config.typesafe.endpoint),
+      RESPONSE_STAGE_VERSIONS.memory,
+      e.id, e.session, e.senderId, e.request, e.answer, e.feedback, candidates,
+      [...options.config.responseAudit.memoryCorpora].sort(),
+    ]);
+    let judged = store.stage(cohort, e, "memory", memoryKey);
+    if (judged) usage.stageCacheHits++;
+    else {
+      store.stageBegin([memoryKey], Date.now());
+      usage.stageAttempts++;
+      judged = await abortable(judgeMemoryOpportunity(e, candidates, params), params.signal);
+      store.stageSave(memoryKey, judged, Date.now());
+    }
+    return { status: "checked", candidates: judged };
+  } catch {
+    if (params.signal.aborted) throw new Error("Audit cancelled");
+    return { status: "unavailable", candidates: [] };
   }
 }
 

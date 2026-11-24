@@ -1069,3 +1069,282 @@ test("review policy uses grouped intensity and attribution probabilities and ref
   assert.equal(store.reviews.list(cohort)[0]!.status, "dismissed");
   assert.equal(store.reviews.refresh(cohort, 0), 0);
 });
+
+test("ok episodes with unavailable memory automatically retry only memory after backoff and clear unresolvedWork", async t => {
+  const start = Date.UTC(2026, 8, 20, 12, 0, 0);
+  t.mock.timers.enable({ apis: ["Date"], now: start });
+  const { db, options } = await fixture(); t.after(() => db.close());
+  const root = join(options.storePath, "..");
+  const source = resolveSource(root, "memory/**/*.md");
+  const indexDb = new DatabaseSync(options.indexPath); t.after(() => indexDb.close());
+  indexDb.exec(`CREATE TABLE documents(id INTEGER PRIMARY KEY,collection TEXT,path TEXT,hash TEXT,active INTEGER);
+    CREATE TABLE content(hash TEXT PRIMARY KEY,doc TEXT);
+    CREATE VIRTUAL TABLE documents_fts USING fts5(body);`);
+  for (const [id, doc] of [[1, "Brief explanation guidelines for Atlas."], [2, "Elaborate explanation notes for Atlas."]] as const) {
+    indexDb.prepare("INSERT INTO documents VALUES(?,?,?,?,1)").run(id, source.collection, `${id}.md`, `h${id}`);
+    indexDb.prepare("INSERT INTO content VALUES(?,?)").run(`h${id}`, doc);
+    indexDb.prepare("INSERT INTO documents_fts(rowid,body) VALUES(?,?)").run(id, doc);
+  }
+  const memConfig = resolveConfig({
+    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
+  });
+  const memOptions = { ...options, config: memConfig, sources: [source] };
+  const cohort = responseCohort(memConfig.responseAudit);
+  let failMemory = true;
+  const seenQuestions: string[][] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const keys = Object.keys(body.questions);
+    seenQuestions.push(keys);
+    if (body.questions.candidate_0) {
+      if (failMemory && body.state[0].candidates[0].text.includes("Elaborate")) {
+        throw new Error("transient memory candidate outage");
+      }
+      const noul = body.state[0].candidates[0].text.includes("Brief") ? 0.85 : 0.65;
+      return Response.json({ answers: { candidate_0: { type: "noul", noul } } });
+    }
+    const result = payload(body);
+    if (body.questions.memoryGap) result.answers.memoryGap = { type: "noul", noul: 0.95 };
+    return Response.json(result);
+  });
+
+  const first = await auditResponses(memOptions);
+  assert.equal(first.status, "ok");
+  assert.equal(first.coverage?.evaluated, 1);
+  const store = new ResponseAuditStore(memOptions.storePath); t.after(() => store.close());
+  const e = responseEpisodes(session, basic(), memConfig.responseAudit).episodes[0]!;
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 1);
+  assert.equal(store.report(cohort, 0, e.id).episode!.result.memory.status, "unavailable");
+  // Within backoff: not due, no API calls on immediate re-scan.
+  assert.equal(store.needsJudgment(cohort, e, Date.now() + 1), false);
+  assert.equal(store.sessionWork(cohort, "s", 0, Date.now() + 1).due, 0);
+  assert.equal(store.pendingWork(cohort, 0, Date.now() + 1), 0);
+  const beforeBackoffCalls = seenQuestions.length;
+  const skipped = await auditResponses(memOptions);
+  assert.equal(skipped.coverage?.attempted, 0);
+  assert.equal(seenQuestions.length, beforeBackoffCalls);
+
+  // After backoff: automatically retries ONLY the memory stage.
+  t.mock.timers.tick(600_000);
+  assert.equal(store.needsJudgment(cohort, e, Date.now()), true);
+  assert.equal(store.sessionWork(cohort, "s", 0, Date.now()).due, 1);
+  assert.equal(store.pendingWork(cohort, 0, Date.now()), 1);
+  failMemory = false;
+  const retry = await auditResponses(memOptions);
+  assert.equal(retry.status, "ok");
+  assert.equal(retry.coverage?.attempted, 1);
+  assert.equal(retry.coverage?.evaluated, 1);
+  assert.equal(retry.coverage?.failed, 0);
+  const retryCalls = seenQuestions.slice(beforeBackoffCalls);
+  assert.equal(retryCalls.length, 2);
+  assert.ok(retryCalls.every(keys => keys.length === 1 && keys[0] === "candidate_0"),
+    "memory retry must not re-call quality, feedback, sentiment or retrospective stages");
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 0);
+  assert.equal(store.needsJudgment(cohort, e, Date.now() + 600_000), false);
+  assert.equal(store.pendingWork(cohort, 0, Date.now() + 600_000), 0);
+  const finalMemory = store.report(cohort, 0, e.id).episode!.result.memory;
+  assert.equal(finalMemory.status, "checked");
+  assert.deepEqual(finalMemory.candidates.map((c: { hash: string; usefulness: number }) => [c.hash, c.usefulness]),
+    [["h1", 0.85], ["h2", 0.65]]);
+});
+
+test("memory failures before stage-key creation respect retry bounds and retryFailed resets cleanly", async t => {
+  const start = Date.UTC(2026, 8, 20, 12, 0, 0);
+  t.mock.timers.enable({ apis: ["Date"], now: start });
+  const { db, options } = await fixture(); t.after(() => db.close());
+  const root = join(options.storePath, "..");
+  const source = resolveSource(root, "memory/**/*.md");
+  const memConfig = resolveConfig({
+    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
+  });
+  const memOptions = { ...options, config: memConfig, sources: [source] };
+  const cohort = responseCohort(memConfig.responseAudit);
+  const coreCalls: string[][] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const keys = Object.keys(body.questions);
+    if (!body.questions.candidate_0) coreCalls.push(keys);
+    const result = payload(body);
+    if (body.questions.memoryGap) result.answers.memoryGap = { type: "noul", noul: 0.95 };
+    return Response.json(result);
+  });
+
+  // Attempt 1: index DB does not exist yet -> fails before stage key creation.
+  assert.equal((await auditResponses(memOptions)).coverage?.evaluated, 1);
+  assert.equal(coreCalls.length, 3);
+  const rawDb = new DatabaseSync(memOptions.storePath); t.after(() => rawDb.close());
+  const store = new ResponseAuditStore(memOptions.storePath); t.after(() => store.close());
+  assert.equal(rawDb.prepare("SELECT COUNT(*) n FROM response_stage_links WHERE stage='memory'").get()!.n, 0);
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 1);
+
+  // Attempts 2 and 3 after backoff still fail without re-calling core stages, then exhaust.
+  for (const expectedAttempt of [2, 3]) {
+    t.mock.timers.tick(600_000);
+    const res = await auditResponses(memOptions);
+    assert.equal(res.coverage?.attempted, 1);
+    assert.equal(res.coverage?.failed, 1);
+    assert.equal(res.coverage?.evaluated, 0);
+    assert.equal(coreCalls.length, 3);
+    assert.equal(rawDb.prepare("SELECT status,attempts FROM response_results").get()!.attempts, expectedAttempt);
+    assert.equal(rawDb.prepare("SELECT status FROM response_results").get()!.status, "ok");
+  }
+  // Exhausted after MAX_RETRY_ATTEMPTS = 3: no further automatic retries.
+  t.mock.timers.tick(600_000);
+  assert.equal(store.pendingWork(cohort, 0, Date.now()), 0);
+  assert.equal((await auditResponses(memOptions)).coverage?.attempted, 0);
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 1);
+
+  // Restore index DB and use operator retryFailed: keeps valid 'ok' row intact while resetting retry budget.
+  const indexDb = new DatabaseSync(memOptions.indexPath); t.after(() => indexDb.close());
+  indexDb.exec(`CREATE TABLE documents(id INTEGER PRIMARY KEY,collection TEXT,path TEXT,hash TEXT,active INTEGER);
+    CREATE TABLE content(hash TEXT PRIMARY KEY,doc TEXT);
+    CREATE VIRTUAL TABLE documents_fts USING fts5(body);`);
+  indexDb.prepare("INSERT INTO documents VALUES(1,?,?,?,1)").run(source.collection, "1.md", "h1");
+  indexDb.prepare("INSERT INTO content VALUES(?,?)").run("h1", "Brief explanation note.");
+  indexDb.prepare("INSERT INTO documents_fts(rowid,body) VALUES(1,?)").run("Brief explanation note.");
+
+  assert.deepEqual(store.retryFailed(cohort), { stages: 0, episodes: 1 });
+  const afterReset = rawDb.prepare("SELECT status,attempts,attempted_at,result FROM response_results").get()!;
+  assert.equal(afterReset.status, "ok");
+  assert.equal(afterReset.attempts, 0);
+  assert.equal(afterReset.attempted_at, null);
+  assert.ok(typeof afterReset.result === "string");
+
+  const recovered = await auditResponses(memOptions);
+  assert.equal(recovered.coverage?.attempted, 1);
+  assert.equal(recovered.coverage?.evaluated, 1);
+  assert.equal(coreCalls.length, 3);
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 0);
+
+  // retryFailed on a broken non-memory episode clears stale result and assessed_at when resetting to pending.
+  rawDb.prepare("UPDATE response_results SET status='failed',assessed_at=12345").run();
+  assert.equal(store.retryFailed(cohort).episodes, 1);
+  const cleaned = rawDb.prepare("SELECT status,assessed_at,result FROM response_results").get()!;
+  assert.equal(cleaned.status, "pending");
+  assert.equal(cleaned.assessed_at, null);
+  assert.equal(cleaned.result, null);
+});
+
+test("judgeMemoryOpportunity aborts sibling candidate requests cleanly on transient failure", { timeout: 2000 }, async t => {
+  const e = responseEpisodes(session, basic(), config.responseAudit).episodes[0]!;
+  const signals: AbortSignal[] = [];
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    calls++;
+    if (init.signal) signals.push(init.signal);
+    if (calls === 1) return new Promise<Response>(() => {});
+    throw new Error("transient candidate failure");
+  });
+  const candidates = ["first", "second"].map(text => ({ text, path: `qmd://memory/${text}.md`, hash: text }));
+  await assert.rejects(
+    judgeMemoryOpportunity(e, candidates, { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal }),
+    { code: "network_error" },
+  );
+  assert.equal(calls, 2);
+  assert.equal(signals[0]?.aborted, true, "sibling request must be aborted when another candidate fails");
+});
+
+test("cached stage hydration rejects corrupted probability distributions and inconsistent score means", async t => {
+  const e = responseEpisodes(session, basic(), config.responseAudit).episodes[0]!;
+  const params = { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal };
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => Response.json(payload(JSON.parse(String(init.body)))));
+  const valid = await judgeResponse(e, params);
+  const validSentiment = {
+    sentiment: valid.feedback.sentiment!,
+    annoyance: valid.feedback.annoyance!,
+    frustration: valid.feedback.frustration!,
+    dissatisfactionIntensity: valid.feedback.dissatisfactionIntensity!,
+  };
+
+  let fetched = 0, began = 0;
+  t.mock.method(globalThis, "fetch", async () => { fetched++; throw new Error("must not fetch on corrupted cache"); });
+  const cacheHooks = { begin() { began++; }, save() {} };
+
+  // Quality: distribution summing to 0 rejected.
+  const zeroQuality = structuredClone(valid.quality);
+  zeroQuality.fulfillment.probabilities = { "0": 0, "1": 0, "2": 0, "3": 0 };
+  await assert.rejects(
+    judgeResponse(e, params, true, { quality: zeroQuality, feedback: valid.feedback, sentiment: validSentiment, ...cacheHooks }),
+    /probability distribution/,
+  );
+
+  // Quality: expected score mismatch rejected.
+  const badScoreQuality = structuredClone(valid.quality);
+  badScoreQuality.fulfillment.score = 0;
+  await assert.rejects(
+    judgeResponse(e, params, true, { quality: badScoreQuality, feedback: valid.feedback, sentiment: validSentiment, ...cacheHooks }),
+    /probability distribution/,
+  );
+
+  // Feedback: choice distribution summing to 0 rejected (both fully cached and partial cache before API call).
+  const zeroFeedback = structuredClone(valid.feedback);
+  zeroFeedback.target.probabilities = Object.fromEntries(Object.keys(zeroFeedback.target.probabilities).map(k => [k, 0])) as typeof zeroFeedback.target.probabilities;
+  await assert.rejects(
+    judgeResponse(e, params, true, { quality: valid.quality, feedback: zeroFeedback, sentiment: validSentiment, ...cacheHooks }),
+    /probability distribution/,
+  );
+  await assert.rejects(
+    judgeResponse(e, params, true, { quality: valid.quality, feedback: zeroFeedback, ...cacheHooks }),
+    /probability distribution/,
+  );
+
+  // Sentiment: choice distribution summing to 0 and intensity expected-score mismatch rejected.
+  const zeroSentiment = structuredClone(validSentiment);
+  zeroSentiment.sentiment.probabilities = Object.fromEntries(Object.keys(zeroSentiment.sentiment.probabilities).map(k => [k, 0])) as typeof zeroSentiment.sentiment.probabilities;
+  await assert.rejects(
+    judgeResponse(e, params, true, { quality: valid.quality, feedback: valid.feedback, sentiment: zeroSentiment, ...cacheHooks }),
+    /probability distribution/,
+  );
+  await assert.rejects(
+    judgeResponse(e, params, true, { quality: valid.quality, sentiment: zeroSentiment, ...cacheHooks }),
+    /probability distribution/,
+  );
+  const badIntensitySentiment = structuredClone(validSentiment);
+  badIntensitySentiment.dissatisfactionIntensity.score = 0;
+  await assert.rejects(
+    judgeResponse(e, params, true, { quality: valid.quality, feedback: valid.feedback, sentiment: badIntensitySentiment, ...cacheHooks }),
+    /probability distribution/,
+  );
+  assert.equal(fetched, 0);
+  assert.equal(began, 0);
+
+  // Valid 8-option 2-decimal rounding drift (0.13 * 8 = 1.04 <= 1 + 0.045) remains accepted.
+  const roundedFeedback = structuredClone(valid.feedback);
+  roundedFeedback.target.probabilities = Object.fromEntries(
+    Object.keys(roundedFeedback.target.probabilities).map(k => [k, 0.13]),
+  ) as typeof roundedFeedback.target.probabilities;
+  const hydrated = await judgeResponse(e, params, true, { quality: valid.quality, feedback: roundedFeedback, sentiment: validSentiment, ...cacheHooks });
+  assert.equal(hydrated.feedback.target.choice, valid.feedback.target.choice);
+});
+
+test("later non-terminal assistant events preserve current.final and errored next turns do not close feedback", () => {
+  // Later visible commentary or toolUse assistant event must not overwrite current.final = true.
+  for (const trailing of [
+    answer("Postscript commentary.", { channel: "commentary", stopReason: "stop" }),
+    answer("Running follow-up tool.", { stopReason: "toolUse" }),
+  ]) {
+    const out = responseEpisodes(
+      session,
+      rows([user("Question"), answer("Final answer."), trailing, user("Thanks!"), answer("You are welcome.")]),
+      config.responseAudit,
+    );
+    assert.equal(out.episodes.length, 1);
+    assert.equal(out.episodes[0]!.answer.length, 2);
+    assert.equal(out.episodes[0]!.feedback[0]!.text, "Thanks!");
+    assert.equal(out.episodes[0]!.followup.status, "complete");
+  }
+
+  // Errored or aborted next assistant turn must be rejected BEFORE closing current's feedback window.
+  for (const stopReason of ["error", "aborted"] as const) {
+    const out = responseEpisodes(
+      session,
+      rows([user("Question"), answer("Original answer."), user("That missed part 2."), answer("Partial crash", { stopReason })]),
+      config.responseAudit,
+    );
+    assert.equal(out.episodes.length, 0);
+    assert.equal(out.coverage.completedResponses, 1);
+    assert.equal(out.coverage.pendingFeedback, 1);
+  }
+});
