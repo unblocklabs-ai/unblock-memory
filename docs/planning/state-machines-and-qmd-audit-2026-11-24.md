@@ -1,5 +1,14 @@
 # Architectural Audit: `@unblocklabs/qmd` Friction & Implicit State Machines
 
+> **Post-Migration Re-Audit (2026-11-24 · Independent Neon + GPT-6.2 verification at `unblock-memory@0dc6dd0`, `qmd@4c60f75`):**
+> - **Part 1 QMD Corrections:**
+>   - Local `node_modules/@unblocklabs/qmd` drift is **resolved** (now `3.0.4`, matching pin); QMD `main@4c60f75` has migrated off legacy `typesafe-query.ts` onto `@unblocklabs/decisions@^0.1.2` (unreleased to npm).
+>   - **Premise fixes:** `exportEmbeddedSnapshot` does **not** exist in QMD (remove "just re-export"); `node-llama-cpp` `LlamaEmbeddingContext` already serializes evaluation per context (manager `#operationChain` is SQLite/lifecycle admission, not raw llama.cpp concurrency); durable curation already lives in `curation.sqlite` (only analysis tables/projected annotations remain in `index.sqlite`).
+> - **Part 2 State-Machine Corrections:**
+>   - Section 3 Low (`typesafe-client.ts` provider transport/cancellation) moved into `@unblocklabs/decisions@0.1.2`.
+>   - `src/mlx-query-worker.py` (Section 3 High) is **dead code** (zero callers in `src/`, `scripts/`, or `tests/`); skip.
+>   - **All 5 Top-5 Fix-First Invariant Traps remain open** and are scheduled as **Batch 1 (5 strictly file-disjoint Neon swarm slices: A People Dossier, B Response Audit, C Inside Out, D Training Proof, E Session Sync & Manager Lifecycle)**. Extraction lease/cursor fencing, People Learning receipt-to-inventory binding, and atomic Python dataset publication follow in **Batch 2**.
+
 **Mode:** Read-only audit (zero files modified)
 **Scope:** `@unblocklabs/qmd` integration surface (`package.json` `3.0.4`, installed `node_modules/@unblocklabs/qmd` `3.0.2`) + full `index.ts`, `src/`, and `scripts/` implicit state-machine audit by **GPT-6.2 Sol** (`high` effort).
 

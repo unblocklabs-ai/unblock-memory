@@ -1,5 +1,12 @@
 # `@unblocklabs/decisions` — SDK Spec & Migration Plan
 
+> **Status Update (2026-11-24 · Re-audited by Neon + GPT-6.2 at `decisions@4c94845`, `qmd@4c60f75`, `unblock-memory@0dc6dd0`):**
+> - **Phase 1 — SHIPPED:** `@unblocklabs/decisions@0.1.2` is published on npm via GitHub Actions Trusted Publishing (Sigstore provenance). Actual shipped deviations from original draft: uses `zod` runtime validator (zero native deps), splits `envKeys` into `ambientEnvKeys` + `fileEnvKeys` + `preDispatchRetryAfterOrigins`, omits `box`, adds `allowExtraAnswerKeys` and `decideRaw()`, and `extract()` always serializes `state` as a `string` and parses `answers.<field>.value` (optional `type`).
+> - **Phase 2.1 — MIGRATED ON QMD `main` (`4c60f75`), UNRELEASED TO NPM:** `qmd/src/typesafe-query.ts` deleted and replaced with `qmd/src/decision-query.ts` (`decisionModel` + deprecated `typesafe` alias, `explain.ranking: "decision"`). Installed `@unblocklabs/qmd` in `unblock-memory` is still `3.0.4` until QMD `3.1.0` is published. Phase 2.2 QMD helper APIs remain deferred.
+> - **Phase 3.1–3.2 — MIGRATED ON `unblock-memory` `main` (`0dc6dd0`):** `src/typesafe-client.ts` delegates all transport/validation/credentials to `@unblocklabs/decisions@^0.1.2` (keeping `estimateJevTokens` CJK-aware budgeting intact); all decision callers migrated; `decisionModel` primary config + mutually exclusive deprecated `typesafe` alias shipped in `openclaw.plugin.json` and `src/config.ts` with byte-identical cache/cohort keys. Remaining follow-ups: optional `typesafe-client.ts` / `typesafe-fleet*.mjs` rename, deprecation log on `typesafe` config key, `README.md` update, and Phase 3b `.extract()` adoption.
+> - **Section 4 Open Questions — RESOLVED & RETIRED:** Package name (`@unblocklabs/decisions`), `zod` validator, `/v1/extractions` endpoint derivation, and `decisionModel` + `typesafe` alias are all settled.
+> - **Upstream Prerequisite Before Adopting `.extract()`:** If a caller configures a *cross-origin* `extractionsEndpoint` different from `endpoint`, `decisions/src/client.ts` currently forwards `config`'s credential; scope extraction credentials to the extraction origin before enabling `.extract()` in consumers.
+
 ## 1. Design Goals
 
 - **Zero vendor/model lock-in:** Standardize all naming, config keys, errors, and telemetry around **decision model** (`decisionModel`), never `typesafe`, `jev`, or `liquid`.

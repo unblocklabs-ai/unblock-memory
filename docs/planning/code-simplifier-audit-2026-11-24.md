@@ -1,5 +1,11 @@
 # Code Simplifier Audit — `@unblocklabs/unblock-memory`
 
+> **Post-Migration Re-Audit (2026-11-24 · Independent Neon + GPT-6.2 verification at `HEAD` `0dc6dd0`):**
+> - **Fully Resolved (4):** High **#5** (`src/typesafe-review.ts`), High **#16** (`src/response-judge.ts` main finding — note cached-stage distribution validation regression fixed in Batch 1B), Medium **#28** (`src/typesafe.ts`, `src/typesafe-review.ts`), Medium **#56** (`src/training.ts`, `src/training-queries.ts`).
+> - **Partially Resolved (4):** High **#1** (`src/config.ts` `resolveDecisionModel` now delegates to SDK; remaining boilerplate deferred as low-ROI churn), High **#8** (`src/people-primer.ts` 6 loop invariants hoisted; minor cleanup left), Medium **#32** (`src/my-turn.ts` question hoisted), Low **#75** (`src/extraction-model.ts` decision questions hoisted).
+> - **Batch 1 Priority Mapping (paired with Top-5 state-machine fixes):** Slice A (`#6`, `#39`, `#41`, `#43`), Slice B (`#57`, `#58` + cached distribution validation), Slice C (`#11`, `#12`, `#45`, `#52`), Slice D (`#17`, `#18`), Slice E (`#13`, `#26`).
+> - **Deferred to Batch 2 / Low-ROI:** People Learning (`#7`, `#9`, `#10`, `#44`), Extraction (`#14`, `#48`), Whisperers (`#4`, `#29`), Report/Python (`#15`, `#19`). Do **not** bulk-apply every item originally tagged `Safe` without respecting concurrency/attribution/privacy boundaries; generic `config.ts`/`plugin.ts`/`review-tools.ts` wrappers (`#1`, `#2`, `#20`, `#25`, `#37`) are deferred as low-ROI churn.
+
 ## Summary
 
 - **Mode:** `--audit` (read-only; **zero** repository files edited)
