@@ -4,14 +4,14 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { SkillSearchCandidate } from "./manager.js";
 import { selectTypeSafeSkill } from "./typesafe.js";
 import { isTypeSafeTimeout, resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { buildSkillWhispererQuery, recentSkillMessages } from "./whisperer-context.js";
+import { buildSkillWhispererQuery, MAX_SKILL_QUERY_CHARS, recentSkillMessages } from "./whisperer-context.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
 import { isRecord } from "./guards.js";
 
 const CANDIDATE_LIMIT = 10;
-const MAX_QUERY_CHARS = 12_000;
 const TYPESAFE_CANDIDATE_LIMIT = 3;
+const MAX_SESSIONS = 1_000;
 export const SKILL_WHISPERER_TIMEOUT_MS = 3000;
 
 type SkillWhispererRuntime = {
@@ -33,8 +33,8 @@ type SessionState = {
 };
 
 function typeSafeConversation(prompt: string, messages: ReturnType<typeof recentSkillMessages>) {
-  const currentRequest = prompt.trim().slice(-MAX_QUERY_CHARS);
-  let remaining = MAX_QUERY_CHARS - currentRequest.length;
+  const currentRequest = prompt.trim().slice(-MAX_SKILL_QUERY_CHARS);
+  let remaining = MAX_SKILL_QUERY_CHARS - currentRequest.length;
   const history: { role: "user" | "assistant"; content: string }[] = [];
   for (let i = messages.length - 1; i >= 0; i--) {
     if (remaining <= 0) break;
@@ -66,12 +66,21 @@ export function registerSkillWhisperer(
 ): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
   if (!config.enabled) return;
   const sessions = new Map<string, SessionState>();
+  const touchSession = (scope: string, state: SessionState) => {
+    sessions.delete(scope);
+    sessions.set(scope, state);
+  };
   const stateFor = (scope: string) => {
     let state = sessions.get(scope);
     if (!state) {
+      if (sessions.size >= MAX_SESSIONS) {
+        const oldest = sessions.keys().next().value!;
+        sessions.get(oldest)?.controller?.abort();
+        sessions.delete(oldest);
+      }
       state = { turn: 0, skills: new Map() };
-      sessions.set(scope, state);
     }
+    touchSession(scope, state);
     return state;
   };
   const active = (agentId: string) => ({ cfg: api.config, agentId });
@@ -106,15 +115,17 @@ export function registerSkillWhisperer(
           const canonicalPath = runtime.resolveSkillPath(runtimeParams, candidate.path);
           return canonicalPath ? [{ candidate, canonicalPath }] : [];
         });
-        let resolved = resolvedCandidates[0];
-        if (!resolved) { diagnostics?.record(agentId, "skill", "no_candidates"); return; }
+        if (!resolvedCandidates.length) { diagnostics?.record(agentId, "skill", "no_candidates"); return; }
         const cooling = (path: string) => {
           const previous = state.skills.get(path);
           return state.turn - Math.max(previous?.suggested ?? -Infinity, previous?.opened ?? -Infinity) <= config.cooldownTurns;
         };
+        // Exclude cooling skills before choosing a winner so a cooling top hit never suppresses an eligible alternative.
+        const eligibleCandidates = resolvedCandidates.filter(({ canonicalPath }) => !cooling(canonicalPath));
+        if (!eligibleCandidates.length) { diagnostics?.record(agentId, "skill", "cooldown"); return; }
+        let resolved = eligibleCandidates[0]!;
         if (apiKey) {
-          const shortlist = resolvedCandidates.slice(0, TYPESAFE_CANDIDATE_LIMIT);
-          if (shortlist.every(({ canonicalPath }) => cooling(canonicalPath))) { diagnostics?.record(agentId, "skill", "cooldown"); return; }
+          const shortlist = eligibleCandidates.slice(0, TYPESAFE_CANDIDATE_LIMIT);
           const selectedIndex = await abortable(selectTypeSafeSkill({
             apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, signal,
             ...typeSafeConversation(event.prompt, recentMessages),
@@ -128,9 +139,8 @@ export function registerSkillWhisperer(
             },
           }), signal);
           if (selectedIndex === undefined) { diagnostics?.record(agentId, "skill", "rejected"); return; }
-          resolved = shortlist[selectedIndex];
-        } else if (resolved && resolved.candidate.score < config.minScore) { diagnostics?.record(agentId, "skill", "rejected"); return; }
-        if (!resolved) return;
+          resolved = shortlist[selectedIndex]!;
+        } else if (resolved.candidate.score < config.minScore) { diagnostics?.record(agentId, "skill", "rejected"); return; }
         // A selection completing after session teardown must not resurrect its hint.
         if (sessions.get(scope) !== state || state.lastRunId !== runId) { diagnostics?.record(agentId, "skill", "cancelled"); return; }
         const { candidate: selected, canonicalPath } = resolved;
@@ -159,10 +169,13 @@ export function registerSkillWhisperer(
     const scope = sessionScope(context);
     const path = scope ? readPath(event.params) : undefined;
     if (!scope || !path) return;
+    // Ignore late callbacks for cleared, closed, or unknown sessions rather than recreating stale state.
+    const state = sessions.get(scope);
+    if (!state) return;
     try {
       const canonicalPath = runtime.resolveSkillPath(active(context.agentId), path);
       if (!canonicalPath) return;
-      const state = stateFor(scope);
+      touchSession(scope, state);
       const history = state.skills.get(canonicalPath) ?? {};
       history.opened = state.turn;
       state.skills.set(canonicalPath, history);

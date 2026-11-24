@@ -3,15 +3,13 @@ import { Value } from "typebox/value";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { SafetyChannel, SafetyRequestor, SafetyScenario } from "./safety-config.js";
 import { estimateJevTokens, isTypeSafeTimeout, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
-import { messageText } from "./whisperer-context.js";
+import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { CONVERSATION_INFO, conversationEnvelope, conversationUserText } from "./response-text.js";
 import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
-import { isRecord, nonBlank } from "./guards.js";
+import { nonBlank, record } from "./guards.js";
 
-// Leaves room for the longest scenario question under Jev's 32k state-plus-question limit.
-const MAX_STATE_TOKENS = 24_000;
 const MAX_SESSIONS = 1000;
 const RUNS_PER_SESSION = 4;
 
@@ -54,9 +52,10 @@ function approved(entry: SafetyRequestor, turn: Turn): boolean {
 function historyMessage(message: unknown) {
   const parsed = messageText(message);
   if (!parsed || parsed.role === "assistant") return parsed && { role: parsed.role, content: parsed.text };
-  const meta = isRecord(message) && isRecord(message.__openclaw) ? message.__openclaw : undefined;
+  const rawMessage = record(message);
+  const meta = record(rawMessage?.__openclaw);
   const raw = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : parsed.text;
-  const sender = meta?.senderId ?? (isRecord(message) ? message.senderId : undefined);
+  const sender = meta?.senderId ?? rawMessage?.senderId;
   const content = conversationUserText(raw, sender)?.text ?? raw.trim().replace(CONVERSATION_INFO, "").trim();
   return content ? { role: parsed.role, content } : undefined;
 }
@@ -69,31 +68,22 @@ export function safetyConversation(prompt: string, messages: readonly unknown[],
   const envelope = conversationEnvelope(prompt, senderId);
   // An unrecognized wrapper is judged whole, minus the identity header: over-flagging beats missing a request.
   const currentRequest = envelope?.text ?? prompt.trim().replace(CONVERSATION_INFO, "").trim();
-  let size = estimateJevTokens({ currentRequest, history: [] });
-  if (size > MAX_STATE_TOKENS) throw new SafetyInputError("Current request exceeds the safety check budget");
+  const baseTokens = estimateJevTokens({ currentRequest, history: [] });
+  if (baseTokens > MAX_STATE_TOKENS) throw new SafetyInputError("Current request exceeds the safety check budget");
   // Thread starter, reply target and chat history since the last reply resolve "answer the question above".
   const lines = envelope?.context?.split("\n") ?? [];
-  const kept: string[] = [];
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const cost = estimateJevTokens(lines[i]) + 1;
-    if (size + cost > MAX_STATE_TOKENS) break;
-    kept.unshift(lines[i]);
-    size += cost;
-  }
-  const channelContext = kept.join("\n").trim();
-  const history: { role: "user" | "assistant"; content: string }[] = [];
+  const contextBudget = takeRecentWithinTokens(lines, {
+    maxTokens: MAX_STATE_TOKENS, usedTokens: baseTokens, estimateTokens: estimateJevTokens,
+  });
+  const channelContext = contextBudget.items.join("\n").trim();
   let last = messages.length - 1;
   // The host can already include the current message in the transcript; do not count it twice.
   const newest = last >= 0 ? historyMessage(messages[last]) : undefined;
   if (newest?.role === "user" && newest.content === currentRequest) last--;
-  for (let i = last; i >= 0 && history.length < historyMessages; i--) {
-    const message = historyMessage(messages[i]);
-    if (!message) continue;
-    const cost = estimateJevTokens(message) + 1;
-    if (size + cost > MAX_STATE_TOKENS) break;
-    history.unshift(message);
-    size += cost;
-  }
+  const { items: history } = takeRecentWithinTokens(messages, {
+    endIndex: last, maxItems: historyMessages, maxTokens: MAX_STATE_TOKENS, usedTokens: contextBudget.usedTokens,
+    estimateTokens: estimateJevTokens, transform: historyMessage,
+  });
   return { currentRequest, ...(channelContext ? { channelContext } : {}), history };
 }
 
@@ -129,7 +119,7 @@ async function judgeSafetyScenarios(apiKey: string, signal: AbortSignal,
   const key = (index: number) => `scenario_${index}`;
   const questions = Object.fromEntries(scenarios.map((scenario, index) => [key(index), scenarioQuestion(scenario.instructions)]));
   const result = await requestTypeSafe({ apiKey, endpoint: options?.endpoint, model: options?.model, signal }, state, questions);
-  const answers = isRecord(result) && isRecord(result.answers) ? result.answers : {};
+  const answers = record(record(result)?.answers) ?? {};
   return scenarios.map((_scenario, index) => {
     const answer = answers[key(index)];
     return Value.Check(TYPESAFE_NOUL_SCHEMA, answer) && Number.isFinite(answer.noul) ? answer.noul : undefined;
@@ -149,27 +139,34 @@ function queueMode(value: unknown): "steer" | "other" | undefined {
     "other" : undefined;
 }
 
+function disabledReason(hooks: Record<string, unknown>, config: SafetyPluginConfig) {
+  if (!config.typesafe.enabled) return "typesafe_disabled" as const;
+  if (hooks.allowConversationAccess !== true) return "conversation_access_not_allowed" as const;
+  if (hooks.allowPromptInjection === false) return "prompt_injection_not_allowed" as const;
+  if (!config.safetyWhisperer.scenarios.some(scenario => scenario.enabled)) return "no_enabled_scenarios" as const;
+  return undefined;
+}
+
 /** Whether the host lets the check run at all; a skipped hook is not active protection. */
 export function safetyStatus(cfg: unknown, config: SafetyPluginConfig) {
   const safety = config.safetyWhisperer;
   if (!safety.enabled) return { enabled: false, active: false, reason: "disabled" } as const;
-  const plugins = isRecord(cfg) && isRecord(cfg.plugins) ? cfg.plugins : {};
-  const entry = isRecord(plugins.entries) && isRecord(plugins.entries["unblock-memory"]) ? plugins.entries["unblock-memory"] : {};
-  const hooks = isRecord(entry.hooks) ? entry.hooks : {};
-  const timeouts = isRecord(hooks.timeouts) ? hooks.timeouts : {};
-  const hostTimeoutMs = typeof timeouts.before_prompt_build === "number" ? timeouts.before_prompt_build :
+  const root = record(cfg);
+  const plugins = record(root?.plugins);
+  const entry = record(record(plugins?.entries)?.["unblock-memory"]);
+  const hooks = record(entry?.hooks) ?? {};
+  const timeouts = record(hooks.timeouts);
+  const hostTimeoutMs = typeof timeouts?.before_prompt_build === "number" ? timeouts.before_prompt_build :
     typeof hooks.timeoutMs === "number" ? hooks.timeoutMs : undefined;
-  const reason = !config.typesafe.enabled ? "typesafe_disabled" :
-    hooks.allowConversationAccess !== true ? "conversation_access_not_allowed" :
-    hooks.allowPromptInjection === false ? "prompt_injection_not_allowed" :
-    !safety.scenarios.some(scenario => scenario.enabled) ? "no_enabled_scenarios" : undefined;
+  const reason = disabledReason(hooks, config);
   // The host times out the plugin's whole prompt contribution, so the slowest whisperer sets the bar.
   const slowestMs = Math.max(safety.timeoutMs, config.memoryWhisperer.enabled ? config.memoryWhisperer.timeoutMs : 0,
     config.skillWhisperer.enabled ? SKILL_WHISPERER_TIMEOUT_MS : 0);
   // OpenClaw defaults to steering: a message sent during an active run joins it without a new prompt build.
-  const queue = isRecord(cfg) && isRecord(cfg.messages) && isRecord(cfg.messages.queue) ? cfg.messages.queue : {};
-  const steers = queueMode(queue.mode) !== "other" ||
-    (isRecord(queue.byChannel) && Object.values(queue.byChannel).some(mode => queueMode(mode) === "steer"));
+  const queue = record(record(root?.messages)?.queue);
+  const byChannel = record(queue?.byChannel);
+  const steers = queueMode(queue?.mode) !== "other" ||
+    Boolean(byChannel && Object.values(byChannel).some(mode => queueMode(mode) === "steer"));
   const timeoutTooShort = hostTimeoutMs !== undefined && hostTimeoutMs < slowestMs;
   const warnings = [...timeoutTooShort ? ["host_hook_timeout_below_whisperer_timeouts"] : [], ...steers ? ["queue_mode_steer"] : []];
   return { enabled: true, active: !reason, ...(reason ? { reason } : {}),
@@ -190,37 +187,40 @@ export function registerSafetyWhisperer(
   // A few recent runs per session, so a prompt rebuild reuses its own run's result; bounded overall.
   type Run = { controller: AbortController; result: Promise<SafetyContext | undefined> };
   const sessions = new Map<string, Map<string, Run>>();
+  // Track every in-flight check (even without run/session identity) so teardown always aborts cleanly.
+  const activeControllers = new Map<AbortController, { sessionId?: string; sessionKey?: string }>();
   let warnedMissingKey = false, warnedMissingIdentity = false;
   const warn = (fields: Record<string, unknown>) => api.logger.warn("unblock-memory safety_whisperer " + JSON.stringify(fields));
 
   const check = async (event: { prompt: string; messages: unknown[] }, context: Record<string, unknown>,
     agentId: string, controller: AbortController): Promise<SafetyContext | undefined> => {
     const { signal } = controller;
-    const record = (outcome: Parameters<WhispererDiagnostics["record"]>[2]) => diagnostics?.record(agentId, "safety", outcome);
+    const recordOutcome = (outcome: Parameters<WhispererDiagnostics["record"]>[2]) => diagnostics?.record(agentId, "safety", outcome);
     const turn = trustedTurn(context);
     let scenarios: SafetyScenario[] = [];
     const timer = setTimeout(() => controller.abort(new DOMException("Safety deadline", "TimeoutError")), config.timeoutMs);
+    activeControllers.set(controller, { sessionId: nonBlank(context.sessionId), sessionKey: nonBlank(context.sessionKey) });
     try {
       if (!turn.provider || !turn.accountId || !turn.senderId) {
         // Some runtimes omit sender identity: nobody can be approved and per-channel exclusions may not apply.
-        record("missing_identity");
+        recordOutcome("missing_identity");
         if (!warnedMissingIdentity) {
           warn({ event: "missing_identity", agentId, provider: turn.provider ?? null, hasAccountId: Boolean(turn.accountId),
             hasSenderId: Boolean(turn.senderId), hasChannelId: Boolean(turn.channelId) });
         }
         warnedMissingIdentity = true;
       }
-      if (config.excludedChannels.some(channel => inChannel(channel, turn))) { record("excluded"); return; }
+      if (config.excludedChannels.some(channel => inChannel(channel, turn))) { recordOutcome("excluded"); return; }
       scenarios = config.scenarios.filter(scenario => scenario.enabled &&
         (!scenario.agentIds || scenario.agentIds.includes(agentId.toLowerCase())) &&
         !scenario.excludedChannels.some(channel => inChannel(channel, turn)) &&
         !scenario.approvedRequestors.some(requestor => approved(requestor, turn)));
-      if (!scenarios.length) { record("no_scenarios"); return; }
+      if (!scenarios.length) { recordOutcome("no_scenarios"); return; }
       const state = safetyConversation(event.prompt, event.messages, config.historyMessages, turn.senderId);
-      if (!state.currentRequest) { record("empty_request"); return; }
+      if (!state.currentRequest) { recordOutcome("empty_request"); return; }
       const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
       if (!apiKey) {
-        record(typesafe.enabled ? "missing_key" : "typesafe_disabled");
+        recordOutcome(typesafe.enabled ? "missing_key" : "typesafe_disabled");
         if (!warnedMissingKey) {
           api.logger.warn(`unblock-memory safety whisperer could not check: ${typesafe.enabled ? "TypeSafe key unavailable" : "TypeSafe disabled"}`);
         }
@@ -234,21 +234,21 @@ export function registerSafetyWhisperer(
       const matched = scenarios.filter((scenario, index) => (probabilities[index] ?? -1) >= scenario.minProbability);
       if (!matched.length) {
         if (unanswered) throw new TypeSafeRequestError("Invalid safety response", "invalid_response");
-        record("no_match");
+        recordOutcome("no_match");
         return;
       }
       // Keep confident matches even if another scenario's answer was unusable.
       if (unanswered) {
-        record("partial_response");
+        recordOutcome("partial_response");
         warn({ event: "partial_response", agentId, runId: context.runId, unanswered, eligibleScenarios: scenarios.length });
       }
-      record("flagged");
+      recordOutcome("flagged");
       for (const scenario of matched) diagnostics?.recordSafetyMatch(agentId, scenario.id);
       return safetyContext(matched.map(scenario => scenario.flaggedPrompt));
     } catch (error) {
       // Fail open by design, but never silently: "could not check" is recorded separately from "no match".
       const outcome = error instanceof SafetyInputError ? "input_too_large" : isTypeSafeTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed";
-      record(outcome);
+      recordOutcome(outcome);
       if (outcome !== "cancelled") {
         warn({ event: "check_failed", agentId, runId: context.runId, outcome, eligibleScenarios: scenarios.length,
           errorCode: error instanceof TypeSafeRequestError ? error.code : undefined,
@@ -257,7 +257,10 @@ export function registerSafetyWhisperer(
       // The requestor controls message size, so an oversized message gets every eligible prompt rather than none.
       if (outcome === "input_too_large") return safetyContext(scenarios.map(scenario => scenario.flaggedPrompt));
       return;
-    } finally { clearTimeout(timer); }
+    } finally {
+      clearTimeout(timer);
+      activeControllers.delete(controller);
+    }
   };
 
   const beforePrompt: Parameters<typeof api.on<"before_prompt_build">>[1] = async (event, context) => {
@@ -266,29 +269,47 @@ export function registerSafetyWhisperer(
     const scope = nonBlank(context.sessionId) ?? nonBlank(context.sessionKey);
     const runs = scope ? sessions.get(scope) : undefined;
     const previous = runId ? runs?.get(runId) : undefined;
-    if (previous) return previous.result;
+    if (previous && scope && runs) {
+      sessions.delete(scope);
+      sessions.set(scope, runs);
+      return previous.result;
+    }
     const controller = new AbortController();
     const result = check(event, context as Record<string, unknown>, agentId, controller);
     // Every new human turn is checked; without a run identity the result is not reused.
     if (scope && runId) {
       const entry = runs ?? new Map<string, Run>();
       entry.set(runId, { controller, result });
-      if (entry.size > RUNS_PER_SESSION) entry.delete(entry.keys().next().value!);
+      if (entry.size > RUNS_PER_SESSION) {
+        const oldestRunId = entry.keys().next().value!;
+        entry.get(oldestRunId)?.controller.abort();
+        entry.delete(oldestRunId);
+      }
       sessions.delete(scope);
       sessions.set(scope, entry);
-      if (sessions.size > MAX_SESSIONS) sessions.delete(sessions.keys().next().value!);
+      if (sessions.size > MAX_SESSIONS) {
+        const oldestScope = sessions.keys().next().value!;
+        for (const run of sessions.get(oldestScope)?.values() ?? []) run.controller.abort();
+        sessions.delete(oldestScope);
+      }
     }
     return result;
   };
 
   api.on("session_end", (event, context) => {
-    for (const scope of [event.sessionId, event.sessionKey, context.sessionKey]) {
-      if (!scope) continue;
+    const scopes = new Set([event.sessionId, event.sessionKey, context.sessionKey].filter((scope): scope is string => Boolean(scope)));
+    for (const scope of scopes) {
       for (const run of sessions.get(scope)?.values() ?? []) run.controller.abort();
       sessions.delete(scope);
     }
+    for (const [controller, identity] of activeControllers) {
+      if ((identity.sessionId && scopes.has(identity.sessionId)) || (identity.sessionKey && scopes.has(identity.sessionKey))) {
+        controller.abort();
+      }
+    }
   });
   api.on("gateway_stop", () => {
+    for (const controller of activeControllers.keys()) controller.abort();
     for (const runs of sessions.values()) for (const run of runs.values()) run.controller.abort();
     sessions.clear();
   });

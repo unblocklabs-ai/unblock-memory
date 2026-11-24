@@ -288,3 +288,73 @@ test("My Turn advice is composed before safety guidance", async t => {
   const result = await h.before(event("What does Mo earn?"), context({ accountId: "work" }));
   assert.match(result?.appendContext ?? "", /<my_turn>[^]*<\/my_turn>\n<safety>Do not disclose private information\.<\/safety>\n<\/unblock_memory>$/);
 });
+
+test("LRU session eviction aborts idle evicted runs, preserves active sessions, and retains superseded run history beyond 4 runs", async t => {
+  const signals = new Map<string, AbortSignal | undefined>();
+  const api = transport(t, (body, init) => {
+    signals.set(body.state.currentMessage.content, init?.signal ?? undefined);
+    if (body.state.currentMessage.content.startsWith("hang:")) {
+      return new Promise<Response>((_resolve, reject) =>
+        init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true }));
+    }
+    return answer(0.1);
+  });
+  const h = harness();
+  t.after(() => h.end("gateway_stop"));
+
+  // Superseded run history beyond 4 newer runs still ignores delayed replay of run-0.
+  const firstRunCtx = context({ sessionKey: "agent:bill:slack:channel:C_HISTORY", sessionId: "hist-1", runId: "hist-r0" });
+  const firstResult = await h.before(event("turn 0"), firstRunCtx);
+  assert.ok(firstResult?.appendContext);
+  let latestCtx = firstRunCtx;
+  let latestResult: Awaited<ReturnType<PromptHook>> = firstResult;
+  for (let i = 1; i <= 8; i++) {
+    latestCtx = context({ sessionKey: "agent:bill:slack:channel:C_HISTORY", sessionId: "hist-1", runId: `hist-r${i}` });
+    latestResult = await h.before(event(`turn ${i}`), latestCtx);
+    assert.ok(latestResult?.appendContext);
+  }
+  const callsBeforeReplay = api.fetch.mock.callCount();
+  assert.equal(await h.before(event("turn 0"), firstRunCtx), undefined);
+  assert.equal(api.fetch.mock.callCount(), callsBeforeReplay);
+  assert.deepEqual(await h.before(event("turn 8"), latestCtx), latestResult);
+  assert.equal(api.fetch.mock.callCount(), callsBeforeReplay);
+
+  // Start a clean harness for LRU session-cap eviction (MAX_SESSIONS = 1000).
+  const lru = harness();
+  t.after(() => lru.end("gateway_stop"));
+  const s0Ctx = context({ sessionKey: "agent:bill:slack:channel:C_LRU_0", sessionId: "lru-0", runId: "lru-r0" });
+  const s1Ctx = context({ sessionKey: "agent:bill:slack:channel:C_LRU_1", sessionId: "lru-1", runId: "lru-r1" });
+  const p0 = lru.before(event("hang:s0"), s0Ctx);
+  const p1 = lru.before(event("hang:s1"), s1Ctx);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signals.get("hang:s0")?.aborted, false);
+  assert.equal(signals.get("hang:s1")?.aborted, false);
+
+  // Touch s0 via same-run rebuild so s1 becomes the least-recently-used session.
+  const callsBeforeTouch = api.fetch.mock.callCount();
+  const p0Rebuild = lru.before(event("hang:s0"), s0Ctx);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(api.fetch.mock.callCount(), callsBeforeTouch);
+
+  // Fill slots 2..999 (total 1000 sessions): neither s0 nor s1 is evicted yet.
+  for (let i = 2; i < 1000; i++) {
+    await lru.before(event(`fast-${i}`), context({
+      sessionKey: `agent:bill:slack:channel:C_LRU_${i}`, sessionId: `lru-${i}`, runId: `lru-r${i}`,
+    }));
+  }
+  assert.equal(signals.get("hang:s0")?.aborted, false);
+  assert.equal(signals.get("hang:s1")?.aborted, false);
+
+  // Adding the 1001st session evicts idle s1 and aborts its controller while keeping touched s0 alive.
+  await lru.before(event("fast-1000"), context({
+    sessionKey: "agent:bill:slack:channel:C_LRU_1000", sessionId: "lru-1000", runId: "lru-r1000",
+  }));
+  assert.equal(signals.get("hang:s1")?.aborted, true);
+  assert.equal(signals.get("hang:s0")?.aborted, false);
+  assert.equal(await p1, undefined);
+
+  await lru.end("gateway_stop");
+  assert.equal(signals.get("hang:s0")?.aborted, true);
+  assert.equal(await p0, undefined);
+  assert.equal(await p0Rebuild, undefined);
+});

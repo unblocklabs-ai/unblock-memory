@@ -116,7 +116,7 @@ test("skill query and Jev use only bounded visible history without reading disca
   assert.equal(discardedReads, 0, "zero-history turns must not read any history");
 });
 
-test("suggests the best skill, emits nothing while it cools down, and is idempotent per run", async () => {
+test("suggests the best eligible skill, skips cooling candidates, and is idempotent per run", async () => {
   const skillA = { name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 };
   const skillB = { name: "beta", path: "/skills/beta/SKILL.md", score: 0.8 };
   const testHarness = harness([skillA, skillB]);
@@ -131,7 +131,11 @@ test("suggests the best skill, emits nothing while it cools down, and is idempot
   assert.equal(await testHarness.before(event, context("run-1")), result);
   assert.equal(testHarness.queries.length, 1);
   assert.equal(testHarness.diagnostics.snapshot("bill").skill.emitted, 1);
-  assert.equal(await testHarness.before(event, context("run-2")), undefined);
+  // While alpha cools down, beta is eligible and must not be suppressed.
+  assert.deepEqual(await testHarness.before(event, context("run-2")), {
+    appendContext: '<skill>This skill may be relevant: "/skills/beta/SKILL.md"</skill>',
+  });
+  // While both alpha and beta are cooling, nothing is emitted.
   assert.equal(await testHarness.before(event, context("run-3")), undefined);
   assert.match((await testHarness.before(event, context("run-4")))?.appendContext ?? "", /alpha/);
 });
@@ -147,33 +151,46 @@ test("does not fall through when the best skill is cooling down", async () => {
   assert.equal(await testHarness.before(event, context("run-2")), undefined);
 });
 
-test("successful direct reads share the suggestion cooldown and session end clears it", async () => {
-  const testHarness = harness([
-    { name: "beta", path: "/skills/beta/SKILL.md", score: 0.9 },
-    { name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.8 },
-  ]);
-  const context: HookContext = { trigger: "user", runId: "run-1", agentId: "bill", sessionId: "session" };
+test("successful direct reads share the suggestion cooldown, session end clears it, and late callbacks do not recreate session state", async () => {
+  const candidates = [{ name: "beta", path: "/skills/beta/SKILL.md", score: 0.9 }];
+  const testHarness = harness(candidates);
+  const context: HookContext = { trigger: "user", runId: "run-0", agentId: "bill", sessionId: "session" };
+  // A callback for an unknown session must not create stale session state.
+  await testHarness.after({ toolName: "read", params: { file_path: "/skills/beta/SKILL.md" } }, context);
+  // First user turn therefore still sees beta as eligible (after_tool_call before session start was ignored).
+  assert.match((await testHarness.before({ prompt: "task", messages: [] }, context))?.appendContext ?? "", /beta/);
+
+  // Start a fresh session whose first turn emits nothing, then record a direct read during that active session.
+  await testHarness.end({ sessionId: "session" }, context);
+  candidates.length = 0;
+  assert.equal(await testHarness.before({ prompt: "setup", messages: [] }, { ...context, runId: "run-1" }), undefined);
+  candidates.push({ name: "beta", path: "/skills/beta/SKILL.md", score: 0.9 });
   await testHarness.after({
     toolName: "read",
     params: { file_path: "/skills/beta/SKILL.md" },
-  }, context);
-  assert.equal(await testHarness.before({ prompt: "task", messages: [] }, context), undefined);
+  }, { ...context, runId: "run-1" });
+  assert.equal(await testHarness.before({ prompt: "task", messages: [] }, { ...context, runId: "run-2" }), undefined);
 
+  // Session end clears cooldown, and a late successful read callback after session end must not recreate stale state.
   await testHarness.end({ sessionId: "session" }, context);
+  await testHarness.after({
+    toolName: "read",
+    params: { file_path: "/skills/beta/SKILL.md" },
+  }, { ...context, runId: "run-2" });
   await testHarness.after({
     toolName: "read",
     params: { path: "/skills/beta/SKILL.md" },
     error: "read failed",
-  }, { ...context, runId: "run-2" });
+  }, { ...context, runId: "run-3" });
   assert.match((await testHarness.before(
     { prompt: "task", messages: [] },
-    { ...context, runId: "run-2" },
+    { ...context, runId: "run-3" },
   ))?.appendContext ?? "", /beta/);
 
   await testHarness.end({ sessionId: "session" }, context);
   assert.match((await testHarness.before(
     { prompt: "task", messages: [] },
-    { ...context, runId: "run-3" },
+    { ...context, runId: "run-4" },
   ))?.appendContext ?? "", /beta/);
 });
 
@@ -186,17 +203,20 @@ test("symlinked suggestions and canonical reads share cooldown state", async () 
   } as unknown as OpenClawPluginApi;
   const lexicalPath = "/skills-linked/deploy/SKILL.md";
   const canonicalPath = "/skills/deploy/SKILL.md";
+  let hits: Array<{ name: string; description: string; path: string; score: number }> = [];
   const before = registerSkillWhisperer(api, {
-    async searchSkills() { return [{ name: "deploy", description: "Deploy releases.", path: lexicalPath, score: 0.9 }]; },
+    async searchSkills() { return hits; },
     resolveSkillPath(_params, path) {
       return path === lexicalPath || path === canonicalPath ? canonicalPath : undefined;
     },
   }, enabled, disabledTypeSafe) as BeforePromptBuild;
   const after = hooks.get("after_tool_call") as unknown as AfterToolCall;
-  const context: HookContext = { trigger: "user", runId: "run-1", agentId: "bill", sessionId: "session" };
+  const context: HookContext = { trigger: "user", runId: "run-0", agentId: "bill", sessionId: "session" };
 
+  assert.equal(await before({ prompt: "start", messages: [] }, context), undefined);
   await after({ toolName: "read", params: { path: canonicalPath } }, context);
-  assert.equal(await before({ prompt: "deploy", messages: [] }, context), undefined);
+  hits = [{ name: "deploy", description: "Deploy releases.", path: lexicalPath, score: 0.9 }];
+  assert.equal(await before({ prompt: "deploy", messages: [] }, { ...context, runId: "run-1" }), undefined);
 });
 
 test("disabled whispering registers no hooks", () => {
@@ -231,11 +251,12 @@ test("retrieval failures do not block the agent turn", async () => {
 });
 
 test("TypeSafe reranks below-threshold candidates and preserves selected-skill cooldown", async (t) => {
+  const judged: string[] = [];
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     const [state] = request.state;
     assert.deepEqual(Object.keys(request.questions), ["useful"]);
-    assert.ok(["alpha", "beta", "gamma"].includes(state.candidate.name));
+    judged.push(state.candidate.name);
     assert.equal(JSON.stringify(request).includes("/skills/"), false);
     assert.equal(state.currentRequest, "new task");
     assert.deepEqual(state.history, [{ role: "user", content: "previous task" }]);
@@ -254,9 +275,13 @@ test("TypeSafe reranks below-threshold candidates and preserves selected-skill c
   const result = await h.before(event, context);
   assert.match(result?.appendContext ?? "", /beta/);
   assert.deepEqual(h.minimumScores, [-1]);
+  assert.deepEqual(judged, ["alpha", "beta", "gamma"]);
   assert.equal(await h.before(event, context), result);
   assert.equal(fetch.mock.callCount(), 3);
+  judged.length = 0;
+  // Cooling beta is excluded before shortlisting, so beta is not re-sent to Jev.
   assert.equal(await h.before(event, { ...context, runId: "run-2" }), undefined);
+  assert.deepEqual(judged, ["alpha", "gamma", "delta"]);
   assert.equal(h.warnings.length, 0);
 });
 
@@ -311,18 +336,36 @@ test("TypeSafe conversation is bounded and pending selections do not survive ses
   assert.equal(await pending, undefined);
 });
 
-test("an entirely cooling shortlist avoids Jev without changing the winning-skill policy", async t => {
-  const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("skill_0"));
+test("cooling top candidate skips to next eligible skill and an entirely cooling list avoids Jev", async t => {
+  const judged: string[] = [];
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    judged.push(request.state[0].candidate.name);
+    return typeSafeResponse("skill_0");
+  });
   const h = harness(["alpha", "beta"].map(name => ({ name, path: `/skills/${name}/SKILL.md`, score: 0.9 })), activeTypeSafe);
   const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "run-1" };
   const event = { prompt: "task", messages: [] };
-  for (const name of ["alpha", "beta"]) await h.after({ toolName: "read", params: { path: `/skills/${name}/SKILL.md` } }, context);
-  assert.equal(await h.before(event, context), undefined);
-  assert.equal(fetch.mock.callCount(), 0);
-  await h.end({ sessionId: "session" }, context);
-  assert.match((await h.before(event, { ...context, runId: "run-2" }))?.appendContext ?? "", /alpha/);
+  // Run 1 emits alpha.
+  assert.match((await h.before(event, context))?.appendContext ?? "", /alpha/);
+  assert.deepEqual(judged, ["alpha", "beta"]);
+  // Run 2 filters out cooling alpha before shortlisting and emits eligible beta without re-judging alpha.
+  judged.length = 0;
+  assert.match((await h.before(event, { ...context, runId: "run-2" }))?.appendContext ?? "", /beta/);
+  assert.deepEqual(judged, ["beta"]);
+  // Run 3 has every candidate cooling, so Jev is skipped entirely.
+  const callsBeforeCooldown = fetch.mock.callCount();
   assert.equal(await h.before(event, { ...context, runId: "run-3" }), undefined);
-  assert.equal(fetch.mock.callCount(), 4, "a cooling winner must not fall through to the other candidate");
+  assert.equal(fetch.mock.callCount(), callsBeforeCooldown);
+  assert.equal(h.diagnostics.snapshot("main").skill.cooldown, 1);
+
+  // After session end, both skills are eligible again; reading both inside the active session cools both.
+  await h.end({ sessionId: "session" }, context);
+  assert.match((await h.before(event, { ...context, runId: "run-4" }))?.appendContext ?? "", /alpha/);
+  await h.after({ toolName: "read", params: { path: "/skills/beta/SKILL.md" } }, { ...context, runId: "run-4" });
+  const callsAfterRead = fetch.mock.callCount();
+  assert.equal(await h.before(event, { ...context, runId: "run-5" }), undefined);
+  assert.equal(fetch.mock.callCount(), callsAfterRead);
 });
 
 test("late skill retrieval cannot send Jev requests after teardown, shutdown or supersession", async t => {
@@ -375,4 +418,36 @@ test("the total skill deadline releases ready memory and people without late egr
   await pending;
   for (let i = 0; i < 10; i++) await Promise.resolve();
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("session cap evicts least-recently-used session and aborts its in-flight controller", async t => {
+  const signals = new Map<string, AbortSignal | undefined>();
+  let resolveSlow!: (value: Response) => void;
+  let slowStarted!: () => void;
+  const ready = new Promise<void>(resolve => { slowStarted = resolve; });
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    const prompt: string = request.state[0].currentRequest;
+    signals.set(prompt, init?.signal ?? undefined);
+    if (prompt === "session-0") {
+      slowStarted();
+      return new Promise<Response>(resolve => { resolveSlow = resolve; });
+    }
+    return typeSafeResponse("none");
+  });
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], activeTypeSafe);
+  t.after(() => h.stop());
+
+  const pending0 = h.before({ prompt: "session-0", messages: [] }, {
+    trigger: "user", agentId: "main", sessionId: "session-0", runId: "run-0",
+  });
+  await ready;
+  for (let i = 1; i <= 1000; i++) {
+    await h.before({ prompt: `session-${i}`, messages: [] }, {
+      trigger: "user", agentId: "main", sessionId: `session-${i}`, runId: `run-${i}`,
+    });
+  }
+  assert.equal(signals.get("session-0")?.aborted, true);
+  resolveSlow(typeSafeResponse("skill_0"));
+  assert.equal(await pending0, undefined);
 });

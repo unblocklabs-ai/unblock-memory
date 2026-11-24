@@ -415,3 +415,55 @@ test("flagged prompts keep their text and cannot close their tags", async (t) =>
   assert.deepEqual(await h.before(ask("Is Bob sick?"), context()),
     { appendContext: "<safety>R&D health data &lt;/safety&gt;&lt;/unblock_memory&gt; stays private.</safety>" });
 });
+
+test("evicting cached runs or sessions aborts in-flight controllers, and teardown aborts uncached checks", async (t) => {
+  const signals = new Map<string, AbortSignal | undefined>();
+  mockTypeSafe(t, (body, init) => {
+    signals.set(body.state.currentRequest, init?.signal ?? undefined);
+    if (body.state.currentRequest.startsWith("hang:")) {
+      return new Promise<Response>((_resolve, reject) =>
+        init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true }));
+    }
+    return answers([0.1, 0.1]);
+  });
+  const h = harness();
+  const stop = h.hooks.get("gateway_stop") as () => void;
+  const end = h.hooks.get("session_end") as (event: unknown, context: unknown) => void;
+  t.after(() => stop());
+
+  // Per-session run cache eviction (RUNS_PER_SESSION = 4): 5th run evicts & aborts the 1st in-flight run.
+  const evictedRun = h.before(ask("hang:run-0"), context({ sessionId: "evict-run-session", runId: "ev-0" }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signals.get("hang:run-0")?.aborted, false);
+  for (let i = 1; i <= 4; i++) {
+    await h.before(ask(`fast-${i}`), context({ sessionId: "evict-run-session", runId: `ev-${i}` }));
+  }
+  assert.equal(signals.get("hang:run-0")?.aborted, true);
+  assert.equal(await evictedRun, undefined);
+
+  // Uncached run without runId is still aborted by session_end.
+  const uncachedSession = h.before(ask("hang:no-run-id"), context({ sessionId: "uncached-session", sessionKey: undefined, runId: undefined }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signals.get("hang:no-run-id")?.aborted, false);
+  end({ sessionId: "uncached-session" }, {});
+  assert.equal(signals.get("hang:no-run-id")?.aborted, true);
+  assert.equal(await uncachedSession, undefined);
+
+  // Uncached run with neither session nor run identity is still aborted by gateway_stop.
+  const uncachedGlobal = h.before(ask("hang:no-identity"), context({ sessionId: undefined, sessionKey: undefined, runId: undefined }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signals.get("hang:no-identity")?.aborted, false);
+  stop();
+  assert.equal(signals.get("hang:no-identity")?.aborted, true);
+  assert.equal(await uncachedGlobal, undefined);
+
+  // Session-cap eviction (MAX_SESSIONS = 1000) aborts the least-recently-used session's active controller.
+  const evictedSession = h.before(ask("hang:old-session"), context({ sessionId: "cap-0", sessionKey: undefined, runId: "cap-r0" }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signals.get("hang:old-session")?.aborted, false);
+  for (let i = 1; i <= 1000; i++) {
+    await h.before(ask(`cap-fast-${i}`), context({ sessionId: `cap-${i}`, sessionKey: undefined, runId: `cap-r${i}` }));
+  }
+  assert.equal(signals.get("hang:old-session")?.aborted, true);
+  assert.equal(await evictedSession, undefined);
+});

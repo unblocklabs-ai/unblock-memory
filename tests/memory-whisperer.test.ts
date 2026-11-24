@@ -829,3 +829,86 @@ test("late matched evidence reaches both the judge and hint intact", async t => 
   assert.deepEqual(entries, [{ source: "qmd://sessions/current.md", lines: "1-3", body: selected.text }]);
   assert.ok(entries[0].body.includes(fact));
 });
+
+test("delayed replay of a superseded run does not replace the latest run or re-emit", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => response(0.99));
+  let hitText = "first fact";
+  const h = harness([], { config: { cooldownTurns: 0 }, search: async () => [hit(hitText)] });
+  t.after(() => h.stop());
+
+  const first = await h.before(event, { ...context, runId: "run-1" });
+  assert.match(first?.appendContext ?? "", /first fact/);
+
+  hitText = "second fact";
+  const second = await h.before(event, { ...context, runId: "run-2" });
+  assert.match(second?.appendContext ?? "", /second fact/);
+
+  // A delayed rebuild for superseded run-1 must be ignored without replacing run-2 or calling TypeSafe.
+  const callsBeforeReplay = fetch.mock.callCount();
+  assert.equal(await h.before(event, { ...context, runId: "run-1" }), undefined);
+  assert.equal(fetch.mock.callCount(), callsBeforeReplay);
+
+  // Rebuilding run-2 still reuses run-2's cached result (run-1 did not replace it).
+  assert.equal(await h.before(event, { ...context, runId: "run-2" }), second);
+  assert.equal(fetch.mock.callCount(), callsBeforeReplay);
+});
+
+test("session cap evicts least-recently-used session and aborts its in-flight controller", async t => {
+  const signals = new Map<string, AbortSignal | undefined>();
+  const startedFirst = deferred<void>();
+  const startedSecond = deferred<void>();
+  const pendingFirst = deferred<CorpusMemorySearchResult[]>();
+  const pendingSecond = deferred<CorpusMemorySearchResult[]>();
+  t.mock.method(globalThis, "fetch", async () => response(0.1));
+
+  let activeSession = "";
+  const h = harness([], {
+    config: { timeoutMs: 5_000 },
+    hybrid: async (_queries, opts) => {
+      const current = activeSession;
+      signals.set(current, opts.signal);
+      if (current === "s-0") {
+        startedFirst.resolve();
+        return pendingFirst.promise;
+      }
+      if (current === "s-1") {
+        startedSecond.resolve();
+        return pendingSecond.promise;
+      }
+      return [];
+    },
+  });
+  t.after(() => h.stop());
+
+  activeSession = "s-0";
+  const p0 = h.before(event, { ...context, sessionId: "s-0", sessionKey: undefined, runId: "r-0" });
+  await startedFirst.promise;
+
+  activeSession = "s-1";
+  const p1 = h.before(event, { ...context, sessionId: "s-1", sessionKey: undefined, runId: "r-1" });
+  await startedSecond.promise;
+
+  // Touch s-0 via same-run replay so s-1 becomes least-recently-used.
+  const lookupsBeforeTouch = h.lookups();
+  const p0Rebuild = h.before(event, { ...context, sessionId: "s-0", sessionKey: undefined, runId: "r-0" });
+  assert.equal(h.lookups(), lookupsBeforeTouch);
+
+  // Fill remaining 998 slots to reach cap (1000) without evicting s-0 or s-1 yet.
+  for (let i = 2; i < 1000; i++) {
+    activeSession = `s-${i}`;
+    await h.before(event, { ...context, sessionId: `s-${i}`, sessionKey: undefined, runId: `r-${i}` });
+  }
+  assert.equal(signals.get("s-0")?.aborted, false);
+  assert.equal(signals.get("s-1")?.aborted, false);
+
+  // Adding the 1001st session evicts least-recently-used s-1 and aborts its controller, keeping touched s-0 alive.
+  activeSession = "s-1000";
+  await h.before(event, { ...context, sessionId: "s-1000", sessionKey: undefined, runId: "r-1000" });
+  assert.equal(signals.get("s-1")?.aborted, true);
+  assert.equal(signals.get("s-0")?.aborted, false);
+  assert.equal(await p1, undefined);
+
+  pendingFirst.resolve([]);
+  pendingSecond.resolve([]);
+  assert.equal(await p0Rebuild, await p0);
+});
