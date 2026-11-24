@@ -86,6 +86,7 @@ async function harness(config = peopleConfig, existingStateRoot?: string) {
     received: hooks.get("message_received") as MessageReceived,
     before: before as BeforePromptBuild | undefined,
     agentEnd: hooks.get("agent_end") as AgentEnd | undefined,
+    gatewayStop: hooks.get("gateway_stop") as (() => void) | undefined,
   };
 }
 
@@ -788,7 +789,211 @@ test("registers only observation when People Whisperer is disabled", async () =>
   assert.ok(testHarness.received);
   assert.equal(testHarness.before, undefined);
   assert.equal(testHarness.agentEnd, undefined);
+  assert.equal(testHarness.gatewayStop, undefined);
   testHarness.stores.closeAll();
+});
+
+test("gateway_stop clears both run-mapped and pending thread correlation maps", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    for (const [externalId, blurb] of [
+      ["UA", "Person A context."],
+      ["UB", "Person B context."],
+    ] as const) {
+      const { person } = store.upsertIdentity({
+        provider: "slack",
+        accountScope: "workspace-a",
+        externalId,
+      });
+      saveVerified(store, person.id, "test setup", { schemaVersion: 1, blurb, sections: [] });
+    }
+
+    testHarness.received(
+      { from: "slack:C123", content: "mapped", messageId: "930.0", runId: "run-stop-mapped" },
+      { ...slackContext, senderId: "UA" },
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "pending", messageId: "931.0" },
+      { ...slackContext, senderId: "UB" },
+    );
+
+    assert.ok(testHarness.gatewayStop);
+    testHarness.gatewayStop();
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "mapped after stop", messages: [] },
+        promptContext("UA", "run-stop-mapped"),
+      ),
+      undefined,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "pending after stop", messages: [] },
+        promptContext("UB", "run-stop-pending"),
+      ),
+      undefined,
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("clears stale pending correlation on direct runId match and bounds correlation maps", async t => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    saveVerified(store, person.id, "test setup", {
+      schemaVersion: 1,
+      blurb: "Person context.",
+      sections: [],
+    });
+
+    // Matching-thread pending correlation is cleared when a direct runId match consumes that thread.
+    testHarness.received(
+      { from: "slack:C123", content: "pending same thread", messageId: "950.0" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "direct same thread", messageId: "950.0", runId: "run-direct" },
+      slackContext,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "direct", messages: [] },
+        promptContext("U123", "run-direct"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "stray unmatched", messages: [] },
+        promptContext("U123", "run-stray"),
+      ),
+      undefined,
+    );
+
+    // Expired pending correlation is also cleared on direct runId match.
+    let fakeNow = 1_000_000;
+    t.mock.method(Date, "now", () => fakeNow);
+    testHarness.received(
+      { from: "slack:C123", content: "old pending", messageId: "960.0" },
+      slackContext,
+    );
+    fakeNow += 11 * 60_000;
+    testHarness.received(
+      { from: "slack:C123", content: "fresh direct", messageId: "961.0", runId: "run-fresh-direct" },
+      slackContext,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "fresh direct", messages: [] },
+        promptContext("U123", "run-fresh-direct"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "stray after expiry", messages: [] },
+        promptContext("U123", "run-stray-after-expiry"),
+      ),
+      undefined,
+    );
+
+    // Bounded run correlation evicts oldest entries once capacity is exceeded.
+    for (let i = 0; i < 1005; i++) {
+      testHarness.received(
+        { from: "slack:C123", content: `msg-${i}`, messageId: `1000.${i}`, runId: `run-cap-${i}` },
+        slackContext,
+      );
+    }
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "evicted", messages: [] },
+        promptContext("U123", "run-cap-0"),
+      ),
+      undefined,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "retained", messages: [] },
+        promptContext("U123", "run-cap-1004"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
+test("withholds prompt injection when an unverified dossier replaces a verified one", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    const v1 = store.replaceVerifiedDossier(
+      person.id,
+      "Verified initial",
+      { schemaVersion: 1, blurb: "Verified v1.", sections: [] },
+      "Verified v1",
+      null,
+    );
+    assert.ok(v1);
+
+    // Competing unverified replacement invalidates the verified snapshot.
+    store.replaceDossier(person.id, "Unverified overwrite", {
+      schemaVersion: 1,
+      blurb: "Unverified v2.",
+      sections: [],
+    });
+    testHarness.received(
+      { from: "slack:C123", content: "turn 1", messageId: "970.0", runId: "run-unverified" },
+      slackContext,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "turn 1", messages: [] },
+        promptContext("U123", "run-unverified"),
+      ),
+      undefined,
+    );
+    assert.equal(
+      store.getWhisperReceipt(JSON.stringify(["slack:workspace-a:C123:970.0", "run-unverified"]), person.id),
+      undefined,
+    );
+
+    // Atomic verified replacement restores injection immediately on the next turn.
+    store.replaceVerifiedDossier(
+      person.id,
+      "Verified v3",
+      { schemaVersion: 1, blurb: "Verified v3.", sections: [] },
+      "Verified v3",
+      store.getDossierRevision(person.id),
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "turn 2", threadId: "970.0", messageId: "971.0", runId: "run-verified" },
+      slackContext,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "turn 2", messages: [] },
+        promptContext("U123", "run-verified"),
+      )?.appendContext,
+      "<people>Verified v3.</people>",
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
 });
 
 test("renders only the bounded stored blurb", () => {

@@ -2,6 +2,7 @@ import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { abortable } from "./abortable.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { EvidenceCitation } from "./evidence-review.js";
+import { isInteractionCategory } from "./people-background.js";
 import type { Person, PersonDossier } from "./people-store.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import type { getContext } from "./tool-context.js";
@@ -27,7 +28,7 @@ export async function reviewPersonDossier(params: {
       evidence: dossier.sections.filter(s => s.category === "role" || s.category === "relationship").flatMap(s => s.claims.flatMap(c => c.evidence)) },
     ...dossier.sections.flatMap(section => section.claims.map(claim => ({
       statement: claim.statement + (claim.scope ? ` [Scope: ${claim.scope}]` : ""),
-      kind: ["preferences", "workingStyle"].includes(section.category) ? "interaction" as const : undefined,
+      kind: isInteractionCategory(section.category) ? "interaction" as const : undefined,
       inferred: claim.epistemicType === "agent_assessment", evidence: claim.evidence,
     }))),
   ];
@@ -54,11 +55,12 @@ export async function reviewPersonDossier(params: {
     if (!apiKey) return unavailable("TypeSafe API key not configured; verify manually before saving");
     const { manager } = await abortable(runtime.getMemorySearchManager(active), signal);
     if (!manager) return unavailable("Memory index unavailable; verify manually before saving");
+    const agentName = resolveAgentIdentity(active.cfg, active.agentId)?.name?.trim() || params.agentName?.trim() || "the assistant";
     for (const check of reviews.values()) {
       const review = await abortable(manager.reviewClaim({
         claim: check.statement, citations: check.citations,
         personBackground: { name: person.preferredName ?? person.displayName,
-          agentName: resolveAgentIdentity(active.cfg, active.agentId)?.name?.trim() || params.agentName?.trim() || "the assistant",
+          agentName,
           ...(check.kind ? { kind: check.kind, inferred: check.inferred } : {}) },
         corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
         timeoutMs: config.peoplePrimer.timeoutMs, signal,

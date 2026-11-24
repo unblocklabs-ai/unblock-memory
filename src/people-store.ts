@@ -7,7 +7,14 @@ import { resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-fou
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS, renderPeopleDossier } from "./people-background.js";
+import {
+  AGENT_LESSON_MAX_TTL_MS,
+  backgroundWordCount,
+  INTERACTION_DOSSIER_CATEGORIES,
+  isInteractionCategory,
+  PEOPLE_BACKGROUND_MAX_WORDS,
+  renderPeopleDossier,
+} from "./people-background.js";
 import { agentStateDir } from "./agent-paths.js";
 
 const BASELINE_DOSSIER_CATEGORIES = [
@@ -20,6 +27,10 @@ const BASELINE_DOSSIER_CATEGORIES = [
   "openLoops",
 ] as const;
 
+const isoTimestampSchema = Type.String({
+  pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+});
+
 const evidenceRefSchema = Type.Object(
   {
     source: Type.Union([
@@ -29,12 +40,7 @@ const evidenceRefSchema = Type.Object(
       Type.Literal("manual"),
     ]),
     locator: Type.String({ minLength: 1, maxLength: 1000 }),
-    observedAt: Type.Optional(
-      Type.String({
-        pattern:
-          "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
-      }),
-    ),
+    observedAt: Type.Optional(isoTimestampSchema),
   },
   { additionalProperties: false },
 );
@@ -53,8 +59,8 @@ const claimSchema = Type.Object(
       Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
     ),
     scope: Type.Optional(Type.String({ pattern: "\\S", maxLength: 200 })),
-    reviewedAt: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
-    expiresAt: Type.Optional(Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$" })),
+    reviewedAt: Type.Optional(isoTimestampSchema),
+    expiresAt: Type.Optional(isoTimestampSchema),
   },
   { additionalProperties: false },
 );
@@ -81,7 +87,7 @@ const PERSON_DOSSIER_SCHEMA = Type.Object(
 export const PERSON_DOSSIER_WRITE_SCHEMA = Type.Object({
   ...PERSON_DOSSIER_SCHEMA.properties,
   sections: Type.Array(Type.Object({
-    category: Type.Enum(["role", "relationship", "preferences", "workingStyle"]),
+    category: Type.Enum(["role", "relationship", ...INTERACTION_DOSSIER_CATEGORIES]),
     claims: Type.Array(Type.Object({
       ...claimSchema.properties,
       epistemicType: Type.Enum(["observed", "reported", "agent_assessment"]),
@@ -626,43 +632,82 @@ export class PeopleStore {
     return this.getPerson(personId);
   }
 
-  validateDossier(input: unknown) {
-    const dossier = Value.Parse(PERSON_DOSSIER_WRITE_SCHEMA, input);
-    this.#validateDossier(dossier);
-    serializeDossier(dossier);
-    return dossier;
+  validateDossier(input: unknown): PersonDossier {
+    return this.#parseAndSerializeDossier(input).dossier;
   }
 
   getDossierRevision(personId: string): string | null {
-    const row = this.#db.prepare("SELECT id FROM person_dossier_changes WHERE person_id = ? ORDER BY rowid DESC LIMIT 1")
+    const row = this.#db
+      .prepare("SELECT id FROM person_dossier_changes WHERE person_id = ? ORDER BY rowid DESC LIMIT 1")
       .get(personId) as { id: string } | undefined;
     return row?.id ?? null;
   }
 
   isDossierVerified(personId: string): boolean {
     this.#ensureDossierVerification();
-    const row = this.#db.prepare("SELECT revision FROM person_dossier_verification WHERE person_id=?").get(personId);
-    return !!row && row.revision === this.getDossierRevision(personId);
+    const row = this.#db
+      .prepare(`
+        SELECT 1 FROM person_dossier_verification v
+        WHERE v.person_id = ?
+          AND v.revision = (
+            SELECT c.id FROM person_dossier_changes c
+            WHERE c.person_id = v.person_id
+            ORDER BY c.rowid DESC
+            LIMIT 1
+          )
+      `)
+      .get(personId);
+    return row !== undefined;
+  }
+
+  getVerifiedDossier(personId: string): { dossier: PersonDossier; reviewedAt: string } | undefined {
+    this.#ensureDossierVerification();
+    const row = this.#db
+      .prepare(`
+        SELECT d.dossier_json, d.reviewed_at
+        FROM person_dossiers d
+        JOIN person_dossier_verification v ON v.person_id = d.person_id
+        WHERE d.person_id = ?
+          AND v.revision = (
+            SELECT c.id FROM person_dossier_changes c
+            WHERE c.person_id = d.person_id
+            ORDER BY c.rowid DESC
+            LIMIT 1
+          )
+      `)
+      .get(personId) as { dossier_json: string; reviewed_at: string } | undefined;
+    return row
+      ? {
+          dossier: parseDossierJson(row.dossier_json),
+          reviewedAt: row.reviewed_at,
+        }
+      : undefined;
   }
 
   recordDossierVerification(personId: string, revision: string | null, verification: string): void {
+    const normalizedVerification = required(verification, "verification");
     this.#ensureDossierVerification();
+    const now = new Date().toISOString();
     immediateTransaction(this.#db, () => {
       if (this.getDossierRevision(personId) !== revision) throw new DossierConflictError();
-      if (revision === null) {
-        const existing = this.#db.prepare("SELECT dossier_json FROM person_dossiers WHERE person_id=?").get(personId);
+      let verifiedRevision = revision;
+      if (verifiedRevision === null) {
+        const existing = this.#db
+          .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
+          .get(personId) as { dossier_json: string } | undefined;
         if (!existing) throw new DossierConflictError();
         // Pre-v4 dossiers have no change revision. Establish a baseline snapshot
         // without rewriting their data or pretending the old write happened now.
-        revision = randomUUID();
-        this.#db.prepare(`INSERT INTO person_dossier_changes
-          (id,person_id,action,before_dossier_json,after_dossier_json,reason,changed_at)
-          VALUES (?,?,'replace',?,?,?,?)`).run(revision, personId, existing.dossier_json!, existing.dossier_json!,
-            "Legacy baseline after complete source validation", new Date().toISOString());
+        verifiedRevision = this.#insertDossierChange({
+          personId,
+          action: "replace",
+          beforeDossierJson: existing.dossier_json,
+          afterDossierJson: existing.dossier_json,
+          reason: "Legacy baseline after complete source validation",
+          changedAt: now,
+        });
       }
-      this.#db.prepare(`INSERT INTO person_dossier_verification VALUES (?,?,?,?) ON CONFLICT(person_id) DO UPDATE SET
-        revision=excluded.revision,verification=excluded.verification,verified_at=excluded.verified_at`)
-        .run(personId, revision, verification, new Date().toISOString());
+      this.#upsertDossierVerification(personId, verifiedRevision, normalizedVerification, now);
     });
   }
 
@@ -675,19 +720,73 @@ export class PeopleStore {
     this.#dossierVerificationReady = true;
   }
 
-  /** Returns undefined when the person does not exist. */
-  replaceDossier(personId: string, reasonInput: string, input: unknown, expectedRevision?: string | null): PersonDossier | undefined {
-    const dossier = this.validateDossier(input);
-    const dossierJson = serializeDossier(dossier);
+  #insertDossierChange(params: {
+    personId: string;
+    action: PersonDossierChange["action"];
+    beforeDossierJson: string | null;
+    afterDossierJson: string | null;
+    reason: string;
+    changedAt: string;
+  }): string {
+    const id = randomUUID();
+    this.#db
+      .prepare(`
+        INSERT INTO person_dossier_changes
+          (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        id,
+        params.personId,
+        params.action,
+        params.beforeDossierJson,
+        params.afterDossierJson,
+        params.reason,
+        params.changedAt,
+      );
+    return id;
+  }
+
+  #upsertDossierVerification(
+    personId: string,
+    revision: string,
+    verification: string,
+    verifiedAt: string,
+  ): void {
+    this.#db
+      .prepare(`
+        INSERT INTO person_dossier_verification (person_id, revision, verification, verified_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(person_id) DO UPDATE SET
+          revision = excluded.revision,
+          verification = excluded.verification,
+          verified_at = excluded.verified_at
+      `)
+      .run(personId, revision, verification, verifiedAt);
+  }
+
+  #writeDossier(
+    personId: string,
+    reasonInput: string,
+    input: unknown,
+    expectedRevision?: string | null,
+    verificationInput?: string,
+  ): { dossier: PersonDossier; changeId: string } | undefined {
+    const { dossier, dossierJson } = this.#parseAndSerializeDossier(input);
     const reason = dossierReason(reasonInput);
+    const verification =
+      verificationInput === undefined ? undefined : required(verificationInput, "verification");
+    if (verification !== undefined) this.#ensureDossierVerification();
     const reviewedAt = new Date().toISOString();
     return immediateTransaction(this.#db, () => {
       const target = this.#db.prepare("SELECT id, status FROM people WHERE id = ?").get(personId) as
         | { id: string; status: string }
         | undefined;
       if (!target) return undefined;
-      if (expectedRevision !== undefined &&
-          (target.status !== "active" || this.getDossierRevision(personId) !== expectedRevision)) {
+      if (
+        expectedRevision !== undefined &&
+        (target.status !== "active" || this.getDossierRevision(personId) !== expectedRevision)
+      ) {
         throw new DossierConflictError();
       }
       const existing = this.#db
@@ -704,28 +803,49 @@ export class PeopleStore {
             reviewed_at = excluded.reviewed_at
         `)
         .run(personId, dossierJson, dossier.blurb, reviewedAt);
-      this.#db
-        .prepare(`
-          INSERT INTO person_dossier_changes
-            (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
-          VALUES (?, ?, 'replace', ?, ?, ?, ?)
-        `)
-        .run(
-          randomUUID(),
-          personId,
-          existing?.dossier_json ?? null,
-          dossierJson,
-          reason,
-          reviewedAt,
-        );
-      return dossier;
+      const changeId = this.#insertDossierChange({
+        personId,
+        action: "replace",
+        beforeDossierJson: existing?.dossier_json ?? null,
+        afterDossierJson: dossierJson,
+        reason,
+        changedAt: reviewedAt,
+      });
+      if (verification !== undefined) {
+        this.#upsertDossierVerification(personId, changeId, verification, reviewedAt);
+      }
+      return { dossier, changeId };
     });
   }
 
-  deleteDossier(personId: string, reasonInput: string): boolean {
+  /** Returns undefined when the person does not exist. */
+  replaceDossier(
+    personId: string,
+    reasonInput: string,
+    input: unknown,
+    expectedRevision?: string | null,
+  ): PersonDossier | undefined {
+    return this.#writeDossier(personId, reasonInput, input, expectedRevision)?.dossier;
+  }
+
+  /** Atomically replaces a dossier, records its history revision, and binds verification to that revision. */
+  replaceVerifiedDossier(
+    personId: string,
+    reasonInput: string,
+    input: unknown,
+    verificationInput: string,
+    expectedRevision?: string | null,
+  ): { dossier: PersonDossier; changeId: string } | undefined {
+    return this.#writeDossier(personId, reasonInput, input, expectedRevision, verificationInput);
+  }
+
+  deleteDossier(personId: string, reasonInput: string, expectedRevision?: string | null): boolean {
     const reason = dossierReason(reasonInput);
     const changedAt = new Date().toISOString();
     return immediateTransaction(this.#db, () => {
+      if (expectedRevision !== undefined && this.getDossierRevision(personId) !== expectedRevision) {
+        throw new DossierConflictError();
+      }
       const existing = this.#db
         .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
         .get(personId) as { dossier_json: string } | undefined;
@@ -734,13 +854,14 @@ export class PeopleStore {
       }
       parseDossierJson(existing.dossier_json);
       this.#db.prepare("DELETE FROM person_dossiers WHERE person_id = ?").run(personId);
-      this.#db
-        .prepare(`
-          INSERT INTO person_dossier_changes
-            (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
-          VALUES (?, ?, 'delete', ?, NULL, ?, ?)
-        `)
-        .run(randomUUID(), personId, existing.dossier_json, reason, changedAt);
+      this.#insertDossierChange({
+        personId,
+        action: "delete",
+        beforeDossierJson: existing.dossier_json,
+        afterDossierJson: null,
+        reason,
+        changedAt,
+      });
       return true;
     });
   }
@@ -1033,7 +1154,13 @@ export class PeopleStore {
       .get(provider, accountScope, externalId) as IdentityRow | undefined;
   }
 
-  #validateDossier(dossier: PersonDossier): void {
+  #parseAndSerializeDossier(input: unknown): { dossier: PersonDossier; dossierJson: string } {
+    const dossier = Value.Parse(PERSON_DOSSIER_WRITE_SCHEMA, input);
+    this.#checkDossierRules(dossier);
+    return { dossier, dossierJson: serializeDossier(dossier) };
+  }
+
+  #checkDossierRules(dossier: PersonDossier): void {
     if (dossier.blurb.length > this.#maxBlurbChars) {
       throw new Error(`dossier blurb must not exceed ${this.#maxBlurbChars} characters`);
     }
@@ -1044,19 +1171,29 @@ export class PeopleStore {
     if (backgroundWordCount(dossier.blurb) > PEOPLE_BACKGROUND_MAX_WORDS) {
       throw new Error(`dossier blurb must not exceed ${PEOPLE_BACKGROUND_MAX_WORDS} words`);
     }
-    for (const section of dossier.sections) for (const claim of section.claims) {
-      if (["preferences", "workingStyle"].includes(section.category) && (!claim.reviewedAt || !claim.scope)) {
-        throw new Error("Interaction claims require explicit scope and reviewedAt after source verification");
-      }
-      for (const date of [claim.reviewedAt, claim.expiresAt]) {
-        if (date !== undefined && !Number.isFinite(Date.parse(date))) throw new Error("Invalid claim review/expiry date");
-      }
-      if (claim.epistemicType === "agent_assessment") {
-        if (!["preferences", "workingStyle"].includes(section.category) || !claim.reviewedAt || !claim.expiresAt) {
-          throw new Error("Agent lessons require a preference/workingStyle section, reviewedAt and expiresAt");
+    for (const section of dossier.sections) {
+      const interaction = isInteractionCategory(section.category);
+      for (const claim of section.claims) {
+        if (interaction && (!claim.reviewedAt || !claim.scope)) {
+          throw new Error("Interaction claims require explicit scope and reviewedAt after source verification");
         }
-        const lifetime = Date.parse(claim.expiresAt) - Date.parse(claim.reviewedAt);
-        if (lifetime <= 0 || lifetime > 30 * 86400000) throw new Error("Agent lessons must expire within 30 days of review");
+        const reviewedAtMs = claim.reviewedAt === undefined ? undefined : Date.parse(claim.reviewedAt);
+        const expiresAtMs = claim.expiresAt === undefined ? undefined : Date.parse(claim.expiresAt);
+        if (
+          (reviewedAtMs !== undefined && !Number.isFinite(reviewedAtMs)) ||
+          (expiresAtMs !== undefined && !Number.isFinite(expiresAtMs))
+        ) {
+          throw new Error("Invalid claim review/expiry date");
+        }
+        if (claim.epistemicType === "agent_assessment") {
+          if (!interaction || reviewedAtMs === undefined || expiresAtMs === undefined) {
+            throw new Error("Agent lessons require a preference/workingStyle section, reviewedAt and expiresAt");
+          }
+          const lifetime = expiresAtMs - reviewedAtMs;
+          if (lifetime <= 0 || lifetime > AGENT_LESSON_MAX_TTL_MS) {
+            throw new Error("Agent lessons must expire within 30 days of review");
+          }
+        }
       }
     }
     if (renderPeopleDossier(dossier).length > this.#maxBlurbChars) {

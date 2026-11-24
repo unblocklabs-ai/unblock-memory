@@ -4,8 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { PeopleStore, PeopleStores } from "../src/people-store.js";
-import { renderPeopleDossier } from "../src/people-background.js";
+import { DossierConflictError, PeopleStore, PeopleStores } from "../src/people-store.js";
+import {
+  AGENT_LESSON_MAX_TTL_MS,
+  INTERACTION_DOSSIER_CATEGORIES,
+  isInteractionCategory,
+  isRenderableInteractionClaim,
+  renderPeopleDossier,
+} from "../src/people-background.js";
 
 const options = { maxOpenTodos: 2, maxBlurbChars: 1200 };
 
@@ -646,6 +652,278 @@ test("rolls back dossier mutations when their audit insert fails", async () => {
   } finally {
     store.close();
   }
+});
+
+test("replaceVerifiedDossier rolls back dossier and history atomically when verification write fails", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const existingPerson = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U123",
+    }).person;
+    const freshPerson = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U456",
+    }).person;
+    const v1 = { schemaVersion: 1, blurb: "Verified v1.", sections: [] } as const;
+    const v2 = { schemaVersion: 1, blurb: "Should roll back.", sections: [] } as const;
+
+    const first = store.replaceVerifiedDossier(
+      existingPerson.id,
+      "Initial verified dossier",
+      v1,
+      "Verified v1 against original source",
+      null,
+    );
+    assert.ok(first);
+    assert.equal(store.getDossierRevision(existingPerson.id), first.changeId);
+    assert.deepEqual(store.getVerifiedDossier(existingPerson.id)?.dossier, v1);
+
+    const db = new DatabaseSync(path);
+    try {
+      db.exec(`
+        CREATE TRIGGER fail_verification_update BEFORE UPDATE ON person_dossier_verification
+        BEGIN SELECT RAISE(FAIL, 'verification update unavailable'); END;
+      `);
+    } finally {
+      db.close();
+    }
+
+    assert.throws(
+      () =>
+        store.replaceVerifiedDossier(
+          existingPerson.id,
+          "Attempted verified update",
+          v2,
+          "Verified v2",
+          first.changeId,
+        ),
+      /verification update unavailable/,
+    );
+    assert.deepEqual(store.getDossier(existingPerson.id)?.dossier, v1);
+    assert.deepEqual(store.getVerifiedDossier(existingPerson.id)?.dossier, v1);
+    assert.equal(store.getDossierRevision(existingPerson.id), first.changeId);
+    assert.equal(store.listDossierChanges(existingPerson.id).length, 1);
+
+    const dbInsert = new DatabaseSync(path);
+    try {
+      dbInsert.exec(`
+        CREATE TRIGGER fail_verification_insert BEFORE INSERT ON person_dossier_verification
+        BEGIN SELECT RAISE(FAIL, 'verification insert unavailable'); END;
+      `);
+    } finally {
+      dbInsert.close();
+    }
+
+    assert.throws(
+      () =>
+        store.replaceVerifiedDossier(
+          freshPerson.id,
+          "Attempted initial verified write",
+          v2,
+          "Verified fresh",
+          null,
+        ),
+      /verification insert unavailable/,
+    );
+    assert.equal(store.getDossier(freshPerson.id), undefined);
+    assert.equal(store.getVerifiedDossier(freshPerson.id), undefined);
+    assert.equal(store.getDossierRevision(freshPerson.id), null);
+    assert.deepEqual(store.listDossierChanges(freshPerson.id), []);
+  } finally {
+    store.close();
+  }
+});
+
+test("competing writes never inherit approval and getVerifiedDossier reads one consistent snapshot", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const person = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U123",
+    }).person;
+    const v1 = { schemaVersion: 1, blurb: "Verified v1.", sections: [] } as const;
+    const v2 = { schemaVersion: 1, blurb: "Competing unverified v2.", sections: [] } as const;
+    const v3 = { schemaVersion: 1, blurb: "Verified v3.", sections: [] } as const;
+    const v4 = { schemaVersion: 1, blurb: "Uncommitted unverified v4.", sections: [] } as const;
+    const v5 = { schemaVersion: 1, blurb: "Committed verified v5.", sections: [] } as const;
+
+    const first = store.replaceVerifiedDossier(person.id, "Initial verified", v1, "Verified v1", null)!;
+    assert.equal(store.isDossierVerified(person.id), true);
+    assert.deepEqual(store.getVerifiedDossier(person.id)?.dossier, v1);
+
+    // Competing unverified write advances the revision and must not inherit v1 approval.
+    store.replaceDossier(person.id, "Competing unverified write", v2);
+    assert.equal(store.isDossierVerified(person.id), false);
+    assert.equal(store.getVerifiedDossier(person.id), undefined);
+
+    // A stale verified write targeting rev1 fails with conflict and leaves v2 unverified.
+    assert.throws(
+      () => store.replaceVerifiedDossier(person.id, "Stale approval", v3, "Approved v3", first.changeId),
+      DossierConflictError,
+    );
+    assert.deepEqual(store.getDossier(person.id)?.dossier, v2);
+    assert.equal(store.isDossierVerified(person.id), false);
+    assert.equal(store.getVerifiedDossier(person.id), undefined);
+
+    const third = store.replaceVerifiedDossier(
+      person.id,
+      "Re-verified after inspection",
+      v3,
+      "Verified v3",
+      store.getDossierRevision(person.id),
+    )!;
+    assert.deepEqual(store.getVerifiedDossier(person.id)?.dossier, v3);
+
+    // Verify single-snapshot isolation against an in-flight writer on a second connection.
+    const writer = new DatabaseSync(path);
+    try {
+      writer.exec("BEGIN IMMEDIATE");
+      writer
+        .prepare("UPDATE person_dossiers SET dossier_json = ?, blurb = ?, reviewed_at = ? WHERE person_id = ?")
+        .run(JSON.stringify(v4), v4.blurb, "2026-11-24T12:00:00.000Z", person.id);
+      writer
+        .prepare(`INSERT INTO person_dossier_changes
+          (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+          VALUES (?, ?, 'replace', ?, ?, ?, ?)`)
+        .run("rev-v4", person.id, JSON.stringify(v3), JSON.stringify(v4), "Unverified v4", "2026-11-24T12:00:00.000Z");
+
+      // Before commit, reader sees the complete committed v3 snapshot.
+      assert.deepEqual(store.getVerifiedDossier(person.id)?.dossier, v3);
+      assert.equal(store.getDossierRevision(person.id), third.changeId);
+      writer.exec("COMMIT");
+
+      // After commit, reader sees v4 body + unverified revision atomically.
+      assert.deepEqual(store.getDossier(person.id)?.dossier, v4);
+      assert.equal(store.getVerifiedDossier(person.id), undefined);
+
+      // Concurrent verified v5 update is invisible until both dossier and verification commit.
+      writer.exec("BEGIN IMMEDIATE");
+      writer
+        .prepare("UPDATE person_dossiers SET dossier_json = ?, blurb = ?, reviewed_at = ? WHERE person_id = ?")
+        .run(JSON.stringify(v5), v5.blurb, "2026-11-24T12:01:00.000Z", person.id);
+      writer
+        .prepare(`INSERT INTO person_dossier_changes
+          (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+          VALUES (?, ?, 'replace', ?, ?, ?, ?)`)
+        .run("rev-v5", person.id, JSON.stringify(v4), JSON.stringify(v5), "Verified v5", "2026-11-24T12:01:00.000Z");
+      writer
+        .prepare(`INSERT INTO person_dossier_verification (person_id, revision, verification, verified_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(person_id) DO UPDATE SET
+            revision = excluded.revision, verification = excluded.verification, verified_at = excluded.verified_at`)
+        .run(person.id, "rev-v5", "Verified v5", "2026-11-24T12:01:00.000Z");
+      assert.equal(store.getVerifiedDossier(person.id), undefined);
+      writer.exec("COMMIT");
+
+      assert.deepEqual(store.getVerifiedDossier(person.id)?.dossier, v5);
+    } finally {
+      writer.close();
+    }
+  } finally {
+    store.close();
+  }
+});
+
+test("deleteDossier enforces optional expectedRevision compare-and-swap", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const person = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U123",
+    }).person;
+    const v1 = { schemaVersion: 1, blurb: "First dossier.", sections: [] } as const;
+    const v2 = { schemaVersion: 1, blurb: "Second dossier.", sections: [] } as const;
+
+    store.replaceDossier(person.id, "v1", v1);
+    const rev1 = store.getDossierRevision(person.id)!;
+    store.replaceDossier(person.id, "v2", v2);
+    const rev2 = store.getDossierRevision(person.id)!;
+
+    assert.throws(
+      () => store.deleteDossier(person.id, "Stale delete", rev1),
+      DossierConflictError,
+    );
+    assert.deepEqual(store.getDossier(person.id)?.dossier, v2);
+    assert.equal(store.listDossierChanges(person.id).length, 2);
+
+    assert.equal(store.deleteDossier(person.id, "Exact revision delete", rev2), true);
+    assert.equal(store.getDossier(person.id), undefined);
+    const deleteRev = store.getDossierRevision(person.id)!;
+    assert.notEqual(deleteRev, rev2);
+
+    // Repeating with the pre-delete revision conflicts; matching the post-delete revision reports absent.
+    assert.throws(
+      () => store.deleteDossier(person.id, "Stale retry", rev2),
+      DossierConflictError,
+    );
+    assert.equal(store.deleteDossier(person.id, "Already deleted at latest rev", deleteRev), false);
+
+    // Legacy pre-v4 dossier with null revision honors expectedRevision = null.
+    const legacy = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U456",
+    }).person;
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare("INSERT INTO person_dossiers (person_id, dossier_json, blurb, reviewed_at) VALUES (?, ?, ?, ?)")
+        .run(legacy.id, JSON.stringify(v1), v1.blurb, "2026-11-01T00:00:00.000Z");
+    } finally {
+      db.close();
+    }
+    assert.equal(store.getDossierRevision(legacy.id), null);
+    assert.throws(
+      () => store.deleteDossier(legacy.id, "Mismatched legacy rev", "some-rev"),
+      DossierConflictError,
+    );
+    assert.equal(store.deleteDossier(legacy.id, "Delete legacy baseline", null), true);
+    assert.equal(store.getDossier(legacy.id), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test("interaction claim helpers enforce shared categories, single timestamp checks, and 30-day lesson TTL", () => {
+  assert.deepEqual(INTERACTION_DOSSIER_CATEGORIES, ["preferences", "workingStyle"]);
+  assert.equal(AGENT_LESSON_MAX_TTL_MS, 30 * 86400_000);
+  assert.equal(isInteractionCategory("preferences"), true);
+  assert.equal(isInteractionCategory("workingStyle"), true);
+  assert.equal(isInteractionCategory("role"), false);
+
+  const now = Date.parse("2026-11-20T00:00:00Z");
+  const baseClaim = {
+    statement: "Lead with the recommendation.",
+    scope: "Status updates",
+    reviewedAt: "2026-11-16T00:00:00Z",
+    epistemicType: "reported" as const,
+    evidence: [{ source: "manual" as const, locator: "Slack note" }],
+  };
+  assert.equal(isRenderableInteractionClaim(baseClaim, now), true);
+  assert.equal(isRenderableInteractionClaim({ ...baseClaim, reviewedAt: "2026-11-25T00:00:00Z" }, now), false);
+  assert.equal(isRenderableInteractionClaim({ ...baseClaim, scope: undefined }, now), false);
+  assert.equal(isRenderableInteractionClaim({ ...baseClaim, expiresAt: "2026-11-20T00:00:00Z" }, now), false);
+  assert.equal(
+    isRenderableInteractionClaim(
+      { ...baseClaim, epistemicType: "agent_assessment", expiresAt: "2026-12-16T00:00:00Z" },
+      now,
+    ),
+    true,
+  );
+  assert.equal(
+    isRenderableInteractionClaim(
+      { ...baseClaim, epistemicType: "agent_assessment", expiresAt: "2026-12-17T00:00:00Z" },
+      now,
+    ),
+    false,
+  );
 });
 
 test("restores an unavailable person without restoring injection or deleting related records", async () => {

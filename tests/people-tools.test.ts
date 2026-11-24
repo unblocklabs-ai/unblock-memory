@@ -3,6 +3,7 @@ import { normalizeToolParameterSchema } from "@openclaw/ai/internal/tool-schema"
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type {
   OpenClawConfig,
@@ -90,7 +91,7 @@ async function harness(
     assert.ok(created);
     return created;
   };
-  return { stores, options, maybeTool, tool };
+  return { root, stores, options, maybeTool, tool };
 }
 
 const dossier = {
@@ -270,8 +271,77 @@ test("in-flight review cannot overwrite concurrent writes, deletions or archived
     });
     assert.equal((await h.write()).status, "conflict", mutation);
     assert.equal(h.store.listDossierChanges(h.person.id).some(change => change.reason.startsWith("Verified identity")), false);
+    assert.equal(h.store.isDossierVerified(h.person.id), false, `${mutation} must never inherit approval`);
+    assert.equal(h.store.getVerifiedDossier(h.person.id), undefined, `${mutation} must not appear verified`);
     t.mock.restoreAll();
   }
+});
+
+test("replace_dossier rolls back atomically when verification write fails", async t => {
+  const h = await writeHarness(t);
+  const initial = await h.write({ manualVerification });
+  assert.equal(initial.status, "ok");
+  const before = h.store.getVerifiedDossier(h.person.id);
+  const beforeRev = h.store.getDossierRevision(h.person.id);
+  const beforeChanges = h.store.listDossierChanges(h.person.id).length;
+
+  const dbPath = join(h.root, "agents", "bill", "unblock-memory", "unblock-memory.sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TRIGGER fail_tool_verification BEFORE UPDATE ON person_dossier_verification
+      BEGIN SELECT RAISE(FAIL, 'verification write failed'); END;
+    `);
+  } finally {
+    db.close();
+  }
+
+  const next = { ...dossier, blurb: "Uncommitted replacement." };
+  await assert.rejects(
+    h.write({ dossier: next, manualVerification }),
+    /verification write failed/,
+  );
+  assert.deepEqual(h.store.getDossier(h.person.id), before);
+  assert.deepEqual(h.store.getVerifiedDossier(h.person.id), before);
+  assert.equal(h.store.getDossierRevision(h.person.id), beforeRev);
+  assert.equal(h.store.listDossierChanges(h.person.id).length, beforeChanges);
+});
+
+test("delete_dossier honors optional expectedRevision compare-and-swap", async t => {
+  const h = await writeHarness(t);
+  const first = await h.write({ manualVerification });
+  assert.equal(first.status, "ok");
+  const rev1 = String(first.changeId);
+  const second = await h.write({
+    dossier: { ...dossier, blurb: "Updated verified blurb." },
+    manualVerification,
+  });
+  assert.equal(second.status, "ok");
+  const rev2 = String(second.changeId);
+
+  const update = h.tool("memory_people_update");
+  const conflict = resultJson(
+    await update.execute("delete-stale", {
+      action: "delete_dossier",
+      personId: h.person.id,
+      reason: "Stale delete attempt",
+      expectedRevision: rev1,
+    }),
+  );
+  assert.equal(conflict.status, "conflict");
+  assert.equal(conflict.saved, false);
+  assert.equal(h.store.getDossier(h.person.id)?.dossier.blurb, "Updated verified blurb.");
+
+  const deleted = resultJson(
+    await update.execute("delete-current", {
+      action: "delete_dossier",
+      personId: h.person.id,
+      reason: "Matched revision delete",
+      expectedRevision: rev2,
+    }),
+  );
+  assert.equal(deleted.status, "ok");
+  assert.equal(h.store.getDossier(h.person.id), undefined);
 });
 
 test("cancelled reviews never save, including explicit manual writes", async t => {
