@@ -407,7 +407,8 @@ async function evaluateExample(ctx, example) {
                 const feedback = first.map(item => ({ query: item.query, score: item.score }));
                 const revision = await reviseLaneOnce(ctx, example, input, lane, feedback);
                 if (!revision.result) {
-                    if (ctx.store.stepRecordStatus(revision.id))
+                    const revisionStatus = ctx.store.stepRecordStatus(revision.id);
+                    if (revisionStatus && revisionStatus !== "pending")
                         problems.add(revision.id);
                     return;
                 }

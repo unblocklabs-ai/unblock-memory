@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { chmod, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { closeSync, constants, fchmodSync, lstatSync, openSync } from "node:fs";
+import fs from "node:fs/promises";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { resolveAgentWorkspaceDir, resolveStateDir, } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { QmdMemoryManager } from "./manager.js";
@@ -10,13 +12,21 @@ import { unchangedSessionSync } from "./session-sync.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
 import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
-const SESSION_SYNC_LOCK_FILE = "session-sync.lock";
-const SESSION_SYNC_RECLAIM_LOCK_FILE = "session-sync.lock.reclaim";
+const SESSION_SYNC_LOCK_FILE = "session-sync.lock.sqlite";
 const SESSION_SYNC_STATUS_FILE = "session-sync-status.json";
-const MAX_LOCK_ATTEMPTS = 4;
+const LEASE_BUSY_TIMEOUT_MS = 5000;
+const MAX_LEASE_BUSY_RETRIES = 6;
+const LEASE_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS session_sync_lease (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    pid INTEGER NOT NULL,
+    token TEXT NOT NULL,
+    started_at TEXT NOT NULL
+  )
+`;
 async function readJson(path) {
     try {
-        return JSON.parse(await readFile(path, "utf8"));
+        return JSON.parse(await fs.readFile(path, "utf8"));
     }
     catch (error) {
         if (error.code === "ENOENT")
@@ -26,7 +36,7 @@ async function readJson(path) {
 }
 async function removeIfPresent(path) {
     try {
-        await unlink(path);
+        await fs.unlink(path);
     }
     catch (error) {
         if (error.code !== "ENOENT")
@@ -36,9 +46,9 @@ async function removeIfPresent(path) {
 async function atomicWriteJson(path, value) {
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
-        await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-        await chmod(temporary, 0o600);
-        await rename(temporary, path);
+        await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+        await fs.chmod(temporary, 0o600);
+        await fs.rename(temporary, path);
     }
     finally {
         await removeIfPresent(temporary);
@@ -60,10 +70,10 @@ function isProcessAlive(pid) {
         throw error;
     }
 }
-function parseSessionSyncLock(value) {
+function parseLeaseRow(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return undefined;
-    const { pid, token, startedAt } = value;
+    const { pid, token, started_at: startedAt } = value;
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 ||
         typeof token !== "string" || token.length === 0 ||
         typeof startedAt !== "string" || startedAt.length === 0) {
@@ -71,128 +81,137 @@ function parseSessionSyncLock(value) {
     }
     return { pid, token, startedAt };
 }
-async function readSessionSyncLock(lockPath) {
-    try {
-        const raw = await readFile(lockPath, "utf8");
-        try {
-            return { exists: true, lock: parseSessionSyncLock(JSON.parse(raw)) };
-        }
-        catch {
-            return { exists: true, lock: undefined };
-        }
-    }
-    catch (error) {
-        if (error.code === "ENOENT")
-            return { exists: false };
-        throw error;
-    }
+function isSqliteBusy(error) {
+    if (!(error instanceof Error))
+        return false;
+    const errcode = "errcode" in error && typeof error.errcode === "number" ? error.errcode : undefined;
+    return errcode !== undefined && (errcode & 0xff) === 5;
 }
-async function createExclusiveLockFile(lockPath, lock) {
-    const body = `${JSON.stringify(lock, null, 2)}\n`;
-    const temporary = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-        await writeFile(temporary, body, { encoding: "utf8", flag: "wx", mode: 0o600 });
-        await chmod(temporary, 0o600);
+async function withLeaseBusyRetry(operation) {
+    for (let attempt = 0;; attempt += 1) {
         try {
-            await link(temporary, lockPath);
-            return true;
+            return operation();
         }
         catch (error) {
-            const code = error.code;
-            if (code === "EEXIST")
-                return false;
-            if (code !== "EPERM" && code !== "ENOTSUP" && code !== "ENOSYS" && code !== "EXDEV") {
+            if (!isSqliteBusy(error) || attempt >= MAX_LEASE_BUSY_RETRIES)
                 throw error;
-            }
-            try {
-                await writeFile(lockPath, body, { encoding: "utf8", flag: "wx", mode: 0o600 });
-                await chmod(lockPath, 0o600);
-                return true;
-            }
-            catch (fallbackError) {
-                if (fallbackError.code === "EEXIST")
-                    return false;
-                throw fallbackError;
-            }
+            const backoffMs = Math.min(200, 20 * (attempt + 1));
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
         }
     }
-    finally {
-        await removeIfPresent(temporary);
+}
+function ensurePrivateLeaseFile(lockPath) {
+    const existing = lstatSync(lockPath, { throwIfNoEntry: false });
+    if (existing && !existing.isFile()) {
+        throw new Error("Session sync lock database must be a regular file, not a symlink");
     }
+    const descriptor = openSync(lockPath, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try {
+        fchmodSync(descriptor, 0o600);
+    }
+    finally {
+        closeSync(descriptor);
+    }
+}
+async function withImmediateLeaseTransaction(lockPath, fn) {
+    return await withLeaseBusyRetry(() => {
+        ensurePrivateLeaseFile(lockPath);
+        const db = new DatabaseSync(lockPath);
+        let inTransaction = false;
+        try {
+            db.exec(`PRAGMA busy_timeout = ${LEASE_BUSY_TIMEOUT_MS}; PRAGMA trusted_schema = OFF;`);
+            db.exec("BEGIN IMMEDIATE");
+            inTransaction = true;
+            db.exec(LEASE_SCHEMA_SQL);
+            const { commit, value } = fn(db);
+            db.exec(commit ? "COMMIT" : "ROLLBACK");
+            inTransaction = false;
+            return value;
+        }
+        catch (error) {
+            if (inTransaction) {
+                try {
+                    db.exec("ROLLBACK");
+                }
+                catch {
+                    // Transaction may already be rolled back by SQLite.
+                }
+            }
+            throw error;
+        }
+        finally {
+            db.close();
+        }
+    });
+}
+async function readSessionSyncLock(lockPath) {
+    const stat = lstatSync(lockPath, { throwIfNoEntry: false });
+    if (!stat)
+        return { exists: false };
+    if (!stat.isFile()) {
+        throw new Error("Session sync lock database must be a regular file, not a symlink");
+    }
+    return await withLeaseBusyRetry(() => {
+        const db = new DatabaseSync(lockPath, { readOnly: true });
+        try {
+            db.exec(`PRAGMA busy_timeout = ${LEASE_BUSY_TIMEOUT_MS}; PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;`);
+            const table = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_sync_lease'").get();
+            if (!table)
+                return { exists: false };
+            const row = db.prepare("SELECT pid, token, started_at FROM session_sync_lease WHERE id = 1").get();
+            if (!row)
+                return { exists: false };
+            return { exists: true, lock: parseLeaseRow(row) };
+        }
+        finally {
+            db.close();
+        }
+    });
 }
 async function releaseSessionSyncLock(lockPath, token) {
-    const current = await readSessionSyncLock(lockPath);
-    if (!current.exists || current.lock?.token !== token)
+    const existing = lstatSync(lockPath, { throwIfNoEntry: false });
+    if (!existing)
         return;
-    await removeIfPresent(lockPath);
+    await withImmediateLeaseTransaction(lockPath, (db) => {
+        db.prepare("DELETE FROM session_sync_lease WHERE id = 1 AND token = ?").run(token);
+        return { commit: true, value: undefined };
+    });
 }
-async function tryReclaimStaleLock(directory, lockPath, stale, replacement) {
-    const reclaimPath = join(directory, SESSION_SYNC_RECLAIM_LOCK_FILE);
-    const reclaimLock = {
-        pid: process.pid,
-        token: randomUUID(),
-        startedAt: new Date().toISOString(),
-    };
-    let acquiredReclaim = await createExclusiveLockFile(reclaimPath, reclaimLock);
-    if (!acquiredReclaim) {
-        const existingReclaim = await readSessionSyncLock(reclaimPath);
-        if (existingReclaim.exists && (!existingReclaim.lock || !isProcessAlive(existingReclaim.lock.pid))) {
-            await removeIfPresent(reclaimPath);
-            acquiredReclaim = await createExclusiveLockFile(reclaimPath, reclaimLock);
+async function clearStaleSessionSyncLease(lockPath) {
+    const existing = lstatSync(lockPath, { throwIfNoEntry: false });
+    if (!existing)
+        return undefined;
+    return await withImmediateLeaseTransaction(lockPath, (db) => {
+        const row = db.prepare("SELECT pid, token, started_at FROM session_sync_lease WHERE id = 1").get();
+        if (!row)
+            return { commit: false, value: undefined };
+        const current = parseLeaseRow(row);
+        if (current && isProcessAlive(current.pid)) {
+            return { commit: false, value: current };
         }
-    }
-    if (!acquiredReclaim)
-        return "busy";
-    try {
-        const current = await readSessionSyncLock(lockPath);
-        if (!current.exists) {
-            if (replacement && await createExclusiveLockFile(lockPath, replacement))
-                return "acquired";
-            return "reclaimed";
-        }
-        if (current.lock && isProcessAlive(current.lock.pid)) {
-            return "busy";
-        }
-        if (stale && current.lock && current.lock.token !== stale.token) {
-            return "busy";
-        }
-        await removeIfPresent(lockPath);
-        if (replacement && await createExclusiveLockFile(lockPath, replacement))
-            return "acquired";
-        return "reclaimed";
-    }
-    finally {
-        await releaseSessionSyncLock(reclaimPath, reclaimLock.token).catch(() => undefined);
-    }
+        db.prepare("DELETE FROM session_sync_lease WHERE id = 1").run();
+        return { commit: true, value: undefined };
+    });
 }
 async function acquireSessionSyncLock(directory, startedAt) {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     const lockPath = join(directory, SESSION_SYNC_LOCK_FILE);
     const candidate = {
         pid: process.pid,
         token: randomUUID(),
         startedAt,
     };
-    for (let attempt = 0; attempt < MAX_LOCK_ATTEMPTS; attempt += 1) {
-        if (await createExclusiveLockFile(lockPath, candidate)) {
-            return { acquired: true, lock: candidate, lockPath };
+    const acquisition = await withImmediateLeaseTransaction(lockPath, (db) => {
+        const row = db.prepare("SELECT pid, token, started_at FROM session_sync_lease WHERE id = 1").get();
+        const existing = parseLeaseRow(row);
+        if (existing && isProcessAlive(existing.pid)) {
+            return { commit: false, value: { acquired: false, owner: existing } };
         }
-        const existing = await readSessionSyncLock(lockPath);
-        if (!existing.exists)
-            continue;
-        if (existing.lock && isProcessAlive(existing.lock.pid)) {
-            return { acquired: false, owner: existing.lock };
-        }
-        const outcome = await tryReclaimStaleLock(directory, lockPath, existing.lock, candidate);
-        if (outcome === "acquired") {
-            return { acquired: true, lock: candidate, lockPath };
-        }
-    }
-    const existing = await readSessionSyncLock(lockPath);
-    if (existing.exists && existing.lock && isProcessAlive(existing.lock.pid)) {
-        return { acquired: false, owner: existing.lock };
-    }
-    throw new Error(`could not acquire session sync lock in ${directory}`);
+        db.prepare("INSERT OR REPLACE INTO session_sync_lease (id, pid, token, started_at) VALUES (1, ?, ?, ?)").run(candidate.pid, candidate.token, candidate.startedAt);
+        return { commit: true, value: { acquired: true, lock: candidate, lockPath } };
+    });
+    await fs.chmod(lockPath, 0o600);
+    return acquisition;
 }
 function runningStatusFromReceipt(status, startedAt) {
     return status?.status === "running" && status.startedAt === startedAt
@@ -211,12 +230,9 @@ export async function recoverInterruptedSessionSync(directory, statusPath, stale
             return { status: "idle" };
         if (current.status !== "running")
             return current;
-        if (current.startedAt !== stale.startedAt) {
-            return { status: "running", phase: current.phase, startedAt: current.startedAt };
-        }
         const failed = {
             status: "failed",
-            startedAt: stale.startedAt,
+            startedAt: current.startedAt,
             completedAt: new Date().toISOString(),
             error: "session sync interrupted by Gateway restart",
         };
@@ -236,9 +252,15 @@ export class QmdMemoryRuntime {
     #managers = new Map();
     #closingManagers = new Map();
     #activeSessionSyncs = new Map();
+    #pendingSessionSyncStarts = new Set();
+    #closing = false;
+    #closed = false;
+    #closePromise;
     #sessionSyncTimer;
     startSessionSyncSchedule(cfg, onError) {
         this.stopSessionSyncSchedule();
+        if (this.#closing || this.#closed)
+            return;
         const sessions = this.#corpora.find((corpus) => corpus.kind === "sessions");
         if (!sessions?.syncIntervalMinutes)
             return;
@@ -263,6 +285,9 @@ export class QmdMemoryRuntime {
     }
     async getMemorySearchManager(params) {
         while (true) {
+            if (this.#closing || this.#closed) {
+                return { manager: null, error: "memory runtime is closing" };
+            }
             const closing = this.#closingManagers.get(params.agentId);
             if (closing) {
                 await closing.catch(() => undefined);
@@ -274,7 +299,11 @@ export class QmdMemoryRuntime {
                 this.#managers.set(params.agentId, pending);
             }
             try {
-                return { manager: await pending };
+                const manager = await pending;
+                if (this.#closing || this.#closed) {
+                    return { manager: null, error: "memory runtime is closing" };
+                }
+                return { manager };
             }
             catch (error) {
                 if (this.#managers.get(params.agentId) === pending)
@@ -287,19 +316,38 @@ export class QmdMemoryRuntime {
         return { backend: "builtin" };
     }
     classifyWorkspaceMemoryPaths = classifyWorkspaceMemoryPaths;
-    async startSessionSync(params, force = false) {
+    startSessionSync(params, force = false) {
+        if (this.#closing || this.#closed) {
+            return Promise.resolve({
+                status: "unavailable",
+                error: "memory runtime is closing",
+            });
+        }
         if (!this.#corpora.some((corpus) => corpus.kind === "sessions")) {
-            return {
+            return Promise.resolve({
                 status: "unavailable",
                 error: 'memory session sync requires a configured "sessions" corpus',
-            };
+            });
         }
+        const pending = this.#startSessionSync(params, force);
+        this.#pendingSessionSyncStarts.add(pending);
+        const cleanup = () => {
+            this.#pendingSessionSyncStarts.delete(pending);
+        };
+        pending.then(cleanup, cleanup);
+        return pending;
+    }
+    async #startSessionSync(params, force) {
         const directory = this.#stateDir(params.agentId);
         const statusPath = join(directory, SESSION_SYNC_STATUS_FILE);
         const startedAt = new Date().toISOString();
         const acquired = await acquireSessionSyncLock(directory, startedAt);
         if (!acquired.acquired) {
             return { status: "already_running", startedAt: acquired.owner.startedAt };
+        }
+        if (this.#closing || this.#closed) {
+            await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
+            return { status: "unavailable", error: "memory runtime is closing" };
         }
         try {
             await atomicWriteJson(statusPath, {
@@ -313,6 +361,21 @@ export class QmdMemoryRuntime {
             await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
             throw error;
         }
+        if (this.#closing || this.#closed) {
+            try {
+                await atomicWriteJson(statusPath, {
+                    status: "failed",
+                    startedAt,
+                    completedAt: new Date().toISOString(),
+                    error: "memory runtime is closing",
+                });
+            }
+            catch {
+                // Best effort: the next status read recovers any remaining running receipt.
+            }
+            await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
+            return { status: "unavailable", error: "memory runtime is closing" };
+        }
         const run = this.#runSessionSync(params, force, {
             directory,
             statusPath,
@@ -321,11 +384,12 @@ export class QmdMemoryRuntime {
             startedAt,
         });
         this.#activeSessionSyncs.set(directory, run);
-        void run.finally(() => {
+        const cleanupRun = () => {
             if (this.#activeSessionSyncs.get(directory) === run) {
                 this.#activeSessionSyncs.delete(directory);
             }
-        });
+        };
+        run.then(cleanupRun, cleanupRun);
         return { status: "started", startedAt };
     }
     async #runSessionSync(params, force, run) {
@@ -389,11 +453,10 @@ export class QmdMemoryRuntime {
             return await recoverInterruptedSessionSync(directory, statusPath, status);
         }
         if (lockState.exists) {
-            await tryReclaimStaleLock(directory, lockPath, lockState.lock);
-            const refreshedLock = await readSessionSyncLock(lockPath);
-            if (refreshedLock.exists && refreshedLock.lock && isProcessAlive(refreshedLock.lock.pid)) {
+            const liveOwner = await clearStaleSessionSyncLease(lockPath);
+            if (liveOwner) {
                 const refreshedStatus = await readJson(statusPath);
-                return runningStatusFromReceipt(refreshedStatus, refreshedLock.lock.startedAt);
+                return runningStatusFromReceipt(refreshedStatus, liveOwner.startedAt);
             }
             const refreshedStatus = await readJson(statusPath);
             if (refreshedStatus?.status === "running") {
@@ -404,8 +467,11 @@ export class QmdMemoryRuntime {
         return status ?? { status: "idle" };
     }
     async #drainSessionSyncs() {
-        while (this.#activeSessionSyncs.size > 0) {
-            await Promise.allSettled([...this.#activeSessionSyncs.values()]);
+        while (this.#pendingSessionSyncStarts.size > 0 || this.#activeSessionSyncs.size > 0) {
+            await Promise.allSettled([
+                ...this.#pendingSessionSyncStarts,
+                ...this.#activeSessionSyncs.values(),
+            ]);
         }
     }
     async closeMemorySearchManager(params) {
@@ -465,7 +531,20 @@ export class QmdMemoryRuntime {
         await Promise.all([...agentIds].map((agentId) => this.closeMemorySearchManager({ agentId })));
     }
     async close() {
-        await this.closeAllMemorySearchManagers();
+        if (this.#closePromise)
+            return this.#closePromise;
+        this.#closing = true;
+        const closing = (async () => {
+            try {
+                await this.closeAllMemorySearchManagers();
+            }
+            finally {
+                this.#closed = true;
+                this.#closing = false;
+            }
+        })();
+        this.#closePromise = closing;
+        return closing;
     }
     async searchSkills(params, query, minScore, limit) {
         const { manager, error } = await this.getMemorySearchManager(params);

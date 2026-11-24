@@ -397,12 +397,17 @@ export class PeopleStore {
         this.#ensureDossierVerification();
         const row = this.#db
             .prepare(`
-        SELECT 1 FROM person_dossier_verification v
-        WHERE v.person_id = ?
-          AND v.revision = (
-            SELECT c.id FROM person_dossier_changes c
-            WHERE c.person_id = v.person_id
-            ORDER BY c.rowid DESC
+        SELECT 1
+        FROM person_dossiers d
+        JOIN person_dossier_verification v ON v.person_id = d.person_id
+        JOIN person_dossier_changes c ON c.person_id = d.person_id AND c.id = v.revision
+        WHERE d.person_id = ?
+          AND c.action = 'replace'
+          AND c.after_dossier_json = d.dossier_json
+          AND c.id = (
+            SELECT latest.id FROM person_dossier_changes latest
+            WHERE latest.person_id = d.person_id
+            ORDER BY latest.rowid DESC
             LIMIT 1
           )
       `)
@@ -416,11 +421,14 @@ export class PeopleStore {
         SELECT d.dossier_json, d.reviewed_at
         FROM person_dossiers d
         JOIN person_dossier_verification v ON v.person_id = d.person_id
+        JOIN person_dossier_changes c ON c.person_id = d.person_id AND c.id = v.revision
         WHERE d.person_id = ?
-          AND v.revision = (
-            SELECT c.id FROM person_dossier_changes c
-            WHERE c.person_id = d.person_id
-            ORDER BY c.rowid DESC
+          AND c.action = 'replace'
+          AND c.after_dossier_json = d.dossier_json
+          AND c.id = (
+            SELECT latest.id FROM person_dossier_changes latest
+            WHERE latest.person_id = d.person_id
+            ORDER BY latest.rowid DESC
             LIMIT 1
           )
       `)
@@ -437,15 +445,18 @@ export class PeopleStore {
         this.#ensureDossierVerification();
         const now = new Date().toISOString();
         immediateTransaction(this.#db, () => {
-            if (this.getDossierRevision(personId) !== revision)
+            const latestChange = this.#db
+                .prepare("SELECT id, action, after_dossier_json FROM person_dossier_changes WHERE person_id = ? ORDER BY rowid DESC LIMIT 1")
+                .get(personId);
+            if ((latestChange?.id ?? null) !== revision)
+                throw new DossierConflictError();
+            const existing = this.#db
+                .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
+                .get(personId);
+            if (!existing)
                 throw new DossierConflictError();
             let verifiedRevision = revision;
             if (verifiedRevision === null) {
-                const existing = this.#db
-                    .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
-                    .get(personId);
-                if (!existing)
-                    throw new DossierConflictError();
                 // Pre-v4 dossiers have no change revision. Establish a baseline snapshot
                 // without rewriting their data or pretending the old write happened now.
                 verifiedRevision = this.#insertDossierChange({
@@ -456,6 +467,11 @@ export class PeopleStore {
                     reason: "Legacy baseline after complete source validation",
                     changedAt: now,
                 });
+            }
+            else if (!latestChange ||
+                latestChange.action !== "replace" ||
+                latestChange.after_dossier_json !== existing.dossier_json) {
+                throw new DossierConflictError();
             }
             this.#upsertDossierVerification(personId, verifiedRevision, normalizedVerification, now);
         });

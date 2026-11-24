@@ -11,6 +11,11 @@ function identifier(value) {
 function promptIdentityKey(sessionKey, accountScope, externalId) {
     return JSON.stringify([sessionKey, accountScope, externalId]);
 }
+function matchesPendingMessage(pending, threadKey, messageId) {
+    return (messageId !== undefined &&
+        pending.threadKey === threadKey &&
+        pending.messageId === messageId);
+}
 function resolveSlackThreadKey(event, accountScope, conversationId, sessionKey) {
     const threadRootId = identifier(event.threadId) ?? nonBlank(event.replyToId);
     const rootMessageId = threadRootId ?? nonBlank(event.messageId);
@@ -29,14 +34,14 @@ function getFreshCorrelation(map, key, now) {
     }
     return entry;
 }
-function setBoundedCorrelation(map, key, threadKey, now) {
+function setBoundedCorrelation(map, key, threadKey, now, messageId) {
     map.delete(key);
     for (const [existingKey, entry] of map) {
         if (now - entry.observedAt <= CORRELATION_TTL_MS)
             break;
         map.delete(existingKey);
     }
-    map.set(key, { threadKey, observedAt: now });
+    map.set(key, { threadKey, messageId, observedAt: now });
     while (map.size > MAX_CORRELATION_ENTRIES) {
         const oldest = map.keys().next().value;
         if (oldest === undefined)
@@ -77,14 +82,26 @@ export function registerPeopleHooks(api, stores, config) {
             const threadKey = resolveSlackThreadKey(event, accountScope, conversationId, sessionKey);
             if (threadKey) {
                 const now = Date.now();
+                const messageId = nonBlank(event.messageId) ?? identifier(event.metadata?.messageId);
+                const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
                 if (runId) {
-                    setBoundedCorrelation(threadByRun, runId, threadKey, now);
+                    setBoundedCorrelation(threadByRun, runId, threadKey, now, messageId);
+                    const pending = pendingThreadByIdentity.get(identityKey);
+                    if (pending &&
+                        (now - pending.observedAt > CORRELATION_TTL_MS ||
+                            matchesPendingMessage(pending, threadKey, messageId))) {
+                        pendingThreadByIdentity.delete(identityKey);
+                    }
                 }
                 else {
-                    const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
                     const pending = getFreshCorrelation(pendingThreadByIdentity, identityKey, now);
                     const nextThreadKey = pending === undefined || pending.threadKey === threadKey ? threadKey : null;
-                    setBoundedCorrelation(pendingThreadByIdentity, identityKey, nextThreadKey, now);
+                    const nextMessageId = nextThreadKey === null
+                        ? undefined
+                        : pending === undefined || pending.messageId === messageId
+                            ? messageId
+                            : undefined;
+                    setBoundedCorrelation(pendingThreadByIdentity, identityKey, nextThreadKey, now, nextMessageId);
                 }
             }
         }
@@ -136,7 +153,8 @@ export function registerPeopleHooks(api, stores, config) {
             threadKey = mapped.threadKey;
             const pending = pendingThreadByIdentity.get(identityKey);
             if (pending &&
-                (now - pending.observedAt > CORRELATION_TTL_MS || pending.threadKey === mapped.threadKey)) {
+                (now - pending.observedAt > CORRELATION_TTL_MS ||
+                    matchesPendingMessage(pending, mapped.threadKey, mapped.messageId))) {
                 pendingThreadByIdentity.delete(identityKey);
             }
         }
@@ -145,7 +163,7 @@ export function registerPeopleHooks(api, stores, config) {
             pendingThreadByIdentity.delete(identityKey);
             threadKey = pending?.threadKey;
             if (typeof threadKey === "string") {
-                setBoundedCorrelation(threadByRun, runId, threadKey, now);
+                setBoundedCorrelation(threadByRun, runId, threadKey, now, pending?.messageId);
             }
         }
         if (!threadKey)

@@ -139,7 +139,8 @@ function readSnapshot(params) {
             const sourceFingerprint = JSON.stringify(window);
             fingerprints.set(window.sessionId, sourceFingerprint);
             const entryProjectionKey = previous?.projectionKey ?? params.previousManifest.projectionKey;
-            const unchanged = !window.cold && !params.force &&
+            const previouslyFailed = params.previousManifest.failedSessions?.[window.sessionId] !== undefined;
+            const unchanged = !window.cold && !params.force && !previouslyFailed &&
                 (previous
                     ? entryProjectionKey === params.currentProjectionKey &&
                         previous.sourceFingerprint === sourceFingerprint &&
@@ -182,7 +183,8 @@ export async function unchangedSessionSync(params, indexPath) {
     const manifest = await readSessionManifest(params.manifestPath);
     const currentProjectionKey = projectionKey(params);
     if (!manifest.lastSuccessfulSyncAt || manifest.projectionKey !== currentProjectionKey ||
-        !manifest.indexSignature || manifest.indexSignature !== sessionIndexSignature(indexPath))
+        !manifest.indexSignature || manifest.indexSignature !== sessionIndexSignature(indexPath) ||
+        Object.keys(manifest.failedSessions ?? {}).length > 0)
         return;
     const snapshot = readSnapshot({
         ...params,
@@ -220,7 +222,27 @@ export async function readSessionManifest(path) {
         typeof manifest.sessions !== "object" || Array.isArray(manifest.sessions)) {
         throw new Error(`unsupported unblock-memory session manifest: ${path}`);
     }
-    return manifest;
+    const parsed = { ...manifest };
+    if (manifest.failedSessions !== undefined) {
+        if (!manifest.failedSessions || typeof manifest.failedSessions !== "object" || Array.isArray(manifest.failedSessions)) {
+            delete parsed.failedSessions;
+        }
+        else {
+            const validFailed = {};
+            for (const [sessionId, fingerprint] of Object.entries(manifest.failedSessions)) {
+                if (sessionId.length > 0 && typeof fingerprint === "string") {
+                    validFailed[sessionId] = fingerprint;
+                }
+            }
+            if (Object.keys(validFailed).length > 0) {
+                parsed.failedSessions = validFailed;
+            }
+            else {
+                delete parsed.failedSessions;
+            }
+        }
+    }
+    return parsed;
 }
 async function atomicWrite(path, content, mode) {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -368,6 +390,7 @@ export async function syncSessionProjections(params) {
     });
     const sessions = {};
     const ignoredSessions = {};
+    const failedSessions = {};
     const counts = { unchanged: 0, updated: 0, removed: 0, skipped: 0, failed: 0 };
     const diagnostics = { internalMessagesCleaned: 0, attachmentsCleaned: 0, attachmentBudgetSkipped: 0 };
     await mkdir(params.outputDir, { recursive: true, mode: 0o700 });
@@ -389,6 +412,7 @@ export async function syncSessionProjections(params) {
         });
         if (outcome.kind === "failed") {
             counts.failed += 1;
+            failedSessions[window.sessionId] = snapshot.fingerprints.get(window.sessionId);
             if (outcome.session)
                 sessions[window.sessionId] = outcome.session;
         }
@@ -446,6 +470,7 @@ export async function syncSessionProjections(params) {
         projectionKey: manifestProjectionKey,
         indexSignature,
         ignoredSessions,
+        ...(Object.keys(failedSessions).length ? { failedSessions } : {}),
         sessions,
     };
     await atomicWrite(params.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 0o600);

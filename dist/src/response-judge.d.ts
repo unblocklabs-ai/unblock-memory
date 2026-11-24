@@ -197,6 +197,7 @@ type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
     begin: (stages: JudgeStage[]) => void;
     save: <K extends JudgeStage>(stage: K, result: ResponseStages[K]) => void;
 };
+export declare function validateCachedStage<K extends keyof ResponseStages>(stage: K, value: unknown): ResponseStages[K];
 /** Separate requests are deliberate: later feedback must not leak into the original quality grade. */
 export declare function judgeResponse(episode: ResponseEpisode, params: ResponseJudgeParams, sentimentEnabled?: boolean, cache?: StageCache): Promise<ResponseJudgment>;
 /** Later evidence is kept in a third request and never changes the original grade. */

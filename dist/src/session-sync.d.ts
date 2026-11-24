@@ -20,6 +20,7 @@ export type SessionManifest = {
     projectionKey?: string;
     indexSignature?: string;
     ignoredSessions?: Record<string, string>;
+    failedSessions?: Record<string, string>;
     sessions: Record<string, IndexedSession>;
 };
 export type SessionSyncResult = {

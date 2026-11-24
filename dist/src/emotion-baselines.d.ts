@@ -110,7 +110,7 @@ export declare function emotionBaselineHistory(db: DatabaseSync, options?: {
     cumulative: Summary;
 }[];
 /**
- * Fingerprint of refresh inputs only (settings, current week, People tables, and grades).
+ * Fingerprint of refresh inputs only (settings, current week, People tables, grades, and purge generations).
  * Excludes derived output tables so a refresh can verify inputs stayed stable across a pass
  * before certifying its post-pass fingerprint.
  */
@@ -119,8 +119,19 @@ export declare function baselineInputFingerprint(db: DatabaseSync, options: {
     now: number;
 }): string;
 /**
- * Changes whenever a refresh input could: grades, links, people, stored results, the current week,
- * grades crossing `now`, or settings. Equal fingerprints mean a refresh would write nothing.
+ * Computes both input and full fingerprints inside one consistent SQLite read snapshot so
+ * post-pass certification never rescans inputs or mixes pre- and post-commit state.
+ */
+export declare function baselineFingerprints(db: DatabaseSync, options: {
+    minInteractions: number;
+    now: number;
+}): {
+    inputFingerprint: string;
+    fullFingerprint: string;
+};
+/**
+ * Changes whenever a refresh input could: grades, links, people, purge generations, stored results,
+ * the current week, grades crossing `now`, or settings. Equal fingerprints mean a refresh would write nothing.
  */
 export declare function baselineFingerprint(db: DatabaseSync, options: {
     minInteractions: number;

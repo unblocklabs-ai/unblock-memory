@@ -146,11 +146,37 @@ const retrospectiveSchema = Type.Object({
     outcome: choiceSchema(outcomes),
     reason: choiceSchema(outcomeReasons),
 });
+const retrospectiveStageSchema = Type.Object({
+    status: Type.Enum(["pending", "complete", "partial", "unavailable", "oversized"]),
+    judgment: Type.Union([retrospectiveSchema, Type.Null()]),
+});
+const memoryCandidateSchema = Type.Object({
+    path: Type.String(),
+    hash: Type.String(),
+    usefulness: probability,
+    basis: Type.String(),
+});
+const memoryStageSchema = Type.Array(memoryCandidateSchema);
+function qualityFields({ taskType, assessability, fitAssessability, underdelivery, failureReason, fulfillment, deliverableFit, consistency, }) {
+    return {
+        taskType,
+        assessability,
+        fitAssessability,
+        underdelivery,
+        failureReason,
+        fulfillment,
+        deliverableFit,
+        consistency,
+    };
+}
 function feedbackBaseFields({ feedbackType, target, avoidableRework, repeatedConstraint, memoryGap }) {
     return { feedbackType, target, avoidableRework, repeatedConstraint, memoryGap };
 }
 function sentimentFields({ sentiment, annoyance, frustration, dissatisfactionIntensity }) {
     return { sentiment, annoyance, frustration, dissatisfactionIntensity };
+}
+function retrospectiveFields({ correction, deliveryAdmission, regression, scopeClarification, outcome, reason, }) {
+    return { correction, deliveryAdmission, regression, scopeClarification, outcome, reason };
 }
 function validateDistributions(answers) {
     for (const answer of Object.values(answers)) {
@@ -169,8 +195,9 @@ function validateDistributions(answers) {
 function validateCachedQuality(value) {
     if (!Value.Check(qualitySchema, value))
         throw new Error("Invalid cached response quality judgment");
-    validateDistributions(value);
-    return value;
+    const picked = qualityFields(value);
+    validateDistributions(picked);
+    return picked;
 }
 function validateCachedFeedback(value) {
     if (!Value.Check(feedbackSchema, value))
@@ -185,6 +212,28 @@ function validateCachedSentiment(value) {
     const picked = sentimentFields(value);
     validateDistributions(picked);
     return picked;
+}
+function validateCachedRetrospective(value) {
+    if (!Value.Check(retrospectiveStageSchema, value))
+        throw new Error("Invalid cached response retrospective judgment");
+    const judgment = value.judgment ? retrospectiveFields(value.judgment) : null;
+    if (judgment)
+        validateDistributions(judgment);
+    return { status: value.status, judgment };
+}
+function validateCachedMemory(value) {
+    if (!Value.Check(memoryStageSchema, value))
+        throw new Error("Invalid cached response memory judgment");
+    return value.map(({ path, hash, usefulness, basis }) => ({ path, hash, usefulness, basis }));
+}
+export function validateCachedStage(stage, value) {
+    switch (stage) {
+        case "quality": return validateCachedQuality(value);
+        case "feedback": return validateCachedFeedback(value);
+        case "sentiment": return validateCachedSentiment(value);
+        case "retrospective": return validateCachedRetrospective(value);
+        case "memory": return validateCachedMemory(value);
+    }
 }
 function toFourLevelScore(answer) {
     return {

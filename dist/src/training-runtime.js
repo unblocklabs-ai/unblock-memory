@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fsyncSync, linkSync, lstatSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
@@ -28,7 +28,7 @@ function existsError(path) {
     return error;
 }
 /** Write JSONL to a private same-filesystem temp file and publish atomically without overwriting. */
-export function writeTrainingExportJsonl(output, data) {
+export function writeTrainingExportJsonl(output, data, link = linkSync) {
     if (pathExists(output))
         throw existsError(output);
     const tempPath = join(dirname(output), `.${basename(output)}.${process.pid}.${randomUUID()}.tmp`);
@@ -36,6 +36,7 @@ export function writeTrainingExportJsonl(output, data) {
     let rows = 0;
     let closed = false;
     try {
+        fchmodSync(fd, 0o600);
         for (const row of data) {
             writeSync(fd, JSON.stringify(row) + "\n");
             rows++;
@@ -44,15 +45,18 @@ export function writeTrainingExportJsonl(output, data) {
         closeSync(fd);
         closed = true;
         try {
-            linkSync(tempPath, output);
+            link(tempPath, output);
         }
         catch (error) {
             const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-            if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EXDEV")
-                throw error;
-            if (pathExists(output))
+            if (code === "EEXIST")
                 throw existsError(output);
-            renameSync(tempPath, output);
+            if (code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS" || code === "EXDEV") {
+                const unsupported = new Error(`Atomic no-overwrite export requires filesystem hardlink support (${code}): '${output}'`, { cause: error });
+                unsupported.code = code;
+                throw unsupported;
+            }
+            throw error;
         }
         return rows;
     }
@@ -62,7 +66,7 @@ export function writeTrainingExportJsonl(output, data) {
         try {
             unlinkSync(tempPath);
         }
-        catch { /* already renamed or removed */ }
+        catch { /* already removed */ }
     }
 }
 function thresholdOption(value) {

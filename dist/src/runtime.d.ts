@@ -53,11 +53,11 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         cfg: OpenClawConfig;
         agentId: string;
     }): Promise<{
-        manager: QmdMemoryManager;
-        error?: undefined;
-    } | {
         manager: null;
         error: string;
+    } | {
+        manager: QmdMemoryManager;
+        error?: undefined;
     }>;
     resolveMemoryBackendConfig(): {
         backend: "builtin";

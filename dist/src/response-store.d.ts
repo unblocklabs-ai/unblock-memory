@@ -1,5 +1,5 @@
 import type { ResponseEpisode } from "./response-episodes.js";
-import type { ResponseJudgment, ResponseStages, judgeMemoryOpportunity, judgeResponseFollowup } from "./response-judge.js";
+import { type ResponseJudgment, type ResponseStages, type judgeMemoryOpportunity, type judgeResponseFollowup } from "./response-judge.js";
 import { responseOutcome } from "./response-outcome.js";
 import type { ResponseHuman } from "./response-identity.js";
 import { ResponseReviews } from "./response-reviews.js";

@@ -114,8 +114,7 @@ async function captureSourceSessions(stateDir: string, chatTypes: readonly ChatT
   assertFileExists(indexPath, "No QMD index; sync sessions before evaluating training queries");
   assertFileExists(manifestPath, "No session manifest; sync sessions before evaluating training queries");
   const manifest = await readSessionManifest(manifestPath);
-  const failedSessions = (manifest as { failedSessions?: Record<string, string> }).failedSessions;
-  if (failedSessions && typeof failedSessions === "object" && Object.keys(failedSessions).length > 0) {
+  if (manifest.failedSessions && Object.keys(manifest.failedSessions).length > 0) {
     throw new HistoricalCorpusUnavailableError("Session manifest has unavailable/failed sessions; sync sessions before evaluating training queries");
   }
   const source = resolveSessionSource(join(stateDir, "sessions"), chatTypes);
