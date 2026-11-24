@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import type { ResponseEpisode } from "./response-episodes.js";
-import type { ResponseJudgment, ResponseStages, judgeMemoryOpportunity, judgeResponseFollowup } from "./response-judge.js";
+import { validateCachedStage, type ResponseJudgment, type ResponseStages, type judgeMemoryOpportunity, type judgeResponseFollowup } from "./response-judge.js";
 import { responseOutcome, RESPONSE_REPORT_VERSION } from "./response-outcome.js";
 import type { ResponseHuman } from "./response-identity.js";
 import { ResponsePeople } from "./response-identity.js";
@@ -183,11 +183,23 @@ export class ResponseAuditStore {
       .get(cohort, since, until)!.n);
   }
   stage<K extends keyof ResponseStages>(cohort: string, e: ResponseEpisode, stage: K, key: string): ResponseStages[K] | undefined {
-    this.#db.prepare("INSERT OR IGNORE INTO response_stages(key,stage) VALUES(?,?)").run(key, stage);
-    this.#db.prepare(`INSERT INTO response_stage_links VALUES(?,?,?,?,?) ON CONFLICT(cohort,episode_id,stage)
-      DO UPDATE SET input_hash=excluded.input_hash,key=excluded.key`).run(cohort, e.id, e.inputHash, stage, key);
-    const row = this.#db.prepare("SELECT result FROM response_stages WHERE key=? AND status='ok'").get(key);
-    return row ? JSON.parse(String(row.result)) as ResponseStages[K] : undefined;
+    return immediateTransaction(this.#db, () => {
+      this.#db.prepare("INSERT OR IGNORE INTO response_stages(key,stage) VALUES(?,?)").run(key, stage);
+      this.#db.prepare(`INSERT INTO response_stage_links VALUES(?,?,?,?,?) ON CONFLICT(cohort,episode_id,stage)
+        DO UPDATE SET input_hash=excluded.input_hash,key=excluded.key`).run(cohort, e.id, e.inputHash, stage, key);
+      const row = this.#db.prepare("SELECT result FROM response_stages WHERE key=? AND status='ok'").get(key);
+      if (!row) return undefined;
+      try {
+        if (typeof row.result !== "string") throw new Error("Missing cached response stage payload");
+        return validateCachedStage(stage, JSON.parse(row.result));
+      } catch {
+        // Evict only this corrupted cached stage so valid siblings remain cached and this stage can recompute cleanly.
+        this.#db.prepare(`UPDATE response_stages
+          SET status='pending',attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL
+          WHERE key=? AND status='ok'`).run(key);
+        return undefined;
+      }
+    });
   }
   stageBegin(keys: string[], now: number) {
     immediateTransaction(this.#db, () => {
@@ -215,7 +227,7 @@ export class ResponseAuditStore {
         SET attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL,status='pending'
         WHERE cohort=? AND active=1 AND (
           status!='ok'
-          OR (NOT (status='ok' AND json_extract(result,'$.memory.status')='unavailable') AND EXISTS (
+          OR (NOT (status='ok' AND COALESCE(json_extract(result,'$.memory.status'),'')='unavailable') AND EXISTS (
             SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
             WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
               AND (s.status IS NULL OR s.status!='ok')

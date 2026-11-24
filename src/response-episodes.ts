@@ -6,7 +6,7 @@ import { responseUserText } from "./response-text.js";
 import { jsonHash } from "./json-hash.js";
 import { record } from "./guards.js";
 
-export const RESPONSE_EXTRACTOR_VERSION = 6;
+export const RESPONSE_EXTRACTOR_VERSION = 7;
 const MAX_EVENTS = 2000, MAX_SESSION_BYTES = 2_000_000, MAX_EPISODE_CHARS = 24_000;
 type Row = { seq: number; eventJson: string; createdAt: number };
 export type ResponseSession = { sessionId: string; accountId: string; chatType: string; conversationId: string };

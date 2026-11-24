@@ -6,9 +6,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { resolveConfig } from "../src/config.js";
-import { responseEpisodes, ResponseTranscriptReader } from "../src/response-episodes.js";
+import { RESPONSE_EXTRACTOR_VERSION, responseEpisodes, ResponseTranscriptReader } from "../src/response-episodes.js";
 import { auditResponses, responseCohort } from "../src/response-audit.js";
-import { judgeResponse, judgeResponseFollowup, judgeMemoryOpportunity } from "../src/response-judge.js";
+import {
+  judgeResponse,
+  judgeResponseFollowup,
+  judgeMemoryOpportunity,
+  RESPONSE_STAGE_VERSIONS,
+  responseRubricVersion,
+} from "../src/response-judge.js";
+import { jsonHash } from "../src/json-hash.js";
 import { responseUserText } from "../src/response-text.js";
 import { ResponseAuditStore } from "../src/response-store.js";
 import { responseOutcome } from "../src/response-outcome.js";
@@ -1347,4 +1354,345 @@ test("later non-terminal assistant events preserve current.final and errored nex
     assert.equal(out.coverage.completedResponses, 1);
     assert.equal(out.coverage.pendingFeedback, 1);
   }
+});
+
+test("corrupted persisted ok stage rows are invalidated and recomputed across all stages while preserving valid siblings", async t => {
+  const start = Date.UTC(2026, 8, 22, 12, 0, 0);
+  t.mock.timers.enable({ apis: ["Date"], now: start });
+  const { db, options } = await fixture(); t.after(() => db.close());
+  const root = join(options.storePath, "..");
+  const source = resolveSource(root, "memory/**/*.md");
+  const indexDb = new DatabaseSync(options.indexPath); t.after(() => indexDb.close());
+  indexDb.exec(`CREATE TABLE documents(id INTEGER PRIMARY KEY,collection TEXT,path TEXT,hash TEXT,active INTEGER);
+    CREATE TABLE content(hash TEXT PRIMARY KEY,doc TEXT);
+    CREATE VIRTUAL TABLE documents_fts USING fts5(body);`);
+  indexDb.prepare("INSERT INTO documents VALUES(1,?,?,?,1)").run(source.collection, "1.md", "h1");
+  indexDb.prepare("INSERT INTO content VALUES(?,?)").run("h1", "Brief explanation guidelines for Atlas.");
+  indexDb.prepare("INSERT INTO documents_fts(rowid,body) VALUES(1,?)").run("Brief explanation guidelines for Atlas.");
+
+  const memConfig = resolveConfig({
+    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
+  });
+  const memOptions = { ...options, config: memConfig, sources: [source] };
+  const cohort = responseCohort(memConfig.responseAudit);
+
+  let failProvider = false;
+  const seenRequests: string[][] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    seenRequests.push(Object.keys(body.questions));
+    if (failProvider) throw new Error("transient provider outage");
+    if (body.questions.candidate_0) {
+      return Response.json({ answers: { candidate_0: { type: "noul", noul: 0.85 } } });
+    }
+    const result = payload(body);
+    if (body.questions.memoryGap) result.answers.memoryGap = { type: "noul", noul: 0.95 };
+    return Response.json(result);
+  });
+
+  // Seed all 5 valid stages (quality, feedback, sentiment, retrospective, memory).
+  const initial = await auditResponses(memOptions);
+  assert.equal(initial.status, "ok");
+  assert.equal(initial.coverage?.evaluated, 1);
+
+  const rawDb = new DatabaseSync(memOptions.storePath); t.after(() => rawDb.close());
+  const store = new ResponseAuditStore(memOptions.storePath); t.after(() => store.close());
+  const readStages = () => Object.fromEntries(
+    rawDb.prepare("SELECT stage, key, status, attempts, assessed_at, result FROM response_stages").all()
+      .map(row => [String(row.stage), {
+        key: String(row.key),
+        status: String(row.status),
+        attempts: Number(row.attempts),
+        assessedAt: Number(row.assessed_at),
+        result: String(row.result),
+      }]),
+  );
+  assert.deepEqual(Object.keys(readStages()).sort(), ["feedback", "memory", "quality", "retrospective", "sentiment"]);
+
+  // 1) Corrupted 'quality' stage with provider failure -> invalidated to 'failed' (retryable via retryFailed), siblings preserved.
+  t.mock.timers.tick(5_000);
+  const beforeQuality = readStages();
+  const brokenQuality = JSON.parse(beforeQuality.quality!.result);
+  brokenQuality.fulfillment.probabilities = { "0": 0, "1": 0, "2": 0, "3": 0 };
+  rawDb.prepare("UPDATE response_stages SET status='ok',attempts=3,attempted_at=?,result=? WHERE stage='quality'")
+    .run(Date.now(), JSON.stringify(brokenQuality));
+  rawDb.prepare("UPDATE response_results SET status='pending',attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL").run();
+
+  seenRequests.length = 0;
+  failProvider = true;
+  const failedRun = await auditResponses(memOptions);
+  assert.equal(failedRun.coverage?.failed, 1);
+  assert.equal(failedRun.coverage?.stageAttempts, 1);
+  assert.equal(seenRequests.length, 1);
+  assert.ok(seenRequests[0]!.includes("fulfillment"));
+  // Rejected stage is now 'failed' (not stranded as 'ok'), while valid siblings remain untouched 'ok'.
+  assert.equal(rawDb.prepare("SELECT status FROM response_stages WHERE stage='quality'").get()!.status, "failed");
+  for (const sibling of ["feedback", "sentiment", "retrospective", "memory"]) {
+    const row = rawDb.prepare("SELECT status, assessed_at FROM response_stages WHERE stage=?").get(sibling)!;
+    assert.equal(row.status, "ok");
+    assert.equal(Number(row.assessed_at), beforeQuality[sibling]!.assessedAt);
+  }
+  assert.deepEqual(store.retryFailed(cohort), { stages: 1, episodes: 1 });
+
+  t.mock.timers.tick(5_000);
+  seenRequests.length = 0;
+  failProvider = false;
+  const recoveredQuality = await auditResponses(memOptions);
+  assert.equal(recoveredQuality.coverage?.evaluated, 1);
+  assert.equal(recoveredQuality.coverage?.stageAttempts, 1);
+  assert.equal(recoveredQuality.coverage?.stageCacheHits, 4);
+  assert.equal(seenRequests.length, 1);
+  assert.ok(seenRequests[0]!.includes("fulfillment"));
+  assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 0);
+  for (const sibling of ["feedback", "sentiment", "retrospective", "memory"]) {
+    assert.equal(
+      Number(rawDb.prepare("SELECT assessed_at FROM response_stages WHERE stage=?").get(sibling)!.assessed_at),
+      beforeQuality[sibling]!.assessedAt,
+      `${sibling} must remain cached and untouched while quality recovers`,
+    );
+  }
+
+  // 2) Immediate invalidation and recomputation for feedback, sentiment, retrospective, and memory stages.
+  const corruptions: { stage: "feedback" | "sentiment" | "retrospective" | "memory"; expectedQuestion: string; corrupt: (raw: string) => string }[] = [
+    {
+      stage: "feedback",
+      expectedQuestion: "feedbackType",
+      corrupt(raw) {
+        const parsed = JSON.parse(raw);
+        parsed.target.probabilities = Object.fromEntries(Object.keys(parsed.target.probabilities).map(k => [k, 0]));
+        return JSON.stringify(parsed);
+      },
+    },
+    {
+      stage: "sentiment",
+      expectedQuestion: "dissatisfactionIntensity",
+      corrupt(raw) {
+        const parsed = JSON.parse(raw);
+        parsed.dissatisfactionIntensity.score = 0;
+        return JSON.stringify(parsed);
+      },
+    },
+    {
+      stage: "retrospective",
+      expectedQuestion: "outcome",
+      corrupt(raw) {
+        const parsed = JSON.parse(raw);
+        parsed.judgment.outcome.probabilities = Object.fromEntries(Object.keys(parsed.judgment.outcome.probabilities).map(k => [k, 0]));
+        return JSON.stringify(parsed);
+      },
+    },
+    {
+      stage: "memory",
+      expectedQuestion: "candidate_0",
+      corrupt() {
+        return JSON.stringify([{ path: "qmd://memory/1.md", hash: "h1", usefulness: 2.5, basis: "bad" }]);
+      },
+    },
+  ];
+
+  for (const { stage, expectedQuestion, corrupt } of corruptions) {
+    t.mock.timers.tick(5_000);
+    const before = readStages();
+    rawDb.prepare("UPDATE response_stages SET status='ok',attempts=3,attempted_at=?,result=? WHERE stage=?")
+      .run(Date.now(), corrupt(before[stage]!.result), stage);
+    if (stage === "memory") {
+      // Exercise memory-only retry path where response_results is ok + memory.unavailable.
+      const saved = JSON.parse(String(rawDb.prepare("SELECT result FROM response_results").get()!.result));
+      saved.memory = { status: "unavailable", candidates: [] };
+      rawDb.prepare("UPDATE response_results SET status='ok',attempts=0,attempted_at=NULL,result=?").run(JSON.stringify(saved));
+    } else {
+      rawDb.prepare("UPDATE response_results SET status='pending',attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL").run();
+    }
+
+    seenRequests.length = 0;
+    const recovered = await auditResponses(memOptions);
+    assert.equal(recovered.status, "ok", `${stage} recovery status`);
+    assert.equal(recovered.coverage?.evaluated, 1, `${stage} recovery evaluated`);
+    assert.equal(recovered.coverage?.stageAttempts, 1, `${stage} must recompute only the corrupted stage`);
+    assert.equal(seenRequests.length, 1, `${stage} must make exactly one provider request`);
+    assert.ok(seenRequests[0]!.includes(expectedQuestion), `${stage} request must target ${expectedQuestion}`);
+    assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 0);
+
+    const after = readStages();
+    assert.equal(after[stage]!.status, "ok");
+    assert.ok(after[stage]!.assessedAt > before[stage]!.assessedAt, `${stage} should have a fresh assessed_at`);
+    for (const sibling of Object.keys(before)) {
+      if (sibling === stage) continue;
+      assert.equal(after[sibling]!.assessedAt, before[sibling]!.assessedAt, `${sibling} must be preserved when ${stage} is evicted`);
+    }
+  }
+
+  // 3) Malformed JSON in an ok stage row is also evicted cleanly on direct hydration.
+  const e = responseEpisodes(session, basic(), memConfig.responseAudit).episodes[0]!;
+  const feedbackKey = readStages().feedback!.key;
+  rawDb.prepare("UPDATE response_stages SET status='ok',attempts=2,attempted_at=?,result='{broken-json' WHERE key=?")
+    .run(Date.now(), feedbackKey);
+  assert.equal(store.stage(cohort, e, "feedback", feedbackKey), undefined);
+  const evicted = rawDb.prepare("SELECT status,attempts,attempted_at,assessed_at,result FROM response_stages WHERE key=?").get(feedbackKey)!;
+  assert.equal(evicted.status, "pending");
+  assert.equal(evicted.attempts, 0);
+  assert.equal(evicted.attempted_at, null);
+  assert.equal(evicted.assessed_at, null);
+  assert.equal(evicted.result, null);
+});
+
+test("upgrading RESPONSE_EXTRACTOR_VERSION to 7 re-extracts unchanged v6 checkpoints cleanly without mixing v6 and v7 verdicts", async t => {
+  assert.equal(RESPONSE_EXTRACTOR_VERSION, 7);
+  const root = await mkdtemp(join(tmpdir(), "response-upgrade-v7-"));
+  const databasePath = join(root, "agent.sqlite");
+  const db = createAgentDatabase(databasePath); t.after(() => db.close());
+  insertSession(db, { sessionId: "s", chatType: "direct" });
+  // Transcript with Batch 1 trailing-commentary boundary fix: v6 dropped this episode; v7 extracts it.
+  const transcriptRows = rows([
+    user("Explain the rollout plan."),
+    answer("Here is the rollout plan."),
+    answer("Postscript commentary.", { channel: "commentary", stopReason: "stop" }),
+    user("Thanks, looks good."),
+    answer("Happy to help."),
+  ]);
+  for (const [i, row] of transcriptRows.entries()) {
+    db.prepare("INSERT INTO transcript_events VALUES(?,?,?,?)").run("s", row.seq, row.eventJson, row.createdAt);
+    db.prepare("INSERT INTO session_transcript_active_events VALUES(?,?,?,?)").run("s", i, row.seq, i);
+  }
+  const options = {
+    agentId: "main",
+    config,
+    databasePath,
+    storePath: join(root, "audit/response.sqlite"),
+    indexPath: join(root, "absent.sqlite"),
+    sources: [],
+  };
+
+  const v6Cohort = responseRubricVersion() + ":" + jsonHash({
+    extractor: 6,
+    historyMessages: config.responseAudit.historyMessages,
+    stages: RESPONSE_STAGE_VERSIONS,
+    sentimentEnabled: config.responseAudit.sentimentEnabled,
+    senderIds: [...config.responseAudit.senderIds].sort(),
+    chatTypes: [...config.responseAudit.chatTypes].sort(),
+    memoryCorpora: [...config.responseAudit.memoryCorpora].sort(),
+  }).slice(0, 16);
+  const v7Cohort = responseCohort(config.responseAudit);
+  assert.notEqual(v7Cohort, v6Cohort);
+
+  const v6Revision = jsonHash([
+    6,
+    session,
+    config.responseAudit.historyMessages,
+    [...config.responseAudit.senderIds].sort(),
+    transcriptRows,
+  ]);
+
+  // Direct reader check: a v6 checkpoint revision on the unchanged transcript must NOT short-circuit as unchanged.
+  const reader = new ResponseTranscriptReader(databasePath, "main"); t.after(() => reader.close());
+  const readResult = reader.read(session, config.responseAudit, v6Revision);
+  assert.ok(readResult && !("unchanged" in readResult), "v6 checkpoint revision must force re-extraction under v7");
+  assert.notEqual(readResult.revision, v6Revision);
+  assert.equal(readResult.episodes.length, 1);
+
+  // Seed persisted store with a v6 checkpoint and an old v6 verdict (score = 0) before upgrading to v7.
+  const seedStore = new ResponseAuditStore(options.storePath); t.after(() => seedStore.close());
+  seedStore.checkpointSave(v6Cohort, "s", v6Revision, {
+    completedResponses: 0, eligible: 0, noFeedback: 0, pendingFeedback: 0, oversized: 0, filteredEvents: 0,
+  });
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    calls++;
+    return Response.json(payload(JSON.parse(String(init.body))));
+  });
+  const params = { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal };
+  const sampleEpisode = readResult.episodes[0]!;
+  const legacyJudgment = await judgeResponse(sampleEpisode, params);
+  const legacyRetrospective = await judgeResponseFollowup(sampleEpisode, params);
+  legacyJudgment.quality.fulfillment = { type: "score", score: 0, confidence: 0.95, probabilities: { "0": 1, "1": 0, "2": 0, "3": 0 } };
+  const legacyEpisode = { ...sampleEpisode, id: "legacy-v6-episode", inputHash: "legacy-v6-hash" };
+  seedStore.observe(v6Cohort, "s", [legacyEpisode]);
+  seedStore.save(v6Cohort, legacyEpisode, {
+    ...legacyJudgment,
+    retrospective: legacyRetrospective,
+    references: { sessionId: "s", request: [1], answer: [2], feedback: [4], followup: [5], inputHash: legacyEpisode.inputHash },
+    agentModel: "agent-model",
+    contextLimited: false,
+    memorySearchCalls: 0,
+    memory: { status: "not_requested", candidates: [] },
+  }, Date.now());
+  // Even if a pre-upgrade v6 revision existed on the v7 cohort row, v7 still re-extracts because revision hashes v7.
+  seedStore.checkpointSave(v7Cohort, "s", v6Revision, {
+    completedResponses: 0, eligible: 0, noFeedback: 0, pendingFeedback: 0, oversized: 0, filteredEvents: 0,
+  });
+
+  calls = 0;
+  const upgraded = await auditResponses(options);
+  assert.equal(upgraded.status, "ok");
+  assert.equal(upgraded.cohort, v7Cohort);
+  assert.equal(upgraded.coverage?.extractedSessions, 1);
+  assert.equal(upgraded.coverage?.unchangedSessions, 0);
+  assert.equal(upgraded.coverage?.evaluated, 1);
+  assert.equal(calls, 3);
+
+  // v7 report contains ONLY the newly extracted v7 verdict (score = 3), never mixed with the old v6 verdict (score = 0).
+  const v7Report = seedStore.report(v7Cohort, 0);
+  assert.equal(v7Report.stored, 1);
+  assert.equal(v7Report.groups[0]!.fulfillmentMean, 3);
+  const v6Report = seedStore.report(v6Cohort, 0);
+  assert.equal(v6Report.stored, 1);
+  assert.equal(v6Report.groups[0]!.fulfillmentMean, 0);
+
+  // Subsequent pass on the unchanged transcript now hits the persisted v7 checkpoint cleanly.
+  const steady = await auditResponses(options);
+  assert.equal(steady.coverage?.unchangedSessions, 1);
+  assert.equal(steady.coverage?.extractedSessions, 0);
+  assert.equal(calls, 3);
+});
+
+test("retryFailed resets legacy status=ok rows lacking $.memory.status when linked stages are failed", async t => {
+  const root = await mkdtemp(join(tmpdir(), "response-retry-legacy-"));
+  const storePath = join(root, "response.sqlite");
+  const store = new ResponseAuditStore(storePath); t.after(() => store.close());
+  const rawDb = new DatabaseSync(storePath); t.after(() => rawDb.close());
+  const cohort = responseCohort(config.responseAudit);
+  const base = responseEpisodes(session, basic(), config.responseAudit).episodes[0]!;
+  const brokenLegacy = { ...base, id: "legacy-broken", inputHash: "hash-legacy-broken" };
+  const healthyLegacy = { ...base, id: "legacy-healthy", inputHash: "hash-legacy-healthy" };
+  store.observe(cohort, "s", [brokenLegacy, healthyLegacy]);
+
+  const legacyJsonWithoutMemory = JSON.stringify({ agentModel: "agent-model", contextLimited: false, memorySearchCalls: 0 });
+  const now = Date.now();
+  for (const ep of [brokenLegacy, healthyLegacy]) {
+    rawDb.prepare(`UPDATE response_results
+      SET status='ok',attempts=3,attempted_at=?,assessed_at=12345,result=?
+      WHERE cohort=? AND id=?`).run(now, legacyJsonWithoutMemory, cohort, ep.id);
+  }
+  // Broken legacy row has a failed linked 'memory' stage (so only the negated COALESCE disjunct matches it).
+  rawDb.prepare("INSERT INTO response_stages(key,stage,status,attempts,attempted_at) VALUES('legacy-mem-fail','memory','failed',3,?)").run(now);
+  rawDb.prepare("INSERT INTO response_stage_links(cohort,episode_id,input_hash,stage,key) VALUES(?,?,?,'memory','legacy-mem-fail')")
+    .run(cohort, brokenLegacy.id, brokenLegacy.inputHash);
+  // Healthy legacy row has only an ok linked stage and must remain untouched.
+  rawDb.prepare("INSERT INTO response_stages(key,stage,status,attempts,attempted_at,assessed_at,result) VALUES('legacy-mem-ok','memory','ok',1,?,?,?)")
+    .run(now, now, "[]");
+  rawDb.prepare("INSERT INTO response_stage_links(cohort,episode_id,input_hash,stage,key) VALUES(?,?,?,'memory','legacy-mem-ok')")
+    .run(cohort, healthyLegacy.id, healthyLegacy.inputHash);
+
+  assert.deepEqual(store.retryFailed(cohort), { stages: 1, episodes: 1 });
+
+  const brokenRow = rawDb.prepare("SELECT status,attempts,attempted_at,assessed_at,result FROM response_results WHERE id=?")
+    .get(brokenLegacy.id)!;
+  assert.equal(brokenRow.status, "pending");
+  assert.equal(brokenRow.attempts, 0);
+  assert.equal(brokenRow.attempted_at, null);
+  assert.equal(brokenRow.assessed_at, null);
+  assert.equal(brokenRow.result, null);
+
+  const failedStage = rawDb.prepare("SELECT status,attempts,attempted_at FROM response_stages WHERE key='legacy-mem-fail'").get()!;
+  assert.equal(failedStage.status, "pending");
+  assert.equal(failedStage.attempts, 0);
+  assert.equal(failedStage.attempted_at, null);
+
+  const healthyRow = rawDb.prepare("SELECT status,attempts,assessed_at,result FROM response_results WHERE id=?")
+    .get(healthyLegacy.id)!;
+  assert.equal(healthyRow.status, "ok");
+  assert.equal(healthyRow.attempts, 3);
+  assert.equal(healthyRow.assessed_at, 12345);
+  assert.equal(healthyRow.result, legacyJsonWithoutMemory);
 });

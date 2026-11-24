@@ -170,6 +170,17 @@ const retrospectiveSchema = Type.Object({
   outcome: choiceSchema(outcomes),
   reason: choiceSchema(outcomeReasons),
 });
+const retrospectiveStageSchema = Type.Object({
+  status: Type.Enum(["pending", "complete", "partial", "unavailable", "oversized"]),
+  judgment: Type.Union([retrospectiveSchema, Type.Null()]),
+});
+const memoryCandidateSchema = Type.Object({
+  path: Type.String(),
+  hash: Type.String(),
+  usefulness: probability,
+  basis: Type.String(),
+});
+const memoryStageSchema = Type.Array(memoryCandidateSchema);
 
 type ResponseQuality = Static<typeof qualitySchema>;
 type ResponseFeedbackBase = Static<typeof feedbackSchema>;
@@ -190,12 +201,45 @@ type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
   save: <K extends JudgeStage>(stage: K, result: ResponseStages[K]) => void;
 };
 
+function qualityFields({
+  taskType,
+  assessability,
+  fitAssessability,
+  underdelivery,
+  failureReason,
+  fulfillment,
+  deliverableFit,
+  consistency,
+}: ResponseQuality): ResponseQuality {
+  return {
+    taskType,
+    assessability,
+    fitAssessability,
+    underdelivery,
+    failureReason,
+    fulfillment,
+    deliverableFit,
+    consistency,
+  };
+}
+
 function feedbackBaseFields({ feedbackType, target, avoidableRework, repeatedConstraint, memoryGap }: ResponseFeedbackBase): ResponseFeedbackBase {
   return { feedbackType, target, avoidableRework, repeatedConstraint, memoryGap };
 }
 
 function sentimentFields({ sentiment, annoyance, frustration, dissatisfactionIntensity }: ResponseSentiment): ResponseSentiment {
   return { sentiment, annoyance, frustration, dissatisfactionIntensity };
+}
+
+function retrospectiveFields({
+  correction,
+  deliveryAdmission,
+  regression,
+  scopeClarification,
+  outcome,
+  reason,
+}: ResponseRetrospective): ResponseRetrospective {
+  return { correction, deliveryAdmission, regression, scopeClarification, outcome, reason };
 }
 
 function validateDistributions(answers: Record<string, { type: string; probabilities?: Record<string, number>; score?: number }>) {
@@ -214,8 +258,9 @@ function validateDistributions(answers: Record<string, { type: string; probabili
 
 function validateCachedQuality(value: unknown): ResponseQuality {
   if (!Value.Check(qualitySchema, value)) throw new Error("Invalid cached response quality judgment");
-  validateDistributions(value);
-  return value;
+  const picked = qualityFields(value);
+  validateDistributions(picked);
+  return picked;
 }
 
 function validateCachedFeedback(value: unknown): ResponseFeedbackBase {
@@ -230,6 +275,28 @@ function validateCachedSentiment(value: unknown): ResponseSentiment {
   const picked = sentimentFields(value);
   validateDistributions(picked);
   return picked;
+}
+
+function validateCachedRetrospective(value: unknown): ResponseStages["retrospective"] {
+  if (!Value.Check(retrospectiveStageSchema, value)) throw new Error("Invalid cached response retrospective judgment");
+  const judgment = value.judgment ? retrospectiveFields(value.judgment) : null;
+  if (judgment) validateDistributions(judgment);
+  return { status: value.status, judgment };
+}
+
+function validateCachedMemory(value: unknown): ResponseStages["memory"] {
+  if (!Value.Check(memoryStageSchema, value)) throw new Error("Invalid cached response memory judgment");
+  return value.map(({ path, hash, usefulness, basis }) => ({ path, hash, usefulness, basis }));
+}
+
+export function validateCachedStage<K extends keyof ResponseStages>(stage: K, value: unknown): ResponseStages[K] {
+  switch (stage) {
+    case "quality": return validateCachedQuality(value) as ResponseStages[K];
+    case "feedback": return validateCachedFeedback(value) as ResponseStages[K];
+    case "sentiment": return validateCachedSentiment(value) as ResponseStages[K];
+    case "retrospective": return validateCachedRetrospective(value) as ResponseStages[K];
+    case "memory": return validateCachedMemory(value) as ResponseStages[K];
+  }
 }
 
 function toFourLevelScore(answer: ScoreAnswer): Static<typeof scoreSchema> {
