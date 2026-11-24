@@ -13,7 +13,7 @@ import { Worker } from "node:worker_threads";
 import { baselineFingerprint, deviationReader, refreshEmotionBaselines } from "../src/emotion-baselines.js";
 import { runInsideOut, reportInsideOut, refreshInsideOutBaselines, reportInsideOutBaselines, linkInsideOutPeople,
   purgeInsideOutPerson, refreshInsideOutBaselinesAsync } from "../src/inside-out.js";
-import { openInsideOutStore } from "../src/inside-out-store.js";
+import { openInsideOutStore, refreshWithFingerprint } from "../src/inside-out-store.js";
 
 // Owns the persisted statistical contract: real PeopleSQL identities, transcript grading,
 // snapshot refresh, operator export and immutable historical comparisons. Only Jev is offline.
@@ -487,4 +487,92 @@ test("the compiled baseline worker runs under plain Node and never imports the O
     process.stdout.write(JSON.stringify(await m.refreshInsideOutBaselinesAsync(${JSON.stringify(path)}, { now: ${now} })));`);
   const { stdout } = await promisify(execFile)(process.execPath, [script], { env: { ...process.env, NODE_OPTIONS: "" }, timeout: 30_000 });
   assert.deepEqual(JSON.parse(stdout), { snapshots: 2, comparisons: 40 });
+});
+
+test("an input change arriving mid-refresh prevents false fingerprint certification and forces another refresh pass", async t => {
+  const { path, ids: [one], now } = await gradedStore([{ account: "one", grades: 60, weeks: 3 }]);
+  // Initialize baseline schema v2 beforehand so the first BEGIN IMMEDIATE occurs at the write batch after reads.
+  purgeInsideOutPerson(path, "nobody");
+  const exec = DatabaseSync.prototype.exec;
+  let raced = false;
+  // Inject a new grade into week 0 right when the first write batch begins.
+  t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && !raced) {
+      raced = true;
+      const writer = new DatabaseSync(path);
+      try {
+        writer.prepare(`INSERT INTO inside_out (interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,
+          channel,source,target_at,reviewed_at,model,context_trimmed,${EMOTIONS.join(",")},error,person_id)
+          VALUES (${Array(21).fill("?").join(",")})`)
+          .run("midpass-grade", "emotion-presence-v2", "s", "midpass-grade", "a", JSON.stringify(["slack", "one", "u"]), "u",
+            "slack", "s.jsonl", FIRST_WEEK + 500, FIRST_WEEK + 500, "jev-test", 0, ...EMOTIONS.map(() => 0.9), null, one!);
+      } finally { writer.close(); }
+    }
+    return exec.call(this, sql);
+  });
+
+  const first = refreshWithFingerprint(path, { now, link: false });
+  assert.equal(raced, true);
+  assert.equal(first.fingerprint, undefined, "mid-pass input changes must never be certified as processed");
+  assert.equal(first.result.snapshots, 0, "stale snapshots affected by the mid-pass grade are fenced out");
+
+  // Because no fingerprint was certified, the next pass runs and picks up the new grade.
+  const second = refreshWithFingerprint(path, { now, link: false, unless: first.fingerprint });
+  assert.equal(second.result.snapshots, 3);
+  assert.equal(typeof second.fingerprint, "string");
+  const [latest] = reportInsideOutBaselines(path, { personId: one, limit: 1 });
+  assert.equal(latest?.cumulative.joy.count, 61, "follow-up refresh includes the mid-pass grade");
+
+  // Once inputs are stable, the certified fingerprint skips redundant passes.
+  const third = refreshWithFingerprint(path, { now, link: false, unless: second.fingerprint });
+  assert.deepEqual(third.result, { snapshots: 0, comparisons: 0 });
+  assert.equal(third.fingerprint, second.fingerprint);
+});
+
+test("population drop is fenced against concurrent relinks and failing workers release SQLite before settling", async t => {
+  const { path, ids: [one, two], now } = await gradedStore([
+    { account: "one", grades: 40, weeks: 2 },
+    { account: "two", grades: 40, weeks: 2 },
+  ]);
+  assert.deepEqual(refreshInsideOutBaselines(path, { now }), { snapshots: 4, comparisons: 80 });
+
+  // Unlink person `two` before refresh starts so `refreshEmotionBaselines` schedules a population drop for `two`.
+  const setup = new DatabaseSync(path);
+  setup.prepare("UPDATE inside_out SET person_id=NULL WHERE person_id=?").run(two!);
+  setup.close();
+
+  const db = openInsideOutStore(path);
+  t.after(() => db.close());
+  const exec = DatabaseSync.prototype.exec;
+  let relinked = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+    if (this === db && sql === "BEGIN IMMEDIATE" && !relinked) {
+      relinked = true;
+      const writer = new DatabaseSync(path);
+      try {
+        writer.prepare("UPDATE inside_out SET person_id=? WHERE human_key=?").run(two!, JSON.stringify(["slack", "two", "u"]));
+      } finally { writer.close(); }
+    }
+    return exec.call(this, sql);
+  });
+  refreshEmotionBaselines(db, { minInteractions: 20, now });
+  assert.equal(relinked, true);
+  assert.equal(db.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(two!)?.n, 2,
+    "concurrently relinked population keeps its baselines");
+  assert.equal(db.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(one!)?.n, 2);
+
+  // Worker error settles only on exit so the store is immediately unlocked and a subsequent refresh succeeds.
+  const errorStore = await gradedStore([{ account: "one", grades: 40, weeks: 2 }]);
+  const blocker = openInsideOutStore(errorStore.path);
+  blocker.exec("INSERT INTO memory_schema VALUES ('emotion-baselines',99)");
+  blocker.close();
+  await assert.rejects(
+    refreshInsideOutBaselinesAsync(errorStore.path, { now: errorStore.now }),
+    /Unsupported Inside Out baseline storage version/,
+  );
+  const probe = new DatabaseSync(errorStore.path);
+  probe.exec("PRAGMA busy_timeout=0; CREATE TABLE exit_probe(x); DROP TABLE exit_probe;");
+  probe.exec("DELETE FROM memory_schema WHERE component='emotion-baselines'");
+  probe.close();
+  assert.deepEqual(await refreshInsideOutBaselinesAsync(errorStore.path, { now: errorStore.now }), { snapshots: 2, comparisons: 40 });
 });

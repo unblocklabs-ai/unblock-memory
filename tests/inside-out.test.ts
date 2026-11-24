@@ -11,7 +11,9 @@ import { zstdCompressSync } from "node:zlib";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { resolveConfig } from "../src/config.js";
-import { linkInsideOutPeople, repairInsideOutIdentities, runInsideOut, reportInsideOut } from "../src/inside-out.js";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, reportInsideOutBaselines, runInsideOut } from "../src/inside-out.js";
+import { registerInsideOut } from "../src/inside-out-runtime.js";
 import { PeopleStore } from "../src/people-store.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
@@ -696,4 +698,126 @@ test("Inside Out validates payload.model without aborting and stores the request
   assert.equal(u1Rows.length, 2);
   assert.notEqual(u1Rows[0]?.rubric, u1Rows[1]?.rubric);
   assert.ok(u1Rows.every(r => r.model === "liquid/d1.2-ultra"));
+});
+
+test("purging a person during in-flight retry grading cannot resurrect grades or dispatch remaining purged retries", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-purge-race-")), sessionsDir = join(root, "sessions");
+  await mkdir(sessionsDir);
+  const storePath = join(root, "unblock-memory.sqlite");
+  const people = new PeopleStore(storePath, { maxOpenTodos: 100, maxBlurbChars: 1000 });
+  t.after(() => people.close());
+  const person = people.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U111", displayName: "Bek" }).person.id;
+  const reply = (text: string) => ({
+    ...user(text, "U111"),
+    __openclaw: { senderId: "U111", senderIdentity: { senderKind: "human", id: "U111", pluginId: "slack", accountId: "default" } },
+  });
+  await writeFile(join(sessionsDir, "s.jsonl"), [
+    { type: "session", id: "s" },
+    event("a1", assistant("Answer 1")),
+    event("r1", reply("First failed reply")),
+    event("a2", assistant("Answer 2")),
+    event("r2", reply("Second failed reply")),
+  ].map(e => JSON.stringify(e)).join("\n"));
+
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath, config: cfg() };
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {} }));
+  const failed = await runInsideOut(options);
+  assert.equal("failed" in failed && failed.failed, 2);
+  assert.equal(fetchMock.mock.callCount(), 2);
+
+  let retryFetches = 0;
+  fetchMock.mock.mockImplementation(async () => {
+    retryFetches++;
+    // Operator purges this person while retry #1 is in flight.
+    if (retryFetches === 1) {
+      const purged = purgeInsideOutPerson(storePath, person, { grades: true });
+      assert.equal(purged.grades, 2);
+    }
+    return Response.json({
+      model: "liquid/d1.2-ultra-20261116",
+      answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.9 }])),
+    });
+  });
+
+  const retried = await runInsideOut({ ...options, retry: true });
+  assert.equal(retryFetches, 1, "rechecking retry eligibility skips remaining purged rows before calling Jev");
+  assert.equal("reviewed" in retried && retried.reviewed, 0, "fenced tombstone write does not report a revived grade");
+  assert.equal("failed" in retried && retried.failed, 0);
+
+  const rows = reportInsideOut(storePath);
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every(row => row.error === "Purged by operator" && row.person_id === null && emotions.every(e => row[e] === null)),
+    "in-flight retry result cannot overwrite purge tombstones");
+  assert.deepEqual(reportInsideOutBaselines(storePath, { personId: person }), []);
+
+  await runInsideOut({ ...options, retry: true });
+  assert.equal(retryFetches, 1, "subsequent retries still never dispatch purged rows");
+});
+
+test("repeated gateway_start clears prior timers and guards tick/refresh after gateway_stop", async t => {
+  const active = new Map<number, { fn: () => void; ms: number }>();
+  let nextId = 1;
+  let cleared = 0;
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
+  t.after(() => {
+    globalThis.setInterval = origSetInterval;
+    globalThis.clearInterval = origClearInterval;
+  });
+  globalThis.setInterval = ((fn: () => void, ms?: number) => {
+    const id = nextId++;
+    active.set(id, { fn, ms: Number(ms ?? 0) });
+    return { id, unref() { return this; } } as unknown as NodeJS.Timeout;
+  }) as typeof globalThis.setInterval;
+  globalThis.clearInterval = ((handle?: NodeJS.Timeout) => {
+    const id = (handle as unknown as { id?: number } | undefined)?.id;
+    if (id !== undefined && active.delete(id)) cleared++;
+  }) as typeof globalThis.clearInterval;
+
+  const hooks: Record<string, () => void | Promise<void>> = {};
+  const warnings: string[] = [];
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Should not call fetch after gateway_stop");
+  });
+  const api = {
+    config: { agents: { list: [] } },
+    registrationMode: "full",
+    registerCli: () => {},
+    on: (name: string, fn: () => void | Promise<void>) => { hooks[name] = fn; },
+    logger: { warn: (msg: string) => warnings.push(msg) },
+  } as unknown as OpenClawPluginApi;
+
+  registerInsideOut(api, resolveConfig({
+    insideOut: { enabled: true, intervalMinutes: 5 },
+    typesafe: { enabled: true, apiKey: "fake" },
+  }));
+
+  hooks.gateway_start!();
+  assert.equal(active.size, 2, "initial gateway_start arms baseline and review timers");
+  assert.equal(cleared, 0);
+
+  hooks.gateway_start!();
+  assert.equal(active.size, 2, "second gateway_start replaces prior timers instead of orphaning them");
+  assert.equal(cleared, 2);
+
+  hooks.gateway_start!();
+  assert.equal(active.size, 2, "third gateway_start still leaves only two active timers");
+  assert.equal(cleared, 4);
+
+  const callbacks = [...active.values()].map(entry => entry.fn);
+  await hooks.gateway_stop!();
+  assert.equal(active.size, 0, "gateway_stop clears all active timers");
+  assert.equal(cleared, 6);
+
+  // Invoking stale timer callbacks after abort must be a no-op.
+  for (const callback of callbacks) callback();
+  await new Promise(setImmediate);
+  assert.equal(fetchMock.mock.callCount(), 0);
+  assert.deepEqual(warnings, []);
+
+  // Restarting after gateway_stop arms a fresh lifecycle cleanly.
+  hooks.gateway_start!();
+  assert.equal(active.size, 2);
+  await hooks.gateway_stop!();
+  assert.equal(active.size, 0);
 });
