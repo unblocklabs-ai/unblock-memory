@@ -1,6 +1,6 @@
 import { readAnalysisSummary, readCluster } from "./analysis.js";
 import { parseSafeVirtualPath } from "./sources.js";
-import { TYPESAFE_MODEL } from "./typesafe-client.js";
+import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
 import { reviewClusterDefects } from "./typesafe-review.js";
 import { chunkFingerprint } from "./curation.js";
 function indexedChunk(db, safe, member) {
@@ -61,6 +61,6 @@ export async function reviewClusterIngestion(params) {
         });
         return { status: "ok", runId: snapshot.runId, clusterId: params.clusterId, members, recurring,
             sampled: sample.length, considered: snapshot.considered, clusterSize: snapshot.clusterSize,
-            policy: `${TYPESAFE_MODEL}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
+            policy: `${decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint)}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
     });
 }

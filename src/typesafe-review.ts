@@ -3,7 +3,7 @@ import { Value } from "typebox/value";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
 import { requestTypeSafe, TYPESAFE_NOUL_ANSWERS_SCHEMA as nouls, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
 
-type RequestOptions = { apiKey: string; timeoutMs: number; signal: AbortSignal };
+type RequestOptions = { apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal: AbortSignal };
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 
 const relationSchema = Type.Object({ answers: Type.Object({ relation: Type.Object({

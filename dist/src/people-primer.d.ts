@@ -10,6 +10,8 @@ export declare function primePersonDossier(params: {
     search: (query: string, options: CorpusSearchOptions) => Promise<CorpusMemorySearchResult[]>;
     config: PeoplePrimerConfig;
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     signal: AbortSignal;
 }): Promise<{
     status: "disabled";

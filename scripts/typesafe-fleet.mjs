@@ -55,10 +55,22 @@ export function safeReport(stdout) {
 export function main(args) {
   const [path, ...flags] = args;
   if (!path || path === "--help") {
-    console.log("Usage: node scripts/typesafe-fleet.mjs KEYS.csv [--apply] [--restart]\nDefault: read-only dry-run. Blank keys are skipped. --restart requires --apply.");
+    console.log("Usage: node scripts/typesafe-fleet.mjs KEYS.csv [--provider codex|typesafe] [--apply] [--restart]\nDefault: read-only dry-run for Codex LB (https://codex.unblocklabs.ai/v1/decisions). Blank keys are skipped. --restart requires --apply.");
     return 0;
   }
-  if (flags.some(flag => !["--apply", "--restart"].includes(flag)) || (flags.includes("--restart") && !flags.includes("--apply"))) throw new Error("Invalid flags");
+  let provider = "codex";
+  let apply = false;
+  let restart = false;
+  for (let i = 0; i < flags.length; i++) {
+    const flag = flags[i];
+    if (flag === "--apply") apply = true;
+    else if (flag === "--restart") restart = true;
+    else if (flag === "--provider") {
+      provider = flags[++i] ?? "";
+      if (!["codex", "typesafe"].includes(provider)) throw new Error("Invalid provider");
+    } else throw new Error("Invalid flags");
+  }
+  if (restart && !apply) throw new Error("Invalid flags");
   const stat = statSync(path);
   if (!stat.isFile() || stat.size > 1_000_000 || (stat.mode & 0o077) || stat.uid !== process.getuid()) throw new Error("CSV must be your private regular file (chmod 600), at most 1 MB");
   const rows = readRows(readFileSync(path, "utf8"));
@@ -80,7 +92,7 @@ export function main(args) {
     if (row.apiKey) {
       const child = spawnSync("ssh", ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", row.host, remoteCommand], {
-        input: JSON.stringify({ source, options: { apiKey: row.apiKey, apply: flags.includes("--apply"), restart: flags.includes("--restart") } }),
+        input: JSON.stringify({ source, options: { apiKey: row.apiKey, apply, restart, provider } }),
         encoding: "utf8", timeout: 600_000, maxBuffer: 2_000_000, stdio: ["pipe", "pipe", "pipe"],
       });
       if (child.status !== 0 || child.error) result = { status: "failed", stage: "ssh_or_timeout" };

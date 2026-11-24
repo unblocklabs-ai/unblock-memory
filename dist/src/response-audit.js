@@ -1,14 +1,14 @@
 import { abortable } from "./abortable.js";
-import { resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
+import { decisionModelScope, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader } from "./response-episodes.js";
-import { RESPONSE_RUBRIC_VERSION, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity } from "./response-judge.js";
+import { responseRubricVersion, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity } from "./response-judge.js";
 import { ResponseAuditStore } from "./response-store.js";
 import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
 import { ResponsePeople } from "./response-identity.js";
 import { jsonHash } from "./json-hash.js";
-export function responseCohort(config) {
-    return RESPONSE_RUBRIC_VERSION + ":" + jsonHash({
+export function responseCohort(config, model = TYPESAFE_MODEL, endpoint) {
+    return responseRubricVersion(model, endpoint) + ":" + jsonHash({
         extractor: RESPONSE_EXTRACTOR_VERSION, historyMessages: config.historyMessages,
         stages: RESPONSE_STAGE_VERSIONS,
         sentimentEnabled: config.sentimentEnabled,
@@ -21,7 +21,7 @@ export async function auditResponses(options) {
     if (!config.responseAudit.enabled || !config.typesafe.enabled)
         return { status: "disabled" };
     const signal = AbortSignal.any([AbortSignal.timeout(120_000), ...(options.signal ? [options.signal] : [])]);
-    const cohort = responseCohort(config.responseAudit);
+    const cohort = responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
     let key;
     if (!options.dryRun) {
         try {
@@ -115,14 +115,14 @@ export async function auditResponses(options) {
                 coverage.attempted++;
                 store.attempted(cohort, e, Date.now());
                 try {
-                    const params = { apiKey: key, timeoutMs: config.typesafe.timeoutMs, signal };
+                    const params = { apiKey: key, endpoint: config.typesafe.endpoint, model: config.typesafe.model, timeoutMs: config.typesafe.timeoutMs, signal };
                     const judgment = await abortable(assessResponseStages(store, cohort, e, params, config.responseAudit.sentimentEnabled, coverage), signal);
                     let memory = { status: "not_requested", candidates: [] };
                     if (judgment.feedback.memoryGap.noul >= 0.8 && config.responseAudit.memoryCorpora.length) {
                         try {
                             const approved = options.sources.filter(s => config.responseAudit.memoryCorpora.includes(s.corpus));
                             const candidates = responseMemoryCandidates(options.indexPath, approved, e);
-                            const memoryKey = jsonHash([TYPESAFE_MODEL, RESPONSE_STAGE_VERSIONS.memory,
+                            const memoryKey = jsonHash([decisionModelScope(config.typesafe.model, config.typesafe.endpoint), RESPONSE_STAGE_VERSIONS.memory,
                                 e.id, e.session, e.senderId, e.request, e.answer, e.feedback, candidates,
                                 [...config.responseAudit.memoryCorpora].sort()]);
                             let judged = store.stage(cohort, e, "memory", memoryKey);

@@ -73,7 +73,11 @@ export async function runExtraction(params: { config: UnblockMemoryConfig; store
           signal.throwIfAborted();
           // Isolated judgments overlap, but failed chunks drain before their lease is released.
           const judgments = await Promise.allSettled(proposals.slice(start, start + 4).map(async proposal => ({ proposal,
-            judgment: await (params.validate ?? validateExtractedMemory)({ proposal, messages, newIds, existing, apiKey, signal, thresholds: config }) })));
+            judgment: await (params.validate ?? validateExtractedMemory)({
+              proposal, messages, newIds, existing, apiKey,
+              endpoint: params.config.typesafe.endpoint, model: params.config.typesafe.model,
+              signal, thresholds: config,
+            }) })));
           const failure = judgments.find(result => result.status === "rejected");
           if (failure) throw failure.reason;
           for (const result of judgments) {

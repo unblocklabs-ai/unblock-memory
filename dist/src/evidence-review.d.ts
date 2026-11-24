@@ -11,6 +11,8 @@ export declare function reviewIndexedClaim(params: {
     claim: string;
     citations: readonly EvidenceCitation[];
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
     personBackground?: {

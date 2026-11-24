@@ -9,15 +9,20 @@ import { deploy } from "../scripts/typesafe-fleet-remote.mjs";
 import { readRows, safeReport, remoteCommand } from "../scripts/typesafe-fleet.mjs";
 
 const key = "fixture-SECRET-key#123";
-function fixture() {
+function fixture(provider = "codex") {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "typesafe-fleet-test-")));
   const configPath = join(root, "openclaw.json");
-  const entry = { enabled: true, config: { typesafe: { apiKey: "old-secret", timeoutMs: 1234 },
+  const entry = { enabled: true, config: { typesafe: { apiKey: "old-secret", model: "jev-1.13.0", timeoutMs: 1234 },
     responseAudit: { enabled: false, senderIds: ["approved-human"] }, skillWhisperer: { enabled: true } } };
   const config = { unrelated: { token: "private" }, plugins: { entries: { "unblock-memory": entry } } };
   writeFileSync(configPath, JSON.stringify(config));
+  let currentProvider = provider;
   const commands = [];
   const cli = (args, input) => {
+    const expectedFile = currentProvider === "typesafe" ? "unblock-memory-typesafe.env" : "unblock-memory-decisions.env";
+    const expectedEndpoint = currentProvider === "typesafe"
+      ? "https://api.typesafe.ai/v1/systemone"
+      : "https://codex.unblocklabs.ai/v1/decisions";
     commands.push(args);
     if (args.join(" ") === "config file --json") return JSON.stringify({ path: configPath });
     if (args[1] === "get") {
@@ -29,11 +34,13 @@ function fixture() {
     if (args[1] === "patch") {
       const patch = JSON.parse(input).plugins.entries["unblock-memory"].config.typesafe;
       assert.equal(patch.apiKey, null);
-      assert.equal(patch.apiKeyFile, join(root, "secrets/unblock-memory-typesafe.env"));
+      assert.equal(patch.endpoint, expectedEndpoint);
+      assert.equal(patch.apiKeyFile, join(root, `secrets/${expectedFile}`));
       assert.equal(input.includes(key), false);
       if (!args.includes("--dry-run")) {
         Object.assign(entry.config.typesafe, patch);
         delete entry.config.typesafe.apiKey;
+        if (patch.model === null) delete entry.config.typesafe.model;
         writeFileSync(configPath, JSON.stringify(config));
       }
       return "{}";
@@ -43,7 +50,7 @@ function fixture() {
     if (args[1] === "status") return JSON.stringify({ rpc: { ok: true } });
     throw new Error("unexpected CLI");
   };
-  return { root, configPath, entry, config, commands, cli };
+  return { root, configPath, entry, config, commands, cli, setProvider(next) { currentProvider = next; } };
 }
 
 test("CSV handles quotes, BOM, CRLF and blank rows; rejects malformed or unsafe input before deployment", () => {
@@ -72,8 +79,9 @@ test("apply preserves approvals/settings, stores literal private dotenv key, bac
   assert.equal(f.entry.config.typesafe.timeoutMs, 1234);
   assert.deepEqual(f.entry.config.responseAudit, { enabled: false, senderIds: ["approved-human"] });
   assert.equal(f.config.unrelated.token, "private");
-  const secretDir = join(f.root, "secrets"), path = join(secretDir, "unblock-memory-typesafe.env");
-  assert.equal(parseEnv(readFileSync(path, "utf8")).TYPESAFE_API_KEY, key);
+  const secretDir = join(f.root, "secrets"), path = join(secretDir, "unblock-memory-decisions.env");
+  assert.equal(parseEnv(readFileSync(path, "utf8")).CODEX_LB_API_KEY, key);
+  assert.equal(f.entry.config.typesafe.endpoint, "https://codex.unblocklabs.ai/v1/decisions");
   assert.equal(statSync(path).mode & 0o777, 0o600); assert.equal(statSync(secretDir).mode & 0o777, 0o700);
   const backup = readdirSync(secretDir).find(name => name.startsWith("typesafe-backup-"));
   assert.ok(readFileSync(join(secretDir, backup, "openclaw.json")).equals(before));
@@ -83,6 +91,23 @@ test("apply preserves approvals/settings, stores literal private dotenv key, bac
   assert.equal(f.commands.some(args => args[1] === "restart"), false);
   assert.equal((await deploy({ apiKey: "rotated-fixture-key", apply: true, restart: true }, f.cli)).restart, "not_needed");
   assert.equal(f.commands.some(args => args[1] === "restart"), false);
+
+  const legacy = fixture("typesafe");
+  const legacyResult = await deploy({ apiKey: key, apply: true, restart: true, provider: "typesafe" }, legacy.cli);
+  assert.equal(legacyResult.status, "configured");
+  assert.equal(parseEnv(readFileSync(join(legacy.root, "secrets/unblock-memory-typesafe.env"), "utf8")).TYPESAFE_API_KEY, key);
+  assert.equal(legacy.entry.config.typesafe.endpoint, "https://api.typesafe.ai/v1/systemone");
+  // Same-provider key rotation preserves an intentional model pin; switching providers clears it.
+  legacy.entry.config.typesafe.model = "jev-1.14.0";
+  writeFileSync(legacy.configPath, JSON.stringify(legacy.config));
+  const rotatedPin = await deploy({ apiKey: "rotated-legacy-key", apply: true, restart: true, provider: "typesafe" }, legacy.cli);
+  assert.equal(rotatedPin.status, "configured");
+  assert.equal(rotatedPin.configChanged, false);
+  assert.equal(legacy.entry.config.typesafe.model, "jev-1.14.0");
+  legacy.setProvider("codex");
+  const switched = await deploy({ apiKey: "switched-codex-key", apply: true, restart: true, provider: "codex" }, legacy.cli);
+  assert.equal(switched.status, "configured");
+  assert.equal(Object.hasOwn(legacy.entry.config.typesafe, "model"), false);
 });
 
 test("failed preflight, symlink and disabled plugin never write; patch failure reports a partial key write without leaking errors", async () => {
@@ -162,16 +187,22 @@ test("local CLI rejects public CSV and duplicate endpoints, skips blanks, and se
   const log = join(f.root, "calls.jsonl");
   writeFileSync(join(bin, "ssh"), `#!${process.execPath}\nimport fs from 'node:fs';\nconst a=process.argv.slice(2);fs.appendFileSync(process.env.FLEET_TEST_LOG,JSON.stringify(a)+'\\n');
 if(a[0]==='-G'){console.log('hostname '+(process.env.FLEET_TEST_DUP ? 'same' : a[1])+'\\nuser fixture\\nport 22');}
-else{let s='';for await(const c of process.stdin)s+=c;const p=JSON.parse(s);if(!p.options.apiKey)process.exit(2);console.log('TYPESAFE_FLEET_RESULT '+JSON.stringify({status:'planned',stage:'complete',extra:p.options.apiKey}));}
+else{let s='';for await(const c of process.stdin)s+=c;const p=JSON.parse(s);if(!p.options.apiKey)process.exit(2);fs.appendFileSync(process.env.FLEET_TEST_LOG,JSON.stringify({provider:p.options.provider})+'\\n');console.log('TYPESAFE_FLEET_RESULT '+JSON.stringify({status:'planned',stage:'complete',extra:p.options.apiKey}));}
 `, { mode: 0o700 });
   // Extensionless node scripts default to CommonJS outside a package; force module detection with syntax on Node 22+.
   const csv = join(f.root, "keys.csv");
   writeFileSync(csv, `agent,ssh_host,api_key\nBill,billsmacmini,${key}\nPearl,pearlperelel,\n`, { mode: 0o600 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FLEET_TEST_LOG: log };
-  const run = extra => spawnSync(process.execPath, [resolve("scripts/typesafe-fleet.mjs"), csv], { env: { ...env, ...extra }, encoding: "utf8" });
+  const run = (extra, args = []) => spawnSync(process.execPath, [resolve("scripts/typesafe-fleet.mjs"), csv, ...args], { env: { ...env, ...extra }, encoding: "utf8" });
   const child = run({});
   assert.equal(child.status, 0, child.stderr); assert.match(child.stdout, /skipped_blank/);
   assert.equal(child.stdout.includes(key), false); assert.equal(readFileSync(log, "utf8").includes(key), false);
+  assert.match(readFileSync(log, "utf8"), /"provider":"codex"/);
+  const legacyChild = run({}, ["--provider", "typesafe"]);
+  assert.equal(legacyChild.status, 0, legacyChild.stderr);
+  assert.equal(legacyChild.stdout.includes(key), false);
+  assert.match(readFileSync(log, "utf8"), /"provider":"typesafe"/);
+  assert.equal(run({}, ["--provider", "bogus"]).status, 1);
   writeFileSync(csv, `agent,ssh_host,api_key\nBill,billsmacmini,${key}\nPearl,pearlperelel,${key}\n`);
   const duplicate = run({ FLEET_TEST_DUP: "1" });
   assert.equal(duplicate.status, 1); assert.equal(duplicate.stderr.includes(key), false);

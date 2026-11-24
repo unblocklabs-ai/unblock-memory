@@ -1,5 +1,7 @@
 // Synthetic cases only; never reads corpus data. Default invocation makes no API calls.
+import { resolveConfig } from "../../src/config.js";
 import { judgeTypeSafeQuality } from "../../src/typesafe.js";
+import { resolveTypeSafeApiKey } from "../../src/typesafe-client.js";
 import { qualityStructure } from "../../src/quality-audit.js";
 
 const cases = [
@@ -19,17 +21,22 @@ const cases = [
 ];
 
 async function main() {
-  if (!process.argv.slice(2).includes("--live")) {
-    console.log(`${cases.length} synthetic quality-audit cases. Use --live with TYPESAFE_API_KEY for inference.`);
+  const args = process.argv.slice(2);
+  if (!args.includes("--live")) {
+    console.log(`${cases.length} synthetic quality-audit cases. Use --live with CODEX_LB_API_KEY (or --legacy with TYPESAFE_API_KEY) for inference.`);
     return;
   }
-  const apiKey = process.env.TYPESAFE_API_KEY?.trim();
-  if (!apiKey) throw new Error("TYPESAFE_API_KEY is required");
+  const typesafe = resolveConfig({
+    typesafe: args.includes("--legacy") ? { endpoint: "https://api.typesafe.ai/v1/systemone" } : undefined,
+  }).typesafe;
+  const apiKey = await resolveTypeSafeApiKey(typesafe);
+  if (!apiKey) throw new Error("Decision model credential is required for the configured endpoint");
   const rows = [];
   const started = Date.now();
   for (let offset = 0; offset < cases.length; offset += 4) {
     const batch = cases.slice(offset, offset + 4);
-    const answers = await judgeTypeSafeQuality({ apiKey, timeoutMs: 10_000,
+    const answers = await judgeTypeSafeQuality({
+      apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: 10_000,
       signal: new AbortController().signal,
       chunks: batch.map(item => ({ text: item.text, sourceKind: "files" })),
     });

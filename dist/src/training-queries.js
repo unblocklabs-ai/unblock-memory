@@ -4,6 +4,7 @@ import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.j
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_MODEL, TRAINING_TEACHER_VERSION } from "./training-models.js";
 import { historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
+import { memoryJudgeVersion } from "./typesafe.js";
 import { jsonHash } from "./json-hash.js";
 const LANES = ["lex", "vec"];
 const SELECTION_VERSION = "independent-lanes-top3-mean-v2";
@@ -48,7 +49,7 @@ async function checkpoint(store, step, result, operation) {
             /^LLM_[A-Z_]+$/u.test(error.code) ? error.code : undefined;
         const status = error instanceof HistoricalCorpusUnavailableError || hostCode === "LLM_COMPLETION_NOT_AUTHORIZED" ||
             (error instanceof TypeSafeRequestError && error.code === "http_error" &&
-                error.status !== undefined && error.status >= 400 && error.status < 500) ? "failed" : "ambiguous";
+                ((error.status !== undefined && error.status >= 400 && error.status < 500) || error.retryAfter === true)) ? "failed" : "ambiguous";
         store.finishStep(step.stage, step.id, attempt, { status,
             error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
                 `http_${error.status}` : error instanceof HistoricalCorpusUnavailableError ? "historical_corpus_unavailable" :
@@ -154,6 +155,33 @@ export function selectTrainingQueries(queries) {
     };
     return { lex: winner("lex"), vec: winner("vec") };
 }
+function stepBelongsToJudge(info, judgeVersion) {
+    if (!info)
+        return false;
+    if (info.stage === "evaluate" || info.stage === "score")
+        return info.request.judgeVersion === judgeVersion;
+    if (info.stage === "judge") {
+        return typeof info.request.identity === "string" &&
+            jsonHash([judgeVersion, info.request.request]) === info.request.identity;
+    }
+    return true;
+}
+function stepBlocksJudge(store, stepId, judgeVersion) {
+    const info = store.stepScope(stepId);
+    return !!info && info.status !== "pending" && info.status !== "complete" && stepBelongsToJudge(info, judgeVersion);
+}
+function reviewBlocksJudge(store, review, judgeVersion) {
+    if (review.reason !== "evaluation-unresolved")
+        return true;
+    if (review.scope && review.scope !== "__legacy__")
+        return review.scope === judgeVersion;
+    if (!("steps" in review.details))
+        return true;
+    return review.details.steps.some(id => stepBelongsToJudge(store.stepScope(id), judgeVersion));
+}
+function legacyUnresolvedMatchesJudge(store, judgeVersion) {
+    return (details) => "steps" in details && details.steps.length > 0 && details.steps.every(id => stepBelongsToJudge(store.stepScope(id), judgeVersion));
+}
 export async function evaluateTrainingQueries(source, store, config, runtime, options, createSearch) {
     bounds(options);
     const corpus = config.corpora.find(c => c.kind === "sessions");
@@ -182,21 +210,36 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
     };
     const judgments = new Map();
     const revisions = new Map();
-    const reviews = new Map(store.reviews().map(review => [review.sourceId, review]));
+    const reviewsBySource = new Map();
+    for (const review of store.reviews()) {
+        const list = reviewsBySource.get(review.sourceId);
+        if (list)
+            list.push(review);
+        else
+            reviewsBySource.set(review.sourceId, [review]);
+    }
+    const judgeVersion = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+    const evaluationOptions = { endpoint: config.typesafe.endpoint, model: config.typesafe.model };
     const evaluate = async (example) => {
-        const previousReview = reviews.get(example.id);
-        if (previousReview && "steps" in previousReview.details) {
-            const blocked = previousReview.details.steps.filter(id => {
+        const blocked = (reviewsBySource.get(example.id) ?? []).flatMap(review => {
+            if (!("steps" in review.details))
+                return [];
+            if (review.reason === "evaluation-unresolved") {
+                if (review.scope && review.scope !== "__legacy__" && review.scope !== judgeVersion)
+                    return [];
+                return review.details.steps.filter(id => stepBlocksJudge(store, id, judgeVersion));
+            }
+            return review.details.steps.filter(id => {
                 const status = store.stepRecordStatus(id);
                 return status !== undefined && status !== "pending" && status !== "complete";
             });
-            // A known failed example cannot resolve before manual retry. Do not scan its
-            // historical corpus or consume the example budget on every invocation.
-            if (blocked.length) {
-                result.blocked += blocked.length;
-                result.flagged++;
-                return;
-            }
+        });
+        // A known failed example for this judge cannot resolve before manual retry. Do not scan its
+        // historical corpus or consume the example budget on every invocation.
+        if (blocked.length) {
+            result.blocked += blocked.length;
+            result.flagged++;
+            return;
         }
         const initial = LANES.map(lane => ({ lane, step: store.step("generate", teacherRequest(example, lane)) }));
         if (initial.some(({ step }) => !step.result)) {
@@ -230,17 +273,17 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
         try {
             const evaluation = store.step("evaluate", { version: SELECTION_VERSION, sourceId: example.id, inputHash: example.inputHash,
                 timestamp: example.timestamp, teacherIds: initial.map(({ step }) => step.id), corpusHash: snapshot.corpusHash,
-                retrievalVersion: TRAINING_RETRIEVAL_VERSION, judgeVersion: CONTEXT_JUDGE_VERSION,
+                retrievalVersion: TRAINING_RETRIEVAL_VERSION, judgeVersion,
                 options: TRAINING_SEARCH_OPTIONS });
             if (evaluation.result) {
                 result.cached++;
-                store.clearReview(example.id);
+                store.clearReview(example.id, judgeVersion, legacyUnresolvedMatchesJudge(store, judgeVersion));
                 return;
             }
             if (evaluation.status !== "pending") {
                 result.blocked++;
                 result.flagged++;
-                store.flagReview(example, "evaluation-unresolved", { steps: [evaluation.id] });
+                store.flagReview(example, "evaluation-unresolved", { steps: [evaluation.id] }, judgeVersion);
                 return;
             }
             if (shouldStop() || (options.maxExamples !== undefined && result.examples >= options.maxExamples))
@@ -251,8 +294,8 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
             const input = JSON.parse(example.inputJson);
             const problems = new Set();
             const judge = (hit) => {
-                const request = contextJudgeRequest(input, snapshot.maxDate, hit);
-                const identity = jsonHash([CONTEXT_JUDGE_VERSION, request]);
+                const request = contextJudgeRequest(input, snapshot.maxDate, hit, config.typesafe.model);
+                const identity = jsonHash([judgeVersion, request]);
                 let pending = judgments.get(identity);
                 if (!pending) {
                     pending = (async () => {
@@ -268,7 +311,7 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
                         const credential = await apiKey();
                         if (!room())
                             return { id: step.id, result: undefined };
-                        return { id: step.id, result: await checkpoint(store, step, result, () => judgeTrainingPassage(request, credential)) };
+                        return { id: step.id, result: await checkpoint(store, step, result, () => judgeTrainingPassage(request, credential, evaluationOptions)) };
                     })();
                     judgments.set(identity, pending);
                 }
@@ -277,7 +320,7 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
             const scoreQueries = async (lane, round, generation, generationId) => await drain(generation.queries.map(async (query) => {
                 try {
                     const score = store.step("score", { version: SELECTION_VERSION, lane, round, generationId, query,
-                        sourceId: example.id, corpusHash: snapshot.corpusHash, judgeVersion: CONTEXT_JUDGE_VERSION,
+                        sourceId: example.id, corpusHash: snapshot.corpusHash, judgeVersion,
                         retrievalVersion: TRAINING_RETRIEVAL_VERSION });
                     if (score.result) {
                         result.cached++;
@@ -363,7 +406,7 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
             }));
             if (problems.size) {
                 result.flagged++;
-                store.flagReview(example, "evaluation-unresolved", { steps: [...problems] });
+                store.flagReview(example, "evaluation-unresolved", { steps: [...problems] }, judgeVersion);
                 return;
             }
             if (lanes.some(lane => !lane))
@@ -372,7 +415,7 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
             const selected = selectTrainingQueries(queries);
             save(store, evaluation, { sourceId: example.id, inputHash: example.inputHash, timestamp: example.timestamp,
                 corpusHash: snapshot.corpusHash, corpusReport: snapshot.report, teacherIds: lanes.flatMap(lane => lane.teacherIds), queries, selected, review: [] });
-            store.clearReview(example.id);
+            store.clearReview(example.id, judgeVersion, legacyUnresolvedMatchesJudge(store, judgeVersion));
             result.evaluated++;
         }
         finally {
@@ -398,10 +441,11 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
     return { refreshed, ...result, concurrency, threshold: options.threshold ?? TRAINING_GATE_THRESHOLD,
         retrievalMethod: "independent-lex10-vec10", callUnit: "teacher completion, retrieval operation or uncached passage judgment" };
 }
-export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD) {
+export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD, judgeVersion = CONTEXT_JUDGE_VERSION) {
     const active = new Map(store.queryExamples(threshold).map(e => [e.id, e]));
-    const unresolved = new Set(store.reviews().map(review => review.sourceId)), exported = new Set();
-    for (const evaluation of store.completedEvaluations({ selection: SELECTION_VERSION, retrieval: TRAINING_RETRIEVAL_VERSION, judge: CONTEXT_JUDGE_VERSION })) {
+    const unresolved = new Set(store.reviews().filter(review => reviewBlocksJudge(store, review, judgeVersion)).map(review => review.sourceId));
+    const exported = new Set();
+    for (const evaluation of store.completedEvaluations({ selection: SELECTION_VERSION, retrieval: TRAINING_RETRIEVAL_VERSION, judge: judgeVersion })) {
         const source = active.get(evaluation.sourceId);
         if (!source || source.inputHash !== evaluation.inputHash || source.timestamp !== evaluation.timestamp || exported.has(source.id))
             continue;
@@ -415,7 +459,9 @@ export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD)
         const selected = selectTrainingQueries(evaluation.queries);
         const provenance = [...evaluation.teacherIds, ...evaluation.queries.flatMap(q => [q.retrievalId, ...q.judgments])];
         yield { stage: "query-training", input: JSON.parse(source.inputJson), inputHash: source.inputHash,
-            recallProbability: source.recallProbability, threshold, target: selected, targetPolicy: TARGET_POLICY,
+            recallProbability: source.recallProbability, ...(source.recallModel ? { recallModel: source.recallModel } : {}),
+            recallRequestedModel: store.requestedModel,
+            threshold, target: selected, targetPolicy: TARGET_POLICY,
             source: store.sourceDetails(source.id), evaluation: { ...evaluation, selected, review: [] }, splitGroup: jsonHash(source.sessionId),
             provenance: [...new Set(provenance)].map(id => store.stepRecord(id)) };
     }

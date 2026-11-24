@@ -1,15 +1,17 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
-export const RESPONSE_RUBRIC_VERSION = `${TYPESAFE_MODEL}:response-v10`;
+import { decisionModelScope, requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
+export function responseRubricVersion(model = TYPESAFE_MODEL, endpoint) {
+    return `${decisionModelScope(model, endpoint)}:response-v10`;
+}
 export const RESPONSE_STAGE_VERSIONS = { quality: "quality-v9", feedback: "feedback-v9", sentiment: "sentiment-v10", retrospective: "retrospective-v9", memory: "memory-v2-isolated" };
 const probability = Type.Number({ minimum: 0, maximum: 1 });
 const score = Type.Object({ type: Type.Literal("score"), score: Type.Number({ minimum: 0, maximum: 3 }),
-    confidence: probability, probabilities: Type.Object({ "0": probability, "1": probability, "2": probability, "3": probability }) });
+    confidence: probability, probabilities: Type.Object({ "0": probability, "1": probability, "2": probability, "3": probability }, { additionalProperties: false }) });
 function choiceSchema(criteria) {
     const labels = Object.keys(criteria);
     return Type.Object({ type: Type.Literal("choice"), choice: Type.Enum(labels),
-        confidence: probability, probabilities: Type.Object(Object.fromEntries(labels.map(x => [x, probability]))) });
+        confidence: probability, probabilities: Type.Object(Object.fromEntries(labels.map(x => [x, probability])), { additionalProperties: false }) });
 }
 const taskTypes = { question: "Answering a question or explaining.", artifact: "Producing a document, report or other artifact.",
     action: "Implementing, fixing or executing an action.", discussion: "Brainstorming or collaborative planning.", other: "Other or unclear." };
@@ -60,7 +62,9 @@ function validateDistributions(answers) {
         if (!answer.probabilities)
             continue;
         const entries = Object.entries(answer.probabilities);
-        if (Math.abs(entries.reduce((sum, [, p]) => sum + p, 0) - 1) > 0.03 ||
+        // Allow 2-decimal rounding drift across all options (up to 0.005 per option) while still rejecting malformed sums.
+        const sumTolerance = Math.max(0.03, entries.length * 0.005 + 0.005);
+        if (Math.abs(entries.reduce((sum, [, p]) => sum + p, 0) - 1) > sumTolerance ||
             (answer.type === "score" && Math.abs(entries.reduce((sum, [k, p]) => sum + Number(k) * p, 0) - answer.score) > 0.06)) {
             throw new Error("Invalid response-audit probability distribution");
         }

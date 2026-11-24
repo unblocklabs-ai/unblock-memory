@@ -19,8 +19,8 @@ const user = (content: string, extra = {}) => ({ role: "user", content,
 const assistant = (content: string, extra = {}) => ({ role: "assistant", content, stopReason: "stop", ...extra });
 const rows = (messages: unknown[]) => messages.map((message, i) => ({ seq: i + 1, createdAt: 10_000 + i,
   eventJson: JSON.stringify({ type: "message", message }) }));
-const payload = (probability: number) => ({ model: "jev-1.13.0", answers: { recall_needed: { type: "noul", noul: probability } },
-  usage: { input_tokens: 123, output_tokens: 20 } });
+const payload = (probability: number) => ({ model: "liquid/d1.2-ultra-20261116", answers: { recall_needed: { type: "noul", noul: probability } },
+  usage: { input_tokens: 123, output_tokens: 0 } });
 const bounds = { maxExamples: 100, maxInputBytes: 3_000_000 };
 function fixture(t: { after: (fn: () => void) => void }) {
   const root = mkdtempSync(join(tmpdir(), "memory-training-"));
@@ -152,7 +152,7 @@ test("positives, negatives and identical inputs across sessions are cached; repe
     calls++;
     const body = JSON.parse(String(init.body));
     assert.doesNotMatch(JSON.stringify(body.state), /Welcome|Other answer/);
-    return new Response(JSON.stringify(payload(body.state.currentRequest === "Thanks" ? 0.05 : 0.9)));
+    return new Response(JSON.stringify(payload(body.state[0].currentRequest === "Thanks" ? 0.05 : 0.9)));
   });
   await f.store.locked(async () => {
     assert.equal(collectTraining(f.source, f.store).added, 3);
@@ -385,11 +385,34 @@ test("expired leases fence old writers and preserve interrupted attempts for exp
     const external = new DatabaseSync(f.storePath);
     try { external.exec("UPDATE training_lock SET expires=0"); } finally { external.close(); }
     await other.locked(() => {
-      assert.throws(() => f.store.finish(job.id, attempt, { probability: 0.9, model: "jev-1.13.0", usage: { input_tokens: 123, output_tokens: 20 } }), /lease lost/);
+      assert.throws(() => f.store.finish(job.id, attempt, { probability: 0.9, model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 123, output_tokens: 0 } }), /lease lost/);
       assert.equal(other.pending(1).length, 0);
       assert.equal(other.retry(false, [job.id]), 0);
       assert.equal(other.retry(true, [job.id]), 1);
     });
     assert.throws(() => f.store.renew(), /lease lost/);
+  });
+});
+
+test("pre-dispatch 503 Retry-After records failed (retryable without --include-ambiguous) while plain 503 records ambiguous", async t => {
+  const f = fixture(t);
+  f.add("s", [user("First question"), assistant("A1"), user("Second question"), assistant("A2")]);
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return calls === 1
+      ? new Response("busy", { status: 503, headers: { "Retry-After": "1" } })
+      : new Response("busy", { status: 503 });
+  });
+  await f.store.locked(async () => {
+    collectTraining(f.source, f.store);
+    const result = await runTraining(f.source, f.store, config, { ...bounds, concurrency: 1 });
+    assert.equal(result.failed, 1);
+    assert.equal(result.ambiguous, 1);
+    const retryable = f.store.status(0.7).retryable as { id: string; status: string }[];
+    const failedId = retryable.find(item => item.status === "failed")!.id;
+    const ambiguousId = retryable.find(item => item.status === "ambiguous")!.id;
+    assert.equal(f.store.retry(false, [failedId]), 1);
+    assert.equal(f.store.retry(false, [ambiguousId]), 0);
   });
 });

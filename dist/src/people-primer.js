@@ -1,5 +1,5 @@
 import { Value } from "typebox/value";
-import { requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_ANSWERS_SCHEMA as answerSchema } from "./typesafe-client.js";
+import { decisionModelScope, defaultDecisionModel, requestTypeSafe, TYPESAFE_NOUL_ANSWERS_SCHEMA as answerSchema } from "./typesafe-client.js";
 import { abortable } from "./abortable.js";
 import { jsonHash } from "./json-hash.js";
 const VERSION = "people-primer-interaction-v1";
@@ -101,7 +101,9 @@ export async function primePersonDossier(params) {
                             false: "Only a topic/name match, activity summary, psychological profile, ambiguous attribution or no substantive answer." },
                     }])),
             };
-            const key = jsonHash([VERSION, TYPESAFE_MODEL, person.id, state, questions]);
+            const model = params.model ?? defaultDecisionModel(params.endpoint);
+            const scope = decisionModelScope(model, params.endpoint);
+            const key = jsonHash([VERSION, scope, person.id, state, questions]);
             const expectedKeys = Object.keys(questions);
             const valid = (value) => Value.Check(answerSchema, value) &&
                 Object.keys(value.answers).length === expectedKeys.length && expectedKeys.every(k => Object.hasOwn(value.answers, k));
@@ -111,7 +113,9 @@ export async function primePersonDossier(params) {
                     cached++;
                 else {
                     requests++;
-                    payload = await requestTypeSafe({ apiKey: params.apiKey, timeoutMs: config.timeoutMs, signal }, state, questions);
+                    payload = await requestTypeSafe({
+                        apiKey: params.apiKey, endpoint: params.endpoint, model, timeoutMs: config.timeoutMs, signal,
+                    }, state, questions);
                     signal.throwIfAborted();
                     if (!valid(payload))
                         throw new Error("Invalid primer judgments");

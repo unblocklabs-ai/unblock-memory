@@ -11,6 +11,7 @@ import { generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, 
 import { historicalTrainingSearch, HistoricalCorpusUnavailableError, type TrainingHit } from "../src/training-retrieval.js";
 import { resolveConfig } from "../src/config.js";
 import { collectTraining } from "../src/training.js";
+import { memoryJudgeVersion } from "../src/typesafe.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 import type { QueryLane } from "../src/query-contract.js";
 
@@ -23,7 +24,7 @@ const config = resolveConfig({ typesafe: { apiKey: "test-key" }, corpora: [
 const candidates = (lane: QueryLane, round: number) => Array.from({ length: 5 }, (_, i) => `${lane} round ${round} query ${i}`);
 const teacherResponse = (queries = candidates("lex", 1)) => ({ model: "gpt-6-luna", text: JSON.stringify({ queries }),
   usage: { inputTokens: 100, outputTokens: 50 }, execution: { mode: "isolated-agent-runtime" } });
-const gradeResponse = (probability = 0.9) => ({ model: "jev-1.13.0", usage,
+const gradeResponse = (probability = 0.9) => ({ model: "liquid/d1.2-ultra-20261116", usage,
   answers: { memory_0: { type: "noul", noul: probability } } });
 type TeacherRequest = { model: string; reasoning: string; maxTokens: number; messages: { content: string }[]; execution: unknown; systemPrompt: string };
 function runtime(capture?: (request: TeacherRequest, lane: QueryLane, round: number) => void) {
@@ -49,7 +50,7 @@ function fixture(t: { after: (f: () => void) => void }) {
   add("test", input.currentRequest);
   const initialize = (probability: number | null = 0.9) => {
     collectTraining(source, store);
-    if (probability !== null) for (const job of store.pending()) store.finish(job.id, store.start(job.id), { probability, model: "jev-1.13.0", usage });
+    if (probability !== null) for (const job of store.pending()) store.finish(job.id, store.start(job.id), { probability, model: "liquid/d1.2-ultra-20261116", usage });
   };
   t.after(() => { db.close(); store.close(); });
   return { source, store, storePath, db, initialize, add };
@@ -112,7 +113,7 @@ test("v2 real checkpoint flow resumes, reuses blind judgments and independently 
     return [hit("Evidence 0.75"), ...probabilities.map((p, i) => hit(`Evidence ${p}`, `${query}-${i}`))];
   });
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
-    const state = JSON.parse(String(init.body)).state;
+    const [state] = JSON.parse(String(init.body)).state;
     assert.deepEqual(Object.keys(state), ["conversation", "asOf", "candidates"]);
     assert.equal(state.candidates.length, 1);
     assert.deepEqual(Object.keys(state.candidates[0]), ["excerpt", "corpus", "sourcePath", "dates"]);
@@ -237,7 +238,7 @@ test("failed judgment flags only its example; explicit exact retry resolves it w
   let calls = 0, fail = true;
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
     calls++;
-    const state = JSON.parse(String(init.body)).state;
+    const [state] = JSON.parse(String(init.body)).state;
     if (state.conversation.currentRequest === input.currentRequest && fail) return new Response("bad", { status: 400 });
     return new Response(JSON.stringify(gradeResponse()));
   });
@@ -361,10 +362,89 @@ test("recall gate, changed inputs and passive old rows cannot contaminate v2 tar
     await generateTrainingQueries(f.source, f.store, runtime(), options);
     await evaluateTrainingQueries(f.source, f.store, config, runtime(), {}, search);
     assert.equal([...exportQueryTraining(f.store)].length, 1); assert.equal([...exportQueryTraining(f.store, 0.8)].length, 0);
+    assert.equal([...exportQueryTraining(f.store)][0]!.recallModel, "liquid/d1.2-ultra-20261116");
     f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='test' AND seq=1")
       .run(JSON.stringify({ type: "message", message: { role: "user", content: "Changed request" } }));
     assert.equal((await generateTrainingQueries(f.source, f.store, {}, options)).calls, 0);
     assert.equal([...exportQueryTraining(f.store)].length, 0);
     assert.equal(external.prepare("SELECT status FROM training_steps WHERE id=?").get("a".repeat(64))!.status, "failed");
+  });
+});
+
+test("a failed legacy Jev evaluation review does not block Liquid, and Liquid success does not clear Jev's review on switchback", async t => {
+  const f = fixture(t), host = runtime();
+  let corpusHash = "corpus-v1";
+  const dynamicSearch: typeof historicalTrainingSearch = async () => ({
+    maxDate: "2026-04-06", corpusHash,
+    report: { sessions: 1, chunks: 1, excluded: 0, truncated: 0, excludedChunks: 0 },
+    search: async () => [{ ...hit(), text: `Atlas fact from ${corpusHash}` }], close: async () => {},
+  });
+  const legacyConfig = resolveConfig({
+    typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone", apiKey: "legacy-key" },
+    corpora: [
+      { name: "memory", kind: "files", paths: ["MEMORY.md"] },
+      { name: "sessions", kind: "sessions", chatTypes: ["direct"] },
+    ],
+  });
+  const jevJudge = memoryJudgeVersion(legacyConfig.typesafe.model, legacyConfig.typesafe.endpoint);
+  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  const legacyStore = new TrainingStore(f.storePath, "main", "jev-1.13.0");
+  t.after(() => legacyStore.close());
+  const fetch = t.mock.method(globalThis, "fetch", async () =>
+    new Response(JSON.stringify({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.9 } }, usage })));
+  // 1. Jev succeeds on corpus-v1.
+  await legacyStore.locked(async () => {
+    collectTraining(f.source, legacyStore);
+    for (const job of legacyStore.pending()) legacyStore.finish(job.id, legacyStore.start(job.id), { probability: 0.9, model: "jev-1.13.0", usage });
+    await generateTrainingQueries(f.source, legacyStore, host, options);
+    const okJev = await evaluateTrainingQueries(f.source, legacyStore, legacyConfig, host, { concurrency: 1 }, dynamicSearch);
+    assert.equal(okJev.evaluated, 1);
+    assert.equal([...exportQueryTraining(legacyStore, 0.7, jevJudge)].length, 1);
+    // 2. Corpus changes to corpus-v2 and Jev fails, flagging Jev's review and blocking stale corpus-v1 export.
+    corpusHash = "corpus-v2";
+    fetch.mock.mockImplementation(async () => new Response("bad", { status: 400 }));
+    const failedJev = await evaluateTrainingQueries(f.source, legacyStore, legacyConfig, host, { concurrency: 1 }, dynamicSearch);
+    assert.equal(failedJev.flagged, 1);
+    assert.equal([...exportQueryTraining(legacyStore, 0.7, jevJudge)].length, 0);
+  });
+  // 3. Liquid runs on corpus-v2 and succeeds; Liquid exports cleanly.
+  fetch.mock.mockImplementation(async () => new Response(JSON.stringify(gradeResponse())));
+  await f.store.locked(async () => {
+    f.initialize();
+    const done = await evaluateTrainingQueries(f.source, f.store, config, host, { concurrency: 1 }, dynamicSearch);
+    assert.equal(done.evaluated, 1);
+    assert.equal(done.flagged, 0);
+    const liquidRows = [...exportQueryTraining(f.store, 0.7, liquidJudge)];
+    assert.equal(liquidRows.length, 1);
+    assert.equal(liquidRows[0]!.recallRequestedModel, "liquid/d1.2-ultra");
+  });
+  // 4. Switching back to Jev must STILL block exporting the stale corpus-v1 Jev evaluation.
+  await legacyStore.locked(async () => {
+    assert.equal([...exportQueryTraining(legacyStore, 0.7, jevJudge)].length, 0);
+  });
+  // 5. Migrated v1 evaluation-unresolved holds use __legacy__ scope and survive a shared snapshot error + Liquid recovery.
+  const rawDb = new DatabaseSync(f.storePath);
+  t.after(() => rawDb.close());
+  const jevReview = rawDb.prepare("SELECT * FROM training_reviews WHERE scope=?").get(jevJudge)!;
+  rawDb.exec("DROP TABLE training_reviews;");
+  rawDb.exec(`CREATE TABLE training_reviews (
+    source_id TEXT PRIMARY KEY REFERENCES training_examples(id), input_hash TEXT NOT NULL,
+    recipe TEXT NOT NULL, reason TEXT NOT NULL, details_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+  ) STRICT; INSERT OR REPLACE INTO memory_schema VALUES ('training',1);`);
+  rawDb.prepare("INSERT INTO training_reviews VALUES (?,?,?,?,?,?)")
+    .run(jevReview.source_id, jevReview.input_hash, jevReview.recipe, jevReview.reason, jevReview.details_json, jevReview.updated_at);
+  const migrated = new TrainingStore(f.storePath, "main");
+  t.after(() => migrated.close());
+  assert.equal(migrated.reviews().find(r => r.reason === "evaluation-unresolved")?.scope, "__legacy__");
+  await migrated.locked(async () => {
+    const failingSearch: typeof historicalTrainingSearch = async () => { throw new HistoricalCorpusUnavailableError("transient"); };
+    const snapFail = await evaluateTrainingQueries(f.source, migrated, config, host, { concurrency: 1 }, failingSearch);
+    assert.equal(snapFail.flagged, 1);
+    const recovered = await evaluateTrainingQueries(f.source, migrated, config, host, { concurrency: 1 }, dynamicSearch);
+    assert.equal(recovered.cached, 1);
+    assert.equal([...exportQueryTraining(migrated, 0.7, liquidJudge)].length, 1);
+  });
+  await legacyStore.locked(async () => {
+    assert.equal([...exportQueryTraining(legacyStore, 0.7, jevJudge)].length, 0);
   });
 });

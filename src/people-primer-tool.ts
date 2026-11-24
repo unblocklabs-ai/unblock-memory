@@ -58,8 +58,10 @@ export function registerPeoplePrimerTool(api: OpenClawPluginApi, runtime: QmdMem
           const agentName = resolveAgentIdentity(active.cfg, active.agentId)?.name?.trim() || suppliedName?.trim() || "the assistant";
           if (draft) return jsonResult(await manager.reviewClaim({ claim: draft.blurb, citations: draft.citations,
             personBackground: { name: person.preferredName ?? person.displayName, agentName },
-            corpora: config.peoplePrimer.corpora, apiKey, timeoutMs: config.peoplePrimer.timeoutMs, signal: combined }));
-          return jsonResult(await primePersonDossier({ personId, agentName, store, config: config.peoplePrimer, apiKey, signal: combined,
+            corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
+            timeoutMs: config.peoplePrimer.timeoutMs, signal: combined }));
+          return jsonResult(await primePersonDossier({ personId, agentName, store, config: config.peoplePrimer, apiKey,
+            endpoint: config.typesafe.endpoint, model: config.typesafe.model, signal: combined,
             search: (query, options) => manager.search(query, { ...options, requestContext: active.requestContext }) }));
         } catch {
           return jsonResult({ status: "unavailable", needsReview: true, reason: "Primer failed or was cancelled; no dossier written" });

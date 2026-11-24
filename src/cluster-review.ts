@@ -1,7 +1,7 @@
 import type { QMDStore } from "@unblocklabs/qmd";
 import { readAnalysisSummary, readCluster } from "./analysis.js";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
-import { TYPESAFE_MODEL } from "./typesafe-client.js";
+import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
 import { reviewClusterDefects } from "./typesafe-review.js";
 import { chunkFingerprint } from "./curation.js";
 
@@ -14,7 +14,7 @@ function indexedChunk(db: QMDStore["internal"]["db"], safe: { source: ResolvedSo
 /** Inspect center and edge samples; never extrapolate their labels to the rest of a cluster. */
 export async function reviewClusterIngestion(params: {
   db: QMDStore["internal"]["db"]; sources: readonly ResolvedSource[]; clusterId: string;
-  apiKey: string; timeoutMs: number; signal: AbortSignal;
+  apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal: AbortSignal;
   read?: <T>(run: () => T) => Promise<T>;
 }) {
   params.signal.throwIfAborted();
@@ -60,6 +60,6 @@ export async function reviewClusterIngestion(params: {
     });
     return { status: "ok" as const, runId: snapshot.runId, clusterId: params.clusterId, members, recurring,
       sampled: sample.length, considered: snapshot.considered, clusterSize: snapshot.clusterSize,
-      policy: `${TYPESAFE_MODEL}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
+      policy: `${decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint)}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
   });
 }

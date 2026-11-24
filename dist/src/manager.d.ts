@@ -213,6 +213,8 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     auditQuality(params: {
         corpora: readonly string[];
         apiKey: string;
+        endpoint?: string;
+        model?: string;
         timeoutMs: number;
         minNoise: number;
         limit?: number;

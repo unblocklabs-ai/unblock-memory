@@ -29,7 +29,7 @@ export async function reviewRequestContext(runtime: QmdMemoryRuntime, active: No
   if (!apiKey) return { status: "unavailable", reason: "TypeSafe API key not configured" } as const;
   const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
   if (!manager) return { status: "unavailable", reason: "Memory manager unavailable" } as const;
-  return { status: "ready", manager, apiKey, signal: combined, timeoutMs: typesafe.timeoutMs } as const;
+  return { status: "ready", manager, apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal: combined, timeoutMs: typesafe.timeoutMs } as const;
 }
 
 export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRuntime, config: UnblockMemoryConfig, diagnostics: WhispererDiagnostics) {
@@ -75,7 +75,7 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
           const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
           if (context.status !== "ready") return jsonResult(context);
           return jsonResult(await context.manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora,
-            apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal }));
+            apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
         } catch { return jsonResult({ status: "unavailable", needsReview: true, reason: "Claim review failed or was cancelled; no claim verified" }); }
       },
     };
@@ -95,7 +95,7 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
           const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
           if (context.status !== "ready") return jsonResult(context);
           return jsonResult(await context.manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora,
-            apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal }));
+            apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
         } catch { return jsonResult({ status: "unavailable", reason: "Cluster review failed or was cancelled; no cluster judgment made" }); }
       },
     };

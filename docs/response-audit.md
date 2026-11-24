@@ -44,7 +44,9 @@ investigation while still tracking response quality and sentiment.
 }
 ```
 
-This is explicit approval to send those exchanges to TypeSafe. Sender IDs apply
+This is explicit approval to send those exchanges to the configured decision-model
+endpoint (defaulting to `https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter
+`liquid/d1.2-ultra`, or `https://api.typesafe.ai/v1/systemone` when overridden). Sender IDs apply
 across the agent's Slack accounts; use only identities approved in all such accounts.
 `memoryCorpora` is optional and separately approves configured **file** corpora for
 memory-gap investigation. Leave it empty to send no indexed memory evidence.
@@ -88,7 +90,7 @@ openclaw memory-responses retry-failed --agent main
 Reports group by scoped human identity as well as task/model/time. Names are not
 identity keys. Existing active people-store links are resolved read-only at assessment
 time; missing links do not prevent analysis. Unknown account scopes stay isolated
-per session. No new identity fields are sent to TypeSafe. Date ranges are UTC with
+per session. No new identity fields are sent to the decision endpoint. Date ranges are UTC with
 an inclusive start and exclusive end. `periodStart` identifies a day/week bucket;
 legacy `week`/`fromWeek`/`toWeek` fields remain aliases. `--task-type` and `--model`
 further narrow comparisons. Human-specific scores are not rankings of the humans:

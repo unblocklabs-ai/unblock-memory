@@ -89,7 +89,7 @@ export function registerSkillWhisperer(api, runtime, config, typesafe, diagnosti
                         return;
                     }
                     const selectedIndex = await abortable(selectTypeSafeSkill({
-                        apiKey, timeoutMs: typesafe.timeoutMs, signal,
+                        apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, signal,
                         ...typeSafeConversation(event.prompt, recentMessages),
                         candidates: shortlist.map(({ candidate }) => candidate),
                         onCandidateFailure: (candidateIndex, error) => {

@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { stripReasoningTagsFromText } from "openclaw/plugin-sdk/text-chunking";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
-import { estimateJevTokens, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
+import { estimateJevTokens, matchesDecisionModel, requestTypeSafe, resolveTypeSafeApiKey } from "./typesafe-client.js";
 import { readInsideOutSources } from "./inside-out-sources.js";
 import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHistory } from "./emotion-baselines.js";
 import { PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
@@ -11,7 +11,12 @@ import { jsonHash } from "./json-hash.js";
 import { tableExists } from "./memory-database.js";
 export { linkInsideOutPeople, purgeInsideOutPerson, refreshInsideOutBaselines, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 const RUBRIC = "emotion-presence-v2";
+const LEGACY_TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const CONTEXT_ERROR = "Target reply and preceding assistant exceed context budget";
+function insideOutRubric(endpoint) {
+    const canonical = endpoint.replace(/\/+$/u, "");
+    return canonical === LEGACY_TYPESAFE_ENDPOINT ? RUBRIC : `${RUBRIC}@${canonical}`;
+}
 const meanings = {
     joy: "joy or happiness: pleasure, delight, satisfaction, or happy relief; not mere polite acknowledgment",
     sadness: "sadness: sorrow, grief, unhappiness, or disappointment; not merely describing a negative event",
@@ -181,6 +186,7 @@ export async function runInsideOut(options) {
     let store;
     const result = { reviewed: 0, cached: 0, failed: 0, sources: 0, skippedSources: 0, errors: [] };
     try {
+        const rubric = insideOutRubric(config.typesafe.endpoint);
         store = openInsideOutStore(storePath);
         const person = tableExists(store, "person_identities")
             ? store.prepare(`SELECT (${PERSON_MATCH}) person_id FROM (SELECT ? channel,? human_key,? sender_id) e`)
@@ -200,7 +206,7 @@ export async function runInsideOut(options) {
         processing: for (const retrying of [false, true]) {
             const pending = new Map();
             if (retrying) {
-                for (const row of failures.all(RUBRIC, PURGED_GRADE, Number(options.retry ?? false), CONTEXT_ERROR, Date.now() - 3600_000, options.sessionId ?? null, options.sessionId ?? null)) {
+                for (const row of failures.all(rubric, PURGED_GRADE, Number(options.retry ?? false), CONTEXT_ERROR, Date.now() - 3600_000, options.sessionId ?? null, options.sessionId ?? null)) {
                     const source = String(row.source);
                     if (!pending.has(source))
                         pending.set(source, new Set());
@@ -214,7 +220,7 @@ export async function runInsideOut(options) {
                 const retryIds = pending.get(reader.source);
                 if (retrying && !retryIds)
                     continue;
-                const prior = checkpoint.get(reader.source, RUBRIC);
+                const prior = checkpoint.get(reader.source, rubric);
                 const sessionId = reader.sessionId ?? prior?.session_id;
                 if (options.sessionId && sessionId && options.sessionId !== sessionId)
                     continue;
@@ -237,7 +243,7 @@ export async function runInsideOut(options) {
                 const cached = (id) => {
                     if (retrying)
                         return !retryIds?.has(id);
-                    const skip = !!existing.get(id, RUBRIC);
+                    const skip = !!existing.get(id, rubric);
                     if (skip)
                         result.cached++;
                     return skip;
@@ -246,27 +252,34 @@ export async function runInsideOut(options) {
                     options.signal?.throwIfAborted();
                     if (result.reviewed + result.failed >= config.insideOut.maxInteractions)
                         break processing;
-                    let probabilities = INSIDE_OUT_EMOTIONS.map(() => null), error = null, model = TYPESAFE_MODEL;
+                    let probabilities = INSIDE_OUT_EMOTIONS.map(() => null), error = null, model = config.typesafe.model;
                     try {
                         if (interaction.oversized)
                             throw new Error(CONTEXT_ERROR);
-                        const response = await requestTypeSafe({ apiKey, timeoutMs: config.typesafe.timeoutMs, signal: options.signal }, interaction.state, questions);
+                        const response = await requestTypeSafe({
+                            apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
+                            timeoutMs: config.typesafe.timeoutMs, signal: options.signal,
+                        }, interaction.state, questions);
                         const payload = response;
+                        if (payload?.model !== undefined && !matchesDecisionModel(payload.model, config.typesafe.model)) {
+                            throw new Error("Decision model returned unexpected model");
+                        }
                         probabilities = INSIDE_OUT_EMOTIONS.map(emotion => {
                             const answer = payload?.answers?.[emotion], value = answer?.noul;
                             if (answer?.type !== "noul" || typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
-                                throw new Error("Jev returned invalid emotion probabilities");
+                                throw new Error("Decision model returned invalid emotion probabilities");
                             }
                             return value;
                         });
-                        model = payload.model ?? TYPESAFE_MODEL;
+                        // Persist the requested alias so upstream date-snapshot rotations do not fragment baselines.
+                        model = config.typesafe.model;
                     }
                     catch (failure) {
                         options.signal?.throwIfAborted();
                         error = failure instanceof Error ? failure.message : "Jev request failed";
                         probabilities = INSIDE_OUT_EMOTIONS.map(() => null);
                     }
-                    save.run(interaction.id, RUBRIC, source.sessionId, interaction.messageId, interaction.assistantId, interaction.human, interaction.sender, interaction.channel, source.source, interaction.targetAt, Date.now(), model, Number(interaction.trimmed), ...probabilities, error, person?.get(interaction.channel, interaction.human, interaction.sender)?.person_id ?? null);
+                    save.run(interaction.id, rubric, source.sessionId, interaction.messageId, interaction.assistantId, interaction.human, interaction.sender, interaction.channel, source.source, interaction.targetAt, Date.now(), model, Number(interaction.trimmed), ...probabilities, error, person?.get(interaction.channel, interaction.human, interaction.sender)?.person_id ?? null);
                     if (error)
                         result.failed++;
                     else
@@ -274,7 +287,7 @@ export async function runInsideOut(options) {
                 }
                 // Only exhausted snapshots advance: partial passes resume using the existing per-interaction cache.
                 if (!retrying)
-                    finish.run(source.source, RUBRIC, source.sessionId, reader.signature, reader.revision, source.events.reduce((last, event) => Math.max(last, event.seq), 0));
+                    finish.run(source.source, rubric, source.sessionId, reader.signature, reader.revision, source.events.reduce((last, event) => Math.max(last, event.seq), 0));
                 if (result.reviewed + result.failed >= config.insideOut.maxInteractions)
                     break processing;
             }

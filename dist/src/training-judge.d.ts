@@ -1,7 +1,7 @@
 import type { TrainingInput } from "./training-input.js";
 import type { TrainingHit } from "./training-retrieval.js";
-export declare const CONTEXT_JUDGE_VERSION = "jev-1.13.0:memory-usefulness-v2";
-export declare function contextJudgeRequest(input: TrainingInput, asOf: string, hit: TrainingHit): {
+export declare const CONTEXT_JUDGE_VERSION: string;
+export declare function contextJudgeRequest(input: TrainingInput, asOf: string, hit: TrainingHit, model?: string): {
     model: string;
     state: {
         conversation: {
@@ -30,13 +30,16 @@ export declare function contextJudgeRequest(input: TrainingInput, asOf: string, 
         };
     };
 };
-export declare function judgeTrainingPassage(request: ReturnType<typeof contextJudgeRequest>, apiKey: string): Promise<{
+export declare function judgeTrainingPassage(request: ReturnType<typeof contextJudgeRequest>, apiKey: string, options?: {
+    endpoint?: string;
+    model?: string;
+}): Promise<{
     probability: number;
     answer: {
         type: "noul";
         noul: number;
     };
-    model: "jev-1.13.0";
+    model: string;
     usage: {
         input_tokens: number;
         output_tokens: number;

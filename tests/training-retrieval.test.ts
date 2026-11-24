@@ -93,7 +93,7 @@ test("runtime and historical retrieval send byte-identical expanded-turn evidenc
     const requests: unknown[] = [];
     t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
       requests.push(JSON.parse(String(init?.body)));
-      return Response.json({ model: "jev-1.13.0", usage: { input_tokens: 20, output_tokens: 5 }, answers: { memory_0: { type: "noul", noul: 0.9 } } });
+      return Response.json({ model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 20, output_tokens: 0 }, answers: { memory_0: { type: "noul", noul: 0.9 } } });
     });
     const conversation = { history: [], currentRequest: "Who approved our staging deployment?" };
     await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {

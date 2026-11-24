@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
+import { defaultDecisionModel, matchesDecisionModel, requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
 import type { TrainingInput } from "./training-input.js";
 
 export const TRAINING_GATE_VERSION = "historical-recall-v2";
@@ -28,15 +28,22 @@ export const TRAINING_GATE_QUESTIONS = { recall_needed: {
   },
 } };
 const resultSchema = Type.Object({
-  model: Type.Literal(TRAINING_GATE_MODEL),
+  model: Type.String({ minLength: 1 }),
   answers: Type.Object({ recall_needed: TYPESAFE_NOUL_SCHEMA }),
   usage: Type.Object({ input_tokens: Type.Integer({ minimum: 0 }), output_tokens: Type.Integer({ minimum: 0 }) }),
 });
 
-export async function judgeTrainingInput(input: TrainingInput, apiKey: string, signal: AbortSignal) {
-  const result = await requestTypeSafe({ apiKey, signal }, input, TRAINING_GATE_QUESTIONS);
-  if (!Value.Check(resultSchema, result) || !Number.isFinite(result.answers.recall_needed.noul)) {
+export async function judgeTrainingInput(input: TrainingInput, apiKey: string, signal: AbortSignal,
+  options?: { endpoint?: string; model?: string }) {
+  const expectedModel = options?.model ?? defaultDecisionModel(options?.endpoint);
+  const result = await requestTypeSafe({ apiKey, endpoint: options?.endpoint, model: expectedModel, signal }, input, TRAINING_GATE_QUESTIONS);
+  if (!Value.Check(resultSchema, result) || !matchesDecisionModel(result.model, expectedModel) ||
+      !Number.isFinite(result.answers.recall_needed.noul)) {
     throw new TypeSafeRequestError("Invalid training gate response", "invalid_response");
   }
-  return { probability: result.answers.recall_needed.noul, model: result.model, usage: result.usage };
+  return {
+    probability: result.answers.recall_needed.noul,
+    model: result.model,
+    usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens },
+  };
 }

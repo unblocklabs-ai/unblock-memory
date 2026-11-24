@@ -67,7 +67,7 @@ type ReviewDetails = {
 };
 export declare class TrainingStore {
     #private;
-    constructor(path: string, agentId: string);
+    constructor(path: string, agentId: string, requestedModel?: string);
     locked<T>(fn: () => T | Promise<T>): Promise<T>;
     renew(): void;
     sessions(): string[];
@@ -87,6 +87,7 @@ export declare class TrainingStore {
     retry(includeAmbiguous: boolean, ids: readonly string[]): number;
     queryExamples(threshold?: number): (TrainingSourceExample & {
         recallProbability: number;
+        recallModel: string | null;
     })[];
     step<S extends keyof TrainingStepResults>(stage: S, parameters: Record<string, unknown>): {
         id: string;
@@ -97,10 +98,12 @@ export declare class TrainingStore {
         status: StepStatus;
         result: TrainingStepResults[S] | undefined;
     };
-    flagReview(example: TrainingSourceExample, reason: string, details: ReviewDetails): void;
-    clearReview(sourceId: string): void;
+    get requestedModel(): string;
+    flagReview(example: TrainingSourceExample, reason: string, details: ReviewDetails, scope?: string): void;
+    clearReview(sourceId: string, scope?: string, matchesLegacyUnresolved?: (details: ReviewDetails) => boolean): void;
     reviews(): {
         sourceId: string;
+        scope: string;
         inputHash: string;
         reason: string;
         details: ReviewDetails;
@@ -131,6 +134,11 @@ export declare class TrainingStore {
         completedAt: import("node:sqlite").SQLOutputValue;
     };
     stepRecordStatus(id: string): StepStatus | undefined;
+    stepScope(id: string): {
+        stage: string;
+        status: StepStatus;
+        request: Record<string, unknown>;
+    } | undefined;
     status(threshold: number): {
         nodeId: string;
         agentId: string;
@@ -150,6 +158,7 @@ export declare class TrainingStore {
         recipe: string;
         reviews: {
             sourceId: string;
+            scope: string;
             inputHash: string;
             reason: string;
             details: ReviewDetails;
@@ -169,6 +178,7 @@ export declare class TrainingStore {
         recallNeeded: boolean;
         threshold: number;
         model: import("node:sqlite").SQLOutputValue;
+        requestedModel: string;
         promptVersion: import("node:sqlite").SQLOutputValue;
         usage: {
             input_tokens: import("node:sqlite").SQLOutputValue;

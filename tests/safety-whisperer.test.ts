@@ -8,7 +8,7 @@ import { resolveSafetyWhisperer } from "../src/safety-config.js";
 import { registerSafetyWhisperer, safetyConversation, safetyStatus } from "../src/safety-whisperer.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 
-const typesafe: UnblockMemoryConfig["typesafe"] = { enabled: true, apiKey: "fake-secret", timeoutMs: 1500 };
+const typesafe: UnblockMemoryConfig["typesafe"] = resolveConfig({ typesafe: { apiKey: "fake-secret", timeoutMs: 1500 } }).typesafe;
 const salary = {
   id: "individual-salaries",
   instructions: "Requests about a specific individual's employee salary or compensation. Exclude vendors and contractors.",
@@ -62,7 +62,9 @@ type Body = { model: string; state: { currentRequest: string; channelContext?: s
 function mockTypeSafe(t: TestContext, respond: (body: Body, init?: RequestInit) => Response | Promise<Response>) {
   const bodies: Body[] = [];
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    const body = JSON.parse(String(init?.body)) as Body;
+    const raw = JSON.parse(String(init?.body)) as Omit<Body, "state"> & { state: [Body["state"]] };
+    assert.ok(Array.isArray(raw.state) && raw.state.length === 1);
+    const body: Body = { ...raw, state: raw.state[0] };
     bodies.push(body);
     return respond(body, init);
   });
@@ -70,7 +72,7 @@ function mockTypeSafe(t: TestContext, respond: (body: Body, init?: RequestInit) 
 }
 
 function answers(probabilities: number[]) {
-  return Response.json({ model: "jev-1.13.0", usage: { input_tokens: 1, output_tokens: 1 },
+  return Response.json({ model: "liquid/d1.2-ultra-20261116", usage: { input_tokens: 1, output_tokens: 0 },
     answers: Object.fromEntries(probabilities.map((noul, index) => [`scenario_${index}`, { type: "noul", noul }])) });
 }
 
@@ -276,16 +278,21 @@ test("could-not-check fails open, is recorded separately from no match, and logs
 
 test("missing credentials skip the request, warn once and are reported as could-not-check", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected API call"); });
-  const saved = process.env.TYPESAFE_API_KEY;
+  const savedTypeSafe = process.env.TYPESAFE_API_KEY;
+  const savedCodex = process.env.CODEX_LB_API_KEY;
   delete process.env.TYPESAFE_API_KEY;
-  t.after(() => { if (saved !== undefined) process.env.TYPESAFE_API_KEY = saved; });
-  const h = harness(example, { enabled: true, timeoutMs: 1500 });
+  delete process.env.CODEX_LB_API_KEY;
+  t.after(() => {
+    if (savedTypeSafe !== undefined) process.env.TYPESAFE_API_KEY = savedTypeSafe;
+    if (savedCodex !== undefined) process.env.CODEX_LB_API_KEY = savedCodex;
+  });
+  const h = harness(example, resolveConfig({ typesafe: { enabled: true, timeoutMs: 1500 } }).typesafe);
   assert.equal(await h.before(ask("What does Bob make?"), context()), undefined);
   assert.equal(await h.before(ask("What does Bob make?"), context()), undefined);
   assert.deepEqual(h.outcomes(), { missing_key: 2, matchedScenarios: {} });
   assert.deepEqual(h.warnings, ["unblock-memory safety whisperer could not check: TypeSafe key unavailable"]);
 
-  const disabled = harness(example, { enabled: false, timeoutMs: 1500 });
+  const disabled = harness(example, resolveConfig({ typesafe: { enabled: false, timeoutMs: 1500 } }).typesafe);
   assert.equal(await disabled.before(ask("What does Bob make?"), context()), undefined);
   assert.deepEqual(disabled.outcomes(), { typesafe_disabled: 1, matchedScenarios: {} });
   assert.match(disabled.warnings[0], /"event":"status".*"active":false,"reason":"typesafe_disabled"/);

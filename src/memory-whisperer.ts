@@ -116,7 +116,7 @@ export function registerMemoryWhisperer(
       if (signal.aborted) return;
       if (!manager) { reason = "unavailable"; diagnostics?.record(agentId, "memory", "unavailable"); return; }
       const search = await searchMemory(manager, queries, {
-        corpora, signal, apiKey, timeoutMs: typesafe.timeoutMs, conversation: compactJudgeConversation(conversation),
+        corpora, signal, apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, conversation: compactJudgeConversation(conversation),
         asOf, timings: measurement, minUsefulness: config.minUsefulness, maxResults: 4,
         maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
         onCandidates: observation => {
@@ -152,7 +152,7 @@ export function registerMemoryWhisperer(
       if (config.complementaryHints && config.maxHints > 1 && ranked.length > 1) {
         stage = "redundancy";
         try {
-          const pairs = await reviewMemoryRedundancy({ apiKey, timeoutMs: typesafe.timeoutMs, signal,
+          const pairs = await reviewMemoryRedundancy({ apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, signal,
             excerpts: ranked.map(candidate => candidate.excerpt) });
           selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]);
         } catch (error) {

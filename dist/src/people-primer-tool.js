@@ -60,8 +60,10 @@ export function registerPeoplePrimerTool(api, runtime, stores, config) {
                     if (draft)
                         return jsonResult(await manager.reviewClaim({ claim: draft.blurb, citations: draft.citations,
                             personBackground: { name: person.preferredName ?? person.displayName, agentName },
-                            corpora: config.peoplePrimer.corpora, apiKey, timeoutMs: config.peoplePrimer.timeoutMs, signal: combined }));
-                    return jsonResult(await primePersonDossier({ personId, agentName, store, config: config.peoplePrimer, apiKey, signal: combined,
+                            corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
+                            timeoutMs: config.peoplePrimer.timeoutMs, signal: combined }));
+                    return jsonResult(await primePersonDossier({ personId, agentName, store, config: config.peoplePrimer, apiKey,
+                        endpoint: config.typesafe.endpoint, model: config.typesafe.model, signal: combined,
                         search: (query, options) => manager.search(query, { ...options, requestContext: active.requestContext }) }));
                 }
                 catch {

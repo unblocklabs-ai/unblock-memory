@@ -56,7 +56,7 @@ if (mode !== "dry-run" && first.status === "ok") {
   assert.equal(cacheVerified, original.length, "Successful pilot judgments were unexpectedly repeated");
   const store = new ResponseAuditStore(options.storePath);
   try {
-    const cohort = responseCohort(config.responseAudit);
+    const cohort = responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
     report = store.report(cohort, Date.now() - lookbackDays * 86400_000);
     assert.ok(report.groups.every(g => g.human?.senderId === senderId), "Human attribution missing or mixed");
     assert.equal(repeated.coverage.extractedSessions, 0, "Repeat extracted unchanged sessions");

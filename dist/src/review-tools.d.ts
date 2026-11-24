@@ -9,6 +9,8 @@ export declare function reviewRequestContext(runtime: QmdMemoryRuntime, active: 
     readonly reason: "TypeSafe API key not configured";
     readonly manager?: undefined;
     readonly apiKey?: undefined;
+    readonly endpoint?: undefined;
+    readonly model?: undefined;
     readonly signal?: undefined;
     readonly timeoutMs?: undefined;
 } | {
@@ -16,12 +18,16 @@ export declare function reviewRequestContext(runtime: QmdMemoryRuntime, active: 
     readonly reason: "Memory manager unavailable";
     readonly manager?: undefined;
     readonly apiKey?: undefined;
+    readonly endpoint?: undefined;
+    readonly model?: undefined;
     readonly signal?: undefined;
     readonly timeoutMs?: undefined;
 } | {
     readonly status: "ready";
     readonly manager: import("./manager.js").QmdMemoryManager;
     readonly apiKey: string;
+    readonly endpoint: string;
+    readonly model: string;
     readonly signal: AbortSignal;
     readonly timeoutMs: number;
     reason?: undefined;

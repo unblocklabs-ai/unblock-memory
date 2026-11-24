@@ -2,7 +2,7 @@ import type { QMDStore } from "@unblocklabs/qmd";
 import type { CurationStore, MaintenanceTask } from "./curation.js";
 import { chunkFingerprint } from "./curation.js";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
-import { judgeTypeSafeQuality, QUALITY_JUDGE_VERSION, type QualityJudgment } from "./typesafe.js";
+import { judgeTypeSafeQuality, qualityJudgeVersion, type QualityJudgment } from "./typesafe.js";
 import { qualityTriage } from "./quality-triage.js";
 
 export type QualityCursor = { documentId: number; seq: number };
@@ -31,6 +31,8 @@ export async function auditQualityPage(params: {
   curation: CurationStore;
   sources: readonly ResolvedSource[];
   apiKey: string;
+  endpoint?: string;
+  model?: string;
   timeoutMs: number;
   minNoise: number;
   limit?: number;
@@ -39,6 +41,7 @@ export async function auditQualityPage(params: {
   isActive: () => boolean;
 }) {
   const { db, curation, signal } = params;
+  const policy = qualityJudgeVersion(params.model, params.endpoint);
   const sources = new Map(params.sources.filter(source => source.kind !== "skills")
     .map(source => [source.collection, source]));
   const groups = new Map<string, {
@@ -50,7 +53,7 @@ export async function auditQualityPage(params: {
   const result = (status: "ok" | "partial", done: boolean) => ({
     status, done, next, scanned, judged, cached, skippedOversized, skippedStale, flagged,
     groups: [...groups.values()].sort((a, b) => Number(b.triage === "preserve_evidence_repair") - Number(a.triage === "preserve_evidence_repair")),
-    policy: QUALITY_JUDGE_VERSION,
+    policy,
     scope: "Indexed chunks only; not a whole-source audit. Findings are indicators, not permission to modify data.",
   });
   const check = () => {
@@ -87,7 +90,7 @@ export async function auditQualityPage(params: {
       const source = sources.get(row.collection)!;
       const text = row.doc.slice(row.pos, row.pos + row.chunk_len);
       const fingerprint = chunkFingerprint(text);
-      const cacheKey = chunkFingerprint(JSON.stringify([QUALITY_JUDGE_VERSION, source.kind, fingerprint]));
+      const cacheKey = chunkFingerprint(JSON.stringify([policy, source.kind, fingerprint]));
       const eligible = Boolean(parseSafeVirtualPath(`qmd://${source.collection}/${row.path}`, sources)) && row.pos >= 0 && row.chunk_len > 0 &&
         row.pos + row.chunk_len <= row.doc.length;
       const structure = qualityStructure(text);
@@ -98,7 +101,7 @@ export async function auditQualityPage(params: {
     const missing = [...new Map(batch.filter(item => item.eligible && item.text.length <= MAX_CHUNK_CHARS &&
       item.structure !== "empty" && !item.judgment).map(item => [item.cacheKey, item])).values()];
     const answers = await Promise.allSettled(missing.map(async item => (await judgeTypeSafeQuality({
-      apiKey: params.apiKey, timeoutMs: params.timeoutMs, signal,
+      apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs: params.timeoutMs, signal,
       chunks: [{ text: item.text, sourceKind: item.source.kind === "sessions" ? "sessions" : "files" }],
     }))[0]));
     check();
@@ -141,7 +144,7 @@ export async function auditQualityPage(params: {
           excerpt: text.slice(0, 400), excerptTruncated: text.length > 400,
           indicator: structure === "empty" ? "deterministic_empty" :
             structure === "encoded_message" ? "deterministic_encoding" : "typesafe",
-          ...judgment, policy: QUALITY_JUDGE_VERSION,
+          ...judgment, policy,
           triage,
           instruction: "Inspect original source and ingestion before acting. Verify source/index after any authorized repair. Never manually edit generated session projections.",
         }),

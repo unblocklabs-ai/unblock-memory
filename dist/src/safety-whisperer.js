@@ -112,10 +112,10 @@ function scenarioQuestion(policy) {
     };
 }
 /** One request with one independent yes/no question per scenario; an invalid answer is undefined. */
-async function judgeSafetyScenarios(apiKey, signal, state, scenarios) {
+async function judgeSafetyScenarios(apiKey, signal, state, scenarios, options) {
     const key = (index) => `scenario_${index}`;
     const questions = Object.fromEntries(scenarios.map((scenario, index) => [key(index), scenarioQuestion(scenario.instructions)]));
-    const result = await requestTypeSafe({ apiKey, signal }, state, questions);
+    const result = await requestTypeSafe({ apiKey, endpoint: options?.endpoint, model: options?.model, signal }, state, questions);
     const answers = isRecord(result) && isRecord(result.answers) ? result.answers : {};
     return scenarios.map((_scenario, index) => {
         const answer = answers[key(index)];
@@ -214,7 +214,7 @@ export function registerSafetyWhisperer(api, plugin, diagnostics) {
                 return;
             }
             warnedMissingKey = false;
-            const probabilities = await abortable(judgeSafetyScenarios(apiKey, signal, state, scenarios), signal);
+            const probabilities = await abortable(judgeSafetyScenarios(apiKey, signal, state, scenarios, { endpoint: typesafe.endpoint, model: typesafe.model }), signal);
             const unanswered = probabilities.filter(probability => probability === undefined).length;
             const matched = scenarios.filter((scenario, index) => (probabilities[index] ?? -1) >= scenario.minProbability);
             if (!matched.length) {

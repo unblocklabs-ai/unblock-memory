@@ -54,8 +54,8 @@ test("searchMemory respects maxJudgeCandidates after dedup/cooldown while leavin
   const judged: string[] = [];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
-    judged.push(request.state.candidates[0].excerpt);
-    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.9 } } });
+    judged.push(request.state[0].candidates[0].excerpt);
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul: 0.9 } } });
   });
   const excludedPassages = new Map([[memoryPassageId(hits[0]!.snippet), 1]]);
   const capped = await searchMemory(manager, { lex: "k", vec: "v" }, {
@@ -140,17 +140,18 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   const judged: string[] = [];
   let provider: "partial" | "failed" | "healthy" = "partial";
   t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof fetch>) => {
-    assert.equal(url, "https://api.typesafe.ai/v1/systemone", "no query generation service");
+    assert.equal(url, "https://codex.unblocklabs.ai/v1/decisions", "no query generation service");
     const request = JSON.parse(String(init?.body));
+    const [state] = request.state;
     assert.deepEqual(Object.keys(request.questions), ["memory_0"], "no recall gate");
-    assert.deepEqual(request.state.conversation, { history: [], currentRequest: "Who approved the rollout and under what conditions?" });
-    assert.equal(request.state.candidates.length, 1);
-    const path: string = request.state.candidates[0].sourcePath;
+    assert.deepEqual(state.conversation, { history: [], currentRequest: "Who approved the rollout and under what conditions?" });
+    assert.equal(state.candidates.length, 1);
+    const path: string = state.candidates[0].sourcePath;
     assert.ok(!path.endsWith("direct.md"), "session filter applies before external judging");
     judged.push(path);
     if (provider === "failed" || (provider === "partial" && path.endsWith("channel.md"))) return new Response(null, { status: 529 });
     const noul = path.endsWith("semantic.md") ? 0.956 : path.endsWith("keyword.md") ? 0.854 : 0.1;
-    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul } } });
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul } } });
   });
   const input = { bm25Query: "Exactneedle", vectorQuery: "Who approved the rollout and under what conditions?",
     corpora: ["memory", "sessions"], sessionFilter: { chatType: "channel" }, maxResults: 2 };

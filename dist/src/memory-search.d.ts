@@ -20,6 +20,8 @@ export type MemoryRanking = {
 /** Both entry points use the same complete passages and independent usefulness judgments. */
 export declare function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
     apiKey?: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     conversation: QueryConversation;
     asOf?: string;

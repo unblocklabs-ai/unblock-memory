@@ -96,7 +96,9 @@ export async function validateExtractedMemory(params) {
         proposal.evidence.some(e => !e.quote.trim() || !messages.find(m => m.id === e.messageId)?.text.includes(e.quote));
     if (invalid)
         return { accepted: false, reason: "invalid_evidence" };
-    const raw = await requestTypeSafe({ apiKey: params.apiKey, timeoutMs: 10_000, signal: params.signal }, { proposal, messages: messages.map(m => ({ ...m, sourceDate: new Date(m.timestamp).toISOString() })),
+    const raw = await requestTypeSafe({
+        apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs: 10_000, signal: params.signal,
+    }, { proposal, messages: messages.map(m => ({ ...m, sourceDate: new Date(m.timestamp).toISOString() })),
         newMessageIds: params.newIds, prior: prior ?? null }, {
         supported: { type: "choice", instructions: {
                 question: "Is the proposed memory a faithful extraction of what the messages establish? Resolve first-person pronouns using each message's speaker field and references such as 'this feature' using the surrounding messages. An explicit human self-report or project report is sufficient evidence of that report; independent external verification is not required.",

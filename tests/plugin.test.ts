@@ -321,9 +321,10 @@ test("memory search compacts judged results without changing evidence or request
   } satisfies OpenClawPluginToolContext;
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.deepEqual(request.state.conversation, { history: [], currentRequest: "session" });
-    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul",
-      noul: request.state.candidates[0].corpus === "memory" ? 0.304999 : 0.87654321 } } });
+    const [state] = request.state;
+    assert.deepEqual(state.conversation, { history: [], currentRequest: "session" });
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul",
+      noul: state.candidates[0].corpus === "memory" ? 0.304999 : 0.87654321 } } });
   });
   const tool = searchFactory(context)!;
   const response = await tool.execute("search", { bm25Query: "session", vectorQuery: "session", minUsefulness: 0 }) as {

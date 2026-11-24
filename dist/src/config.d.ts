@@ -36,6 +36,8 @@ export type UnblockMemoryConfig = {
     };
     typesafe: {
         enabled: boolean;
+        endpoint: string;
+        model: string;
         apiKey?: string;
         apiKeyFile?: string;
         timeoutMs: number;

@@ -29,7 +29,7 @@ const api = {
   logger: { warn: (message: string) => console.error(message) },
   on() {},
 } as unknown as OpenClawPluginApi;
-const before = registerSafetyWhisperer(api, { ...resolveConfig({}), safetyWhisperer, typesafe: { enabled: true, timeoutMs: 10_000 } })!;
+const before = registerSafetyWhisperer(api, { ...resolveConfig({ typesafe: { enabled: true, timeoutMs: 10_000 } }), safetyWhisperer })!;
 
 const realFetch = globalThis.fetch;
 let answers: Record<string, { noul: number }> | undefined;

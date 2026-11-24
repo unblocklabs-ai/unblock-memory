@@ -120,9 +120,13 @@ def prepare(exports, cohort_exports, output, tokenizer, validation_fraction=0.1)
         if not isinstance(row.get("sources"), list) or not row["sources"]:
             raise ValueError("Recall cohort row has no historical sources")
         inputs.setdefault(key, row["input"])
+        cohort_model = row.get("model") if isinstance(row.get("model"), str) and row.get("model").strip() else None
+        cohort_requested = row.get("requestedModel") if isinstance(row.get("requestedModel"), str) and row.get("requestedModel").strip() else None
         for raw in row["sources"]:
             identity, source = source_identity(raw, "id")
-            item = {"id": identity, "inputId": key, "inputHash": checkpoint_hash, "source": source}
+            item = {"id": identity, "inputId": key, "inputHash": checkpoint_hash, "source": source,
+                    **({"recallModel": cohort_model} if cohort_model else {}),
+                    **({"recallRequestedModel": cohort_requested} if cohort_requested else {})}
             if identity in cohort and cohort[identity] != item:
                 raise ValueError(f"Conflicting frozen cohort source: {identity}")
             if identity in cohort:
@@ -153,6 +157,16 @@ def prepare(exports, cohort_exports, output, tokenizer, validation_fraction=0.1)
         frozen = cohort.get(identity)
         if frozen is None or frozen["inputId"] != key or frozen["inputHash"] != checkpoint_hash or frozen["source"] != source:
             raise ValueError(f"Query target is outside the frozen cohort: {identity}")
+        query_model = row.get("recallModel") if isinstance(row.get("recallModel"), str) and row.get("recallModel").strip() else None
+        if frozen.get("recallModel") and query_model and frozen["recallModel"] != query_model:
+            raise ValueError(f"Query target recallModel mismatches frozen cohort: {identity}")
+        query_requested = row.get("recallRequestedModel") if isinstance(row.get("recallRequestedModel"), str) and row.get("recallRequestedModel").strip() else None
+        frozen_requested = frozen.get("recallRequestedModel")
+        if frozen_requested and (
+            (query_requested and frozen_requested != query_requested)
+            or (not query_requested and "@" in frozen_requested)
+        ):
+            raise ValueError(f"Query target recallRequestedModel mismatches frozen cohort: {identity}")
         target = validate_query_pair(row["target"])
         target_inputs.add(key)
         target_sources.add(identity)

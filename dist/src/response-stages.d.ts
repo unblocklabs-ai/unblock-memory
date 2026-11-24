@@ -2,6 +2,8 @@ import type { ResponseEpisode } from "./response-episodes.js";
 import type { ResponseAuditStore } from "./response-store.js";
 export declare function assessResponseStages(store: ResponseAuditStore, cohort: string, e: ResponseEpisode, params: {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
 }, sentimentEnabled: boolean, usage: {

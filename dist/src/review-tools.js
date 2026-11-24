@@ -24,7 +24,7 @@ export async function reviewRequestContext(runtime, active, typesafe, signal) {
     const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
     if (!manager)
         return { status: "unavailable", reason: "Memory manager unavailable" };
-    return { status: "ready", manager, apiKey, signal: combined, timeoutMs: typesafe.timeoutMs };
+    return { status: "ready", manager, apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal: combined, timeoutMs: typesafe.timeoutMs };
 }
 export function registerReviewTools(api, runtime, config, diagnostics) {
     api.registerTool(ctx => {
@@ -79,7 +79,7 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
                     if (context.status !== "ready")
                         return jsonResult(context);
                     return jsonResult(await context.manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora,
-                        apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal }));
+                        apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
                 }
                 catch {
                     return jsonResult({ status: "unavailable", needsReview: true, reason: "Claim review failed or was cancelled; no claim verified" });
@@ -104,7 +104,7 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
                     if (context.status !== "ready")
                         return jsonResult(context);
                     return jsonResult(await context.manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora,
-                        apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal }));
+                        apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
                 }
                 catch {
                     return jsonResult({ status: "unavailable", reason: "Cluster review failed or was cancelled; no cluster judgment made" });

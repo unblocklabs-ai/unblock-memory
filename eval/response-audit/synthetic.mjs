@@ -1,14 +1,31 @@
-// Live TypeSafe calibration pilot over synthetic exchanges only.
+// Live decision-model calibration pilot over synthetic exchanges only.
+// Usage: node synthetic.mjs PLUGIN KEYFILE OUTPUT [--legacy | --endpoint=URL --model=ID]
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-const [plugin, keyFile, output] = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const positional = rawArgs.filter(a => !a.startsWith("--"));
+const [plugin, keyFile, output] = positional;
 assert.ok(plugin && keyFile && output);
-const { resolveTypeSafeApiKey } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
-const { judgeResponse, judgeResponseFollowup, RESPONSE_RUBRIC_VERSION } = await import(pathToFileURL(`${plugin}/dist/src/response-judge.js`));
+const legacy = rawArgs.includes("--legacy");
+const endpointFlag = rawArgs.find(a => a.startsWith("--endpoint="))?.slice("--endpoint=".length);
+const modelFlag = rawArgs.find(a => a.startsWith("--model="))?.slice("--model=".length);
+const { resolveConfig } = await import(pathToFileURL(`${plugin}/dist/src/config.js`));
+const { resolveTypeSafeApiKey, TYPESAFE_DEFAULT_ENDPOINT } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
+const { judgeResponse, judgeResponseFollowup, responseRubricVersion } = await import(pathToFileURL(`${plugin}/dist/src/response-judge.js`));
 const { responseOutcome } = await import(pathToFileURL(`${plugin}/dist/src/response-outcome.js`));
-const apiKey = await resolveTypeSafeApiKey({ enabled: true, apiKeyFile: keyFile, timeoutMs: 10000 });
-assert.ok(apiKey);
+const { typesafe } = resolveConfig({
+  typesafe: {
+    enabled: true,
+    endpoint: endpointFlag ?? (legacy ? "https://api.typesafe.ai/v1/systemone" : TYPESAFE_DEFAULT_ENDPOINT),
+    ...(modelFlag ? { model: modelFlag } : {}),
+    apiKeyFile: keyFile,
+    timeoutMs: 10000,
+  },
+});
+const { endpoint, model } = typesafe;
+const apiKey = await resolveTypeSafeApiKey(typesafe);
+assert.ok(apiKey, "Decision model key unavailable");
 const cases = [
   { id: "acceptance_new_scope", request: "Explain what a database index does in one sentence.", answer: "An index helps a database find matching rows without scanning the entire table.", feedback: "Great, now give me an example.", kind: "acceptance", rework: false },
   { id: "wrong_deliverable", request: "Write the final two-sentence email asking Lee to approve the budget.", answer: "First decide on your tone, then draft an email requesting approval.", feedback: "I asked you to write the email, not tell me how.", kind: "correction", rework: true, underdelivery: true },
@@ -63,8 +80,8 @@ for (const c of cases) {
     answer: [text("assistant", c.answer, 3)], feedback: [text("user", c.feedback, 4)],
     followup: { status: c.followup ? "complete" : "pending", messages: c.followup ? [text("assistant", c.followup, 5)] : [] } };
   const start = performance.now();
-  const judgment = await judgeResponse(episode, { apiKey, timeoutMs: 10000, signal: AbortSignal.timeout(30000) });
-  const retrospective = await judgeResponseFollowup(episode, { apiKey, timeoutMs: 10000, signal: AbortSignal.timeout(30000) });
+  const judgment = await judgeResponse(episode, { apiKey, endpoint, model, timeoutMs: 10000, signal: AbortSignal.timeout(30000) });
+  const retrospective = await judgeResponseFollowup(episode, { apiKey, endpoint, model, timeoutMs: 10000, signal: AbortSignal.timeout(30000) });
   const checks = { feedback: !c.kind || judgment.feedback.feedbackType.choice === c.kind,
     outcome: retrospective.judgment.outcome.choice === expectedOutcomes[c.id] && retrospective.judgment.outcome.confidence >= 0.8,
     underdelivery: c.underdelivery === undefined || (c.underdelivery ? judgment.quality.underdelivery.noul >= 0.8 : judgment.quality.underdelivery.noul <= 0.2),
@@ -86,6 +103,6 @@ for (const c of cases) {
 }
 const passed = results.filter(r => Object.values(r.checks).every(Boolean)).length;
 const behaviorPassed = results.filter(r => Object.values(r.behaviorChecks).every(Boolean)).length;
-await writeFile(output, JSON.stringify({ rubric: RESPONSE_RUBRIC_VERSION, passed, behaviorPassed, total: cases.length, results }, null, 2), { mode: 0o600, flag: "wx" });
+await writeFile(output, JSON.stringify({ endpoint, model, rubric: responseRubricVersion(model, endpoint), passed, behaviorPassed, total: cases.length, results }, null, 2), { mode: 0o600, flag: "wx" });
 console.log(JSON.stringify({ passed, behaviorPassed, total: cases.length, cases: results.map(r => ({ id: r.id, checks: r.checks, behaviorChecks: r.behaviorChecks, milliseconds: r.milliseconds })) }));
 if (behaviorPassed !== cases.length) process.exitCode = 1;

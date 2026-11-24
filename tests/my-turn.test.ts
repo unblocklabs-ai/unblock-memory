@@ -50,7 +50,9 @@ type RequestBody = {
 function transport(t: TestContext, respond: (body: RequestBody, init?: RequestInit) => Response | Promise<Response> = () => answer(0.1)) {
   const bodies: RequestBody[] = [];
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    const body = JSON.parse(String(init?.body)) as RequestBody;
+    const raw = JSON.parse(String(init?.body)) as Omit<RequestBody, "state"> & { state: [RequestBody["state"]] };
+    assert.ok(Array.isArray(raw.state) && raw.state.length === 1);
+    const body: RequestBody = { ...raw, state: raw.state[0] };
     bodies.push(body);
     return respond(body, init);
   });

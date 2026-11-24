@@ -33,12 +33,14 @@ export class TrainingStore {
   readonly #owner = randomUUID();
   readonly #nodeId: string;
   readonly #agentId: string;
-  constructor(path: string, agentId: string) {
+  readonly #requestedModel: string;
+  constructor(path: string, agentId: string, requestedModel = TRAINING_GATE_MODEL) {
     this.#db = openMemoryDatabase(path);
     this.#agentId = agentId;
+    this.#requestedModel = requestedModel;
     try {
       const version = this.#db.prepare("SELECT version FROM memory_schema WHERE component='training'").get()?.version;
-      if (version !== undefined && version !== 1) throw new Error("Unsupported training database version");
+      if (version !== undefined && version !== 1 && version !== 2) throw new Error("Unsupported training database version");
       this.#db.exec(`
         CREATE TABLE IF NOT EXISTS training_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), node_id TEXT NOT NULL, agent_id TEXT NOT NULL) STRICT;
         CREATE TABLE IF NOT EXISTS training_lock (singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, expires INTEGER NOT NULL) STRICT;
@@ -68,15 +70,34 @@ export class TrainingStore {
           result_json TEXT, error TEXT, completed_at INTEGER
         ) STRICT;
         CREATE TABLE IF NOT EXISTS training_reviews (
-          source_id TEXT PRIMARY KEY REFERENCES training_examples(id), input_hash TEXT NOT NULL,
-          recipe TEXT NOT NULL, reason TEXT NOT NULL, details_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+          source_id TEXT NOT NULL REFERENCES training_examples(id), scope TEXT NOT NULL DEFAULT '',
+          input_hash TEXT NOT NULL, recipe TEXT NOT NULL, reason TEXT NOT NULL,
+          details_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+          PRIMARY KEY(source_id,scope)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS training_step_attempts (
           id INTEGER PRIMARY KEY, step_id TEXT NOT NULL REFERENCES training_steps(id), started_at INTEGER NOT NULL,
           finished_at INTEGER, status TEXT NOT NULL, error TEXT, result_json TEXT
         ) STRICT;
-        INSERT OR IGNORE INTO memory_schema VALUES ('training',1);
       `);
+      if (!this.#db.prepare("SELECT 1 FROM pragma_table_info('training_reviews') WHERE name='scope'").get()) {
+        immediateTransaction(this.#db, () => {
+          this.#db.exec(`
+            CREATE TABLE training_reviews_v2 (
+              source_id TEXT NOT NULL REFERENCES training_examples(id), scope TEXT NOT NULL DEFAULT '',
+              input_hash TEXT NOT NULL, recipe TEXT NOT NULL, reason TEXT NOT NULL,
+              details_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+              PRIMARY KEY(source_id,scope)
+            ) STRICT;
+            INSERT INTO training_reviews_v2 (source_id,scope,input_hash,recipe,reason,details_json,updated_at)
+              SELECT source_id,CASE WHEN reason='evaluation-unresolved' THEN '__legacy__' ELSE '' END,
+                input_hash,recipe,reason,details_json,updated_at FROM training_reviews;
+            DROP TABLE training_reviews;
+            ALTER TABLE training_reviews_v2 RENAME TO training_reviews;
+          `);
+        });
+      }
+      this.#db.exec("INSERT OR REPLACE INTO memory_schema VALUES ('training',2);");
       this.#db.prepare("INSERT OR IGNORE INTO training_identity VALUES (1,?,?)").run(randomUUID(), agentId);
       const identity = this.#db.prepare("SELECT node_id,agent_id FROM training_identity WHERE singleton=1").get()!;
       if (identity.agent_id !== agentId) throw new Error("Training database belongs to a different agent");
@@ -96,11 +117,11 @@ export class TrainingStore {
       // A request may have been billed before a crashed process saved the response.
       this.#db.prepare(`UPDATE training_gates SET status='ambiguous',error='interrupted' WHERE status='attempted'
         AND prompt_version=? AND requested_model=? AND input_hash IN (SELECT hash FROM training_inputs WHERE preparation=?)`)
-        .run(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+        .run(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
       this.#db.prepare(`UPDATE training_attempts SET status='ambiguous',error='interrupted' WHERE status='attempted'
         AND gate_id IN (SELECT g.id FROM training_gates g JOIN training_inputs i ON i.hash=g.input_hash
           WHERE g.prompt_version=? AND g.requested_model=? AND i.preparation=?)`)
-        .run(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+        .run(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
       this.#db.prepare(`UPDATE training_steps SET status='ambiguous',error='interrupted' WHERE status='attempted'
         AND json_extract(request_json,'$.recipe')=?`).run(TRAINING_RECIPE_VERSION);
       this.#db.prepare(`UPDATE training_step_attempts SET status='ambiguous',error='interrupted' WHERE status='attempted'
@@ -146,8 +167,8 @@ export class TrainingStore {
         input.run(example.inputHash, TRAINING_PREPARATION, JSON.stringify(example.input));
         source.run(jsonHash([this.#nodeId, this.#agentId, sessionId, example.seq]), sessionId, example.seq,
           example.timestamp, example.inputHash, Number(example.contextLimited));
-        const id = jsonHash([example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL]);
-        gate.run(id, example.inputHash, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL);
+        const id = jsonHash([example.inputHash, TRAINING_GATE_VERSION, this.#requestedModel]);
+        gate.run(id, example.inputHash, TRAINING_GATE_VERSION, this.#requestedModel);
         if (!old) counts.added++;
         else if (old.input_hash !== example.inputHash || old.active !== 1) counts.changed++;
         else counts.unchanged++;
@@ -168,7 +189,7 @@ export class TrainingStore {
       FROM training_gates g JOIN training_inputs i ON i.hash=g.input_hash
       WHERE ${this.#scope} AND g.status='pending' ORDER BY
       (SELECT MAX(timestamp) FROM training_examples WHERE input_hash=g.input_hash AND active=1) DESC,g.id LIMIT ?`)
-      .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION, limit ?? -1) as Job[];
+      .all(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION, limit ?? -1) as Job[];
   }
   start(id: string): number {
     return immediateTransaction(this.#db, () => {
@@ -200,7 +221,7 @@ export class TrainingStore {
       const gates = this.#db.prepare(`UPDATE training_gates SET status='pending',error=NULL WHERE id=?
         AND prompt_version=? AND requested_model=? AND status IN ${statuses}
         AND input_hash IN (SELECT hash FROM training_inputs WHERE preparation=?)`)
-        .run(id, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+        .run(id, TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
       const steps = this.#db.prepare(`UPDATE training_steps SET status='pending',error=NULL WHERE id=?
         AND json_extract(request_json,'$.recipe')=? AND status IN ${statuses}`).run(id, TRAINING_RECIPE_VERSION);
       return count + Number(gates.changes) + Number(steps.changes);
@@ -209,12 +230,12 @@ export class TrainingStore {
   queryExamples(threshold = TRAINING_GATE_THRESHOLD) {
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) throw new Error("Threshold must be between 0 and 1");
     return this.#db.prepare(`SELECT e.id,e.input_hash inputHash,i.input_json inputJson,e.session_id sessionId,e.timestamp,
-      g.probability recallProbability FROM training_examples e JOIN training_inputs i ON i.hash=e.input_hash
+      g.probability recallProbability,g.actual_model recallModel FROM training_examples e JOIN training_inputs i ON i.hash=e.input_hash
       JOIN training_gates g ON g.input_hash=e.input_hash
       WHERE e.active=1 AND i.preparation=? AND g.prompt_version=? AND g.requested_model=?
       AND g.status='complete' AND g.probability>=? ORDER BY e.timestamp DESC,e.id`)
-      .all(TRAINING_PREPARATION, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, threshold) as
-        (TrainingSourceExample & { recallProbability: number })[];
+      .all(TRAINING_PREPARATION, TRAINING_GATE_VERSION, this.#requestedModel, threshold) as
+        (TrainingSourceExample & { recallProbability: number; recallModel: string | null })[];
   }
   step<S extends keyof TrainingStepResults>(stage: S, parameters: Record<string, unknown>) {
     const request = { ...parameters, recipe: TRAINING_RECIPE_VERSION };
@@ -223,24 +244,41 @@ export class TrainingStore {
     return { id, stage, request, status: (row?.status ?? "pending") as StepStatus,
       result: row?.status === "complete" ? JSON.parse(String(row.result_json)) as TrainingStepResults[S] : undefined };
   }
-  flagReview(example: TrainingSourceExample, reason: string, details: ReviewDetails) {
+  get requestedModel(): string { return this.#requestedModel; }
+  flagReview(example: TrainingSourceExample, reason: string, details: ReviewDetails, scope = "") {
     this.#checkLease();
-    this.#db.prepare(`INSERT INTO training_reviews VALUES (?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET
+    this.#db.prepare(`INSERT INTO training_reviews (source_id,scope,input_hash,recipe,reason,details_json,updated_at)
+      VALUES (?,?,?,?,?,?,?) ON CONFLICT(source_id,scope) DO UPDATE SET
       input_hash=excluded.input_hash,recipe=excluded.recipe,reason=excluded.reason,
       details_json=excluded.details_json,updated_at=excluded.updated_at`)
-      .run(example.id, example.inputHash, TRAINING_RECIPE_VERSION, reason, JSON.stringify(details), Date.now());
+      .run(example.id, scope, example.inputHash, TRAINING_RECIPE_VERSION, reason, JSON.stringify(details), Date.now());
   }
-  clearReview(sourceId: string) {
+  clearReview(sourceId: string, scope?: string, matchesLegacyUnresolved?: (details: ReviewDetails) => boolean) {
     this.#checkLease();
-    this.#db.prepare("DELETE FROM training_reviews WHERE source_id=? AND recipe=?").run(sourceId, TRAINING_RECIPE_VERSION);
+    if (scope === undefined) {
+      this.#db.prepare("DELETE FROM training_reviews WHERE source_id=? AND recipe=?").run(sourceId, TRAINING_RECIPE_VERSION);
+      return;
+    }
+    this.#db.prepare(`DELETE FROM training_reviews WHERE source_id=? AND recipe=?
+      AND (scope=? OR (scope='' AND reason!='evaluation-unresolved'))`)
+      .run(sourceId, TRAINING_RECIPE_VERSION, scope);
+    if (!matchesLegacyUnresolved) return;
+    const legacyRows = this.#db.prepare(`SELECT scope,details_json details FROM training_reviews
+      WHERE source_id=? AND recipe=? AND scope IN ('','__legacy__') AND reason='evaluation-unresolved'`).all(sourceId, TRAINING_RECIPE_VERSION);
+    for (const legacy of legacyRows) {
+      if (matchesLegacyUnresolved(JSON.parse(String(legacy.details)) as ReviewDetails)) {
+        this.#db.prepare(`DELETE FROM training_reviews WHERE source_id=? AND recipe=? AND scope=? AND reason='evaluation-unresolved'`)
+          .run(sourceId, TRAINING_RECIPE_VERSION, String(legacy.scope));
+      }
+    }
   }
   reviews() {
     // Old usefulness-only flags remain in SQLite for audit, but no longer block training.
-    return this.#db.prepare(`SELECT r.source_id sourceId,r.input_hash inputHash,r.reason,r.details_json details,r.updated_at updatedAt
+    return this.#db.prepare(`SELECT r.source_id sourceId,r.scope,r.input_hash inputHash,r.reason,r.details_json details,r.updated_at updatedAt
       FROM training_reviews r JOIN training_examples e ON e.id=r.source_id
       WHERE r.recipe=? AND e.active=1 AND e.input_hash=r.input_hash AND r.reason!='no-useful-evidence'
-      ORDER BY r.updated_at DESC,r.source_id`)
-      .all(TRAINING_RECIPE_VERSION).map(row => ({ sourceId: String(row.sourceId), inputHash: String(row.inputHash),
+      ORDER BY r.updated_at DESC,r.source_id,r.scope`)
+      .all(TRAINING_RECIPE_VERSION).map(row => ({ sourceId: String(row.sourceId), scope: String(row.scope), inputHash: String(row.inputHash),
         reason: String(row.reason), details: JSON.parse(String(row.details)) as ReviewDetails, updatedAt: Number(row.updatedAt) }));
   }
   startStep(stage: keyof TrainingStepResults, id: string, request: unknown) {
@@ -291,14 +329,24 @@ export class TrainingStore {
     return this.#db.prepare("SELECT status FROM training_steps WHERE id=? AND json_extract(request_json,'$.recipe')=?")
       .get(id, TRAINING_RECIPE_VERSION)?.status as StepStatus | undefined;
   }
+  stepScope(id: string): { stage: string; status: StepStatus; request: Record<string, unknown> } | undefined {
+    const row = this.#db.prepare("SELECT stage,status,request_json FROM training_steps WHERE id=? AND json_extract(request_json,'$.recipe')=?")
+      .get(id, TRAINING_RECIPE_VERSION);
+    if (!row) return undefined;
+    return {
+      stage: String(row.stage),
+      status: String(row.status) as StepStatus,
+      request: JSON.parse(String(row.request_json)) as Record<string, unknown>,
+    };
+  }
   status(threshold: number) {
     const stages = this.#db.prepare(`SELECT g.status,COUNT(*) count FROM training_gates g WHERE ${this.#scope} GROUP BY g.status`)
-      .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+      .all(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
     const labels = this.#db.prepare(`SELECT COUNT(*) complete,COALESCE(SUM(g.probability>=?),0) positive,
       COALESCE(SUM(g.input_tokens),0) inputTokens,COALESCE(SUM(g.output_tokens),0) outputTokens
-      FROM training_gates g WHERE ${this.#scope} AND g.status='complete'`).get(threshold, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION)!;
+      FROM training_gates g WHERE ${this.#scope} AND g.status='complete'`).get(threshold, TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION)!;
     return { nodeId: this.#nodeId, agentId: this.#agentId, preparation: TRAINING_PREPARATION,
-      promptVersion: TRAINING_GATE_VERSION, requestedModel: TRAINING_GATE_MODEL, threshold,
+      promptVersion: TRAINING_GATE_VERSION, requestedModel: this.#requestedModel, threshold,
       examples: this.#db.prepare(`SELECT e.active,COUNT(*) count FROM training_examples e
         JOIN training_inputs i ON i.hash=e.input_hash WHERE i.preparation=? GROUP BY e.active`).all(TRAINING_PREPARATION),
       collectedInputs: Number(this.#db.prepare(`SELECT COUNT(DISTINCT e.input_hash) count FROM training_examples e
@@ -312,7 +360,7 @@ export class TrainingStore {
         WHERE json_extract(request_json,'$.recipe')=? AND status IN ('failed','ambiguous')
         UNION ALL SELECT g.id,'recall',g.status,g.error FROM training_gates g WHERE ${this.#scope}
         AND g.status IN ('failed','ambiguous') ORDER BY stage,id`)
-        .all(TRAINING_RECIPE_VERSION, TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION),
+        .all(TRAINING_RECIPE_VERSION, TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION),
       queryStages: this.#db.prepare(`SELECT stage,status,COUNT(*) count FROM training_steps
         WHERE json_extract(request_json,'$.recipe')=? GROUP BY stage,status ORDER BY stage,status`).all(TRAINING_RECIPE_VERSION),
       queryAttempts: this.#db.prepare(`SELECT s.stage,a.status,COUNT(*) count,
@@ -325,15 +373,16 @@ export class TrainingStore {
         COALESCE(SUM(json_extract(a.result_json,'$.usage.input_tokens')),0) inputTokens,
         COALESCE(SUM(json_extract(a.result_json,'$.usage.output_tokens')),0) outputTokens
         FROM training_attempts a JOIN training_gates g ON g.id=a.gate_id WHERE ${this.#scope} GROUP BY a.status`)
-        .all(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION) };
+        .all(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION) };
   }
   *exportRows(threshold: number) {
     const rows = this.#db.prepare(`SELECT g.*,i.input_json FROM training_gates g JOIN training_inputs i ON i.hash=g.input_hash
-      WHERE ${this.#scope} AND g.status='complete' ORDER BY g.id`).iterate(TRAINING_GATE_VERSION, TRAINING_GATE_MODEL, TRAINING_PREPARATION);
+      WHERE ${this.#scope} AND g.status='complete' ORDER BY g.id`).iterate(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
     for (const row of rows) {
       yield { stage: "recall-gate", inputHash: row.input_hash, preparation: TRAINING_PREPARATION,
         input: JSON.parse(String(row.input_json)) as TrainingInput, recallProbability: row.probability,
-        recallNeeded: Number(row.probability) >= threshold, threshold, model: row.actual_model, promptVersion: row.prompt_version,
+        recallNeeded: Number(row.probability) >= threshold, threshold, model: row.actual_model,
+        requestedModel: this.#requestedModel, promptVersion: row.prompt_version,
         usage: { input_tokens: row.input_tokens, output_tokens: row.output_tokens },
         sources: this.#db.prepare(`SELECT id,session_id sessionId,event_seq userEventId,timestamp,context_limited contextLimited
           FROM training_examples WHERE input_hash=? AND active=1 ORDER BY session_id,event_seq`).all(String(row.input_hash))

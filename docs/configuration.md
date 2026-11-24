@@ -54,23 +54,40 @@ These evidence relationships are deliberately preserved, not split into unrelate
 {
   "typesafe": {
     "enabled": true,
-    "apiKeyFile": "/absolute/path/to/secrets/unblock-memory-typesafe.env",
+    "endpoint": "https://codex.unblocklabs.ai/v1/decisions",
+    "model": "liquid/d1.2-ultra",
+    "apiKeyFile": "/absolute/path/to/secrets/unblock-memory-decisions.env",
     "timeoutMs": 1500
   }
 }
 ```
 
 This is a **plugin config fragment**, not a top-level OpenClaw configuration.
+Defaults are `enabled: true`, `endpoint: "https://codex.unblocklabs.ai/v1/decisions"`,
+`model: "liquid/d1.2-ultra"`, and `timeoutMs: 1500` (routed through Codex LB to OpenRouter's
+`liquid/d1.2-ultra` Decisions API). To use TypeSafe Jev directly instead, set
+`endpoint: "https://api.typesafe.ai/v1/systemone"` (which infers `model: "jev-1.13.0"`
+when `model` is omitted). Remote cleartext `http://` endpoints are rejected; `http://` is
+allowed only for loopback (`localhost`, `127.0.0.1`, `[::1]`).
+
 The key file can contain a plaintext key or dotenv entries:
 
 ```dotenv
-TYPESAFE_API_KEY="YOUR_TYPESAFE_KEY"
+CODEX_LB_API_KEY="YOUR_CODEX_LB_KEY"
 ```
 
-Credentials come from inline `typesafe.apiKey`, an absolute `typesafe.apiKeyFile`,
-or (when neither is configured) the Gateway process's `TYPESAFE_API_KEY` environment
-variable. Configure at most one of `apiKey` and `apiKeyFile`; prefer a private file
-over a secret in config. Defaults are `enabled: true` and `timeoutMs: 1500`.
+Credentials are **strictly isolated by provider**:
+- Inline `typesafe.apiKey` or a plaintext `typesafe.apiKeyFile` applies to whichever
+  endpoint is configured (so if upgrading an existing node that stored a plaintext or
+  inline TypeSafe key, either replace it with a `codex-lb` key or pin
+  `typesafe.endpoint: "https://api.typesafe.ai/v1/systemone"`).
+- Dotenv `typesafe.apiKeyFile` and ambient Gateway environment lookup read
+  **`CODEX_LB_API_KEY` only** for `https://codex.unblocklabs.ai` and
+  **`TYPESAFE_API_KEY` only** for `https://api.typesafe.ai`. A legacy dotenv file
+  containing only `TYPESAFE_API_KEY` will never be transmitted to `codex.unblocklabs.ai`.
+- Custom endpoints (other HTTPS origins or loopback HTTP) never inherit ambient
+  environment variables and require an explicit `apiKey` or `apiKeyFile`.
+Configure at most one of `apiKey` and `apiKeyFile`; prefer a private file over a secret in config.
 
 The file is reread when a feature resolves credentials, so replacing its contents
 does not require a Gateway restart. Restart/reload the Gateway after changing the
@@ -79,7 +96,7 @@ code and does not change the process environment. Workspace `.env` files are not
 auto-discovered, and an interactive shell's exported key need not reach a managed
 Gateway service.
 
-Missing/empty files or dotenv files without `TYPESAFE_API_KEY` count as no key.
+Missing/empty files or dotenv files without a matching key entry count as no key.
 An explicit file never falls back to an unrelated environment key. Missing or
 unreadable credentials do not break normal memory functionality or Gateway startup;
 the feature-specific fallback/skip behavior above applies. **Unreadable files and
@@ -88,8 +105,7 @@ Use `memory_diagnostics` for credential availability; it does not verify provide
 acceptance. Keep secret files mode `600`, secret directories mode `700`, and keys
 out of Git, chat, shell arguments and logs.
 
-The plugin reads only `TYPESAFE_API_KEY` from the environment. Standalone QMD also
-supports `TYPESAFE_API_KEY_FILE`; these are separate credential resolvers.
+Standalone QMD also supports `TYPESAFE_API_KEY_FILE`; these are separate credential resolvers.
 `typesafe.timeoutMs` is not a universal total deadline: People Primer and dossier
 save review use `peoplePrimer.timeoutMs` per request; Memory Whisperer has its
 own overall budget. Skill Whisperer's fixed three-second total budget includes
@@ -141,16 +157,18 @@ Select only desired skill locations. To use TypeSafe selection instead, enable
     { "name": "memory", "kind": "files", "paths": ["MEMORY.md", "USER.md", "memory/**/*.md"] },
     { "name": "knowledge", "kind": "files", "paths": ["knowledge/**/*.md"] }
   ],
-  "typesafe": { "apiKeyFile": "/absolute/path/to/secrets/unblock-memory-typesafe.env" },
+  "typesafe": { "apiKeyFile": "/absolute/path/to/secrets/unblock-memory-decisions.env" },
   "memoryWhisperer": { "enabled": true, "corpora": ["knowledge"] }
 }
 ```
 
-Create the private key file first. To recall conversation history, configure a
+Create the private key file first (`CODEX_LB_API_KEY=...` for the default Codex LB route, or pin `typesafe.endpoint: "https://api.typesafe.ai/v1/systemone"` with a `TYPESAFE_API_KEY=...` file). To recall conversation history, configure a
 sessions corpus and add `sessions` to `memoryWhisperer.corpora`. Automatic recall
 can then retrieve across this agent's indexed sessions. The sessions corpus's
 `chatTypes` setting controls whether direct messages are included. Selected
-excerpts are sent to TypeSafe and may be injected into any conversation using this agent.
+excerpts are sent to the configured decision endpoint (defaults to
+`https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter `liquid/d1.2-ultra`)
+and may be injected into any conversation using this agent.
 
 ### People storage, without injection
 
@@ -164,12 +182,14 @@ excerpts are sent to TypeSafe and may be injected into any conversation using th
 {
   "people": { "enabled": true, "whisperer": { "enabled": true } },
   "peoplePrimer": { "enabled": true, "corpora": ["memory"] },
-  "typesafe": { "apiKeyFile": "/absolute/path/to/secrets/unblock-memory-typesafe.env" }
+  "typesafe": { "apiKeyFile": "/absolute/path/to/secrets/unblock-memory-decisions.env" }
 }
 ```
 
 The default memory corpus exists. This separately approves its evidence for
-TypeSafe; it does not create a dossier or schedule maintenance. Use the
+the configured decision endpoint (defaults to `https://codex.unblocklabs.ai/v1/decisions`
+-> OpenRouter `liquid/d1.2-ultra`, or pin `typesafe.endpoint: "https://api.typesafe.ai/v1/systemone"`
+with a `TYPESAFE_API_KEY` file); it does not create a dossier or schedule maintenance. Use the
 [people workflow](peoplesql.md). Adding `sessions` to primer approval, after
 configuring that corpus, approves **all indexed sessions**, as with Memory Whisperer.
 
@@ -218,8 +238,10 @@ contract; these tables explain their effects.
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
 | `typesafe.enabled` | `true` | Shared plugin provider gate; no feature is opted in merely by adding a key |
+| `typesafe.endpoint` | `https://codex.unblocklabs.ai/v1/decisions` | HTTPS (or loopback HTTP) decision endpoint without credentials, query, or fragment; set `https://api.typesafe.ai/v1/systemone` for TypeSafe Jev |
+| `typesafe.model` | `liquid/d1.2-ultra` (`jev-1.13.0` on `api.typesafe.ai`) | Decision model alias sent in requests; dated `liquid/d1.2-ultra-*` snapshots are rejected on the default Codex LB route |
 | `typesafe.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
-| `typesafe.apiKeyFile` | Unset | Absolute raw-key or dotenv file, reread at credential resolution; explicit missing file never falls back to a different key |
+| `typesafe.apiKeyFile` | Unset | Absolute raw-key or provider-scoped dotenv file (`CODEX_LB_API_KEY` for Codex LB, `TYPESAFE_API_KEY` for `api.typesafe.ai`), reread at credential resolution; explicit missing file never falls back to a different key |
 | `typesafe.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
 | `skillWhisperer.enabled` | `true` with a `skills` corpus, else `false` | Needs appropriate host hook access; fixed 3-second total deadline; `false` opts out. An explicit `true` without a skills corpus logs a warning and stays inactive |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
@@ -235,21 +257,23 @@ contract; these tables explain their effects.
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
 | `memoryWhisperer.timeoutMs` | `3000` | 1–10,000 total whisper deadline, not just the provider timeout |
 | `memoryWhisperer.complementaryHints` | `false` | Optional extra redundancy judgment; does not expand retrieval or enable the feature |
-| `safetyWhisperer.enabled` | `false` | Requires at least one scenario, a TypeSafe key and host hooks; see [Safety Whisperer](#safety-whisperer) |
+| `safetyWhisperer.enabled` | `false` | Requires at least one scenario, decision-model credentials and host hooks; see [Safety Whisperer](#safety-whisperer) |
 | `safetyWhisperer.historyMessages` | `6` | 0–20 earlier visible messages, whole messages only, for resolving follow-ups |
 | `safetyWhisperer.timeoutMs` | `3000` | 1–10,000 total deadline (credential and request); the host hook timeout must exceed the slowest enabled whisperer |
 | `safetyWhisperer.excludedChannels` | `[]` | Up to 500 `{ provider, accountId, channelId, name? }`, matched case-insensitively; skips every scenario there |
 | `safetyWhisperer.scenarios` | `[]` | Up to 20; unique `id` of letters, digits, `.`, `_` or `-` |
-| `safetyWhisperer.scenarios[].instructions` | Required | Up to 2,000 characters: what the scenario covers, with exclusions; sent to TypeSafe |
-| `safetyWhisperer.scenarios[].flaggedPrompt` | Required | Up to 2,000 characters, appended for matching unapproved requests; never sent to TypeSafe |
+| `safetyWhisperer.scenarios[].instructions` | Required | Up to 2,000 characters: what the scenario covers, with exclusions; sent to the configured decision endpoint |
+| `safetyWhisperer.scenarios[].flaggedPrompt` | Required | Up to 2,000 characters, appended for matching unapproved requests; never sent to the decision endpoint |
 | `safetyWhisperer.scenarios[].minProbability` | `0.4` | 0–1 minimum yes-probability that the current request is covered |
 | `safetyWhisperer.scenarios[].approvedRequestors` | `[]` | Up to 500 `{ provider, accountId, senderId, name? }`; `senderId` must match exactly; skip this scenario for them |
 | `safetyWhisperer.scenarios[].excludedChannels` | `[]` | Up to 500 channels where only this scenario is skipped |
 | `safetyWhisperer.scenarios[].agentIds` | Unset (every agent) | Non-empty list limits the scenario to these agents when one config serves several; normalized like OpenClaw agent IDs (lowercase) |
-| `safetyWhisperer.scenarios[].enabled` | `true` | Disabled scenarios are never sent to TypeSafe |
+| `safetyWhisperer.scenarios[].enabled` | `true` | Disabled scenarios are never sent to the decision endpoint |
 
-No configured plugin credential means fallback to **`TYPESAFE_API_KEY` only** in
-the Gateway environment. Unlike QMD's resolver, the plugin does not read a
+No configured plugin credential means fallback to **`CODEX_LB_API_KEY` only**
+for the default `https://codex.unblocklabs.ai` endpoint, **`TYPESAFE_API_KEY` only**
+for `https://api.typesafe.ai`, and **no ambient environment fallback** for custom
+endpoints. Unlike QMD's resolver, the plugin does not read a
 `TYPESAFE_API_KEY_FILE` environment variable. Do not conflate these contracts.
 Missing/empty key and unreadable/erroring key are different for Skill Whisperer:
 the former allows vector fallback; the latter suppresses the hint.
@@ -401,7 +425,8 @@ or score is not proof. Enabling a feature approves only that feature's documente
 ## My Turn
 
 An optional advisor for group/channel conversations. Before an incoming-message
-turn reaches the main model, Jev judges whether this particular agent should
+turn reaches the main model, the configured decision model (default `liquid/d1.2-ultra`
+via `https://codex.unblocklabs.ai/v1/decisions`) judges whether this particular agent should
 respond. It uses the agent's configured identity name (falling back to its ID),
 the triggering message, and recent visible conversation text. The agent always
 retains the final say; this does not prevent wakes or guarantee silence.
@@ -644,14 +669,16 @@ change memories, retrieval, prompts, or dossiers.
 ```
 
 Defaults: disabled; daily cadence; at most 100 attempted reviews per run; estimated
-30,000-token context budget, leaving room for questions under Jev's 32k
+30,000-token context budget, leaving room for questions under a 32k
 state-plus-longest-question limit. `intervalMinutes: 0` makes inference manual-only;
 local baselines still refresh daily and on Gateway startup when Inside Out is enabled.
 `baselineMinInteractions` defaults to 20 (1–10,000) for each comparison population.
-The shared `typesafe` settings supply Jev credentials and request timeout.
+The shared `typesafe` settings supply the decision endpoint, model, credentials, and request timeout.
 
 **Enabling this approves sending visible human/assistant conversation text across
-all retained channels to TypeSafe.** System messages, tool bodies, thinking blocks,
+all retained channels to the configured decision endpoint (defaults to
+`https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter `liquid/d1.2-ultra`, or
+`https://api.typesafe.ai/v1/systemone` when overridden).** System messages, tool bodies, thinking blocks,
 known bots, delivery mirrors, and recognized automated inputs are omitted. The
 state includes human identity keys for speaker attribution. Probabilities describe
 expressed emotion, not intensity; several emotions can be present, and they need
@@ -666,7 +693,10 @@ successes or retry oversized failures. Six Noul questions judge only `target.tex
 using history to interpret tone and speaker attribution. Short yes/no criteria define each emotion; subtle
 emotion counts without requiring explicit emotion words. Raw tool-result messages
 and tool-call blocks never enter either field; visible assistant text explaining a
-tool's findings remains conversation text. The rubric is `emotion-presence-v2`.
+tool's findings remains conversation text. The rubric is `emotion-presence-v2`
+for legacy `https://api.typesafe.ai/v1/systemone`, and
+`emotion-presence-v2@<canonical-endpoint>` for Codex LB and custom endpoints
+(while `inside_out.model` stores the requested model alias).
 
 ```bash
 openclaw memory-emotions run --agent main
@@ -696,7 +726,7 @@ lease or persistent scheduling infrastructure.
 
 `--session` limits `run`, `report`, and `export` to one exact session ID. For a
 manual canary, keep `intervalMinutes: 0` and run/export that session; this still
-requires `insideOut.enabled: true` and sends its eligible interactions to Jev.
+requires `insideOut.enabled: true` and sends its eligible interactions to the configured decision endpoint.
 Files are scoped by their session filename, with a header-only check for legacy
 names that differ from the session ID; unrelated transcript bodies are not parsed.
 
@@ -845,7 +875,7 @@ removed. It makes no Jev calls.
   after correcting a misattributed identity.
 - **With `--grades`**, it also erases the six probabilities of every reply currently
   linked to that person and unlinks it. Each row stays as a tombstone with the error
-  `Purged by operator`, so `run` (including `--retry`) never sends that reply to Jev
+  `Purged by operator`, so `run` (including `--retry`) never sends that reply to the decision endpoint
   again, `link-people` never relinks it, and refreshes skip it. Purge refreshes
   People links first, so replies linked since the last refresh are included. This
   cannot be undone.

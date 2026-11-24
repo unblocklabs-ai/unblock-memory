@@ -123,7 +123,7 @@ function reviewCohort(manifest: ReturnType<typeof inventoryPeople>) {
 }
 
 function analysisBasis(config: UnblockMemoryConfig, manifest: ReturnType<typeof inventoryPeople>) {
-  return jsonHash([responseCohort(config.responseAudit), config.responseAudit.lookbackDays, manifest]);
+  return jsonHash([responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint), config.responseAudit.lookbackDays, manifest]);
 }
 
 const STARTUP_RETRY_DELAY_MS = 5_000;
@@ -276,7 +276,7 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
             let report: unknown;
             if (config.responseAudit.enabled && hasMemoryTable(paths.storePath, "response_results")) {
               const store = new ResponseAuditStore(paths.storePath);
-              try { report = store.report(responseCohort(config.responseAudit), Date.now() - 8 * 86400_000); }
+              try { report = store.report(responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint), Date.now() - 8 * 86400_000); }
               finally { store.close(); }
             }
             return jsonResult({ status: "not_approved", report, reason: "Automatic external analysis is not enabled; cached leads only" });
@@ -299,8 +299,8 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
           if (hasMemoryTable(paths.storePath, "response_results")) {
             const store = new ResponseAuditStore(paths.storePath);
             try {
-              unresolved = store.unresolvedWork(responseCohort(analysisConfig.responseAudit), since, until);
-              report = store.report(responseCohort(analysisConfig.responseAudit), since, undefined, { until, bucket: "day" });
+              unresolved = store.unresolvedWork(responseCohort(analysisConfig.responseAudit, analysisConfig.typesafe.model, analysisConfig.typesafe.endpoint), since, until);
+              report = store.report(responseCohort(analysisConfig.responseAudit, analysisConfig.typesafe.model, analysisConfig.typesafe.endpoint), since, undefined, { until, bucket: "day" });
             } finally { store.close(); }
           } else unresolved++;
           const analysisStatus = !unresolved && since >= Date.now() - analysisConfig.responseAudit.lookbackDays * 86400_000 && audit.status === "ok" && pending && !pending.failed && !pending.deferredByLimit &&

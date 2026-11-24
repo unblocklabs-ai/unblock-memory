@@ -1,13 +1,14 @@
 import { RESPONSE_EXTRACTOR_VERSION } from "./response-episodes.js";
 import { judgeResponse, judgeResponseFollowup, RESPONSE_STAGE_VERSIONS } from "./response-judge.js";
-import { TYPESAFE_MODEL } from "./typesafe-client.js";
+import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
 import { jsonHash } from "./json-hash.js";
 export async function assessResponseStages(store, cohort, e, params, sentimentEnabled, usage) {
+    const scope = decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint);
     const original = { before: e.before, request: e.request, answer: e.answer, contextLimited: e.contextLimited };
     const feedback = { ...original, feedback: e.feedback };
     const evidence = { quality: original, feedback, sentiment: feedback, retrospective: { ...feedback, followup: e.followup } };
     const keys = Object.fromEntries(Object.keys(evidence).map(stage => [stage,
-        jsonHash([RESPONSE_EXTRACTOR_VERSION, TYPESAFE_MODEL, RESPONSE_STAGE_VERSIONS[stage],
+        jsonHash([RESPONSE_EXTRACTOR_VERSION, scope, RESPONSE_STAGE_VERSIONS[stage],
             e.id, e.session, e.senderId, e.thread, evidence[stage]]),
     ]));
     const cache = {

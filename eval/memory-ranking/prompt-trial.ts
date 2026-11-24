@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveConfig } from "../../src/config.js";
-import { requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_MODEL, TypeSafeRequestError } from "../../src/typesafe-client.js";
+import { requestTypeSafe, resolveTypeSafeApiKey, TypeSafeRequestError } from "../../src/typesafe-client.js";
 
 type Input = { id: string; state: unknown };
 const record = (v: unknown): Record<string, unknown> | undefined =>
@@ -30,7 +30,7 @@ mkdirSync(values.out, { mode: 0o700 });
 const out = values.out;
 const save = (file: string, v: unknown) => writeFileSync(join(out, file), JSON.stringify(v, null, 2) + "\n", { flag: "wx", mode: 0o600 });
 const append = (v: unknown) => appendFileSync(join(out, "judgments.jsonl"), JSON.stringify(v) + "\n", { mode: 0o600 });
-save("manifest.json", { startedAt: new Date().toISOString(), model: TYPESAFE_MODEL, inputs: inputs.length,
+save("manifest.json", { startedAt: new Date().toISOString(), endpoint: config.typesafe.endpoint, model: config.typesafe.model, inputs: inputs.length,
   inputHash: hash(inputs), promptHash: hash(questions), timeoutMs: config.typesafe.timeoutMs,
   stateMode: "frozen-production-state-no-query-rank-score-or-reference-label", concurrency: inputs.length });
 save("questions.json", questions);
@@ -40,7 +40,9 @@ await Promise.all(inputs.map(async input => {
   const requestStarted = performance.now();
   append({ id: input.id, status: "attempted" });
   try {
-    const payload = await requestTypeSafe({ apiKey, timeoutMs: config.typesafe.timeoutMs }, input.state, questions);
+    const payload = await requestTypeSafe({
+      apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model, timeoutMs: config.typesafe.timeoutMs,
+    }, input.state, questions);
     const response = record(payload), answers = record(response?.answers), answer = record(answers?.memory_0);
     const score = answer?.noul;
     if (!answers || Object.keys(answers).length !== 1 || answer?.type !== "noul" ||

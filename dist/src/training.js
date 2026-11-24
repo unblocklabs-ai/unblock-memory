@@ -49,7 +49,7 @@ export async function runTraining(source, store, config, options) {
         !Number.isSafeInteger(options.maxInputBytes) || options.maxInputBytes < 1)
         throw new Error("Invalid training run bounds");
     const refreshed = collectTraining(source, store, { existingOnly: true });
-    const concurrency = options.concurrency ?? 256;
+    const concurrency = options.concurrency ?? 32;
     if (!Number.isSafeInteger(concurrency) || concurrency < 1)
         throw new Error("Invalid training concurrency");
     const jobs = store.pending(options.maxExamples);
@@ -81,11 +81,11 @@ export async function runTraining(source, store, config, options) {
                 let judgment;
                 try {
                     // Offline labeling has its own deadline, not Whisperer's latency-sensitive timeout.
-                    judgment = await judgeTrainingInput(input, key, AbortSignal.timeout(30_000));
+                    judgment = await judgeTrainingInput(input, key, AbortSignal.timeout(30_000), { endpoint: config.typesafe.endpoint, model: config.typesafe.model });
                 }
                 catch (error) {
                     const definite = error instanceof TypeSafeRequestError && error.code === "http_error" &&
-                        error.status !== undefined && error.status >= 400 && error.status < 500;
+                        ((error.status !== undefined && error.status >= 400 && error.status < 500) || error.retryAfter === true);
                     const status = definite ? "failed" : "ambiguous";
                     store.finish(job.id, attempt, { status, error: error instanceof TypeSafeRequestError && error.code === "http_error" ?
                             `http_${error.status}` : "request_or_response_uncertain" });

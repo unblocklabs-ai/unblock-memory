@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
-import { TYPESAFE_MODEL } from "./typesafe-client.js";
+import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
 import { reviewTypeSafeClaim } from "./typesafe-review.js";
 
 export type EvidenceCitation = { path: string; from: number; lines: number };
@@ -9,7 +9,7 @@ export type EvidenceCitation = { path: string; from: number; lines: number };
 export async function reviewIndexedClaim(params: {
   db: QMDStore["internal"]["db"]; sources: readonly ResolvedSource[];
   claim: string; citations: readonly EvidenceCitation[];
-  apiKey: string; timeoutMs: number; signal: AbortSignal;
+  apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal: AbortSignal;
   personBackground?: { name: string; agentName: string; kind?: "interaction"; inferred?: boolean };
   read?: <T>(run: () => T) => Promise<T>;
 }) {
@@ -48,7 +48,7 @@ export async function reviewIndexedClaim(params: {
     }
     return { status: "ok" as const, ...judgment,
       evidence: evidence.map(({ text: _text, ...citation }) => citation),
-      policy: `${TYPESAFE_MODEL}:${params.personBackground?.kind === "interaction" ? "person-interaction-v1" : params.personBackground ? "person-background-v2" : "claim-v1"}`,
+      policy: `${decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint)}:${params.personBackground?.kind === "interaction" ? "person-interaction-v1" : params.personBackground ? "person-background-v2" : "claim-v1"}`,
       scope: "Advisory support check against cited indexed excerpts only, not current truth or authorization to write. Verify original sources and identity before promotion." };
   });
 }

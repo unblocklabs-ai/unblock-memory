@@ -6,7 +6,8 @@ changes, memory writes, live-index mutation or automatic background inference.
 ## Recipe
 
 1. Collect eligible historical user turns and preceding visible conversation.
-2. TypeSafe `jev-1.13.0` recall probability **>=0.7** gates query generation.
+2. Configured decision model (default `liquid/d1.2-ultra` via `https://codex.unblocklabs.ai/v1/decisions`,
+   or `jev-1.13.0` when overridden to `https://api.typesafe.ai/v1/systemone`) recall probability **>=0.7** gates query generation.
    Preserve negative labels for audit; greetings do not need query targets.
 3. Isolated `openai/gpt-6-luna`, **xhigh**, generates **five distinct queries per
    lane**: discriminating BM25 keywords for `lex`, semantic natural language for
@@ -39,7 +40,7 @@ V2 replaces v1 in place; no v1 execution mode or old-output compatibility parser
 ```sh
 openclaw memory-training collect --agent main --dry-run
 openclaw memory-training collect --agent main
-openclaw memory-training run --agent main --concurrency 256
+openclaw memory-training run --agent main --concurrency 32
 openclaw memory-training generate --agent main --concurrency 8
 openclaw memory-training evaluate --agent main --concurrency 4
 openclaw memory-training status --agent main
@@ -61,7 +62,7 @@ Evaluate's optional `--max-calls` counts new retrievals, uncached passage judgme
 and revision teacher calls. Its revision teacher input-byte budget also defaults to
 3,000,000. There is no default example/call-count cap.
 
-Recall defaults to 256 concurrent requests, generation to 8 isolated completions.
+Recall defaults to 32 concurrent requests, generation to 8 isolated completions.
 Evaluation defaults to 4 inputs. Distinct remote passage judgments overlap;
 identical conversation/passage judgments are reused across queries and rounds.
 Native vector work is serialized per snapshot. Raise concurrency within machine

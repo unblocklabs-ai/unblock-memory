@@ -8,7 +8,7 @@ import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import { resolveConfig } from "../../src/config.js";
 import { resolveSources, resolveSessionSource } from "../../src/sources.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "../../src/typesafe.js";
-import { resolveTypeSafeApiKey, TypeSafeRequestError, TYPESAFE_MODEL } from "../../src/typesafe-client.js";
+import { resolveTypeSafeApiKey, TypeSafeRequestError } from "../../src/typesafe-client.js";
 import { collectSearches, hash, record, searchQueries, type SearchCase } from "./cases.js";
 import type { SessionManifest } from "../../src/session-sync.js";
 import { blindCase, retrieve, type Judgment, type Retrieval } from "./ranking.js";
@@ -55,7 +55,7 @@ if (sessions?.kind === "sessions") sources.push(resolveSessionSource(join(stateD
 const approved = sources.filter(s => config.memoryWhisperer.corpora.includes(s.corpus));
 if (!approved.length) throw new Error("No Memory Whisperer approved corpora; explicitly configure the evaluation scope");
 const collections = new Map(approved.map(s => [s.collection, s.corpus]));
-const recipe = { version: "memory-ranking-v1", model: TYPESAFE_MODEL, limitPerMethod: 10,
+const recipe = { version: "memory-ranking-v1", endpoint: config.typesafe.endpoint, model: config.typesafe.model, limitPerMethod: 10,
   ...(frozenCases ? { frozenCasesHash: hash(frozenCases) } : {}),
   limitScope: "across_selected_collections", inputWindow: "lfm-8192-tokens-24000-bytes",
   timeoutMs: config.typesafe.timeoutMs, minUsefulness: config.memoryWhisperer.minUsefulness,
@@ -138,8 +138,8 @@ async function main() {
           let terminal: Judgment;
           try {
             const { probability: score } = await judgeMemoryPassage(
-              memoryUsefulnessRequest(params.conversation, params.candidates[0]!, params.asOf),
-              { apiKey: key, timeoutMs: recipe.timeoutMs, signal: new AbortController().signal });
+              memoryUsefulnessRequest(params.conversation, params.candidates[0]!, params.asOf, config.typesafe.model),
+              { apiKey: key, endpoint: config.typesafe.endpoint, model: config.typesafe.model, timeoutMs: recipe.timeoutMs, signal: new AbortController().signal });
             terminal = { ...attempt, status: "complete", typesafe_score: score, elapsedMs: performance.now() - started };
           } catch (error) {
             terminal = { ...attempt, status: "failed", elapsedMs: performance.now() - started,

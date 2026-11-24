@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe, TypeSafeRequestError, TYPESAFE_MODEL, TYPESAFE_NOUL_ANSWERS_SCHEMA, TYPESAFE_NOUL_SCHEMA } from "./typesafe-client.js";
+import { decisionModelScope, defaultDecisionModel, matchesDecisionModel, requestTypeSafe, TypeSafeRequestError, TYPESAFE_MODEL, TYPESAFE_NOUL_ANSWERS_SCHEMA, TYPESAFE_NOUL_SCHEMA, } from "./typesafe-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 const SKILL_MIN_USEFULNESS = 0.7;
 /** Select from trusted candidates; never accept a provider-generated path or skill name. */
@@ -50,7 +50,9 @@ async function judgeTypeSafeSkill(params) {
         throw new TypeSafeRequestError("TypeSafe returned an invalid selection", "invalid_response");
     return payload.answers.useful.noul;
 }
-export const QUALITY_JUDGE_VERSION = `${TYPESAFE_MODEL}:quality-v3-isolated`;
+export function qualityJudgeVersion(model = TYPESAFE_MODEL, endpoint) {
+    return `${decisionModelScope(model, endpoint)}:quality-v3-isolated`;
+}
 /** These are indicators for review, never authorization to delete or rewrite. */
 export async function judgeTypeSafeQuality(params) {
     if (!params.chunks.length)
@@ -90,7 +92,9 @@ export async function judgeTypeSafeQuality(params) {
                 } },
         };
         let payload;
-        payload = await requestTypeSafe({ apiKey: params.apiKey, signal: params.signal, timeoutMs: params.timeoutMs }, { chunks: [chunk] }, questions);
+        payload = await requestTypeSafe({
+            apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, signal: params.signal, timeoutMs: params.timeoutMs,
+        }, { chunks: [chunk] }, questions);
         if (!Value.Check(TYPESAFE_NOUL_ANSWERS_SCHEMA, payload) ||
             Object.keys(payload.answers).length !== Object.keys(questions).length ||
             Object.keys(questions).some(key => !Object.hasOwn(payload.answers, key))) {
@@ -102,7 +106,10 @@ export async function judgeTypeSafeQuality(params) {
         };
     }));
 }
-export const MEMORY_JUDGE_VERSION = `${TYPESAFE_MODEL}:memory-usefulness-v2`;
+export function memoryJudgeVersion(model = TYPESAFE_MODEL, endpoint) {
+    return `${decisionModelScope(model, endpoint)}:memory-usefulness-v2`;
+}
+export const MEMORY_JUDGE_VERSION = memoryJudgeVersion();
 const MEMORY_QUESTIONS = { memory_0: {
         type: "noul",
         instructions: "Would a careful assistant use a specific factual detail from `candidates[0].excerpt` when " +
@@ -119,29 +126,36 @@ const MEMORY_QUESTIONS = { memory_0: {
         },
     } };
 /** The sole versioned passage prompt/state builder for both training and runtime. */
-export function memoryUsefulnessRequest(conversation, candidate, asOf) {
+export function memoryUsefulnessRequest(conversation, candidate, asOf, model = TYPESAFE_MODEL) {
     if (!Number.isFinite(Date.parse(asOf)))
         throw new Error("Invalid judgment time");
     if (!candidate.excerpt.trim() || candidate.excerpt.length > MEMORY_PASSAGE_CHARS)
         throw new Error("Invalid judgment passage");
     // Deliberate allowlist: no generated query, rank, backend, score, or other candidates.
-    return { model: TYPESAFE_MODEL, state: {
+    return { model, state: {
             conversation: { history: conversation.history, currentRequest: conversation.currentRequest }, asOf,
             candidates: [{ excerpt: candidate.excerpt, corpus: candidate.corpus, sourcePath: candidate.sourcePath, dates: candidate.dates }],
         }, questions: MEMORY_QUESTIONS };
 }
 const memoryJudgmentSchema = Type.Object({
-    model: Type.Literal(TYPESAFE_MODEL),
+    model: Type.String({ minLength: 1 }),
     answers: Type.Object({ memory_0: TYPESAFE_NOUL_SCHEMA }, { additionalProperties: false }),
     usage: Type.Optional(Type.Object({ input_tokens: Type.Integer({ minimum: 0 }), output_tokens: Type.Integer({ minimum: 0 }) })),
 });
-function parseMemoryJudgment(payload) {
-    if (!Value.Check(memoryJudgmentSchema, payload) || !Number.isFinite(payload.answers.memory_0.noul)) {
+function parseMemoryJudgment(payload, expectedModel = TYPESAFE_MODEL) {
+    if (!Value.Check(memoryJudgmentSchema, payload) || !matchesDecisionModel(payload.model, expectedModel) ||
+        !Number.isFinite(payload.answers.memory_0.noul)) {
         throw new TypeSafeRequestError("TypeSafe returned invalid memory judgments", "invalid_response");
     }
-    return { probability: payload.answers.memory_0.noul, answer: payload.answers.memory_0,
-        model: payload.model, usage: payload.usage ?? null };
+    const noul = payload.answers.memory_0.noul;
+    return {
+        probability: noul,
+        answer: { type: "noul", noul },
+        model: payload.model,
+        usage: payload.usage ? { input_tokens: payload.usage.input_tokens, output_tokens: payload.usage.output_tokens } : null,
+    };
 }
 export async function judgeMemoryPassage(request, params) {
-    return parseMemoryJudgment(await requestTypeSafe(params, request.state, request.questions));
+    const model = params.model ?? (params.endpoint && request.model === TYPESAFE_MODEL ? defaultDecisionModel(params.endpoint) : request.model);
+    return parseMemoryJudgment(await requestTypeSafe({ ...params, model }, request.state, request.questions), model);
 }

@@ -2,6 +2,8 @@ import type { QueryConversation } from "./query-contract.js";
 /** Select from trusted candidates; never accept a provider-generated path or skill name. */
 export declare function selectTypeSafeSkill(params: {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal?: AbortSignal;
     currentRequest: string;
@@ -15,7 +17,7 @@ export declare function selectTypeSafeSkill(params: {
     }[];
     onCandidateFailure?: (index: number, error: unknown) => void;
 }): Promise<number | undefined>;
-export declare const QUALITY_JUDGE_VERSION = "jev-1.13.0:quality-v3-isolated";
+export declare function qualityJudgeVersion(model?: string, endpoint?: string): string;
 export type QualityJudgment = {
     noise: number;
     evidence: number;
@@ -23,6 +25,8 @@ export type QualityJudgment = {
 /** These are indicators for review, never authorization to delete or rewrite. */
 export declare function judgeTypeSafeQuality(params: {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
     chunks: readonly {
@@ -30,7 +34,8 @@ export declare function judgeTypeSafeQuality(params: {
         sourceKind: "files" | "sessions";
     }[];
 }): Promise<QualityJudgment[]>;
-export declare const MEMORY_JUDGE_VERSION = "jev-1.13.0:memory-usefulness-v2";
+export declare function memoryJudgeVersion(model?: string, endpoint?: string): string;
+export declare const MEMORY_JUDGE_VERSION: string;
 export type MemoryPassage = {
     excerpt: string;
     corpus: string;
@@ -38,7 +43,7 @@ export type MemoryPassage = {
     dates: readonly string[];
 };
 /** The sole versioned passage prompt/state builder for both training and runtime. */
-export declare function memoryUsefulnessRequest(conversation: QueryConversation, candidate: MemoryPassage, asOf: string): {
+export declare function memoryUsefulnessRequest(conversation: QueryConversation, candidate: MemoryPassage, asOf: string, model?: string): {
     model: string;
     state: {
         conversation: {
@@ -69,6 +74,8 @@ export declare function memoryUsefulnessRequest(conversation: QueryConversation,
 };
 export declare function judgeMemoryPassage(request: ReturnType<typeof memoryUsefulnessRequest>, params: {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal?: AbortSignal;
 }): Promise<{
@@ -77,7 +84,7 @@ export declare function judgeMemoryPassage(request: ReturnType<typeof memoryUsef
         type: "noul";
         noul: number;
     };
-    model: "jev-1.13.0";
+    model: string;
     usage: {
         input_tokens: number;
         output_tokens: number;

@@ -93,7 +93,7 @@ const judgments = Type.Object({ answers: Type.Object({
 }) });
 
 export async function validateExtractedMemory(params: { proposal: MemoryProposal; messages: ExtractionMessage[];
-  newIds: string[]; existing: PriorMemory[]; apiKey: string; signal: AbortSignal;
+  newIds: string[]; existing: PriorMemory[]; apiKey: string; endpoint?: string; model?: string; signal: AbortSignal;
   thresholds: Pick<ExtractionConfig, "minSupport" | "minRetention" | "minReplacement"> }) {
   const { proposal, messages, existing } = params;
   const prior = existing.find(m => m.id === proposal.replaces);
@@ -101,7 +101,9 @@ export async function validateExtractedMemory(params: { proposal: MemoryProposal
     !proposal.evidence.some(e => params.newIds.includes(e.messageId)) ||
     proposal.evidence.some(e => !e.quote.trim() || !messages.find(m => m.id === e.messageId)?.text.includes(e.quote));
   if (invalid) return { accepted: false, reason: "invalid_evidence" as const };
-  const raw = await requestTypeSafe({ apiKey: params.apiKey, timeoutMs: 10_000, signal: params.signal },
+  const raw = await requestTypeSafe({
+    apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs: 10_000, signal: params.signal,
+  },
     { proposal, messages: messages.map(m => ({ ...m, sourceDate: new Date(m.timestamp).toISOString() })),
       newMessageIds: params.newIds, prior: prior ?? null }, {
       supported: { type: "choice", instructions: {

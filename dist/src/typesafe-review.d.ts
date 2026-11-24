@@ -1,5 +1,7 @@
 type RequestOptions = {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
 };

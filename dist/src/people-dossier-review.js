@@ -51,7 +51,8 @@ export async function reviewPersonDossier(params) {
                 personBackground: { name: person.preferredName ?? person.displayName,
                     agentName: resolveAgentIdentity(active.cfg, active.agentId)?.name?.trim() || params.agentName?.trim() || "the assistant",
                     ...(check.kind ? { kind: check.kind, inferred: check.inferred } : {}) },
-                corpora: config.peoplePrimer.corpora, apiKey, timeoutMs: config.peoplePrimer.timeoutMs, signal,
+                corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
+                timeoutMs: config.peoplePrimer.timeoutMs, signal,
             }), signal);
             if (review.status !== "ok" || review.needsReview)
                 return review;

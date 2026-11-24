@@ -25,7 +25,7 @@ export type MemoryRanking = {
 
 /** Both entry points use the same complete passages and independent usefulness judgments. */
 export async function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
-  apiKey?: string; timeoutMs: number; conversation: QueryConversation; asOf?: string;
+  apiKey?: string; endpoint?: string; model?: string; timeoutMs: number; conversation: QueryConversation; asOf?: string;
   /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
   allowRetrievalFallback?: boolean;
   /** Cap top retrieval-ranked candidates sent to TypeSafe (after dedup and cooldown filtering). */
@@ -94,7 +94,7 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
           excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
           dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
             ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
-        }, asOf), { ...options, apiKey });
+        }, asOf, options.model), { ...options, apiKey });
         signal?.throwIfAborted();
         observation.requestsSucceeded++;
         options.onJudgment?.({ candidateIndex, elapsedMs: performance.now() - requestStarted });

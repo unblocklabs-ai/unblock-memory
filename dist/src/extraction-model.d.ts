@@ -38,6 +38,8 @@ export declare function validateExtractedMemory(params: {
     newIds: string[];
     existing: PriorMemory[];
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     signal: AbortSignal;
     thresholds: Pick<ExtractionConfig, "minSupport" | "minRetention" | "minReplacement">;
 }): Promise<{

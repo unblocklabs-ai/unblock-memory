@@ -4,10 +4,10 @@ import test from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { registerSkillWhisperer } from "../src/skill-whisperer.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
-import type { UnblockMemoryConfig } from "../src/config.js";
+import { resolveConfig, type UnblockMemoryConfig } from "../src/config.js";
 
-const disabledTypeSafe = { enabled: false, timeoutMs: 1500 };
-const activeTypeSafe = { enabled: true, apiKey: "fake-secret", timeoutMs: 100 };
+const disabledTypeSafe = resolveConfig({ typesafe: { enabled: false, timeoutMs: 1500 } }).typesafe;
+const activeTypeSafe = resolveConfig({ typesafe: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).typesafe;
 
 function typeSafeResponse(choice: string) {
   return Response.json({ answers: { useful: { type: "noul", noul: choice === "none" ? 0.1 : 0.9 } } });
@@ -90,7 +90,7 @@ function harness(
 test("skill query and Jev use only bounded visible history without reading discarded messages", async t => {
   let expectedHistory = [{ role: "assistant", content: "recent answer" }, { role: "user", content: "recent question" }];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    assert.deepEqual(JSON.parse(String(init?.body)).state.history, expectedHistory);
+    assert.deepEqual(JSON.parse(String(init?.body)).state[0].history, expectedHistory);
     return typeSafeResponse("skill_0");
   });
   let discardedReads = 0;
@@ -233,12 +233,13 @@ test("retrieval failures do not block the agent turn", async () => {
 test("TypeSafe reranks below-threshold candidates and preserves selected-skill cooldown", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
+    const [state] = request.state;
     assert.deepEqual(Object.keys(request.questions), ["useful"]);
-    assert.ok(["alpha", "beta", "gamma"].includes(request.state.candidate.name));
+    assert.ok(["alpha", "beta", "gamma"].includes(state.candidate.name));
     assert.equal(JSON.stringify(request).includes("/skills/"), false);
-    assert.equal(request.state.currentRequest, "new task");
-    assert.deepEqual(request.state.history, [{ role: "user", content: "previous task" }]);
-    return typeSafeResponse(request.state.candidate.name === "beta" ? "skill_1" : "none");
+    assert.equal(state.currentRequest, "new task");
+    assert.deepEqual(state.history, [{ role: "user", content: "previous task" }]);
+    return typeSafeResponse(state.candidate.name === "beta" ? "skill_1" : "none");
   });
   const h = harness([
     { name: "invalid", path: "/not-allowed/SKILL.md", score: 0.95 },
@@ -261,9 +262,9 @@ test("TypeSafe reranks below-threshold candidates and preserves selected-skill c
 
 test("missing key keeps original selection and does not call TypeSafe", async (t) => {
   t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected API call"); });
-  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], {
-    enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-unblock-typesafe-fixture/key",
-  });
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], resolveConfig({
+    typesafe: { enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-unblock-typesafe-fixture/key" },
+  }).typesafe);
   assert.match((await h.before({ prompt: "task", messages: [] }, {
     trigger: "user", agentId: "main", sessionId: "session", runId: "run",
   }))?.appendContext ?? "", /alpha/);
@@ -294,8 +295,8 @@ test("TypeSafe conversation is bounded and pending selections do not survive ses
   let requestSignal: AbortSignal | null | undefined;
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.state.currentRequest.length, 12_000);
-    assert.deepEqual(request.state.history, []);
+    assert.equal(request.state[0].currentRequest.length, 12_000);
+    assert.deepEqual(request.state[0].history, []);
     requestSignal = init?.signal;
     requestStarted();
     return new Promise<Response>(resolve => { resolveRequest = resolve; });

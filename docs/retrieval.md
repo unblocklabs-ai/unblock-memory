@@ -323,8 +323,9 @@ An empty allowlist is invalid when enabled; `all`, unknown names, and `skills`
 are not accepted. When `sessions` is enabled for Memory Whisperer, automatic recall
 can retrieve across this agent's indexed sessions. The sessions corpus's `chatTypes`
 setting controls whether direct messages are included; no additional session-scope
-toggle is required. Selected excerpts are sent to TypeSafe and may be injected into
-any conversation using this agent. Session availability still depends on the normal
+toggle is required. Selected excerpts are sent to the configured decision endpoint
+(defaults to `https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter `liquid/d1.2-ultra`)
+and may be injected into any conversation using this agent. Session availability still depends on the normal
 indexing/sync schedule.
 
 The example is a plugin config fragment; `knowledge` must already be configured.
@@ -537,13 +538,14 @@ superseding turns and Gateway shutdown cancel its wait and provider requests;
 shared indexing/embedding work can finish for other callers, but cannot trigger
 late Jev calls or hints for the cancelled run.
 
-**Privacy:** enabled TypeSafe selection sends up to 12,000 characters of current
-prompt/recent user-assistant text, plus the shortlisted names/descriptions, to
-`api.typesafe.ai`. Source-path fields, full skill procedures, tool-result messages,
-and system messages are excluded; dossiers and ordinary memory files are not read
+**Privacy:** enabled decision-model selection sends up to 12,000 characters of current
+prompt/recent user-assistant text, plus the shortlisted names/descriptions, to the
+configured `typesafe.endpoint` (defaulting to `https://codex.unblocklabs.ai/v1/decisions`,
+routed to OpenRouter's `liquid/d1.2-ultra`; or `https://api.typesafe.ai/v1/systemone` with
+`jev-1.13.0` when overridden). Source-path fields, full skill procedures, tool-result
+messages, and system messages are excluded; dossiers and ordinary memory files are not read
 for this call. Material already quoted in user/assistant text can still be included.
-Disable `typesafe.enabled` to keep Skill Whisperer entirely local. The pinned model
-is `jev-1.13.0`.
+Disable `typesafe.enabled` to keep Skill Whisperer entirely local.
 
 The defaults use five prior messages, a vector-only score threshold of `0.5`,
 and a ten-turn cooldown. A skill is cooling down after either a suggestion or a
@@ -616,9 +618,10 @@ The retrieval corpus/session boundaries are unchanged.
 
 ## Memory quality audit
 
-`memory_audit_quality` is an on-demand, source-read-only audit. TypeSafe flags likely
-ingestion noise for agent investigation; it never deletes, rewrites, or suppresses
-memory. Enable it with explicit approval for the corpora sent to TypeSafe:
+`memory_audit_quality` is an on-demand, source-read-only audit. The configured decision
+model flags likely ingestion noise for agent investigation; it never deletes, rewrites,
+or suppresses memory. Enable it with explicit approval for the corpora sent to the
+configured decision endpoint (defaults to `https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter `liquid/d1.2-ultra`):
 
 ```json
 {

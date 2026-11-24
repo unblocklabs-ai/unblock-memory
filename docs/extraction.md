@@ -51,9 +51,11 @@ host policy **alongside `config`** in the plugin entry:
 ```
 
 Luna uses the host's configured agent runtime and credentials, with zero tools and
-no alternate-model/provider fallback. Missing TypeSafe credentials prevent source
+no alternate-model/provider fallback. Missing decision-model credentials prevent source
 scans and model calls. Enabling approves sending selected conversation text to
-Luna and Jev; tool calls/results and hidden thinking are removed first.
+Luna and the configured decision endpoint (defaults to
+`https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter `liquid/d1.2-ultra`, or
+`https://api.typesafe.ai/v1/systemone` when overridden); tool calls/results and hidden thinking are removed first.
 
 ## Run, backfill, inspect
 

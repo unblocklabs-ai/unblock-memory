@@ -39,9 +39,24 @@ function privateWrite(path, bytes) {
   try { writeFileSync(fd, bytes); } finally { closeSync(fd); }
 }
 
-export async function deploy({ apiKey, apply, restart }, cli = command) {
+const PROVIDERS = {
+  codex: {
+    file: "unblock-memory-decisions.env",
+    envKey: "CODEX_LB_API_KEY",
+    endpoint: "https://codex.unblocklabs.ai/v1/decisions",
+  },
+  typesafe: {
+    file: "unblock-memory-typesafe.env",
+    envKey: "TYPESAFE_API_KEY",
+    endpoint: "https://api.typesafe.ai/v1/systemone",
+  },
+};
+
+export async function deploy({ apiKey, apply, restart, provider = "codex" }, cli = command) {
   const report = { status: "failed", stage: "inspect", configChanged: false, keyChanged: false, restart: "not_needed" };
   try {
+    const target = PROVIDERS[provider];
+    if (!target) throw new Error("invalid_provider");
     if (typeof apiKey !== "string" || !/^[\x21-\x7e]{8,4096}$/.test(apiKey) || /["'`\\]/.test(apiKey)) throw new Error("invalid_key");
     const configPath = cliJson(cli(["config", "file", "--json"])).path;
     safePath(configPath);
@@ -53,14 +68,16 @@ export async function deploy({ apiKey, apply, restart }, cli = command) {
     if (!entry || entry.enabled === false) throw new Error("plugin_not_enabled");
     const current = entry.config?.typesafe ?? {};
     const secrets = join(dirname(configPath), "secrets");
-    const keyFile = join(secrets, "unblock-memory-typesafe.env");
+    const keyFile = join(secrets, target.file);
     safePath(secrets, true); safePath(keyFile);
-    const bytes = Buffer.from(`TYPESAFE_API_KEY="${apiKey}"\n`);
+    const bytes = Buffer.from(`${target.envKey}="${apiKey}"\n`);
     const priorKey = existsSync(keyFile) ? readFileSync(keyFile) : undefined;
-    const configChanged = current.enabled === false || current.apiKeyFile !== keyFile || Object.hasOwn(current, "apiKey");
+    const clearModel = Object.hasOwn(current, "model") && current.endpoint !== target.endpoint;
+    const configChanged = current.enabled === false || current.apiKeyFile !== keyFile ||
+      current.endpoint !== target.endpoint || Object.hasOwn(current, "apiKey") || clearModel;
     const keyChanged = !priorKey?.equals(bytes);
     const patch = JSON.stringify({ plugins: { entries: { "unblock-memory": { config: {
-      typesafe: { enabled: true, apiKey: null, apiKeyFile: keyFile },
+      typesafe: { enabled: true, endpoint: target.endpoint, ...(clearModel ? { model: null } : {}), apiKey: null, apiKeyFile: keyFile },
     } } } } });
     report.stage = "validate_patch";
     if (configChanged) cli(["config", "patch", "--stdin", "--dry-run", "--json"], patch);
@@ -79,7 +96,7 @@ export async function deploy({ apiKey, apply, restart }, cli = command) {
       const backup = join(secrets, `typesafe-backup-${randomUUID()}`);
       mkdirSync(backup, { mode: 0o700 });
       privateWrite(join(backup, "openclaw.json"), initialConfig);
-      if (priorKey) privateWrite(join(backup, "typesafe.env"), priorKey);
+      if (priorKey) privateWrite(join(backup, target.file), priorKey);
     }
     if (keyChanged) {
       const temporary = join(secrets, `.typesafe-${randomUUID()}.tmp`);
@@ -97,12 +114,17 @@ export async function deploy({ apiKey, apply, restart }, cli = command) {
     report.stage = "verify";
     cli(["config", "validate", "--json"]);
     const after = JSON.parse(readFileSync(configPath, "utf8")).plugins?.entries?.["unblock-memory"];
-    if (after.config?.typesafe?.apiKeyFile !== keyFile || after.config.typesafe.enabled === false || Object.hasOwn(after.config.typesafe, "apiKey")) throw new Error("config_mismatch");
-    // Check plugin settings outside the three intended leaves, including audit approvals.
+    if (after.config?.typesafe?.apiKeyFile !== keyFile || after.config.typesafe.enabled === false ||
+        after.config.typesafe.endpoint !== target.endpoint ||
+        Object.hasOwn(after.config.typesafe, "apiKey") ||
+        (clearModel ? Object.hasOwn(after.config.typesafe, "model") : after.config.typesafe.model !== current.model)) {
+      throw new Error("config_mismatch");
+    }
+    // Check plugin settings outside the intended decision-provider leaves, including audit approvals.
     const strip = value => {
       const copy = structuredClone(value);
       if (copy.config?.typesafe) {
-        for (const key of ["enabled", "apiKey", "apiKeyFile"]) delete copy.config.typesafe[key];
+        for (const key of ["enabled", "endpoint", "model", "apiKey", "apiKeyFile"]) delete copy.config.typesafe[key];
         if (!Object.keys(copy.config.typesafe).length) delete copy.config.typesafe;
       }
       if (copy.config && !Object.keys(copy.config).length) delete copy.config;

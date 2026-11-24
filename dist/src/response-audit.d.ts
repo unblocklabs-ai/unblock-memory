@@ -1,6 +1,6 @@
 import type { UnblockMemoryConfig } from "./config.js";
 import type { ResolvedSource } from "./sources.js";
-export declare function responseCohort(config: UnblockMemoryConfig["responseAudit"]): string;
+export declare function responseCohort(config: UnblockMemoryConfig["responseAudit"], model?: string, endpoint?: string): string;
 export type ResponseAuditOptions = {
     agentId: string;
     databasePath: string;

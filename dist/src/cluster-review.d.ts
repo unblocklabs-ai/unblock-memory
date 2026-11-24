@@ -6,6 +6,8 @@ export declare function reviewClusterIngestion(params: {
     sources: readonly ResolvedSource[];
     clusterId: string;
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
     read?: <T>(run: () => T) => Promise<T>;

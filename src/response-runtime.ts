@@ -43,7 +43,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
         if (!hasMemoryTable(storePath, "response_results")) { console.log(JSON.stringify({ status: "not_run" })); return; }
         const store = new ResponseAuditStore(storePath);
         if (opts.bucket !== "day" && opts.bucket !== "week") { store.close(); throw new Error("Bucket must be day or week"); }
-        try { console.log(JSON.stringify(store.report(responseCohort(config.responseAudit), dateOption(opts.since, Date.now() - config.responseAudit.lookbackDays * 86400_000), opts.episode,
+        try { console.log(JSON.stringify(store.report(responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint), dateOption(opts.since, Date.now() - config.responseAudit.lookbackDays * 86400_000), opts.episode,
           { until: dateOption(opts.until, Number.MAX_SAFE_INTEGER), bucket: opts.bucket, senderId: opts.sender,
             accountScope: opts.account, personId: opts.person, taskType: opts.taskType, agentModel: opts.model }), null, 2)); }
         finally { store.close(); }
@@ -53,7 +53,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
       const { storePath } = options(cfg, agent);
       if (!hasMemoryTable(storePath, "response_results")) throw new Error("Response audit has not run");
       const store = new ResponseAuditStore(storePath);
-      try { console.log(JSON.stringify(fn(store, responseCohort(config.responseAudit)), null, 2)); }
+      try { console.log(JSON.stringify(fn(store, responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint)), null, 2)); }
       finally { store.close(); }
     };
     root.command("tasks").description("Operator-only response reviews; never automatically writes memories or preferences")

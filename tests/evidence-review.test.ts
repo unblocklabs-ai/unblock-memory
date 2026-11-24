@@ -26,7 +26,7 @@ test("claim review loads indexed evidence, returns provenance and uncertainty, a
   let choice = "supports", confidence = 0.99;
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.deepEqual(request.state.evidence, [note.text.split("\n")[1]]);
+    assert.deepEqual(request.state[0].evidence, [note.text.split("\n")[1]]);
     assert.match(JSON.stringify(request.questions), /person\/entity, date, scope, negation and certainty/);
     assert.equal(init?.redirect, "error");
     return response(choice, confidence);
@@ -91,8 +91,8 @@ test("background review requires support and background eligibility, with approv
   let backgroundOnly = 0.99, explicitSupport = 0.99;
   const fetchMock = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const body = JSON.parse(String(init?.body));
-    assert.deepEqual(body.state.person, params.personBackground);
-    assert.deepEqual(body.state.evidence, [note.text]);
+    assert.deepEqual(body.state[0].person, params.personBackground);
+    assert.deepEqual(body.state[0].evidence, [note.text]);
     assert.equal(Object.keys(body.questions).length, 3);
     return Response.json({ answers: { relation: { type: "choice", choice: "supports", confidence: 0.99,
       probabilities: { supports: 0.99, contradicts: 0.005, insufficient_evidence: 0.005 } },

@@ -13,6 +13,8 @@ export declare function auditQualityPage(params: {
     curation: CurationStore;
     sources: readonly ResolvedSource[];
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     minNoise: number;
     limit?: number;

@@ -1,6 +1,6 @@
 import { Type, type Static } from "typebox";
 import type { ResponseEpisode } from "./response-episodes.js";
-export declare const RESPONSE_RUBRIC_VERSION = "jev-1.13.0:response-v10";
+export declare function responseRubricVersion(model?: string, endpoint?: string): string;
 export declare const RESPONSE_STAGE_VERSIONS: {
     readonly quality: "quality-v9";
     readonly feedback: "feedback-v9";
@@ -159,6 +159,8 @@ type StageCache = Partial<ResponseStages> & {
 /** Separate requests are deliberate: later feedback must not leak into the original quality grade. */
 export declare function judgeResponse(episode: ResponseEpisode, params: {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
 }, sentimentEnabled?: boolean, cache?: StageCache): Promise<ResponseJudgment>;
@@ -201,6 +203,8 @@ declare const retrospectiveSchema: Type.TObject<{
 /** Later evidence is kept in a third request and never changes the original grade. */
 export declare function judgeResponseFollowup(episode: ResponseEpisode, params: {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
 }): Promise<{
@@ -213,6 +217,8 @@ export declare function judgeMemoryOpportunity(episode: ResponseEpisode, candida
     hash: string;
 }[], params: {
     apiKey: string;
+    endpoint?: string;
+    model?: string;
     timeoutMs: number;
     signal: AbortSignal;
 }): Promise<{

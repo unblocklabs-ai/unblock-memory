@@ -75,7 +75,7 @@ export async function searchMemory(manager, queries, options) {
                     excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
                     dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
                             ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
-                }, asOf), { ...options, apiKey });
+                }, asOf, options.model), { ...options, apiKey });
                 signal?.throwIfAborted();
                 observation.requestsSucceeded++;
                 options.onJudgment?.({ candidateIndex, elapsedMs: performance.now() - requestStarted });

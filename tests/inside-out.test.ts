@@ -55,7 +55,7 @@ test("Inside Out judges visible replies, not replay metadata, and leaves unsafe 
   }
   const requests: { target: { text: string }; history: { text: string }[] }[] = [];
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
-    requests.push(JSON.parse(String(init.body)).state);
+    requests.push(JSON.parse(String(init.body)).state[0]);
     return Response.json({ answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])) });
   });
   const storePath = join(root, "unblock-memory.sqlite");
@@ -191,7 +191,7 @@ test("session-scoped passes skip unchanged payloads and resume bounded appends, 
   t.after(() => db.close());
   const requests: { history: { text: string }[]; target: { text: string } }[] = [];
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
-    requests.push(JSON.parse(String(init.body)).state);
+    requests.push(JSON.parse(String(init.body)).state[0]);
     return Response.json({ answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.3 }])) });
   });
   let payloadReads = 0;
@@ -294,10 +294,10 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     config: cfg({ maxInteractions: 3 }) };
   assert.ok(existsSync(options.databasePath));
   type Message = { id: string; text: string; human?: string };
-  const requests: { state: { history: Message[]; target: Message }; questions: Record<string, { type: string }> }[] = [];
+  const requests: { state: [{ history: Message[]; target: Message }]; questions: Record<string, { type: string }> }[] = [];
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
     const request = JSON.parse(String(init.body)); requests.push(request);
-    return Response.json({ model: "jev-1.13.0", answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: e === "joy" ? 0.85 : 0.05 }])) });
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: e === "joy" ? 0.85 : 0.05 }])) });
   });
   const first = await runInsideOut(options);
   assert.equal("reviewed" in first && first.reviewed, 3);
@@ -308,13 +308,14 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   for (const request of requests) {
     assert.deepEqual(Object.keys(request.questions).sort(), [...emotions].sort());
     assert.ok(Object.values(request.questions).every(q => q.type === "noul"));
-    const target = request.state.target;
+    const [state] = request.state;
+    const target = state.target;
     if (target.text === "Please include this too.") {
-      assert.equal(request.state.history.filter(m => m.text.includes("Done.")).length, 0);
-      assert.ok(request.state.history.some(m => m.text === "Working on it."));
+      assert.equal(state.history.filter(m => m.text.includes("Done.")).length, 0);
+      assert.ok(state.history.some(m => m.text === "Working on it."));
       assert.ok(target.human?.includes("alex"));
     }
-    if (target.text === "Also this, please.") assert.ok(request.state.history.some(m => m.text === "Great!"));
+    if (target.text === "Also this, please.") assert.ok(state.history.some(m => m.text === "Great!"));
   }
   let payloadReads = 0;
   const prepare = DatabaseSync.prototype.prepare;
@@ -350,7 +351,7 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     people.close();
     let calls = 0, channel = "telegram";
     globalThis.fetch = async (_url,init) => {
-      if (JSON.parse(JSON.parse(init.body).state.target.human)[0] !== channel) throw new Error("Wrong session uploaded");
+      if (JSON.parse(JSON.parse(init.body).state[0].target.human)[0] !== channel) throw new Error("Wrong session uploaded");
       calls++; return Response.json({answers:Object.fromEntries(
       ${JSON.stringify(emotions)}.map(e => [e,{type:"noul",noul:0.7}]))}); };
     const program = new Command(), output = [], hooks = {};
@@ -439,8 +440,8 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     assert.deepEqual("errors" in fresh && fresh.errors, []);
     assert.equal("reviewed" in fresh && fresh.reviewed, 1);
     assert.equal(requests.length, 9);
-    assert.equal(requests.at(-1)!.state.target.text, "That makes me happy!");
-    assert.ok(requests.at(-1)!.state.history.some(m => m.text === "New compressed answer."));
+    assert.equal(requests.at(-1)!.state[0].target.text, "That makes me happy!");
+    assert.ok(requests.at(-1)!.state[0].history.some(m => m.text === "New compressed answer."));
     const compressedRows = reportInsideOut(options.storePath);
     assert.equal(compressedRows.length, 9);
     assert.ok(compressedRows.some(row => row.message_id === "compressed-1" && row.joy === 0.85));
@@ -467,7 +468,7 @@ test("legacy files keep whole messages, unknown identities, broad formatting, br
   await writeFile(join(sessionsDir, "old.jsonl.reset.test.zst"), zstdCompressSync(Buffer.from(events.map(e => JSON.stringify(e)).join("\n"))));
   const requests: { history: { text: string }[]; target: { text: string } }[] = [];
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
-    const { state } = JSON.parse(String(init.body)); requests.push(state);
+    const { state: [state] } = JSON.parse(String(init.body)); requests.push(state);
     return Response.json({ answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.1 }])) });
   });
   const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir,
@@ -517,7 +518,7 @@ test("opt-in, tool/automation filtering and failed-request retries through the p
   db.close();
   const options = { agentId: "main", databasePath, storePath: join(root, "unblock-memory.sqlite"), config: cfg() };
   const mock = t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
-    const { state } = JSON.parse(String(init.body));
+    const { state: [state] } = JSON.parse(String(init.body));
     assert.ok(!JSON.stringify(state).includes("INTERNAL_"), "tool payloads, system text and hidden reasoning never reach Jev");
     if (state.target.text === "Fast reply") assert.ok(state.history.some((m: { text: string }) => m.text === "Progress"));
     return Response.json({ answers: {} });
@@ -569,7 +570,7 @@ test("bounded passes discover new replies before retries and leave oversized fai
   const targets: string[] = [];
   let unavailable = true;
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
-    const target = JSON.parse(String(init.body)).state.target.text;
+    const target = JSON.parse(String(init.body)).state[0].target.text;
     targets.push(target);
     return Response.json({ answers: unavailable ? {} : Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])) });
   });
@@ -614,7 +615,7 @@ test("an unavailable failed copy does not reset the live transcript checkpoint",
   await writeFile(oldPath, [{ type: "session", id: "s" }, event("old-a", assistant("Old answer")),
     event("old-b", user("Old failed reply"))].map(e => JSON.stringify(e)).join("\n"));
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => Response.json({
-    answers: JSON.parse(String(init.body)).state.target.text === "Old failed reply" ? {}
+    answers: JSON.parse(String(init.body)).state[0].target.text === "Old failed reply" ? {}
       : Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])),
   }));
   const options = { agentId: "main", databasePath, sessionsDir, storePath: join(root, "unblock-memory.sqlite"),
@@ -652,4 +653,47 @@ test("single-session file passes ignore unrelated corruption and preserve legacy
   assert.deepEqual("errors" in unchanged && unchanged.errors, []);
   assert.equal("sources" in unchanged && unchanged.sources, 0);
   assert.equal(mock.mock.callCount(), 3);
+});
+
+test("Inside Out validates payload.model without aborting and stores the requested alias for baseline continuity", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-model-")), sessionsDir = join(root, "sessions");
+  await mkdir(sessionsDir);
+  await writeFile(join(sessionsDir, "s.jsonl"), [
+    { type: "session", id: "s" },
+    event("a1", assistant("Answer")), event("u1", user("Snapshot reply")),
+    event("a2", assistant("Answer 2")), event("u2", user("Bad model reply")),
+  ].map(e => JSON.stringify(e)).join("\n"));
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+    const target = JSON.parse(String(init.body)).state[0].target.text;
+    return Response.json({
+      model: target === "Bad model reply" ? { unexpected: true } : "liquid/d1.2-ultra-20261116",
+      answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])),
+    });
+  });
+  const storePath = join(root, "unblock-memory.sqlite");
+  const result = await runInsideOut({ agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath, config: cfg() });
+  assert.equal("reviewed" in result && result.reviewed, 1);
+  assert.equal("failed" in result && result.failed, 1);
+  const rows = reportInsideOut(storePath);
+  const good = rows.find(r => r.message_id === "u1");
+  const bad = rows.find(r => r.message_id === "u2");
+  assert.equal(good?.model, "liquid/d1.2-ultra");
+  assert.equal(good?.error, null);
+  assert.match(String(bad?.error), /unexpected model/);
+
+  // Switching to a different endpoint under the same model alias must not reuse checkpoints or pool rubrics.
+  const alt = await runInsideOut({
+    agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath,
+    config: resolveConfig({
+      typesafe: { endpoint: "https://alt.example/v1/decisions", model: "liquid/d1.2-ultra", apiKey: "alt-key", timeoutMs: 1000 },
+      insideOut: { enabled: true, intervalMinutes: 0, maxInteractions: 100 },
+    }),
+  });
+  assert.equal("reviewed" in alt && alt.reviewed, 1);
+  assert.equal("failed" in alt && alt.failed, 1);
+  const allRows = reportInsideOut(storePath);
+  const u1Rows = allRows.filter(r => r.message_id === "u1");
+  assert.equal(u1Rows.length, 2);
+  assert.notEqual(u1Rows[0]?.rubric, u1Rows[1]?.rubric);
+  assert.ok(u1Rows.every(r => r.model === "liquid/d1.2-ultra"));
 });

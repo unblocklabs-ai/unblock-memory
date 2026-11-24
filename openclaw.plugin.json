@@ -47,35 +47,43 @@
     "memory_people_learning": { "sideEffecting": true }
   },
   "uiHints": {
-    "myTurn.enabled": { "label": "My Turn", "help": "Opt in to sending recent group/channel conversation text and agent identity to TypeSafe. Appends an advisory NO_REPLY hint only when Jev clearly favors silence. DMs and internal wakes are excluded. Failures never prevent a turn. Requires hook conversation access and prompt injection. Disabled by default." },
+    "myTurn.enabled": { "label": "My Turn", "help": "Opt in to sending recent group/channel conversation text and agent identity to the configured decision model (default: https://codex.unblocklabs.ai/v1/decisions -> OpenRouter Liquid d1.2-ultra). Appends an advisory NO_REPLY hint only when the model clearly favors silence. DMs and internal wakes are excluded. Failures never prevent a turn. Requires hook conversation access and prompt injection. Disabled by default." },
     "myTurn.historyMessages": { "label": "My Turn Message Window", "help": "Recent host-confirmed human messages including the trigger (1-50, default 10). Agent/bot/internal messages and unverified bundled history are excluded. If the trigger cannot be verified human, My Turn skips without affecting the agent turn." },
     "myTurn.channels": { "label": "My Turn Channel Overrides", "help": "Canonical provider IDs, e.g. slack or imessage. Once My Turn is enabled, omitted providers and omitted enabled flags default on. Set a provider's enabled to false to exclude it." },
-    "peoplePrimer.enabled": { "label": "People Background Primer", "help": "Opt in to sending identity, approved excerpts and proposed snippets to TypeSafe. Prepares evidence and checks <=70-word blurbs before replace_dossier saves; disabled/unavailable reviews require explicit manual verification. Existing dossiers are not evidence. Results are accessible to the agent's tool callers." },
+    "peoplePrimer.enabled": { "label": "People Background Primer", "help": "Opt in to sending identity, approved excerpts and proposed snippets to the configured decision model (default: Codex LB -> OpenRouter Liquid d1.2-ultra). Prepares evidence and checks <=70-word blurbs before replace_dossier saves; disabled/unavailable reviews require explicit manual verification. Existing dossiers are not evidence. Results are accessible to the agent's tool callers." },
     "peoplePrimer.corpora": { "label": "Primer Approved Corpora", "help": "Explicit non-skill corpus allowlist. Sessions includes all indexed conversations; approve only content suitable for this agent's audiences." },
-    "responseAudit.enabled": { "label": "Response Quality Audit", "help": "Opt in to background TypeSafe evaluation of approved Slack humans. Operator-only reports; no prompt or memory writes." },
+    "responseAudit.enabled": { "label": "Response Quality Audit", "help": "Opt in to background decision-model evaluation (default: Codex LB -> OpenRouter Liquid d1.2-ultra) of approved Slack humans. Operator-only reports; no prompt or memory writes." },
     "responseAudit.sentimentEnabled": { "label": "Human Sentiment Analysis", "help": "Default on within an enabled, approved response audit. Includes annoyance, frustration and expressed intensity; does not imply agent fault." },
     "responseAudit.intervalMinutes": { "label": "Response Audit Interval (minutes)", "help": "Shared cadence for quality and enabled sentiment analysis. Unchanged successful exchanges are cached. Zero means manual-only." },
-    "responseAudit.senderIds": { "label": "Approved Human Sender IDs", "help": "Explicit human Slack user IDs whose exchanges may be sent to TypeSafe. Also requires trusted human identity or owner metadata; explicit bots are always excluded." },
+    "responseAudit.senderIds": { "label": "Approved Human Sender IDs", "help": "Explicit human Slack user IDs whose exchanges may be sent to the configured decision model. Also requires trusted human identity or owner metadata; explicit bots are always excluded." },
     "responseAudit.memoryCorpora": { "label": "Response Audit Memory Evidence", "help": "Optional configured file corpora approved for current-index memory-gap investigation. Does not prove historical availability." },
     "qualityAudit.enabled": {
       "label": "Memory Quality Audit",
-      "help": "Enable an on-demand TypeSafe audit. Records review indicators only; never edits or suppresses data."
+      "help": "Enable an on-demand decision-model audit (default: Codex LB -> OpenRouter Liquid d1.2-ultra). Records review indicators only; never edits or suppresses data."
     },
-    "evidenceReview.enabled": { "label": "Evidence Review", "help": "Opt in to sending proposed claims and explicitly approved indexed evidence to TypeSafe. Advisory only; never writes." },
-    "evidenceReview.corpora": { "label": "Evidence Review Corpora", "help": "Explicit non-skill corpus approval for claim evidence sent to TypeSafe." },
+    "evidenceReview.enabled": { "label": "Evidence Review", "help": "Opt in to sending proposed claims and explicitly approved indexed evidence to the configured decision model (default: Codex LB -> OpenRouter Liquid d1.2-ultra). Advisory only; never writes." },
+    "evidenceReview.corpora": { "label": "Evidence Review Corpora", "help": "Explicit non-skill corpus approval for claim evidence sent to the configured decision model." },
     "qualityAudit.corpora": {
       "label": "Approved Audit Corpora",
-      "help": "Explicit non-skill corpora approved for external TypeSafe processing and maintenance results visible to every audience using this agent. Sessions means ALL indexed sessions, not only the current conversation."
+      "help": "Explicit non-skill corpora approved for external decision-model processing and maintenance results visible to every audience using this agent. Sessions means ALL indexed sessions, not only the current conversation."
     },
     "typesafe.enabled": {
-      "label": "TypeSafe Judgments",
-      "help": "Shared provider gate for My Turn, opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Memory search discovers locally and uses TypeSafe to rank usefulness; People Whisperer injection stays local."
+      "label": "Decision Model Judgments",
+      "help": "Shared provider gate for My Turn, opted-in whisperers, people primer/save review, evidence/quality reviews and response audits. Does not enable features or approve corpora by itself. Defaults to https://codex.unblocklabs.ai/v1/decisions (routed to OpenRouter Liquid d1.2-ultra); set typesafe.endpoint to https://api.typesafe.ai/v1/systemone to use TypeSafe Jev directly. Memory search discovers locally and uses the configured decision model to rank usefulness; People Whisperer injection stays local."
     },
-    "typesafe.apiKey": { "label": "TypeSafe API Key", "sensitive": true },
-    "typesafe.timeoutMs": { "label": "TypeSafe Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, Skill Whisperer has a fixed 3-second total budget, and My Turn has a fixed 1.5-second total budget." },
+    "typesafe.endpoint": {
+      "label": "Decision Model Endpoint",
+      "help": "HTTPS (or loopback HTTP) decision API endpoint without credentials, query, or fragment. Defaults to https://codex.unblocklabs.ai/v1/decisions (OpenRouter Liquid d1.2-ultra). Set to https://api.typesafe.ai/v1/systemone to use TypeSafe Jev directly."
+    },
+    "typesafe.model": {
+      "label": "Decision Model ID",
+      "help": "Model alias sent to the decision endpoint. When omitted, defaults to liquid/d1.2-ultra (or jev-1.13.0 when endpoint is https://api.typesafe.ai/v1/systemone)."
+    },
+    "typesafe.apiKey": { "label": "Decision API Key", "sensitive": true },
+    "typesafe.timeoutMs": { "label": "Decision Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, Skill Whisperer has a fixed 3-second total budget, and My Turn has a fixed 1.5-second total budget." },
     "typesafe.apiKeyFile": {
-      "label": "TypeSafe Key File",
-      "help": "Absolute path to a plaintext API key or a dotenv file containing TYPESAFE_API_KEY. Prefer this over storing a key in config."
+      "label": "Decision API Key File",
+      "help": "Absolute path to a plaintext API key or a provider-scoped dotenv file (CODEX_LB_API_KEY for codex.unblocklabs.ai, TYPESAFE_API_KEY for api.typesafe.ai). Prefer this over storing a key in config."
     },
     "keepEmbeddingModelWarm": {
       "label": "Keep Embedding Model Warm",
@@ -91,15 +99,15 @@
     },
     "memoryWhisperer.enabled": {
       "label": "Memory Whisperer",
-      "help": "Append up to three TypeSafe-approved historical excerpts after the user prompt. Requires explicit corpora, TypeSafe credentials, and hook conversation access. Disabled by default."
+      "help": "Append up to three decision-model-approved historical excerpts after the user prompt. Requires explicit corpora, decision-model credentials (defaults to https://codex.unblocklabs.ai/v1/decisions -> OpenRouter liquid/d1.2-ultra), and hook conversation access. Disabled by default."
     },
     "memoryWhisperer.corpora": {
       "label": "Approved Hint Corpora",
-      "help": "Explicit non-skill corpus allowlist for automatic recall and TypeSafe processing. Session recall spans this agent's indexed sessions; the sessions corpus chatTypes setting controls direct-message inclusion."
+      "help": "Explicit non-skill corpus allowlist for automatic recall and decision-model processing (defaults to https://codex.unblocklabs.ai/v1/decisions -> OpenRouter liquid/d1.2-ultra). Session recall spans this agent's indexed sessions; the sessions corpus chatTypes setting controls direct-message inclusion."
     },
     "safetyWhisperer.enabled": {
       "label": "Safety Whisperer",
-      "help": "Prompt-level guardrail, not access control. Sends every checked human message and bounded recent history to TypeSafe and appends a scenario's flaggedPrompt when an unapproved requestor's message matches. Fails open: if the check cannot run, the turn proceeds without it. Requires hook conversation access and prompt injection. Disabled by default."
+      "help": "Prompt-level guardrail, not access control. Sends every checked human message and bounded recent history to the configured decision endpoint (defaults to https://codex.unblocklabs.ai/v1/decisions -> OpenRouter liquid/d1.2-ultra) and appends a scenario's flaggedPrompt when an unapproved requestor's message matches. Fails open: if the check cannot run, the turn proceeds without it. Requires hook conversation access and prompt injection. Disabled by default."
     },
     "safetyWhisperer.scenarios": {
       "label": "Safety Scenarios",
@@ -107,7 +115,7 @@
     },
     "people.enabled": {
       "label": "PeopleSQL",
-      "help": "Enable the agent-local people store, Slack identity observation and people tools. Disabled by default; whispering and TypeSafe primer/review are separate opt-ins."
+      "help": "Enable the agent-local people store, Slack identity observation and people tools. Disabled by default; whispering and decision-model primer/review are separate opt-ins."
     },
     "people.whisperer.enabled": {
       "label": "People Whisperer",
@@ -335,11 +343,17 @@
         "not": { "required": ["apiKey", "apiKeyFile"] },
         "properties": {
           "enabled": { "type": "boolean", "default": true },
+          "endpoint": {
+            "type": "string",
+            "pattern": "^(?:https://(?:\\[[0-9A-Fa-f:]+\\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::\\d+)?(?:/[^\\s?#]*)?|http://(?:localhost|127\\.0\\.0\\.1|\\[::1\\])(?::\\d+)?(?:/[^\\s?#]*)?)$",
+            "default": "https://codex.unblocklabs.ai/v1/decisions"
+          },
+          "model": { "type": "string", "pattern": "\\S" },
           "apiKey": { "type": "string", "pattern": "\\S" },
           "apiKeyFile": { "type": "string", "pattern": "\\S" },
           "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1500 }
         },
-        "default": { "enabled": true, "timeoutMs": 1500 }
+        "default": { "enabled": true, "endpoint": "https://codex.unblocklabs.ai/v1/decisions", "timeoutMs": 1500 }
       },
       "memoryWhisperer": {
         "type": "object",
@@ -363,7 +377,7 @@
               "modelPath": { "type": "string", "pattern": "^/" }
             }
           },
-          "complementaryHints": { "type": "boolean", "default": false, "description": "Optionally remove confidently redundant hints with up to six concurrent TypeSafe requests, one per directional pair. Uncertainty retains hints." },
+          "complementaryHints": { "type": "boolean", "default": false, "description": "Optionally remove confidently redundant hints with up to six concurrent decision-model requests, one per directional pair. Uncertainty retains hints." },
           "enabled": { "type": "boolean", "default": false },
           "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
           "minUsefulness": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
@@ -445,7 +459,7 @@
                 "enabled": { "type": "boolean", "default": true },
                 "instructions": { "type": "string", "pattern": "\\S", "maxLength": 2000, "description": "What requests this scenario covers, including exclusions." },
                 "flaggedPrompt": { "type": "string", "pattern": "\\S", "maxLength": 2000, "description": "Appended next to the human message when an unapproved requestor's message matches." },
-                "minProbability": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4, "description": "Minimum TypeSafe yes-probability that the current request is covered." },
+                "minProbability": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4, "description": "Minimum decision-model yes-probability that the current request is covered." },
                 "agentIds": {
                   "type": "array",
                   "minItems": 1,

@@ -10,8 +10,9 @@ keyword or vector similarity.
 
 **Requirements:** Node.js 22+ and OpenClaw 2026.8.1-beta.3 or later.
 Use the Node version required by your OpenClaw release.
-A [TypeSafe](https://docs.typesafe.ai) API key enables usefulness ranking; without
-it, explicit search returns labeled local search leads.
+A decision-model API key (defaulting to `https://codex.unblocklabs.ai/v1/decisions`
+with `liquid/d1.2-ultra`, or `https://api.typesafe.ai/v1/systemone` via `typesafe.endpoint`)
+enables usefulness ranking; without it, explicit search returns labeled local search leads.
 
 1. Install once per OpenClaw host, not once per agent:
 
@@ -19,11 +20,11 @@ it, explicit search returns labeled local search leads.
    openclaw plugins install npm:@unblocklabs/unblock-memory
    ```
 
-2. For usefulness ranking, save your TypeSafe key in a private file (`chmod 600`), for example
-   `~/.openclaw/secrets/unblock-memory-typesafe.env`:
+2. For usefulness ranking, save your `codex-lb` key in a private file (`chmod 600`), for example
+   `~/.openclaw/secrets/unblock-memory-decisions.env`:
 
    ```dotenv
-   TYPESAFE_API_KEY="your-key"
+   CODEX_LB_API_KEY="your-key"
    ```
 
 3. Merge this into `~/.openclaw/openclaw.json`, keeping your other settings.
@@ -37,13 +38,15 @@ it, explicit search returns labeled local search leads.
          "unblock-memory": {
            "enabled": true,
            "config": {
-             "typesafe": { "apiKeyFile": "/home/you/.openclaw/secrets/unblock-memory-typesafe.env" }
+             "typesafe": { "apiKeyFile": "/home/you/.openclaw/secrets/unblock-memory-decisions.env" }
            }
          }
        }
      }
    }
    ```
+
+   To use legacy TypeSafe (`jev-1.13.0`) instead, store `TYPESAFE_API_KEY="your-key"` in a private file and also set `"endpoint": "https://api.typesafe.ai/v1/systemone"` under `typesafe`.
 
 4. Restart the Gateway, then ask an agent to run `memory_diagnostics`:
 
@@ -114,10 +117,10 @@ Everything below is off until you configure it.
 | Feature | What it does |
 | --- | --- |
 | [Session indexing](docs/retrieval.md#sessions) | Makes past conversations searchable. Group and channel chats by default; DMs only if you add them. |
-| [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill for a user message. Never runs it. Turns on when you add a `skills` corpus; works without TypeSafe. |
-| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to three relevant past excerpts before the agent replies. Needs TypeSafe; optionally uses a self-hosted query-generation API with local fallback. |
-| [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if TypeSafe is unavailable. |
-| [My Turn](docs/configuration.md#my-turn) | Asks Jev whether a group/channel conversation needs this agent's response. Advises `NO_REPLY` only when silence is clearly favored; the agent keeps the final say. Opt-in; failures leave the turn unchanged. |
+| [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill for a user message. Never runs it. Turns on when you add a `skills` corpus; works without a remote decision model. |
+| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to three relevant past excerpts before the agent replies. Needs a configured decision endpoint (`typesafe`); optionally uses a self-hosted query-generation API with local fallback. |
+| [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if the decision endpoint is unavailable. |
+| [My Turn](docs/configuration.md#my-turn) | Asks the configured decision model (default `liquid/d1.2-ultra` via Codex LB) whether a group/channel conversation needs this agent's response. Advises `NO_REPLY` only when silence is clearly favored; the agent keeps the final say. Opt-in; failures leave the turn unchanged. |
 | [People dossiers](docs/peoplesql.md) | Lets the agent keep a short, evidence-backed note about each person it works with. |
 | [People Whisperer](docs/peoplesql.md#injection-and-person-state) | Supplies identity, scoped preferences and unexpired lessons on each Slack user turn. Includes [private nightly learning and weekly validation](docs/people-learning.md) by default. |
 | [People Primer](docs/peoplesql.md#optional-people-dossier-primer) | Gathers evidence for a person's note and reviews proposed notes before they are saved. |

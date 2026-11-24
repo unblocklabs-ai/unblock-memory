@@ -132,7 +132,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
           sessionFilter,
           maxResults,
           minUsefulness,
-          apiKey, timeoutMs: typesafe.timeoutMs, conversation, allowRetrievalFallback: true,
+          apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, conversation, allowRetrievalFallback: true,
           signal, timings: measurement,
           requestContext: active.requestContext,
           onCandidates: ({ retrievalMs, candidates, eligible }) => {
@@ -386,7 +386,7 @@ function createAuditQualityTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
         if (context.status !== "ready") return jsonResult(context);
         return jsonResult(await context.manager.auditQuality({
           ...options, corpora: config.qualityAudit.corpora, minNoise: config.qualityAudit.minNoise,
-          apiKey: context.apiKey, timeoutMs: context.timeoutMs, signal: context.signal,
+          apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal,
         }));
       } catch {
         return jsonResult({ status: "unavailable", reason: "Quality audit failed or was cancelled; retry the same page" });

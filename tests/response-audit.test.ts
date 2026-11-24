@@ -60,6 +60,8 @@ test("response audit config is separately opted in and explicitly scopes humans 
   }
   assert.notEqual(responseCohort(config.responseAudit), responseCohort({ ...config.responseAudit, historyMessages: 3 }));
   assert.notEqual(responseCohort(config.responseAudit), responseCohort({ ...config.responseAudit, sentimentEnabled: false }));
+  assert.notEqual(responseCohort(config.responseAudit, "liquid/d1.2-ultra", "https://codex.unblocklabs.ai/v1/decisions"),
+    responseCohort(config.responseAudit, "liquid/d1.2-ultra", "https://openrouter.ai/api/alpha/decisions"));
   assert.equal(responseCohort(config.responseAudit), responseCohort({ ...config.responseAudit, intervalMinutes: 15 }));
 });
 
@@ -121,7 +123,7 @@ test("bounded later evidence preserves original inputs, rejects unsafe boundarie
   assert.equal(e.answer.length, 1);
   const seen: Record<string, unknown>[] = [];
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
-    const body = JSON.parse(String(init.body)); seen.push(body.state); return Response.json(payload(body));
+    const body = JSON.parse(String(init.body)); seen.push(body.state[0]); return Response.json(payload(body));
   });
   const params = { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal };
   await judgeResponse(e, params); await judgeResponseFollowup(e, params);
@@ -202,12 +204,38 @@ test("quality request cannot see later feedback; schema errors and provider erro
   let n = 0;
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body));
-    if (n++ === 0) { assert.equal(body.state.feedback, undefined); assert.equal(JSON.stringify(body).includes("Great, now elaborate."), false); }
-    else assert.equal(body.state.feedback[0].text, "Great, now elaborate.");
+    const [state] = body.state;
+    if (n++ === 0) { assert.equal(state.feedback, undefined); assert.equal(JSON.stringify(body).includes("Great, now elaborate."), false); }
+    else assert.equal(state.feedback[0].text, "Great, now elaborate.");
     return Response.json(payload(body));
   });
   await judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 });
   assert.equal(n, 2);
+  // Two-decimal rounding across an 8-option choice can sum to 1.04 (0.13 * 8) legitimately.
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const result = payload(body);
+    if (result.answers.target && "probabilities" in result.answers.target && result.answers.target.probabilities) {
+      result.answers.target.probabilities = Object.fromEntries(
+        Object.keys(result.answers.target.probabilities).map(k => [k, 0.13]),
+      );
+    }
+    return Response.json(result);
+  });
+  await judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 });
+  // Extra unknown probability keys must be rejected rather than inflating sum tolerance.
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const result = payload(body);
+    if (result.answers.target && "probabilities" in result.answers.target && result.answers.target.probabilities) {
+      result.answers.target.probabilities = {
+        ...Object.fromEntries(Object.keys(result.answers.target.probabilities).map(k => [k, 0.132])),
+        unknown_a: 0, unknown_b: 0, unknown_c: 0,
+      };
+    }
+    return Response.json(result);
+  });
+  await assert.rejects(judgeResponse(e, { apiKey: "fake", signal: new AbortController().signal, timeoutMs: 1000 }), /Invalid/);
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     const result = payload(JSON.parse(String(init.body)));
     result.answers.fulfillment = { type: "score", score: 0, confidence: 0.95, probabilities: { "0": 0, "1": 0, "2": 0, "3": 1 } };
@@ -245,7 +273,7 @@ test("disabled, missing key and already-running gates prevent API work", async t
   const { db, options } = await fixture(); t.after(() => db.close());
   t.mock.method(globalThis, "fetch", async () => { assert.fail("must not call TypeSafe"); });
   assert.equal((await auditResponses({ ...options, config: resolveConfig({}) })).status, "disabled");
-  assert.equal((await auditResponses({ ...options, config: { ...config, typesafe: { enabled: true, timeoutMs: 1000, apiKeyFile: "/not-found-response-key" } } })).status, "unavailable");
+  assert.equal((await auditResponses({ ...options, config: { ...config, typesafe: { ...config.typesafe, apiKey: undefined, apiKeyFile: "/not-found-response-key" } } })).status, "unavailable");
   const store = new ResponseAuditStore(options.storePath); t.after(() => store.close());
   const lease = store.acquire(Date.now())!;
   assert.equal((await auditResponses(options)).status, "already_running");
@@ -464,7 +492,7 @@ test("memory investigation limits to approved active whole documents before rank
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     calls++;
     const body = JSON.parse(String(init.body));
-    assert.deepEqual(body.state.candidates, [{ text: result[0]!.text }]);
+    assert.deepEqual(body.state[0].candidates, [{ text: result[0]!.text }]);
     return Response.json(payload(body));
   });
   const params = { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal };
@@ -482,7 +510,7 @@ test("memory opportunity judgments isolate concurrent candidates and retain sour
   const candidates = ["first", "second"].map(text => ({ text, path: `qmd://memory/${text}.md`, hash: text }));
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body));
-    assert.deepEqual(body.state.candidates, [{ text: candidates[pending.length].text }]);
+    assert.deepEqual(body.state[0].candidates, [{ text: candidates[pending.length].text }]);
     assert.deepEqual(Object.keys(body.questions), ["candidate_0"]);
     assert.doesNotMatch(JSON.stringify(body), /qmd:\/\/|"hash"/);
     return new Promise<Response>(resolve => pending.push(resolve));
@@ -740,7 +768,7 @@ test("sentiment schema requires all enabled questions and validates intensity di
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body)), result = payload(body);
     if (body.questions.annoyance) {
-      assert.ok(body.state.feedback); assert.equal(body.state.nextAssistantResponse, undefined);
+      assert.ok(body.state[0].feedback); assert.equal(body.state[0].nextAssistantResponse, undefined);
       assert.equal(body.questions.annoyance.type, "noul");
       assert.equal(body.questions.frustration.type, "noul");
       assert.equal(body.questions.dissatisfactionIntensity.type, "score");

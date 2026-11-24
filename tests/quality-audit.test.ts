@@ -79,11 +79,12 @@ test("bounded pages cache judgments, respect scope and preserve dismissed versio
   let evaluated = 0;
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
+    const [state] = request.state;
     assert.equal(JSON.stringify(request).includes("private source"), false);
     assert.equal(JSON.stringify(request).includes("outside pattern"), false);
-    assert.equal(request.state.chunks.length, 1);
-    evaluated += request.state.chunks.length;
-    return Response.json({ answers: Object.fromEntries(request.state.chunks.flatMap((chunk: { text: string }, i: number) => [
+    assert.equal(state.chunks.length, 1);
+    evaluated += state.chunks.length;
+    return Response.json({ answers: Object.fromEntries(state.chunks.flatMap((chunk: { text: string }, i: number) => [
       [`noise_${i}`, { type: "noul", noul: chunk.text.includes("wrapper") ? 0.97 : 0.1 }],
       [`evidence_${i}`, { type: "noul", noul: 0.98 }],
     ])) });
@@ -120,7 +121,7 @@ test("multi-chunk pages preserve UTF-16 slices without repeatedly materializing 
   const requested: string[] = [];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
-    requested.push(request.state.chunks[0].text);
+    requested.push(request.state[0].chunks[0].text);
     return Response.json({ answers: {
       noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.95 },
     } });

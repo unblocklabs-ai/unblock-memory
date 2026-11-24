@@ -1,14 +1,30 @@
 // Bounded live check using invented text only. Never reads user transcripts.
-// Usage: node sentiment.mjs PLUGIN KEYFILE OUTPUT
+// Usage: node sentiment.mjs PLUGIN KEYFILE OUTPUT [--legacy | --endpoint=URL --model=ID]
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-const [plugin, keyFile, output] = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const positional = rawArgs.filter(a => !a.startsWith("--"));
+const [plugin, keyFile, output] = positional;
 assert.ok(plugin && keyFile && output);
-const { resolveTypeSafeApiKey } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
-const { judgeResponse, RESPONSE_RUBRIC_VERSION } = await import(pathToFileURL(`${plugin}/dist/src/response-judge.js`));
-const apiKey = await resolveTypeSafeApiKey({ enabled: true, apiKeyFile: keyFile, timeoutMs: 10000 });
-assert.ok(apiKey, "TypeSafe key unavailable");
+const legacy = rawArgs.includes("--legacy");
+const endpointFlag = rawArgs.find(a => a.startsWith("--endpoint="))?.slice("--endpoint=".length);
+const modelFlag = rawArgs.find(a => a.startsWith("--model="))?.slice("--model=".length);
+const { resolveConfig } = await import(pathToFileURL(`${plugin}/dist/src/config.js`));
+const { resolveTypeSafeApiKey, TYPESAFE_DEFAULT_ENDPOINT } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
+const { judgeResponse, responseRubricVersion } = await import(pathToFileURL(`${plugin}/dist/src/response-judge.js`));
+const { typesafe } = resolveConfig({
+  typesafe: {
+    enabled: true,
+    endpoint: endpointFlag ?? (legacy ? "https://api.typesafe.ai/v1/systemone" : TYPESAFE_DEFAULT_ENDPOINT),
+    ...(modelFlag ? { model: modelFlag } : {}),
+    apiKeyFile: keyFile,
+    timeoutMs: 10000,
+  },
+});
+const { endpoint, model } = typesafe;
+const apiKey = await resolveTypeSafeApiKey(typesafe);
+assert.ok(apiKey, "Decision model key unavailable");
 const cases = [
   { id: "neutral_correction", feedback: "The total is 42, not 43. Please update it.", annoyed: false, frustrated: false, polarity: "neutral" },
   { id: "brief_followup", feedback: "Shorter please.", annoyed: false, frustrated: false, polarity: "neutral" },
@@ -28,7 +44,7 @@ for (const c of cases) {
     before: [], request: [text("user", "Explain the report total in one sentence.", 1)],
     answer: [text("assistant", "The report total is 43 because it sums all included entries.", 2)],
     feedback: [text("user", c.feedback, 3)], followup: { status: "pending", messages: [] } };
-  const result = await judgeResponse(episode, { apiKey, timeoutMs: 10000, signal: AbortSignal.timeout(30000) });
+  const result = await judgeResponse(episode, { apiKey, endpoint, model, timeoutMs: 10000, signal: AbortSignal.timeout(30000) });
   const f = result.feedback;
   const checks = {
     annoyance: c.annoyed === undefined || (c.annoyed ? f.annoyance.noul >= 0.8 : f.annoyance.noul <= 0.2),
@@ -45,6 +61,6 @@ for (const c of cases) {
 }
 const passed = results.filter(r => Object.values(r.checks).every(Boolean)).length;
 const behaviorPassed = results.filter(r => Object.values(r.behaviorChecks).every(Boolean)).length;
-await writeFile(output, JSON.stringify({ rubric: RESPONSE_RUBRIC_VERSION, passed, behaviorPassed, total: cases.length, results }, null, 2), { mode: 0o600, flag: "wx" });
+await writeFile(output, JSON.stringify({ endpoint, model, rubric: responseRubricVersion(model, endpoint), passed, behaviorPassed, total: cases.length, results }, null, 2), { mode: 0o600, flag: "wx" });
 console.log(JSON.stringify({ passed, behaviorPassed, total: cases.length }));
 if (behaviorPassed !== cases.length) process.exitCode = 1;

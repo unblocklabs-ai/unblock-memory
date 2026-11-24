@@ -116,7 +116,7 @@ export function registerSkillWhisperer(
           const shortlist = resolvedCandidates.slice(0, TYPESAFE_CANDIDATE_LIMIT);
           if (shortlist.every(({ canonicalPath }) => cooling(canonicalPath))) { diagnostics?.record(agentId, "skill", "cooldown"); return; }
           const selectedIndex = await abortable(selectTypeSafeSkill({
-            apiKey, timeoutMs: typesafe.timeoutMs, signal,
+            apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, signal,
             ...typeSafeConversation(event.prompt, recentMessages),
             candidates: shortlist.map(({ candidate }) => candidate),
             onCandidateFailure: (candidateIndex, error) => {

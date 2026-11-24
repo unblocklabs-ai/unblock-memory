@@ -16,7 +16,7 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
 const model = TYPESAFE_MODEL;
 const minScore = 0.5;
 const shortlistSize = 3;
-const inputPricePerMillion = 0.042; // Published pricing, checked 2026-09-17.
+const legacyInputPricePerMillion = 0.042; // Legacy TypeSafe Jev published pricing, checked 2026-09-17.
 
 const rosterSchema = Type.Array(Type.Object({
   name: Type.String(), description: Type.String(), source: Type.String(),
@@ -55,14 +55,17 @@ async function main() {
     if (!names.has(label)) throw new Error(`Unknown fixture label: ${label}`);
   }
   const args = process.argv.slice(2);
-  if (args.some(arg => arg !== "--live")) throw new Error("Usage: compare.ts [--live]");
+  if (args.some(arg => !["--live", "--legacy"].includes(arg))) throw new Error("Usage: compare.ts [--live] [--legacy]");
   if (!args.includes("--live")) {
     console.log(`${cases.length} synthetic cases, ${roster.length} snapshotted skills. No API calls made.`);
-    console.log(`Use --live for local embeddings and up to ${cases.length * (shortlistSize + roster.length)} independent TypeSafe requests. No conversation logs are read.`);
+    console.log(`Use --live with CODEX_LB_API_KEY (or --legacy with TYPESAFE_API_KEY) for local embeddings and up to ${cases.length * (shortlistSize + roster.length)} independent decision requests. No conversation logs are read.`);
     return;
   }
-  const apiKey = process.env.TYPESAFE_API_KEY?.trim();
-  if (!apiKey) throw new Error("Set TYPESAFE_API_KEY using --env-file=.env");
+  const legacy = args.includes("--legacy");
+  const endpoint = legacy ? "https://api.typesafe.ai/v1/systemone" : "https://codex.unblocklabs.ai/v1/decisions";
+  const resolvedModel = legacy ? "jev-1.13.0" : model;
+  const apiKey = (legacy ? process.env.TYPESAFE_API_KEY : process.env.CODEX_LB_API_KEY)?.trim();
+  if (!apiKey) throw new Error(`Set ${legacy ? "TYPESAFE_API_KEY" : "CODEX_LB_API_KEY"} using --env-file=.env`);
   const reportDir = resolve(root, "reports", "skill-whisperer", new Date().toISOString().replace(/[:.]/g, "-"));
   await mkdir(reportDir, { recursive: true });
   const workspaceDir = join(reportDir, "workspace");
@@ -77,8 +80,9 @@ async function main() {
     sources: resolveSources(workspaceDir, [{ name: "skills", kind: "skills", paths: ["skills/**/SKILL.md"] }]),
   });
   const rows: Row[] = [];
+  const inputPricePerMillion = legacy ? legacyInputPricePerMillion : null;
   const metadata = {
-    model, minScore, shortlistSize, historyMessages: 5, inputPricePerMillion,
+    endpoint, model: resolvedModel, minScore, shortlistSize, historyMessages: 5, inputPricePerMillion,
     gitHead: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(),
     fixtureHash: createHash("sha256").update(JSON.stringify({ roster, cases })).digest("hex"),
     selectorHash: createHash("sha256").update(await readFile(new URL("../../src/typesafe.ts", import.meta.url))).digest("hex"),
@@ -101,7 +105,9 @@ async function main() {
     let failed = 0;
     globalThis.fetch = async (url, init) => {
       const start = performance.now();
-      const item = { candidate: String(JSON.parse(String(init?.body)).state.candidate.name), status: 0, elapsedMs: 0 };
+      const body = JSON.parse(String(init?.body));
+      const state = Array.isArray(body.state) ? body.state[0] : body.state;
+      const item = { candidate: String(state.candidate.name), status: 0, elapsedMs: 0 };
       trace.push(item);
       try {
         const response = await nativeFetch(url, init);
@@ -117,7 +123,7 @@ async function main() {
       } finally { item.elapsedMs = performance.now() - start; }
     };
     try {
-      const index = await selectTypeSafeSkill({ apiKey: apiKey!, timeoutMs: 30_000,
+      const index = await selectTypeSafeSkill({ apiKey: apiKey!, endpoint, model: resolvedModel, timeoutMs: 30_000,
         currentRequest: row.prompt, history: row.history, candidates: skills, onCandidateFailure: () => { failed++; } });
       return { choice: index === undefined ? "none" : skills[index].name,
         elapsedMs: performance.now() - started, requests: trace.length, failed, usage };
@@ -164,7 +170,7 @@ async function main() {
       missedSkill: predictions.filter(({ row, choice }) => row.expected.length && choice === "none").length,
       p50Ms: quantile(latencies, 0.5), p95Ms: quantile(latencies, 0.95), inputTokens,
       failedRequests: rows.reduce((sum, row) => sum + (arm === "baseline" ? 0 : row[arm]!.failed), 0),
-      estimatedUsd: inputTokens / 1_000_000 * inputPricePerMillion };
+      estimatedUsd: inputPricePerMillion === null ? null : inputTokens / 1_000_000 * inputPricePerMillion };
   });
   const positive = rows.filter(row => row.expected.length);
   const top3Coverage = positive.filter(row => row.candidates.slice(0, shortlistSize).some(candidate => row.expected.includes(candidate.name))).length;
@@ -178,10 +184,10 @@ async function main() {
     negativeCases: rows.length - positive.length, ungatedTop1Correct, thresholdSensitivity, metrics };
   await writeFile(join(reportDir, "summary.json"), JSON.stringify(summary, null, 2));
   const lines = ["# Skill Whisperer comparison", "",
-    `${rows.length} authored synthetic cases; ${roster.length} snapshotted skills. Pinned model: ${model}.`, "",
+    `${rows.length} authored synthetic cases; ${roster.length} snapshotted skills. Endpoint: ${endpoint}; model: ${resolvedModel}.`, "",
     "| Selector | Correct | False hint on no-skill | Wrong skill | Missed skill | p50 ms | p95 ms | Input tokens | Estimated USD |",
     "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ...metrics.map(m => `| ${m.arm} | ${m.correct}/${rows.length} | ${m.falseHints} | ${m.wrongSkill} | ${m.missedSkill} | ${m.p50Ms} | ${m.p95Ms} | ${m.inputTokens} | ${m.estimatedUsd.toFixed(6)} |`), "",
+    ...metrics.map(m => `| ${m.arm} | ${m.correct}/${rows.length} | ${m.falseHints} | ${m.wrongSkill} | ${m.missedSkill} | ${m.p50Ms} | ${m.p95Ms} | ${m.inputTokens} | ${m.estimatedUsd === null ? "n/a" : m.estimatedUsd.toFixed(6)} |`), "",
     `Top-three retrieval coverage: ${top3Coverage}/${positive.length} positive cases. Ungated vector top-one accuracy: ${ungatedTop1Correct}/${rows.length}.`,
     `Cold local initialization + roster embedding: ${Math.round(coldStartMs)} ms, excluded from warm latency.`, "",
     "## Vector threshold sensitivity (post-hoc diagnostic, not held-out tuning)", "",

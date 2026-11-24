@@ -17,10 +17,11 @@ test("cluster review samples center and edge, excludes unapproved members and pr
   const seen: string[] = [];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.state.excerpts.length, 1);
-    assert.equal(request.state.excerpts.includes("Wrapper 8"), false);
-    seen.push(request.state.excerpts[0]);
-    return Response.json({ answers: Object.fromEntries(request.state.excerpts.map((text: string, i: number) => [
+    const [state] = request.state;
+    assert.equal(state.excerpts.length, 1);
+    assert.equal(state.excerpts.includes("Wrapper 8"), false);
+    seen.push(state.excerpts[0]);
+    return Response.json({ answers: Object.fromEntries(state.excerpts.map((text: string, i: number) => [
       `member_${i}`, answer(text === "Useful decision" ? "none_or_uncertain" : "wrapper", text === "Wrapper 7" ? 0.4 : 0.99),
     ])) });
   });

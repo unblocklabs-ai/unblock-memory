@@ -165,7 +165,9 @@ export function registerMyTurn(api, config, typesafe, diagnostics) {
                     state.history.unshift(message);
                     size += cost;
                 }
-                const result = await abortable(requestTypeSafe({ apiKey, signal, timeoutMs: typesafe.timeoutMs }, state, {
+                const result = await abortable(requestTypeSafe({
+                    apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal, timeoutMs: typesafe.timeoutMs,
+                }, state, {
                     should_respond: {
                         type: "noul",
                         instructions: {

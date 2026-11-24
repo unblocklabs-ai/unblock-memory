@@ -49,7 +49,7 @@ test("partial success never mixes retrieval scores; valid rejection never trigge
   let partial = true;
   t.mock.method(globalThis, "fetch", async () => {
     if (partial && calls++ % 2 === 0) return new Response(null, { status: 402 });
-    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.1 } } });
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul: 0.1 } } });
   });
   for (const isPartial of [true, false]) {
     partial = isPartial;
@@ -97,9 +97,14 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
   test(`public tool returns explicitly labeled retrieval evidence with ${credential} credential`, async t => {
     let providerCalls = 0;
     t.mock.method(globalThis, "fetch", async () => { providerCalls++; throw new Error("must not call provider"); });
-    const previous = process.env.TYPESAFE_API_KEY;
+    const previousTypeSafe = process.env.TYPESAFE_API_KEY;
+    const previousCodex = process.env.CODEX_LB_API_KEY;
     delete process.env.TYPESAFE_API_KEY;
-    t.after(() => { if (previous === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = previous; });
+    delete process.env.CODEX_LB_API_KEY;
+    t.after(() => {
+      if (previousTypeSafe === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = previousTypeSafe;
+      if (previousCodex === undefined) delete process.env.CODEX_LB_API_KEY; else process.env.CODEX_LB_API_KEY = previousCodex;
+    });
     type Tool = { execute(id: string, params: unknown): Promise<{ details: Record<string, unknown> }> };
     let factory: ((ctx: OpenClawPluginToolContext) => Tool) | undefined;
     let diagnosticsFactory: typeof factory;

@@ -97,11 +97,8 @@ export declare function evaluateTrainingQueries(source: Source, store: TrainingS
         }[];
     };
 }>;
-export declare function exportQueryTraining(store: TrainingStore, threshold?: number): Generator<{
-    stage: string;
-    input: TrainingInput;
-    inputHash: string;
-    recallProbability: number;
+export declare function exportQueryTraining(store: TrainingStore, threshold?: number, judgeVersion?: string): Generator<{
+    recallRequestedModel: string;
     threshold: number;
     target: QueryPair;
     targetPolicy: string;
@@ -135,5 +132,10 @@ export declare function exportQueryTraining(store: TrainingStore, threshold?: nu
         result: unknown;
         completedAt: import("node:sqlite").SQLOutputValue;
     }[];
+    recallModel?: string | undefined;
+    stage: string;
+    input: TrainingInput;
+    inputHash: string;
+    recallProbability: number;
 }, void, unknown>;
 export {};

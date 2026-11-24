@@ -6,6 +6,7 @@ import { DEFAULT_LEARNING, resolvePeopleLearning } from "./people-learning-confi
 import { resolveInsideOut } from "./inside-out.js";
 import { resolveSafetyWhisperer } from "./safety-config.js";
 import { resolveMyTurn } from "./my-turn.js";
+import { defaultDecisionModel, isLoopbackHostname, TYPESAFE_DEFAULT_ENDPOINT, TYPESAFE_MODEL, } from "./typesafe-client.js";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
@@ -25,6 +26,8 @@ export const DEFAULT_PEOPLE_CONFIG = {
 };
 const DEFAULT_TYPESAFE_CONFIG = {
     enabled: true,
+    endpoint: TYPESAFE_DEFAULT_ENDPOINT,
+    model: TYPESAFE_MODEL,
     timeoutMs: 1500,
 };
 const DEFAULT_QUALITY_AUDIT = {
@@ -59,14 +62,36 @@ function resolveTypeSafe(value) {
         throw new Error("unblock-memory typesafe must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["enabled", "apiKey", "apiKeyFile", "timeoutMs"], "typesafe");
+    assertOnlyKeys(config, ["enabled", "endpoint", "model", "apiKey", "apiKeyFile", "timeoutMs"], "typesafe");
     const enabled = config.enabled ?? true;
     if (typeof enabled !== "boolean")
         throw new Error("unblock-memory typesafe.enabled must be a boolean");
-    for (const key of ["apiKey", "apiKeyFile"]) {
+    const rawEndpoint = config.endpoint ?? DEFAULT_TYPESAFE_CONFIG.endpoint;
+    if (typeof rawEndpoint !== "string" || /\s/u.test(rawEndpoint) || rawEndpoint.includes("?") || rawEndpoint.includes("#")) {
+        throw new Error("unblock-memory typesafe.endpoint must be an HTTPS (or loopback HTTP) URL without whitespace, query or fragment");
+    }
+    let url;
+    try {
+        url = new URL(rawEndpoint);
+    }
+    catch {
+        throw new Error("unblock-memory typesafe.endpoint must be an HTTPS (or loopback HTTP) URL");
+    }
+    const allowedProtocol = url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHostname(url.hostname));
+    if (!allowedProtocol || !url.hostname || url.username || url.password || url.search || url.hash) {
+        throw new Error("unblock-memory typesafe.endpoint must be an HTTPS (or loopback HTTP) URL without credentials, query or fragment");
+    }
+    const endpoint = url.href.replace(/\/+$/u, "");
+    for (const key of ["model", "apiKey", "apiKeyFile"]) {
         if (config[key] !== undefined && (typeof config[key] !== "string" || !config[key].trim())) {
             throw new Error(`unblock-memory typesafe.${key} must be a non-empty string`);
         }
+    }
+    const model = typeof config.model === "string"
+        ? config.model.trim()
+        : defaultDecisionModel(endpoint);
+    if (endpoint === TYPESAFE_DEFAULT_ENDPOINT && model.startsWith(`${TYPESAFE_MODEL}-`)) {
+        throw new Error(`unblock-memory typesafe.model must use the alias "${TYPESAFE_MODEL}" for ${TYPESAFE_DEFAULT_ENDPOINT}`);
     }
     const apiKey = typeof config.apiKey === "string" ? config.apiKey.trim() : undefined;
     const apiKeyFile = typeof config.apiKeyFile === "string" ? config.apiKeyFile.trim() : undefined;
@@ -76,7 +101,7 @@ function resolveTypeSafe(value) {
         throw new Error("unblock-memory typesafe.apiKeyFile must be an absolute path");
     }
     return {
-        enabled, ...(apiKey ? { apiKey } : {}), ...(apiKeyFile ? { apiKeyFile } : {}),
+        enabled, endpoint, model, ...(apiKey ? { apiKey } : {}), ...(apiKeyFile ? { apiKeyFile } : {}),
         timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_TYPESAFE_CONFIG.timeoutMs, "typesafe.timeoutMs", 10_000),
     };
 }

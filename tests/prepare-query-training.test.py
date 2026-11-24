@@ -207,6 +207,45 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cohort is required"):
                 prepare.prepare([source], [], root / "missing", CharacterTokenizer())
 
+    def test_mismatched_recall_model_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = query_row()
+            row["recallModel"] = "liquid/d1.2-ultra-20261116"
+            cohort = cohort_row(row)
+            cohort["model"] = "jev-1.13.0"
+            source_file = write_rows(root / "queries.jsonl", [row])
+            cohort_file = write_rows(root / "cohort.jsonl", [cohort])
+            with self.assertRaisesRegex(ValueError, "recallModel mismatches"):
+                prepare.prepare([source_file], [cohort_file], root / "prepared", CharacterTokenizer())
+
+    def test_mismatched_recall_endpoint_scope_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = query_row()
+            row["recallModel"] = "liquid/d1.2-ultra-20261116"
+            row["recallRequestedModel"] = "liquid/d1.2-ultra@https://custom.example/v1/decisions"
+            cohort = cohort_row(row)
+            cohort["model"] = "liquid/d1.2-ultra-20261116"
+            cohort["requestedModel"] = "liquid/d1.2-ultra"
+            source_file = write_rows(root / "queries.jsonl", [row])
+            cohort_file = write_rows(root / "cohort.jsonl", [cohort])
+            with self.assertRaisesRegex(ValueError, "recallRequestedModel mismatches"):
+                prepare.prepare([source_file], [cohort_file], root / "prepared", CharacterTokenizer())
+            # A target missing recallRequestedModel is also rejected against a custom-endpoint scoped cohort.
+            unscoped = query_row()
+            unscoped["recallModel"] = "liquid/d1.2-ultra-20261116"
+            scoped_cohort = cohort_row(unscoped)
+            scoped_cohort["model"] = "liquid/d1.2-ultra-20261116"
+            scoped_cohort["requestedModel"] = "liquid/d1.2-ultra@https://custom.example/v1/decisions"
+            with self.assertRaisesRegex(ValueError, "recallRequestedModel mismatches"):
+                prepare.prepare(
+                    [write_rows(root / "unscoped.jsonl", [unscoped])],
+                    [write_rows(root / "scoped-cohort.jsonl", [scoped_cohort])],
+                    root / "prepared-scoped",
+                    CharacterTokenizer(),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

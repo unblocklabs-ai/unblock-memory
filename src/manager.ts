@@ -798,7 +798,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   }
 
   async auditQuality(params: {
-    corpora: readonly string[]; apiKey: string; timeoutMs: number; minNoise: number;
+    corpora: readonly string[]; apiKey: string; endpoint?: string; model?: string; timeoutMs: number; minNoise: number;
     limit?: number; after?: QualityCursor; signal: AbortSignal;
   }) {
     if (this.#qualityAuditRunning) return { status: "busy" as const };

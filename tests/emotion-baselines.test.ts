@@ -30,9 +30,9 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   let calls = 0;
   t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
     calls++;
-    const request: { state: { target: { text: string } } } = JSON.parse(String(init.body));
-    const text = request.state.target.text;
-    return Response.json({ model: text.startsWith("model:") ? "other-model" : "jev-test", answers: text === "failed" ? {} : Object.fromEntries(
+    const request: { model: string; state: [{ target: { text: string } }] } = JSON.parse(String(init.body));
+    const text = request.state[0].target.text;
+    return Response.json({ model: request.model === "liquid/d1.2-ultra" ? "liquid/d1.2-ultra-20261116" : request.model, answers: text === "failed" ? {} : Object.fromEntries(
       ["joy", "sadness", "fear", "anger", "disgust", "surprise"].map(e => [e, { type: "noul", noul: e === "joy" ? Number(text.replace("model:", "")) : 0.05 }])) });
   });
   const events: unknown[] = [{ type: "session", id: "s" }, { type: "message", id: "answer", timestamp: new Date(firstWeek).toISOString(),
@@ -45,7 +45,6 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
     add(`one-${i}`, "one", "0.8", firstWeek + 1000 + i);
     add(`two-${i}`, "two", "0.1", firstWeek + 1000 + i);
   }
-  add("other-model", "one", "model:0.9", firstWeek + 2000);
   add("routine", "one", "0.8", firstWeek + week + 1000);
   add("unusual", "two", "0.8", firstWeek + week + 1000);
   add("less", "one", "0.2", firstWeek + 2 * week + 1000);
@@ -54,6 +53,16 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   add("future", "one", "0.8", now + 86400_000);
   add("failure", "one", "failed", now);
   const saveTranscript = () => writeFile(join(sessionsDir, "s.jsonl"), events.map(e => JSON.stringify(e)).join("\n"));
+  await writeFile(join(sessionsDir, "other.jsonl"), [
+    { type: "session", id: "other" },
+    { type: "message", id: "other-a", timestamp: new Date(firstWeek).toISOString(), message: { role: "assistant", content: "Answer" } },
+    { type: "message", id: "other-model", timestamp: new Date(firstWeek + 2000).toISOString(),
+      message: { role: "user", content: "model:0.9", timestamp: firstWeek + 2000,
+        __openclaw: { senderIdentity: { senderKind: "human", id: "same", pluginId: "slack", accountId: "one" } } } },
+  ].map(e => JSON.stringify(e)).join("\n"));
+  await runInsideOut({ agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath: path,
+    config: resolveConfig({ typesafe: { apiKey: "offline", model: "other-model", timeoutMs: 1000 },
+      insideOut: { enabled: true, intervalMinutes: 0, maxInteractions: 100 } }) });
   await saveTranscript();
   const config = resolveConfig({ typesafe: { apiKey: "offline", timeoutMs: 1000 },
     insideOut: { enabled: true, intervalMinutes: 0, maxInteractions: 100 } });
@@ -87,7 +96,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   const snapshots = reportInsideOutBaselines(path);
   assert.equal(snapshots.length, 6);
   assert.ok(snapshots.some(s => s.model === "other-model" && s.cumulative.joy.count === 1));
-  const initial = snapshots.find(s => s.person_id === expressive && s.model === "jev-test" && s.week_end === firstWeek + week)!;
+  const initial = snapshots.find(s => s.person_id === expressive && s.model === "liquid/d1.2-ultra" && s.week_end === firstWeek + week)!;
   assert.equal(initial.weekly.joy.count, 20);
   assert.equal(initial.weekly.joy.p10, 0.8);
   assert.equal(initial.cumulative.joy.mean, 0.8);
@@ -105,7 +114,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   await runInsideOut(options);
   assert.equal(calls, beforeCalls + 1, "backfill grades only the newly discovered reply");
   assert.deepEqual(deviation("routine"), routine);
-  const replaced = reportInsideOutBaselines(path, { personId: expressive }).filter(s => s.model === "jev-test");
+  const replaced = reportInsideOutBaselines(path, { personId: expressive }).filter(s => s.model === "liquid/d1.2-ultra");
   assert.equal(replaced.length, 3, "the late reply's week joins; later weeks are replaced, never duplicated");
   assert.equal(replaced.some(s => s.id === initial.id), false);
   assert.equal(replaced.find(s => s.week_end === initial.week_end)?.cumulative.joy.count, 21);
@@ -152,7 +161,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   refreshInsideOutBaselines(path);
   assert.equal(deviation("future").status, "ok", "future_time described the clock; once due, a normal refresh compares it");
   const emptyWeek = reportInsideOutBaselines(path, { personId: expressive })
-    .find(s => s.model === "jev-test" && s.week_start === firstWeek + 3 * week)!;
+    .find(s => s.model === "liquid/d1.2-ultra" && s.week_start === firstWeek + 3 * week)!;
   assert.equal(emptyWeek.weekly.joy.count, 0);
   add("after-gap", "one", "0.8", firstWeek + 4 * week + 1000);
   await saveTranscript();
@@ -191,7 +200,7 @@ test("new grades use history linked since the preceding grading run", async t =>
   let calls = 0;
   t.mock.method(globalThis, "fetch", async () => {
     calls++;
-    return Response.json({ model: "jev-test", answers: Object.fromEntries(
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: Object.fromEntries(
       ["joy", "sadness", "fear", "anger", "disgust", "surprise"].map(e => [e, { type: "noul", noul: 0.8 }])) });
   });
   const reply = (id: string, time: number) => ({ type: "message", id, timestamp: new Date(time).toISOString(),
@@ -444,7 +453,7 @@ test("a failed baseline refresh never turns a saved grading run into a failure",
   const root = await mkdtemp(join(tmpdir(), "emotion-refresh-failure-")), sessionsDir = join(root, "sessions");
   await mkdir(sessionsDir);
   const storePath = join(root, "unblock-memory.sqlite");
-  t.mock.method(globalThis, "fetch", async () => Response.json({ model: "jev-test",
+  t.mock.method(globalThis, "fetch", async () => Response.json({ model: "liquid/d1.2-ultra-20261116",
     answers: Object.fromEntries(EMOTIONS.map(e => [e, { type: "noul", noul: 0.4 }])) }));
   await writeFile(join(sessionsDir, "s.jsonl"), [{ type: "message", id: "answer", message: { role: "assistant", content: "Answer" } },
     { type: "message", id: "reply", message: { role: "user", content: "Thanks!" } }].map(e => JSON.stringify(e)).join("\n"));

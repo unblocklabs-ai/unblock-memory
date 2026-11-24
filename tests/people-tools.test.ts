@@ -121,14 +121,14 @@ test("reviews every preference and stored role assertion, even when the identity
     reviewedAt: "2026-11-16T12:00:00Z",
   }] });
   const before = h.store.getDossier(h.person.id);
-  const requests: { state: { claim: string; person?: { kind?: string } } }[] = [];
+  const requests: { state: [{ claim: string; person?: { kind?: string } }] }[] = [];
   t.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const request = JSON.parse(String(init?.body)); requests.push(request);
-    return backgroundResponse(request.state.person?.kind === "interaction");
+    return backgroundResponse(request.state[0].person?.kind === "interaction");
   });
   assert.equal((await h.write({ dossier: proposed })).status, "needs_review");
   assert.equal(requests.length, 2);
-  assert.match(requests[1]!.state.claim, /Start with the recommendation.*Scope/);
+  assert.match(requests[1]!.state[0].claim, /Start with the recommendation.*Scope/);
   assert.deepEqual(h.store.getDossier(h.person.id), before);
 
   proposed.sections.pop();
@@ -136,7 +136,7 @@ test("reviews every preference and stored role assertion, even when the identity
   requests.length = 0;
   await h.write({ dossier: proposed });
   assert.equal(requests.length, 2, "claims outside the injected blurb must also be checked");
-  assert.equal(requests[1]!.state.claim, "Mira is also the CFO.");
+  assert.equal(requests[1]!.state[0].claim, "Mira is also the CFO.");
 });
 
 async function writeHarness(t: test.TestContext) {

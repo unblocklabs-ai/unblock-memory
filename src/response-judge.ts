@@ -1,17 +1,19 @@
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
+import { decisionModelScope, requestTypeSafe, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA as noul } from "./typesafe-client.js";
 import type { ResponseEpisode } from "./response-episodes.js";
 
-export const RESPONSE_RUBRIC_VERSION = `${TYPESAFE_MODEL}:response-v10`;
+export function responseRubricVersion(model = TYPESAFE_MODEL, endpoint?: string): string {
+  return `${decisionModelScope(model, endpoint)}:response-v10`;
+}
 export const RESPONSE_STAGE_VERSIONS = { quality: "quality-v9", feedback: "feedback-v9", sentiment: "sentiment-v10", retrospective: "retrospective-v9", memory: "memory-v2-isolated" } as const;
 const probability = Type.Number({ minimum: 0, maximum: 1 });
 const score = Type.Object({ type: Type.Literal("score"), score: Type.Number({ minimum: 0, maximum: 3 }),
-  confidence: probability, probabilities: Type.Object({ "0": probability, "1": probability, "2": probability, "3": probability }) });
+  confidence: probability, probabilities: Type.Object({ "0": probability, "1": probability, "2": probability, "3": probability }, { additionalProperties: false }) });
 function choiceSchema<T extends Record<string, unknown>>(criteria: T) {
   const labels = Object.keys(criteria) as (keyof T & string)[];
   return Type.Object({ type: Type.Literal("choice"), choice: Type.Enum(labels),
-    confidence: probability, probabilities: Type.Object(Object.fromEntries(labels.map(x => [x, probability]))) });
+    confidence: probability, probabilities: Type.Object(Object.fromEntries(labels.map(x => [x, probability])), { additionalProperties: false }) });
 }
 const taskTypes = { question: "Answering a question or explaining.", artifact: "Producing a document, report or other artifact.",
   action: "Implementing, fixing or executing an action.", discussion: "Brainstorming or collaborative planning.", other: "Other or unclear." };
@@ -76,7 +78,9 @@ function validateDistributions(answers: Record<string, { type: string; probabili
   for (const answer of Object.values(answers)) {
     if (!answer.probabilities) continue;
     const entries = Object.entries(answer.probabilities);
-    if (Math.abs(entries.reduce((sum, [, p]) => sum + p, 0) - 1) > 0.03 ||
+    // Allow 2-decimal rounding drift across all options (up to 0.005 per option) while still rejecting malformed sums.
+    const sumTolerance = Math.max(0.03, entries.length * 0.005 + 0.005);
+    if (Math.abs(entries.reduce((sum, [, p]) => sum + p, 0) - 1) > sumTolerance ||
         (answer.type === "score" && Math.abs(entries.reduce((sum, [k, p]) => sum + Number(k) * p, 0) - answer.score!) > 0.06)) {
       throw new Error("Invalid response-audit probability distribution");
     }
@@ -84,7 +88,7 @@ function validateDistributions(answers: Record<string, { type: string; probabili
 }
 
 /** Separate requests are deliberate: later feedback must not leak into the original quality grade. */
-export async function judgeResponse(episode: ResponseEpisode, params: { apiKey: string; timeoutMs: number; signal: AbortSignal }, sentimentEnabled = true, cache?: StageCache): Promise<ResponseJudgment> {
+export async function judgeResponse(episode: ResponseEpisode, params: { apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal: AbortSignal }, sentimentEnabled = true, cache?: StageCache): Promise<ResponseJudgment> {
   const state = { before: episode.before, request: episode.request, answer: episode.answer,
     contextLimited: episode.contextLimited, evidenceLimit: "Visible conversation only. Artifacts, tool results and external facts are not provided." };
   if (!cache?.quality) cache?.begin(["quality"]);
@@ -193,7 +197,7 @@ const outcomeReasons = {
 const retrospectiveSchema = Type.Object({ answers: Type.Object({ correction: noul, deliveryAdmission: noul,
   regression: noul, scopeClarification: noul, outcome: choiceSchema(outcomes), reason: choiceSchema(outcomeReasons) }) });
 /** Later evidence is kept in a third request and never changes the original grade. */
-export async function judgeResponseFollowup(episode: ResponseEpisode, params: { apiKey: string; timeoutMs: number; signal: AbortSignal }):
+export async function judgeResponseFollowup(episode: ResponseEpisode, params: { apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal: AbortSignal }):
   Promise<{ status: ResponseEpisode["followup"]["status"]; judgment: Static<typeof retrospectiveSchema>["answers"] | null }> {
   const later = ["complete", "partial"].includes(episode.followup.status) ? episode.followup.messages : [];
   const payload = await requestTypeSafe(params, { before: episode.before, originalRequest: episode.request, originalAnswer: episode.answer,
@@ -241,7 +245,7 @@ export async function judgeResponseFollowup(episode: ResponseEpisode, params: { 
 }
 
 export async function judgeMemoryOpportunity(episode: ResponseEpisode, candidates: readonly { path: string; text: string; hash: string }[],
-  params: { apiKey: string; timeoutMs: number; signal: AbortSignal }) {
+  params: { apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal: AbortSignal }) {
   const questions = { candidate_0: { type: "noul",
     instructions: { question: "Would the information in `candidates[0]` materially address the specific context gap expressed in `feedback` about `answer`?",
       limits: "Judge substantive relevance, not shared vocabulary. This is a CURRENT indexed excerpt; its presence does not prove historical availability, truth, or agent fault.", trust } } };

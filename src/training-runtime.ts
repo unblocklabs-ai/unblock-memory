@@ -8,6 +8,8 @@ import { TrainingStore } from "./training-store.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { collectTraining, runTraining } from "./training.js";
 import { generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, TRAINING_EVALUATION_CONCURRENCY } from "./training-queries.js";
+import { memoryJudgeVersion } from "./typesafe.js";
+import { decisionModelScope } from "./typesafe-client.js";
 import { dateOption } from "./date-option.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
@@ -32,7 +34,7 @@ export function registerMemoryTraining(api: OpenClawPluginApi, config: UnblockMe
     const withStore = async <T>(agent: string, options: { create?: boolean; readOnly?: boolean }, fn: (store: TrainingStore, source: ReturnType<typeof paths>) => T | Promise<T>) => {
       const source = paths(cfg, agent);
       if (!options.create && !existsSync(source.storePath)) throw new Error("No training database; run memory-training collect first");
-      const store = new TrainingStore(source.storePath, source.agentId);
+      const store = new TrainingStore(source.storePath, source.agentId, decisionModelScope(config.typesafe.model, config.typesafe.endpoint));
       try { return await (options.readOnly ? fn(store, source) : store.locked(() => fn(store, source))); } finally { store.close(); }
     };
     root.command("collect").option("--agent <id>", "Agent id", "main")
@@ -49,7 +51,7 @@ export function registerMemoryTraining(api: OpenClawPluginApi, config: UnblockMe
     root.command("run").description("Judge whether historical recall would help each collected input").option("--agent <id>", "Agent id", "main")
       .option("--max-examples <n>", "Optional maximum new API calls; no example-count limit by default")
       .option("--max-input-bytes <n>", "Maximum total serialized state + question bytes, not tokens", "3000000")
-      .option("--concurrency <n>", "Concurrent TypeSafe recall requests", "256")
+      .option("--concurrency <n>", "Concurrent decision-model recall requests", "32")
       .option("--dry-run", "Refresh local checkpoints and preview pending work without API calls")
       .action(async (opts: { agent: string; maxExamples?: string; maxInputBytes: string; concurrency: string; dryRun?: boolean }) => {
         const result = await withStore(opts.agent, {}, (store, source) => runTraining(source, store, config, {
@@ -106,7 +108,9 @@ export function registerMemoryTraining(api: OpenClawPluginApi, config: UnblockMe
           collectTraining(source, store, { existingOnly: true });
           const fd = openSync(output, "wx", 0o600);
           let rows = 0;
-          const data = opts.stage === "query-training" ? exportQueryTraining(store, threshold) : store.exportRows(threshold);
+          const data = opts.stage === "query-training"
+            ? exportQueryTraining(store, threshold, memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint))
+            : store.exportRows(threshold);
           try { for (const row of data) { writeSync(fd, JSON.stringify(row) + "\n"); rows++; } }
           finally { closeSync(fd); }
           return { output, rows, stage: opts.stage };

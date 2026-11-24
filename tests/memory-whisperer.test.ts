@@ -12,7 +12,7 @@ import { ApiQueryGenerator, QueryApiError, queryConversation } from "../src/quer
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 
 const config = { ...resolveConfig(undefined).memoryWhisperer, enabled: true, corpora: ["memory", "sessions"], cooldownTurns: 2 };
-const typesafe = { enabled: true, apiKey: "fake-secret", timeoutMs: 100 };
+const typesafe = resolveConfig({ typesafe: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).typesafe;
 const context = { trigger: "user", agentId: "bill", sessionId: "current", sessionKey: "key", runId: "run-1" };
 const logPrefix = "unblock-memory memory_whisperer ";
 const event = { prompt: "Deploy this", messages: [{ role: "user", content: "Use project alpha" }] };
@@ -36,14 +36,15 @@ test("API generation caps TypeSafe passage judgments to top 6 with compact conte
   const judgedExcerpts: string[] = [];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
+    const [state] = request.state;
     assert.equal(request.questions.recall_needed, undefined, "live whisperer runs without recall gate");
-    assert.equal(request.state.conversation.currentRequest, dmRequest);
-    assert.equal(request.state.conversation.history.length, 2, "judge receives compact 2-message history");
-    assert.deepEqual(request.state.conversation.history.map((m: { content: string }) => m.content), ["m3", "m4"]);
+    assert.equal(state.conversation.currentRequest, dmRequest);
+    assert.equal(state.conversation.history.length, 2, "judge receives compact 2-message history");
+    assert.deepEqual(state.conversation.history.map((m: { content: string }) => m.content), ["m3", "m4"]);
     assert.doesNotMatch(JSON.stringify(request.state), /generated [ABC]|vectorScore|"score"/);
-    assert.equal(request.state.candidates.length, 1);
+    assert.equal(state.candidates.length, 1);
     assert.equal(Object.keys(request.questions).length, 1);
-    judgedExcerpts.push(request.state.candidates[0].excerpt);
+    judgedExcerpts.push(state.candidates[0].excerpt);
     if (judgedExcerpts.length === 6) judged.resolve();
     await release.promise;
     return response(0.95);
@@ -85,7 +86,7 @@ test("cold-start and date-referencing prompts emit matching memories without a r
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     assert.deepEqual(Object.keys(request.questions), ["memory_0"]);
-    return response(request.state.candidates[0].excerpt.includes("Casey") ? 0.67 : 0.53);
+    return response(request.state[0].candidates[0].excerpt.includes("Casey") ? 0.67 : 0.53);
   });
   const h = harness([
     hit("Monday Loggie meeting: Casey deck + Bek/Rico Slack MCP pilot plan"),
@@ -111,7 +112,7 @@ test("one failed candidate preserves other judgments, score alignment, and safe 
       t.mock.method(ApiQueryGenerator.prototype, "generate", async () => ({ lex: "private generated query", vec: "private generated query" }));
       const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
         const request = JSON.parse(String(init?.body));
-        const excerpt = request.state.candidates[0].excerpt;
+        const excerpt = request.state[0].candidates[0].excerpt;
         if (excerpt === "private evidence 2") {
           if (failure === "http_error") return new Response("fake-secret provider body", { status: 529 });
           if (failure === "invalid_response") return Response.json({ answers: { wrong: "fake-secret" } });
@@ -184,7 +185,7 @@ test("partial judgments cannot bypass total deadline or session cancellation", a
       t.mock.method(ApiQueryGenerator.prototype, "generate", async () => ({ lex: "query", vec: "query" }));
       t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
         const request = JSON.parse(String(init?.body));
-        if (request.state.candidates[0].excerpt === "evidence 0") {
+        if (request.state[0].candidates[0].excerpt === "evidence 0") {
           firstBatch.resolve();
           return response(0.99);
         }
@@ -402,12 +403,13 @@ test("complementary hints skip a confident paraphrase but retain contradictory e
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     calls++;
     const request = JSON.parse(String(init?.body));
-    if (request.questions.memory_0) return response(request.state.candidates[0].excerpt === "Staging was approved" ? 0.99 :
-      request.state.candidates[0].excerpt === "Approval granted for staging" ? 0.98 : 0.97);
-    assert.equal(request.state.excerpts.length, 2);
+    const [state] = request.state;
+    if (request.questions.memory_0) return response(state.candidates[0].excerpt === "Staging was approved" ? 0.99 :
+      state.candidates[0].excerpt === "Approval granted for staging" ? 0.98 : 0.97);
+    assert.equal(state.excerpts.length, 2);
     assert.match(JSON.stringify(request.questions), /contradiction/);
     return Response.json({ answers: {
-      pair_0: { type: "noul", noul: request.state.excerpts[1] === "Approval granted for staging" ? 0.99 : 0.01 },
+      pair_0: { type: "noul", noul: state.excerpts[1] === "Approval granted for staging" ? 0.99 : 0.01 },
     } });
   });
   const h = harness([hit("Staging was approved"), hit("Approval granted for staging"), hit("Approval was revoked")],
@@ -425,14 +427,15 @@ test("complementary hints skip a confident paraphrase but retain contradictory e
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     calls++;
     const request = JSON.parse(String(init?.body));
+    const [state] = request.state;
     if (request.questions.memory_0) {
       const scores: Record<string, number> = {
         "Fact A": 0.99, "Fact A paraphrase": 0.98, "Fact B": 0.97, "Fact C": 0.96,
       };
-      return response(scores[request.state.candidates[0].excerpt] ?? 0.1);
+      return response(scores[state.candidates[0].excerpt] ?? 0.1);
     }
     return Response.json({ answers: {
-      pair_0: { type: "noul", noul: request.state.excerpts[1] === "Fact A paraphrase" ? 0.99 : 0.01 },
+      pair_0: { type: "noul", noul: state.excerpts[1] === "Fact A paraphrase" ? 0.99 : 0.01 },
     } });
   });
   const three = harness([hit("Fact A"), hit("Fact A paraphrase"), hit("Fact B"), hit("Fact C")],
@@ -449,7 +452,7 @@ test("redundancy uncertainty or failure preserves baseline hints and stays insid
   let mode = "uncertain";
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
     const request = JSON.parse(String(init?.body));
-    if (request.questions.memory_0) return response(request.state.candidates[0].excerpt === "first fact" ? 0.99 : 0.98);
+    if (request.questions.memory_0) return response(request.state[0].candidates[0].excerpt === "first fact" ? 0.99 : 0.98);
     if (mode === "failure") throw new Error("secret response");
     if (mode === "wait") return new Promise<Response>(() => {});
     return Response.json({ answers: { pair_0: { type: "noul", noul: 0.5 } } });
@@ -480,7 +483,7 @@ test("content-free memory diagnostics distinguish no candidates, rejected, missi
   const rejected = harness();
   await rejected.before(event, context);
   assert.equal(rejected.diagnostics.snapshot("bill").memory.rejected, 1);
-  const missing = harness([], { typesafe: { enabled: true, apiKeyFile: "/nonexistent/unblock-test.env", timeoutMs: 10 } });
+  const missing = harness([], { typesafe: resolveConfig({ typesafe: { enabled: true, apiKeyFile: "/nonexistent/unblock-test.env", timeoutMs: 10 } }).typesafe });
   await missing.before(event, context);
   assert.equal(missing.diagnostics.snapshot("bill").memory.missing_key, 1);
   fetch.mock.mockImplementation(async () => { throw new Error("secret-text"); });
@@ -496,7 +499,7 @@ function hit(excerpt: string, overrides: Partial<CorpusMemorySearchResult> = {})
 }
 
 function response(...probabilities: number[]) {
-  return Response.json({ model: "jev-1.13.0", answers: Object.fromEntries(probabilities.map((noul, i) => [`memory_${i}`, { type: "noul", noul }])) });
+  return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: Object.fromEntries(probabilities.map((noul, i) => [`memory_${i}`, { type: "noul", noul }])) });
 }
 
 function deferred<T>() {
@@ -588,12 +591,13 @@ test("memory whisperer requires explicit, known non-skill corpora and bounded co
 test("isolated judges rank useful hits, enforce threshold, deduplicate and inject original sources", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.state.conversation.history.length, 2);
-    assert.equal(request.state.candidates.length, 1);
-    assert.equal(request.state.candidates[0].sourcePath.startsWith("qmd://"), true);
+    const [state] = request.state;
+    assert.equal(state.conversation.history.length, 2);
+    assert.equal(state.candidates.length, 1);
+    assert.equal(state.candidates[0].sourcePath.startsWith("qmd://"), true);
     assert.equal(Object.keys(request.questions).length, 1);
     assert.match(JSON.stringify(request.questions.memory_0.instructions), /candidates\[0\]/);
-    return response(request.state.candidates[0].excerpt === "first" ? 0.5 : request.state.candidates[0].excerpt === "second" ? 0.99 : 0.49);
+    return response(state.candidates[0].excerpt === "first" ? 0.5 : state.candidates[0].excerpt === "second" ? 0.99 : 0.49);
   });
   const h = harness([hit("first"), hit("first"), hit("overlap", { path: "qmd://memory/first.md", startLine: 2 }), hit("second"), hit("third")]);
   const result = await h.before({ prompt: "now", messages: [
@@ -625,8 +629,8 @@ test("recalls other sessions with a session ID or only a key, while excluding un
   const messageTimestamp = "2026-09-17 10:01:00 EDT";
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.state.candidates.length, 1);
-    const candidate = request.state.candidates[0];
+    assert.equal(request.state[0].candidates.length, 1);
+    const candidate = request.state[0].candidates[0];
     assert.deepEqual(candidate, candidate.excerpt === "safe" ? { excerpt: "safe", corpus: "memory", sourcePath: "qmd://memory/safe.md", dates: [] } :
       { excerpt: "other session", corpus: "sessions", sourcePath: "qmd://memory/other session.md", dates: [messageTimestamp] });
     return response(candidate.excerpt === "safe" ? 0.1 : 0.99);
@@ -652,7 +656,7 @@ test("disabled features and missing credentials cause no retrieval or provider c
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected"); });
   assert.equal(harness([], { config: { enabled: false } }).hooks.size, 0);
   assert.equal(harness([], { typesafe: { ...typesafe, enabled: false } }).hooks.size, 0);
-  const h = harness(undefined, { typesafe: { enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-memory-whisperer/key" } });
+  const h = harness(undefined, { typesafe: resolveConfig({ typesafe: { enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-memory-whisperer/key" } }).typesafe });
   assert.equal(await h.before(event, context), undefined);
   assert.equal(h.lookups(), 0);
   assert.equal(fetch.mock.callCount(), 0);
@@ -732,8 +736,8 @@ test("pending judgments cannot survive session teardown, shutdown, or supersedin
 test("candidate count and payload are bounded; oversized results are skipped, not sliced", async t => {
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.state.candidates.length, 1);
-    assert.ok(request.state.candidates.every((candidate: { excerpt: string }) => candidate.excerpt.length <= 1200));
+    assert.equal(request.state[0].candidates.length, 1);
+    assert.ok(request.state[0].candidates.every((candidate: { excerpt: string }) => candidate.excerpt.length <= 1200));
     return response(0.99);
   });
   const h = harness([hit("oversized ".repeat(180)), ...Array.from({ length: 12 }, (_, i) =>
@@ -751,7 +755,7 @@ test("payload limit packs complete hints up to 5000 chars and only cools down em
   const bodyB = `B ${"<".repeat(340)}`;
   const bodyC = `C ${"<".repeat(340)}`;
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    const excerpt: string = JSON.parse(String(init?.body)).state.candidates[0].excerpt;
+    const excerpt: string = JSON.parse(String(init?.body)).state[0].candidates[0].excerpt;
     return response(excerpt.startsWith("A") ? 0.99 : excerpt.startsWith("B") ? 0.95 : 0.90);
   });
   let currentHits = [
@@ -778,7 +782,7 @@ test("payload limit packs complete hints up to 5000 chars and only cools down em
   const bodyHuge2 = `Huge ${"<".repeat(900)}`;
   const bodySmall3 = "Small third fact";
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    const excerpt: string = JSON.parse(String(init?.body)).state.candidates[0].excerpt;
+    const excerpt: string = JSON.parse(String(init?.body)).state[0].candidates[0].excerpt;
     return response(excerpt === bodySmall1 ? 0.99 : excerpt === bodyHuge2 ? 0.95 : 0.90);
   });
   const skipMiddle = harness([
@@ -810,10 +814,11 @@ test("late matched evidence reaches both the judge and hint intact", async t => 
   const selected = await expandSessionSearchHit(vectorHit, 2000, async () => 400, 1200);
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.state.candidates[0].excerpt, selected.text);
-    assert.ok(request.state.candidates[0].excerpt.includes(fact));
-    assert.equal(request.state.candidates[0].messageTimestamp, undefined);
-    assert.equal(request.state.candidates[0].startedAt, undefined);
+    const [state] = request.state;
+    assert.equal(state.candidates[0].excerpt, selected.text);
+    assert.ok(state.candidates[0].excerpt.includes(fact));
+    assert.equal(state.candidates[0].messageTimestamp, undefined);
+    assert.equal(state.candidates[0].startedAt, undefined);
     return response(0.99);
   });
   const h = harness([hit(selected.text, { path: "qmd://sessions/current.md", corpus: "sessions",
