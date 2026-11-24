@@ -890,3 +890,263 @@ test("concurrent closeMemorySearchManager and getMemorySearchManager serialize c
   assert.deepEqual(events, ["start:1", "close:start:1", "close:end:1", "start:2"]);
   assert.equal((await runtime.getMemorySearchManager(active)).manager, second.manager);
 });
+
+test("transient lease-release failure surfaces error and recovers on next sync without restart", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-release-fail-"));
+  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
+  const lockPath = join(stateDir, "session-sync.lock.sqlite");
+  const errors: unknown[] = [];
+  const runtime = new QmdMemoryRuntime(sessionCorpora, {
+    stateRoot,
+    onError: (error) => errors.push(error),
+  });
+  t.after(() => runtime.close());
+
+  let syncRuns = 0;
+  Object.defineProperty(runtime, "getMemorySearchManager", {
+    value: async () => ({
+      manager: {
+        async syncSessions() {
+          syncRuns += 1;
+          return {
+            scanned: 1,
+            unchanged: 0,
+            updated: 1,
+            removed: 0,
+            skipped: 0,
+            failed: 0,
+            embedded: 0,
+            lastSuccessfulSyncAt: Date.now(),
+          };
+        },
+      },
+    }),
+  });
+
+  // Fail the DELETE inside releaseSessionSyncLock once to leave a relinquished same-PID row behind.
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  let failedDelete = false;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (!failedDelete && sql.includes("DELETE FROM session_sync_lease")) {
+      failedDelete = true;
+      throw new Error("transient lease release disk error");
+    }
+    return originalPrepare.call(this, sql);
+  });
+
+  const first = await runtime.startSessionSync(active, true);
+  assert.equal(first.status, "started");
+  await waitFor(() => errors.length === 1, "release failure callback");
+  assert.match(String(errors[0]), /transient lease release disk error/);
+  assert.equal(syncRuns, 1);
+
+  // Lease row with our live process.pid is still in SQLite, but it was relinquished in-process.
+  const stranded = readSessionSyncLeaseRows(lockPath);
+  assert.equal(stranded.length, 1);
+  assert.equal(stranded[0]!.pid, process.pid);
+
+  // Next startSessionSync reclaims the relinquished same-PID lease atomically without restart.
+  const second = await runtime.startSessionSync(active, true);
+  assert.equal(second.status, "started");
+  await waitFor(() => syncRuns === 2 && readSessionSyncLeaseRows(lockPath).length === 0, "second sync after recovery");
+  assert.equal((await runtime.sessionSyncStatus(active.agentId)).status, "completed");
+
+  // Directly seeded orphaned same-PID row (not in held token set) is also reclaimed cleanly.
+  seedSessionSyncLease(lockPath, {
+    pid: process.pid,
+    token: "orphaned-same-pid-token",
+    startedAt: "2026-11-24T12:00:00.000Z",
+  });
+  const third = await runtime.startSessionSync(active, true);
+  assert.equal(third.status, "started");
+  await waitFor(() => syncRuns === 3 && readSessionSyncLeaseRows(lockPath).length === 0, "third sync after orphaned same-pid row");
+});
+
+test("respects live legacy session-sync.lock without unlinking it and ignores dead-PID legacy locks", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-legacy-lock-"));
+  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
+  const legacyLockPath = join(stateDir, "session-sync.lock");
+  const statusPath = join(stateDir, "session-sync-status.json");
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 10_000)"], { stdio: "ignore" });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  assert.ok(child.pid);
+
+  const startedAt = "2026-11-24T12:30:00.000Z";
+  const legacyPayload = JSON.stringify({ pid: child.pid, token: "legacy-token", startedAt });
+  await writeFile(legacyLockPath, legacyPayload, { mode: 0o600 });
+  await writeFile(statusPath, JSON.stringify({
+    status: "running",
+    phase: "projecting",
+    pid: child.pid,
+    startedAt,
+  }), { mode: 0o600 });
+
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  t.after(() => runtime.close());
+  Object.defineProperty(runtime, "getMemorySearchManager", {
+    value: async () => ({
+      manager: {
+        async syncSessions() {
+          return {
+            scanned: 1,
+            unchanged: 1,
+            updated: 0,
+            removed: 0,
+            skipped: 0,
+            failed: 0,
+            embedded: 0,
+            lastSuccessfulSyncAt: Date.now(),
+          };
+        },
+      },
+    }),
+  });
+
+  // Live legacy lock blocks concurrent SQLite lease acquisition and is never unlinked.
+  assert.deepEqual(await runtime.startSessionSync(active, true), {
+    status: "already_running",
+    startedAt,
+  });
+  assert.deepEqual(await runtime.sessionSyncStatus(active.agentId), {
+    status: "running",
+    phase: "projecting",
+    startedAt,
+  });
+  assert.equal(await readFile(legacyLockPath, "utf8"), legacyPayload);
+
+  // Once the legacy process exits, the dead-PID legacy lock no longer blocks acquisition or recovery.
+  child.kill("SIGKILL");
+  await once(child, "exit");
+
+  const recovered = await runtime.sessionSyncStatus(active.agentId);
+  assert.equal(recovered.status, "failed");
+  const started = await runtime.startSessionSync(active, true);
+  assert.equal(started.status, "started");
+  await waitFor(
+    async () => (await runtime.sessionSyncStatus(active.agentId)).status === "completed",
+    "sync after dead legacy lock",
+  );
+});
+
+test("prepareReload fences admissions, drains managers/syncs with error reporting, and resumes only if retained", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-prepare-reload-"));
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  t.after(() => runtime.close());
+
+  let starts = 0;
+  let closes = 0;
+  let failNextClose = false;
+  t.mock.method(QmdMemoryManager.prototype, "start", async () => {
+    starts += 1;
+  });
+  t.mock.method(QmdMemoryManager.prototype, "close", async () => {
+    closes += 1;
+    if (failNextClose) {
+      failNextClose = false;
+      throw new Error("manager close boom");
+    }
+  });
+
+  const initial = await runtime.getMemorySearchManager(active);
+  assert.ok(initial.manager);
+  assert.equal(starts, 1);
+
+  // Non-retiring reload (unrelated embedding providers) does not disturb QMD managers.
+  const unrelated = runtime.prepareReload({ retireRuntime: false, retiringEmbeddingProviders: [] });
+  assert.equal((await runtime.getMemorySearchManager(active)).manager, initial.manager);
+  assert.deepEqual(await unrelated.drain(), { errors: [] });
+  unrelated.resume();
+  assert.equal(closes, 0);
+
+  // Retiring reload synchronously fences manager and session sync admissions.
+  failNextClose = true;
+  const reload = runtime.prepareReload({ retireRuntime: true, retiringEmbeddingProviders: [] });
+  assert.deepEqual(await runtime.getMemorySearchManager(active), {
+    manager: null,
+    error: "memory runtime is reloading",
+  });
+  assert.deepEqual(await runtime.startSessionSync(active, true), {
+    status: "unavailable",
+    error: "memory runtime is reloading",
+  });
+  assert.equal(starts, 1);
+
+  const drained = await reload.drain();
+  assert.equal(closes, 1);
+  assert.ok(drained && drained.errors.length === 1);
+  assert.match(String(drained.errors[0]), /manager close boom/);
+
+  // Resuming a retained runtime reopens admission cleanly and creates a fresh manager.
+  reload.resume();
+  reload.resume(); // Idempotent.
+  const resumed = await runtime.getMemorySearchManager(active);
+  assert.ok(resumed.manager);
+  assert.notEqual(resumed.manager, initial.manager);
+  assert.equal(starts, 2);
+
+  // Permanent close() prevents a later resume() from reopening admission.
+  const secondReload = runtime.prepareReload({ retireRuntime: true, retiringEmbeddingProviders: [] });
+  await runtime.close();
+  secondReload.resume();
+  assert.deepEqual(await runtime.getMemorySearchManager(active), {
+    manager: null,
+    error: "memory runtime is closing",
+  });
+  assert.deepEqual(await runtime.startSessionSync(active), {
+    status: "unavailable",
+    error: "memory runtime is closing",
+  });
+});
+
+test("closeAllMemorySearchManagers fences concurrent getMemorySearchManager attempts while draining", async (t) => {
+  const events: string[] = [];
+  let releaseClose!: () => void;
+  const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+  let closeStarted!: () => void;
+  const closeEntered = new Promise<void>((resolve) => { closeStarted = resolve; });
+  let starts = 0;
+
+  t.mock.method(QmdMemoryManager.prototype, "start", async () => {
+    events.push(`start:${++starts}`);
+  });
+  t.mock.method(QmdMemoryManager.prototype, "close", async () => {
+    events.push("close:start");
+    closeStarted();
+    await closeGate;
+    events.push("close:end");
+  });
+
+  const runtime = new QmdMemoryRuntime([]);
+  t.after(() => runtime.close());
+
+  const first = await runtime.getMemorySearchManager(active);
+  assert.ok(first.manager);
+
+  const closeAllPromise = runtime.closeAllMemorySearchManagers();
+  await closeEntered;
+
+  // Concurrent manager acquisitions (same agent and different agent) are fenced out while draining.
+  assert.deepEqual(await runtime.getMemorySearchManager(active), {
+    manager: null,
+    error: "memory runtime is closing",
+  });
+  assert.deepEqual(await runtime.getMemorySearchManager({ cfg: {} as OpenClawConfig, agentId: "other" }), {
+    manager: null,
+    error: "memory runtime is closing",
+  });
+  assert.equal(starts, 1, "no new manager may be opened during closeAllMemorySearchManagers");
+
+  releaseClose();
+  await closeAllPromise;
+  assert.deepEqual(events, ["start:1", "close:start", "close:end"]);
+
+  // Because close() was not called, admission reopens after closeAllMemorySearchManagers finishes.
+  const reopened = await runtime.getMemorySearchManager(active);
+  assert.ok(reopened.manager);
+  assert.notEqual(reopened.manager, first.manager);
+  assert.equal(starts, 2);
+});

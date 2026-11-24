@@ -6,6 +6,7 @@ import { nonBlank } from "./guards.js";
 import { renderPeopleDossier } from "./people-background.js";
 
 const MAX_CORRELATION_ENTRIES = 1000;
+const MAX_PENDING_PER_IDENTITY = 16;
 const CORRELATION_TTL_MS = 10 * 60_000;
 
 type TimedCorrelation<T> = { threadKey: T; messageId?: string; observedAt: number };
@@ -20,7 +21,7 @@ function promptIdentityKey(sessionKey: string, accountScope: string, externalId:
 }
 
 function matchesPendingMessage(
-  pending: TimedCorrelation<string | null>,
+  pending: TimedCorrelation<string>,
   threadKey: string,
   messageId: string | undefined,
 ): boolean {
@@ -37,8 +38,8 @@ function resolveSlackThreadKey(
   conversationId: string,
   sessionKey: string,
 ): string | undefined {
-  const threadRootId = identifier(event.threadId) ?? nonBlank(event.replyToId);
-  const rootMessageId = threadRootId ?? nonBlank(event.messageId);
+  const threadRootId = identifier(event.threadId) ?? identifier(event.replyToId);
+  const rootMessageId = threadRootId ?? identifier(event.messageId);
   if (conversationId.startsWith("D") && threadRootId === undefined) {
     return `slack:${accountScope}:${conversationId}:session:${sessionKey}`;
   }
@@ -79,6 +80,74 @@ function setBoundedCorrelation<T>(
   }
 }
 
+function enqueuePendingCorrelation(
+  map: Map<string, TimedCorrelation<string>[]>,
+  key: string,
+  threadKey: string,
+  now: number,
+  messageId?: string,
+): void {
+  const existing = map.get(key) ?? [];
+  map.delete(key);
+  for (const [existingKey, entries] of map) {
+    const latest = entries[entries.length - 1];
+    if (latest && now - latest.observedAt <= CORRELATION_TTL_MS) break;
+    map.delete(existingKey);
+  }
+  const fresh = existing.filter((entry) => now - entry.observedAt <= CORRELATION_TTL_MS);
+  fresh.push({ threadKey, messageId, observedAt: now });
+  if (fresh.length > MAX_PENDING_PER_IDENTITY) {
+    fresh.splice(0, fresh.length - MAX_PENDING_PER_IDENTITY);
+  }
+  map.set(key, fresh);
+  while (map.size > MAX_CORRELATION_ENTRIES) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+function removeMatchingPendingCorrelation(
+  map: Map<string, TimedCorrelation<string>[]>,
+  key: string,
+  threadKey: string,
+  messageId: string | undefined,
+  now: number,
+): void {
+  const existing = map.get(key);
+  if (!existing) return;
+  const fresh = existing.filter((entry) => now - entry.observedAt <= CORRELATION_TTL_MS);
+  if (messageId !== undefined) {
+    const matchIndex = fresh.findIndex((entry) => matchesPendingMessage(entry, threadKey, messageId));
+    if (matchIndex !== -1) fresh.splice(matchIndex, 1);
+  }
+  if (fresh.length === 0) map.delete(key);
+  else map.set(key, fresh);
+}
+
+function consumeUnambiguousPendingCorrelation(
+  map: Map<string, TimedCorrelation<string>[]>,
+  key: string,
+  now: number,
+): TimedCorrelation<string> | undefined {
+  const existing = map.get(key);
+  if (!existing) return undefined;
+  const fresh = existing.filter((entry) => now - entry.observedAt <= CORRELATION_TTL_MS);
+  if (fresh.length === 0) {
+    map.delete(key);
+    return undefined;
+  }
+  const firstThreadKey = fresh[0]!.threadKey;
+  if (fresh.some((entry) => entry.threadKey !== firstThreadKey)) {
+    map.delete(key);
+    return undefined;
+  }
+  const consumed = fresh.shift()!;
+  if (fresh.length === 0) map.delete(key);
+  else map.set(key, fresh);
+  return consumed;
+}
+
 function observedAt(timestamp: number | undefined): string | undefined {
   if (timestamp === undefined || !Number.isFinite(timestamp)) return undefined;
   const date = new Date(timestamp);
@@ -102,7 +171,7 @@ export function registerPeopleHooks(
   config: UnblockMemoryConfig["people"],
 ): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
   const threadByRun = new Map<string, TimedCorrelation<string>>();
-  const pendingThreadByIdentity = new Map<string, TimedCorrelation<string | null>>();
+  const pendingThreadByIdentity = new Map<string, TimedCorrelation<string>[]>();
 
   api.on("message_received", (event, context) => {
     if (context.channelId !== "slack") return;
@@ -118,35 +187,19 @@ export function registerPeopleHooks(
       const threadKey = resolveSlackThreadKey(event, accountScope, conversationId, sessionKey);
       if (threadKey) {
         const now = Date.now();
-        const messageId = nonBlank(event.messageId) ?? identifier(event.metadata?.messageId);
+        const messageId = identifier(event.messageId) ?? identifier(event.metadata?.messageId);
         const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
         if (runId) {
           setBoundedCorrelation(threadByRun, runId, threadKey, now, messageId);
-          const pending = pendingThreadByIdentity.get(identityKey);
-          if (
-            pending &&
-            (now - pending.observedAt > CORRELATION_TTL_MS ||
-              matchesPendingMessage(pending, threadKey, messageId))
-          ) {
-            pendingThreadByIdentity.delete(identityKey);
-          }
-        } else {
-          const pending = getFreshCorrelation(pendingThreadByIdentity, identityKey, now);
-          const nextThreadKey =
-            pending === undefined || pending.threadKey === threadKey ? threadKey : null;
-          const nextMessageId =
-            nextThreadKey === null
-              ? undefined
-              : pending === undefined || pending.messageId === messageId
-                ? messageId
-                : undefined;
-          setBoundedCorrelation(
+          removeMatchingPendingCorrelation(
             pendingThreadByIdentity,
             identityKey,
-            nextThreadKey,
+            threadKey,
+            messageId,
             now,
-            nextMessageId,
           );
+        } else {
+          enqueuePendingCorrelation(pendingThreadByIdentity, identityKey, threadKey, now, messageId);
         }
       }
     }
@@ -193,22 +246,20 @@ export function registerPeopleHooks(
     const now = Date.now();
     const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
     const mapped = getFreshCorrelation(threadByRun, runId, now);
-    let threadKey: string | null | undefined;
+    let threadKey: string | undefined;
     if (mapped) {
       threadKey = mapped.threadKey;
-      const pending = pendingThreadByIdentity.get(identityKey);
-      if (
-        pending &&
-        (now - pending.observedAt > CORRELATION_TTL_MS ||
-          matchesPendingMessage(pending, mapped.threadKey, mapped.messageId))
-      ) {
-        pendingThreadByIdentity.delete(identityKey);
-      }
+      removeMatchingPendingCorrelation(
+        pendingThreadByIdentity,
+        identityKey,
+        mapped.threadKey,
+        mapped.messageId,
+        now,
+      );
     } else {
-      const pending = getFreshCorrelation(pendingThreadByIdentity, identityKey, now);
-      pendingThreadByIdentity.delete(identityKey);
+      const pending = consumeUnambiguousPendingCorrelation(pendingThreadByIdentity, identityKey, now);
       threadKey = pending?.threadKey;
-      if (typeof threadKey === "string") {
+      if (threadKey) {
         setBoundedCorrelation(threadByRun, runId, threadKey, now, pending?.messageId);
       }
     }

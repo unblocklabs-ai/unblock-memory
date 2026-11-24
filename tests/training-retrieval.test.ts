@@ -72,7 +72,7 @@ test("runtime and historical retrieval send byte-identical expanded-turn evidenc
   const model = store.internal.llm!.embedModelName;
   store.internal.insertEmbedding(hash, 0, span.start, new Float32Array([1, 0]), model, "now", 1, undefined, span.end - span.start);
   t.mock.method(store.internal.llm!, "embed", async () => ({ embedding: [1, 0], model }));
-  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { s: { sessionId: "s", provider: "slack", chatType: "direct",
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "sig-v1", sessions: { s: { sessionId: "s", provider: "slack", chatType: "direct",
     startedAt: 0, projectionHash: hash, documentPath: "s.md", messages: projection.messages } } }));
   const manager = new QmdMemoryManager({ dbPath, workspaceDir: root, sources: [source], storeFactory: async () => store,
     sessions: { agentId: "bill", agentName: "Bill", chatTypes: ["direct"], collection: source.collection, outputDir: source.root,
@@ -154,7 +154,7 @@ test("real QMD snapshot removes future FTS text and crossing vectors before eith
     projection.messages[0]!.end - projection.messages[0]!.start);
   original.internal.insertEmbedding(hash, 1, projection.messages[0]!.start, new Float32Array([0, 1]), embedModel, "now", 2, undefined,
     projection.messages[1]!.end - projection.messages[0]!.start);
-  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: { s: {
+  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, lastSuccessfulSyncAt: Date.parse("2026-09-22"), indexSignature: "sig-v1", sessions: { s: {
     sessionId: "s", provider: "slack", chatType: "direct", startedAt: Date.parse("2026-09-21"), projectionHash: hash,
     documentPath: "session.md", messages: projection.messages,
   } } }));
@@ -212,7 +212,7 @@ test("snapshot copying yields between documents and vectors without changing his
   original.internal.ensureVecTable(2);
   for (const [i, span] of projection.messages.entries()) original.internal.insertEmbedding(hash, i, span.start,
     new Float32Array([1, i]), original.internal.llm!.embedModelName, "now", 3, undefined, span.end - span.start);
-  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: Object.fromEntries(
+  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "sig-v1", sessions: Object.fromEntries(
     ["a", "b"].map(id => [id, { sessionId: id, provider: "slack", chatType: "direct", startedAt: 0,
       projectionHash: hash, documentPath: `${id}.md`, messages: projection.messages }]),
   ) }));
@@ -270,7 +270,7 @@ test("run-scoped source evidence survives live writes with isolated cutoff index
   const updateVector = (values: number[]) => original.internal.insertEmbedding(hash, 0, span.start, new Float32Array(values),
     original.internal.llm!.embedModelName, "now", 1, undefined, span.end - span.start);
   updateVector([1, 0]);
-  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: { s: {
+  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "sig-v1", sessions: { s: {
     sessionId: "s", provider: "slack", chatType: "direct", startedAt: 0, projectionHash: hash, documentPath: "s.md", messages: projection.messages,
   } } }));
   let captured: QMDStore | undefined;
@@ -362,14 +362,14 @@ test("missing or unbacked session manifest throws HistoricalCorpusUnavailableErr
   );
 
   // 3. Empty manifest while QMD has active session documents is unbacked -> HistoricalCorpusUnavailableError.
-  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: {} }));
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "sig-v1", sessions: {} }));
   await assert.rejects(
     historicalTrainingSource(root, ["direct"]),
-    error => error instanceof HistoricalCorpusUnavailableError,
+    error => error instanceof HistoricalCorpusUnavailableError && /unbacked/i.test(error.message),
   );
 
   // 4. Pre-cutoff manifest session with mismatched QMD projectionHash cannot prove empty cutoff.
-  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { s: {
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "sig-v1", sessions: { s: {
     sessionId: "s", provider: "slack", chatType: "direct", startedAt: 10_000,
     projectionHash: "0".repeat(64), documentPath: "s.md", messages: projection.messages,
   } } }));
@@ -382,7 +382,7 @@ test("missing or unbacked session manifest throws HistoricalCorpusUnavailableErr
   } finally { await mismatched.close(); }
 
   // 5. Backed pre-cutoff session lacking boundary spans cannot prove empty cutoff.
-  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { s: {
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "sig-v1", sessions: { s: {
     sessionId: "s", provider: "slack", chatType: "direct", startedAt: 10_000,
     projectionHash: hash, documentPath: "s.md",
   } } }));
@@ -411,7 +411,7 @@ test("validly proven empty cutoff returns [] cleanly for both lanes without mate
 
   const manifestPath = join(root, "sessions-manifest.json");
   // 1. Valid manifest proves session started after cutoff -> empty cutoff returns [] for lex and vec.
-  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { later: {
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 201_000, indexSignature: "sig-v1", sessions: { later: {
     sessionId: "later", provider: "slack", chatType: "direct", startedAt: 200_000,
     projectionHash: hash, documentPath: "later.md", messages: projection.messages,
   } } }));
@@ -426,7 +426,7 @@ test("validly proven empty cutoff returns [] cleanly for both lanes without mate
   } finally { await beforeSession.close(); }
 
   // 2. Session started before cutoff, but all valid message spans are at/after cutoff -> proven empty.
-  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: { later: {
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 201_000, indexSignature: "sig-v1", sessions: { later: {
     sessionId: "later", provider: "slack", chatType: "direct", startedAt: 50_000,
     projectionHash: hash, documentPath: "later.md", messages: projection.messages,
   } } }));
@@ -532,4 +532,38 @@ test("uncertified empty manifest and manifests with failedSessions reject with H
     historicalTrainingSource(emptyRoot, ["direct"]),
     error => error instanceof HistoricalCorpusUnavailableError && /unavailable\/failed/i.test(error.message),
   );
+
+  // 7. Non-empty backed manifest missing indexSignature or lastSuccessfulSyncAt rejects as uncertified.
+  const backedRoot = mkdtempSync(join(tmpdir(), "training-uncertified-nonempty-"));
+  const backedSource = resolveSessionSource(join(backedRoot, "sessions"), ["direct"]);
+  const backedStore = await createStore({ dbPath: join(backedRoot, "index.sqlite"), config: { collections: {
+    [backedSource.collection]: { path: backedSource.root, pattern: "**/*.md" },
+  } } });
+  const projection = projectSessionDocument({ sessionId: "backed", chatType: "direct", agentName: "Bill", timezone: "UTC", startedAt: 10_000,
+    events: [{ createdAt: 20_000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "Backed fact" } }) }],
+  })!;
+  const hash = createHash("sha256").update(projection.content).digest("hex");
+  backedStore.internal.insertContent(hash, projection.content, "now");
+  backedStore.internal.insertDocument(backedSource.collection, "backed.md", "Transcript", hash, "now", "now");
+  await backedStore.close();
+
+  const backedManifestPath = join(backedRoot, "sessions-manifest.json");
+  const backedSession = {
+    backed: {
+      sessionId: "backed", provider: "slack", chatType: "direct", startedAt: 10_000,
+      projectionHash: hash, documentPath: "backed.md", messages: projection.messages,
+    },
+  };
+  for (const uncertified of [
+    { version: 1, sessions: backedSession },
+    { version: 1, lastSuccessfulSyncAt: 100_000, sessions: backedSession },
+    { version: 1, indexSignature: "sig-v1", sessions: backedSession },
+    { version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "   ", sessions: backedSession },
+  ]) {
+    writeFileSync(backedManifestPath, JSON.stringify(uncertified));
+    await assert.rejects(
+      historicalTrainingSource(backedRoot, ["direct"]),
+      error => error instanceof HistoricalCorpusUnavailableError && /uncertified/i.test(error.message),
+    );
+  }
 });

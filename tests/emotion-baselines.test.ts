@@ -10,7 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import { resolveConfig } from "../src/config.js";
 import { PeopleStore } from "../src/people-store.js";
 import { Worker } from "node:worker_threads";
-import { baselineFingerprint, deviationReader, refreshEmotionBaselines } from "../src/emotion-baselines.js";
+import { baselineFingerprint, baselineInputSnapshot, deviationReader, refreshEmotionBaselines } from "../src/emotion-baselines.js";
 import { runInsideOut, reportInsideOut, refreshInsideOutBaselines, reportInsideOutBaselines, linkInsideOutPeople,
   purgeInsideOutPerson, refreshInsideOutBaselinesAsync } from "../src/inside-out.js";
 import { openInsideOutStore, refreshWithFingerprint } from "../src/inside-out-store.js";
@@ -772,4 +772,88 @@ test("earlier week grade mutation during an in-flight refresh fences out later w
   const targetDevs = dbB.prepare("SELECT baseline_id FROM inside_out_deviations WHERE interaction_id='w1-target'").all();
   assert.equal(targetDevs.length, 1);
   assert.equal(targetDevs[0]!.baseline_id, newWeek0Id, "follow-up refresh assesses week-2 against the updated week-1 baseline");
+});
+
+test("analytics-only purge between pre-pass snapshot and refreshEmotionBaselines is fenced out", async t => {
+  // Part A: refreshWithFingerprint (no `unless`) — purge commits immediately after pre-pass readSnapshot COMMIT,
+  // before refreshEmotionBaselines starts.
+  const storeA = await gradedStore([
+    { account: "one", grades: 40, weeks: 2 },
+    { account: "two", grades: 40, weeks: 2 },
+  ]);
+  const [oneA, twoA] = storeA.ids;
+  // Seed existing baselines so the analytics-only purge actually deletes rows and bumps generation.
+  assert.deepEqual(refreshInsideOutBaselines(storeA.path, { now: storeA.now, link: false }), { snapshots: 4, comparisons: 80 });
+
+  const exec = DatabaseSync.prototype.exec;
+  let racedA = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+    const out = exec.call(this, sql);
+    if (sql === "COMMIT" && !racedA) {
+      racedA = true;
+      const purged = purgeInsideOutPerson(storeA.path, oneA!);
+      assert.deepEqual(purged, { baselines: 2, assessments: 40, grades: 0 });
+    }
+    return out;
+  });
+
+  const outcomeA = refreshWithFingerprint(storeA.path, { now: storeA.now, link: false });
+  assert.equal(racedA, true);
+  assert.equal(outcomeA.fingerprint, undefined, "purge between pre-pass snapshot and refresh invalidates certification");
+  assert.deepEqual(outcomeA.result, { snapshots: 0, comparisons: 0 });
+  const checkA = new DatabaseSync(storeA.path);
+  t.after(() => checkA.close());
+  assert.equal(checkA.prepare("SELECT count(*) n FROM inside_out WHERE person_id=?").get(oneA!)?.n, 40, "raw grades remain");
+  assert.equal(checkA.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(oneA!)?.n, 0,
+    "purged baselines must not be recreated");
+  assert.equal(checkA.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(oneA!)?.n, 0,
+    "purged deviations must not be recreated");
+  assert.equal(checkA.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(twoA!)?.n, 2);
+
+  // Part B: refreshWithFingerprint (with stale `unless` using baselineFingerprints) — same pre-pass race window.
+  const storeB = await gradedStore([
+    { account: "one", grades: 40, weeks: 2 },
+    { account: "two", grades: 40, weeks: 2 },
+  ]);
+  const [oneB, twoB] = storeB.ids;
+  let racedB = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+    const out = exec.call(this, sql);
+    if (sql === "COMMIT" && !racedB) {
+      racedB = true;
+      purgeInsideOutPerson(storeB.path, oneB!);
+    }
+    return out;
+  });
+  const outcomeB = refreshWithFingerprint(storeB.path, { now: storeB.now, link: false, unless: "stale-fingerprint" });
+  assert.equal(racedB, true);
+  assert.equal(outcomeB.fingerprint, undefined);
+  assert.deepEqual(outcomeB.result, { snapshots: 2, comparisons: 40 }, "only untouched person commits");
+  const checkB = new DatabaseSync(storeB.path);
+  t.after(() => checkB.close());
+  assert.equal(checkB.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(oneB!)?.n, 0);
+  assert.equal(checkB.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(oneB!)?.n, 0);
+  assert.equal(checkB.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(twoB!)?.n, 2);
+  assert.equal(checkB.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(twoB!)?.n, 40);
+
+  // Part C: direct baselineInputSnapshot -> concurrent purge on second connection -> refreshEmotionBaselines(..., { expectedGenerations }).
+  const storeC = await gradedStore([
+    { account: "one", grades: 40, weeks: 2 },
+    { account: "two", grades: 40, weeks: 2 },
+  ]);
+  const [oneC, twoC] = storeC.ids;
+  const dbC = openInsideOutStore(storeC.path);
+  t.after(() => dbC.close());
+  const snapshotC = baselineInputSnapshot(dbC, { minInteractions: 20, now: storeC.now });
+  purgeInsideOutPerson(storeC.path, oneC!);
+  const direct = refreshEmotionBaselines(dbC, {
+    minInteractions: 20,
+    now: storeC.now,
+    expectedGenerations: snapshotC.personGenerations,
+  });
+  assert.deepEqual(direct, { snapshots: 2, comparisons: 40 });
+  assert.equal(dbC.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(oneC!)?.n, 0);
+  assert.equal(dbC.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(oneC!)?.n, 0);
+  assert.equal(dbC.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(twoC!)?.n, 2);
+  assert.equal(dbC.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(twoC!)?.n, 40);
 });

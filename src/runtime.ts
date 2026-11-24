@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fchmodSync, lstatSync, openSync } from "node:fs";
+import { closeSync, constants, fchmodSync, lstatSync, openSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
@@ -48,9 +48,11 @@ type LockAcquisition =
   | { acquired: false; owner: SessionSyncLock };
 
 const SESSION_SYNC_LOCK_FILE = "session-sync.lock.sqlite";
+const LEGACY_SESSION_SYNC_LOCK_FILE = "session-sync.lock";
 const SESSION_SYNC_STATUS_FILE = "session-sync-status.json";
 const LEASE_BUSY_TIMEOUT_MS = 5000;
 const MAX_LEASE_BUSY_RETRIES = 6;
+const heldSessionSyncLeaseTokens = new Set<string>();
 const LEASE_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS session_sync_lease (
     id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -59,6 +61,49 @@ const LEASE_SCHEMA_SQL = `
     started_at TEXT NOT NULL
   )
 `;
+
+function heldLeaseKey(lockPath: string, token: string): string {
+  return `${lockPath}\0${token}`;
+}
+
+function isLeaseHeldInProcess(lockPath: string, token: string): boolean {
+  return heldSessionSyncLeaseTokens.has(heldLeaseKey(lockPath, token));
+}
+
+function isLeaseActive(lockPath: string, lease: SessionSyncLock): boolean {
+  if (!isProcessAlive(lease.pid)) return false;
+  if (lease.pid === process.pid && !isLeaseHeldInProcess(lockPath, lease.token)) {
+    return false;
+  }
+  return true;
+}
+
+function parseLegacySessionSyncLock(value: unknown): SessionSyncLock | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const { pid, token, startedAt } = value as Partial<SessionSyncLock>;
+  if (
+    typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 ||
+    typeof token !== "string" || token.length === 0 ||
+    typeof startedAt !== "string" || startedAt.length === 0
+  ) {
+    return undefined;
+  }
+  return { pid, token, startedAt };
+}
+
+function readLiveLegacySessionSyncLock(directory: string): SessionSyncLock | undefined {
+  const legacyPath = join(directory, LEGACY_SESSION_SYNC_LOCK_FILE);
+  try {
+    const stat = lstatSync(legacyPath, { throwIfNoEntry: false });
+    if (!stat || !stat.isFile()) return undefined;
+    const parsed = parseLegacySessionSyncLock(JSON.parse(readFileSync(legacyPath, "utf8")));
+    if (!parsed || !isProcessAlive(parsed.pid)) return undefined;
+    return parsed;
+  } catch {
+    // Missing, unreadable, or invalid legacy lock file does not block SQLite lease acquisition.
+    return undefined;
+  }
+}
 
 async function readJson<T>(path: string): Promise<T | undefined> {
   try {
@@ -157,7 +202,7 @@ function ensurePrivateLeaseFile(lockPath: string): void {
 
 async function withImmediateLeaseTransaction<T>(
   lockPath: string,
-  fn: (db: DatabaseSync) => { commit: boolean; value: T },
+  fn: (db: DatabaseSync) => { commit: boolean; value: T; onCommit?: () => void },
 ): Promise<T> {
   return await withLeaseBusyRetry(() => {
     ensurePrivateLeaseFile(lockPath);
@@ -168,9 +213,10 @@ async function withImmediateLeaseTransaction<T>(
       db.exec("BEGIN IMMEDIATE");
       inTransaction = true;
       db.exec(LEASE_SCHEMA_SQL);
-      const { commit, value } = fn(db);
+      const { commit, value, onCommit } = fn(db);
       db.exec(commit ? "COMMIT" : "ROLLBACK");
       inTransaction = false;
+      if (commit) onCommit?.();
       return value;
     } catch (error) {
       if (inTransaction) {
@@ -213,12 +259,26 @@ async function readSessionSyncLock(lockPath: string): Promise<LockReadResult> {
 }
 
 async function releaseSessionSyncLock(lockPath: string, token: string): Promise<void> {
+  heldSessionSyncLeaseTokens.delete(heldLeaseKey(lockPath, token));
   const existing = lstatSync(lockPath, { throwIfNoEntry: false });
   if (!existing) return;
   await withImmediateLeaseTransaction(lockPath, (db) => {
     db.prepare("DELETE FROM session_sync_lease WHERE id = 1 AND token = ?").run(token);
     return { commit: true, value: undefined };
   });
+}
+
+async function releaseSessionSyncLockSafely(
+  lockPath: string,
+  token: string,
+  onError?: (error: unknown) => void,
+): Promise<void> {
+  try {
+    await releaseSessionSyncLock(lockPath, token);
+  } catch (error) {
+    if (onError) onError(error);
+    else console.warn(`unblock-memory failed to release session sync lease (${lockPath}): ${String(error)}`);
+  }
 }
 
 async function clearStaleSessionSyncLease(lockPath: string): Promise<SessionSyncLock | undefined> {
@@ -230,7 +290,7 @@ async function clearStaleSessionSyncLease(lockPath: string): Promise<SessionSync
     ).get();
     if (!row) return { commit: false, value: undefined };
     const current = parseLeaseRow(row);
-    if (current && isProcessAlive(current.pid)) {
+    if (current && isLeaseActive(lockPath, current)) {
       return { commit: false, value: current };
     }
     db.prepare("DELETE FROM session_sync_lease WHERE id = 1").run();
@@ -243,27 +303,39 @@ async function acquireSessionSyncLock(
   startedAt: string,
 ): Promise<LockAcquisition> {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const liveLegacyBefore = readLiveLegacySessionSyncLock(directory);
+  if (liveLegacyBefore) {
+    return { acquired: false, owner: liveLegacyBefore };
+  }
   const lockPath = join(directory, SESSION_SYNC_LOCK_FILE);
   const candidate: SessionSyncLock = {
     pid: process.pid,
     token: randomUUID(),
     startedAt,
   };
-  const acquisition = await withImmediateLeaseTransaction<LockAcquisition>(lockPath, (db) => {
+  return await withImmediateLeaseTransaction<LockAcquisition>(lockPath, (db) => {
     const row = db.prepare(
       "SELECT pid, token, started_at FROM session_sync_lease WHERE id = 1",
     ).get();
     const existing = parseLeaseRow(row);
-    if (existing && isProcessAlive(existing.pid)) {
+    if (existing && isLeaseActive(lockPath, existing)) {
       return { commit: false, value: { acquired: false, owner: existing } };
+    }
+    const liveLegacy = readLiveLegacySessionSyncLock(directory);
+    if (liveLegacy) {
+      return { commit: false, value: { acquired: false, owner: liveLegacy } };
     }
     db.prepare(
       "INSERT OR REPLACE INTO session_sync_lease (id, pid, token, started_at) VALUES (1, ?, ?, ?)",
     ).run(candidate.pid, candidate.token, candidate.startedAt);
-    return { commit: true, value: { acquired: true, lock: candidate, lockPath } };
+    return {
+      commit: true,
+      value: { acquired: true, lock: candidate, lockPath },
+      onCommit: () => {
+        heldSessionSyncLeaseTokens.add(heldLeaseKey(lockPath, candidate.token));
+      },
+    };
   });
-  await fs.chmod(lockPath, 0o600);
-  return acquisition;
 }
 
 function runningStatusFromReceipt(
@@ -279,6 +351,7 @@ export async function recoverInterruptedSessionSync(
   directory: string,
   statusPath: string,
   stale: StoredRunningSessionSync,
+  onError?: (error: unknown) => void,
 ): Promise<SessionSyncStatus> {
   const acquired = await acquireSessionSyncLock(directory, stale.startedAt);
   if (!acquired.acquired) {
@@ -298,7 +371,7 @@ export async function recoverInterruptedSessionSync(
     await atomicWriteJson(statusPath, failed);
     return failed;
   } finally {
-    await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
+    await releaseSessionSyncLockSafely(acquired.lockPath, acquired.lock.token, onError);
   }
 }
 
@@ -308,31 +381,78 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #analysisExecutable?: string;
   readonly #keepEmbeddingModelWarm: boolean;
   readonly #stateRoot: string;
+  readonly #onError?: (error: unknown) => void;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
   readonly #closingManagers = new Map<string, Promise<void>>();
   readonly #activeSessionSyncs = new Map<string, Promise<void>>();
   readonly #pendingSessionSyncStarts = new Set<Promise<unknown>>();
   #closing = false;
   #closed = false;
+  #reloadFences = 0;
+  #closeAllFences = 0;
   #closePromise?: Promise<void>;
   #sessionSyncTimer?: NodeJS.Timeout;
+  #schedule?: { cfg: OpenClawConfig; onError: (error: unknown) => void };
 
   startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void {
     this.stopSessionSyncSchedule();
     if (this.#closing || this.#closed) return;
     const sessions = this.#corpora.find((corpus) => corpus.kind === "sessions");
     if (!sessions?.syncIntervalMinutes) return;
+    this.#schedule = { cfg, onError };
+    if (this.#reloadFences === 0 && this.#closeAllFences === 0) {
+      this.#startSessionSyncTimer(sessions.syncIntervalMinutes, cfg, onError);
+    }
+  }
+
+  stopSessionSyncSchedule(): void {
+    this.#schedule = undefined;
+    this.#pauseSessionSyncSchedule();
+  }
+
+  #pauseSessionSyncSchedule(): void {
+    if (this.#sessionSyncTimer) clearInterval(this.#sessionSyncTimer);
+    this.#sessionSyncTimer = undefined;
+  }
+
+  #maybeResumeSessionSyncSchedule(): void {
+    if (
+      this.#closing ||
+      this.#closed ||
+      this.#reloadFences > 0 ||
+      this.#closeAllFences > 0 ||
+      this.#sessionSyncTimer ||
+      !this.#schedule
+    ) {
+      return;
+    }
+    const sessions = this.#corpora.find((corpus) => corpus.kind === "sessions");
+    if (!sessions?.syncIntervalMinutes) return;
+    this.#startSessionSyncTimer(sessions.syncIntervalMinutes, this.#schedule.cfg, this.#schedule.onError);
+  }
+
+  #startSessionSyncTimer(
+    syncIntervalMinutes: number,
+    cfg: OpenClawConfig,
+    onError: (error: unknown) => void,
+  ): void {
     this.#sessionSyncTimer = setInterval(() => {
       for (const agentId of listAgentIds(cfg)) {
         void this.startSessionSync({ cfg, agentId }).catch(onError);
       }
-    }, sessions.syncIntervalMinutes * 60_000);
+    }, syncIntervalMinutes * 60_000);
     this.#sessionSyncTimer.unref();
   }
 
-  stopSessionSyncSchedule(): void {
-    if (this.#sessionSyncTimer) clearInterval(this.#sessionSyncTimer);
-    this.#sessionSyncTimer = undefined;
+  #admissionBlockedReason(): string | undefined {
+    if (this.#closing || this.#closed) return "memory runtime is closing";
+    if (this.#reloadFences > 0) return "memory runtime is reloading";
+    if (this.#closeAllFences > 0) return "memory runtime is closing";
+    return undefined;
+  }
+
+  async #releaseLease(lockPath: string, token: string): Promise<void> {
+    await releaseSessionSyncLockSafely(lockPath, token, this.#onError ?? this.#schedule?.onError);
   }
 
   constructor(
@@ -342,6 +462,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       keepEmbeddingModelWarm?: boolean;
       stateRoot?: string;
       extraction?: ExtractionConfig;
+      onError?: (error: unknown) => void;
     } = {},
   ) {
     this.#corpora = corpora;
@@ -349,12 +470,14 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     this.#analysisExecutable = options.analysisExecutable;
     this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
     this.#stateRoot = options.stateRoot ?? resolveStateDir();
+    this.#onError = options.onError;
   }
 
   async getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }) {
     while (true) {
-      if (this.#closing || this.#closed) {
-        return { manager: null, error: "memory runtime is closing" };
+      const blocked = this.#admissionBlockedReason();
+      if (blocked) {
+        return { manager: null, error: blocked };
       }
       const closing = this.#closingManagers.get(params.agentId);
       if (closing) {
@@ -368,8 +491,12 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       }
       try {
         const manager = await pending;
-        if (this.#closing || this.#closed) {
-          return { manager: null, error: "memory runtime is closing" };
+        const blockedAfter = this.#admissionBlockedReason();
+        if (blockedAfter) {
+          return { manager: null, error: blockedAfter };
+        }
+        if (this.#managers.get(params.agentId) !== pending) {
+          continue;
         }
         return { manager };
       } catch (error) {
@@ -391,10 +518,11 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     params: { cfg: OpenClawConfig; agentId: string },
     force = false,
   ): Promise<SessionSyncStartResult> {
-    if (this.#closing || this.#closed) {
+    const blocked = this.#admissionBlockedReason();
+    if (blocked) {
       return Promise.resolve({
         status: "unavailable",
-        error: "memory runtime is closing",
+        error: blocked,
       });
     }
     if (!this.#corpora.some((corpus) => corpus.kind === "sessions")) {
@@ -423,9 +551,10 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     if (!acquired.acquired) {
       return { status: "already_running", startedAt: acquired.owner.startedAt };
     }
-    if (this.#closing || this.#closed) {
-      await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
-      return { status: "unavailable", error: "memory runtime is closing" };
+    const blockedAfterAcquire = this.#admissionBlockedReason();
+    if (blockedAfterAcquire) {
+      await this.#releaseLease(acquired.lockPath, acquired.lock.token);
+      return { status: "unavailable", error: blockedAfterAcquire };
     }
     try {
       await atomicWriteJson(statusPath, {
@@ -435,22 +564,23 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         startedAt,
       });
     } catch (error) {
-      await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
+      await this.#releaseLease(acquired.lockPath, acquired.lock.token);
       throw error;
     }
-    if (this.#closing || this.#closed) {
+    const blockedAfterWrite = this.#admissionBlockedReason();
+    if (blockedAfterWrite) {
       try {
         await atomicWriteJson(statusPath, {
           status: "failed",
           startedAt,
           completedAt: new Date().toISOString(),
-          error: "memory runtime is closing",
+          error: blockedAfterWrite,
         });
       } catch {
         // Best effort: the next status read recovers any remaining running receipt.
       }
-      await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
-      return { status: "unavailable", error: "memory runtime is closing" };
+      await this.#releaseLease(acquired.lockPath, acquired.lock.token);
+      return { status: "unavailable", error: blockedAfterWrite };
     }
     const run = this.#runSessionSync(params, force, {
       directory,
@@ -519,7 +649,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         // The next status read converts the persisted running state to interrupted.
       }
     } finally {
-      await releaseSessionSyncLock(run.lockPath, run.token).catch(() => undefined);
+      await this.#releaseLease(run.lockPath, run.token);
     }
   }
 
@@ -527,14 +657,20 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     const directory = this.#stateDir(agentId);
     const lockPath = join(directory, SESSION_SYNC_LOCK_FILE);
     const statusPath = join(directory, SESSION_SYNC_STATUS_FILE);
+    const onError = this.#onError ?? this.#schedule?.onError;
     const lockState = await readSessionSyncLock(lockPath);
-    if (lockState.exists && lockState.lock && isProcessAlive(lockState.lock.pid)) {
+    if (lockState.exists && lockState.lock && isLeaseActive(lockPath, lockState.lock)) {
       const status = await readJson<SessionSyncState>(statusPath);
       return runningStatusFromReceipt(status, lockState.lock.startedAt);
     }
+    const legacyOwner = readLiveLegacySessionSyncLock(directory);
+    if (legacyOwner) {
+      const status = await readJson<SessionSyncState>(statusPath);
+      return runningStatusFromReceipt(status, legacyOwner.startedAt);
+    }
     const status = await readJson<SessionSyncState>(statusPath);
     if (status?.status === "running") {
-      return await recoverInterruptedSessionSync(directory, statusPath, status);
+      return await recoverInterruptedSessionSync(directory, statusPath, status, onError);
     }
     if (lockState.exists) {
       const liveOwner = await clearStaleSessionSyncLease(lockPath);
@@ -544,7 +680,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       }
       const refreshedStatus = await readJson<SessionSyncState>(statusPath);
       if (refreshedStatus?.status === "running") {
-        return await recoverInterruptedSessionSync(directory, statusPath, refreshedStatus);
+        return await recoverInterruptedSessionSync(directory, statusPath, refreshedStatus, onError);
       }
       return refreshedStatus ?? { status: "idle" };
     }
@@ -558,6 +694,64 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         ...this.#activeSessionSyncs.values(),
       ]);
     }
+  }
+
+  prepareReload(
+    change: Parameters<NonNullable<MemoryPluginRuntimeContract["prepareReload"]>>[0],
+  ): ReturnType<NonNullable<MemoryPluginRuntimeContract["prepareReload"]>> {
+    // QMD embeds locally rather than via host MemoryEmbeddingProviderAdapter instances,
+    // so only retiring this runtime affects its managers and session syncs.
+    if (!change.retireRuntime) {
+      return {
+        drain: async () => ({ errors: [] }),
+        resume() {},
+      };
+    }
+    this.#reloadFences += 1;
+    this.#pauseSessionSyncSchedule();
+    let resumed = false;
+    let drainPromise: Promise<{ errors: readonly unknown[] }> | undefined;
+    return {
+      drain: () => {
+        if (!drainPromise) {
+          drainPromise = (async () => {
+            const errors: unknown[] = [];
+            if (resumed) return { errors };
+            let ranOnce = false;
+            while (
+              !ranOnce ||
+              (!resumed && (
+                this.#pendingSessionSyncStarts.size > 0 ||
+                this.#activeSessionSyncs.size > 0 ||
+                this.#managers.size > 0 ||
+                this.#closingManagers.size > 0
+              ))
+            ) {
+              ranOnce = true;
+              await this.#drainSessionSyncs();
+              if (resumed) break;
+              const agentIds = new Set([...this.#managers.keys(), ...this.#closingManagers.keys()]);
+              if (agentIds.size > 0) {
+                const settled = await Promise.allSettled(
+                  [...agentIds].map((agentId) => this.closeMemorySearchManager({ agentId })),
+                );
+                for (const outcome of settled) {
+                  if (outcome.status === "rejected") errors.push(outcome.reason);
+                }
+              }
+            }
+            return { errors };
+          })();
+        }
+        return drainPromise;
+      },
+      resume: () => {
+        if (resumed) return;
+        resumed = true;
+        this.#reloadFences = Math.max(0, this.#reloadFences - 1);
+        this.#maybeResumeSessionSyncSchedule();
+      },
+    };
   }
 
   async closeMemorySearchManager(params: { agentId: string }): Promise<void> {
@@ -607,10 +801,35 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   }
 
   async closeAllMemorySearchManagers(): Promise<void> {
+    this.#closeAllFences += 1;
     this.stopSessionSyncSchedule();
-    await this.#drainSessionSyncs();
-    const agentIds = new Set([...this.#managers.keys(), ...this.#closingManagers.keys()]);
-    await Promise.all([...agentIds].map((agentId) => this.closeMemorySearchManager({ agentId })));
+    let firstError: unknown;
+    let hasError = false;
+    try {
+      while (
+        this.#pendingSessionSyncStarts.size > 0 ||
+        this.#activeSessionSyncs.size > 0 ||
+        this.#managers.size > 0 ||
+        this.#closingManagers.size > 0
+      ) {
+        await this.#drainSessionSyncs();
+        const agentIds = new Set([...this.#managers.keys(), ...this.#closingManagers.keys()]);
+        if (agentIds.size > 0) {
+          const settled = await Promise.allSettled(
+            [...agentIds].map((agentId) => this.closeMemorySearchManager({ agentId })),
+          );
+          for (const outcome of settled) {
+            if (outcome.status === "rejected" && !hasError) {
+              hasError = true;
+              firstError = outcome.reason;
+            }
+          }
+        }
+      }
+    } finally {
+      this.#closeAllFences = Math.max(0, this.#closeAllFences - 1);
+    }
+    if (hasError) throw firstError;
   }
 
   async close(): Promise<void> {

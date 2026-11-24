@@ -1120,6 +1120,124 @@ test("mapped Slack turn in the same thread does not consume another queued messa
   }
 });
 
+test("queues multiple run-less Slack messages in the same thread while failing closed across threads", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    saveVerified(store, person.id, "test setup", {
+      schemaVersion: 1,
+      blurb: "Person context.",
+      sections: [],
+    });
+
+    // Two run-less messages in one thread: both prompts receive verified People context,
+    // and same-run retry does not consume the second queued entry.
+    testHarness.received(
+      { from: "slack:C123", content: "first follow-up", threadId: "990.0", messageId: "991.0" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "second follow-up", threadId: "990.0", messageId: "992.0" },
+      slackContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "first follow-up", messages: [] },
+        promptContext("U123", "run-queued-1"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "first retry", messages: [] },
+        promptContext("U123", "run-queued-1"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "second follow-up", messages: [] },
+        promptContext("U123", "run-queued-2"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "third stray", messages: [] },
+        promptContext("U123", "run-queued-3"),
+      ),
+      undefined,
+    );
+
+    // A direct runId hit matching one queued message only removes that single entry.
+    testHarness.received(
+      { from: "slack:C123", content: "queued A", threadId: "993.0", messageId: "993.1" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "queued B", threadId: "993.0", messageId: "993.2" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "direct A", threadId: "993.0", messageId: "993.1", runId: "run-direct-a" },
+      slackContext,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "direct A", messages: [] },
+        promptContext("U123", "run-direct-a"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "queued B", messages: [] },
+        promptContext("U123", "run-queued-b"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "no leftover", messages: [] },
+        promptContext("U123", "run-queued-c"),
+      ),
+      undefined,
+    );
+
+    // Two run-less messages across DIFFERENT threads still fail closed.
+    testHarness.received(
+      { from: "slack:C123", content: "thread one", threadId: "995.0", messageId: "995.1" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "thread two", threadId: "996.0", messageId: "996.1" },
+      slackContext,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "ambiguous 1", messages: [] },
+        promptContext("U123", "run-diff-1"),
+      ),
+      undefined,
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "ambiguous 2", messages: [] },
+        promptContext("U123", "run-diff-2"),
+      ),
+      undefined,
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
 test("renders only the bounded stored blurb", () => {
   assert.equal(renderPeopleWhisper("  useful context  ", 8), "useful c");
   assert.equal(renderPeopleWhisper("   ", 8), undefined);

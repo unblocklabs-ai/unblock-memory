@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
-import { PURGED_GRADE, baselineFingerprints, baselineInputFingerprint, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
+import { PURGED_GRADE, baselineFingerprints, baselineInputSnapshot, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
 
 // Imported by the baseline worker with plain Node resolution: host SDK aliases do not
 // reach worker threads, so this module and its imports must stay free of `openclaw`.
@@ -92,16 +92,20 @@ export function refreshWithFingerprint(path: string, options: BaselineOptions & 
     if (options.link !== false) linkInsideOutPeopleInDb(db);
     const settings = { ...options, minInteractions: options.minInteractions ?? 20, now: options.now ?? Date.now() };
     let beforeInputs: string;
+    let expectedGenerations: Map<string, number>;
     if (!options.recompare && options.unless) {
       const before = baselineFingerprints(db, settings);
       if (before.fullFingerprint === options.unless) {
         return { result: { snapshots: 0, comparisons: 0 }, fingerprint: options.unless };
       }
       beforeInputs = before.inputFingerprint;
+      expectedGenerations = before.personGenerations;
     } else {
-      beforeInputs = baselineInputFingerprint(db, settings);
+      const before = baselineInputSnapshot(db, settings);
+      beforeInputs = before.inputFingerprint;
+      expectedGenerations = before.personGenerations;
     }
-    const result = refreshEmotionBaselines(db, settings);
+    const result = refreshEmotionBaselines(db, { ...settings, expectedGenerations });
     const after = baselineFingerprints(db, settings);
     // Only certify the post-pass fingerprint if grades, People inputs, and purge generations stayed unchanged mid-pass.
     const fingerprint = after.inputFingerprint === beforeInputs ? after.fullFingerprint : undefined;
