@@ -623,3 +623,55 @@ test("provider switchback retains Jev retrieval hold after Liquid recovers on a 
     assert.equal(exportedJev[0]!.evaluation.corpusHash, "corpus-v3");
   });
 });
+
+test("budget pause on a retried pending revision step does not falsely flag evaluation-unresolved", async t => {
+  const f = fixture(t);
+  let failLexRevision = true;
+  const host = runtime((_request, lane, round) => {
+    if (lane === "lex" && round === 2 && failLexRevision) {
+      throw Object.assign(new Error("transient unauthorized"), { code: "LLM_COMPLETION_NOT_AUTHORIZED" });
+    }
+  });
+  const search = searchFixture(async () => [hit()]);
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(gradeResponse(0.8))));
+
+  await f.store.locked(async () => {
+    f.initialize();
+    await generateTrainingQueries(f.source, f.store, host, options);
+
+    // 1. Round-2 lex revision fails and flags evaluation-unresolved.
+    const failedRun = await evaluateTrainingQueries(f.source, f.store, config, host, { concurrency: 1 }, search);
+    assert.equal(failedRun.failed, 1);
+    assert.equal(failedRun.flagged, 1);
+    const retryable = f.store.status(0.7).retryable;
+    assert.equal(retryable.length, 1);
+    const revisionId = String(retryable[0]!.id);
+
+    // 2. Operator resets the failed revision via retry-failed (row remains in training_steps with status='pending').
+    assert.equal(f.store.retry(false, [revisionId]), 1);
+    assert.equal(f.store.stepRecordStatus(revisionId), "pending");
+
+    // 3. A budget-limited rerun pauses cleanly on the pending revision step without flagging or writing a failure.
+    failLexRevision = false;
+    const paused = await evaluateTrainingQueries(
+      f.source,
+      f.store,
+      config,
+      host,
+      { concurrency: 1, maxInputBytes: 1 },
+      search,
+    );
+    assert.equal(paused.budgetLimited, true);
+    assert.equal(paused.flagged, 0);
+    assert.equal(paused.failed, 0);
+    assert.equal(paused.blocked, 0);
+    assert.equal(f.store.stepRecordStatus(revisionId), "pending");
+
+    // 4. Subsequent unbudgeted rerun completes cleanly and clears the prior review.
+    const completed = await evaluateTrainingQueries(f.source, f.store, config, host, { concurrency: 1 }, search);
+    assert.equal(completed.evaluated, 1);
+    assert.equal(completed.flagged, 0);
+    assert.equal(f.store.reviews().length, 0);
+    assert.equal([...exportQueryTraining(f.store)].length, 1);
+  });
+});

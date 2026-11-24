@@ -114,6 +114,10 @@ async function captureSourceSessions(stateDir: string, chatTypes: readonly ChatT
   assertFileExists(indexPath, "No QMD index; sync sessions before evaluating training queries");
   assertFileExists(manifestPath, "No session manifest; sync sessions before evaluating training queries");
   const manifest = await readSessionManifest(manifestPath);
+  const failedSessions = (manifest as { failedSessions?: Record<string, string> }).failedSessions;
+  if (failedSessions && typeof failedSessions === "object" && Object.keys(failedSessions).length > 0) {
+    throw new HistoricalCorpusUnavailableError("Session manifest has unavailable/failed sessions; sync sessions before evaluating training queries");
+  }
   const source = resolveSessionSource(join(stateDir, "sessions"), chatTypes);
   // Use QMD's exact binding, never mix node:sqlite with sqlite-vec.
   const requireQmd = createRequire(import.meta.resolve("@unblocklabs/qmd"));
@@ -138,6 +142,10 @@ async function captureSourceSessions(stateDir: string, chatTypes: readonly ChatT
       const hasIndexedDocs = sourceDb.prepare("SELECT 1 FROM documents WHERE active=1 AND collection=? LIMIT 1").get(source.collection);
       if (hasIndexedDocs) {
         throw new HistoricalCorpusUnavailableError("Session manifest is unbacked by QMD index; sync sessions before evaluating training queries");
+      }
+      if (typeof manifest.lastSuccessfulSyncAt !== "number" || !Number.isFinite(manifest.lastSuccessfulSyncAt) ||
+          typeof manifest.indexSignature !== "string" || !manifest.indexSignature.trim()) {
+        throw new HistoricalCorpusUnavailableError("Session manifest is uncertified; sync sessions before evaluating training queries");
       }
     }
     const document = sourceDb.prepare(`SELECT d.hash,c.doc FROM documents d JOIN content c ON c.hash=d.hash

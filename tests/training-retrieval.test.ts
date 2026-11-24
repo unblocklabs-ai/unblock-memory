@@ -440,14 +440,19 @@ test("validly proven empty cutoff returns [] cleanly for both lanes without mate
     assert.deepEqual(await beforeMessages.search("Future evidence", "vec"), []);
   } finally { await beforeMessages.close(); }
 
-  // 3. Valid empty manifest paired with an empty QMD sessions collection -> proven empty.
+  // 3. Valid certified empty manifest paired with an empty QMD sessions collection -> proven empty.
   const emptyRoot = mkdtempSync(join(tmpdir(), "training-empty-corpus-"));
   const emptySource = resolveSessionSource(join(emptyRoot, "sessions"), ["direct"]);
   const emptyStore = await createStore({ dbPath: join(emptyRoot, "index.sqlite"), config: { collections: {
     [emptySource.collection]: { path: emptySource.root, pattern: "**/*.md" },
   } } });
   await emptyStore.close();
-  writeFileSync(join(emptyRoot, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: {} }));
+  writeFileSync(join(emptyRoot, "sessions-manifest.json"), JSON.stringify({
+    version: 1,
+    lastSuccessfulSyncAt: 100_000,
+    indexSignature: "sig-empty-v1",
+    sessions: {},
+  }));
   const emptySnapshot = await historicalTrainingSearch(emptyRoot, ["direct"], 100_000, async () => {
     assert.fail("Proven empty corpus must not materialize QMD");
   });
@@ -457,4 +462,74 @@ test("validly proven empty cutoff returns [] cleanly for both lanes without mate
     assert.deepEqual(await emptySnapshot.search("Anything", "lex"), []);
     assert.deepEqual(await emptySnapshot.search("Anything", "vec"), []);
   } finally { await emptySnapshot.close(); }
+});
+
+test("uncertified empty manifest and manifests with failedSessions reject with HistoricalCorpusUnavailableError", async () => {
+  const emptyRoot = mkdtempSync(join(tmpdir(), "training-uncertified-manifest-"));
+  const emptySource = resolveSessionSource(join(emptyRoot, "sessions"), ["direct"]);
+  const emptyStore = await createStore({ dbPath: join(emptyRoot, "index.sqlite"), config: { collections: {
+    [emptySource.collection]: { path: emptySource.root, pattern: "**/*.md" },
+  } } });
+  await emptyStore.close();
+
+  const manifestPath = join(emptyRoot, "sessions-manifest.json");
+
+  // 1. Missing both lastSuccessfulSyncAt and indexSignature -> uncertified.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, sessions: {} }));
+  await assert.rejects(
+    historicalTrainingSource(emptyRoot, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError && /uncertified/i.test(error.message),
+  );
+
+  // 2. Missing indexSignature -> uncertified.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, sessions: {} }));
+  await assert.rejects(
+    historicalTrainingSource(emptyRoot, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError && /uncertified/i.test(error.message),
+  );
+
+  // 3. Missing lastSuccessfulSyncAt -> uncertified.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, indexSignature: "sig-v1", sessions: {} }));
+  await assert.rejects(
+    historicalTrainingSource(emptyRoot, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError && /uncertified/i.test(error.message),
+  );
+
+  // 4. Empty/whitespace indexSignature -> uncertified.
+  writeFileSync(manifestPath, JSON.stringify({ version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "   ", sessions: {} }));
+  await assert.rejects(
+    historicalTrainingSource(emptyRoot, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError && /uncertified/i.test(error.message),
+  );
+
+  // 5. Empty manifest with failedSessions rejects even if certified fields exist.
+  writeFileSync(manifestPath, JSON.stringify({
+    version: 1,
+    lastSuccessfulSyncAt: 100_000,
+    indexSignature: "sig-v1",
+    failedSessions: { cold1: "unable to read cold transcript" },
+    sessions: {},
+  }));
+  await assert.rejects(
+    historicalTrainingSource(emptyRoot, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError && /unavailable\/failed/i.test(error.message),
+  );
+
+  // 6. Non-empty manifest with failedSessions also rejects immediately.
+  writeFileSync(manifestPath, JSON.stringify({
+    version: 1,
+    lastSuccessfulSyncAt: 100_000,
+    indexSignature: "sig-v1",
+    failedSessions: { cold2: "read error" },
+    sessions: {
+      ok: {
+        sessionId: "ok", provider: "slack", chatType: "direct", startedAt: 200_000,
+        projectionHash: "a".repeat(64), documentPath: "ok.md",
+      },
+    },
+  }));
+  await assert.rejects(
+    historicalTrainingSource(emptyRoot, ["direct"]),
+    error => error instanceof HistoricalCorpusUnavailableError && /unavailable\/failed/i.test(error.message),
+  );
 });

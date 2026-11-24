@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fsyncSync, linkSync, lstatSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
@@ -29,13 +29,18 @@ function existsError(path: string): NodeJS.ErrnoException {
 }
 
 /** Write JSONL to a private same-filesystem temp file and publish atomically without overwriting. */
-export function writeTrainingExportJsonl(output: string, data: Iterable<unknown>): number {
+export function writeTrainingExportJsonl(
+  output: string,
+  data: Iterable<unknown>,
+  link: typeof linkSync = linkSync,
+): number {
   if (pathExists(output)) throw existsError(output);
   const tempPath = join(dirname(output), `.${basename(output)}.${process.pid}.${randomUUID()}.tmp`);
   const fd = openSync(tempPath, "wx", 0o600);
   let rows = 0;
   let closed = false;
   try {
+    fchmodSync(fd, 0o600);
     for (const row of data) {
       writeSync(fd, JSON.stringify(row) + "\n");
       rows++;
@@ -44,17 +49,24 @@ export function writeTrainingExportJsonl(output: string, data: Iterable<unknown>
     closeSync(fd);
     closed = true;
     try {
-      linkSync(tempPath, output);
+      link(tempPath, output);
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-      if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EXDEV") throw error;
-      if (pathExists(output)) throw existsError(output);
-      renameSync(tempPath, output);
+      if (code === "EEXIST") throw existsError(output);
+      if (code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS" || code === "EXDEV") {
+        const unsupported = new Error(
+          `Atomic no-overwrite export requires filesystem hardlink support (${code}): '${output}'`,
+          { cause: error },
+        ) as NodeJS.ErrnoException;
+        unsupported.code = code;
+        throw unsupported;
+      }
+      throw error;
     }
     return rows;
   } finally {
     if (!closed) closeSync(fd);
-    try { unlinkSync(tempPath); } catch { /* already renamed or removed */ }
+    try { unlinkSync(tempPath); } catch { /* already removed */ }
   }
 }
 
