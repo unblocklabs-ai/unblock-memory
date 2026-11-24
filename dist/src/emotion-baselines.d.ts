@@ -45,6 +45,7 @@ export declare function refreshEmotionBaselines(db: DatabaseSync, options: {
     minInteractions: number;
     now?: number;
     recompare?: boolean;
+    expectedGenerations?: ReadonlyMap<string, number>;
 }): {
     snapshots: number;
     comparisons: number;
@@ -110,17 +111,20 @@ export declare function emotionBaselineHistory(db: DatabaseSync, options?: {
     cumulative: Summary;
 }[];
 /**
- * Fingerprint of refresh inputs only (settings, current week, People tables, grades, and purge generations).
- * Excludes derived output tables so a refresh can verify inputs stayed stable across a pass
- * before certifying its post-pass fingerprint.
+ * Snapshot of refresh inputs only (settings, current week, People tables, grades, and purge generations).
+ * Captures input fingerprint and per-person purge generations in one read snapshot so purges committing
+ * after the pre-pass snapshot are fenced out before refreshEmotionBaselines runs.
  */
-export declare function baselineInputFingerprint(db: DatabaseSync, options: {
+export declare function baselineInputSnapshot(db: DatabaseSync, options: {
     minInteractions: number;
     now: number;
-}): string;
+}): {
+    inputFingerprint: string;
+    personGenerations: Map<string, number>;
+};
 /**
- * Computes both input and full fingerprints inside one consistent SQLite read snapshot so
- * post-pass certification never rescans inputs or mixes pre- and post-commit state.
+ * Computes input fingerprint, full fingerprint, and purge generations inside one consistent SQLite
+ * read snapshot so pre-pass fencing and post-pass certification never mix pre- and post-commit state.
  */
 export declare function baselineFingerprints(db: DatabaseSync, options: {
     minInteractions: number;
@@ -128,6 +132,7 @@ export declare function baselineFingerprints(db: DatabaseSync, options: {
 }): {
     inputFingerprint: string;
     fullFingerprint: string;
+    personGenerations: Map<string, number>;
 };
 /**
  * Changes whenever a refresh input could: grades, links, people, purge generations, stored results,

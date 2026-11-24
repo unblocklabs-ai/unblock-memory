@@ -23,4 +23,4 @@ export declare function readExtractionPage(agentId: string, agentName: string, s
     cursor?: string;
     maxMessages: number;
     maxBytes: number;
-}) => Promise<unknown>): Promise<ExtractionPage>;
+}) => Promise<unknown>, signal?: AbortSignal): Promise<ExtractionPage>;

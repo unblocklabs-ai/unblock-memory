@@ -38,7 +38,7 @@ type StoredRunningSessionSync = Extract<StoredSessionSyncStatus, {
 }> & {
     pid: number;
 };
-export declare function recoverInterruptedSessionSync(directory: string, statusPath: string, stale: StoredRunningSessionSync): Promise<SessionSyncStatus>;
+export declare function recoverInterruptedSessionSync(directory: string, statusPath: string, stale: StoredRunningSessionSync, onError?: (error: unknown) => void): Promise<SessionSyncStatus>;
 export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     #private;
     startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void;
@@ -48,6 +48,7 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         keepEmbeddingModelWarm?: boolean;
         stateRoot?: string;
         extraction?: ExtractionConfig;
+        onError?: (error: unknown) => void;
     });
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;
@@ -68,6 +69,7 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         agentId: string;
     }, force?: boolean): Promise<SessionSyncStartResult>;
     sessionSyncStatus(agentId: string): Promise<SessionSyncStatus>;
+    prepareReload(change: Parameters<NonNullable<MemoryPluginRuntimeContract["prepareReload"]>>[0]): ReturnType<NonNullable<MemoryPluginRuntimeContract["prepareReload"]>>;
     closeMemorySearchManager(params: {
         agentId: string;
     }): Promise<void>;

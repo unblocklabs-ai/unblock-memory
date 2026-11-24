@@ -27,4 +27,7 @@ export declare function readExtractionChunk(params: {
     fence: string;
     exhausted: boolean;
     cursor: string;
+} | {
+    kind: "reset";
+    cursor: null;
 }>;

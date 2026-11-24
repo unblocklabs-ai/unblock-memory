@@ -44,6 +44,7 @@ export type ReviewManifest = {
     inventoryPending?: boolean;
 };
 export declare function dossierAssertions(personId: string, dossier: PersonDossier): ReviewAssertion[];
+/** Atomically publishes a flushed 0o600 private JSON artifact; never accepts a truncated partial file. */
 export declare function privateJson(root: string, name: string, value: unknown): string;
 export declare function inventoryPeople(options: {
     agentId: string;

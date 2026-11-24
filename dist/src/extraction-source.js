@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { abortable } from "./abortable.js";
 import { projectMessage } from "./session-projector.js";
 export function extractionSessions(databasePath, agentId, chatTypes) {
     const db = new DatabaseSync(databasePath, { readOnly: true });
@@ -30,7 +31,10 @@ export function extractionSessions(databasePath, agentId, chatTypes) {
 const pageSchema = Type.Object({ kind: Type.Literal("page"), cursor: Type.String(), hasMore: Type.Boolean(),
     requiredBytes: Type.Optional(Type.Number()), entries: Type.Array(Type.Object({ entryId: Type.String(),
         message: Type.Unknown(), createdAt: Type.Optional(Type.String()) })) });
-export async function readExtractionPage(agentId, agentName, session, cursor, read) {
+const resetSchema = Type.Object({ kind: Type.Literal("reset"), cursor: Type.String() });
+const missingSchema = Type.Object({ kind: Type.Union([Type.Literal("missing"), Type.Literal("unavailable")]) });
+export async function readExtractionPage(agentId, agentName, session, cursor, read, signal) {
+    signal?.throwIfAborted();
     // Runtime-only import: the supported host export ships JS without a declaration file.
     const sdkPath = "openclaw/plugin-sdk/session-transcript-runtime";
     const sdk = read ? undefined : await import(sdkPath);
@@ -40,17 +44,23 @@ export async function readExtractionPage(agentId, agentName, session, cursor, re
     let maxBytes = 1_000_000;
     let result;
     for (;;) {
-        result = await readDelta({ agentId, sessionId: session.sessionId,
+        signal?.throwIfAborted();
+        const pending = readDelta({ agentId, sessionId: session.sessionId,
             sessionKey: session.sessionKey, ...(cursor ? { cursor } : {}), maxMessages: 40, maxBytes });
-        if (!Value.Check(pageSchema, result) || result.entries.length || !result.requiredBytes)
+        if (signal)
+            void pending.catch(() => { });
+        result = await abortable(pending, signal);
+        signal?.throwIfAborted();
+        if (!Value.Check(pageSchema, result))
             break;
-        // The host caps reads at 64 MiB. This is an allocation bound, not a model budget.
-        if (!Number.isSafeInteger(result.requiredBytes) || result.requiredBytes <= maxBytes || result.requiredBytes > 64 * 1024 * 1024) {
-            throw new Error("Transcript entry exceeds host read capacity");
+        if (!result.entries.length && result.requiredBytes) {
+            // The host caps reads at 64 MiB. This is an allocation bound, not a model budget.
+            if (!Number.isSafeInteger(result.requiredBytes) || result.requiredBytes <= maxBytes || result.requiredBytes > 64 * 1024 * 1024) {
+                throw new Error("Transcript entry exceeds host read capacity");
+            }
+            maxBytes = result.requiredBytes;
+            continue;
         }
-        maxBytes = result.requiredBytes;
-    }
-    if (Value.Check(pageSchema, result)) {
         const messages = result.entries.flatMap(entry => {
             const createdAt = Date.parse(entry.createdAt ?? "");
             if (!Number.isFinite(createdAt))
@@ -60,10 +70,8 @@ export async function readExtractionPage(agentId, agentName, session, cursor, re
         });
         return { kind: "page", cursor: result.cursor, hasMore: result.hasMore, messages, entryCount: result.entries.length };
     }
-    const resetSchema = Type.Object({ kind: Type.Literal("reset"), cursor: Type.String() });
     if (Value.Check(resetSchema, result))
         return { kind: "reset", cursor: result.cursor };
-    const missingSchema = Type.Object({ kind: Type.Union([Type.Literal("missing"), Type.Literal("unavailable")]) });
     if (Value.Check(missingSchema, result))
         return { kind: result.kind };
     throw new Error("Invalid host transcript page");

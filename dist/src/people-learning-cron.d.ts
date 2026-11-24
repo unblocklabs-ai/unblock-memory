@@ -10,5 +10,5 @@ export type LearningJob = {
 /** Service-owned cron, not bundled-only scheduleSessionTurn.
  * Stable declarations make a lost add response/reload safe. Legacy history stays on disabled originals.
  */
-export declare function reconcilePeopleLearning(cron: PeopleCron, cfg: OpenClawConfig, config: PeopleLearningConfig, active?: () => boolean): Promise<LearningJob[]>;
+export declare function reconcilePeopleLearning(cron: PeopleCron, cfg: OpenClawConfig, config: PeopleLearningConfig, active?: () => boolean, onRecognize?: (jobs: readonly LearningJob[], fullSnapshot?: boolean) => void): Promise<LearningJob[]>;
 export declare function learningSession(sessionKey: string | undefined, jobs: readonly LearningJob[]): LearningJob | undefined;

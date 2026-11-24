@@ -13,6 +13,7 @@ export declare function runExtraction(params: {
     since?: number;
     sessionId?: string;
     scheduled?: boolean;
+    version?: string;
     readPage?: typeof readExtractionPage;
     extract?: typeof extractWithLuna;
     validate?: typeof validateExtractedMemory;

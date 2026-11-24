@@ -4,7 +4,7 @@ import { parseAgentSessionKey, parseThreadSessionSuffix } from "openclaw/plugin-
 import { abortable } from "./abortable.js";
 import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
-import { messageText } from "./whisperer-context.js";
+import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { decideWithModel, estimateJevTokens, isTypeSafeTimeout, resolveTypeSafeApiKey } from "./typesafe-client.js";
 export function resolveMyTurn(value) {
     const config = value === undefined ? {} : value;
@@ -36,7 +36,8 @@ export function resolveMyTurn(value) {
     return { enabled, historyMessages, channels };
 }
 const DEADLINE_MS = 1500;
-const MAX_STATE_TOKENS = 24_000;
+const MAX_SESSIONS = 1_000;
+const MAX_SEEN_RUNS = 64;
 const HINT = "<my_turn>Your internal Decision API determined that you probably don’t need to respond to this conversation. " +
     "If you agree, return exactly NO_REPLY. If it missed a request or obligation directed at you, respond normally.</my_turn>";
 const SHOULD_RESPOND_QUESTIONS = {
@@ -96,13 +97,45 @@ function groupProvider(sessionKey, agentId) {
     if ((kind === "group" || kind === "channel") && peerId)
         return provider;
 }
+function buildMyTurnState(params) {
+    const { cfg, agentId, provider, prompt, messages, senderId, historyMessages } = params;
+    const latest = messages.at(-1);
+    const currentMessage = humanMessage(latest);
+    // Without matching host-authored metadata, skip advice rather than guess that the trigger is human.
+    if (!currentMessage || messageText(latest)?.text !== prompt.trim() ||
+        !senderId || currentMessage.senderId !== senderId) {
+        return { ok: false, reason: "missing_identity" };
+    }
+    const state = {
+        agent: { id: agentId, name: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId },
+        provider,
+        currentMessage,
+        history: [],
+    };
+    const baseTokens = estimateJevTokens(state);
+    // Never advise silence after silently truncating the current human request.
+    if (baseTokens > MAX_STATE_TOKENS)
+        return { ok: false, reason: "input_too_large" };
+    state.history = takeRecentWithinTokens(messages, {
+        endIndex: messages.length - 2,
+        maxItems: historyMessages - 1,
+        maxTokens: MAX_STATE_TOKENS,
+        usedTokens: baseTokens,
+        estimateTokens: estimateJevTokens,
+        transform: humanMessage,
+    }).items;
+    return { ok: true, state };
+}
 export function registerMyTurn(api, config, typesafe, diagnostics) {
     if (!config.enabled)
         return;
     const sessions = new Map();
+    const touchSession = (key, session) => {
+        sessions.delete(key);
+        sessions.set(key, session);
+    };
     const stop = (key) => {
-        for (const run of sessions.get(key)?.runs.values() ?? [])
-            run.controller.abort();
+        sessions.get(key)?.current?.controller.abort();
         sessions.delete(key);
     };
     const beforePrompt = async (event, context) => {
@@ -125,30 +158,41 @@ export function registerMyTurn(api, config, typesafe, diagnostics) {
             stop(scope);
             session = undefined;
         }
-        const previous = session?.runs.get(runId);
-        if (previous)
-            return session?.latest === runId ? previous.result : undefined;
-        if (!session) {
-            if (sessions.size >= 1000)
-                stop(sessions.keys().next().value);
-            session = { sessionId: context.sessionId, latest: runId, runs: new Map() };
-            sessions.set(scope, session);
+        if (session) {
+            touchSession(scope, session);
+            if (session.latest === runId)
+                return session.current?.result;
+            if (session.seenRuns.has(runId))
+                return undefined;
         }
-        for (const run of session.runs.values())
-            run.controller.abort();
+        else {
+            if (sessions.size >= MAX_SESSIONS)
+                stop(sessions.keys().next().value);
+            session = { sessionId: context.sessionId, latest: runId, seenRuns: new Set() };
+            touchSession(scope, session);
+        }
+        session.current?.controller.abort();
         session.latest = runId;
+        session.seenRuns.add(runId);
+        if (session.seenRuns.size > MAX_SEEN_RUNS)
+            session.seenRuns.delete(session.seenRuns.values().next().value);
         const activeSession = session;
         const controller = new AbortController(), { signal } = controller;
         const record = (outcome) => diagnostics?.record(agentId, "myTurn", outcome);
         const timer = setTimeout(() => controller.abort(new DOMException("My Turn deadline", "TimeoutError")), DEADLINE_MS);
         const check = async () => {
             try {
-                const latest = event.messages.at(-1);
-                const currentMessage = humanMessage(latest);
-                // Without matching host-authored metadata, skip advice rather than guess that the trigger is human.
-                if (!currentMessage || messageText(latest)?.text !== event.prompt.trim() ||
-                    !context.senderId || currentMessage.senderId !== context.senderId) {
-                    record("missing_identity");
+                const built = buildMyTurnState({
+                    cfg: api.config,
+                    agentId,
+                    provider,
+                    prompt: event.prompt,
+                    messages: event.messages,
+                    senderId: context.senderId,
+                    historyMessages: config.historyMessages,
+                });
+                if (!built.ok) {
+                    record(built.reason);
                     return;
                 }
                 const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
@@ -156,26 +200,7 @@ export function registerMyTurn(api, config, typesafe, diagnostics) {
                     record("missing_key");
                     return;
                 }
-                const history = [];
-                const state = { agent: { id: agentId, name: resolveAgentIdentity(api.config, agentId)?.name?.trim() || agentId },
-                    provider, currentMessage, history };
-                let size = estimateJevTokens(state);
-                // Never advise silence after silently truncating the current human request.
-                if (size > MAX_STATE_TOKENS) {
-                    record("input_too_large");
-                    return;
-                }
-                for (let i = event.messages.length - 2; i >= 0 && state.history.length < config.historyMessages - 1; i--) {
-                    const message = humanMessage(event.messages[i]);
-                    if (!message)
-                        continue;
-                    const cost = estimateJevTokens(message) + 1;
-                    if (size + cost > MAX_STATE_TOKENS)
-                        break;
-                    state.history.unshift(message);
-                    size += cost;
-                }
-                const result = await abortable(decideWithModel({ apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal, timeoutMs: typesafe.timeoutMs }, state, SHOULD_RESPOND_QUESTIONS, { validateModel: false }), signal);
+                const result = await abortable(decideWithModel({ apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal, timeoutMs: typesafe.timeoutMs }, built.state, SHOULD_RESPOND_QUESTIONS, { validateModel: false }), signal);
                 if (sessions.get(scope) !== activeSession || activeSession.latest !== runId) {
                     record("cancelled");
                     return;
@@ -201,9 +226,7 @@ export function registerMyTurn(api, config, typesafe, diagnostics) {
             }
         };
         const result = check();
-        session.runs.set(runId, { controller, result });
-        if (session.runs.size > 4)
-            session.runs.delete(session.runs.keys().next().value);
+        session.current = { controller, result };
         return result;
     };
     api.on("session_end", (event, context) => {

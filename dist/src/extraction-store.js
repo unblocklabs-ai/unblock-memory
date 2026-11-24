@@ -1,5 +1,42 @@
 import { createHash, randomUUID } from "node:crypto";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
+import { jsonHash } from "./json-hash.js";
+export class ExtractionLeaseLostError extends Error {
+    constructor() {
+        super("Extraction lease lost");
+        this.name = "ExtractionLeaseLostError";
+    }
+}
+export function extractionPolicyFingerprint(params) {
+    return jsonHash({
+        version: params.version,
+        historyMessages: params.historyMessages,
+        minSupport: params.minSupport,
+        minRetention: params.minRetention,
+        minReplacement: params.minReplacement,
+        validatorModel: params.validatorModel ?? null,
+    });
+}
+export function buildCompleteRevision(sourceRevision, policyFingerprint) {
+    return JSON.stringify({ sourceRevision, policy: policyFingerprint });
+}
+function parseCompleteRevision(value) {
+    if (value === null)
+        return null;
+    try {
+        const parsed = JSON.parse(value);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
+            typeof parsed.sourceRevision === "string" &&
+            typeof parsed.policy === "string") {
+            return {
+                sourceRevision: parsed.sourceRevision,
+                policy: parsed.policy,
+            };
+        }
+    }
+    catch { /* Legacy plain-string complete_revision without policy binding. */ }
+    return { sourceRevision: value, policy: null };
+}
 function memoryDigest(text) {
     return createHash("sha256").update(text.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]+$/, "")).digest("hex");
 }
@@ -55,21 +92,50 @@ export class ExtractionStore {
         const now = Date.now();
         if (!this.db.prepare("UPDATE extraction_worker SET lease_until=? WHERE id=1 AND owner=? AND lease_until>=?")
             .run(now + 180_000, owner, now).changes)
-            throw new Error("Extraction lease lost");
+            throw new ExtractionLeaseLostError();
     }
     release(owner) { this.db.prepare("UPDATE extraction_worker SET owner=NULL,lease_until=0 WHERE id=1 AND owner=?").run(owner); }
-    checkpoint(session, since) {
-        this.db.prepare(`INSERT INTO extraction_sessions(session_id,metadata,updated_at,extract_since) VALUES(?,?,?,?)
-      ON CONFLICT(session_id) DO UPDATE SET metadata=excluded.metadata WHERE metadata IS NOT excluded.metadata`).run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince());
-        const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision FROM extraction_sessions WHERE session_id=?").get(session.sessionId);
-        if (since !== undefined && since < Number(row.extract_since)) {
-            // A broader explicitly approved backfill replays this session. Existing facts are
-            // supplied to Luna and exact duplicates are ignored; history is never deleted.
-            this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=? WHERE session_id=?").run(since, session.sessionId);
-            return { cursor: null, context: [], since, completeRevision: null };
-        }
-        return { cursor: row.cursor, context: JSON.parse(String(row.context)), since: Number(row.extract_since),
-            completeRevision: row.complete_revision };
+    readCheckpoint(sessionId) {
+        const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision,error FROM extraction_sessions WHERE session_id=?").get(sessionId);
+        if (!row)
+            return undefined;
+        return {
+            cursor: row.cursor,
+            context: JSON.parse(String(row.context)),
+            since: Number(row.extract_since),
+            completeRevision: row.complete_revision,
+            error: row.error,
+        };
+    }
+    checkpoint(session, owner, since, policyFingerprint) {
+        return immediateTransaction(this.db, () => {
+            this.renew(owner);
+            this.db.prepare(`INSERT INTO extraction_sessions(session_id,metadata,updated_at,extract_since) VALUES(?,?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET metadata=excluded.metadata WHERE metadata IS NOT excluded.metadata`)
+                .run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince());
+            const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision FROM extraction_sessions WHERE session_id=?").get(session.sessionId);
+            if (since !== undefined && since < Number(row.extract_since)) {
+                // A broader explicitly approved backfill replays this session. Existing facts are
+                // supplied to Luna and exact duplicates are ignored; history is never deleted.
+                this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=? WHERE session_id=?").run(since, session.sessionId);
+                return { cursor: null, context: [], since, completeRevision: null };
+            }
+            const storedCompleteRevision = row.complete_revision;
+            if (policyFingerprint !== undefined && storedCompleteRevision !== null) {
+                const parsed = parseCompleteRevision(storedCompleteRevision);
+                if (parsed && parsed.policy !== policyFingerprint) {
+                    // A prompt or retention-policy change replays the session with existing facts retained.
+                    this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL WHERE session_id=?").run(session.sessionId);
+                    return { cursor: null, context: [], since: Number(row.extract_since), completeRevision: null };
+                }
+            }
+            return {
+                cursor: row.cursor,
+                context: JSON.parse(String(row.context)),
+                since: Number(row.extract_since),
+                completeRevision: storedCompleteRevision,
+            };
+        });
     }
     records(sessionId, paths) {
         const keys = paths?.filter(path => /^[a-f0-9-]+\/[1-9]\d*$/.test(path)).map(path => path.split("/"));
@@ -86,15 +152,27 @@ export class ExtractionStore {
         immediateTransaction(this.db, () => {
             this.renew(owner);
             this.db.prepare("UPDATE extracted_memories SET status='withdrawn' WHERE session_id=? AND status='active'").run(sessionId);
-            this.db.prepare("UPDATE extraction_sessions SET cursor=?,context='[]',complete_revision=NULL,error=NULL WHERE session_id=?").run(cursor, sessionId);
+            this.db.prepare("UPDATE extraction_sessions SET cursor=?,context='[]',complete_revision=NULL,error=NULL,updated_at=? WHERE session_id=?")
+                .run(cursor, Date.now(), sessionId);
+        });
+    }
+    completeEmpty(params) {
+        immediateTransaction(this.db, () => {
+            this.renew(params.owner);
+            const current = this.db.prepare("SELECT cursor FROM extraction_sessions WHERE session_id=?").get(params.sessionId);
+            if (!current || current.cursor !== params.expected)
+                throw new Error("Extraction checkpoint changed");
+            this.db.prepare("UPDATE extraction_sessions SET updated_at=?,complete_revision=?,error=NULL WHERE session_id=?")
+                .run(Date.now(), params.completeRevision ?? null, params.sessionId);
         });
     }
     commit(params) {
         return immediateTransaction(this.db, () => {
             let written = 0;
+            const replaced = new Set();
             this.renew(params.owner);
             const current = this.db.prepare("SELECT cursor FROM extraction_sessions WHERE session_id=?").get(params.session.sessionId);
-            if (current?.cursor !== params.expected)
+            if (!current || current.cursor !== params.expected)
                 throw new Error("Extraction checkpoint changed");
             for (const { proposal, observedAt, judgment } of params.accepted) {
                 const digest = memoryDigest(proposal.text);
@@ -104,10 +182,13 @@ export class ExtractionStore {
                     continue;
                 let id = randomUUID(), revision = 1;
                 if (proposal.replaces) {
+                    if (replaced.has(proposal.replaces))
+                        throw new Error("Conflicting memory replacement in batch");
                     const previous = this.db.prepare("SELECT revision,observed_at FROM extracted_memories WHERE id=? AND session_id=? AND status='active'")
                         .get(proposal.replaces, params.session.sessionId);
                     if (!previous || Number(previous.observed_at) > observedAt)
                         throw new Error("Invalid or stale memory replacement");
+                    replaced.add(proposal.replaces);
                     id = proposal.replaces;
                     revision = Number(previous.revision) + 1;
                     this.db.prepare("UPDATE extracted_memories SET status='superseded' WHERE id=? AND status='active'").run(id);
@@ -121,8 +202,11 @@ export class ExtractionStore {
             return written;
         });
     }
-    error(sessionId, code) {
-        this.db.prepare("UPDATE extraction_sessions SET error=?,updated_at=? WHERE session_id=?").run(code, Date.now(), sessionId);
+    error(sessionId, code, owner) {
+        immediateTransaction(this.db, () => {
+            this.renew(owner);
+            this.db.prepare("UPDATE extraction_sessions SET error=?,updated_at=? WHERE session_id=?").run(code, Date.now(), sessionId);
+        });
     }
     report() {
         return { memories: this.records(), sessions: this.db.prepare("SELECT session_id,updated_at,error,cursor IS NOT NULL AS checkpointed FROM extraction_sessions").all() };

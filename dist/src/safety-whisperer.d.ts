@@ -23,7 +23,7 @@ export declare function safetyStatus(cfg: unknown, config: SafetyPluginConfig): 
     hostTimeoutMs?: number | undefined;
     slowestWhispererMs?: number | undefined;
     warnings?: string[] | undefined;
-    reason?: string | undefined;
+    reason?: "typesafe_disabled" | "conversation_access_not_allowed" | "prompt_injection_not_allowed" | "no_enabled_scenarios" | undefined;
     enabled: boolean;
     active: boolean;
 };

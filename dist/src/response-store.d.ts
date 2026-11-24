@@ -1,5 +1,5 @@
 import type { ResponseEpisode } from "./response-episodes.js";
-import { type ResponseJudgment, type ResponseStages, type judgeMemoryOpportunity, type judgeResponseFollowup } from "./response-judge.js";
+import { type ResponseJudgment, type ResponseStageContracts, type ResponseStages, type judgeMemoryOpportunity, type judgeResponseFollowup } from "./response-judge.js";
 import { responseOutcome } from "./response-outcome.js";
 import type { ResponseHuman } from "./response-identity.js";
 import { ResponseReviews } from "./response-reviews.js";
@@ -62,7 +62,7 @@ export declare class ResponseAuditStore {
     pendingWork(cohort: string, since: number, now: number): number;
     /** Retry eligibility is not completion: include backoff and exhausted work. */
     unresolvedWork(cohort: string, since: number, until: number): number;
-    stage<K extends keyof ResponseStages>(cohort: string, e: ResponseEpisode, stage: K, key: string): ResponseStages[K] | undefined;
+    stage<K extends keyof ResponseStages>(cohort: string, e: ResponseEpisode, stage: K, key: string, contract?: ResponseStageContracts[K]): ResponseStages[K] | undefined;
     stageBegin(keys: string[], now: number): void;
     stageSave<K extends keyof ResponseStages>(key: string, result: ResponseStages[K], now: number): void;
     retryFailed(cohort: string): {
@@ -167,8 +167,8 @@ export declare class ResponseAuditStore {
             beforeCoverage: number;
             afterCoverage: number;
             coverageChanged: boolean;
-            denominator: string;
-            scale: string;
+            denominator: "confident_assessable_exchanges" | "all_evaluated_exchanges" | "sentiment_assessed_exchanges" | "emotion_assessed_exchanges" | "confident_intensity_exchanges";
+            scale: "0_to_3_visible_quality" | "0_to_1_observed_rate" | "0_to_3_expressed_dissatisfaction";
             delta: number | null;
         }[];
         examples: {

@@ -192,12 +192,24 @@ export type ResponseStages = {
     retrospective: Awaited<ReturnType<typeof judgeResponseFollowup>>;
     memory: Awaited<ReturnType<typeof judgeMemoryOpportunity>>;
 };
+export type ResponseStageContracts = {
+    quality?: undefined;
+    feedback?: undefined;
+    sentiment?: undefined;
+    retrospective?: {
+        status: ResponseEpisode["followup"]["status"];
+    };
+    memory?: readonly {
+        path: string;
+        hash: string;
+    }[];
+};
 type JudgeStage = "quality" | "feedback" | "sentiment";
 type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
     begin: (stages: JudgeStage[]) => void;
     save: <K extends JudgeStage>(stage: K, result: ResponseStages[K]) => void;
 };
-export declare function validateCachedStage<K extends keyof ResponseStages>(stage: K, value: unknown): ResponseStages[K];
+export declare function validateCachedStage<K extends keyof ResponseStages>(stage: K, value: unknown, contract?: ResponseStageContracts[K]): ResponseStages[K];
 /** Separate requests are deliberate: later feedback must not leak into the original quality grade. */
 export declare function judgeResponse(episode: ResponseEpisode, params: ResponseJudgeParams, sentimentEnabled?: boolean, cache?: StageCache): Promise<ResponseJudgment>;
 /** Later evidence is kept in a third request and never changes the original grade. */

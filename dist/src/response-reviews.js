@@ -3,9 +3,14 @@ import { responseOutcome } from "./response-outcome.js";
 import { immediateTransaction } from "./memory-database.js";
 import { jsonHash } from "./json-hash.js";
 export const RESPONSE_REVIEW_POLICY = "response-review-v2";
+const DECISION_PROVENANCE_COLUMNS = ["cohort", "input_hash", "evidence_hash"];
+function evidenceRevision(cohort, inputHash, detail) {
+    return jsonHash([cohort, inputHash, detail]);
+}
 /** Operator-only tasks, intentionally not exposed as memory-curation agent tools. */
 export class ResponseReviews {
     db;
+    #provenanceColumnsReady = false;
     constructor(db) {
         this.db = db;
         db.exec(`CREATE TABLE IF NOT EXISTS response_review_tasks (
@@ -23,6 +28,20 @@ export class ResponseReviews {
         PRIMARY KEY(cohort,episode_id));
       CREATE TABLE IF NOT EXISTS response_annotations (
         id TEXT PRIMARY KEY, occurred_at INTEGER NOT NULL, kind TEXT NOT NULL, note TEXT NOT NULL);`);
+    }
+    #decisionColumns() {
+        const rows = this.db.prepare("PRAGMA table_info(response_review_decisions)").all();
+        return new Set(rows.map(row => String(row.name)));
+    }
+    #ensureDecisionProvenanceColumns() {
+        if (this.#provenanceColumnsReady)
+            return;
+        const existing = this.#decisionColumns();
+        for (const column of DECISION_PROVENANCE_COLUMNS) {
+            if (!existing.has(column)) {
+                this.db.exec(`ALTER TABLE response_review_decisions ADD COLUMN ${column} TEXT`);
+            }
+        }
     }
     sync(cohort, episodeId, inputHash, result, now) {
         this.db.prepare(`UPDATE response_review_evidence SET active=-1 WHERE cohort=? AND task_id IN
@@ -75,25 +94,103 @@ export class ResponseReviews {
     list(cohort, id) {
         return this.db.prepare(`SELECT t.*,e.input_hash,e.active,e.detail FROM response_review_tasks t
       JOIN response_review_evidence e ON e.task_id=t.id WHERE e.cohort=? ${id ? "AND t.id=?" : ""}
-      ORDER BY t.updated_at DESC,t.id LIMIT 1001`).all(cohort, ...(id ? [id] : [])).map(row => ({
-            id: String(row.id), episodeId: String(row.episode_id), family: String(row.family), status: String(row.status),
-            evidenceStatus: row.active === 1 ? "current" : row.active === -1 ? "superseded" : "stale", reviewerKind: row.reviewer_kind,
-            resolutionNote: row.resolution_note, createdAt: row.created_at, updatedAt: row.updated_at,
-            evidence: JSON.parse(String(row.detail)),
+      ORDER BY t.updated_at DESC,t.id LIMIT 1001`).all(cohort, ...(id ? [id] : [])).map(row => {
+            const inputHash = String(row.input_hash);
+            const detail = String(row.detail);
+            return {
+                id: String(row.id), episodeId: String(row.episode_id), family: String(row.family), status: String(row.status),
+                cohort, inputHash, evidenceHash: evidenceRevision(cohort, inputHash, detail),
+                evidenceStatus: row.active === 1 ? "current" : row.active === -1 ? "superseded" : "stale", reviewerKind: row.reviewer_kind,
+                resolutionNote: row.resolution_note, createdAt: row.created_at, updatedAt: row.updated_at,
+                evidence: JSON.parse(detail),
+            };
+        });
+    }
+    decisions(taskId, cohort) {
+        const columns = this.#decisionColumns();
+        const hasCohort = columns.has("cohort");
+        const hasInputHash = columns.has("input_hash");
+        const hasEvidenceHash = columns.has("evidence_hash");
+        if (cohort !== undefined && !hasCohort)
+            return [];
+        const clauses = [];
+        const params = [];
+        if (taskId !== undefined) {
+            clauses.push("task_id=?");
+            params.push(taskId);
+        }
+        if (cohort !== undefined) {
+            clauses.push("cohort=?");
+            params.push(cohort);
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+        const select = [
+            "id", "task_id", "status", "reviewer_kind", "note", "decided_at",
+            hasCohort ? "cohort" : "NULL AS cohort",
+            hasInputHash ? "input_hash" : "NULL AS input_hash",
+            hasEvidenceHash ? "evidence_hash" : "NULL AS evidence_hash",
+        ].join(",");
+        return this.db.prepare(`SELECT ${select} FROM response_review_decisions ${where} ORDER BY decided_at,id`)
+            .all(...params)
+            .map(row => ({
+            id: Number(row.id),
+            taskId: String(row.task_id),
+            status: String(row.status),
+            reviewerKind: String(row.reviewer_kind),
+            note: String(row.note),
+            decidedAt: Number(row.decided_at),
+            cohort: row.cohort === null ? null : String(row.cohort),
+            inputHash: row.input_hash === null ? null : String(row.input_hash),
+            evidenceHash: row.evidence_hash === null ? null : String(row.evidence_hash),
         }));
     }
-    decide(cohort, id, status, reviewer, note, now = Date.now()) {
+    decide(cohort, id, status, reviewer, note, now = Date.now(), options) {
+        const trimmedNote = note.trim();
         if (!["pending", "resolved", "dismissed", "deferred"].includes(status) || !["human", "agent"].includes(reviewer) ||
-            !note.trim() || note.length > 4000)
+            !trimmedNote || note.length > 4000)
             throw new Error("Invalid response review decision");
-        if (!this.list(cohort, id).length)
-            throw new Error("Unknown response review task in current cohort");
-        immediateTransaction(this.db, () => {
+        if (options?.expectedInputHash !== undefined && !options.expectedInputHash.trim()) {
+            throw new Error("Invalid expected response review input hash");
+        }
+        if (options?.expectedEvidenceHash !== undefined && !options.expectedEvidenceHash.trim()) {
+            throw new Error("Invalid expected response review evidence hash");
+        }
+        const recorded = immediateTransaction(this.db, () => {
+            const row = this.db.prepare(`SELECT t.episode_id,e.input_hash,e.active,e.detail
+        FROM response_review_tasks t
+        JOIN response_review_evidence e ON e.task_id=t.id
+        WHERE e.cohort=? AND t.id=?`).get(cohort, id);
+            if (!row)
+                throw new Error("Unknown response review task in current cohort");
+            const active = Number(row.active);
+            if (active !== 1) {
+                const state = active === -1 ? "superseded" : "stale";
+                throw new Error(`Cannot decide response review task with ${state} evidence`);
+            }
+            const inputHash = String(row.input_hash);
+            const currentResult = this.db.prepare(`SELECT 1 FROM response_results
+        WHERE cohort=? AND id=? AND input_hash=? AND active=1 AND status='ok'`)
+                .get(cohort, String(row.episode_id), inputHash);
+            if (!currentResult) {
+                throw new Error("Cannot decide response review task with stale evidence");
+            }
+            const evidenceHash = evidenceRevision(cohort, inputHash, String(row.detail));
+            if (options?.expectedInputHash !== undefined && options.expectedInputHash !== inputHash) {
+                throw new Error("Response review evidence input hash mismatch");
+            }
+            if (options?.expectedEvidenceHash !== undefined && options.expectedEvidenceHash !== evidenceHash) {
+                throw new Error("Response review evidence revision mismatch");
+            }
+            this.#ensureDecisionProvenanceColumns();
             this.db.prepare("UPDATE response_review_tasks SET status=?,reviewer_kind=?,resolution_note=?,updated_at=? WHERE id=?")
-                .run(status, reviewer, note.trim(), now, id);
-            this.db.prepare("INSERT INTO response_review_decisions(task_id,status,reviewer_kind,note,decided_at) VALUES(?,?,?,?,?)")
-                .run(id, status, reviewer, note.trim(), now);
+                .run(status, reviewer, trimmedNote, now, id);
+            this.db.prepare(`INSERT INTO response_review_decisions(task_id,status,reviewer_kind,note,decided_at,cohort,input_hash,evidence_hash)
+        VALUES(?,?,?,?,?,?,?,?)`)
+                .run(id, status, reviewer, trimmedNote, now, cohort, inputHash, evidenceHash);
+            return { taskId: id, status, reviewerKind: reviewer, note: trimmedNote, decidedAt: now, cohort, inputHash, evidenceHash };
         });
+        this.#provenanceColumnsReady = true;
+        return recorded;
     }
     annotate(occurredAt, kind, note) {
         if (!Number.isFinite(occurredAt) || !["model", "prompt", "deployment", "other"].includes(kind) || !note.trim() || note.length > 4000)

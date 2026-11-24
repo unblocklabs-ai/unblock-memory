@@ -391,7 +391,7 @@ export function refreshEmotionBaselines(db, options) {
     if (!Number.isFinite(now) || !Number.isInteger(minimum) || minimum < 1)
         throw new Error("Invalid baseline settings");
     initializeEmotionBaselines(db);
-    const expectedGenerations = loadPersonGenerations(db);
+    const expectedGenerations = options.expectedGenerations ?? loadPersonGenerations(db);
     const readGeneration = db.prepare("SELECT generation FROM inside_out_person_generations WHERE person_id=?");
     const personGenerationMatches = (tx, personId) => getPersonGeneration(tx, readGeneration, personId) === (expectedGenerations.get(personId) ?? 0);
     let snapshots = 0, comparisons = 0;
@@ -490,7 +490,7 @@ function readBaselineHistory(db, options, limit) {
     }
     return selected.map(row => snapshots.get(JSON.stringify([JSON.stringify([row.person_id, row.rubric, row.model]), row.week_start])));
 }
-function computeBaselineInputFingerprint(db, options) {
+function computeBaselineInputSnapshot(db, options) {
     const digest = createHash("sha256").update(JSON.stringify([VERSION, weekStart(options.now), options.minInteractions]));
     if (tableExists(db, "people")) {
         let count = 0;
@@ -527,16 +527,20 @@ function computeBaselineInputFingerprint(db, options) {
     else {
         digest.update("|grades:-1");
     }
+    const personGenerations = new Map();
     digest.update("|generations:");
     let generationCount = 0;
     if (tableExists(db, "inside_out_person_generations")) {
         for (const row of db.prepare("SELECT person_id,generation FROM inside_out_person_generations ORDER BY person_id").iterate()) {
-            digest.update(`${JSON.stringify([row.person_id, row.generation])},`);
+            const personId = String(row.person_id);
+            const generation = Number(row.generation);
+            personGenerations.set(personId, generation);
+            digest.update(`${JSON.stringify([personId, generation])},`);
             generationCount++;
         }
     }
     digest.update(`#${generationCount}`);
-    return digest.digest("hex");
+    return { inputFingerprint: digest.digest("hex"), personGenerations };
 }
 function computeBaselineFingerprintFromInput(db, inputFingerprint) {
     const digest = createHash("sha256").update(JSON.stringify([inputFingerprint, schemaVersion(db) ?? null]));
@@ -546,21 +550,25 @@ function computeBaselineFingerprintFromInput(db, inputFingerprint) {
     return digest.digest("hex");
 }
 /**
- * Fingerprint of refresh inputs only (settings, current week, People tables, grades, and purge generations).
- * Excludes derived output tables so a refresh can verify inputs stayed stable across a pass
- * before certifying its post-pass fingerprint.
+ * Snapshot of refresh inputs only (settings, current week, People tables, grades, and purge generations).
+ * Captures input fingerprint and per-person purge generations in one read snapshot so purges committing
+ * after the pre-pass snapshot are fenced out before refreshEmotionBaselines runs.
  */
-export function baselineInputFingerprint(db, options) {
-    return readSnapshot(db, () => computeBaselineInputFingerprint(db, options));
+export function baselineInputSnapshot(db, options) {
+    return readSnapshot(db, () => computeBaselineInputSnapshot(db, options));
 }
 /**
- * Computes both input and full fingerprints inside one consistent SQLite read snapshot so
- * post-pass certification never rescans inputs or mixes pre- and post-commit state.
+ * Computes input fingerprint, full fingerprint, and purge generations inside one consistent SQLite
+ * read snapshot so pre-pass fencing and post-pass certification never mix pre- and post-commit state.
  */
 export function baselineFingerprints(db, options) {
     return readSnapshot(db, () => {
-        const inputFingerprint = computeBaselineInputFingerprint(db, options);
-        return { inputFingerprint, fullFingerprint: computeBaselineFingerprintFromInput(db, inputFingerprint) };
+        const { inputFingerprint, personGenerations } = computeBaselineInputSnapshot(db, options);
+        return {
+            inputFingerprint,
+            fullFingerprint: computeBaselineFingerprintFromInput(db, inputFingerprint),
+            personGenerations,
+        };
     });
 }
 /**

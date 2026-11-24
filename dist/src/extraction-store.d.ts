@@ -21,6 +21,18 @@ export type ExtractedRecord = {
     metadata: ExtractionSession;
     judgment: unknown;
 };
+export declare class ExtractionLeaseLostError extends Error {
+    constructor();
+}
+export declare function extractionPolicyFingerprint(params: {
+    version: string;
+    historyMessages: number;
+    minSupport: number;
+    minRetention: number;
+    minReplacement: number;
+    validatorModel?: string;
+}): string;
+export declare function buildCompleteRevision(sourceRevision: string, policyFingerprint: string): string;
 export declare class ExtractionStore {
     readonly db: import("node:sqlite").DatabaseSync;
     constructor(path: string);
@@ -29,9 +41,18 @@ export declare class ExtractionStore {
     claim(scheduled: boolean, intervalMs: number): string | undefined;
     renew(owner: string): void;
     release(owner: string): void;
-    checkpoint(session: ExtractionSession, since?: number): Checkpoint;
+    readCheckpoint(sessionId: string): (Checkpoint & {
+        error: string | null;
+    }) | undefined;
+    checkpoint(session: ExtractionSession, owner: string, since?: number, policyFingerprint?: string): Checkpoint;
     records(sessionId?: string, paths?: readonly string[]): ExtractedRecord[];
     reset(sessionId: string, cursor: string | null, owner: string): void;
+    completeEmpty(params: {
+        sessionId: string;
+        expected: string | null;
+        owner: string;
+        completeRevision?: string;
+    }): void;
     commit(params: {
         session: ExtractionSession;
         expected: string | null;
@@ -46,7 +67,7 @@ export declare class ExtractionStore {
         version: string;
         completeRevision?: string;
     }): number;
-    error(sessionId: string, code: string): void;
+    error(sessionId: string, code: string, owner: string): void;
     report(): {
         memories: ExtractedRecord[];
         sessions: Record<string, import("node:sqlite").SQLOutputValue>[];

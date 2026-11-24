@@ -1,6 +1,7 @@
 import { Type, type Static } from "typebox";
 import type { ReviewManifest } from "./people-learning-inventory.js";
 export declare const LEARNING_RECEIPT_SCHEMA: Type.TObject<{
+    manifestRevision: Type.TOptional<Type.TString>;
     peopleReviews: Type.TArray<Type.TObject<{
         reason: Type.TString;
         sourceRefs: Type.TArray<Type.TString>;
@@ -35,6 +36,15 @@ export declare const LEARNING_RECEIPT_SCHEMA: Type.TObject<{
     executionFollowups: Type.TArray<Type.TString>;
 }>;
 export type LearningReceipt = Static<typeof LEARNING_RECEIPT_SCHEMA>;
+export type RecordAnalysisOptions = {
+    expectedManifestRevision?: string;
+    startedAt?: number;
+    recordedAt?: number;
+    generation?: number;
+    sequence?: number;
+    instanceId?: string;
+};
+export declare function manifestRevision(manifest: ReviewManifest): string;
 export declare function verifyLearningCoverage(manifest: ReviewManifest, receipt: LearningReceipt, now?: number): {
     status: "partial" | "complete" | "invalid";
     expectedPeople: number;
@@ -49,11 +59,16 @@ export declare class PeopleLearningStore {
     readonly agentId: string;
     constructor(path: string, agentId: string);
     close(): void;
-    recordAnalysis(id: string, status: "complete" | "unresolved", result: unknown, basis: string): void;
+    recordAnalysis(id: string, status: "complete" | "unresolved", result: unknown, basis: string, options?: RecordAnalysisOptions): {
+        recorded: boolean;
+        reason?: "manifest_changed" | "superseded";
+    };
     analysis(id: string): Record<string, import("node:sqlite").SQLOutputValue> | undefined;
-    begin(manifest: ReviewManifest): {
+    begin(manifest: ReviewManifest, beforeCommit?: (manifest: ReviewManifest) => void): {
         manifest: ReviewManifest;
+        manifestRevision: string;
         receipt: {
+            manifestRevision?: string | undefined;
             analysis: {
                 status: "complete" | "unresolved" | "not_approved";
                 reason: string;
@@ -91,9 +106,12 @@ export declare class PeopleLearningStore {
         coverage: unknown;
     };
     planMissedWindows(manifest: ReviewManifest): void;
+    matchesRevision(id: string, expectedRevision?: string): boolean;
     get(id: string): {
         manifest: ReviewManifest;
+        manifestRevision: string;
         receipt: {
+            manifestRevision?: string | undefined;
             analysis: {
                 status: "complete" | "unresolved" | "not_approved";
                 reason: string;
@@ -135,12 +153,11 @@ export declare class PeopleLearningStore {
         status: string;
         coverage: unknown;
     }[];
-    checkpoint(id: string, input: unknown, now?: number, checkSaves?: (receipt: LearningReceipt) => string[], finalize?: (receiptId: string) => void): {
-        backlog: {
-            id: string;
-            status: string;
-            coverage: unknown;
-        }[];
+    checkpoint(id: string, input: unknown, now?: number, checkSaves?: (receipt: LearningReceipt) => string[], finalize?: (receiptId: string) => void, expectedManifestRevision?: string): {
+        receiptId: string;
+        manifestRevision: string;
+        backlog: ReturnType<PeopleLearningStore["backlog"]>;
+    } & {
         status: "partial" | "complete" | "invalid";
         expectedPeople: number;
         expectedSessions: number;
@@ -148,6 +165,5 @@ export declare class PeopleLearningStore {
         missing: string[];
         errors: string[];
         unresolved: string[];
-        receiptId: string;
     };
 }

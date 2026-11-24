@@ -213,26 +213,37 @@ function validateCachedSentiment(value) {
     validateDistributions(picked);
     return picked;
 }
-function validateCachedRetrospective(value) {
+function validateCachedRetrospective(value, contract) {
     if (!Value.Check(retrospectiveStageSchema, value))
         throw new Error("Invalid cached response retrospective judgment");
+    if (contract && value.status !== contract.status) {
+        throw new Error("Cached response retrospective status mismatches expected followup status");
+    }
     const judgment = value.judgment ? retrospectiveFields(value.judgment) : null;
+    if (value.status === "complete" && !judgment) {
+        throw new Error("Invalid cached response retrospective judgment: complete status requires judgment");
+    }
     if (judgment)
         validateDistributions(judgment);
     return { status: value.status, judgment };
 }
-function validateCachedMemory(value) {
+function validateCachedMemory(value, contract) {
     if (!Value.Check(memoryStageSchema, value))
         throw new Error("Invalid cached response memory judgment");
+    if (contract) {
+        if (value.length !== contract.length || contract.some((expected, i) => value[i].path !== expected.path || value[i].hash !== expected.hash)) {
+            throw new Error("Cached response memory judgment mismatches candidate contract");
+        }
+    }
     return value.map(({ path, hash, usefulness, basis }) => ({ path, hash, usefulness, basis }));
 }
-export function validateCachedStage(stage, value) {
+export function validateCachedStage(stage, value, contract) {
     switch (stage) {
         case "quality": return validateCachedQuality(value);
         case "feedback": return validateCachedFeedback(value);
         case "sentiment": return validateCachedSentiment(value);
-        case "retrospective": return validateCachedRetrospective(value);
-        case "memory": return validateCachedMemory(value);
+        case "retrospective": return validateCachedRetrospective(value, contract);
+        case "memory": return validateCachedMemory(value, contract);
     }
 }
 function toFourLevelScore(answer) {

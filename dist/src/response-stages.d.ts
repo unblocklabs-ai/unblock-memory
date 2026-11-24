@@ -8,18 +8,18 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
     retrospective: {
         status: ResponseEpisode["followup"]["status"];
         judgment: {
-            outcome: {
+            reason: {
                 type: "choice";
-                choice: "unknown" | "reported_shortfall" | "acknowledged_success";
+                choice: "none_or_unclear" | "missing_requested_work" | "unnecessary_deferral" | "regression" | "incorrect_claim" | "wrong_scope" | "failed_delivery";
                 probabilities: {
                     [x: string]: number;
                     [x: number]: number;
                 };
                 confidence: number;
             };
-            reason: {
+            outcome: {
                 type: "choice";
-                choice: "none_or_unclear" | "missing_requested_work" | "unnecessary_deferral" | "regression" | "incorrect_claim" | "wrong_scope" | "failed_delivery";
+                choice: "unknown" | "reported_shortfall" | "acknowledged_success";
                 probabilities: {
                     [x: string]: number;
                     [x: number]: number;
