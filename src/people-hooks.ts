@@ -8,7 +8,7 @@ import { renderPeopleDossier } from "./people-background.js";
 const MAX_CORRELATION_ENTRIES = 1000;
 const CORRELATION_TTL_MS = 10 * 60_000;
 
-type TimedCorrelation<T> = { threadKey: T; observedAt: number };
+type TimedCorrelation<T> = { threadKey: T; messageId?: string; observedAt: number };
 
 function identifier(value: unknown): string | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
@@ -17,6 +17,18 @@ function identifier(value: unknown): string | undefined {
 
 function promptIdentityKey(sessionKey: string, accountScope: string, externalId: string): string {
   return JSON.stringify([sessionKey, accountScope, externalId]);
+}
+
+function matchesPendingMessage(
+  pending: TimedCorrelation<string | null>,
+  threadKey: string,
+  messageId: string | undefined,
+): boolean {
+  return (
+    messageId !== undefined &&
+    pending.threadKey === threadKey &&
+    pending.messageId === messageId
+  );
 }
 
 function resolveSlackThreadKey(
@@ -52,13 +64,14 @@ function setBoundedCorrelation<T>(
   key: string,
   threadKey: T,
   now: number,
+  messageId?: string,
 ): void {
   map.delete(key);
   for (const [existingKey, entry] of map) {
     if (now - entry.observedAt <= CORRELATION_TTL_MS) break;
     map.delete(existingKey);
   }
-  map.set(key, { threadKey, observedAt: now });
+  map.set(key, { threadKey, messageId, observedAt: now });
   while (map.size > MAX_CORRELATION_ENTRIES) {
     const oldest = map.keys().next().value;
     if (oldest === undefined) break;
@@ -105,14 +118,35 @@ export function registerPeopleHooks(
       const threadKey = resolveSlackThreadKey(event, accountScope, conversationId, sessionKey);
       if (threadKey) {
         const now = Date.now();
+        const messageId = nonBlank(event.messageId) ?? identifier(event.metadata?.messageId);
+        const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
         if (runId) {
-          setBoundedCorrelation(threadByRun, runId, threadKey, now);
+          setBoundedCorrelation(threadByRun, runId, threadKey, now, messageId);
+          const pending = pendingThreadByIdentity.get(identityKey);
+          if (
+            pending &&
+            (now - pending.observedAt > CORRELATION_TTL_MS ||
+              matchesPendingMessage(pending, threadKey, messageId))
+          ) {
+            pendingThreadByIdentity.delete(identityKey);
+          }
         } else {
-          const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
           const pending = getFreshCorrelation(pendingThreadByIdentity, identityKey, now);
           const nextThreadKey =
             pending === undefined || pending.threadKey === threadKey ? threadKey : null;
-          setBoundedCorrelation(pendingThreadByIdentity, identityKey, nextThreadKey, now);
+          const nextMessageId =
+            nextThreadKey === null
+              ? undefined
+              : pending === undefined || pending.messageId === messageId
+                ? messageId
+                : undefined;
+          setBoundedCorrelation(
+            pendingThreadByIdentity,
+            identityKey,
+            nextThreadKey,
+            now,
+            nextMessageId,
+          );
         }
       }
     }
@@ -165,7 +199,8 @@ export function registerPeopleHooks(
       const pending = pendingThreadByIdentity.get(identityKey);
       if (
         pending &&
-        (now - pending.observedAt > CORRELATION_TTL_MS || pending.threadKey === mapped.threadKey)
+        (now - pending.observedAt > CORRELATION_TTL_MS ||
+          matchesPendingMessage(pending, mapped.threadKey, mapped.messageId))
       ) {
         pendingThreadByIdentity.delete(identityKey);
       }
@@ -174,7 +209,7 @@ export function registerPeopleHooks(
       pendingThreadByIdentity.delete(identityKey);
       threadKey = pending?.threadKey;
       if (typeof threadKey === "string") {
-        setBoundedCorrelation(threadByRun, runId, threadKey, now);
+        setBoundedCorrelation(threadByRun, runId, threadKey, now, pending?.messageId);
       }
     }
     if (!threadKey) return;

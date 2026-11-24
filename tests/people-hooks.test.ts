@@ -996,6 +996,130 @@ test("withholds prompt injection when an unverified dossier replaces a verified 
   }
 });
 
+test("mapped Slack turn in the same thread does not consume another queued message's pending correlation", async () => {
+  const testHarness = await harness();
+  try {
+    const store = testHarness.stores.get("bill");
+    const { person } = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "workspace-a",
+      externalId: "U123",
+    });
+    saveVerified(store, person.id, "test setup", {
+      schemaVersion: 1,
+      blurb: "Person context.",
+      sections: [],
+    });
+
+    // Order 1: mapped message arrives first, then a distinct run-less message in the same thread.
+    testHarness.received(
+      { from: "slack:C123", content: "first queued", threadId: "980.0", messageId: "981.0", runId: "run-mapped-1" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "second queued", threadId: "980.0", messageId: "982.0" },
+      slackContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "first queued", messages: [] },
+        promptContext("U123", "run-mapped-1"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "second queued", messages: [] },
+        promptContext("U123", "run-pending-2"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+
+    // Order 2: run-less message arrives first, then a distinct mapped message in the same thread.
+    testHarness.received(
+      { from: "slack:C123", content: "third queued", threadId: "980.0", messageId: "983.0" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "fourth queued", threadId: "980.0", messageId: "984.0", runId: "run-mapped-3" },
+      slackContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "fourth queued", messages: [] },
+        promptContext("U123", "run-mapped-3"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "third queued", messages: [] },
+        promptContext("U123", "run-pending-4"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+
+    // Missing messageId on a mapped turn must not clobber a pending turn in the same thread.
+    testHarness.received(
+      { from: "slack:C123", content: "mapped without id", threadId: "980.0", runId: "run-mapped-5" },
+      slackContext,
+    );
+    testHarness.received(
+      { from: "slack:C123", content: "pending with id", threadId: "980.0", messageId: "985.0" },
+      slackContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "mapped without id", messages: [] },
+        promptContext("U123", "run-mapped-5"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "pending with id", messages: [] },
+        promptContext("U123", "run-pending-6"),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+
+    // Unthreaded DM messages share one session threadKey and must also stay isolated by messageId.
+    const dmContext = {
+      ...slackContext,
+      conversationId: "D980",
+      sessionKey: "agent:bill:slack:direct:U123",
+    };
+    testHarness.received(
+      { from: "slack:U123", content: "dm mapped", messageId: "986.0", runId: "dm-mapped-1" },
+      dmContext,
+    );
+    testHarness.received(
+      { from: "slack:U123", content: "dm pending", messageId: "987.0" },
+      dmContext,
+    );
+
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "dm mapped", messages: [] },
+        promptContext("U123", "dm-mapped-1", dmContext.sessionKey),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+    assert.equal(
+      testHarness.before?.(
+        { prompt: "dm pending", messages: [] },
+        promptContext("U123", "dm-pending-2", dmContext.sessionKey),
+      )?.appendContext,
+      "<people>Person context.</people>",
+    );
+  } finally {
+    testHarness.stores.closeAll();
+  }
+});
+
 test("renders only the bounded stored blurb", () => {
   assert.equal(renderPeopleWhisper("  useful context  ", 8), "useful c");
   assert.equal(renderPeopleWhisper("   ", 8), undefined);

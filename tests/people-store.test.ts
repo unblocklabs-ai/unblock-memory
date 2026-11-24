@@ -891,6 +891,70 @@ test("deleteDossier enforces optional expectedRevision compare-and-swap", async 
   }
 });
 
+test("recordDossierVerification rejects verifying a deleted dossier change ID and keeps isDossierVerified false", async () => {
+  const path = await temporaryPath();
+  const store = new PeopleStore(path, options);
+  try {
+    const person = store.upsertIdentity({
+      provider: "slack",
+      accountScope: "default",
+      externalId: "U123",
+    }).person;
+    const v1 = { schemaVersion: 1, blurb: "Verified v1.", sections: [] } as const;
+    const v2 = { schemaVersion: 1, blurb: "Recreated v2.", sections: [] } as const;
+
+    store.replaceVerifiedDossier(person.id, "Initial verified dossier", v1, "Verified v1", null);
+    assert.equal(store.isDossierVerified(person.id), true);
+
+    assert.equal(store.deleteDossier(person.id, "No longer accurate"), true);
+    const deleteRev = store.getDossierRevision(person.id);
+    assert.ok(deleteRev);
+    assert.equal(store.listDossierChanges(person.id)[0]?.action, "delete");
+    assert.equal(store.isDossierVerified(person.id), false);
+    assert.equal(store.getVerifiedDossier(person.id), undefined);
+
+    assert.throws(
+      () =>
+        store.recordDossierVerification(
+          person.id,
+          deleteRev,
+          "Attempt to verify deleted dossier revision",
+        ),
+      DossierConflictError,
+    );
+    assert.equal(store.isDossierVerified(person.id), false);
+    assert.equal(store.getVerifiedDossier(person.id), undefined);
+
+    // Even if a verification row points at the delete revision directly in SQLite,
+    // verification queries still require an active dossier row and a non-delete latest change.
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare(`
+        INSERT INTO person_dossier_verification (person_id, revision, verification, verified_at)
+        VALUES (?, ?, 'Injected delete verification', '2026-11-24T12:00:00.000Z')
+        ON CONFLICT(person_id) DO UPDATE SET
+          revision = excluded.revision,
+          verification = excluded.verification,
+          verified_at = excluded.verified_at
+      `).run(person.id, deleteRev);
+    } finally {
+      db.close();
+    }
+    assert.equal(store.isDossierVerified(person.id), false);
+    assert.equal(store.getVerifiedDossier(person.id), undefined);
+
+    // Recreating an active dossier allows verifying its new replace revision.
+    store.replaceDossier(person.id, "Recreated dossier", v2);
+    const recreatedRev = store.getDossierRevision(person.id);
+    assert.ok(recreatedRev && recreatedRev !== deleteRev);
+    store.recordDossierVerification(person.id, recreatedRev, "Verified recreated v2");
+    assert.equal(store.isDossierVerified(person.id), true);
+    assert.deepEqual(store.getVerifiedDossier(person.id)?.dossier, v2);
+  } finally {
+    store.close();
+  }
+});
+
 test("interaction claim helpers enforce shared categories, single timestamp checks, and 30-day lesson TTL", () => {
   assert.deepEqual(INTERACTION_DOSSIER_CATEGORIES, ["preferences", "workingStyle"]);
   assert.equal(AGENT_LESSON_MAX_TTL_MS, 30 * 86400_000);
