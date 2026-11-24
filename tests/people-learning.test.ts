@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi, OpenClawPluginService, OpenClawPluginToolFactory } from "openclaw/plugin-sdk/plugin-entry";
@@ -9,8 +9,8 @@ import { resolveConfig } from "../src/config.js";
 import { learningForAgent, PEOPLE_LEARNING_SCHEMA } from "../src/people-learning-config.js";
 import { reviewWindow } from "../src/people-learning-time.js";
 import { learningSession, reconcilePeopleLearning, type PeopleCron } from "../src/people-learning-cron.js";
-import { inventoryPeople, type ReviewManifest } from "../src/people-learning-inventory.js";
-import { PeopleLearningStore, verifyLearningCoverage, type LearningReceipt } from "../src/people-learning-store.js";
+import { inventoryPeople, privateJson, type ReviewManifest } from "../src/people-learning-inventory.js";
+import { manifestRevision, PeopleLearningStore, verifyLearningCoverage, type LearningReceipt } from "../src/people-learning-store.js";
 import { PeopleStores } from "../src/people-store.js";
 import { registerPeopleLearning } from "../src/people-learning-runtime.js";
 import { createAgentDatabase, insertSession, compressAgentTranscripts } from "./helpers/session-database.js";
@@ -708,4 +708,412 @@ test("startup inspection deferral coalesces boot hooks quietly, retries quickly,
   assert.equal(warns.length, 3);
   await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
   stores.closeAll();
+});
+
+test("stale receipt patches after manifest refresh are rejected in store, verifier, and runtime tool", async t => {
+  let now = Date.parse("2026-11-16T05:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  const f = fixture(); t.after(() => { f.db.close(); f.stores.closeAll(); });
+  f.add("dm", "workspace", "direct");
+  const setImage = (data: string) => {
+    const event = JSON.parse(String(f.db.prepare("SELECT event_json FROM transcript_events WHERE session_id='dm' AND seq=1").get()!.event_json));
+    event.message.content = [{ type: "text", text: "Use this image" }, { type: "image", mimeType: "image/png", data }];
+    f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='dm' AND seq=1").run(JSON.stringify(event));
+  };
+  setImage("image-v1");
+
+  // Store-level verification: reopening a completed run via source refresh rejects both stale and unversioned late patches.
+  const ledgerPath = join(f.root, "revision-binding.sqlite");
+  const ledger = new PeopleLearningStore(ledgerPath, "alpha"); t.after(() => ledger.close());
+  const firstRun = ledger.begin(f.inventory());
+  const rev1 = firstRun.manifestRevision;
+  assert.equal(rev1, manifestRevision(firstRun.manifest));
+  const receipt1 = receiptFor(firstRun.manifest);
+  receipt1.manifestRevision = rev1;
+  receipt1.sourceGapReviews = firstRun.manifest.sourceGaps.map(g => ({
+    sourceGapId: g.id, status: "resolved", reason: "Verified v1 attachment",
+    sourceRefs: ["native:dm:1"], reviewedAt: "2026-11-16T04:00:00Z",
+  }));
+  assert.equal(ledger.checkpoint(firstRun.manifest.id, receipt1, now).status, "complete");
+
+  now += 60_000;
+  setImage("image-v2");
+  const refreshedRun = ledger.begin(f.inventory());
+  const rev2 = refreshedRun.manifestRevision;
+  assert.notEqual(rev2, rev1);
+  assert.equal(refreshedRun.status, "partial");
+
+  // Standalone verifier rejects stale manifestRevision while still accepting unversioned offline receipts.
+  assert.equal(verifyLearningCoverage(refreshedRun.manifest, receipt1, now).status, "invalid");
+  const { manifestRevision: _omitted, ...unversionedReceipt } = receipt1;
+  assert.equal(verifyLearningCoverage(refreshedRun.manifest, unversionedReceipt, now).status, "complete");
+
+  // Late patch carrying rev1 (in receipt or explicit parameter) is rejected and cannot reintroduce stale coverage.
+  const staleInReceipt = ledger.checkpoint(firstRun.manifest.id, receipt1, now + 1);
+  assert.equal(staleInReceipt.status, "invalid");
+  assert.ok(staleInReceipt.errors.some(e => e.includes("Stale manifest revision")));
+  assert.equal(ledger.get(firstRun.manifest.id)!.status, "partial");
+  assert.deepEqual(ledger.get(firstRun.manifest.id)!.receipt!.sourceGapReviews, []);
+
+  const staleInArg = ledger.checkpoint(firstRun.manifest.id, unversionedReceipt, now + 2, undefined, undefined, rev1);
+  assert.equal(staleInArg.status, "invalid");
+  assert.ok(staleInArg.errors.some(e => e.includes("Stale manifest revision")));
+  assert.equal(ledger.get(firstRun.manifest.id)!.status, "partial");
+
+  // Late unversioned patch omitting manifestRevision after a source refresh reopened the run is also rejected.
+  const omittedAfterReopen = ledger.checkpoint(firstRun.manifest.id, unversionedReceipt, now + 3);
+  assert.equal(omittedAfterReopen.status, "invalid");
+  assert.ok(omittedAfterReopen.errors.some(e => e.includes("Manifest was refreshed")));
+  assert.equal(ledger.get(firstRun.manifest.id)!.status, "partial");
+
+  // Fresh receipt bound to rev2 succeeds cleanly.
+  const completedV2 = ledger.checkpoint(firstRun.manifest.id, { ...unversionedReceipt, manifestRevision: rev2 }, now + 4);
+  assert.equal(completedV2.status, "complete");
+  assert.equal(completedV2.manifestRevision, rev2);
+
+  // Runtime tool contract: checkpoint propagates manifestRevision and rejects stale or conflicting revisions.
+  const workspace = join(f.root, "workspace-rev"); mkdirSync(workspace);
+  const hostConfig: OpenClawConfig = { agents: { defaults: { workspace, userTimezone: "UTC" }, entries: { alpha: { workspace, agentDir: f.root } } } };
+  const h = hostCron();
+  let service: OpenClawPluginService | undefined, factory: OpenClawPluginToolFactory | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const api = {
+    config: hostConfig, pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+    logger: { warn(m: string) { assert.fail(m); } },
+    registerService(v: OpenClawPluginService) { service = v; },
+    registerTool(v: OpenClawPluginToolFactory) { factory = v; },
+    on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, enabled(), f.stores);
+  await service!.start({ config: hostConfig, stateDir: f.root, logger: api.logger,
+    getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }) });
+  await hooks.get("gateway_start")!({}, {});
+  const nightlyJob = h.jobs.find(j => String(j.name).endsWith(":nightly"))!;
+  const tool = await factory!({ config: hostConfig, agentId: "alpha", sessionKey: `agent:alpha:cron:${nightlyJob.id}:run:r1` });
+  assert.ok(tool && !Array.isArray(tool));
+  const call = async (params: unknown) => JSON.parse(String(record((await tool.execute("rev", params)).content[0])!.text));
+
+  setImage("tool-v1");
+  const inv1 = await call({ action: "inventory", kind: "nightly" });
+  now += 60_000;
+  const toolReceipt1 = receiptFor(inv1.manifest);
+  toolReceipt1.sourceGapReviews = inv1.manifest.sourceGaps.map((g: { id: string }) => ({
+    sourceGapId: g.id, status: "resolved", reason: "Verified tool v1",
+    sourceRefs: ["native:dm:1"], reviewedAt: new Date(now).toISOString(),
+  }));
+  const done1 = await call({ action: "checkpoint", runId: inv1.manifest.id, manifestRevision: inv1.manifestRevision, receipt: toolReceipt1 });
+  assert.equal(done1.status, "complete");
+
+  now += 60_000;
+  setImage("tool-v2");
+  const inv2 = await call({ action: "inventory", kind: "nightly" });
+  assert.notEqual(inv2.manifestRevision, inv1.manifestRevision);
+  assert.equal(inv2.status, "partial");
+
+  const lateToolPatch = await call({ action: "checkpoint", runId: inv1.manifest.id, manifestRevision: inv1.manifestRevision, receipt: toolReceipt1 });
+  assert.equal(lateToolPatch.status, "invalid");
+  assert.ok(lateToolPatch.errors.some((e: string) => e.includes("Stale manifest revision")));
+
+  const conflictingToolPatch = await call({
+    action: "checkpoint", runId: inv1.manifest.id, manifestRevision: inv2.manifestRevision,
+    receipt: { ...toolReceipt1, manifestRevision: inv1.manifestRevision },
+  });
+  assert.equal(conflictingToolPatch.status, "invalid");
+  assert.ok(conflictingToolPatch.errors.some((e: string) => e.includes("Conflicting manifest revision")));
+
+  const freshToolPatch = await call({ action: "checkpoint", runId: inv2.manifest.id, manifestRevision: inv2.manifestRevision, receipt: toolReceipt1 });
+  assert.equal(freshToolPatch.status, "complete");
+  await service!.stop!({ config: hostConfig, stateDir: f.root, logger: api.logger });
+});
+
+test("older in-flight analysis cannot overwrite or regress a newer analysis result or basis", async t => {
+  let now = Date.parse("2026-11-16T05:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  const f = fixture(); t.after(() => { f.db.close(); f.stores.closeAll(); });
+  f.add("dm", "workspace", "direct");
+
+  // Store-level fencing: startedAt, manifest revision, and equal-timestamp status regression checks.
+  const ledger = new PeopleLearningStore(join(f.root, "analysis-fence.sqlite"), "alpha"); t.after(() => ledger.close());
+  const run = ledger.begin(f.inventory("weekly"));
+  assert.deepEqual(
+    ledger.recordAnalysis(run.manifest.id, "complete", { v: 2 }, "basis-new", {
+      expectedManifestRevision: run.manifestRevision, startedAt: now + 2_000, recordedAt: now + 2_100,
+    }),
+    { recorded: true },
+  );
+  assert.deepEqual(
+    ledger.recordAnalysis(run.manifest.id, "unresolved", { v: 1 }, "basis-old", {
+      expectedManifestRevision: run.manifestRevision, startedAt: now + 1_000, recordedAt: now + 3_000,
+    }),
+    { recorded: false, reason: "superseded" },
+  );
+  assert.deepEqual(
+    ledger.recordAnalysis(run.manifest.id, "complete", { v: 3 }, "basis-stale-manifest", {
+      expectedManifestRevision: "stale-manifest-revision", startedAt: now + 5_000, recordedAt: now + 5_100,
+    }),
+    { recorded: false, reason: "manifest_changed" },
+  );
+  assert.deepEqual(
+    ledger.recordAnalysis(run.manifest.id, "unresolved", { v: 2 }, "basis-new", {
+      expectedManifestRevision: run.manifestRevision, startedAt: now + 2_000, recordedAt: now + 2_200,
+    }),
+    { recorded: false, reason: "superseded" },
+  );
+  const stored = ledger.analysis(run.manifest.id);
+  assert.equal(stored?.status, "complete");
+  assert.equal(stored?.basis, "basis-new");
+
+  // Runtime-level overlapping signals calls: slow older call finishing after a newer cohort call cannot overwrite it.
+  const workspace = join(f.root, "workspace-analysis"); mkdirSync(workspace);
+  const automaticU1 = {
+    people: { enabled: true, whisperer: { enabled: true } },
+    typesafe: { enabled: true, apiKey: "fake" },
+    responseAudit: { enabled: true, senderIds: ["U1"], intervalMinutes: 45, lookbackDays: 30 },
+  };
+  const automaticNoOne = {
+    ...automaticU1,
+    responseAudit: { ...automaticU1.responseAudit, senderIds: ["NOONE"] },
+  };
+  const hostConfig: OpenClawConfig = {
+    agents: { defaults: { workspace, userTimezone: "UTC" }, entries: { alpha: { workspace, agentDir: f.root } } },
+    plugins: { entries: { "unblock-memory": { config: automaticU1 } } },
+  };
+  const h = hostCron();
+  let service: OpenClawPluginService | undefined, factory: OpenClawPluginToolFactory | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const api = {
+    config: hostConfig, pluginConfig: automaticU1,
+    logger: { warn(m: string) { assert.fail(m); } },
+    registerService(v: OpenClawPluginService) { service = v; },
+    registerTool(v: OpenClawPluginToolFactory) { factory = v; },
+    on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, resolveConfig(automaticU1), f.stores);
+  await service!.start({ config: hostConfig, stateDir: f.root, logger: api.logger,
+    getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }) });
+  await hooks.get("gateway_start")!({}, {});
+  const weeklyJob = h.jobs.find(j => String(j.name).endsWith(":weekly"))!;
+  const tool = await factory!({ config: hostConfig, agentId: "alpha", sessionKey: `agent:alpha:cron:${weeklyJob.id}:run:r1` });
+  assert.ok(tool && !Array.isArray(tool));
+  const call = async (params: unknown) => JSON.parse(String(record((await tool.execute("sig", params)).content[0])!.text));
+
+  const inv = await call({ action: "inventory", kind: "weekly" });
+  let releaseOldFetch: (() => void) | undefined;
+  const oldFetchStarted = new Promise<void>(resolve => {
+    t.mock.method(globalThis, "fetch", async () => {
+      resolve();
+      await new Promise<void>(done => { releaseOldFetch = done; });
+      return new Response("upstream error", { status: 503 });
+    });
+  });
+
+  // Start slow older signals call (cohort U1) which blocks inside fetch.
+  const slowOlder = call({ action: "signals", runId: inv.manifest.id });
+  await oldFetchStarted;
+
+  // Advance past the 180s response-audit lease so a newer signals call after config reload completes first.
+  now += 200_000;
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, {
+    config: { ...hostConfig, plugins: { entries: { "unblock-memory": { config: automaticNoOne } } } },
+  });
+  const newerSignals = await call({ action: "signals", runId: inv.manifest.id });
+  assert.equal(newerSignals.status, "complete");
+
+  // Unblock slow older call; it must be fenced and never overwrite the newer complete analysis.
+  releaseOldFetch!();
+  const olderSignals = await slowOlder;
+  assert.equal(olderSignals.stale, true);
+  assert.equal(olderSignals.status, "unresolved");
+
+  const receipt = receiptFor(inv.manifest);
+  receipt.peopleReviews = [];
+  receipt.analysis = { status: "complete", reason: "Current cohort analysis completed" };
+  const verified = await call({ action: "checkpoint", runId: inv.manifest.id, manifestRevision: inv.manifestRevision, receipt });
+  assert.equal(verified.status, "complete", "older in-flight analysis must not regress newer analysis basis");
+  await service!.stop!({ config: hostConfig, stateDir: f.root, logger: api.logger });
+});
+
+test("private artifacts publish atomically, replace truncated files, reject symlinks, and precede ledger commits", async t => {
+  const f = fixture(); t.after(() => { f.db.close(); f.stores.closeAll(); });
+  const artifactRoot = join(f.root, "private-artifacts");
+  mkdirSync(artifactRoot, { recursive: true, mode: 0o700 });
+
+  // A truncated partial file left from a crash must NEVER be accepted by existence; it is atomically replaced with 0o600 bytes.
+  const targetPath = join(artifactRoot, "sample.json");
+  writeFileSync(targetPath, "{\"truncated\":", { mode: 0o644 });
+  chmodSync(targetPath, 0o644);
+  const expected = { hello: "world", count: 42 };
+  const published = privateJson(artifactRoot, "sample.json", expected);
+  assert.equal(published, targetPath);
+  assert.deepEqual(JSON.parse(readFileSync(published, "utf8")), expected);
+  assert.equal(statSync(published).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(artifactRoot), ["sample.json"], "no leftover temporary files remain after atomic publish");
+
+  // Pre-existing symlink at artifact target is rejected without touching the symlink target.
+  const outsideTarget = join(f.root, "outside-secret.txt");
+  writeFileSync(outsideTarget, "DO_NOT_TOUCH", { mode: 0o600 });
+  const symlinkPath = join(artifactRoot, "symlinked.json");
+  symlinkSync(outsideTarget, symlinkPath);
+  assert.throws(() => privateJson(artifactRoot, "symlinked.json", { shouldNotWrite: true }), /regular file, not a symlink/);
+  assert.equal(readFileSync(outsideTarget, "utf8"), "DO_NOT_TOUCH");
+
+  // Store-level: if manifest artifact publication fails beforeCommit, the SQLite ledger transaction rolls back cleanly.
+  const ledgerPath = join(f.root, "atomic-order.sqlite");
+  const ledger = new PeopleLearningStore(ledgerPath, "alpha"); t.after(() => ledger.close());
+  const manifest = f.inventory("nightly");
+  assert.throws(
+    () => ledger.begin(manifest, () => { throw new Error("Simulated manifest write failure"); }),
+    /Simulated manifest write failure/,
+  );
+  assert.equal(ledger.get(manifest.id), undefined, "ledger must not commit a run row before manifest publication succeeds");
+  const checkDb = new DatabaseSync(ledgerPath, { readOnly: true });
+  try {
+    assert.equal(checkDb.prepare("SELECT count(*) n FROM people_learning_inventories WHERE run_id=?").get(manifest.id)!.n, 0);
+  } finally { checkDb.close(); }
+
+  // Refresh failure also preserves prior run state intact.
+  const committed = ledger.begin(manifest);
+  const changedManifest = { ...manifest, sourceGaps: [{ id: "gap-new", reason: "New gap" }] };
+  assert.throws(
+    () => ledger.begin(changedManifest, () => { throw new Error("Disk full during refresh"); }),
+    /Disk full during refresh/,
+  );
+  assert.equal(ledger.get(manifest.id)!.manifestRevision, committed.manifestRevision, "failed refresh publication must not mutate existing run");
+
+  // End-to-end runtime inventory: a blocked manifest path prevents committing the SQLite run row.
+  const now = Date.parse("2026-11-16T03:10:00Z");
+  t.mock.method(Date, "now", () => now);
+  const workspace = join(f.root, "workspace-atomic"); mkdirSync(workspace);
+  const hostConfig: OpenClawConfig = { agents: { defaults: { workspace, userTimezone: "UTC" }, entries: { alpha: { workspace, agentDir: f.root } } } };
+  const expectedManifest = inventoryPeople({
+    agentId: "alpha", kind: "nightly", timezone: "UTC", now,
+    people: f.people, databasePath: f.path, exportRoot: join(f.root, "agents/alpha/unblock-memory/people-learning/exports"),
+  });
+  const learningDir = join(f.root, "agents/alpha/unblock-memory/people-learning");
+  mkdirSync(learningDir, { recursive: true, mode: 0o700 });
+  symlinkSync(outsideTarget, join(learningDir, `${manifestRevision(expectedManifest)}.manifest.json`));
+  const h = hostCron();
+  let service: OpenClawPluginService | undefined, factory: OpenClawPluginToolFactory | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const api = {
+    config: hostConfig, pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+    logger: { warn(m: string) { assert.fail(m); } },
+    registerService(v: OpenClawPluginService) { service = v; },
+    registerTool(v: OpenClawPluginToolFactory) { factory = v; },
+    on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, enabled(), f.stores);
+  await service!.start({ config: hostConfig, stateDir: f.root, logger: api.logger,
+    getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }) });
+  await hooks.get("gateway_start")!({}, {});
+  const job = h.jobs.find(j => String(j.name).endsWith(":nightly"))!;
+  const tool = await factory!({ config: hostConfig, agentId: "alpha", sessionKey: `agent:alpha:cron:${job.id}:run:r1` });
+  assert.ok(tool && !Array.isArray(tool));
+  await assert.rejects(tool.execute("inv", { action: "inventory", kind: "nightly" }), /regular file, not a symlink/);
+  const runtimeLedger = new PeopleLearningStore(join(f.root, "agents/alpha/unblock-memory/unblock-memory.sqlite"), "alpha");
+  t.after(() => runtimeLedger.close());
+  assert.equal(runtimeLedger.get(expectedManifest.id), undefined, "runtime inventory must not commit ledger row when manifest publication fails");
+  await service!.stop!({ config: hostConfig, stateDir: f.root, logger: api.logger });
+});
+
+test("missing or throwing getCron schedules retries and transient reconcile failures preserve cron recognition separately from authorization", async t => {
+  const root = mkdtempSync(join(tmpdir(), "people-learning-cron-auth-"));
+  const stores = new PeopleStores({ stateRoot: root, maxOpenTodos: 10, maxBlurbChars: 1200 });
+  t.after(() => stores.closeAll());
+  const hostConfig: OpenClawConfig = { agents: { defaults: { userTimezone: "UTC" }, entries: { alpha: {}, beta: {} } } };
+  const h = hostCron([{
+    id: "durable-alpha-nightly",
+    agentId: "alpha",
+    declarationKey: "unblock-memory:people-learning:alpha:nightly",
+    name: "unblock-memory:people-learning:alpha:nightly",
+    enabled: true,
+  }]);
+  const infos: string[] = [], warns: string[] = [];
+  const scheduled: { id: string; delayMs: number; run: () => Promise<void> | void; cancelled: boolean }[] = [];
+  let service: OpenClawPluginService | undefined, factory: OpenClawPluginToolFactory | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const api = {
+    config: hostConfig,
+    pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+    logger: { info(m: string) { infos.push(m); }, warn(m: string) { warns.push(m); } },
+    registerService(v: OpenClawPluginService) { service = v; },
+    registerTool(v: OpenClawPluginToolFactory) { factory = v; },
+    on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, enabled(), stores);
+
+  let getCronMode: "missing" | "throw_prep" | "partial_fail" | "list_fail" | "ok" = "missing";
+  const baseAdd = h.cron.add.bind(h.cron);
+  const baseList = h.cron.list.bind(h.cron);
+  h.cron.list = async (input) => {
+    if (getCronMode === "list_fail") throw new Error("transient reload cron failure");
+    return baseList(input);
+  };
+  h.cron.add = async (input) => {
+    if (getCronMode === "partial_fail" && record(input)?.agentId === "beta") throw new Error("transient beta add failure");
+    return baseAdd(input);
+  };
+  const makeScheduler = () => ({
+    schedule(task: { id: string; delayMs: number; run: () => Promise<void> | void }) {
+      const entry = { ...task, cancelled: false };
+      scheduled.push(entry);
+      return { cancel() { entry.cancelled = true; } };
+    },
+  });
+
+  // 1. Missing getCron warns and schedules a retry instead of silently stopping reconciliation.
+  service!.start({
+    config: hostConfig, stateDir: root, logger: api.logger,
+    getCron: () => {
+      if (getCronMode === "missing") return undefined as unknown as ReturnType<NonNullable<Parameters<OpenClawPluginService["start"]>[0]["getCron"]>>;
+      if (getCronMode === "throw_prep") throw new Error("Agent main has not completed startup inspection and preparation.");
+      return { ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 };
+    },
+    scheduler: makeScheduler(),
+  } as unknown as Parameters<OpenClawPluginService["start"]>[0]);
+  await hooks.get("gateway_start")!({}, {});
+  assert.equal(warns.length, 1);
+  assert.match(warns[0]!, /getCron/);
+  assert.equal(scheduled.at(-1)?.delayMs, 60_000, "missing getCron must schedule a retry");
+
+  // 2. Synchronous throw from getCron() is caught inside the rejection handler (quiet startup retry).
+  getCronMode = "throw_prep";
+  await scheduled.at(-1)!.run();
+  assert.equal(warns.length, 1, "startup prep error thrown by getCron() retries quietly without crashing");
+  assert.equal(infos.length, 1);
+  assert.equal(scheduled.at(-1)?.delayMs, 5_000);
+
+  // 3. Partial reconcile failure still recognizes durably declared jobs discovered from cron.list.
+  getCronMode = "partial_fail";
+  await scheduled.at(-1)!.run();
+  assert.equal(warns.length, 2);
+  assert.match(warns[1]!, /transient beta add failure/);
+  assert.equal(scheduled.at(-1)?.delayMs, 60_000);
+  const alphaSession = { config: hostConfig, agentId: "alpha", sessionKey: "agent:alpha:cron:durable-alpha-nightly:run:r1" };
+  assert.equal(record(hooks.get("before_tool_call")!({ toolName: "exec", params: {} }, alphaSession))?.block, true,
+    "durably declared job is recognized even when a sibling agent fails reconciliation");
+  assert.equal(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession), undefined);
+  assert.ok(await factory!(alphaSession), "recognized and currently authorized job exposes learning tool");
+
+  // 4. Reload disables alpha while reconcile fails transiently: recognition is preserved while authorization is revoked immediately.
+  getCronMode = "list_fail";
+  const alphaDisabledCfg: OpenClawConfig = {
+    ...hostConfig,
+    plugins: { entries: { "unblock-memory": { config: { people: { enabled: true, whisperer: { enabled: true }, learning: { agents: { alpha: { enabled: false } } } } } } } },
+  };
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: alphaDisabledCfg });
+  assert.equal(warns.length, 3);
+  const blockedWhenDisabled = record(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession));
+  assert.equal(blockedWhenDisabled?.block, true, "preserved recognition blocks tool calls when authorization is disabled");
+  assert.match(String(blockedWhenDisabled?.blockReason), /disabled/);
+  assert.equal(await factory!(alphaSession), null, "disabled agent is no longer authorized to receive the tool");
+
+  // 5. Re-enabling alpha while reconcile recovers restores authorization and clears pending retry timer.
+  getCronMode = "ok";
+  const retryBeforeOk = scheduled.at(-1)!;
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: hostConfig });
+  assert.equal(retryBeforeOk.cancelled, true);
+  assert.equal(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession), undefined);
+  assert.ok(await factory!(alphaSession));
+  await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
 });

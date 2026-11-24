@@ -11,41 +11,79 @@ const legacyNames = {
   nightly: "People Whisperer — nightly dreaming and interaction learning",
   weekly: "People Whisperer — full weekly statement validation",
 };
+
 function containsDeclaration(actual: unknown, expected: unknown): boolean {
   const fields = record(expected), source = record(actual);
   return fields && source ? Object.entries(fields).every(([key, value]) => containsDeclaration(source[key], value))
     : isDeepStrictEqual(actual, expected);
 }
+
+function parseDeclarationKey(value: unknown): { agentId: string; kind: "nightly" | "weekly" } | undefined {
+  if (typeof value !== "string" || !value.startsWith(PREFIX)) return undefined;
+  const rest = value.slice(PREFIX.length);
+  const split = rest.lastIndexOf(":");
+  if (split <= 0) return undefined;
+  const agentId = rest.slice(0, split), kind = rest.slice(split + 1);
+  if (kind !== "nightly" && kind !== "weekly") return undefined;
+  return { agentId, kind };
+}
+
+function matchesLearningJob(
+  job: Record<string, unknown>,
+  agentId: string,
+  kind: "nightly" | "weekly",
+  key: string,
+  legacyJobIds: readonly string[] | undefined,
+): boolean {
+  if (job.agentId !== agentId) return false;
+  if (job.declarationKey === key || job.name === key || job.name === legacyNames[kind]) return true;
+  if (!legacyJobIds?.includes(String(job.id))) return false;
+  const payload = record(job.payload);
+  return payload?.kind === "agentTurn" &&
+    String(payload.message).includes(`people-${kind === "nightly" ? "nightly-dreaming" : "weekly-validation"}.md`);
+}
+
 export const LEARNING_TOOLS = ["read", "memory_people_learning", "memory_people_inspect", "memory_people_update",
   "memory_people_prime", "memory_search", "memory_get"];
 
 export type PeopleCron = Pick<NonNullable<ReturnType<NonNullable<OpenClawPluginServiceContext["getCron"]>>>, "list" | "add" | "update">;
 
 export type LearningJob = { id: string; agentId: string; kind: "nightly" | "weekly" };
+
 /** Service-owned cron, not bundled-only scheduleSessionTurn.
  * Stable declarations make a lost add response/reload safe. Legacy history stays on disabled originals.
  */
-export async function reconcilePeopleLearning(cron: PeopleCron, cfg: OpenClawConfig, config: PeopleLearningConfig,
-  active: () => boolean = () => true): Promise<LearningJob[]> {
+export async function reconcilePeopleLearning(
+  cron: PeopleCron,
+  cfg: OpenClawConfig,
+  config: PeopleLearningConfig,
+  active: () => boolean = () => true,
+  onRecognize?: (jobs: readonly LearningJob[], fullSnapshot?: boolean) => void,
+): Promise<LearningJob[]> {
+  const all = await cron.list({ includeDisabled: true });
+  if (!Array.isArray(all)) throw new Error("Unsupported service cron.list response");
   const jobs: Record<string, unknown>[] = [];
-  {
-    const all = await cron.list({ includeDisabled: true });
-    if (!Array.isArray(all)) throw new Error("Unsupported service cron.list response");
-    for (const item of all) {
-      const job = record(item);
-      if (!job || !nonBlank(job.id)) throw new Error("Invalid cron job inventory");
-      jobs.push(job);
+  const recognized = new Map<string, LearningJob>();
+  for (const item of all) {
+    const job = record(item);
+    if (!job || !nonBlank(job.id)) throw new Error("Invalid cron job inventory");
+    jobs.push(job);
+    const parsed = parseDeclarationKey(job.declarationKey);
+    if (parsed && job.agentId === parsed.agentId) {
+      const id = String(job.id);
+      recognized.set(`${parsed.agentId}:${id}`, { id, agentId: parsed.agentId, kind: parsed.kind });
     }
   }
+  // Surface durably declared jobs immediately so startup/partial-reconcile failures
+  // never leave active cron runs unrecognized by private-session hooks.
+  if (recognized.size && active()) onRecognize?.([...recognized.values()], false);
+
   const result: LearningJob[] = [], owned = new Set<string>();
   for (const agentId of listAgentIds(cfg)) {
     const options = learningForAgent(config, agentId);
     for (const kind of ["nightly", "weekly"] as const) {
       const key = `${PREFIX}${agentId}:${kind}`;
-      const matches = jobs.filter(job => job.agentId === agentId && (job.declarationKey === key ||
-        job.name === key || job.name === legacyNames[kind] ||
-        (options.legacyJobIds?.includes(String(job.id)) && record(job.payload)?.kind === "agentTurn" &&
-          String(record(job.payload)?.message).includes(`people-${kind === "nightly" ? "nightly-dreaming" : "weekly-validation"}.md`))));
+      const matches = jobs.filter(job => matchesLearningJob(job, agentId, kind, key, options.legacyJobIds));
       const primary = matches.find(job => job.declarationKey === key);
       const legacy = matches.filter(job => job.declarationKey !== key);
       const migrationPaused = config.agents?.[agentId]?.enabled !== true &&
@@ -55,11 +93,15 @@ export async function reconcilePeopleLearning(cron: PeopleCron, cfg: OpenClawCon
       const desired = {
         declarationKey: key, agentId, name: key,
         description: "Plugin-owned private People Whisperer review; opt out in people.learning." + (migrationPaused ? " [migration-paused]" : ""),
-        enabled, schedule: { kind: "cron", expr: options[`${kind}Schedule`],
-          tz: options.timezone ?? resolveTimezone(cfg.agents?.defaults?.userTimezone), staggerMs: 0 },
+        enabled, schedule: {
+          kind: "cron", expr: options[`${kind}Schedule`],
+          tz: options.timezone ?? resolveTimezone(cfg.agents?.defaults?.userTimezone), staggerMs: 0,
+        },
         sessionTarget: "isolated", wakeMode: "now", deleteAfterRun: false,
-        payload: { kind: "agentTurn", message: peopleLearningPrompt(kind, agentId), timeoutSeconds: kind === "nightly" ? 2700 : 3600,
-          toolsAllow: LEARNING_TOOLS },
+        payload: {
+          kind: "agentTurn", message: peopleLearningPrompt(kind, agentId), timeoutSeconds: kind === "nightly" ? 2700 : 3600,
+          toolsAllow: LEARNING_TOOLS,
+        },
         delivery: { mode: "none" }, failureAlert: false,
       };
       if (!active()) return result;
@@ -74,9 +116,14 @@ export async function reconcilePeopleLearning(cron: PeopleCron, cfg: OpenClawCon
         const addedId = nonBlank(added?.id) ?? nonBlank(record(added?.job)?.id);
         if (!addedId) throw new Error("Cron creation unconfirmed; retry reconciliation with the same declaration key");
         id = addedId;
+        const created: LearningJob = { id, agentId, kind };
+        recognized.set(`${agentId}:${id}`, created);
+        if (active()) onRecognize?.([created], false);
       }
       owned.add(id);
-      result.push({ id, agentId, kind });
+      const entry: LearningJob = { id, agentId, kind };
+      recognized.set(`${agentId}:${id}`, entry);
+      result.push(entry);
       // Keep duplicate IDs and histories recoverable, but prevent a second run.
       for (const duplicate of matches) if (duplicate.id !== id && duplicate.enabled !== false && active()) {
         await cron.update(String(duplicate.id), { enabled: false });
@@ -89,6 +136,7 @@ export async function reconcilePeopleLearning(cron: PeopleCron, cfg: OpenClawCon
   for (const job of jobs) if (String(job.declarationKey ?? "").startsWith(PREFIX) && !owned.has(String(job.id)) && job.enabled !== false && active()) {
     await cron.update(String(job.id), { enabled: false });
   }
+  if (active()) onRecognize?.([...recognized.values()], true);
   return result;
 }
 
