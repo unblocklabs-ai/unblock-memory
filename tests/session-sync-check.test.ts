@@ -159,3 +159,17 @@ test("excluded DMs do not trigger work and first eligible conversations do", asy
   assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
   assert.equal((await f.run()).result.updated, 1);
 });
+
+test("initial sync with failures leaves lastSuccessfulSyncAt unset and never certifies skip", async () => {
+  const f = await fixture();
+  const db = new DatabaseSync(f.params.databasePath);
+  db.prepare("UPDATE transcript_events SET event_json = '{broken' WHERE session_id = 'conversation'").run();
+  db.close();
+
+  const failedFirst = await f.run();
+  assert.equal(failedFirst.result.failed, 1);
+  assert.equal(failedFirst.result.lastSuccessfulSyncAt, undefined);
+  assert.equal(failedFirst.manifest.lastSuccessfulSyncAt, undefined);
+  assert.equal(failedFirst.manifest.indexSignature, undefined);
+  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+});

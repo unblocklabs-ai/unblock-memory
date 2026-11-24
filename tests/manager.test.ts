@@ -1597,6 +1597,192 @@ test("marks retained analysis stale for add, edit, delete, embedding, and forced
   }
 });
 
+test("coalesces concurrent store opens, fences in-flight reads/skills against close, and rejects closed operations", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-manager-fencing-"));
+  const skillDir = join(workspace, "skills", "deploy");
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(join(workspace, "MEMORY.md"), "memory body\n");
+  await writeFile(join(skillDir, "SKILL.md"), "---\nname: deploy\ndescription: Deploy safely.\n---\n");
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const [skills] = resolveSources(workspace, [{
+    name: "skills",
+    kind: "skills",
+    paths: ["skills/**/SKILL.md"],
+  }]);
+
+  let storeOpens = 0;
+  let storeClosed = false;
+  const openGate = deferred<void>();
+  const readEntered = deferred<void>();
+  const readGate = deferred<void>();
+  const skillEntered = deferred<void>();
+  const skillGate = deferred<void>();
+  const events: string[] = [];
+
+  const backing = await createStore({ dbPath: join(workspace, "index.sqlite"), config: { collections: {} } });
+  backing.internal.llm = {
+    embedModelName: "embeddinggemma-300M",
+    async embed(_text: string) {
+      events.push("skill:start");
+      skillEntered.resolve();
+      await skillGate.promise;
+      events.push("skill:end");
+      return { embedding: [1, 0], model: "test" };
+    },
+    async embedBatch(texts: string[]) {
+      return texts.map(() => ({ embedding: [1, 0], model: "test" }));
+    },
+  } as QMDStore["internal"]["llm"];
+
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    curationPath: join(workspace, "curation.sqlite"),
+    workspaceDir: workspace,
+    sources: [memory, skills!],
+    storeFactory: async () => {
+      storeOpens += 1;
+      await openGate.promise;
+      return createManagerStore({
+        internal: backing.internal,
+        async get(query) {
+          events.push("read:start");
+          readEntered.resolve();
+          await readGate.promise;
+          events.push("read:end");
+          return {
+            filepath: query,
+            displayPath: "MEMORY.md",
+            title: "Memory",
+            context: null,
+            hash: "hash",
+            docid: "hash",
+            collectionName: memory.collection,
+            modifiedAt: "",
+            bodyLength: 12,
+            body: "memory body\n",
+          };
+        },
+        async close() {
+          events.push("store:close");
+          storeClosed = true;
+          await backing.close();
+        },
+      });
+    },
+  });
+
+  // 1. Concurrent cold callers share one store open.
+  const concurrent = Promise.all([
+    manager.diagnostics(),
+    manager.search("memory"),
+    manager.probeEmbeddingAvailability(),
+  ]);
+  await delay(15);
+  assert.equal(storeOpens, 1);
+  openGate.resolve();
+  await concurrent;
+  assert.equal(storeOpens, 1);
+
+  // 2. Concurrent close() waits for in-flight readFile and searchSkills before closing store,
+  //    while rejecting newly admitted operations immediately.
+  const pendingRead = manager.readFile({ relPath: `qmd://${memory.collection}/MEMORY.md` });
+  const pendingSkills = manager.searchSkills("deploy", 0.5, 5);
+  await Promise.all([readEntered.promise, skillEntered.promise]);
+
+  const closing = manager.close();
+  await delay(20);
+  assert.equal(storeClosed, false, "store.close() must wait for in-flight readFile and searchSkills");
+
+  await assert.rejects(manager.sync(), /closed/i);
+  await assert.rejects(manager.search("memory"), /closed/i);
+  await assert.rejects(manager.readFile({ relPath: `qmd://${memory.collection}/MEMORY.md` }), /closed/i);
+  await assert.rejects(manager.searchSkills("deploy", 0.5, 5), /closed/i);
+  await assert.rejects(manager.diagnostics(), /closed/i);
+  await assert.rejects(manager.listMaintenanceTasks(), /closed/i);
+  assert.throws(() => manager.updateMaintenanceTask({ id: "missing", status: "resolved" }), /closed/i);
+
+  readGate.resolve();
+  skillGate.resolve();
+  const [readResult, skillResults] = await Promise.all([pendingRead, pendingSkills]);
+  assert.equal(readResult.status, "ok");
+  assert.equal(skillResults.length, 1);
+  await closing;
+  assert.equal(storeClosed, true);
+  assert.equal(events.at(-1), "store:close");
+
+  // 3. Closing while storeFactory is still opening closes the newly opened store and rejects caller.
+  const openWhileClosingGate = deferred<void>();
+  let lateStoreClosed = false;
+  const lateManager = new QmdMemoryManager({
+    dbPath: join(workspace, "late.sqlite"),
+    workspaceDir: workspace,
+    sources: [memory],
+    storeFactory: async () => {
+      await openWhileClosingGate.promise;
+      return createManagerStore({
+        async close() { lateStoreClosed = true; },
+      });
+    },
+  });
+  const pendingOpen = lateManager.diagnostics();
+  await delay(10);
+  const lateClose = lateManager.close();
+  openWhileClosingGate.resolve();
+  await assert.rejects(pendingOpen, /closed/i);
+  await lateClose;
+  assert.equal(lateStoreClosed, true);
+});
+
+test("in-process syncSessions updates cached manifest mtime so the next search does not reload", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-session-mtime-"));
+  const databasePath = join(root, "openclaw-agent.sqlite");
+  const sessionsDir = join(root, "sessions");
+  const manifestPath = join(root, "sessions-manifest.json");
+  const source = resolveSessionSource(sessionsDir, ["channel", "group"]);
+  createAgentDatabase(databasePath).close();
+  const backing = await createStore({
+    dbPath: join(root, "index.sqlite"),
+    config: { collections: { [source.collection]: { path: source.root, pattern: source.pattern } } },
+  });
+  backing.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+  t.mock.method(backing.internal, "searchVec", async () => []);
+  t.mock.method(backing, "update", async () => ({
+    collections: 1, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0,
+  }));
+  t.mock.method(backing, "embed", async () => ({
+    docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0,
+  }));
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [source],
+    storeFactory: async () => backing,
+    sessions: {
+      agentId: "main",
+      agentName: "Agent",
+      chatTypes: ["channel", "group"],
+      maxExpandedTokens: 500,
+      collection: source.collection,
+      databasePath,
+      manifestPath,
+      outputDir: sessionsDir,
+      timezone: "UTC",
+    },
+  });
+  try {
+    await manager.start();
+    await manager.syncSessions();
+    const timings: { metadataReloads?: number } = {};
+    await manager.searchCandidates({ lex: "anything", vec: "anything" }, {
+      corpora: ["sessions"],
+      timings,
+    });
+    assert.equal(timings.metadataReloads, 0);
+  } finally {
+    await manager.close();
+  }
+});
+
 test("failed reclustering preserves stale results and successful reclustering replaces them fresh", async () => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-recluster-lifecycle-"));
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });

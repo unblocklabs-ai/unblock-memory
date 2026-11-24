@@ -45,6 +45,7 @@ type IndexedSession = SessionMetadata & {
   projectionHash: string;
   documentPath: string;
   projectorVersion: number;
+  projectionKey?: string;
   sourceFingerprint?: string;
   messages?: SessionMessageSpan[];
 };
@@ -67,7 +68,7 @@ export type SessionSyncResult = {
   skipped: number;
   failed: number;
   embedded: number;
-  lastSuccessfulSyncAt: number;
+  lastSuccessfulSyncAt?: number;
   lastCheckedAt?: number;
   lastIndexedAt?: number;
   skipReason?: "no_changes" | "no_indexable_changes";
@@ -170,8 +171,15 @@ function readSnapshot(params: {
   force: boolean;
   outputDir: string;
   previousManifest: SessionManifest;
+  currentProjectionKey: string;
   metadataOnly?: boolean;
-}): { windows: WindowRow[]; events: Map<string, EventRow[]>; changed: Set<string>; unavailable: Set<string> } {
+}): {
+  windows: WindowRow[];
+  fingerprints: Map<string, string>;
+  events: Map<string, EventRow[]>;
+  changed: Set<string>;
+  unavailable: Set<string>;
+} {
   const db = new DatabaseSync(params.databasePath, { readOnly: true });
   try {
     db.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; BEGIN");
@@ -203,6 +211,7 @@ function readSnapshot(params: {
       GROUP BY window.session_id
       ORDER BY window.created_at, window.session_id
     `).all(...params.chatTypes) as WindowRow[];
+    const fingerprints = new Map<string, string>();
     const events = new Map<string, EventRow[]>();
     const changed = new Set<string>();
     const unavailable = new Set<string>();
@@ -211,12 +220,17 @@ function readSnapshot(params: {
       const previous = params.previousManifest.sessions[window.sessionId];
       const documentPath = sessionDocumentPath(metadata);
       const sourceFingerprint = JSON.stringify(window);
+      fingerprints.set(window.sessionId, sourceFingerprint);
+      const entryProjectionKey = previous?.projectionKey ?? params.previousManifest.projectionKey;
       const unchanged = !window.cold && !params.force &&
-        (previous ? previous.sourceFingerprint === sourceFingerprint &&
-          previous.projectorVersion === PROJECTOR_VERSION &&
-          previous.documentPath === documentPath &&
-          existsSync(projectionPath(params.outputDir, documentPath)) :
-          params.previousManifest.ignoredSessions?.[window.sessionId] === sourceFingerprint);
+        (previous
+          ? entryProjectionKey === params.currentProjectionKey &&
+            previous.sourceFingerprint === sourceFingerprint &&
+            previous.projectorVersion === PROJECTOR_VERSION &&
+            previous.documentPath === documentPath &&
+            existsSync(projectionPath(params.outputDir, documentPath))
+          : params.previousManifest.projectionKey === params.currentProjectionKey &&
+            params.previousManifest.ignoredSessions?.[window.sessionId] === sourceFingerprint);
       if (!unchanged) {
         changed.add(window.sessionId);
         if (!params.metadataOnly) {
@@ -230,7 +244,7 @@ function readSnapshot(params: {
       }
     }
     db.exec("COMMIT");
-    return { windows, events, changed, unavailable };
+    return { windows, fingerprints, events, changed, unavailable };
   } catch (error) {
     try { db.exec("ROLLBACK"); } catch { /* transaction may not have started */ }
     throw error;
@@ -244,9 +258,16 @@ export async function unchangedSessionSync(
   indexPath: string,
 ): Promise<SessionSyncResult | undefined> {
   const manifest = await readSessionManifest(params.manifestPath);
-  if (!manifest.lastSuccessfulSyncAt || manifest.projectionKey !== projectionKey(params) ||
+  const currentProjectionKey = projectionKey(params);
+  if (!manifest.lastSuccessfulSyncAt || manifest.projectionKey !== currentProjectionKey ||
     !manifest.indexSignature || manifest.indexSignature !== sessionIndexSignature(indexPath)) return;
-  const snapshot = readSnapshot({ ...params, previousManifest: manifest, force: false, metadataOnly: true });
+  const snapshot = readSnapshot({
+    ...params,
+    previousManifest: manifest,
+    currentProjectionKey,
+    force: false,
+    metadataOnly: true,
+  });
   const ids = new Set(snapshot.windows.map(window => window.sessionId));
   if (snapshot.changed.size || Object.keys(manifest.sessions).some(id => !ids.has(id)) ||
     Object.keys(manifest.ignoredSessions ?? {}).some(id => !ids.has(id))) return;
@@ -316,6 +337,130 @@ export function sessionMetadataByPath(manifest: SessionManifest): Map<string, Se
   }]));
 }
 
+type WindowSyncOutcome =
+  | { kind: "failed"; session?: IndexedSession }
+  | { kind: "unchanged"; session?: IndexedSession; ignoredFingerprint?: string }
+  | { kind: "skipped"; ignoredFingerprint: string; removedPrevious: boolean }
+  | { kind: "updated"; session: IndexedSession };
+
+function retainPreviousSession(
+  previous: IndexedSession | undefined,
+  previousManifestProjectionKey: string | undefined,
+): IndexedSession | undefined {
+  if (!previous) return undefined;
+  if (previous.projectionKey !== undefined || previousManifestProjectionKey === undefined) {
+    return previous;
+  }
+  return { ...previous, projectionKey: previousManifestProjectionKey };
+}
+
+async function syncWindow(params: {
+  window: WindowRow;
+  sourceFingerprint: string;
+  previous?: IndexedSession;
+  events?: EventRow[];
+  unavailable: boolean;
+  force: boolean;
+  outputDir: string;
+  agentName: string;
+  timezone: string;
+  currentProjectionKey: string;
+  previousManifestProjectionKey?: string;
+  diagnostics: NonNullable<SessionProjectionInput["diagnostics"]>;
+}): Promise<WindowSyncOutcome> {
+  const { window, sourceFingerprint, previous, events } = params;
+  const metadata = windowMetadata(window);
+  const documentPath = sessionDocumentPath(metadata);
+  const fail = (): WindowSyncOutcome => ({
+    kind: "failed",
+    session: retainPreviousSession(previous, params.previousManifestProjectionKey),
+  });
+
+  if (params.unavailable) return fail();
+  if (events === undefined) {
+    return previous
+      ? { kind: "unchanged", session: previous }
+      : { kind: "unchanged", ignoredFingerprint: sourceFingerprint };
+  }
+  if (events.length > 0 && (!window.sourceGeneration || window.maxSeq === null)) {
+    return fail();
+  }
+
+  let projection: ReturnType<typeof projectSessionDocument>;
+  try {
+    const input: SessionProjectionInput = {
+      ...metadata,
+      label: window.label ?? undefined,
+      agentName: params.agentName,
+      timezone: params.timezone,
+      events,
+      diagnostics: params.diagnostics,
+    };
+    projection = projectSessionDocument(input);
+  } catch {
+    return fail();
+  }
+  if (!projection) {
+    if (previous) {
+      await remove(projectionPath(params.outputDir, previous.documentPath));
+    }
+    return {
+      kind: "skipped",
+      ignoredFingerprint: sourceFingerprint,
+      removedPrevious: Boolean(previous),
+    };
+  }
+
+  const { content, messages } = projection;
+  const target = projectionPath(params.outputDir, documentPath);
+  const hash = projectionHash(content);
+  const contentChanged = params.force || previous?.projectorVersion !== PROJECTOR_VERSION ||
+    previous.projectionHash !== hash || previous.documentPath !== documentPath || !existsSync(target);
+  if (contentChanged) {
+    await atomicWrite(target, content, 0o600);
+    await utimes(target, new Date(), new Date(metadata.startedAt));
+  }
+  if (previous?.documentPath && previous.documentPath !== documentPath) {
+    await remove(projectionPath(params.outputDir, previous.documentPath));
+  }
+  const session: IndexedSession = {
+    ...metadata,
+    sourceGeneration: window.sourceGeneration!,
+    maxSeq: window.maxSeq!,
+    activeEventCount: window.activeEventCount,
+    sizeBytes: Buffer.byteLength(content),
+    projectionHash: hash,
+    documentPath,
+    projectorVersion: PROJECTOR_VERSION,
+    projectionKey: params.currentProjectionKey,
+    sourceFingerprint,
+    messages,
+  };
+  return contentChanged ? { kind: "updated", session } : { kind: "unchanged", session };
+}
+
+async function resolveIndexSignature(params: {
+  failed: number;
+  needsIndex: boolean;
+  indexed: boolean;
+  indexPath?: string;
+  previousIndexSignature?: string;
+  indexReady?: () => Promise<boolean>;
+}): Promise<string | undefined> {
+  // Never certify an index mutation that happened during a failed, skipped, or readiness check.
+  if (params.failed > 0) return undefined;
+  if (!params.needsIndex) return params.previousIndexSignature;
+  if (!params.indexed || !params.indexPath) return undefined;
+  // Timing point 2: capture index signature after indexing, before readiness check.
+  const signatureBeforeReadiness = sessionIndexSignature(params.indexPath);
+  if (!signatureBeforeReadiness) return undefined;
+  const ready = await params.indexReady?.() ?? false;
+  if (!ready) return undefined;
+  // Timing point 3: verify index did not mutate during readiness validation.
+  if (signatureBeforeReadiness !== sessionIndexSignature(params.indexPath)) return undefined;
+  return signatureBeforeReadiness;
+}
+
 export async function syncSessionProjections(params: ProjectionOptions & {
   force?: boolean;
   indexPath?: string;
@@ -323,10 +468,12 @@ export async function syncSessionProjections(params: ProjectionOptions & {
   index?: () => Promise<number>;
 }): Promise<{ result: SessionSyncResult; manifest: SessionManifest }> {
   const previousManifest = await readSessionManifest(params.manifestPath);
+  const currentProjectionKey = projectionKey(params);
   const snapshot = readSnapshot({
     ...params,
-    force: params.force === true || previousManifest.projectionKey !== projectionKey(params),
+    force: params.force === true,
     previousManifest,
+    currentProjectionKey,
   });
   const sessions: Record<string, IndexedSession> = {};
   const ignoredSessions: Record<string, string> = {};
@@ -336,79 +483,37 @@ export async function syncSessionProjections(params: ProjectionOptions & {
   await chmod(params.outputDir, 0o700);
 
   for (const window of snapshot.windows) {
-    const previous = previousManifest.sessions[window.sessionId];
-    const events = snapshot.events.get(window.sessionId);
-    const metadata = windowMetadata(window);
-    const documentPath = sessionDocumentPath(metadata);
-    if (snapshot.unavailable.has(window.sessionId)) {
+    const outcome = await syncWindow({
+      window,
+      sourceFingerprint: snapshot.fingerprints.get(window.sessionId)!,
+      previous: previousManifest.sessions[window.sessionId],
+      events: snapshot.events.get(window.sessionId),
+      unavailable: snapshot.unavailable.has(window.sessionId),
+      force: params.force === true,
+      outputDir: params.outputDir,
+      agentName: params.agentName,
+      timezone: params.timezone,
+      currentProjectionKey,
+      previousManifestProjectionKey: previousManifest.projectionKey,
+      diagnostics,
+    });
+    if (outcome.kind === "failed") {
       counts.failed += 1;
-      if (previous) sessions[window.sessionId] = previous;
-      continue;
-    }
-    if (events === undefined) {
-      if (previous) sessions[window.sessionId] = previous;
-      else ignoredSessions[window.sessionId] = JSON.stringify(window);
+      if (outcome.session) sessions[window.sessionId] = outcome.session;
+    } else if (outcome.kind === "unchanged") {
       counts.unchanged += 1;
-      continue;
-    }
-    if (events.length > 0 && (!window.sourceGeneration || window.maxSeq === null)) {
-      counts.failed += 1;
-      if (previous) sessions[window.sessionId] = previous;
-      continue;
-    }
-
-    let projection: ReturnType<typeof projectSessionDocument>;
-    try {
-      const input: SessionProjectionInput = {
-        ...metadata,
-        label: window.label ?? undefined,
-        agentName: params.agentName,
-        timezone: params.timezone,
-        events,
-        diagnostics,
-      };
-      projection = projectSessionDocument(input);
-    } catch {
-      counts.failed += 1;
-      if (previous) sessions[window.sessionId] = previous;
-      continue;
-    }
-    if (!projection) {
-      ignoredSessions[window.sessionId] = JSON.stringify(window);
-      counts.skipped += 1;
-      if (previous) {
-        await remove(projectionPath(params.outputDir, previous.documentPath));
-        counts.removed += 1;
+      if (outcome.session) sessions[window.sessionId] = outcome.session;
+      else if (outcome.ignoredFingerprint !== undefined) {
+        ignoredSessions[window.sessionId] = outcome.ignoredFingerprint;
       }
-      continue;
+    } else if (outcome.kind === "skipped") {
+      counts.skipped += 1;
+      ignoredSessions[window.sessionId] = outcome.ignoredFingerprint;
+      if (outcome.removedPrevious) counts.removed += 1;
+    } else {
+      counts.updated += 1;
+      sessions[window.sessionId] = outcome.session;
     }
-
-    const { content, messages } = projection;
-    const target = projectionPath(params.outputDir, documentPath);
-    const hash = projectionHash(content);
-    const contentChanged = params.force === true || previous?.projectorVersion !== PROJECTOR_VERSION ||
-      previous.projectionHash !== hash || previous.documentPath !== documentPath || !existsSync(target);
-    if (contentChanged) {
-      await atomicWrite(target, content, 0o600);
-      await utimes(target, new Date(), new Date(metadata.startedAt));
-    }
-    if (previous?.documentPath && previous.documentPath !== documentPath) {
-      await remove(projectionPath(params.outputDir, previous.documentPath));
-    }
-    sessions[window.sessionId] = {
-      ...metadata,
-      sourceGeneration: window.sourceGeneration!,
-      maxSeq: window.maxSeq!,
-      activeEventCount: window.activeEventCount,
-      sizeBytes: Buffer.byteLength(content),
-      projectionHash: hash,
-      documentPath,
-      projectorVersion: PROJECTOR_VERSION,
-      sourceFingerprint: JSON.stringify(window),
-      messages,
-    };
-    if (contentChanged) counts.updated += 1;
-    else counts.unchanged += 1;
   }
 
   const liveIds = new Set(snapshot.windows.map(window => window.sessionId));
@@ -418,24 +523,33 @@ export async function syncSessionProjections(params: ProjectionOptions & {
     counts.removed += 1;
   }
 
+  // Timing point 1: verify index signature before running QMD index/embed.
   const needsIndex = params.force === true || counts.updated > 0 || counts.removed > 0 ||
-    previousManifest.projectionKey !== projectionKey(params) ||
+    previousManifest.projectionKey !== currentProjectionKey ||
     !previousManifest.indexSignature || !params.indexPath ||
     previousManifest.indexSignature !== sessionIndexSignature(params.indexPath);
   const embedded = needsIndex ? await params.index?.() ?? 0 : 0;
-  const lastSuccessfulSyncAt = Date.now();
+  const checkedAt = Date.now();
   const indexed = needsIndex && params.index !== undefined;
-  const signature = params.indexPath ? sessionIndexSignature(params.indexPath) : undefined;
-  const indexReady = indexed && (await params.indexReady?.() ?? false);
-  const lastIndexedAt = indexed ? lastSuccessfulSyncAt : previousManifest.lastIndexedAt;
+  const indexSignature = await resolveIndexSignature({
+    failed: counts.failed,
+    needsIndex,
+    indexed,
+    indexPath: params.indexPath,
+    previousIndexSignature: previousManifest.indexSignature,
+    indexReady: params.indexReady,
+  });
+  const lastSuccessfulSyncAt = counts.failed === 0 ? checkedAt : previousManifest.lastSuccessfulSyncAt;
+  const lastIndexedAt = indexed ? checkedAt : previousManifest.lastIndexedAt;
+  const manifestProjectionKey = counts.failed === 0
+    ? currentProjectionKey
+    : previousManifest.projectionKey;
   const manifest: SessionManifest = {
     version: MANIFEST_VERSION,
     lastSuccessfulSyncAt,
     lastIndexedAt,
-    projectionKey: projectionKey(params),
-    // Never certify an index mutation that happened during a skipped run or readiness check.
-    indexSignature: counts.failed > 0 ? undefined : !needsIndex ? previousManifest.indexSignature :
-      indexReady && params.indexPath && signature === sessionIndexSignature(params.indexPath) ? signature : undefined,
+    projectionKey: manifestProjectionKey,
+    indexSignature,
     ignoredSessions,
     sessions,
   };
@@ -445,8 +559,8 @@ export async function syncSessionProjections(params: ProjectionOptions & {
       scanned: snapshot.windows.length,
       ...counts,
       embedded,
-      lastSuccessfulSyncAt,
-      lastCheckedAt: lastSuccessfulSyncAt,
+      ...(lastSuccessfulSyncAt !== undefined ? { lastSuccessfulSyncAt } : {}),
+      lastCheckedAt: checkedAt,
       lastIndexedAt,
       ...(!needsIndex ? { skipReason: "no_indexable_changes" as const } : {}),
       diagnostics,

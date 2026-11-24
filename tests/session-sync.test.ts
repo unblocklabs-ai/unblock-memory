@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { zstdCompressSync } from "node:zlib";
-import { PROJECTOR_VERSION, syncSessionProjections } from "../src/session-sync.js";
+import { PROJECTOR_VERSION, syncSessionProjections, unchangedSessionSync } from "../src/session-sync.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 test("refresh retains compressed active history and preserves projections when history goes cold or corrupt", async () => {
@@ -334,4 +334,101 @@ test("schema and malformed-event failures preserve prior projections", async () 
   unsupported.close();
   await assert.rejects(syncSessionProjections(params), /Unsupported transcript cold-storage capabilities/);
   assert.equal(await readFile(projectedPath, "utf8"), original);
+});
+
+test("recovered cold window reprojects after a projection config change and partial runs do not advance lastSuccessfulSyncAt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-partial-config-change-"));
+  const databasePath = join(root, "agent.sqlite");
+  const outputDir = join(root, "sessions");
+  const manifestPath = join(root, "sessions-manifest.json");
+  const indexPath = join(root, "index.sqlite");
+  const db = createAgentDatabase(databasePath, "main", "2026.9.2", 19);
+  insertSession(db, {
+    sessionId: "stable",
+    chatType: "channel",
+    message: {
+      type: "message",
+      timestamp: "2026-08-25T14:32:09Z",
+      message: { role: "assistant", content: "Stable window reply" },
+    },
+  });
+  insertSession(db, {
+    sessionId: "cold-window",
+    chatType: "channel",
+    message: {
+      type: "message",
+      timestamp: "2026-08-25T15:00:00Z",
+      message: { role: "assistant", content: "Cold window reply" },
+    },
+  });
+  db.exec(`
+    PRAGMA user_version=24;
+    UPDATE schema_meta SET schema_version=24;
+    ALTER TABLE transcript_events ADD COLUMN event_zstd BLOB;
+    ALTER TABLE transcript_events ADD COLUMN event_utf8_bytes INTEGER;
+    CREATE TABLE session_transcript_cold_archives (session_id TEXT PRIMARY KEY);
+  `);
+
+  let indexCalls = 0;
+  const index = async () => {
+    await writeFile(indexPath, `index-${++indexCalls}`);
+    return 1;
+  };
+  const baseParams = {
+    databasePath,
+    outputDir,
+    manifestPath,
+    indexPath,
+    agentId: "main",
+    chatTypes: ["channel"] as const,
+    index,
+    indexReady: async () => true,
+  };
+  const utcParams = { ...baseParams, agentName: "Theo", timezone: "UTC" };
+  const nyParams = { ...baseParams, agentName: "Bill", timezone: "America/New_York" };
+
+  try {
+    const first = await syncSessionProjections(utcParams);
+    assert.equal(first.result.failed, 0);
+    assert.equal(first.result.updated, 2);
+    assert.ok(first.manifest.lastSuccessfulSyncAt);
+    assert.ok(first.manifest.indexSignature);
+    const coldDocPath = join(outputDir, first.manifest.sessions["cold-window"]!.documentPath);
+    assert.match(await readFile(coldDocPath, "utf8"), /## Assistant — Theo — 2026-08-25 15:00:00 UTC/u);
+
+    // Simulate a legacy v1 manifest (without per-entry projectionKey) before config change + cold failure.
+    const legacyManifest = structuredClone(first.manifest);
+    delete legacyManifest.sessions.stable!.projectionKey;
+    delete legacyManifest.sessions["cold-window"]!.projectionKey;
+    await writeFile(manifestPath, JSON.stringify(legacyManifest));
+
+    // Mark "cold-window" temporarily cold while changing projection configuration.
+    db.prepare("INSERT INTO session_transcript_cold_archives VALUES ('cold-window')").run();
+    const partial = await syncSessionProjections(nyParams);
+    assert.equal(partial.result.failed, 1);
+    assert.equal(partial.result.updated, 1);
+    assert.equal(partial.manifest.lastSuccessfulSyncAt, first.manifest.lastSuccessfulSyncAt);
+    assert.equal(partial.result.lastSuccessfulSyncAt, first.result.lastSuccessfulSyncAt);
+    assert.equal(partial.manifest.projectionKey, first.manifest.projectionKey);
+    assert.equal(partial.manifest.indexSignature, undefined);
+    assert.equal(partial.manifest.sessions["cold-window"]!.projectionKey, first.manifest.projectionKey);
+    assert.notEqual(partial.manifest.sessions.stable!.projectionKey, first.manifest.projectionKey);
+    assert.match(await readFile(coldDocPath, "utf8"), /## Assistant — Theo — 2026-08-25 15:00:00 UTC/u);
+
+    // Recover "cold-window" with identical source rows/fingerprint; it MUST reproject under nyParams.
+    db.exec("DELETE FROM session_transcript_cold_archives");
+    assert.equal(await unchangedSessionSync(nyParams, indexPath), undefined);
+
+    const recovered = await syncSessionProjections(nyParams);
+    assert.equal(recovered.result.failed, 0);
+    assert.equal(recovered.result.updated, 1);
+    assert.equal(recovered.result.unchanged, 1);
+    assert.match(await readFile(coldDocPath, "utf8"), /## Assistant — Bill — 2026-08-25 11:00:00 EDT/u);
+    assert.notEqual(recovered.manifest.projectionKey, first.manifest.projectionKey);
+    assert.ok(recovered.manifest.indexSignature);
+    assert.ok((recovered.manifest.lastSuccessfulSyncAt ?? 0) >= (first.manifest.lastSuccessfulSyncAt ?? 0));
+    assert.equal((await unchangedSessionSync(nyParams, indexPath))?.skipReason, "no_changes");
+  } finally {
+    db.close();
+  }
 });
