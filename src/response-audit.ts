@@ -195,7 +195,7 @@ async function assessMemoryOpportunity(
       e.id, e.session, e.senderId, e.request, e.answer, e.feedback, candidates,
       [...options.config.responseAudit.memoryCorpora].sort(),
     ]);
-    let judged = store.stage(cohort, e, "memory", memoryKey);
+    let judged = store.stage(cohort, e, "memory", memoryKey, candidates);
     if (judged) usage.stageCacheHits++;
     else {
       store.stageBegin([memoryKey], Date.now());

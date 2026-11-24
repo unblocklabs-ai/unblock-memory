@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import type { ResponseEpisode } from "./response-episodes.js";
-import { validateCachedStage, type ResponseJudgment, type ResponseStages, type judgeMemoryOpportunity, type judgeResponseFollowup } from "./response-judge.js";
+import { validateCachedStage, type ResponseJudgment, type ResponseStageContracts, type ResponseStages, type judgeMemoryOpportunity, type judgeResponseFollowup } from "./response-judge.js";
 import { responseOutcome, RESPONSE_REPORT_VERSION } from "./response-outcome.js";
 import type { ResponseHuman } from "./response-identity.js";
 import { ResponsePeople } from "./response-identity.js";
@@ -182,7 +182,13 @@ export class ResponseAuditStore {
         WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash AND (s.status IS NULL OR s.status!='ok')))`)
       .get(cohort, since, until)!.n);
   }
-  stage<K extends keyof ResponseStages>(cohort: string, e: ResponseEpisode, stage: K, key: string): ResponseStages[K] | undefined {
+  stage<K extends keyof ResponseStages>(
+    cohort: string,
+    e: ResponseEpisode,
+    stage: K,
+    key: string,
+    contract?: ResponseStageContracts[K],
+  ): ResponseStages[K] | undefined {
     return immediateTransaction(this.#db, () => {
       this.#db.prepare("INSERT OR IGNORE INTO response_stages(key,stage) VALUES(?,?)").run(key, stage);
       this.#db.prepare(`INSERT INTO response_stage_links VALUES(?,?,?,?,?) ON CONFLICT(cohort,episode_id,stage)
@@ -191,7 +197,12 @@ export class ResponseAuditStore {
       if (!row) return undefined;
       try {
         if (typeof row.result !== "string") throw new Error("Missing cached response stage payload");
-        return validateCachedStage(stage, JSON.parse(row.result));
+        const effectiveContract = (contract !== undefined
+          ? contract
+          : stage === "retrospective" && e.followup
+            ? { status: e.followup.status }
+            : undefined) as ResponseStageContracts[K];
+        return validateCachedStage(stage, JSON.parse(row.result), effectiveContract);
       } catch {
         // Evict only this corrupted cached stage so valid siblings remain cached and this stage can recompute cleanly.
         this.#db.prepare(`UPDATE response_stages
@@ -262,15 +273,7 @@ export class ResponseAuditStore {
       ${filters.map(() => "AND json_extract(result,?)=?").join(" ")}
       ORDER BY episode_at DESC,id LIMIT 10001`).all(cohort, since, until, ...(id ? [id] : []), ...filters.flat());
     const scan = this.#db.prepare("SELECT observed_at,coverage FROM response_scans WHERE cohort=?").get(cohort);
-    const groups = new Map<string, { week: string; human: ResponseHuman | null; taskType: string; agentModel: string; evaluated: number;
-      assessable: number; fitAssessable: number; fulfillmentScored: number; deliverableFitScored: number;
-      fulfillmentSum: number; deliverableSum: number; feedbackCertain: number;
-      accepted: number; reworkCertain: number; rework: number; memoryGap: number; dissatisfied: number;
-      sentimentAssessed: number; sentimentCertain: number; emotionAssessed: number; annoyed: number; frustrated: number;
-      annoyanceUncertain: number; frustrationUncertain: number; dissatisfactionIntensityScored: number; intensitySum: number;
-      underdeliveryCertain: number; underdelivery: number; failureReasons: Record<string, number>;
-      feedbackTargets: Record<string, number>; retrospectiveAssessed: number; laterCorrections: number; deliveryAdmissions: number;
-      outcomeKnown: number; acknowledgedSuccess: number; reportedShortfall: number; outcomeReasons: Record<string, number> }>();
+    const groups = new Map<string, ReportGroup>();
     const examples: { id: string; episodeAt: number; assessedAt: number; signals: string[]; outcome: ReturnType<typeof responseOutcome> }[] = [];
     for (const row of rows.slice(0, 10000)) {
       if (row.status !== "ok" || typeof row.result !== "string") continue;
@@ -281,132 +284,13 @@ export class ResponseAuditStore {
       const taskType = r.quality.taskType.confidence >= 0.8 ? r.quality.taskType.choice : "uncertain";
       const human = r.human ?? null;
       const key = JSON.stringify([week, taskType, r.agentModel, human?.key ?? null]);
-      const g = groups.get(key) ?? { week, human, taskType, agentModel: r.agentModel, evaluated: 0, assessable: 0, fitAssessable: 0,
-        fulfillmentScored: 0, deliverableFitScored: 0,
-        fulfillmentSum: 0, deliverableSum: 0, feedbackCertain: 0, accepted: 0, reworkCertain: 0, rework: 0, memoryGap: 0, dissatisfied: 0,
-        sentimentAssessed: 0, sentimentCertain: 0, emotionAssessed: 0, annoyed: 0, frustrated: 0,
-        annoyanceUncertain: 0, frustrationUncertain: 0, dissatisfactionIntensityScored: 0, intensitySum: 0,
-        underdeliveryCertain: 0, underdelivery: 0, failureReasons: {},
-        feedbackTargets: {}, retrospectiveAssessed: 0, laterCorrections: 0, deliveryAdmissions: 0,
-        outcomeKnown: 0, acknowledgedSuccess: 0, reportedShortfall: 0, outcomeReasons: {} };
-      g.evaluated++;
-      const underdelivery = r.quality.underdelivery.noul >= 0.8;
-      if (r.quality.underdelivery.noul <= 0.2 || underdelivery) g.underdeliveryCertain++;
-      if (underdelivery) {
-        g.underdelivery++;
-        const reason = r.quality.failureReason.confidence >= 0.8 ? r.quality.failureReason.choice : "uncertain";
-        g.failureReasons[reason] = (g.failureReasons[reason] ?? 0) + 1;
-      }
-      if (r.quality.assessability.choice === "assessable" && r.quality.assessability.confidence >= 0.8) {
-        g.assessable++;
-        if (r.quality.fulfillment.confidence >= 0.8) { g.fulfillmentScored++; g.fulfillmentSum += r.quality.fulfillment.score; }
-      }
-      if (r.quality.fitAssessability.choice === "assessable" && r.quality.fitAssessability.confidence >= 0.8) {
-        g.fitAssessable++;
-        if (r.quality.deliverableFit.confidence >= 0.8) { g.deliverableFitScored++; g.deliverableSum += r.quality.deliverableFit.score; }
-      }
-      const target = r.feedback.target.confidence >= 0.8 ? r.feedback.target.choice : "uncertain";
-      g.feedbackTargets[target] = (g.feedbackTargets[target] ?? 0) + 1;
-      const laterCorrection = (r.retrospective.judgment?.correction.noul ?? 0) >= 0.8;
-      const deliveryAdmission = (r.retrospective.judgment?.deliveryAdmission.noul ?? 0) >= 0.8;
-      const outcome = responseOutcome(r);
-      const reportedShortfall = outcome.status === "reported_shortfall";
-      if (reportedShortfall || outcome.status === "acknowledged_success") {
-        g.outcomeKnown++;
-        if (reportedShortfall) {
-          g.reportedShortfall++;
-          for (const label of outcome.reasons.length ? outcome.reasons : ["uncertain"]) {
-            g.outcomeReasons[label] = (g.outcomeReasons[label] ?? 0) + 1;
-          }
-        } else g.acknowledgedSuccess++;
-      }
-      if (r.retrospective.judgment) g.retrospectiveAssessed++;
-      if (laterCorrection) g.laterCorrections++;
-      if (deliveryAdmission) g.deliveryAdmissions++;
-      if (r.feedback.feedbackType.confidence >= 0.8) { g.feedbackCertain++; if (r.feedback.feedbackType.choice === "acceptance") g.accepted++; }
-      const burden = r.feedback.avoidableRework.noul;
-      if (burden <= 0.2 || burden >= 0.8) { g.reworkCertain++; if (burden >= 0.8) g.rework++; }
-      const memoryGap = r.feedback.memoryGap.noul >= 0.8;
-      const sentiment = r.feedback.sentiment;
-      const sentimentCertain = !!sentiment && sentiment.confidence >= 0.8 && sentiment.choice !== "unclear";
-      const dissatisfied = sentimentCertain && ["dissatisfied", "mixed"].includes(sentiment.choice);
-      if (sentiment) g.sentimentAssessed++;
-      if (sentimentCertain) g.sentimentCertain++;
-      const { annoyance, frustration, dissatisfactionIntensity: intensity } = r.feedback;
-      const annoyed = !!annoyance && annoyance.noul >= 0.8;
-      const frustrated = !!frustration && frustration.noul >= 0.8;
-      if (annoyance && frustration) {
-        g.emotionAssessed++;
-        if (annoyed) g.annoyed++;
-        if (frustrated) g.frustrated++;
-        if (annoyance.noul > 0.2 && annoyance.noul < 0.8) g.annoyanceUncertain++;
-        if (frustration.noul > 0.2 && frustration.noul < 0.8) g.frustrationUncertain++;
-      }
-      if (intensity && intensity.confidence >= 0.8) { g.dissatisfactionIntensityScored++; g.intensitySum += intensity.score; }
-      if (memoryGap) g.memoryGap++;
-      if (dissatisfied) g.dissatisfied++;
+      const g = groups.get(key) ?? createReportGroup(week, human, taskType, r.agentModel);
+      const { signals, outcome } = recordEpisodeInGroup(g, r);
       groups.set(key, g);
-      const signals = [underdelivery ? "clear_underdelivery" : "", burden >= 0.8 ? "avoidable_rework" : "", memoryGap ? "reported_memory_gap" : "", dissatisfied ? `dissatisfied:${target}` : "",
-        annoyed ? `annoyed:${target}` : "", frustrated ? `frustrated:${target}` : "",
-        laterCorrection ? "later_correction" : "", deliveryAdmission ? "delivery_admission" : "", reportedShortfall ? "reported_shortfall" : ""].filter(Boolean);
       if (signals.length && examples.length < 20) examples.push({ id: String(row.id), episodeAt: Number(row.episode_at), assessedAt: Number(row.assessed_at), signals, outcome });
     }
-    const summaries = [...groups.values()].map(({ fulfillmentSum, deliverableSum, intensitySum, ...g }) => ({ ...g,
-      periodStart: g.week,
-      fulfillmentMean: g.fulfillmentScored ? fulfillmentSum / g.fulfillmentScored : null,
-      deliverableFitMean: g.deliverableFitScored ? deliverableSum / g.deliverableFitScored : null,
-      sentimentNotAssessed: g.evaluated - g.sentimentAssessed,
-      sentimentUnknown: g.sentimentAssessed - g.sentimentCertain,
-      sentimentCoverage: g.sentimentAssessed / g.evaluated,
-      // Observed rates include uncertainty in their denominator, never silently label it neutral.
-      dissatisfactionRate: g.sentimentAssessed ? g.dissatisfied / g.sentimentAssessed : null,
-      sentimentUnknownRate: g.sentimentAssessed ? (g.sentimentAssessed - g.sentimentCertain) / g.sentimentAssessed : null,
-      annoyanceRate: g.emotionAssessed ? g.annoyed / g.emotionAssessed : null,
-      frustrationRate: g.emotionAssessed ? g.frustrated / g.emotionAssessed : null,
-      dissatisfactionIntensityMean: g.dissatisfactionIntensityScored ? intensitySum / g.dissatisfactionIntensityScored : null,
-      observedSuccessRate: g.outcomeKnown ? g.acknowledgedSuccess / g.outcomeKnown : null,
-      observedSuccessRate95Interval: wilson(g.acknowledgedSuccess, g.outcomeKnown),
-      outcomeUnknown: g.evaluated - g.outcomeKnown,
-      outcomeCoverage: g.outcomeKnown / g.evaluated,
-      acknowledgedRate: g.acknowledgedSuccess / g.evaluated,
-      reportedShortfallRate: g.reportedShortfall / g.evaluated,
-      unknownRate: (g.evaluated - g.outcomeKnown) / g.evaluated,
-      underdeliveryRate: g.underdeliveryCertain ? g.underdelivery / g.underdeliveryCertain : null,
-      underdeliveryRate95Interval: wilson(g.underdelivery, g.underdeliveryCertain),
-      reworkRate: g.reworkCertain ? g.rework / g.reworkCertain : null,
-      reworkRate95Interval: wilson(g.rework, g.reworkCertain), smallSample: g.evaluated < 20,
-    }));
-    const trends = summaries.flatMap(current => {
-      const previous = summaries.filter(g => g.taskType === current.taskType && g.agentModel === current.agentModel &&
-        g.human?.key === current.human?.key && g.week < current.week)
-        .sort((a, b) => b.week.localeCompare(a.week))[0];
-      if (!previous) return [];
-      return (["fulfillment", "deliverableFit", "acknowledgedRate", "reportedShortfallRate", "unknownRate",
-        "dissatisfactionRate", "sentimentUnknownRate", "annoyanceRate", "frustrationRate", "dissatisfactionIntensity"] as const).map(dimension => {
-        const scoreDimension = dimension === "fulfillment" || dimension === "deliverableFit" || dimension === "dissatisfactionIntensity" ? dimension : null;
-        const sentimentDimension = dimension === "dissatisfactionRate" || dimension === "sentimentUnknownRate";
-        const emotionDimension = dimension === "annoyanceRate" || dimension === "frustrationRate";
-        const assessedSubset = scoreDimension || sentimentDimension || emotionDimension;
-        const beforeN = scoreDimension ? previous[`${scoreDimension}Scored`] : sentimentDimension ? previous.sentimentAssessed : emotionDimension ? previous.emotionAssessed : previous.evaluated;
-        const afterN = scoreDimension ? current[`${scoreDimension}Scored`] : sentimentDimension ? current.sentimentAssessed : emotionDimension ? current.emotionAssessed : current.evaluated;
-        const before = dimension === "fulfillment" || dimension === "deliverableFit" || dimension === "dissatisfactionIntensity" ? previous[`${dimension}Mean`] : previous[dimension];
-        const after = dimension === "fulfillment" || dimension === "deliverableFit" || dimension === "dissatisfactionIntensity" ? current[`${dimension}Mean`] : current[dimension];
-        const beforeCoverage = assessedSubset ? beforeN / previous.evaluated : previous.outcomeCoverage;
-        const afterCoverage = assessedSubset ? afterN / current.evaluated : current.outcomeCoverage;
-        const coverageChanged = beforeCoverage !== afterCoverage;
-        const enough = beforeN >= 20 && afterN >= 20 && current.taskType !== "uncertain" && current.agentModel !== "unknown";
-        const status = !current.human || !current.human.accountScope || current.taskType === "uncertain" || current.agentModel === "unknown" ? "unknown_stratum" :
-          !enough ? "insufficient_samples" : assessedSubset && coverageChanged ? "coverage_changed" : "descriptive_comparison";
-        return { fromWeek: previous.week, toWeek: current.week, taskType: current.taskType, agentModel: current.agentModel,
-          fromPeriod: previous.week, toPeriod: current.week, human: current.human,
-          dimension, beforeN, afterN, status,
-          before, after, beforeEvaluated: previous.evaluated, afterEvaluated: current.evaluated,
-          beforeCoverage, afterCoverage, coverageChanged,
-          denominator: dimension === "dissatisfactionIntensity" ? "confident_intensity_exchanges" : scoreDimension ? "confident_assessable_exchanges" : sentimentDimension ? "sentiment_assessed_exchanges" : emotionDimension ? "emotion_assessed_exchanges" : "all_evaluated_exchanges",
-          scale: dimension === "dissatisfactionIntensity" ? "0_to_3_expressed_dissatisfaction" : scoreDimension ? "0_to_3_visible_quality" : "0_to_1_observed_rate",
-          delta: status === "descriptive_comparison" ? after! - before! : null };
-      });
-    });
+    const summaries = [...groups.values()].map(summarizeGroup);
+    const trends = computeTrends(summaries);
     const stages = this.#db.prepare(`SELECT s.stage,s.status,COUNT(*) count,
       SUM(CASE WHEN s.status!='ok' AND s.attempts>=? THEN 1 ELSE 0 END) exhausted
       FROM response_stage_links l JOIN response_stages s ON s.key=l.key JOIN response_results r
@@ -431,6 +315,196 @@ export class ResponseAuditStore {
         "Evidence references describe the assessed snapshot; transcript rewrites are reconciled on the next in-scope scan."] };
   }
   close() { this.#db.close(); }
+}
+
+type ReportGroup = ReturnType<typeof createReportGroup>;
+type ReportSummary = ReturnType<typeof summarizeGroup>;
+
+function createReportGroup(week: string, human: ResponseHuman | null, taskType: string, agentModel: string) {
+  return {
+    week, human, taskType, agentModel, evaluated: 0, assessable: 0, fitAssessable: 0,
+    fulfillmentScored: 0, deliverableFitScored: 0,
+    fulfillmentSum: 0, deliverableSum: 0, feedbackCertain: 0, accepted: 0, reworkCertain: 0, rework: 0, memoryGap: 0, dissatisfied: 0,
+    sentimentAssessed: 0, sentimentCertain: 0, emotionAssessed: 0, annoyed: 0, frustrated: 0,
+    annoyanceUncertain: 0, frustrationUncertain: 0, dissatisfactionIntensityScored: 0, intensitySum: 0,
+    underdeliveryCertain: 0, underdelivery: 0, failureReasons: {} as Record<string, number>,
+    feedbackTargets: {} as Record<string, number>, retrospectiveAssessed: 0, laterCorrections: 0, deliveryAdmissions: 0,
+    outcomeKnown: 0, acknowledgedSuccess: 0, reportedShortfall: 0, outcomeReasons: {} as Record<string, number>,
+  };
+}
+
+function recordEpisodeInGroup(g: ReportGroup, r: ResponseResult) {
+  g.evaluated++;
+  const underdelivery = r.quality.underdelivery.noul >= 0.8;
+  if (r.quality.underdelivery.noul <= 0.2 || underdelivery) g.underdeliveryCertain++;
+  if (underdelivery) {
+    g.underdelivery++;
+    const reason = r.quality.failureReason.confidence >= 0.8 ? r.quality.failureReason.choice : "uncertain";
+    g.failureReasons[reason] = (g.failureReasons[reason] ?? 0) + 1;
+  }
+  if (r.quality.assessability.choice === "assessable" && r.quality.assessability.confidence >= 0.8) {
+    g.assessable++;
+    if (r.quality.fulfillment.confidence >= 0.8) { g.fulfillmentScored++; g.fulfillmentSum += r.quality.fulfillment.score; }
+  }
+  if (r.quality.fitAssessability.choice === "assessable" && r.quality.fitAssessability.confidence >= 0.8) {
+    g.fitAssessable++;
+    if (r.quality.deliverableFit.confidence >= 0.8) { g.deliverableFitScored++; g.deliverableSum += r.quality.deliverableFit.score; }
+  }
+  const target = r.feedback.target.confidence >= 0.8 ? r.feedback.target.choice : "uncertain";
+  g.feedbackTargets[target] = (g.feedbackTargets[target] ?? 0) + 1;
+  const laterCorrection = (r.retrospective.judgment?.correction.noul ?? 0) >= 0.8;
+  const deliveryAdmission = (r.retrospective.judgment?.deliveryAdmission.noul ?? 0) >= 0.8;
+  const outcome = responseOutcome(r);
+  const reportedShortfall = outcome.status === "reported_shortfall";
+  if (reportedShortfall || outcome.status === "acknowledged_success") {
+    g.outcomeKnown++;
+    if (reportedShortfall) {
+      g.reportedShortfall++;
+      for (const label of outcome.reasons.length ? outcome.reasons : ["uncertain"]) {
+        g.outcomeReasons[label] = (g.outcomeReasons[label] ?? 0) + 1;
+      }
+    } else g.acknowledgedSuccess++;
+  }
+  if (r.retrospective.judgment) g.retrospectiveAssessed++;
+  if (laterCorrection) g.laterCorrections++;
+  if (deliveryAdmission) g.deliveryAdmissions++;
+  if (r.feedback.feedbackType.confidence >= 0.8) { g.feedbackCertain++; if (r.feedback.feedbackType.choice === "acceptance") g.accepted++; }
+  const burden = r.feedback.avoidableRework.noul;
+  if (burden <= 0.2 || burden >= 0.8) { g.reworkCertain++; if (burden >= 0.8) g.rework++; }
+  const memoryGap = r.feedback.memoryGap.noul >= 0.8;
+  const sentiment = r.feedback.sentiment;
+  const sentimentCertain = !!sentiment && sentiment.confidence >= 0.8 && sentiment.choice !== "unclear";
+  const dissatisfied = sentimentCertain && ["dissatisfied", "mixed"].includes(sentiment.choice);
+  if (sentiment) g.sentimentAssessed++;
+  if (sentimentCertain) g.sentimentCertain++;
+  const { annoyance, frustration, dissatisfactionIntensity: intensity } = r.feedback;
+  const annoyed = !!annoyance && annoyance.noul >= 0.8;
+  const frustrated = !!frustration && frustration.noul >= 0.8;
+  if (annoyance && frustration) {
+    g.emotionAssessed++;
+    if (annoyed) g.annoyed++;
+    if (frustrated) g.frustrated++;
+    if (annoyance.noul > 0.2 && annoyance.noul < 0.8) g.annoyanceUncertain++;
+    if (frustration.noul > 0.2 && frustration.noul < 0.8) g.frustrationUncertain++;
+  }
+  if (intensity && intensity.confidence >= 0.8) { g.dissatisfactionIntensityScored++; g.intensitySum += intensity.score; }
+  if (memoryGap) g.memoryGap++;
+  if (dissatisfied) g.dissatisfied++;
+  const signals = [underdelivery ? "clear_underdelivery" : "", burden >= 0.8 ? "avoidable_rework" : "", memoryGap ? "reported_memory_gap" : "", dissatisfied ? `dissatisfied:${target}` : "",
+    annoyed ? `annoyed:${target}` : "", frustrated ? `frustrated:${target}` : "",
+    laterCorrection ? "later_correction" : "", deliveryAdmission ? "delivery_admission" : "", reportedShortfall ? "reported_shortfall" : ""].filter(Boolean);
+  return { signals, outcome };
+}
+
+function summarizeGroup({ fulfillmentSum, deliverableSum, intensitySum, ...g }: ReportGroup) {
+  return {
+    ...g,
+    periodStart: g.week,
+    fulfillmentMean: g.fulfillmentScored ? fulfillmentSum / g.fulfillmentScored : null,
+    deliverableFitMean: g.deliverableFitScored ? deliverableSum / g.deliverableFitScored : null,
+    sentimentNotAssessed: g.evaluated - g.sentimentAssessed,
+    sentimentUnknown: g.sentimentAssessed - g.sentimentCertain,
+    sentimentCoverage: g.sentimentAssessed / g.evaluated,
+    // Observed rates include uncertainty in their denominator, never silently label it neutral.
+    dissatisfactionRate: g.sentimentAssessed ? g.dissatisfied / g.sentimentAssessed : null,
+    sentimentUnknownRate: g.sentimentAssessed ? (g.sentimentAssessed - g.sentimentCertain) / g.sentimentAssessed : null,
+    annoyanceRate: g.emotionAssessed ? g.annoyed / g.emotionAssessed : null,
+    frustrationRate: g.emotionAssessed ? g.frustrated / g.emotionAssessed : null,
+    dissatisfactionIntensityMean: g.dissatisfactionIntensityScored ? intensitySum / g.dissatisfactionIntensityScored : null,
+    observedSuccessRate: g.outcomeKnown ? g.acknowledgedSuccess / g.outcomeKnown : null,
+    observedSuccessRate95Interval: wilson(g.acknowledgedSuccess, g.outcomeKnown),
+    outcomeUnknown: g.evaluated - g.outcomeKnown,
+    outcomeCoverage: g.outcomeKnown / g.evaluated,
+    acknowledgedRate: g.acknowledgedSuccess / g.evaluated,
+    reportedShortfallRate: g.reportedShortfall / g.evaluated,
+    unknownRate: (g.evaluated - g.outcomeKnown) / g.evaluated,
+    underdeliveryRate: g.underdeliveryCertain ? g.underdelivery / g.underdeliveryCertain : null,
+    underdeliveryRate95Interval: wilson(g.underdelivery, g.underdeliveryCertain),
+    reworkRate: g.reworkCertain ? g.rework / g.reworkCertain : null,
+    reworkRate95Interval: wilson(g.rework, g.reworkCertain),
+    smallSample: g.evaluated < 20,
+  };
+}
+
+type TrendDimensionSpec = {
+  dimension:
+    | "fulfillment" | "deliverableFit" | "acknowledgedRate" | "reportedShortfallRate" | "unknownRate"
+    | "dissatisfactionRate" | "sentimentUnknownRate" | "annoyanceRate" | "frustrationRate" | "dissatisfactionIntensity";
+  sampleKey: "fulfillmentScored" | "deliverableFitScored" | "evaluated" | "sentimentAssessed" | "emotionAssessed" | "dissatisfactionIntensityScored";
+  valueKey:
+    | "fulfillmentMean" | "deliverableFitMean" | "acknowledgedRate" | "reportedShortfallRate" | "unknownRate"
+    | "dissatisfactionRate" | "sentimentUnknownRate" | "annoyanceRate" | "frustrationRate" | "dissatisfactionIntensityMean";
+  assessedSubset: boolean;
+  denominator:
+    | "confident_assessable_exchanges" | "all_evaluated_exchanges" | "sentiment_assessed_exchanges"
+    | "emotion_assessed_exchanges" | "confident_intensity_exchanges";
+  scale: "0_to_3_visible_quality" | "0_to_1_observed_rate" | "0_to_3_expressed_dissatisfaction";
+};
+
+const TREND_DIMENSIONS: readonly TrendDimensionSpec[] = [
+  { dimension: "fulfillment", sampleKey: "fulfillmentScored", valueKey: "fulfillmentMean", assessedSubset: true,
+    denominator: "confident_assessable_exchanges", scale: "0_to_3_visible_quality" },
+  { dimension: "deliverableFit", sampleKey: "deliverableFitScored", valueKey: "deliverableFitMean", assessedSubset: true,
+    denominator: "confident_assessable_exchanges", scale: "0_to_3_visible_quality" },
+  { dimension: "acknowledgedRate", sampleKey: "evaluated", valueKey: "acknowledgedRate", assessedSubset: false,
+    denominator: "all_evaluated_exchanges", scale: "0_to_1_observed_rate" },
+  { dimension: "reportedShortfallRate", sampleKey: "evaluated", valueKey: "reportedShortfallRate", assessedSubset: false,
+    denominator: "all_evaluated_exchanges", scale: "0_to_1_observed_rate" },
+  { dimension: "unknownRate", sampleKey: "evaluated", valueKey: "unknownRate", assessedSubset: false,
+    denominator: "all_evaluated_exchanges", scale: "0_to_1_observed_rate" },
+  { dimension: "dissatisfactionRate", sampleKey: "sentimentAssessed", valueKey: "dissatisfactionRate", assessedSubset: true,
+    denominator: "sentiment_assessed_exchanges", scale: "0_to_1_observed_rate" },
+  { dimension: "sentimentUnknownRate", sampleKey: "sentimentAssessed", valueKey: "sentimentUnknownRate", assessedSubset: true,
+    denominator: "sentiment_assessed_exchanges", scale: "0_to_1_observed_rate" },
+  { dimension: "annoyanceRate", sampleKey: "emotionAssessed", valueKey: "annoyanceRate", assessedSubset: true,
+    denominator: "emotion_assessed_exchanges", scale: "0_to_1_observed_rate" },
+  { dimension: "frustrationRate", sampleKey: "emotionAssessed", valueKey: "frustrationRate", assessedSubset: true,
+    denominator: "emotion_assessed_exchanges", scale: "0_to_1_observed_rate" },
+  { dimension: "dissatisfactionIntensity", sampleKey: "dissatisfactionIntensityScored", valueKey: "dissatisfactionIntensityMean", assessedSubset: true,
+    denominator: "confident_intensity_exchanges", scale: "0_to_3_expressed_dissatisfaction" },
+] as const;
+
+function computeTrends(summaries: readonly ReportSummary[]) {
+  const byStratum = new Map<string, ReportSummary[]>();
+  for (const summary of summaries) {
+    const stratumKey = JSON.stringify([summary.taskType, summary.agentModel, summary.human?.key ?? null]);
+    const list = byStratum.get(stratumKey);
+    if (list) list.push(summary);
+    else byStratum.set(stratumKey, [summary]);
+  }
+  const previousBySummary = new Map<ReportSummary, ReportSummary>();
+  for (const periods of byStratum.values()) {
+    if (periods.length < 2) continue;
+    periods.sort((a, b) => a.week.localeCompare(b.week));
+    for (let i = 1; i < periods.length; i++) previousBySummary.set(periods[i]!, periods[i - 1]!);
+  }
+  return summaries.flatMap(current => {
+    const previous = previousBySummary.get(current);
+    if (!previous) return [];
+    const unknownStratum = !current.human || !current.human.accountScope || current.taskType === "uncertain" || current.agentModel === "unknown";
+    return TREND_DIMENSIONS.map(spec => {
+      const beforeN = previous[spec.sampleKey];
+      const afterN = current[spec.sampleKey];
+      const before = previous[spec.valueKey];
+      const after = current[spec.valueKey];
+      const beforeCoverage = spec.assessedSubset ? beforeN / previous.evaluated : previous.outcomeCoverage;
+      const afterCoverage = spec.assessedSubset ? afterN / current.evaluated : current.outcomeCoverage;
+      const coverageChanged = beforeCoverage !== afterCoverage;
+      const status = unknownStratum ? "unknown_stratum"
+        : beforeN < 20 || afterN < 20 ? "insufficient_samples"
+        : spec.assessedSubset && coverageChanged ? "coverage_changed"
+        : "descriptive_comparison";
+      return {
+        fromWeek: previous.week, toWeek: current.week, taskType: current.taskType, agentModel: current.agentModel,
+        fromPeriod: previous.week, toPeriod: current.week, human: current.human,
+        dimension: spec.dimension, beforeN, afterN, status,
+        before, after, beforeEvaluated: previous.evaluated, afterEvaluated: current.evaluated,
+        beforeCoverage, afterCoverage, coverageChanged,
+        denominator: spec.denominator, scale: spec.scale,
+        delta: status === "descriptive_comparison" ? after! - before! : null,
+      };
+    });
+  });
 }
 
 function wilson(successes: number, total: number) {

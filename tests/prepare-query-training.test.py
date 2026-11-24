@@ -1,9 +1,11 @@
 import copy
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("prepare_query_training", Path(__file__).parents[1] / "scripts/prepare-query-training.py")
 prepare = importlib.util.module_from_spec(spec)
@@ -245,6 +247,140 @@ class PreparationTests(unittest.TestCase):
                     root / "prepared-scoped",
                     CharacterTokenizer(),
                 )
+
+    def test_atomic_publication_cleans_staging_on_mid_write_failure_and_allows_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [query_row(node=f"n{i}", session=f"s{i}", request=f"Request {i}", event=i + 1) for i in range(4)]
+            source = write_rows(root / "queries.jsonl", rows)
+            cohort = write_rows(root / "cohort.jsonl", map(cohort_row, rows))
+            out = root / "prepared"
+
+            real_write_jsonl = prepare.write_jsonl
+            call_count = 0
+
+            def flaky_write_jsonl(path, data):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 3:
+                    raise OSError("simulated mid-write disk failure")
+                return real_write_jsonl(path, data)
+
+            with mock.patch.object(prepare, "write_jsonl", side_effect=flaky_write_jsonl):
+                with self.assertRaisesRegex(OSError, "simulated mid-write disk failure"):
+                    prepare.prepare([source], [cohort], out, CharacterTokenizer())
+
+            self.assertFalse(out.exists())
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["cohort.jsonl", "queries.jsonl"])
+
+            # Immediate retry succeeds cleanly and publishes private directory + 0o600 files.
+            manifest = prepare.prepare([source], [cohort], out, CharacterTokenizer())
+            self.assertTrue(out.is_dir())
+            self.assertEqual(out.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((out / "manifest.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["cohort.jsonl", "prepared", "queries.jsonl"])
+            for name, expected_hash in manifest["files"].items():
+                published = out / name
+                self.assertEqual(published.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(hashlib.sha256(published.read_bytes()).hexdigest(), expected_hash)
+
+    def test_atomic_publication_rejects_racing_destination_without_overwriting_or_leaking_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = query_row()
+            source = write_rows(root / "queries.jsonl", [row])
+            cohort = write_rows(root / "cohort.jsonl", [cohort_row(row)])
+            out = root / "prepared"
+
+            real_write_jsonl = prepare.write_jsonl
+            created = False
+
+            def racing_write_jsonl(path, data):
+                nonlocal created
+                real_write_jsonl(path, data)
+                if not created:
+                    created = True
+                    out.mkdir(mode=0o700)
+                    (out / "sentinel.txt").write_text("do-not-overwrite")
+
+            with mock.patch.object(prepare, "write_jsonl", side_effect=racing_write_jsonl):
+                with self.assertRaises(FileExistsError):
+                    prepare.prepare([source], [cohort], out, CharacterTokenizer())
+
+            self.assertEqual((out / "sentinel.txt").read_text(), "do-not-overwrite")
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["cohort.jsonl", "prepared", "queries.jsonl"])
+
+    def test_configurable_min_score_threshold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [
+                query_row(node="n1", session="s1", request="Low score", event=1, probability=0.55),
+                query_row(node="n2", session="s2", request="Mid score", event=2, probability=0.75),
+                query_row(node="n3", session="s3", request="High score", event=3, probability=0.92),
+            ]
+            cohort = write_rows(root / "cohort.jsonl", map(cohort_row, rows))
+
+            # Lower threshold (0.5) admits all 3 rows.
+            all_sources = write_rows(root / "all-queries.jsonl", rows)
+            low_report = prepare.prepare([all_sources], [cohort], root / "out-low", CharacterTokenizer(), min_score=0.5)
+            self.assertEqual(low_report["cohortSourceExamples"], 3)
+            self.assertEqual(low_report["minScore"], 0.5)
+            self.assertEqual(low_report["counts"]["train"] + low_report["counts"]["validation"], 3)
+
+            # Higher threshold (0.8) admits only the 0.92 row and rejects a 0.75 query target.
+            high_only = write_rows(root / "high-queries.jsonl", [rows[2]])
+            high_report = prepare.prepare([high_only], [cohort], root / "out-high", CharacterTokenizer(), min_score=0.8)
+            self.assertEqual(high_report["cohortSourceExamples"], 1)
+            self.assertEqual(high_report["minScore"], 0.8)
+            self.assertEqual(high_report["counts"]["train"] + high_report["counts"]["validation"], 1)
+
+            mid_source = write_rows(root / "mid-queries.jsonl", [rows[1]])
+            with self.assertRaisesRegex(ValueError, "below the recall threshold"):
+                prepare.prepare([mid_source], [cohort], root / "out-reject", CharacterTokenizer(), min_score=0.8)
+            self.assertFalse((root / "out-reject").exists())
+
+            for bad in (-0.1, 1.1, float("nan"), True):
+                with self.assertRaisesRegex(ValueError, "Invalid min_score"):
+                    prepare.prepare([high_only], [cohort], root / "out-bad", CharacterTokenizer(), min_score=bad)
+
+    def test_input_files_are_hashed_from_exact_bytes_read_for_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [
+                query_row(node="n1", session="s1", request="First", event=1),
+                query_row(node="n2", session="s2", request="Second", event=2),
+            ]
+            source = write_rows(root / "queries.jsonl", rows)
+            cohort = write_rows(root / "cohort.jsonl", map(cohort_row, rows))
+            expected_source_bytes = source.read_bytes()
+            expected_cohort_bytes = cohort.read_bytes()
+            expected_source_hash = hashlib.sha256(expected_source_bytes).hexdigest()
+            expected_cohort_hash = hashlib.sha256(expected_cohort_bytes).hexdigest()
+
+            # Simulate concurrent replacement of the path on disk right after open("rb") begins:
+            # hash-while-reading must record the SHA-256 of the exact open FD bytes parsed, never a second read pass.
+            original_open = Path.open
+            open_counts = {}
+
+            def tracking_open(self_path, *args, **kwargs):
+                handle = original_open(self_path, *args, **kwargs)
+                resolved = str(self_path.resolve())
+                if self_path in (source, cohort):
+                    open_counts[resolved] = open_counts.get(resolved, 0) + 1
+                    # Atomically replace path on disk after FD is opened (UNIX inode of `handle` stays original).
+                    replacement = self_path.with_suffix(".replaced")
+                    replacement.write_text('{"corrupted":true}\n')
+                    replacement.replace(self_path)
+                return handle
+
+            with mock.patch.object(Path, "open", tracking_open):
+                manifest = prepare.prepare([source], [cohort], root / "prepared", CharacterTokenizer())
+
+            self.assertEqual(open_counts[str(source.resolve())], 1)
+            self.assertEqual(open_counts[str(cohort.resolve())], 1)
+            self.assertEqual(manifest["sources"][str(source.resolve())], expected_source_hash)
+            self.assertEqual(manifest["cohortSources"][str(cohort.resolve())], expected_cohort_hash)
+            self.assertNotEqual(hashlib.sha256(source.read_bytes()).hexdigest(), expected_source_hash)
 
 
 if __name__ == "__main__":

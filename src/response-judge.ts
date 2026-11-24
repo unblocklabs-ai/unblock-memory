@@ -195,6 +195,13 @@ export type ResponseStages = {
   retrospective: Awaited<ReturnType<typeof judgeResponseFollowup>>;
   memory: Awaited<ReturnType<typeof judgeMemoryOpportunity>>;
 };
+export type ResponseStageContracts = {
+  quality?: undefined;
+  feedback?: undefined;
+  sentiment?: undefined;
+  retrospective?: { status: ResponseEpisode["followup"]["status"] };
+  memory?: readonly { path: string; hash: string }[];
+};
 type JudgeStage = "quality" | "feedback" | "sentiment";
 type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
   begin: (stages: JudgeStage[]) => void;
@@ -277,25 +284,46 @@ function validateCachedSentiment(value: unknown): ResponseSentiment {
   return picked;
 }
 
-function validateCachedRetrospective(value: unknown): ResponseStages["retrospective"] {
+function validateCachedRetrospective(
+  value: unknown,
+  contract?: ResponseStageContracts["retrospective"],
+): ResponseStages["retrospective"] {
   if (!Value.Check(retrospectiveStageSchema, value)) throw new Error("Invalid cached response retrospective judgment");
+  if (contract && value.status !== contract.status) {
+    throw new Error("Cached response retrospective status mismatches expected followup status");
+  }
   const judgment = value.judgment ? retrospectiveFields(value.judgment) : null;
+  if (value.status === "complete" && !judgment) {
+    throw new Error("Invalid cached response retrospective judgment: complete status requires judgment");
+  }
   if (judgment) validateDistributions(judgment);
   return { status: value.status, judgment };
 }
 
-function validateCachedMemory(value: unknown): ResponseStages["memory"] {
+function validateCachedMemory(
+  value: unknown,
+  contract?: ResponseStageContracts["memory"],
+): ResponseStages["memory"] {
   if (!Value.Check(memoryStageSchema, value)) throw new Error("Invalid cached response memory judgment");
+  if (contract) {
+    if (value.length !== contract.length || contract.some((expected, i) => value[i]!.path !== expected.path || value[i]!.hash !== expected.hash)) {
+      throw new Error("Cached response memory judgment mismatches candidate contract");
+    }
+  }
   return value.map(({ path, hash, usefulness, basis }) => ({ path, hash, usefulness, basis }));
 }
 
-export function validateCachedStage<K extends keyof ResponseStages>(stage: K, value: unknown): ResponseStages[K] {
+export function validateCachedStage<K extends keyof ResponseStages>(
+  stage: K,
+  value: unknown,
+  contract?: ResponseStageContracts[K],
+): ResponseStages[K] {
   switch (stage) {
     case "quality": return validateCachedQuality(value) as ResponseStages[K];
     case "feedback": return validateCachedFeedback(value) as ResponseStages[K];
     case "sentiment": return validateCachedSentiment(value) as ResponseStages[K];
-    case "retrospective": return validateCachedRetrospective(value) as ResponseStages[K];
-    case "memory": return validateCachedMemory(value) as ResponseStages[K];
+    case "retrospective": return validateCachedRetrospective(value, contract as ResponseStageContracts["retrospective"]) as ResponseStages[K];
+    case "memory": return validateCachedMemory(value, contract as ResponseStageContracts["memory"]) as ResponseStages[K];
   }
 }
 

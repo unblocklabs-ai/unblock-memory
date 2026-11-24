@@ -14,6 +14,7 @@ import {
   judgeMemoryOpportunity,
   RESPONSE_STAGE_VERSIONS,
   responseRubricVersion,
+  validateCachedStage,
 } from "../src/response-judge.js";
 import { jsonHash } from "../src/json-hash.js";
 import { responseUserText } from "../src/response-text.js";
@@ -1695,4 +1696,321 @@ test("retryFailed resets legacy status=ok rows lacking $.memory.status when link
   assert.equal(healthyRow.attempts, 3);
   assert.equal(healthyRow.assessed_at, 12345);
   assert.equal(healthyRow.result, legacyJsonWithoutMemory);
+});
+
+test("cached retrospective complete-with-null-judgment and mismatched memory candidates are evicted and recomputed", async t => {
+  const start = Date.UTC(2026, 8, 23, 12, 0, 0);
+  t.mock.timers.enable({ apis: ["Date"], now: start });
+  const { db, options } = await fixture(); t.after(() => db.close());
+  const root = join(options.storePath, "..");
+  const source = resolveSource(root, "memory/**/*.md");
+  const indexDb = new DatabaseSync(options.indexPath); t.after(() => indexDb.close());
+  indexDb.exec(`CREATE TABLE documents(id INTEGER PRIMARY KEY,collection TEXT,path TEXT,hash TEXT,active INTEGER);
+    CREATE TABLE content(hash TEXT PRIMARY KEY,doc TEXT);
+    CREATE VIRTUAL TABLE documents_fts USING fts5(body);`);
+  indexDb.prepare("INSERT INTO documents VALUES(1,?,?,?,1)").run(source.collection, "1.md", "h1");
+  indexDb.prepare("INSERT INTO content VALUES(?,?)").run("h1", "Brief explanation guidelines for Atlas.");
+  indexDb.prepare("INSERT INTO documents_fts(rowid,body) VALUES(1,?)").run("Brief explanation guidelines for Atlas.");
+
+  const memConfig = resolveConfig({
+    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
+  });
+  const memOptions = { ...options, config: memConfig, sources: [source] };
+  const cohort = responseCohort(memConfig.responseAudit);
+
+  const seenRequests: string[][] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    seenRequests.push(Object.keys(body.questions));
+    if (body.questions.candidate_0) {
+      return Response.json({ answers: { candidate_0: { type: "noul", noul: 0.85 } } });
+    }
+    const result = payload(body);
+    if (body.questions.memoryGap) result.answers.memoryGap = { type: "noul", noul: 0.95 };
+    return Response.json(result);
+  });
+
+  // Seed all 5 valid stages.
+  assert.equal((await auditResponses(memOptions)).coverage?.evaluated, 1);
+
+  const rawDb = new DatabaseSync(memOptions.storePath); t.after(() => rawDb.close());
+  const store = new ResponseAuditStore(memOptions.storePath); t.after(() => store.close());
+  const readStages = () => Object.fromEntries(
+    rawDb.prepare("SELECT stage, key, status, assessed_at, result FROM response_stages").all()
+      .map(row => [String(row.stage), {
+        key: String(row.key),
+        status: String(row.status),
+        assessedAt: Number(row.assessed_at),
+        result: String(row.result),
+      }]),
+  );
+
+  // Direct validateCachedStage contract checks.
+  const validRetro = JSON.parse(readStages().retrospective!.result);
+  assert.throws(
+    () => validateCachedStage("retrospective", { status: "complete", judgment: null }),
+    /complete status requires judgment/,
+  );
+  assert.throws(
+    () => validateCachedStage("retrospective", { status: "partial", judgment: validRetro.judgment }, { status: "complete" }),
+    /mismatches expected followup status/,
+  );
+  assert.throws(
+    () => validateCachedStage(
+      "memory",
+      [{ path: "qmd://memory/wrong.md", hash: "h1", usefulness: 0.85, basis: "ok" }],
+      [{ path: "qmd://memory/1.md", hash: "h1" }],
+    ),
+    /mismatches candidate contract/,
+  );
+  assert.throws(
+    () => validateCachedStage(
+      "memory",
+      [{ path: "qmd://memory/1.md", hash: "wrong-hash", usefulness: 0.85, basis: "ok" }],
+      [{ path: "qmd://memory/1.md", hash: "h1" }],
+    ),
+    /mismatches candidate contract/,
+  );
+  assert.throws(
+    () => validateCachedStage("memory", [], [{ path: "qmd://memory/1.md", hash: "h1" }]),
+    /mismatches candidate contract/,
+  );
+
+  // 1) Retrospective stage with status="complete" and judgment:null is evicted and recomputed cleanly.
+  t.mock.timers.tick(5_000);
+  const beforeRetroNull = readStages();
+  rawDb.prepare("UPDATE response_stages SET status='ok',result=? WHERE stage='retrospective'")
+    .run(JSON.stringify({ status: "complete", judgment: null }));
+  rawDb.prepare("UPDATE response_results SET status='pending',attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL").run();
+
+  seenRequests.length = 0;
+  const retroRecovered = await auditResponses(memOptions);
+  assert.equal(retroRecovered.status, "ok");
+  assert.equal(retroRecovered.coverage?.evaluated, 1);
+  assert.equal(retroRecovered.coverage?.stageAttempts, 1);
+  assert.equal(retroRecovered.coverage?.stageCacheHits, 4);
+  assert.equal(seenRequests.length, 1);
+  assert.ok(seenRequests[0]!.includes("outcome"));
+  const afterRetroNull = readStages();
+  assert.ok(afterRetroNull.retrospective!.assessedAt > beforeRetroNull.retrospective!.assessedAt);
+  assert.ok(JSON.parse(afterRetroNull.retrospective!.result).judgment !== null);
+  for (const sibling of ["quality", "feedback", "sentiment", "memory"]) {
+    assert.equal(afterRetroNull[sibling]!.assessedAt, beforeRetroNull[sibling]!.assessedAt);
+  }
+
+  // 2) Retrospective stage with wrong followup status (partial vs complete) is evicted and recomputed cleanly.
+  t.mock.timers.tick(5_000);
+  const beforeRetroStatus = readStages();
+  rawDb.prepare("UPDATE response_stages SET status='ok',result=? WHERE stage='retrospective'")
+    .run(JSON.stringify({ status: "partial", judgment: validRetro.judgment }));
+  rawDb.prepare("UPDATE response_results SET status='pending',attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL").run();
+
+  seenRequests.length = 0;
+  const retroStatusRecovered = await auditResponses(memOptions);
+  assert.equal(retroStatusRecovered.coverage?.stageAttempts, 1);
+  assert.equal(seenRequests.length, 1);
+  assert.ok(seenRequests[0]!.includes("outcome"));
+  assert.equal(JSON.parse(readStages().retrospective!.result).status, "complete");
+  assert.equal(readStages().quality!.assessedAt, beforeRetroStatus.quality!.assessedAt);
+
+  // 3) Memory stage with mismatched candidate path or hash is evicted to pending and recomputed cleanly.
+  for (const badEntry of [
+    { path: "qmd://memory/stale-other.md", hash: "h1", usefulness: 0.9, basis: "stale" },
+    { path: `qmd://${source.collection}/1.md`, hash: "stale-hash", usefulness: 0.9, basis: "stale" },
+  ]) {
+    t.mock.timers.tick(5_000);
+    const beforeMem = readStages();
+    rawDb.prepare("UPDATE response_stages SET status='ok',result=? WHERE stage='memory'")
+      .run(JSON.stringify([badEntry]));
+    const saved = JSON.parse(String(rawDb.prepare("SELECT result FROM response_results").get()!.result));
+    saved.memory = { status: "unavailable", candidates: [] };
+    rawDb.prepare("UPDATE response_results SET status='ok',attempts=0,attempted_at=NULL,result=?").run(JSON.stringify(saved));
+
+    seenRequests.length = 0;
+    const memRecovered = await auditResponses(memOptions);
+    assert.equal(memRecovered.status, "ok");
+    assert.equal(memRecovered.coverage?.evaluated, 1);
+    assert.equal(memRecovered.coverage?.stageAttempts, 1);
+    assert.equal(seenRequests.length, 1);
+    assert.deepEqual(seenRequests[0], ["candidate_0"]);
+    assert.equal(store.unresolvedWork(cohort, 0, Number.MAX_SAFE_INTEGER), 0);
+
+    const afterMem = readStages();
+    assert.ok(afterMem.memory!.assessedAt > beforeMem.memory!.assessedAt);
+    const parsedMem = JSON.parse(afterMem.memory!.result) as { path: string; hash: string; usefulness: number }[];
+    assert.equal(parsedMem.length, 1);
+    assert.equal(parsedMem[0]!.hash, "h1");
+    assert.equal(parsedMem[0]!.usefulness, 0.85);
+    for (const sibling of ["quality", "feedback", "sentiment", "retrospective"]) {
+      assert.equal(afterMem[sibling]!.assessedAt, beforeMem[sibling]!.assessedAt);
+    }
+  }
+});
+
+test("review decisions reject stale or superseded evidence and record exact cohort and evidence revisions", async t => {
+  const { db, options } = await fixture(); t.after(() => db.close());
+  options.config = { ...config, responseAudit: { ...config.responseAudit, senderIds: ["owner", "other"] } };
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)), result = payload(body);
+    if (body.questions.underdelivery) result.answers.underdelivery = { type: "noul", noul: 0.99 };
+    return Response.json(result);
+  });
+
+  await auditResponses(options);
+  const store = new ResponseAuditStore(options.storePath); t.after(() => store.close());
+  const rawDb = new DatabaseSync(options.storePath); t.after(() => rawDb.close());
+  const cohort = responseCohort(options.config.responseAudit);
+  const initialTask = store.reviews.list(cohort)[0]!;
+  assert.equal(initialTask.evidenceStatus, "current");
+  assert.equal(initialTask.cohort, cohort);
+  assert.ok(initialTask.inputHash.length > 0);
+  assert.ok(initialTask.evidenceHash.length > 0);
+
+  // Explicit revision guards reject mismatched inputHash or evidenceHash without mutating task or decision log.
+  assert.throws(
+    () => store.reviews.decide(cohort, initialTask.id, "dismissed", "human", "Bad input hash", Date.now(), { expectedInputHash: "wrong-hash" }),
+    /input hash mismatch/,
+  );
+  assert.throws(
+    () => store.reviews.decide(cohort, initialTask.id, "dismissed", "human", "Bad evidence hash", Date.now(), { expectedEvidenceHash: "wrong-evidence" }),
+    /evidence revision mismatch/,
+  );
+  assert.equal(store.reviews.list(cohort, initialTask.id)[0]!.status, "pending");
+  assert.equal(store.reviews.decisions(initialTask.id, cohort).length, 0);
+
+  // Valid decision with matching revision succeeds and records cohort, input_hash, and evidence_hash.
+  const recorded1 = store.reviews.decide(
+    cohort,
+    initialTask.id,
+    "dismissed",
+    "human",
+    "Verified against v1 evidence",
+    10_000,
+    { expectedInputHash: initialTask.inputHash, expectedEvidenceHash: initialTask.evidenceHash },
+  );
+  assert.equal(recorded1.cohort, cohort);
+  assert.equal(recorded1.inputHash, initialTask.inputHash);
+  assert.equal(recorded1.evidenceHash, initialTask.evidenceHash);
+  const dbDecision1 = rawDb.prepare("SELECT cohort, input_hash, evidence_hash, status FROM response_review_decisions WHERE task_id=?").get(initialTask.id)!;
+  assert.equal(dbDecision1.cohort, cohort);
+  assert.equal(dbDecision1.input_hash, initialTask.inputHash);
+  assert.equal(dbDecision1.evidence_hash, initialTask.evidenceHash);
+  assert.equal(dbDecision1.status, "dismissed");
+
+  // Feedback changes -> new inputHash & evidenceHash; deciding again appends second provenance-bound record.
+  db.prepare("UPDATE transcript_events SET event_json=? WHERE seq=3").run(JSON.stringify({ type: "message", message: user("Updated feedback text.") }));
+  await auditResponses(options);
+  const refreshedTask = store.reviews.list(cohort, initialTask.id)[0]!;
+  assert.equal(refreshedTask.evidenceStatus, "current");
+  assert.notEqual(refreshedTask.inputHash, initialTask.inputHash);
+  assert.notEqual(refreshedTask.evidenceHash, initialTask.evidenceHash);
+  assert.throws(
+    () => store.reviews.decide(cohort, initialTask.id, "resolved", "human", "Stale revision", 20_000, { expectedInputHash: initialTask.inputHash }),
+    /input hash mismatch/,
+  );
+  store.reviews.decide(cohort, initialTask.id, "resolved", "human", "Resolved on v2 evidence", 20_000, {
+    expectedInputHash: refreshedTask.inputHash,
+    expectedEvidenceHash: refreshedTask.evidenceHash,
+  });
+  const history = store.reviews.decisions(initialTask.id, cohort);
+  assert.equal(history.length, 2);
+  assert.equal(history[0]!.inputHash, initialTask.inputHash);
+  assert.equal(history[0]!.evidenceHash, initialTask.evidenceHash);
+  assert.equal(history[1]!.inputHash, refreshedTask.inputHash);
+  assert.equal(history[1]!.evidenceHash, refreshedTask.evidenceHash);
+
+  // Superseded evidence (active = -1) after sender rewrite must be rejected.
+  for (const seq of [1, 3]) {
+    const row = db.prepare("SELECT event_json FROM transcript_events WHERE seq=?").get(seq)!;
+    const event = JSON.parse(String(row.event_json));
+    event.message.__openclaw.senderId = "other";
+    db.prepare("UPDATE transcript_events SET event_json=? WHERE seq=?").run(JSON.stringify(event), seq);
+  }
+  await auditResponses(options);
+  const allTasks = store.reviews.list(cohort);
+  const superseded = allTasks.find(x => x.id === initialTask.id)!;
+  const replacement = allTasks.find(x => x.id !== initialTask.id)!;
+  assert.equal(superseded.evidenceStatus, "superseded");
+  assert.equal(replacement.evidenceStatus, "current");
+  assert.throws(
+    () => store.reviews.decide(cohort, superseded.id, "deferred", "human", "Must fail on superseded", 30_000),
+    /superseded evidence/,
+  );
+  assert.equal(store.reviews.decisions(superseded.id, cohort).length, 2);
+
+  // Replacement task with current evidence can still be decided.
+  store.reviews.decide(cohort, replacement.id, "resolved", "human", "Resolved replacement", 35_000);
+  assert.equal(store.reviews.decisions(replacement.id, cohort).length, 1);
+
+  // Stale evidence (active = 0) after removing active transcript events must be rejected.
+  db.exec("DELETE FROM session_transcript_active_events");
+  await auditResponses(options);
+  assert.equal(store.reviews.list(cohort, replacement.id)[0]!.evidenceStatus, "stale");
+  assert.throws(
+    () => store.reviews.decide(cohort, replacement.id, "dismissed", "human", "Must fail on stale", 40_000),
+    /stale evidence/,
+  );
+  assert.equal(store.reviews.decisions(replacement.id, cohort).length, 1);
+});
+
+test("report trends group by stratum in linear time and pair exact previous periods across weeks and strata", async t => {
+  const { db, options } = await fixture(); t.after(() => db.close());
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => Response.json(payload(JSON.parse(String(init.body)))));
+  const e = responseEpisodes(session, basic(), config.responseAudit).episodes[0]!;
+  const params = { apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal };
+  const judgment = await judgeResponse(e, params);
+  const retrospective = await judgeResponseFollowup(e, params);
+  const store = new ResponseAuditStore(options.storePath); t.after(() => store.close());
+  const cohort = responseCohort(config.responseAudit);
+
+  const weeks = [Date.UTC(2026, 8, 7), Date.UTC(2026, 8, 14), Date.UTC(2026, 8, 21)];
+  const models = ["model-a", "model-b"] as const;
+  const episodes: typeof e[] = [];
+  for (const model of models) {
+    for (const [wIdx, ts] of weeks.entries()) {
+      for (let i = 0; i < 20; i++) {
+        episodes.push({ ...e, id: `${model}-w${wIdx}-${i}`, inputHash: `h-${model}-${wIdx}-${i}`, timestamp: ts + i });
+      }
+    }
+  }
+  store.observe(cohort, "s", episodes);
+  for (const ep of episodes) {
+    const isModelA = ep.id.startsWith("model-a");
+    const wIdx = Number(ep.id.split("-")[2]!.slice(1));
+    const quality = structuredClone(judgment.quality);
+    const later = structuredClone(retrospective);
+    later.judgment!.outcome.choice = "acknowledged_success";
+    const score = isModelA ? wIdx + 1 : 3 - wIdx; // model-a: 1 -> 2 -> 3; model-b: 3 -> 2 -> 1
+    quality.fulfillment = {
+      type: "score",
+      score,
+      confidence: 0.95,
+      probabilities: { "0": 0, "1": score === 1 ? 1 : 0, "2": score === 2 ? 1 : 0, "3": score === 3 ? 1 : 0 },
+    };
+    store.save(cohort, ep, {
+      ...judgment,
+      quality,
+      retrospective: later,
+      references: { sessionId: "s", request: [1], answer: [2], feedback: [3], followup: [4], inputHash: ep.inputHash },
+      agentModel: isModelA ? "model-a" : "model-b",
+      contextLimited: false,
+      memorySearchCalls: 0,
+      memory: { status: "not_requested", candidates: [] },
+    }, Date.now());
+  }
+
+  const report = store.report(cohort, 0);
+  // 2 strata * 2 week-over-week transitions * 10 dimensions = 40 trend rows.
+  assert.equal(report.trends.length, 40);
+  const fulfillmentTrends = report.trends.filter(tr => tr.dimension === "fulfillment");
+  assert.deepEqual(
+    fulfillmentTrends.map(tr => [tr.agentModel, tr.fromWeek, tr.toWeek, tr.delta, tr.status]),
+    [
+      ["model-a", "2026-09-14", "2026-09-21", 1, "descriptive_comparison"],
+      ["model-b", "2026-09-14", "2026-09-21", -1, "descriptive_comparison"],
+      ["model-a", "2026-09-07", "2026-09-14", 1, "descriptive_comparison"],
+      ["model-b", "2026-09-07", "2026-09-14", -1, "descriptive_comparison"],
+    ],
+  );
 });
