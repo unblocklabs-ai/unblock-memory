@@ -8,9 +8,11 @@ import test from "node:test";
 import { createStore } from "@unblocklabs/qmd";
 import { resolveConfig } from "../src/config.js";
 import { extractWithLuna, validateExtractedMemory, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
-import { ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
+import { ExtractionLeaseLostError, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
 import { runExtraction } from "../src/extraction-worker.js";
-import type { ExtractionPage } from "../src/extraction-source.js";
+import { readExtractionPage, type ExtractionPage } from "../src/extraction-source.js";
+import { registerExtraction } from "../src/extraction-runtime.js";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { EXTRACTED_COLLECTION, extractedPath, syncExtractedIndex } from "../src/extraction-index.js";
 import { QmdMemoryManager } from "../src/manager.js";
 import { resolveSource } from "../src/sources.js";
@@ -110,14 +112,14 @@ test("commit is atomic, deduplicated, versioned and fenced by checkpoint and lea
   const f = await fixture(), store = new ExtractionStore(f.storePath);
   try {
     const owner = store.claim(false, 0)!; assert.ok(owner); assert.equal(store.claim(false, 0), undefined);
-    store.checkpoint(session);
+    store.checkpoint(session, owner);
     const commit = { session, expected: null, cursor: "c1", context: messages, accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" };
     store.commit(commit); const original = store.records()[0]!;
     assert.throws(() => store.commit(commit), /checkpoint/);
     store.commit({ ...commit, expected: "c1", cursor: "c2" }); assert.equal(store.records().length, 1);
     const replacement = { ...proposal, text: "Bek's favorite color is green.", replaces: original.id };
     assert.throws(() => store.commit({ ...commit, expected: "c2", cursor: "c3", accepted: [{ proposal: replacement, observedAt: 900, judgment: {} }] }), /stale/);
-    assert.equal(store.checkpoint(session).cursor, "c2");
+    assert.equal(store.checkpoint(session, owner).cursor, "c2");
     store.commit({ ...commit, expected: "c2", cursor: "c3", accepted: [{ proposal: replacement, observedAt: 2000, judgment: {} }] });
     assert.equal(store.records()[0]!.revision, 2);
     assert.equal(store.db.prepare("SELECT count(*) AS n FROM extracted_memories").get()!.n, 2);
@@ -153,7 +155,7 @@ test("incremental worker skips unchanged pages, retries failures and never loses
     extract: async () => { calls++; if (fail) throw new Error("private source must never leak into status"); return [proposal]; },
     validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) };
   assert.equal((await runExtraction(opts)).status, "completed");
-  const check = new ExtractionStore(f.storePath); assert.equal(check.checkpoint(session).cursor, null); check.close();
+  const check = new ExtractionStore(f.storePath); assert.equal(check.readCheckpoint(session.sessionId)?.cursor, null); check.close();
   fail = false;
   assert.equal((await runExtraction(opts)).accepted, 1);
   const repeated = await runExtraction(opts); assert.equal(repeated.unchanged, 1); assert.equal(calls, 2);
@@ -163,7 +165,7 @@ test("incremental worker skips unchanged pages, retries failures and never loses
     extract: async () => { calls++; return [{ text: "Bek lives in Brooklyn.", replaces: null, evidence: [{ messageId: "m2", quote: nextMessage.text }] }]; },
   });
   assert.equal(next.accepted, 1); assert.equal(calls, 3);
-  const store = new ExtractionStore(f.storePath); assert.equal(store.records().length, 2); assert.equal(store.checkpoint(session).cursor, "c2"); store.close();
+  const store = new ExtractionStore(f.storePath); assert.equal(store.records().length, 2); assert.equal(store.readCheckpoint(session.sessionId)?.cursor, "c2"); store.close();
 });
 
 test("completed source revisions skip delta reads, while appends, resets and broader backfills remain discoverable", async t => {
@@ -205,12 +207,12 @@ test("rewrite during inference withdraws old evidence and discards the stale com
     readPage: async (_id, _name, _s, cursor) => cursor === "c1" ? { kind: "reset", cursor: "new-generation" } : page("c1"),
     extract: async () => [proposal], validate: async () => ({ accepted: true, reason: "judged", scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) });
   assert.equal(result.accepted, 0);
-  const store = new ExtractionStore(f.storePath); assert.deepEqual(store.records(), []); assert.equal(store.checkpoint(session).cursor, "new-generation"); store.close();
+  const store = new ExtractionStore(f.storePath); assert.deepEqual(store.records(), []); assert.equal(store.readCheckpoint(session.sessionId)?.cursor, "new-generation"); store.close();
 });
 
 test("single-session run does not withdraw another eligible session's memories", async () => {
   const f = await fixture(), store = new ExtractionStore(f.storePath), other = { ...session, sessionId: "s2" };
-  const owner = store.claim(false, 0)!; store.checkpoint(other);
+  const owner = store.claim(false, 0)!; store.checkpoint(other, owner);
   store.commit({ session: other, expected: null, cursor: "c1", context: [], accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
   store.release(owner); store.close();
   await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
@@ -228,12 +230,12 @@ test("scheduled run resumes an approved historical backfill rather than skipping
   await runExtraction({ ...opts, since: 0 });
   const next = await runExtraction({ ...opts, scheduled: true });
   assert.equal(next.accepted, 1); assert.equal(calls, 2);
-  const store = new ExtractionStore(f.storePath); assert.equal(store.checkpoint(session).since, 0); store.close();
+  const store = new ExtractionStore(f.storePath); assert.equal(store.readCheckpoint(session.sessionId)?.since, 0); store.close();
 });
 
 test("QMD projection and authoritative reads reject withdrawn versions without a Markdown file", async t => {
   const f = await fixture(), store = new ExtractionStore(f.storePath), owner = store.claim(false, 0)!;
-  store.checkpoint(session);
+  store.checkpoint(session, owner);
   store.commit({ session, expected: null, cursor: "c1", context: messages, accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
   const qmd = await createStore({ dbPath: join(f.dir, "index.sqlite"), config: { collections: { [EXTRACTED_COLLECTION]: { path: f.dir, pattern: ".no-files" } } } });
   const manager = new QmdMemoryManager({ dbPath: qmd.dbPath, curationPath: f.storePath, workspaceDir: f.dir,
@@ -261,7 +263,7 @@ test("QMD projection and authoritative reads reject withdrawn versions without a
 test("extracted facts survive manager startup and ordinary file sync", async () => {
   const f = await fixture(), store = new ExtractionStore(f.storePath), owner = store.claim(false, 0)!;
   const dbPath = join(f.dir, "index.sqlite");
-  store.checkpoint(session);
+  store.checkpoint(session, owner);
   store.commit({ session, expected: null, cursor: "c1", context: [], accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
   const qmd = await createStore({ dbPath, config: { collections: { [EXTRACTED_COLLECTION]: { path: f.dir, pattern: ".no-extracted-files", includeByDefault: false } } } });
   await syncExtractedIndex({ internal: qmd.internal, embed: async () => ({ docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }) }, store.records());
@@ -280,4 +282,303 @@ test("extracted facts survive manager startup and ordinary file sync", async () 
     try { assert.equal(indexed.internal.getActiveDocumentPaths(EXTRACTED_COLLECTION).length, 1); }
     finally { await indexed.close(); }
   } finally { await manager.close(); store.close(); }
+});
+
+test("lost-lease fencing rejects checkpoint, error, and empty-page completion writes", async () => {
+  const f = await fixture(), store = new ExtractionStore(f.storePath);
+  try {
+    const owner1 = store.claim(false, 0)!;
+    store.checkpoint(session, owner1);
+    store.error(session.sessionId, "prior_error", owner1);
+    // Expire owner1's lease and let owner2 take ownership.
+    store.db.prepare("UPDATE extraction_worker SET lease_until=0 WHERE id=1").run();
+    const owner2 = store.claim(false, 0)!;
+    assert.ok(owner2 && owner2 !== owner1);
+
+    assert.throws(() => store.checkpoint({ ...session, sessionKey: "mutated" }, owner1, 0), ExtractionLeaseLostError);
+    assert.throws(() => store.error(session.sessionId, "stale_error", owner1), ExtractionLeaseLostError);
+    assert.throws(() => store.completeEmpty({ sessionId: session.sessionId, expected: null, owner: owner1, completeRevision: "rev-1" }), ExtractionLeaseLostError);
+
+    // None of owner1's fenced writes mutated the session row.
+    const state = store.readCheckpoint(session.sessionId)!;
+    assert.equal(state.error, "prior_error");
+    assert.equal(state.completeRevision, null);
+    assert.notEqual(state.since, 0);
+
+    // Worker-level: if lease is lost during inference/read, runExtraction fails with lease loss and does not clobber error.
+    store.release(owner2);
+  } finally { store.close(); }
+
+  let stoleLease = false;
+  await assert.rejects(runExtraction({
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    sessions: () => [session], since: 0, signal: signal(),
+    readPage: async () => {
+      if (!stoleLease) {
+        stoleLease = true;
+        const thief = new ExtractionStore(f.storePath);
+        try {
+          thief.db.prepare("UPDATE extraction_worker SET lease_until=0 WHERE id=1").run();
+          assert.ok(thief.claim(false, 0));
+        } finally { thief.close(); }
+      }
+      return page("c1", []);
+    },
+  }), ExtractionLeaseLostError);
+
+  const verify = new ExtractionStore(f.storePath);
+  try {
+    assert.equal(verify.readCheckpoint(session.sessionId)?.error, "prior_error");
+  } finally { verify.close(); }
+});
+
+test("empty-page completion clears a prior session error and updates complete_revision", async () => {
+  const f = await fixture();
+  const s = { ...session, sourceRevision: '["g1",1]' };
+  // First run fails with source_unavailable, setting session error.
+  const first = await runExtraction({
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    sessions: () => [s], since: 0, signal: signal(),
+    readPage: async () => ({ kind: "unavailable" }),
+  });
+  assert.equal(first.status, "completed");
+  assert.equal(first.failed, 1);
+  let store = new ExtractionStore(f.storePath);
+  try {
+    assert.equal(store.readCheckpoint(s.sessionId)?.error, "source_unavailable");
+  } finally { store.close(); }
+
+  // Second run returns an empty exhausted page; error must be cleared and complete_revision recorded.
+  let reads = 0;
+  const second = await runExtraction({
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    sessions: () => [s], since: 0, signal: signal(),
+    readPage: async () => { reads++; return page("c1", []); },
+  });
+  assert.equal(second.status, "completed");
+  assert.equal(second.unchanged, 1);
+  assert.equal(reads, 1);
+  store = new ExtractionStore(f.storePath);
+  try {
+    const state = store.readCheckpoint(s.sessionId)!;
+    assert.equal(state.error, null);
+    assert.ok(state.completeRevision);
+  } finally { store.close(); }
+
+  // Third run with same sourceRevision and policy skips without calling readPage.
+  const third = await runExtraction({
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    sessions: () => [s], since: 0, signal: signal(),
+    readPage: async () => { reads++; return page("c1", []); },
+  });
+  assert.equal(third.unchanged, 1);
+  assert.equal(reads, 1);
+});
+
+test("policy and prompt version changes invalidate complete_revision and re-scan cleanly", async () => {
+  const f = await fixture();
+  const s = { ...session, sourceRevision: '["g1",1]' };
+  const m2: ExtractionMessage = { id: "m2", speaker: "Bek", role: "user", text: "I prefer dark roast coffee.", timestamp: 2000 };
+  const p2: MemoryProposal = { text: "Bek prefers dark roast coffee.", replaces: null, evidence: [{ messageId: "m2", quote: m2.text }] };
+  let reads = 0, extractions = 0;
+
+  const makeOpts = (extraCfg: object = {}, version?: string) => ({
+    config: config(extraCfg), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    sessions: () => [s], since: 0, signal: signal(), version,
+    readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null) => {
+      reads++;
+      return cursor === "c1" ? page("c1", []) : page("c1", [messages[0]!, m2]);
+    },
+    extract: async () => { extractions++; return [proposal, p2]; },
+    validate: async ({ proposal: prop, thresholds: t }: { proposal: MemoryProposal; thresholds: { minSupport: number } }) => ({
+      accepted: prop.text === proposal.text || t.minSupport <= 0.85,
+      reason: "judged" as const,
+      scores: { supported: prop.text === proposal.text ? 0.99 : 0.85, useful: 0.99, replacement: 1 },
+      thresholds: config(extraCfg).extraction,
+    }),
+  });
+
+  // Initial scan under default minSupport=0.9 accepts only proposal 1.
+  const r1 = await runExtraction(makeOpts({}, "lasting-facts-v11"));
+  assert.equal(r1.accepted, 1);
+  assert.equal(extractions, 1);
+  const readsAfter1 = reads;
+
+  // Same policy & prompt version skips cleanly without reading delta.
+  const r2 = await runExtraction(makeOpts({}, "lasting-facts-v11"));
+  assert.equal(r2.unchanged, 1);
+  assert.equal(reads, readsAfter1);
+
+  // Lowering minSupport policy invalidates complete_revision, rewinds cursor, preserves existing fact, and extracts p2.
+  const r3 = await runExtraction(makeOpts({ extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, minSupport: 0.8 } }, "lasting-facts-v11"));
+  assert.equal(r3.accepted, 1);
+  assert.equal(extractions, 2);
+  let store = new ExtractionStore(f.storePath);
+  try { assert.equal(store.records().length, 2); } finally { store.close(); }
+
+  // Changing prompt version invalidates complete_revision and triggers a clean re-scan.
+  const r4 = await runExtraction(makeOpts({ extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, minSupport: 0.8 } }, "lasting-facts-v12"));
+  assert.equal(r4.processed, 1);
+  assert.equal(extractions, 3);
+  const readsAfter4 = reads;
+
+  // Repeating under v12 skips again.
+  const r5 = await runExtraction(makeOpts({ extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, minSupport: 0.8 } }, "lasting-facts-v12"));
+  assert.equal(r5.unchanged, 1);
+  assert.equal(reads, readsAfter4);
+
+  // Legacy plain-string complete_revision (pre-policy binding) also invalidates and re-scans cleanly.
+  store = new ExtractionStore(f.storePath);
+  try {
+    store.db.prepare("UPDATE extraction_sessions SET complete_revision=? WHERE session_id=?").run('["g1",1]', s.sessionId);
+  } finally { store.close(); }
+  const r6 = await runExtraction(makeOpts({ extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, minSupport: 0.8 } }, "lasting-facts-v12"));
+  assert.equal(r6.processed, 1);
+  assert.equal(extractions, 4);
+});
+
+test("multiple accepted proposals targeting the same predecessor pick one deterministic winner and reject store-level conflicts", async () => {
+  const f = await fixture();
+  // Seed initial memory revision 1.
+  const store = new ExtractionStore(f.storePath);
+  let priorId = "";
+  try {
+    const owner = store.claim(false, 0)!;
+    store.checkpoint(session, owner, 0);
+    store.commit({
+      session, expected: null, cursor: "c1", context: messages,
+      accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test",
+    });
+    priorId = store.records(session.sessionId)[0]!.id;
+
+    // Direct store.commit must refuse two conflicting replacements for the same predecessor in one batch.
+    const dupA: MemoryProposal = { text: "Bek's favorite color is green.", replaces: priorId, evidence: [{ messageId: "m2", quote: "green" }] };
+    const dupB: MemoryProposal = { text: "Bek's favorite color is blue.", replaces: priorId, evidence: [{ messageId: "m3", quote: "blue" }] };
+    assert.throws(() => store.commit({
+      session, expected: "c1", cursor: "c2", context: messages,
+      accepted: [
+        { proposal: dupA, observedAt: 2000, judgment: {} },
+        { proposal: dupB, observedAt: 3000, judgment: {} },
+      ],
+      owner, version: "test",
+    }), /Conflicting memory replacement/);
+    assert.equal(store.records(session.sessionId)[0]!.revision, 1);
+    store.release(owner);
+  } finally { store.close(); }
+
+  // Worker batch with 2 accepted replacements targeting priorId picks the latest observedAt deterministically,
+  // creating a single revision 2 (no intermediate revision 2 -> 3) and rejecting the competing proposal.
+  const m2: ExtractionMessage = { id: "m2", speaker: "Bek", role: "user", text: "Actually I like green now.", timestamp: 2000 };
+  const m3: ExtractionMessage = { id: "m3", speaker: "Bek", role: "user", text: "Wait no, make it yellow.", timestamp: 3000 };
+  const repEarly: MemoryProposal = { text: "Bek's favorite color is green.", replaces: priorId, evidence: [{ messageId: "m2", quote: m2.text }] };
+  const repLate: MemoryProposal = { text: "Bek's favorite color is yellow.", replaces: priorId, evidence: [{ messageId: "m3", quote: m3.text }] };
+  const result = await runExtraction({
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    sessions: () => [session], since: 0, signal: signal(),
+    readPage: async (_id, _name, _s, cursor) => cursor === "c2" ? page("c2", []) : page("c2", [m2, m3]),
+    extract: async () => [repEarly, repLate],
+    validate: async () => ({
+      accepted: true, reason: "judged" as const,
+      scores: { supported: 0.99, useful: 0.99, replacement: 0.99 },
+      thresholds: config().extraction,
+    }),
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.accepted, 1);
+  assert.equal(result.rejected, 1);
+
+  const check = new ExtractionStore(f.storePath);
+  try {
+    const active = check.records(session.sessionId);
+    assert.equal(active.length, 1);
+    assert.equal(active[0]!.id, priorId);
+    assert.equal(active[0]!.revision, 2);
+    assert.equal(active[0]!.text, "Bek's favorite color is yellow.");
+    assert.equal(check.db.prepare("SELECT count(*) AS n FROM extracted_memories WHERE id=?").get(priorId)!.n, 2);
+  } finally { check.close(); }
+});
+
+test("extraction-runtime gateway_stop aborts and drains in-flight RPC runs before resolving", async () => {
+  const hooks = new Map<string, () => void | Promise<void>>();
+  let rpcHandler: ((req: { params: unknown; respond: (ok: boolean, data?: unknown, err?: unknown) => void }) => Promise<void>) | undefined;
+  const api = {
+    config: { agents: { entries: { main: { workspace: tmpdir() } } } },
+    runtime: {},
+    logger: { warn() {} },
+    registerCli() {},
+    on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); },
+    registerGatewayMethod(name: string, fn: typeof rpcHandler) { if (name === "unblock-memory.extract") rpcHandler = fn; },
+  } as unknown as OpenClawPluginApi;
+
+  let runStarted!: () => void;
+  const started = new Promise<void>(resolve => { runStarted = resolve; });
+  let releaseCleanup!: () => void;
+  const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve; });
+  let observedAbort = false;
+  let cleanedUp = false;
+  let launchCount = 0;
+
+  registerExtraction(api, config(), undefined, {
+    runExtraction: async ({ signal: runSignal }) => {
+      launchCount++;
+      runStarted();
+      await new Promise<void>(resolve => {
+        if (runSignal.aborted) { observedAbort = true; resolve(); return; }
+        runSignal.addEventListener("abort", () => { observedAbort = true; resolve(); }, { once: true });
+      });
+      await cleanupGate;
+      cleanedUp = true;
+      throw runSignal.reason ?? new Error("aborted");
+    },
+  });
+
+  assert.ok(rpcHandler);
+  assert.ok(hooks.has("gateway_stop"));
+
+  const responses: { ok: boolean; data?: unknown }[] = [];
+  const rpcPromise = rpcHandler!({
+    params: { agentId: "main" },
+    respond: (ok, data) => { responses.push({ ok, data }); },
+  });
+  await started;
+
+  let stopResolved = false;
+  const stopPromise = Promise.resolve(hooks.get("gateway_stop")!()).then(() => { stopResolved = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(observedAbort, true, "gateway_stop must abort in-flight RPC signal");
+  assert.equal(stopResolved, false, "gateway_stop must wait until in-flight RPC drains");
+
+  // New RPCs launched while stopped are rejected immediately without starting work.
+  await rpcHandler!({ params: { agentId: "main" }, respond: (ok, data) => { responses.push({ ok, data }); } });
+  assert.equal(launchCount, 1);
+  assert.equal(responses[0]!.ok, false);
+
+  releaseCleanup();
+  await stopPromise;
+  await rpcPromise;
+  assert.equal(cleanedUp, true);
+  assert.equal(stopResolved, true);
+  assert.equal(responses.length, 2);
+  assert.equal(responses[1]!.ok, false);
+});
+
+test("readExtractionPage propagates cancellation before and during host page reads", async () => {
+  const preAborted = new AbortController();
+  preAborted.abort(new Error("already cancelled"));
+  let readCalls = 0;
+  await assert.rejects(
+    readExtractionPage("main", "Bill", session, null, async () => { readCalls++; return { kind: "missing" }; }, preAborted.signal),
+    /already cancelled/,
+  );
+  assert.equal(readCalls, 0);
+
+  const midAbort = new AbortController();
+  const pending = readExtractionPage("main", "Bill", session, null, async () => {
+    readCalls++;
+    return new Promise(() => {});
+  }, midAbort.signal);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(readCalls, 1);
+  midAbort.abort(new Error("lease aborted"));
+  await assert.rejects(pending, /lease aborted/);
 });

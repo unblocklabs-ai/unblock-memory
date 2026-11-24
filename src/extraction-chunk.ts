@@ -1,5 +1,6 @@
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
+import { abortable } from "./abortable.js";
 import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageTokens, extractionOverhead, type ExtractionMessage, type PriorMemory } from "./extraction-model.js";
 import { readExtractionPage } from "./extraction-source.js";
 import type { ExtractionSession } from "./extraction-store.js";
@@ -60,12 +61,21 @@ export async function readExtractionChunk(params: { agentId: string; agentName: 
   const read = params.readPage ?? readExtractionPage;
   const fetchPage = async (cursor: string | null) => {
     params.signal.throwIfAborted();
-    return read(params.agentId, params.agentName, params.session, cursor);
+    const pending = read(params.agentId, params.agentName, params.session, cursor, undefined, params.signal);
+    void pending.catch(() => {});
+    const page = await abortable(pending, params.signal);
+    params.signal.throwIfAborted();
+    return page;
   };
   let resume: Static<typeof bookmarkSchema> | undefined;
   if (params.cursor?.startsWith(PREFIX)) {
-    const parsed: unknown = JSON.parse(params.cursor.slice(PREFIX.length));
-    if (!Value.Check(bookmarkSchema, parsed)) throw new Error("Invalid extraction bookmark");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(params.cursor.slice(PREFIX.length));
+    } catch {
+      return { kind: "reset" as const, cursor: null };
+    }
+    if (!Value.Check(bookmarkSchema, parsed)) return { kind: "reset" as const, cursor: null };
     resume = parsed;
     const check = await fetchPage(resume.fence);
     if (check.kind !== "page") return check;
@@ -81,8 +91,17 @@ export async function readExtractionChunk(params: { agentId: string; agentName: 
     const page = await fetchPage(before);
     if (page.kind !== "page") return page;
     if ((page.entryCount && page.cursor === before) || (!page.entryCount && page.hasMore)) throw new Error("Transcript reader made no progress");
-    if (resume && (!page.messages[resume.index] || page.messages[resume.index]!.id !== resume.id || jsonHash(page.messages[resume.index]!) !== resume.hash)) {
-      throw new Error("Partial extraction source changed");
+    if (resume) {
+      const target = page.messages[resume.index];
+      if (
+        !target ||
+        target.id !== resume.id ||
+        jsonHash(target) !== resume.hash ||
+        resume.offset >= target.text.length ||
+        (resume.offset > 0 && boundary(target.text, resume.offset) !== resume.offset)
+      ) {
+        return { kind: "reset" as const, cursor: null };
+      }
     }
     entryCount += page.entryCount;
     const finish = (index: number, offset = 0) => {

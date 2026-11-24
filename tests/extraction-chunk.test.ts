@@ -103,14 +103,14 @@ test("source rewrites discard a chunk collected across pages and partial bookmar
   if (resumed.kind === "page") assert.equal(resumed.fence, chunk.fence);
 });
 
-test("partial-page append is safe, changed pending content is not silently consumed", async () => {
+test("partial-page append is safe, changed pending content resets instead of silently consuming", async () => {
   const original = [message("one", " project".repeat(EXTRACTION_INPUT_TARGET)), message("two")];
   const first = await readExtractionChunk(params(fixture([original])));
   assert.equal(first.kind, "page"); if (first.kind !== "page") return;
   const appended = await readExtractionChunk(params(fixture([[...original, message("three")]]), first.cursor));
   assert.equal(appended.kind, "page");
   if (appended.kind === "page") assert.deepEqual(appended.newIds, ["two", "three"]);
-  await assert.rejects(readExtractionChunk(params(fixture([[original[0]!, message("two", "rewritten")]]), first.cursor)), /source changed/);
+  assert.deepEqual(await readExtractionChunk(params(fixture([[original[0]!, message("two", "rewritten")]]), first.cursor)), { kind: "reset", cursor: null });
 });
 
 test("TypeSafe failure cannot commit earlier accepted facts or advance a collected chunk", async () => {
@@ -137,7 +137,7 @@ test("TypeSafe failure cannot commit earlier accepted facts or advance a collect
   assert.equal(peak, 4, "proposal validation overlaps within a four-call bound");
   assert.equal(active, 0, "failed chunks drain every in-flight validation before releasing the lease");
   const store = new ExtractionStore(storePath);
-  try { assert.equal(store.checkpoint(session).cursor, null); assert.deepEqual(store.records(), []); }
+  try { assert.equal(store.readCheckpoint(session.sessionId)?.cursor, null); assert.deepEqual(store.records(), []); }
   finally { store.close(); }
   fail = false; assert.equal((await runExtraction(opts)).accepted, source.length);
 });
@@ -163,11 +163,85 @@ test("worker retries whole chunks, isolates sessions, maps split citations, and 
     validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }),
   };
   assert.equal((await runExtraction(opts)).failed, 2);
-  const failed = new ExtractionStore(storePath); assert.equal(failed.checkpoint(session).cursor, null); failed.close();
+  const failed = new ExtractionStore(storePath); assert.equal(failed.readCheckpoint(session.sessionId)?.cursor, null); failed.close();
   fail = false;
   for (let i = 0; i < 4; i++) { const r = await runExtraction(opts); assert.equal(r.failed, 0); if (!r.processed) break; }
   const before = calls; assert.equal((await runExtraction(opts)).unchanged, 2); assert.equal(calls, before);
   const store = new ExtractionStore(storePath);
   try { assert.equal(store.records().length, 2); assert.equal(store.records("s1")[0]!.evidence[0]!.messageId, "original"); }
   finally { store.close(); }
+});
+
+test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on retry instead of looping forever", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "extraction-poisoned-bookmark-")), storePath = join(dir, "memory.sqlite");
+  const config = resolveConfig({ typesafe: { apiKey: "test" }, corpora: [
+    { name: "memory", kind: "files", paths: ["memory/**/*.md"] },
+    { name: "sessions", kind: "sessions", chatTypes: ["channel"] },
+  ], extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 } });
+  const original = [message("one", " project".repeat(EXTRACTION_INPUT_TARGET)), message("two", "Bek likes espresso.")];
+  const readPage = fixture([original]);
+
+  // Direct chunk reader returns reset(null) for malformed JSON, schema-invalid, out-of-range offset, and mismatched hash bookmarks.
+  for (const badCursor of [
+    "unblock-extraction:v1:{not-json",
+    "unblock-extraction:v1:{\"bad\":true}",
+    `unblock-extraction:v1:${JSON.stringify({ before: null, fence: "1", index: 1, offset: 999, id: "two", hash: "wrong" })}`,
+  ]) {
+    assert.deepEqual(await readExtractionChunk(params(readPage, badCursor)), { kind: "reset", cursor: null });
+  }
+
+  // Mid-surrogate offset bookmark also resets cleanly rather than throwing.
+  const emojiMsg = message("emoji", "🦊hi");
+  const firstEmojiChunk = await readExtractionChunk(params(fixture([[message("pad", " project".repeat(EXTRACTION_INPUT_TARGET)), emojiMsg]])));
+  assert.equal(firstEmojiChunk.kind, "page");
+  if (firstEmojiChunk.kind !== "page") return;
+  const parsed = JSON.parse(firstEmojiChunk.cursor.slice("unblock-extraction:v1:".length)) as Record<string, unknown>;
+  const midSurrogateCursor = "unblock-extraction:v1:" + JSON.stringify({ ...parsed, offset: 1 });
+  assert.deepEqual(
+    await readExtractionChunk(params(fixture([[message("pad", " project".repeat(EXTRACTION_INPUT_TARGET)), emojiMsg]]), midSurrogateCursor)),
+    { kind: "reset", cursor: null },
+  );
+
+  // End-to-end worker test: seed a poisoned bookmark + stale active memory, then verify run 1 rewinds cleanly and run 2 re-extracts.
+  const store = new ExtractionStore(storePath);
+  try {
+    const owner = store.claim(false, 0)!;
+    store.checkpoint(session, owner, 0);
+    store.commit({
+      session, expected: null, cursor: "unblock-extraction:v1:{poisoned", context: [],
+      accepted: [{ proposal: { text: "Stale fact.", replaces: null, evidence: [{ messageId: "one", quote: "project" }] }, observedAt: 1000, judgment: {} }],
+      owner, version: "test",
+    });
+    store.release(owner);
+  } finally { store.close(); }
+
+  const cleanSource = fixture([[message("m1", "Bek likes espresso.")]]);
+  const workerOpts = {
+    config, storePath, agentId: "main", agentName: "Bill", runtime: {}, sessions: () => [session], since: 0,
+    signal: AbortSignal.timeout(30_000), readPage: cleanSource,
+    extract: async () => [{ text: "Bek likes espresso.", replaces: null, evidence: [{ messageId: "m1", quote: "Bek likes espresso." }] }],
+    validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: config.extraction }),
+  };
+
+  // Run 1: cleanly resets poisoned bookmark (failed === 0, processed === 1, cursor -> null, old facts withdrawn).
+  const firstRun = await runExtraction(workerOpts);
+  assert.equal(firstRun.status, "completed");
+  assert.equal(firstRun.failed, 0);
+  assert.equal(firstRun.processed, 1);
+  let verify = new ExtractionStore(storePath);
+  try {
+    assert.equal(verify.readCheckpoint(session.sessionId)?.cursor, null);
+    assert.deepEqual(verify.records(session.sessionId), []);
+  } finally { verify.close(); }
+
+  // Run 2: cleanly extracts from cursor=null instead of looping on the poisoned bookmark.
+  const secondRun = await runExtraction(workerOpts);
+  assert.equal(secondRun.status, "completed");
+  assert.equal(secondRun.failed, 0);
+  assert.equal(secondRun.accepted, 1);
+  verify = new ExtractionStore(storePath);
+  try {
+    assert.equal(verify.records(session.sessionId).length, 1);
+    assert.equal(verify.records(session.sessionId)[0]!.text, "Bek likes espresso.");
+  } finally { verify.close(); }
 });

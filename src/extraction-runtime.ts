@@ -12,27 +12,45 @@ import { extractionSessions } from "./extraction-source.js";
 import { dateOption } from "./date-option.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
-export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemoryConfig, runtime?: QmdMemoryRuntime) {
+export function registerExtraction(
+  api: OpenClawPluginApi,
+  config: UnblockMemoryConfig,
+  runtime?: QmdMemoryRuntime,
+  deps?: { runExtraction?: typeof import("./extraction-worker.js").runExtraction },
+) {
   let lifetime = new AbortController();
+  let stopped = false;
   let timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
+  const activeRuns = new Set<Promise<void>>();
+  const track = <T>(pending: Promise<T>): Promise<T> => {
+    const settled = pending.then(() => undefined, () => undefined);
+    activeRuns.add(settled);
+    void settled.finally(() => { activeRuns.delete(settled); });
+    return pending;
+  };
   const options = (cfg: OpenClawConfig, agentId: string) => {
     if (!listAgentIds(cfg).includes(agentId)) throw new Error("Unknown extraction agent");
     return { agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
       config, runtime: api.runtime, storePath: join(agentStateDir(agentId), MEMORY_DATABASE),
       sessions: () => extractionSessions(agentTranscriptDatabase(cfg, agentId), agentId, config.extraction.chatTypes) };
   };
-  const run = async (cfg: OpenClawConfig, agentId: string, signal: AbortSignal, since?: number, sessionId?: string, scheduled = false) => {
-    const opts = options(cfg, agentId);
-    // Keep the extraction tokenizer/model modules out of normal plugin startup.
-    const { runExtraction } = await import("./extraction-worker.js");
-    const result = await runExtraction({ ...opts, signal, since, scheduled, sessionId });
-    if (result.status === "completed" && config.extraction.publish && runtime) {
-      const { manager, error } = await runtime.getMemorySearchManager({ cfg, agentId });
-      if (!manager) throw new Error(error ?? "Extraction index unavailable");
-      await manager.syncExtracted();
-    }
-    return result;
-  };
+  const run = (cfg: OpenClawConfig, agentId: string, signal: AbortSignal, since?: number, sessionId?: string, scheduled = false) =>
+    track((async () => {
+      signal.throwIfAborted();
+      const opts = options(cfg, agentId);
+      // Keep the extraction tokenizer/model modules out of normal plugin startup.
+      const execute = deps?.runExtraction ?? (await import("./extraction-worker.js")).runExtraction;
+      signal.throwIfAborted();
+      const result = await execute({ ...opts, signal, since, scheduled, sessionId });
+      if (result.status === "completed" && config.extraction.publish && runtime) {
+        signal.throwIfAborted();
+        const { manager, error } = await runtime.getMemorySearchManager({ cfg, agentId });
+        if (!manager) throw new Error(error ?? "Extraction index unavailable");
+        signal.throwIfAborted();
+        await manager.syncExtracted();
+      }
+      return result;
+    })());
   api.registerCli(({ program, config: cfg }) => {
     const root = program.command("memory-extract").description("Optional session fact extraction; no daily Markdown writes");
     root.command("run").option("--agent <id>", "Agent id", "main")
@@ -62,26 +80,43 @@ export function registerExtraction(api: OpenClawPluginApi, config: UnblockMemory
     if (!Value.Check(runParams, params)) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "Invalid extraction parameters")); return;
     }
+    if (stopped || lifetime.signal.aborted) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Extraction failed; check host prerequisites and operator report")); return;
+    }
     try { respond(true, await run(api.config, params.agentId, lifetime.signal, params.since, params.sessionId)); }
     catch { respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Extraction failed; check host prerequisites and operator report")); }
   }, { scope: "operator.admin" });
+  api.on("gateway_stop", async () => {
+    stopped = true;
+    lifetime.abort();
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    while (activeRuns.size || running) {
+      await Promise.allSettled([...activeRuns, ...(running ? [running] : [])]);
+    }
+  });
   if (!config.extraction.enabled) return;
-  api.on("gateway_stop", async () => { lifetime.abort(); if (timer) clearInterval(timer); timer = undefined; await running; });
-  if (!config.extraction.intervalMinutes || !config.typesafe.enabled) return;
   const tick = () => {
-    if (running || lifetime.signal.aborted) return;
+    if (stopped || running || lifetime.signal.aborted) return;
+    const signal = lifetime.signal;
     running = (async () => {
       for (const agentId of listAgentIds(api.config)) {
-        if (lifetime.signal.aborted) break;
+        if (stopped || signal.aborted) break;
         try {
-          const result = await run(api.config, agentId, lifetime.signal, undefined, undefined, true);
+          const result = await run(api.config, agentId, signal, undefined, undefined, true);
           if (result.status === "unavailable" || (result.status === "completed" && result.failed)) api.logger.warn("unblock-memory extraction unavailable; inspect memory-extract report");
-        } catch { api.logger.warn("unblock-memory extraction unavailable"); }
+        } catch {
+          if (!signal.aborted) api.logger.warn("unblock-memory extraction unavailable");
+        }
       }
     })().finally(() => { running = undefined; });
   };
   api.on("gateway_start", () => {
+    stopped = false;
     if (timer) clearInterval(timer);
-    lifetime = new AbortController(); timer = setInterval(tick, 60_000); timer.unref(); tick();
+    timer = undefined;
+    if (lifetime.signal.aborted) lifetime = new AbortController();
+    if (!config.extraction.intervalMinutes || !config.typesafe.enabled) return;
+    timer = setInterval(tick, 60_000); timer.unref(); tick();
   });
 }
