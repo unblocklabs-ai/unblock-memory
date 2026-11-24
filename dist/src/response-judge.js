@@ -1,6 +1,7 @@
 import { choice, noul, score } from "@unblocklabs/decisions";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { abortable } from "./abortable.js";
 import { decideWithModel, decisionModelScope, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA as noulSchema, } from "./typesafe-client.js";
 export function responseRubricVersion(model = TYPESAFE_MODEL, endpoint) {
     return `${decisionModelScope(model, endpoint)}:response-v10`;
@@ -145,8 +146,45 @@ const retrospectiveSchema = Type.Object({
     outcome: choiceSchema(outcomes),
     reason: choiceSchema(outcomeReasons),
 });
+function feedbackBaseFields({ feedbackType, target, avoidableRework, repeatedConstraint, memoryGap }) {
+    return { feedbackType, target, avoidableRework, repeatedConstraint, memoryGap };
+}
 function sentimentFields({ sentiment, annoyance, frustration, dissatisfactionIntensity }) {
     return { sentiment, annoyance, frustration, dissatisfactionIntensity };
+}
+function validateDistributions(answers) {
+    for (const answer of Object.values(answers)) {
+        if (!answer.probabilities)
+            continue;
+        const entries = Object.entries(answer.probabilities);
+        // Match @unblocklabs/decisions: allow 2-decimal rounding drift across options while rejecting malformed sums or inconsistent expected scores.
+        const sumTolerance = Math.max(0.03, entries.length * 0.005 + 0.005);
+        const sum = entries.reduce((acc, [, p]) => acc + p, 0);
+        if (Math.abs(sum - 1) > sumTolerance ||
+            (answer.type === "score" && Math.abs(entries.reduce((acc, [k, p]) => acc + Number(k) * p, 0) - answer.score) > 0.06)) {
+            throw new Error("Invalid response-audit probability distribution");
+        }
+    }
+}
+function validateCachedQuality(value) {
+    if (!Value.Check(qualitySchema, value))
+        throw new Error("Invalid cached response quality judgment");
+    validateDistributions(value);
+    return value;
+}
+function validateCachedFeedback(value) {
+    if (!Value.Check(feedbackSchema, value))
+        throw new Error("Invalid cached response feedback judgment");
+    const base = feedbackBaseFields(value);
+    validateDistributions(base);
+    return base;
+}
+function validateCachedSentiment(value) {
+    if (!Value.Check(sentimentSchema, value))
+        throw new Error("Invalid cached response sentiment judgment");
+    const picked = sentimentFields(value);
+    validateDistributions(picked);
+    return picked;
 }
 function toFourLevelScore(answer) {
     return {
@@ -359,9 +397,7 @@ export async function judgeResponse(episode, params, sentimentEnabled = true, ca
     };
     let quality;
     if (cache?.quality) {
-        if (!Value.Check(qualitySchema, cache.quality))
-            throw new Error("Invalid cached response quality judgment");
-        quality = cache.quality;
+        quality = validateCachedQuality(cache.quality);
     }
     else {
         cache?.begin(["quality"]);
@@ -381,17 +417,15 @@ export async function judgeResponse(episode, params, sentimentEnabled = true, ca
     const needFeedback = !cache?.feedback;
     const needSentiment = sentimentEnabled && !cache?.sentiment;
     if (!needFeedback && !needSentiment) {
-        if (!Value.Check(feedbackSchema, cache.feedback))
-            throw new Error("Invalid cached response feedback judgment");
-        const cachedSentiment = sentimentEnabled && cache?.sentiment ? cache.sentiment : undefined;
-        if (cachedSentiment && !Value.Check(sentimentSchema, cachedSentiment)) {
-            throw new Error("Invalid cached response sentiment judgment");
-        }
+        const cachedFeedback = validateCachedFeedback(cache.feedback);
+        const cachedSentiment = sentimentEnabled && cache?.sentiment ? validateCachedSentiment(cache.sentiment) : undefined;
         return {
             quality,
-            feedback: { ...cache.feedback, ...(cachedSentiment ? sentimentFields(cachedSentiment) : {}) },
+            feedback: { ...cachedFeedback, ...(cachedSentiment ?? {}) },
         };
     }
+    const cachedFeedback = !needFeedback ? validateCachedFeedback(cache.feedback) : undefined;
+    const cachedSentiment = sentimentEnabled && !needSentiment ? validateCachedSentiment(cache?.sentiment) : undefined;
     const feedbackState = { ...state, feedback: episode.feedback };
     cache?.begin([...(needFeedback ? ["feedback"] : []), ...(needSentiment ? ["sentiment"] : [])]);
     let feedbackBase;
@@ -424,16 +458,10 @@ export async function judgeResponse(episode, params, sentimentEnabled = true, ca
             memoryGap: answers.memoryGap,
         };
         cache?.save("feedback", feedbackBase);
-        if (sentimentEnabled) {
-            if (!Value.Check(sentimentSchema, cache?.sentiment))
-                throw new Error("Invalid cached response sentiment judgment");
-            sentimentResult = sentimentFields(cache.sentiment);
-        }
+        sentimentResult = cachedSentiment;
     }
     else {
-        if (!Value.Check(feedbackSchema, cache?.feedback))
-            throw new Error("Invalid cached response feedback judgment");
-        feedbackBase = cache.feedback;
+        feedbackBase = cachedFeedback;
         const { answers } = await decideWithModel(params, feedbackState, SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
         sentimentResult = {
             sentiment: answers.sentiment,
@@ -464,13 +492,29 @@ export async function judgeResponseFollowup(episode, params) {
 export async function judgeMemoryOpportunity(episode, candidates, params) {
     if (!candidates.length)
         return [];
-    return Promise.all(candidates.map(async (candidate) => {
-        const { answers } = await decideWithModel(params, { request: episode.request, answer: episode.answer, feedback: episode.feedback, candidates: [{ text: candidate.text }] }, MEMORY_OPPORTUNITY_QUESTIONS, { validateModel: false });
-        return {
-            path: candidate.path,
-            hash: candidate.hash,
-            usefulness: answers.candidate_0.noul,
-            basis: "current_index_only; historical availability and retrieval exposure unknown",
-        };
+    const controller = new AbortController();
+    const signal = AbortSignal.any([params.signal, controller.signal]);
+    const candidateParams = { ...params, signal };
+    const settled = await Promise.allSettled(candidates.map(async (candidate) => {
+        try {
+            const request = decideWithModel(candidateParams, { request: episode.request, answer: episode.answer, feedback: episode.feedback, candidates: [{ text: candidate.text }] }, MEMORY_OPPORTUNITY_QUESTIONS, { validateModel: false });
+            request.catch(() => { });
+            const { answers } = await abortable(request, signal);
+            return {
+                path: candidate.path,
+                hash: candidate.hash,
+                usefulness: answers.candidate_0.noul,
+                basis: "current_index_only; historical availability and retrieval exposure unknown",
+            };
+        }
+        catch (error) {
+            if (!controller.signal.aborted)
+                controller.abort(error);
+            throw error;
+        }
     }));
+    const failure = settled.find((item) => item.status === "rejected");
+    if (failure)
+        throw failure.reason;
+    return settled.map(item => item.value);
 }

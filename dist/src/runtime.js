@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import { resolveAgentWorkspaceDir, resolveStateDir, } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
@@ -10,7 +10,10 @@ import { unchangedSessionSync } from "./session-sync.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
 import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
-const activeSessionSyncs = new Map();
+const SESSION_SYNC_LOCK_FILE = "session-sync.lock";
+const SESSION_SYNC_RECLAIM_LOCK_FILE = "session-sync.lock.reclaim";
+const SESSION_SYNC_STATUS_FILE = "session-sync-status.json";
+const MAX_LOCK_ATTEMPTS = 4;
 async function readJson(path) {
     try {
         return JSON.parse(await readFile(path, "utf8"));
@@ -34,14 +37,174 @@ async function atomicWriteJson(path, value) {
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
         await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+        await chmod(temporary, 0o600);
         await rename(temporary, path);
     }
     finally {
         await removeIfPresent(temporary);
     }
 }
+function isProcessAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0)
+        return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (error) {
+        const code = error.code;
+        if (code === "EPERM")
+            return true;
+        if (code === "ESRCH")
+            return false;
+        throw error;
+    }
+}
+function parseSessionSyncLock(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return undefined;
+    const { pid, token, startedAt } = value;
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 ||
+        typeof token !== "string" || token.length === 0 ||
+        typeof startedAt !== "string" || startedAt.length === 0) {
+        return undefined;
+    }
+    return { pid, token, startedAt };
+}
+async function readSessionSyncLock(lockPath) {
+    try {
+        const raw = await readFile(lockPath, "utf8");
+        try {
+            return { exists: true, lock: parseSessionSyncLock(JSON.parse(raw)) };
+        }
+        catch {
+            return { exists: true, lock: undefined };
+        }
+    }
+    catch (error) {
+        if (error.code === "ENOENT")
+            return { exists: false };
+        throw error;
+    }
+}
+async function createExclusiveLockFile(lockPath, lock) {
+    const body = `${JSON.stringify(lock, null, 2)}\n`;
+    const temporary = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+        await writeFile(temporary, body, { encoding: "utf8", flag: "wx", mode: 0o600 });
+        await chmod(temporary, 0o600);
+        try {
+            await link(temporary, lockPath);
+            return true;
+        }
+        catch (error) {
+            const code = error.code;
+            if (code === "EEXIST")
+                return false;
+            if (code !== "EPERM" && code !== "ENOTSUP" && code !== "ENOSYS" && code !== "EXDEV") {
+                throw error;
+            }
+            try {
+                await writeFile(lockPath, body, { encoding: "utf8", flag: "wx", mode: 0o600 });
+                await chmod(lockPath, 0o600);
+                return true;
+            }
+            catch (fallbackError) {
+                if (fallbackError.code === "EEXIST")
+                    return false;
+                throw fallbackError;
+            }
+        }
+    }
+    finally {
+        await removeIfPresent(temporary);
+    }
+}
+async function releaseSessionSyncLock(lockPath, token) {
+    const current = await readSessionSyncLock(lockPath);
+    if (!current.exists || current.lock?.token !== token)
+        return;
+    await removeIfPresent(lockPath);
+}
+async function tryReclaimStaleLock(directory, lockPath, stale, replacement) {
+    const reclaimPath = join(directory, SESSION_SYNC_RECLAIM_LOCK_FILE);
+    const reclaimLock = {
+        pid: process.pid,
+        token: randomUUID(),
+        startedAt: new Date().toISOString(),
+    };
+    let acquiredReclaim = await createExclusiveLockFile(reclaimPath, reclaimLock);
+    if (!acquiredReclaim) {
+        const existingReclaim = await readSessionSyncLock(reclaimPath);
+        if (existingReclaim.exists && (!existingReclaim.lock || !isProcessAlive(existingReclaim.lock.pid))) {
+            await removeIfPresent(reclaimPath);
+            acquiredReclaim = await createExclusiveLockFile(reclaimPath, reclaimLock);
+        }
+    }
+    if (!acquiredReclaim)
+        return "busy";
+    try {
+        const current = await readSessionSyncLock(lockPath);
+        if (!current.exists) {
+            if (replacement && await createExclusiveLockFile(lockPath, replacement))
+                return "acquired";
+            return "reclaimed";
+        }
+        if (current.lock && isProcessAlive(current.lock.pid)) {
+            return "busy";
+        }
+        if (stale && current.lock && current.lock.token !== stale.token) {
+            return "busy";
+        }
+        await removeIfPresent(lockPath);
+        if (replacement && await createExclusiveLockFile(lockPath, replacement))
+            return "acquired";
+        return "reclaimed";
+    }
+    finally {
+        await releaseSessionSyncLock(reclaimPath, reclaimLock.token).catch(() => undefined);
+    }
+}
+async function acquireSessionSyncLock(directory, startedAt) {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const lockPath = join(directory, SESSION_SYNC_LOCK_FILE);
+    const candidate = {
+        pid: process.pid,
+        token: randomUUID(),
+        startedAt,
+    };
+    for (let attempt = 0; attempt < MAX_LOCK_ATTEMPTS; attempt += 1) {
+        if (await createExclusiveLockFile(lockPath, candidate)) {
+            return { acquired: true, lock: candidate, lockPath };
+        }
+        const existing = await readSessionSyncLock(lockPath);
+        if (!existing.exists)
+            continue;
+        if (existing.lock && isProcessAlive(existing.lock.pid)) {
+            return { acquired: false, owner: existing.lock };
+        }
+        const outcome = await tryReclaimStaleLock(directory, lockPath, existing.lock, candidate);
+        if (outcome === "acquired") {
+            return { acquired: true, lock: candidate, lockPath };
+        }
+    }
+    const existing = await readSessionSyncLock(lockPath);
+    if (existing.exists && existing.lock && isProcessAlive(existing.lock.pid)) {
+        return { acquired: false, owner: existing.lock };
+    }
+    throw new Error(`could not acquire session sync lock in ${directory}`);
+}
+function runningStatusFromReceipt(status, startedAt) {
+    return status?.status === "running" && status.startedAt === startedAt
+        ? { status: "running", phase: status.phase, startedAt }
+        : { status: "running", phase: "queued", startedAt };
+}
 export async function recoverInterruptedSessionSync(directory, statusPath, stale) {
-    activeSessionSyncs.set(directory, stale.startedAt);
+    const acquired = await acquireSessionSyncLock(directory, stale.startedAt);
+    if (!acquired.acquired) {
+        const current = await readJson(statusPath);
+        return runningStatusFromReceipt(current, acquired.owner.startedAt);
+    }
     try {
         const current = await readJson(statusPath);
         if (!current)
@@ -61,8 +224,7 @@ export async function recoverInterruptedSessionSync(directory, statusPath, stale
         return failed;
     }
     finally {
-        if (activeSessionSyncs.get(directory) === stale.startedAt)
-            activeSessionSyncs.delete(directory);
+        await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
     }
 }
 export class QmdMemoryRuntime {
@@ -72,6 +234,8 @@ export class QmdMemoryRuntime {
     #keepEmbeddingModelWarm;
     #stateRoot;
     #managers = new Map();
+    #closingManagers = new Map();
+    #activeSessionSyncs = new Map();
     #sessionSyncTimer;
     startSessionSyncSchedule(cfg, onError) {
         this.stopSessionSyncSchedule();
@@ -98,18 +262,25 @@ export class QmdMemoryRuntime {
         this.#stateRoot = options.stateRoot ?? resolveStateDir();
     }
     async getMemorySearchManager(params) {
-        let pending = this.#managers.get(params.agentId);
-        if (!pending) {
-            pending = this.#createManager(params.cfg, params.agentId);
-            this.#managers.set(params.agentId, pending);
-        }
-        try {
-            return { manager: await pending };
-        }
-        catch (error) {
-            if (this.#managers.get(params.agentId) === pending)
-                this.#managers.delete(params.agentId);
-            return { manager: null, error: error instanceof Error ? error.message : String(error) };
+        while (true) {
+            const closing = this.#closingManagers.get(params.agentId);
+            if (closing) {
+                await closing.catch(() => undefined);
+                continue;
+            }
+            let pending = this.#managers.get(params.agentId);
+            if (!pending) {
+                pending = this.#createManager(params.cfg, params.agentId);
+                this.#managers.set(params.agentId, pending);
+            }
+            try {
+                return { manager: await pending };
+            }
+            catch (error) {
+                if (this.#managers.get(params.agentId) === pending)
+                    this.#managers.delete(params.agentId);
+                return { manager: null, error: error instanceof Error ? error.message : String(error) };
+            }
         }
     }
     resolveMemoryBackendConfig() {
@@ -124,14 +295,13 @@ export class QmdMemoryRuntime {
             };
         }
         const directory = this.#stateDir(params.agentId);
-        const statusPath = join(directory, "session-sync-status.json");
-        const running = activeSessionSyncs.get(directory);
-        if (running)
-            return { status: "already_running", startedAt: running };
+        const statusPath = join(directory, SESSION_SYNC_STATUS_FILE);
         const startedAt = new Date().toISOString();
-        activeSessionSyncs.set(directory, startedAt);
+        const acquired = await acquireSessionSyncLock(directory, startedAt);
+        if (!acquired.acquired) {
+            return { status: "already_running", startedAt: acquired.owner.startedAt };
+        }
         try {
-            await mkdir(directory, { recursive: true, mode: 0o700 });
             await atomicWriteJson(statusPath, {
                 status: "running",
                 phase: "queued",
@@ -140,85 +310,162 @@ export class QmdMemoryRuntime {
             });
         }
         catch (error) {
-            if (activeSessionSyncs.get(directory) === startedAt)
-                activeSessionSyncs.delete(directory);
+            await releaseSessionSyncLock(acquired.lockPath, acquired.lock.token).catch(() => undefined);
             throw error;
         }
-        void (async () => {
-            let statusWrites = Promise.resolve();
-            const writePhase = (phase) => {
-                statusWrites = statusWrites.then(() => atomicWriteJson(statusPath, {
-                    status: "running",
-                    phase,
-                    pid: process.pid,
-                    startedAt,
-                }));
-            };
+        const run = this.#runSessionSync(params, force, {
+            directory,
+            statusPath,
+            lockPath: acquired.lockPath,
+            token: acquired.lock.token,
+            startedAt,
+        });
+        this.#activeSessionSyncs.set(directory, run);
+        void run.finally(() => {
+            if (this.#activeSessionSyncs.get(directory) === run) {
+                this.#activeSessionSyncs.delete(directory);
+            }
+        });
+        return { status: "started", startedAt };
+    }
+    async #runSessionSync(params, force, run) {
+        let statusWrites = Promise.resolve();
+        const writePhase = (phase) => {
+            statusWrites = statusWrites.then(() => atomicWriteJson(run.statusPath, {
+                status: "running",
+                phase,
+                pid: process.pid,
+                startedAt: run.startedAt,
+            }));
+        };
+        try {
+            const sessions = this.#sessionConfig(params.cfg, params.agentId);
+            let result = !force && sessions
+                ? await unchangedSessionSync(sessions, join(run.directory, "index.sqlite"))
+                : undefined;
+            if (!result) {
+                const { manager, error } = await this.getMemorySearchManager(params);
+                if (!manager)
+                    throw new Error(error ?? "memory unavailable");
+                result = await manager.syncSessions(force, writePhase);
+            }
+            await statusWrites;
+            await atomicWriteJson(run.statusPath, {
+                status: "completed",
+                startedAt: run.startedAt,
+                completedAt: new Date().toISOString(),
+                ...result,
+            });
+        }
+        catch (error) {
+            await statusWrites.catch(() => { });
             try {
-                const sessions = this.#sessionConfig(params.cfg, params.agentId);
-                let result = !force && sessions
-                    ? await unchangedSessionSync(sessions, join(directory, "index.sqlite")) : undefined;
-                if (!result) {
-                    const { manager, error } = await this.getMemorySearchManager(params);
-                    if (!manager)
-                        throw new Error(error ?? "memory unavailable");
-                    result = await manager.syncSessions(force, writePhase);
-                }
-                await statusWrites;
-                await atomicWriteJson(statusPath, {
-                    status: "completed",
-                    startedAt,
+                await atomicWriteJson(run.statusPath, {
+                    status: "failed",
+                    startedAt: run.startedAt,
                     completedAt: new Date().toISOString(),
-                    ...result,
+                    error: error instanceof Error ? error.message : String(error),
                 });
             }
-            catch (error) {
-                await statusWrites.catch(() => { });
-                try {
-                    await atomicWriteJson(statusPath, {
-                        status: "failed",
-                        startedAt,
-                        completedAt: new Date().toISOString(),
-                        error: error instanceof Error ? error.message : String(error),
-                    });
-                }
-                catch {
-                    // The next status read converts the persisted running state to interrupted.
-                }
+            catch {
+                // The next status read converts the persisted running state to interrupted.
             }
-            finally {
-                if (activeSessionSyncs.get(directory) === startedAt)
-                    activeSessionSyncs.delete(directory);
-            }
-        })().catch(() => { });
-        return { status: "started", startedAt };
+        }
+        finally {
+            await releaseSessionSyncLock(run.lockPath, run.token).catch(() => undefined);
+        }
     }
     async sessionSyncStatus(agentId) {
         const directory = this.#stateDir(agentId);
-        const statusPath = join(directory, "session-sync-status.json");
-        const status = await readJson(statusPath);
-        const running = activeSessionSyncs.get(directory);
-        if (running) {
-            return status?.status === "running" && status.startedAt === running
-                ? { status: "running", phase: status.phase, startedAt: running }
-                : { status: "running", phase: "queued", startedAt: running };
+        const lockPath = join(directory, SESSION_SYNC_LOCK_FILE);
+        const statusPath = join(directory, SESSION_SYNC_STATUS_FILE);
+        const lockState = await readSessionSyncLock(lockPath);
+        if (lockState.exists && lockState.lock && isProcessAlive(lockState.lock.pid)) {
+            const status = await readJson(statusPath);
+            return runningStatusFromReceipt(status, lockState.lock.startedAt);
         }
-        if (!status)
-            return { status: "idle" };
-        if (status.status !== "running")
-            return status;
-        return await recoverInterruptedSessionSync(directory, statusPath, status);
+        const status = await readJson(statusPath);
+        if (status?.status === "running") {
+            return await recoverInterruptedSessionSync(directory, statusPath, status);
+        }
+        if (lockState.exists) {
+            await tryReclaimStaleLock(directory, lockPath, lockState.lock);
+            const refreshedLock = await readSessionSyncLock(lockPath);
+            if (refreshedLock.exists && refreshedLock.lock && isProcessAlive(refreshedLock.lock.pid)) {
+                const refreshedStatus = await readJson(statusPath);
+                return runningStatusFromReceipt(refreshedStatus, refreshedLock.lock.startedAt);
+            }
+            const refreshedStatus = await readJson(statusPath);
+            if (refreshedStatus?.status === "running") {
+                return await recoverInterruptedSessionSync(directory, statusPath, refreshedStatus);
+            }
+            return refreshedStatus ?? { status: "idle" };
+        }
+        return status ?? { status: "idle" };
+    }
+    async #drainSessionSyncs() {
+        while (this.#activeSessionSyncs.size > 0) {
+            await Promise.allSettled([...this.#activeSessionSyncs.values()]);
+        }
     }
     async closeMemorySearchManager(params) {
-        const pending = this.#managers.get(params.agentId);
-        this.#managers.delete(params.agentId);
-        await (await pending)?.close();
+        const { agentId } = params;
+        const activeSync = this.#activeSessionSyncs.get(this.#stateDir(agentId));
+        if (activeSync)
+            await activeSync.catch(() => undefined);
+        const previousClose = this.#closingManagers.get(agentId);
+        const pending = this.#managers.get(agentId);
+        this.#managers.delete(agentId);
+        if (!previousClose && !pending)
+            return;
+        const closing = (async () => {
+            let closeError;
+            if (previousClose) {
+                try {
+                    await previousClose;
+                }
+                catch (error) {
+                    closeError = error;
+                }
+            }
+            if (pending) {
+                let manager;
+                try {
+                    manager = await pending;
+                }
+                catch {
+                    // Failed startup already cleaned up its own manager inside #createManager.
+                }
+                if (manager) {
+                    try {
+                        await manager.close();
+                    }
+                    catch (error) {
+                        closeError ??= error;
+                    }
+                }
+            }
+            if (closeError !== undefined)
+                throw closeError;
+        })();
+        this.#closingManagers.set(agentId, closing);
+        try {
+            await closing;
+        }
+        finally {
+            if (this.#closingManagers.get(agentId) === closing) {
+                this.#closingManagers.delete(agentId);
+            }
+        }
     }
     async closeAllMemorySearchManagers() {
         this.stopSessionSyncSchedule();
-        const managers = [...this.#managers.values()];
-        this.#managers.clear();
-        await Promise.all(managers.map(async (pending) => (await pending).close()));
+        await this.#drainSessionSyncs();
+        const agentIds = new Set([...this.#managers.keys(), ...this.#closingManagers.keys()]);
+        await Promise.all([...agentIds].map((agentId) => this.closeMemorySearchManager({ agentId })));
+    }
+    async close() {
+        await this.closeAllMemorySearchManagers();
     }
     async searchSkills(params, query, minScore, limit) {
         const { manager, error } = await this.getMemorySearchManager(params);

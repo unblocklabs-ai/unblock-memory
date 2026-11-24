@@ -1,14 +1,37 @@
 /** Keep identity brief; interaction preferences are stored separately with evidence. */
 export const PEOPLE_BACKGROUND_MAX_WORDS = 70;
+export const INTERACTION_DOSSIER_CATEGORIES = ["preferences", "workingStyle"];
+export const AGENT_LESSON_MAX_TTL_MS = 30 * 86400_000;
+export function isInteractionCategory(category) {
+    return INTERACTION_DOSSIER_CATEGORIES.includes(category);
+}
+export function isRenderableInteractionClaim(claim, now = Date.now()) {
+    if (!claim.scope || !claim.reviewedAt)
+        return false;
+    const reviewedAtMs = Date.parse(claim.reviewedAt);
+    if (!Number.isFinite(reviewedAtMs) || reviewedAtMs > now)
+        return false;
+    const expiresAtMs = claim.expiresAt ? Date.parse(claim.expiresAt) : undefined;
+    if (expiresAtMs !== undefined && (!Number.isFinite(expiresAtMs) || expiresAtMs <= now)) {
+        return false;
+    }
+    if (claim.epistemicType === "observed" || claim.epistemicType === "reported")
+        return true;
+    if (claim.epistemicType !== "agent_assessment")
+        return false;
+    return expiresAtMs !== undefined && expiresAtMs - reviewedAtMs <= AGENT_LESSON_MAX_TTL_MS;
+}
 export function backgroundWordCount(text) {
     return text.trim().split(/\s+/u).filter(Boolean).length;
 }
 export function renderPeopleDossier(dossier, now = Date.now()) {
-    const preferences = dossier.sections.flatMap(section => ["preferences", "workingStyle"].includes(section.category)
-        ? section.claims.filter(claim => claim.scope && claim.reviewedAt && Number.isFinite(Date.parse(claim.reviewedAt)) && Date.parse(claim.reviewedAt) <= now &&
-            (claim.epistemicType === "observed" || claim.epistemicType === "reported" ||
-                (claim.epistemicType === "agent_assessment" && claim.expiresAt && Date.parse(claim.expiresAt) - Date.parse(claim.reviewedAt) <= 30 * 86400_000)) &&
-            (!claim.expiresAt || Date.parse(claim.expiresAt) > now)).map(claim => `- ${claim.epistemicType === "agent_assessment" ? "Provisional agent lesson: " : ""}${claim.statement}${claim.scope ? ` [Scope: ${claim.scope}]` : ""}`)
+    const preferences = dossier.sections.flatMap((section) => isInteractionCategory(section.category)
+        ? section.claims
+            .filter((claim) => isRenderableInteractionClaim(claim, now))
+            .map((claim) => `- ${claim.epistemicType === "agent_assessment" ? "Provisional agent lesson: " : ""}${claim.statement} [Scope: ${claim.scope}]`)
         : []);
-    return [dossier.blurb.trim(), ...(preferences.length ? ["Interaction preferences and lessons:\n" + preferences.join("\n")] : [])].join("\n\n");
+    return [
+        dossier.blurb.trim(),
+        ...(preferences.length ? ["Interaction preferences and lessons:\n" + preferences.join("\n")] : []),
+    ].join("\n\n");
 }

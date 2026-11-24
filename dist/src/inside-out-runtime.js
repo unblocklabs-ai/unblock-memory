@@ -71,46 +71,60 @@ export function registerInsideOut(api, config) {
     let timer, baselineTimer, running;
     let refreshing;
     let lifetime = new AbortController();
+    const clearTimers = () => {
+        if (timer) {
+            clearInterval(timer);
+            timer = undefined;
+        }
+        if (baselineTimer) {
+            clearInterval(baselineTimer);
+            baselineTimer = undefined;
+        }
+    };
     const tick = () => {
-        if (running)
+        if (running || lifetime.signal.aborted)
             return;
+        const { signal } = lifetime;
         running = (async () => {
             for (const agentId of listAgentIds(api.config)) {
-                if (lifetime.signal.aborted)
+                if (signal.aborted)
                     break;
                 try {
-                    const result = await runInsideOut({ ...paths(api.config, agentId), config, signal: lifetime.signal });
+                    const result = await runInsideOut({ ...paths(api.config, agentId), config, signal });
                     if ("failed" in result && (result.failed || result.errors.length))
                         api.logger.warn("Inside Out: some reviews or sources failed; inspect memory-emotions export");
                     if ("baselineError" in result && result.baselineError)
                         api.logger.warn(`Inside Out baselines: ${result.baselineError}`);
                 }
                 catch (error) {
-                    if (!lifetime.signal.aborted)
+                    if (!signal.aborted)
                         api.logger.warn(`Inside Out: ${String(error)}`);
                 }
             }
         })().finally(() => { running = undefined; });
     };
-    api.on("gateway_start", () => {
-        lifetime = new AbortController();
-        const refresh = () => {
-            if (refreshing)
-                return;
-            refreshing = (async () => {
-                for (const agentId of listAgentIds(api.config)) {
-                    if (lifetime.signal.aborted)
-                        break;
-                    try {
-                        await refreshInsideOutBaselinesAsync(paths(api.config, agentId).storePath, { minInteractions: config.insideOut.baselineMinInteractions }, lifetime.signal);
-                    }
-                    catch (error) {
-                        if (!lifetime.signal.aborted)
-                            api.logger.warn(`Inside Out baselines: ${String(error)}`);
-                    }
+    const refresh = () => {
+        if (refreshing || lifetime.signal.aborted)
+            return;
+        const { signal } = lifetime;
+        refreshing = (async () => {
+            for (const agentId of listAgentIds(api.config)) {
+                if (signal.aborted)
+                    break;
+                try {
+                    await refreshInsideOutBaselinesAsync(paths(api.config, agentId).storePath, { minInteractions: config.insideOut.baselineMinInteractions }, signal);
                 }
-            })().finally(() => { refreshing = undefined; });
-        };
+                catch (error) {
+                    if (!signal.aborted)
+                        api.logger.warn(`Inside Out baselines: ${String(error)}`);
+                }
+            }
+        })().finally(() => { refreshing = undefined; });
+    };
+    api.on("gateway_start", () => {
+        clearTimers();
+        if (lifetime.signal.aborted)
+            lifetime = new AbortController();
         // Local statistics remain available when inference is manual-only or lacks a key.
         baselineTimer = setInterval(refresh, 86400_000);
         baselineTimer.unref();
@@ -122,7 +136,5 @@ export function registerInsideOut(api, config) {
         }
     });
     // Aborting cancels active baseline workers rather than waiting for a full historical pass.
-    api.on("gateway_stop", async () => { if (timer)
-        clearInterval(timer); if (baselineTimer)
-        clearInterval(baselineTimer); lifetime.abort(); await Promise.all([running, refreshing]); });
+    api.on("gateway_stop", async () => { clearTimers(); lifetime.abort(); await Promise.all([running, refreshing]); });
 }

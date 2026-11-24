@@ -116,6 +116,11 @@ export declare class TrainingStore {
         status: "failed" | "ambiguous";
         error: string;
     }): void;
+    saveStep<S extends "score" | "evaluate">(stage: S, id: string, request: unknown, result: TrainingStepResults[S], clearReview?: {
+        sourceId: string;
+        scope?: string;
+        matchesLegacyUnresolved?: (details: ReviewDetails) => boolean;
+    }): void;
     completedEvaluations(versions?: {
         selection: string;
         retrieval: string;

@@ -63,9 +63,6 @@ export declare function evaluateTrainingQueries(source: Source, store: TrainingS
     threshold: number;
     retrievalMethod: string;
     callUnit: string;
-    retrievals: number;
-    evaluated: number;
-    awaitingTeacher: number;
     examples: number;
     calls: number;
     completed: number;
@@ -76,6 +73,9 @@ export declare function evaluateTrainingQueries(source: Source, store: TrainingS
     flagged: number;
     inputBytes: number;
     budgetLimited: boolean;
+    retrievals: number;
+    evaluated: number;
+    awaitingTeacher: number;
     refreshed: {
         sessions: number;
         excludedSessions: number;
@@ -97,7 +97,10 @@ export declare function evaluateTrainingQueries(source: Source, store: TrainingS
         }[];
     };
 }>;
-export declare function exportQueryTraining(store: TrainingStore, threshold?: number, judgeVersion?: string): Generator<{
+export declare function currentTrainingCorpusHashes(source: Source, store: TrainingStore, config: UnblockMemoryConfig, threshold?: number, createSearch?: typeof historicalTrainingSearch): Promise<Map<string, string>>;
+export declare function exportQueryTraining(store: TrainingStore, threshold?: number, judgeVersion?: string, options?: {
+    corpusHashes?: ReadonlyMap<string, string>;
+}): Generator<{
     recallRequestedModel: string;
     threshold: number;
     target: QueryPair;

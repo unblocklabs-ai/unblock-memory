@@ -43,6 +43,7 @@ export declare class ResponseAuditStore {
     activeSessions(cohort: string, since: number): string[];
     observe(cohort: string, sessionId: string, episodes: readonly ResponseEpisode[]): void;
     needsJudgment(cohort: string, e: ResponseEpisode, now: number): boolean;
+    memoryRetryResult(cohort: string, e: ResponseEpisode): ResponseResult | undefined;
     attempted(cohort: string, e: ResponseEpisode, now: number): void;
     stale(cohort: string, e: ResponseEpisode): void;
     save(cohort: string, e: ResponseEpisode, result: ResponseResult, now: number): void;
@@ -65,8 +66,8 @@ export declare class ResponseAuditStore {
     stageBegin(keys: string[], now: number): void;
     stageSave<K extends keyof ResponseStages>(key: string, result: ResponseStages[K], now: number): void;
     retryFailed(cohort: string): {
-        stages: number | bigint;
-        episodes: number | bigint;
+        stages: number;
+        episodes: number;
     };
     scan(cohort: string, coverage: object, now: number): void;
     report(cohort: string, since: number, id?: string, options?: ResponseReportOptions): {

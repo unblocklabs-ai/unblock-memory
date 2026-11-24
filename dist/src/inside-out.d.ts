@@ -17,6 +17,15 @@ export declare function repairInsideOutIdentities(options: Parameters<typeof rea
     repaired: number;
     errors: string[];
 }>;
+type InsideOutRunResult = {
+    reviewed: number;
+    cached: number;
+    failed: number;
+    sources: number;
+    skippedSources: number;
+    errors: string[];
+    baselineError?: string;
+};
 export declare function runInsideOut(options: {
     agentId: string;
     databasePath: string;
@@ -26,15 +35,7 @@ export declare function runInsideOut(options: {
     signal?: AbortSignal;
     retry?: boolean;
     sessionId?: string;
-}): Promise<{
-    reviewed: number;
-    cached: number;
-    failed: number;
-    sources: number;
-    skippedSources: number;
-    errors: string[];
-    baselineError?: string;
-} | {
+}): Promise<InsideOutRunResult | {
     status: string;
 }>;
 export declare function reportInsideOutBaselines(path: string, options?: Parameters<typeof emotionBaselineHistory>[1]): {

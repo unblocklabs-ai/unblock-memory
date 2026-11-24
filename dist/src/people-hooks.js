@@ -1,6 +1,8 @@
 import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { nonBlank } from "./guards.js";
 import { renderPeopleDossier } from "./people-background.js";
+const MAX_CORRELATION_ENTRIES = 1000;
+const CORRELATION_TTL_MS = 10 * 60_000;
 function identifier(value) {
     if (typeof value === "number" && Number.isFinite(value))
         return String(value);
@@ -8,6 +10,39 @@ function identifier(value) {
 }
 function promptIdentityKey(sessionKey, accountScope, externalId) {
     return JSON.stringify([sessionKey, accountScope, externalId]);
+}
+function resolveSlackThreadKey(event, accountScope, conversationId, sessionKey) {
+    const threadRootId = identifier(event.threadId) ?? nonBlank(event.replyToId);
+    const rootMessageId = threadRootId ?? nonBlank(event.messageId);
+    if (conversationId.startsWith("D") && threadRootId === undefined) {
+        return `slack:${accountScope}:${conversationId}:session:${sessionKey}`;
+    }
+    return rootMessageId ? `slack:${accountScope}:${conversationId}:${rootMessageId}` : undefined;
+}
+function getFreshCorrelation(map, key, now) {
+    const entry = map.get(key);
+    if (!entry)
+        return undefined;
+    if (now - entry.observedAt > CORRELATION_TTL_MS) {
+        map.delete(key);
+        return undefined;
+    }
+    return entry;
+}
+function setBoundedCorrelation(map, key, threadKey, now) {
+    map.delete(key);
+    for (const [existingKey, entry] of map) {
+        if (now - entry.observedAt <= CORRELATION_TTL_MS)
+            break;
+        map.delete(existingKey);
+    }
+    map.set(key, { threadKey, observedAt: now });
+    while (map.size > MAX_CORRELATION_ENTRIES) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined)
+            break;
+        map.delete(oldest);
+    }
 }
 function observedAt(timestamp) {
     if (timestamp === undefined || !Number.isFinite(timestamp))
@@ -39,21 +74,17 @@ export function registerPeopleHooks(api, stores, config) {
         const runId = nonBlank(event.runId) ?? nonBlank(context.runId);
         const sessionKey = nonBlank(context.sessionKey);
         if (config.whisperer.enabled && accountScope && externalId && conversationId && sessionKey) {
-            const threadRootId = identifier(event.threadId) ?? nonBlank(event.replyToId);
-            const rootMessageId = threadRootId ?? nonBlank(event.messageId);
-            const threadKey = conversationId.startsWith("D") && threadRootId === undefined
-                ? `slack:${accountScope}:${conversationId}:session:${sessionKey}`
-                : rootMessageId
-                    ? `slack:${accountScope}:${conversationId}:${rootMessageId}`
-                    : undefined;
+            const threadKey = resolveSlackThreadKey(event, accountScope, conversationId, sessionKey);
             if (threadKey) {
-                const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
+                const now = Date.now();
                 if (runId) {
-                    threadByRun.set(runId, threadKey);
+                    setBoundedCorrelation(threadByRun, runId, threadKey, now);
                 }
                 else {
-                    const pendingThreadKey = pendingThreadByIdentity.get(identityKey);
-                    pendingThreadByIdentity.set(identityKey, pendingThreadKey === undefined || pendingThreadKey === threadKey ? threadKey : null);
+                    const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
+                    const pending = getFreshCorrelation(pendingThreadByIdentity, identityKey, now);
+                    const nextThreadKey = pending === undefined || pending.threadKey === threadKey ? threadKey : null;
+                    setBoundedCorrelation(pendingThreadByIdentity, identityKey, nextThreadKey, now);
                 }
             }
         }
@@ -97,17 +128,28 @@ export function registerPeopleHooks(api, stores, config) {
         const runId = nonBlank(context.runId);
         if (!sessionKey || !parsed || !accountScope || !externalId || !runId)
             return;
+        const now = Date.now();
         const identityKey = promptIdentityKey(sessionKey, accountScope, externalId);
-        const mappedThreadKey = threadByRun.get(runId);
-        const pendingThreadKey = mappedThreadKey ? undefined : pendingThreadByIdentity.get(identityKey);
-        if (!mappedThreadKey)
+        const mapped = getFreshCorrelation(threadByRun, runId, now);
+        let threadKey;
+        if (mapped) {
+            threadKey = mapped.threadKey;
+            const pending = pendingThreadByIdentity.get(identityKey);
+            if (pending &&
+                (now - pending.observedAt > CORRELATION_TTL_MS || pending.threadKey === mapped.threadKey)) {
+                pendingThreadByIdentity.delete(identityKey);
+            }
+        }
+        else {
+            const pending = getFreshCorrelation(pendingThreadByIdentity, identityKey, now);
             pendingThreadByIdentity.delete(identityKey);
-        const threadKey = mappedThreadKey ?? pendingThreadKey;
+            threadKey = pending?.threadKey;
+            if (typeof threadKey === "string") {
+                setBoundedCorrelation(threadByRun, runId, threadKey, now);
+            }
+        }
         if (!threadKey)
             return;
-        if (typeof pendingThreadKey === "string") {
-            threadByRun.set(runId, pendingThreadKey);
-        }
         try {
             const store = stores.get(parsed.agentId);
             const person = store.findPersonByIdentity("slack", accountScope, externalId);
@@ -120,10 +162,10 @@ export function registerPeopleHooks(api, stores, config) {
             if (previous) {
                 return previous.runId === runId ? peopleContext(previous.contribution) : undefined;
             }
-            const dossier = store.getDossier(person.id);
-            const text = dossier && !store.isDossierVerified(person.id)
-                ? undefined : dossier ? renderPeopleDossier(dossier.dossier) : undefined;
-            const contribution = text ? renderPeopleWhisper(text, config.whisperer.maxChars) : undefined;
+            const verified = store.getVerifiedDossier(person.id);
+            if (!verified)
+                return;
+            const contribution = renderPeopleWhisper(renderPeopleDossier(verified.dossier), config.whisperer.maxChars);
             if (!contribution)
                 return;
             const receipt = store.recordWhisperReceipt({
@@ -143,6 +185,10 @@ export function registerPeopleHooks(api, stores, config) {
         const runId = nonBlank(event.runId) ?? nonBlank(context.runId);
         if (runId)
             threadByRun.delete(runId);
+    });
+    api.on("gateway_stop", () => {
+        threadByRun.clear();
+        pendingThreadByIdentity.clear();
     });
     return beforePrompt;
 }

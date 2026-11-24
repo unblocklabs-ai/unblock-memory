@@ -173,8 +173,10 @@ export class TrainingStore {
         });
     }
     unavailable(sessionId) {
-        this.#checkLease();
-        this.#db.prepare("UPDATE training_examples SET active=-1 WHERE session_id=? AND active=1").run(sessionId);
+        immediateTransaction(this.#db, () => {
+            this.#checkLease();
+            this.#db.prepare("UPDATE training_examples SET active=-1 WHERE session_id=? AND active=1").run(sessionId);
+        });
     }
     #scope = `g.prompt_version=? AND g.requested_model=? AND EXISTS
     (SELECT 1 FROM training_examples e JOIN training_inputs i ON i.hash=e.input_hash
@@ -201,26 +203,34 @@ export class TrainingStore {
             this.#checkLease();
             const ok = "probability" in result;
             const status = ok ? "complete" : result.status, error = ok ? null : result.error;
-            this.#db.prepare(`UPDATE training_gates SET status=?,probability=?,actual_model=?,input_tokens=?,output_tokens=?,error=?,completed_at=? WHERE id=?`)
-                .run(status, ok ? result.probability : null, ok ? result.model : null, ok ? result.usage.input_tokens : null, ok ? result.usage.output_tokens : null, error, Date.now(), id);
-            this.#db.prepare("UPDATE training_attempts SET status=?,finished_at=?,error=?,result_json=? WHERE id=? AND gate_id=?")
-                .run(status, Date.now(), error, ok ? JSON.stringify(result) : null, attempt, id);
+            const now = Date.now();
+            if (!this.#db.prepare(`UPDATE training_gates SET status=?,probability=?,actual_model=?,input_tokens=?,output_tokens=?,error=?,completed_at=? WHERE id=? AND status='attempted'`)
+                .run(status, ok ? result.probability : null, ok ? result.model : null, ok ? result.usage.input_tokens : null, ok ? result.usage.output_tokens : null, error, now, id).changes) {
+                throw new Error("Training gate attempt lost");
+            }
+            if (!this.#db.prepare("UPDATE training_attempts SET status=?,finished_at=?,error=?,result_json=? WHERE id=? AND gate_id=? AND status='attempted'")
+                .run(status, now, error, ok ? JSON.stringify(result) : null, attempt, id).changes) {
+                throw new Error("Training attempt lost");
+            }
         });
     }
     retry(includeAmbiguous, ids) {
         if (!ids.length || ids.some(id => !/^[a-f0-9]{64}$/u.test(id)))
             throw new Error("Specify exact training gate or step hashes to retry");
-        this.#checkLease();
-        return immediateTransaction(this.#db, () => ids.reduce((count, id) => {
+        return immediateTransaction(this.#db, () => {
+            this.#checkLease();
             const statuses = includeAmbiguous ? "('failed','ambiguous')" : "('failed')";
-            const gates = this.#db.prepare(`UPDATE training_gates SET status='pending',error=NULL WHERE id=?
+            const resetGate = this.#db.prepare(`UPDATE training_gates SET status='pending',error=NULL,completed_at=NULL WHERE id=?
         AND prompt_version=? AND requested_model=? AND status IN ${statuses}
-        AND input_hash IN (SELECT hash FROM training_inputs WHERE preparation=?)`)
-                .run(id, TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
-            const steps = this.#db.prepare(`UPDATE training_steps SET status='pending',error=NULL WHERE id=?
-        AND json_extract(request_json,'$.recipe')=? AND status IN ${statuses}`).run(id, TRAINING_RECIPE_VERSION);
-            return count + Number(gates.changes) + Number(steps.changes);
-        }, 0));
+        AND input_hash IN (SELECT hash FROM training_inputs WHERE preparation=?)`);
+            const resetStep = this.#db.prepare(`UPDATE training_steps SET status='pending',error=NULL,completed_at=NULL WHERE id=?
+        AND json_extract(request_json,'$.recipe')=? AND status IN ${statuses}`);
+            return ids.reduce((count, id) => {
+                const gates = resetGate.run(id, TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
+                const steps = resetStep.run(id, TRAINING_RECIPE_VERSION);
+                return count + Number(gates.changes) + Number(steps.changes);
+            }, 0);
+        });
     }
     queryExamples(threshold = TRAINING_GATE_THRESHOLD) {
         if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1)
@@ -241,15 +251,16 @@ export class TrainingStore {
     }
     get requestedModel() { return this.#requestedModel; }
     flagReview(example, reason, details, scope = "") {
-        this.#checkLease();
-        this.#db.prepare(`INSERT INTO training_reviews (source_id,scope,input_hash,recipe,reason,details_json,updated_at)
-      VALUES (?,?,?,?,?,?,?) ON CONFLICT(source_id,scope) DO UPDATE SET
-      input_hash=excluded.input_hash,recipe=excluded.recipe,reason=excluded.reason,
-      details_json=excluded.details_json,updated_at=excluded.updated_at`)
-            .run(example.id, scope, example.inputHash, TRAINING_RECIPE_VERSION, reason, JSON.stringify(details), Date.now());
+        immediateTransaction(this.#db, () => {
+            this.#checkLease();
+            this.#db.prepare(`INSERT INTO training_reviews (source_id,scope,input_hash,recipe,reason,details_json,updated_at)
+        VALUES (?,?,?,?,?,?,?) ON CONFLICT(source_id,scope) DO UPDATE SET
+        input_hash=excluded.input_hash,recipe=excluded.recipe,reason=excluded.reason,
+        details_json=excluded.details_json,updated_at=excluded.updated_at`)
+                .run(example.id, scope, example.inputHash, TRAINING_RECIPE_VERSION, reason, JSON.stringify(details), Date.now());
+        });
     }
-    clearReview(sourceId, scope, matchesLegacyUnresolved) {
-        this.#checkLease();
+    #clearReviewLocked(sourceId, scope, matchesLegacyUnresolved) {
         if (scope === undefined) {
             this.#db.prepare("DELETE FROM training_reviews WHERE source_id=? AND recipe=?").run(sourceId, TRAINING_RECIPE_VERSION);
             return;
@@ -267,6 +278,12 @@ export class TrainingStore {
                     .run(sourceId, TRAINING_RECIPE_VERSION, String(legacy.scope));
             }
         }
+    }
+    clearReview(sourceId, scope, matchesLegacyUnresolved) {
+        immediateTransaction(this.#db, () => {
+            this.#checkLease();
+            this.#clearReviewLocked(sourceId, scope, matchesLegacyUnresolved);
+        });
     }
     reviews() {
         // Old usefulness-only flags remain in SQLite for audit, but no longer block training.
@@ -294,12 +311,31 @@ export class TrainingStore {
             this.#checkLease();
             const ok = "result" in outcome, status = ok ? "complete" : outcome.status;
             const json = ok ? JSON.stringify(outcome.result) : null, error = ok ? null : outcome.error;
+            const now = Date.now();
             if (!this.#db.prepare(`UPDATE training_steps SET status=?,result_json=?,error=?,completed_at=? WHERE id=? AND stage=? AND status='attempted'`)
-                .run(status, json, error, Date.now(), id, stage).changes)
+                .run(status, json, error, now, id, stage).changes)
                 throw new Error("Training step attempt lost");
             if (!this.#db.prepare(`UPDATE training_step_attempts SET status=?,finished_at=?,error=?,result_json=? WHERE id=? AND step_id=? AND status='attempted'`)
-                .run(status, Date.now(), error, json, attempt, id).changes)
+                .run(status, now, error, json, attempt, id).changes)
                 throw new Error("Training attempt lost");
+        });
+    }
+    saveStep(stage, id, request, result, clearReview) {
+        immediateTransaction(this.#db, () => {
+            this.#checkLease();
+            const now = Date.now();
+            const json = JSON.stringify(result);
+            this.#db.prepare("INSERT OR IGNORE INTO training_steps (id,stage,request_json,status) VALUES (?,?,?,'pending')")
+                .run(id, stage, JSON.stringify(request));
+            if (!this.#db.prepare("UPDATE training_steps SET status='complete',result_json=?,error=NULL,completed_at=? WHERE id=? AND stage=? AND status='pending'")
+                .run(json, now, id, stage).changes) {
+                throw new Error("Training step is not pending");
+            }
+            this.#db.prepare("INSERT INTO training_step_attempts (step_id,started_at,finished_at,status,error,result_json) VALUES (?,?,?,'complete',NULL,?)")
+                .run(id, now, now, json);
+            if (clearReview) {
+                this.#clearReviewLocked(clearReview.sourceId, clearReview.scope, clearReview.matchesLegacyUnresolved);
+            }
         });
     }
     completedEvaluations(versions) {
@@ -376,6 +412,8 @@ export class TrainingStore {
                 .all(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION) };
     }
     *exportRows(threshold) {
+        const sourcesQuery = this.#db.prepare(`SELECT id,session_id sessionId,event_seq userEventId,timestamp,context_limited contextLimited
+      FROM training_examples WHERE input_hash=? AND active=1 ORDER BY session_id,event_seq`);
         const rows = this.#db.prepare(`SELECT g.*,i.input_json FROM training_gates g JOIN training_inputs i ON i.hash=g.input_hash
       WHERE ${this.#scope} AND g.status='complete' ORDER BY g.id`).iterate(TRAINING_GATE_VERSION, this.#requestedModel, TRAINING_PREPARATION);
         for (const row of rows) {
@@ -384,8 +422,7 @@ export class TrainingStore {
                 recallNeeded: Number(row.probability) >= threshold, threshold, model: row.actual_model,
                 requestedModel: this.#requestedModel, promptVersion: row.prompt_version,
                 usage: { input_tokens: row.input_tokens, output_tokens: row.output_tokens },
-                sources: this.#db.prepare(`SELECT id,session_id sessionId,event_seq userEventId,timestamp,context_limited contextLimited
-          FROM training_examples WHERE input_hash=? AND active=1 ORDER BY session_id,event_seq`).all(String(row.input_hash))
+                sources: sourcesQuery.all(String(row.input_hash))
                     .map(source => ({ nodeId: this.#nodeId, agentId: this.#agentId, ...source })) };
         }
     }

@@ -22,6 +22,7 @@ export { expandSessionSearchHit } from "./memory-passage.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
+const MANAGER_CLOSED_ERROR = "QmdMemoryManager is closed";
 function readSkillDocuments(source) {
     const documents = [];
     const visitedDirectories = new Set();
@@ -223,9 +224,12 @@ export class QmdMemoryManager {
     #analysisRunner;
     #sessions;
     #store;
+    #storePromise;
     #curation;
     #cleanupRemovedDocuments;
     #operationChain;
+    #inFlight = new Set();
+    #closePromise;
     #watcher;
     #watchReady;
     #watchTimer;
@@ -250,20 +254,22 @@ export class QmdMemoryManager {
         }
     }
     async diagnostics() {
-        await this.#operationChain;
-        const store = await this.#getStore();
-        const status = await store.getStatus();
-        const manifest = this.#sessions ? await readSessionManifest(this.#sessions.manifestPath) : undefined;
-        return {
-            projectorVersion: PROJECTOR_VERSION,
-            semanticChunkingVersion: "semanticChunkingVersion" in status ? status.semanticChunkingVersion : null,
-            sessionsNeedingProjection: manifest ? Object.values(manifest.sessions).filter(session => session.projectorVersion !== PROJECTOR_VERSION).length : 0,
-            needsEmbedding: status.needsEmbedding,
-            embeddingReady: status.needsEmbedding === 0 && status.hasVectorIndex,
-            structuralChunksOmitted: this.#structuralDiagnosticsAvailable ? this.#structuralChunksOmitted : null,
-            retrieval: this.#retrievalTelemetry.snapshot(),
-            scope: "Projection count covers previously indexed sessions; omissions count this manager lifetime; null means dependency has not reported counts.",
-        };
+        return this.#runFenced(async () => {
+            await this.#operationChain;
+            const store = await this.#getStore();
+            const status = await store.getStatus();
+            const manifest = this.#sessions ? await readSessionManifest(this.#sessions.manifestPath) : undefined;
+            return {
+                projectorVersion: PROJECTOR_VERSION,
+                semanticChunkingVersion: "semanticChunkingVersion" in status ? status.semanticChunkingVersion : null,
+                sessionsNeedingProjection: manifest ? Object.values(manifest.sessions).filter(session => session.projectorVersion !== PROJECTOR_VERSION).length : 0,
+                needsEmbedding: status.needsEmbedding,
+                embeddingReady: status.needsEmbedding === 0 && status.hasVectorIndex,
+                structuralChunksOmitted: this.#structuralDiagnosticsAvailable ? this.#structuralChunksOmitted : null,
+                retrieval: this.#retrievalTelemetry.snapshot(),
+                scope: "Projection count covers previously indexed sessions; omissions count this manager lifetime; null means dependency has not reported counts.",
+            };
+        });
     }
     constructor(params) {
         this.#dbPath = params.dbPath;
@@ -281,9 +287,11 @@ export class QmdMemoryManager {
         this.#sessions = params.sessions;
     }
     async start() {
+        this.#assertOpen();
         if (this.#sessions) {
             await this.#reloadSessionMetadata();
         }
+        this.#assertOpen();
         this.#startWatcher();
         await this.sync({ reason: "first-use" });
         await this.#watchReady;
@@ -352,26 +360,71 @@ export class QmdMemoryManager {
                 clearTimeout(this.#watchTimer);
             this.#watchTimer = setTimeout(() => {
                 this.#watchTimer = undefined;
+                if (this.#closed)
+                    return;
                 const collections = [...this.#watchCollections];
                 this.#watchCollections.clear();
                 void this.#sync({ reason: "watch" }, collections).catch(() => undefined);
             }, WATCH_DEBOUNCE_MS);
         });
     }
+    #assertOpen() {
+        if (this.#closed)
+            throw new Error(MANAGER_CLOSED_ERROR);
+    }
+    #runFenced(run) {
+        if (this.#closed)
+            return Promise.reject(new Error(MANAGER_CLOSED_ERROR));
+        const promise = Promise.resolve().then(run);
+        const tracked = promise.then(() => undefined, () => undefined);
+        this.#inFlight.add(tracked);
+        void tracked.finally(() => {
+            this.#inFlight.delete(tracked);
+        });
+        return promise;
+    }
     async #getStore() {
+        this.#assertOpen();
         if (this.#store)
             return this.#store;
+        if (!this.#storePromise) {
+            const pending = this.#openStore();
+            this.#storePromise = pending;
+            void pending.finally(() => {
+                if (this.#storePromise === pending)
+                    this.#storePromise = undefined;
+            }).catch(() => undefined);
+        }
+        const store = await this.#storePromise;
+        this.#assertOpen();
+        return store;
+    }
+    async #openStore() {
+        this.#assertOpen();
         await mkdir(dirname(this.#dbPath), { recursive: true });
+        this.#assertOpen();
         if (this.#storeFactory) {
-            this.#store = await this.#storeFactory();
-            const store = this.#store;
-            if (store.internal) {
-                ensureMemoryAnalysisSchema(store.internal.db);
-                markStaleForAnalysisCollectionChange(store.internal.db, this.#indexCollections, this.#hasSkills);
+            const created = await this.#storeFactory();
+            if (this.#closed) {
+                await created.close().catch(() => undefined);
+                throw new Error(MANAGER_CLOSED_ERROR);
             }
-            return this.#store;
+            try {
+                const store = created;
+                if (store.internal) {
+                    ensureMemoryAnalysisSchema(store.internal.db);
+                    markStaleForAnalysisCollectionChange(store.internal.db, this.#indexCollections, this.#hasSkills);
+                }
+            }
+            catch (error) {
+                await created.close().catch(() => undefined);
+                throw error;
+            }
+            this.#store = created;
+            return created;
         }
         const { createStore } = await import("@unblocklabs/qmd");
+        this.#assertOpen();
         const store = await createStore({
             dbPath: this.#dbPath,
             keepModelsWarm: this.#keepModelsWarm,
@@ -384,6 +437,7 @@ export class QmdMemoryManager {
             },
         });
         try {
+            this.#assertOpen();
             enableSecureDelete(store);
             ensureMemoryAnalysisSchema(store.internal.db);
             markStaleForAnalysisCollectionChange(store.internal.db, this.#indexCollections, this.#hasSkills);
@@ -405,6 +459,7 @@ export class QmdMemoryManager {
             if (prunedDocuments > 0 && prunedAnalysisInput)
                 markMemoryAnalysisStale(store.internal.db);
             await ensureSemanticChunking(store);
+            this.#assertOpen();
         }
         catch (error) {
             await store.close().catch(() => undefined);
@@ -539,6 +594,7 @@ export class QmdMemoryManager {
             });
             this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
             this.#sessionManifest = synced.manifest;
+            this.#sessionManifestMtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
             if (synced.result.skipReason)
                 return synced.result;
             const store = await this.#getStore();
@@ -637,13 +693,15 @@ export class QmdMemoryManager {
         });
     }
     async listMaintenanceTasks(params = {}) {
-        await this.#operationChain;
-        const tasks = this.#getCuration().listTasks(params);
-        if (!tasks.some(task => task.type === "quality_review"))
-            return tasks;
-        const store = await this.#getAnalysisStore();
-        const fingerprints = new Map();
-        return tasks.map(task => ({ ...task, indexPresence: qualityTaskPresence(store.internal.db, task, fingerprints) }));
+        return this.#runFenced(async () => {
+            await this.#operationChain;
+            const tasks = this.#getCuration().listTasks(params);
+            if (!tasks.some(task => task.type === "quality_review"))
+                return tasks;
+            const store = await this.#getAnalysisStore();
+            const fingerprints = new Map();
+            return tasks.map(task => ({ ...task, indexPresence: qualityTaskPresence(store.internal.db, task, fingerprints) }));
+        });
     }
     async auditQuality(params) {
         if (this.#qualityAuditRunning)
@@ -670,6 +728,7 @@ export class QmdMemoryManager {
         return this.#getCuration().updateTask(params);
     }
     #getCuration() {
+        this.#assertOpen();
         this.#curation ??= new CurationStore(this.#curationPath);
         return this.#curation;
     }
@@ -773,7 +832,13 @@ export class QmdMemoryManager {
         return store;
     }
     #enqueue(run) {
-        const result = (this.#operationChain ?? Promise.resolve()).then(run, run);
+        if (this.#closed)
+            return Promise.reject(new Error(MANAGER_CLOSED_ERROR));
+        const guardedRun = () => {
+            this.#assertOpen();
+            return run();
+        };
+        const result = (this.#operationChain ?? Promise.resolve()).then(guardedRun, guardedRun);
         this.#operationChain = result.then(() => undefined, () => undefined);
         return result;
     }
@@ -795,30 +860,32 @@ export class QmdMemoryManager {
         return results;
     }
     async #search(query, opts) {
-        if (opts?.sources && !opts.sources.includes("memory"))
-            return [];
-        if (this.#sources.size === 0)
-            return [];
-        const collections = this.#collectionNames(opts?.corpora);
-        opts?.signal?.throwIfAborted();
-        await this.#operationChain;
-        const sessions = this.#sessions;
-        opts?.signal?.throwIfAborted();
-        if (sessions && collections.includes(sessions.collection)) {
-            await this.#refreshSessionMetadata();
-        }
-        const store = await this.#getStore();
-        opts?.signal?.throwIfAborted();
-        const allowedPaths = this.#allowedPaths(collections, opts?.sessionFilter);
-        const hits = await store.vsearch(query, {
-            collection: collections,
-            limit: opts?.maxResults ?? 5,
-            minScore: opts?.minScore ?? 0.3,
-            allowedPaths,
-            expand: false,
+        return this.#runFenced(async () => {
+            if (opts?.sources && !opts.sources.includes("memory"))
+                return [];
+            if (this.#sources.size === 0)
+                return [];
+            const collections = this.#collectionNames(opts?.corpora);
+            opts?.signal?.throwIfAborted();
+            await this.#operationChain;
+            const sessions = this.#sessions;
+            opts?.signal?.throwIfAborted();
+            if (sessions && collections.includes(sessions.collection)) {
+                await this.#refreshSessionMetadata();
+            }
+            const store = await this.#getStore();
+            opts?.signal?.throwIfAborted();
+            const allowedPaths = this.#allowedPaths(collections, opts?.sessionFilter);
+            const hits = await store.vsearch(query, {
+                collection: collections,
+                limit: opts?.maxResults ?? 5,
+                minScore: opts?.minScore ?? 0.3,
+                allowedPaths,
+                expand: false,
+            });
+            opts?.signal?.throwIfAborted();
+            return this.#renderSearchHits(hits, store, opts);
         });
-        opts?.signal?.throwIfAborted();
-        return this.#renderSearchHits(hits, store, opts);
     }
     /** Shared discovery: exact trained recipe, scoped before either retrieval lane. */
     async searchCandidates(queries, opts) {
@@ -949,78 +1016,83 @@ export class QmdMemoryManager {
         return results.filter(hit => !hit.path.startsWith(EXTRACTED_PREFIX) || finalPaths.has(hit.path));
     }
     async searchSkills(query, minScore, limit) {
-        if (!this.#hasSkills)
-            return [];
-        await this.#operationChain;
-        const store = await this.#getStore();
-        if (!store.internal?.llm)
-            throw new Error("Skill Whisperer requires the QMD embedding model");
-        const llm = store.internal.llm;
-        const { formatDocForEmbedding, formatQueryForEmbedding } = await import("@unblocklabs/qmd");
-        let skillIndex = this.#skillIndex;
-        if (!skillIndex) {
-            const pending = (async () => {
-                // Sources iterate in configuration order, so the first skill of a name wins.
-                const byName = new Map();
-                for (const source of this.#sources.values()) {
-                    if (source.kind !== "skills")
-                        continue;
-                    for (const document of readSkillDocuments(source)) {
-                        const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
-                        const key = name.toLowerCase();
-                        if (byName.has(key))
+        return this.#runFenced(async () => {
+            if (!this.#hasSkills)
+                return [];
+            await this.#operationChain;
+            const store = await this.#getStore();
+            if (!store.internal?.llm)
+                throw new Error("Skill Whisperer requires the QMD embedding model");
+            const llm = store.internal.llm;
+            const { formatDocForEmbedding, formatQueryForEmbedding } = await import("@unblocklabs/qmd");
+            this.#assertOpen();
+            let skillIndex = this.#skillIndex;
+            if (!skillIndex) {
+                const pending = (async () => {
+                    // Sources iterate in configuration order, so the first skill of a name wins.
+                    const byName = new Map();
+                    for (const source of this.#sources.values()) {
+                        if (source.kind !== "skills")
                             continue;
-                        byName.set(key, { name, description: frontmatterValue(document.body, "description") ?? "", path: document.path });
+                        for (const document of readSkillDocuments(source)) {
+                            const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
+                            const key = name.toLowerCase();
+                            if (byName.has(key))
+                                continue;
+                            byName.set(key, { name, description: frontmatterValue(document.body, "description") ?? "", path: document.path });
+                        }
                     }
-                }
-                const skills = [...byName.values()];
-                const embeddings = await llm.embedBatch(skills.map((candidate) => formatDocForEmbedding(candidate.description, candidate.name, llm.embedModelName)));
-                return skills.flatMap((candidate, index) => {
-                    const embedding = embeddings[index]?.embedding;
-                    return embedding ? [{ ...candidate, score: 0, embedding }] : [];
+                    const skills = [...byName.values()];
+                    const embeddings = await llm.embedBatch(skills.map((candidate) => formatDocForEmbedding(candidate.description, candidate.name, llm.embedModelName)));
+                    return skills.flatMap((candidate, index) => {
+                        const embedding = embeddings[index]?.embedding;
+                        return embedding ? [{ ...candidate, score: 0, embedding }] : [];
+                    });
+                })();
+                skillIndex = pending.catch((error) => {
+                    if (this.#skillIndex === skillIndex)
+                        this.#skillIndex = undefined;
+                    throw error;
                 });
-            })();
-            skillIndex = pending.catch((error) => {
-                if (this.#skillIndex === skillIndex)
-                    this.#skillIndex = undefined;
-                throw error;
-            });
-            this.#skillIndex = skillIndex;
-        }
-        const queryEmbedding = await llm.embed(formatQueryForEmbedding(query, llm.embedModelName), { isQuery: true });
-        if (!queryEmbedding)
-            return [];
-        const candidates = await skillIndex;
-        return candidates
-            .map(({ embedding, ...candidate }) => ({
-            ...candidate,
-            score: cosineSimilarity(queryEmbedding.embedding, embedding),
-        }))
-            .filter((candidate) => candidate.score >= minScore)
-            .sort((left, right) => right.score - left.score)
-            .slice(0, limit);
+                this.#skillIndex = skillIndex;
+            }
+            const queryEmbedding = await llm.embed(formatQueryForEmbedding(query, llm.embedModelName), { isQuery: true });
+            if (!queryEmbedding)
+                return [];
+            const candidates = await skillIndex;
+            return candidates
+                .map(({ embedding, ...candidate }) => ({
+                ...candidate,
+                score: cosineSimilarity(queryEmbedding.embedding, embedding),
+            }))
+                .filter((candidate) => candidate.score >= minScore)
+                .sort((left, right) => right.score - left.score)
+                .slice(0, limit);
+        });
     }
     async readFile(params) {
-        if (params.relPath.startsWith(EXTRACTED_PREFIX)) {
-            const record = this.#currentExtracted([params.relPath]).find(r => params.relPath === extractedUri(r));
-            return record ? buildReadResult({ content: `${record.text}\nObserved: ${new Date(record.observedAt).toISOString()}\nSource: ${extractedHit(record, 1).citation}`,
-                path: params.relPath, from: params.from, lines: params.lines }) : { status: "not_found", text: "", path: params.relPath };
-        }
-        const safe = parseSafeVirtualPath(params.relPath, this.#sources);
-        if (!safe || safe.source.kind === "skills") {
-            return { status: "not_found", text: "", path: params.relPath };
-        }
-        await this.#operationChain;
-        const store = await this.#getStore();
-        const doc = await store.get(safe.normalized, { includeBody: true });
-        if ("error" in doc || doc.filepath !== safe.normalized || doc.body === undefined) {
-            return { status: "not_found", text: "", path: params.relPath };
-        }
-        return buildReadResult({
-            content: doc.body,
-            path: safe.normalized,
-            from: params.from,
-            lines: params.lines,
+        return this.#runFenced(async () => {
+            if (params.relPath.startsWith(EXTRACTED_PREFIX)) {
+                const record = this.#currentExtracted([params.relPath]).find(r => params.relPath === extractedUri(r));
+                return record ? buildReadResult({ content: `${record.text}\nObserved: ${new Date(record.observedAt).toISOString()}\nSource: ${extractedHit(record, 1).citation}`,
+                    path: params.relPath, from: params.from, lines: params.lines }) : { status: "not_found", text: "", path: params.relPath };
+            }
+            const safe = parseSafeVirtualPath(params.relPath, this.#sources);
+            if (!safe || safe.source.kind === "skills") {
+                return { status: "not_found", text: "", path: params.relPath };
+            }
+            await this.#operationChain;
+            const store = await this.#getStore();
+            const doc = await store.get(safe.normalized, { includeBody: true });
+            if ("error" in doc || doc.filepath !== safe.normalized || doc.body === undefined) {
+                return { status: "not_found", text: "", path: params.relPath };
+            }
+            return buildReadResult({
+                content: doc.body,
+                path: safe.normalized,
+                from: params.from,
+                lines: params.lines,
+            });
         });
     }
     status() {
@@ -1052,16 +1124,26 @@ export class QmdMemoryManager {
         };
     }
     async probeEmbeddingAvailability() {
-        await this.#getStore();
-        return { ok: true, checked: true, checkedAtMs: Date.now() };
+        return this.#runFenced(async () => {
+            await this.#getStore();
+            return { ok: true, checked: true, checkedAtMs: Date.now() };
+        });
     }
     async probeVectorAvailability() {
-        const status = await (await this.#getStore()).getStatus();
-        return status.hasVectorIndex;
+        return this.#runFenced(async () => {
+            const status = await (await this.#getStore()).getStatus();
+            return status.hasVectorIndex;
+        });
     }
-    async close() {
+    close() {
         this.#closed = true;
         this.#reviewLifetime.abort();
+        if (!this.#closePromise) {
+            this.#closePromise = this.#close();
+        }
+        return this.#closePromise;
+    }
+    async #close() {
         if (this.#watchTimer)
             clearTimeout(this.#watchTimer);
         this.#watchTimer = undefined;
@@ -1070,8 +1152,13 @@ export class QmdMemoryManager {
         this.#watcher = undefined;
         this.#watchReady = undefined;
         await this.#operationChain?.catch(() => undefined);
+        while (this.#inFlight.size > 0) {
+            await Promise.all([...this.#inFlight]);
+        }
+        await this.#storePromise?.catch(() => undefined);
         await this.#store?.close();
         this.#store = undefined;
+        this.#storePromise = undefined;
         this.#curation?.close();
         this.#curation = undefined;
     }

@@ -3,6 +3,8 @@ import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { responseOutcome, RESPONSE_REPORT_VERSION } from "./response-outcome.js";
 import { ResponsePeople } from "./response-identity.js";
 import { ResponseReviews, RESPONSE_REVIEW_POLICY } from "./response-reviews.js";
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 600_000;
 /** Operator-only tables: not a memory corpus and never injected into agent prompts. */
 export class ResponseAuditStore {
     #db;
@@ -10,34 +12,36 @@ export class ResponseAuditStore {
     constructor(path) {
         this.#db = openMemoryDatabase(path);
         try {
-            this.#db.exec("BEGIN IMMEDIATE");
-            const version = this.#db.prepare("SELECT version FROM memory_schema WHERE component='responses'").get()?.version;
-            if (version !== undefined && version !== 1)
-                throw new Error("Unsupported response audit schema version");
-            this.#db.exec(`
-        CREATE TABLE IF NOT EXISTS response_lease (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, expires INTEGER);
-        CREATE TABLE IF NOT EXISTS response_results (
-          cohort TEXT, id TEXT, session_id TEXT NOT NULL, input_hash TEXT NOT NULL,
-          episode_at INTEGER NOT NULL, active INTEGER NOT NULL, status TEXT NOT NULL,
-          attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT,
-          PRIMARY KEY(cohort,id));
-        CREATE TABLE IF NOT EXISTS response_scans (cohort TEXT PRIMARY KEY, observed_at INTEGER, coverage TEXT);
-        CREATE INDEX IF NOT EXISTS response_results_time ON response_results(cohort,episode_at);
-        CREATE INDEX IF NOT EXISTS response_results_session ON response_results(cohort,session_id,episode_at);`);
-            this.#db.exec(`CREATE TABLE IF NOT EXISTS response_checkpoints (
-        cohort TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, coverage TEXT NOT NULL,
-        PRIMARY KEY(cohort,session_id));
-        CREATE TABLE IF NOT EXISTS response_cursors (cohort TEXT PRIMARY KEY,cursor TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS response_schedule (
-          id INTEGER PRIMARY KEY CHECK(id=1), interval_ms INTEGER NOT NULL, next_due INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS response_stages (
-          key TEXT PRIMARY KEY, stage TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-          attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT);
-        CREATE TABLE IF NOT EXISTS response_stage_links (
-          cohort TEXT NOT NULL, episode_id TEXT NOT NULL, input_hash TEXT NOT NULL, stage TEXT NOT NULL, key TEXT NOT NULL,
-          PRIMARY KEY(cohort,episode_id,stage));`);
-            this.reviews = new ResponseReviews(this.#db);
-            this.#db.exec("INSERT OR IGNORE INTO memory_schema VALUES ('responses',1); COMMIT");
+            this.reviews = immediateTransaction(this.#db, () => {
+                const version = this.#db.prepare("SELECT version FROM memory_schema WHERE component='responses'").get()?.version;
+                if (version !== undefined && version !== 1)
+                    throw new Error("Unsupported response audit schema version");
+                this.#db.exec(`
+          CREATE TABLE IF NOT EXISTS response_lease (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, expires INTEGER);
+          CREATE TABLE IF NOT EXISTS response_results (
+            cohort TEXT, id TEXT, session_id TEXT NOT NULL, input_hash TEXT NOT NULL,
+            episode_at INTEGER NOT NULL, active INTEGER NOT NULL, status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT,
+            PRIMARY KEY(cohort,id));
+          CREATE TABLE IF NOT EXISTS response_scans (cohort TEXT PRIMARY KEY, observed_at INTEGER, coverage TEXT);
+          CREATE INDEX IF NOT EXISTS response_results_time ON response_results(cohort,episode_at);
+          CREATE INDEX IF NOT EXISTS response_results_session ON response_results(cohort,session_id,episode_at);`);
+                this.#db.exec(`CREATE TABLE IF NOT EXISTS response_checkpoints (
+          cohort TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, coverage TEXT NOT NULL,
+          PRIMARY KEY(cohort,session_id));
+          CREATE TABLE IF NOT EXISTS response_cursors (cohort TEXT PRIMARY KEY,cursor TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS response_schedule (
+            id INTEGER PRIMARY KEY CHECK(id=1), interval_ms INTEGER NOT NULL, next_due INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS response_stages (
+            key TEXT PRIMARY KEY, stage TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0, attempted_at INTEGER, assessed_at INTEGER, result TEXT);
+          CREATE TABLE IF NOT EXISTS response_stage_links (
+            cohort TEXT NOT NULL, episode_id TEXT NOT NULL, input_hash TEXT NOT NULL, stage TEXT NOT NULL, key TEXT NOT NULL,
+            PRIMARY KEY(cohort,episode_id,stage));`);
+                const reviews = new ResponseReviews(this.#db);
+                this.#db.exec("INSERT OR IGNORE INTO memory_schema VALUES ('responses',1)");
+                return reviews;
+            });
         }
         catch (error) {
             this.#db.close();
@@ -84,24 +88,47 @@ export class ResponseAuditStore {
         });
     }
     needsJudgment(cohort, e, now) {
-        const row = this.#db.prepare("SELECT status,attempts,attempted_at FROM response_results WHERE cohort=? AND id=? AND input_hash=? AND active=1")
-            .get(cohort, e.id, e.inputHash);
-        return !!row && row.status !== "ok" && Number(row.attempts) < 3 && (!row.attempted_at || now - Number(row.attempted_at) >= 600_000);
+        const row = this.#db.prepare(`SELECT 1 FROM response_results
+      WHERE cohort=? AND id=? AND input_hash=? AND active=1
+      AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable')
+      AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?)`)
+            .get(cohort, e.id, e.inputHash, MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS);
+        return !!row;
+    }
+    memoryRetryResult(cohort, e) {
+        const row = this.#db.prepare(`SELECT result FROM response_results r
+      WHERE cohort=? AND id=? AND input_hash=? AND active=1 AND status='ok'
+      AND json_extract(result,'$.memory.status')='unavailable'
+      AND NOT EXISTS (
+        SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
+        WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
+          AND l.stage!='memory' AND (s.status IS NULL OR s.status!='ok')
+      )`).get(cohort, e.id, e.inputHash);
+        return row && typeof row.result === "string" ? JSON.parse(row.result) : undefined;
     }
     attempted(cohort, e, now) {
-        this.#db.prepare("UPDATE response_results SET attempts=attempts+1,attempted_at=?,status='failed' WHERE cohort=? AND id=? AND input_hash=?")
+        this.#db.prepare(`UPDATE response_results SET attempts=attempts+1,attempted_at=?,
+      status=CASE WHEN status='ok' THEN 'ok' ELSE 'failed' END
+      WHERE cohort=? AND id=? AND input_hash=?`)
             .run(now, cohort, e.id, e.inputHash);
     }
     stale(cohort, e) {
         // Snapshot races are not provider failures and must not exhaust their retry budget.
-        this.#db.prepare(`UPDATE response_results SET attempts=MAX(0,attempts-1),attempted_at=NULL,status='pending'
-      WHERE cohort=? AND id=? AND input_hash=? AND active=1 AND status='failed'`).run(cohort, e.id, e.inputHash);
+        this.#db.prepare(`UPDATE response_results SET attempts=MAX(0,attempts-1),attempted_at=NULL,
+      status=CASE WHEN status='ok' THEN 'ok' ELSE 'pending' END
+      WHERE cohort=? AND id=? AND input_hash=? AND active=1
+      AND (status='failed' OR (status='ok' AND json_extract(result,'$.memory.status')='unavailable'))`)
+            .run(cohort, e.id, e.inputHash);
     }
     save(cohort, e, result, now) {
         result = { ...result, human: result.human ?? new ResponsePeople().resolve(e) };
+        const memoryUnavailable = result.memory.status === "unavailable" ? 1 : 0;
         immediateTransaction(this.#db, () => {
-            const changed = this.#db.prepare("UPDATE response_results SET status='ok',assessed_at=?,result=? WHERE cohort=? AND id=? AND input_hash=? AND active=1")
-                .run(now, JSON.stringify(result), cohort, e.id, e.inputHash).changes;
+            const changed = this.#db.prepare(`UPDATE response_results SET
+        attempts=CASE WHEN ?=1 AND (status!='ok' OR COALESCE(json_extract(result,'$.memory.status'),'')!='unavailable') THEN 1 ELSE attempts END,
+        attempted_at=CASE WHEN ?=1 THEN ? ELSE attempted_at END,
+        status='ok',assessed_at=?,result=? WHERE cohort=? AND id=? AND input_hash=? AND active=1`)
+                .run(memoryUnavailable, memoryUnavailable, now, now, JSON.stringify(result), cohort, e.id, e.inputHash).changes;
             if (changed)
                 this.reviews.sync(cohort, e.id, e.inputHash, result, now);
         });
@@ -122,14 +149,17 @@ export class ResponseAuditStore {
         this.#db.prepare("DELETE FROM response_checkpoints WHERE cohort=? AND session_id=?").run(cohort, session);
     }
     sessionWork(cohort, session, since, now) {
-        const row = this.#db.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN status!='ok' AND attempts<3 AND
-      (attempted_at IS NULL OR attempted_at<=?) THEN 1 ELSE 0 END) due FROM response_results
-      WHERE cohort=? AND session_id=? AND active=1 AND episode_at>=?`).get(now - 600_000, cohort, session, since);
+        const row = this.#db.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN (status!='ok' OR json_extract(result,'$.memory.status')='unavailable')
+      AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?) THEN 1 ELSE 0 END) due FROM response_results
+      WHERE cohort=? AND session_id=? AND active=1 AND episode_at>=?`)
+            .get(MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS, cohort, session, since);
         return { total: Number(row.total), due: Number(row.due ?? 0) };
     }
     pendingWork(cohort, since, now) {
         return Number(this.#db.prepare(`SELECT COUNT(*) n FROM response_results WHERE cohort=? AND active=1 AND episode_at>=?
-      AND status!='ok' AND attempts<3 AND (attempted_at IS NULL OR attempted_at<=?)`).get(cohort, since, now - 600_000).n);
+      AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable')
+      AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?)`)
+            .get(cohort, since, MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS).n);
     }
     /** Retry eligibility is not completion: include backoff and exhausted work. */
     unresolvedWork(cohort, since, until) {
@@ -150,7 +180,8 @@ export class ResponseAuditStore {
         immediateTransaction(this.#db, () => {
             for (const key of keys) {
                 const changed = this.#db.prepare(`UPDATE response_stages SET attempts=attempts+1,attempted_at=?,status='failed'
-          WHERE key=? AND status!='ok' AND attempts<3 AND (attempted_at IS NULL OR attempted_at<=?)`).run(now, key, now - 600_000).changes;
+          WHERE key=? AND status!='ok' AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?)`)
+                    .run(now, key, MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS).changes;
                 if (!changed)
                     throw new Error("Response stage in backoff or retry exhausted");
             }
@@ -161,15 +192,33 @@ export class ResponseAuditStore {
     }
     retryFailed(cohort) {
         return immediateTransaction(this.#db, () => {
-            const episodes = this.#db.prepare(`UPDATE response_results AS r SET attempts=0,attempted_at=NULL,status='pending'
-        WHERE cohort=? AND active=1 AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable' OR EXISTS (
-          SELECT 1 FROM response_stage_links l JOIN response_stages s ON s.key=l.key
-          WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash AND s.status!='ok'))`).run(cohort).changes;
-            const stages = this.#db.prepare(`UPDATE response_stages SET attempts=0,attempted_at=NULL,status='pending'
+            const memoryOnly = this.#db.prepare(`UPDATE response_results AS r SET attempts=0,attempted_at=NULL
+        WHERE cohort=? AND active=1 AND status='ok' AND json_extract(result,'$.memory.status')='unavailable'
+        AND NOT EXISTS (
+          SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
+          WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
+            AND l.stage!='memory' AND (s.status IS NULL OR s.status!='ok')
+        )`).run(cohort).changes;
+            const reset = this.#db.prepare(`UPDATE response_results AS r
+        SET attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL,status='pending'
+        WHERE cohort=? AND active=1 AND (
+          status!='ok'
+          OR (NOT (status='ok' AND json_extract(result,'$.memory.status')='unavailable') AND EXISTS (
+            SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
+            WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
+              AND (s.status IS NULL OR s.status!='ok')
+          ))
+          OR EXISTS (
+            SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
+            WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
+              AND l.stage!='memory' AND (s.status IS NULL OR s.status!='ok')
+          )
+        )`).run(cohort).changes;
+            const stages = this.#db.prepare(`UPDATE response_stages SET attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL,status='pending'
         WHERE status!='ok' AND key IN (SELECT l.key FROM response_stage_links l JOIN response_results r
         ON r.cohort=l.cohort AND r.id=l.episode_id AND r.input_hash=l.input_hash WHERE r.cohort=? AND r.active=1)`)
                 .run(cohort).changes;
-            return { stages, episodes };
+            return { stages: Number(stages), episodes: Number(memoryOnly) + Number(reset) };
         });
     }
     scan(cohort, coverage, now) {
@@ -364,10 +413,10 @@ export class ResponseAuditStore {
             });
         });
         const stages = this.#db.prepare(`SELECT s.stage,s.status,COUNT(*) count,
-      SUM(CASE WHEN s.status!='ok' AND s.attempts>=3 THEN 1 ELSE 0 END) exhausted
+      SUM(CASE WHEN s.status!='ok' AND s.attempts>=? THEN 1 ELSE 0 END) exhausted
       FROM response_stage_links l JOIN response_stages s ON s.key=l.key JOIN response_results r
       ON r.cohort=l.cohort AND r.id=l.episode_id AND r.input_hash=l.input_hash
-      WHERE r.cohort=? AND r.active=1 AND r.episode_at>=? AND r.episode_at<? GROUP BY s.stage,s.status`).all(cohort, since, until);
+      WHERE r.cohort=? AND r.active=1 AND r.episode_at>=? AND r.episode_at<? GROUP BY s.stage,s.status`).all(MAX_RETRY_ATTEMPTS, cohort, since, until);
         return { cohort, reportVersion: RESPONSE_REPORT_VERSION, reviewPolicy: RESPONSE_REVIEW_POLICY, bucket, since, until,
             annotations: this.reviews.annotations(since, until), stages, stageCountsScope: "cohort_and_date_range_before_person_filters",
             rubricScope: "Responded-to exchanges only; observational, not factual verification or causal performance attribution.",

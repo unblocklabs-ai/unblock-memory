@@ -1,15 +1,70 @@
-import { existsSync, openSync, writeSync, closeSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 import { TrainingStore } from "./training-store.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { collectTraining, runTraining } from "./training.js";
-import { generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, TRAINING_EVALUATION_CONCURRENCY } from "./training-queries.js";
+import { currentTrainingCorpusHashes, generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, TRAINING_EVALUATION_CONCURRENCY } from "./training-queries.js";
 import { memoryJudgeVersion } from "./typesafe.js";
 import { decisionModelScope } from "./typesafe-client.js";
 import { dateOption } from "./date-option.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
+function pathExists(path) {
+    try {
+        lstatSync(path);
+        return true;
+    }
+    catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
+            return false;
+        throw error;
+    }
+}
+function existsError(path) {
+    const error = new Error(`EEXIST: file already exists, open '${path}'`);
+    error.code = "EEXIST";
+    return error;
+}
+/** Write JSONL to a private same-filesystem temp file and publish atomically without overwriting. */
+export function writeTrainingExportJsonl(output, data) {
+    if (pathExists(output))
+        throw existsError(output);
+    const tempPath = join(dirname(output), `.${basename(output)}.${process.pid}.${randomUUID()}.tmp`);
+    const fd = openSync(tempPath, "wx", 0o600);
+    let rows = 0;
+    let closed = false;
+    try {
+        for (const row of data) {
+            writeSync(fd, JSON.stringify(row) + "\n");
+            rows++;
+        }
+        fsyncSync(fd);
+        closeSync(fd);
+        closed = true;
+        try {
+            linkSync(tempPath, output);
+        }
+        catch (error) {
+            const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+            if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EXDEV")
+                throw error;
+            if (pathExists(output))
+                throw existsError(output);
+            renameSync(tempPath, output);
+        }
+        return rows;
+    }
+    finally {
+        if (!closed)
+            closeSync(fd);
+        try {
+            unlinkSync(tempPath);
+        }
+        catch { /* already renamed or removed */ }
+    }
+}
 function thresholdOption(value) {
     const result = Number(value);
     if (!value.trim() || !Number.isFinite(result) || result < 0 || result > 1)
@@ -113,23 +168,18 @@ export function registerMemoryTraining(api, config) {
             if (!["recall-gate", "query-training"].includes(opts.stage))
                 throw new Error("Unknown training export stage");
             const output = resolve(opts.output);
+            if (pathExists(output))
+                throw existsError(output);
             const threshold = thresholdOption(opts.threshold);
-            const result = await withStore(opts.agent, {}, (store, source) => {
+            const result = await withStore(opts.agent, {}, async (store, source) => {
                 collectTraining(source, store, { existingOnly: true });
-                const fd = openSync(output, "wx", 0o600);
-                let rows = 0;
+                const judgeVersion = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
                 const data = opts.stage === "query-training"
-                    ? exportQueryTraining(store, threshold, memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint))
+                    ? exportQueryTraining(store, threshold, judgeVersion, {
+                        corpusHashes: await currentTrainingCorpusHashes(source, store, config, threshold),
+                    })
                     : store.exportRows(threshold);
-                try {
-                    for (const row of data) {
-                        writeSync(fd, JSON.stringify(row) + "\n");
-                        rows++;
-                    }
-                }
-                finally {
-                    closeSync(fd);
-                }
+                const rows = writeTrainingExportJsonl(output, data);
                 return { output, rows, stage: opts.stage };
             });
             console.log(JSON.stringify(result, null, 2));

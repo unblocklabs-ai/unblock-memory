@@ -38,7 +38,7 @@ export declare function refreshWithFingerprint(path: string, options: BaselineOp
         snapshots: number;
         comparisons: number;
     };
-    fingerprint: string;
+    fingerprint: string | undefined;
 };
 /**
  * Keep historical aggregation off the Gateway event loop; serialize refreshes per store, and skip

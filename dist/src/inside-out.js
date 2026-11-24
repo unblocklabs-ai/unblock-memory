@@ -170,6 +170,116 @@ export async function repairInsideOutIdentities(options) {
         db.close();
     }
 }
+async function gradeInteraction(interaction, options) {
+    // Persist the requested alias so upstream date-snapshot rotations do not fragment baselines.
+    const model = options.config.typesafe.model;
+    try {
+        if (interaction.oversized)
+            throw new Error(CONTEXT_ERROR);
+        let response;
+        try {
+            response = await decideWithModel({
+                apiKey: options.apiKey,
+                endpoint: options.config.typesafe.endpoint,
+                model,
+                timeoutMs: options.config.typesafe.timeoutMs,
+                signal: options.signal,
+            }, interaction.state, questions, { validateModel: false });
+        }
+        catch (err) {
+            if (err instanceof Error && err.message === "Decision model returned invalid model field") {
+                throw new Error("Decision model returned unexpected model");
+            }
+            throw err;
+        }
+        if (!matchesDecisionModel(response.model, model)) {
+            throw new Error("Decision model returned unexpected model");
+        }
+        return {
+            probabilities: INSIDE_OUT_EMOTIONS.map(emotion => response.answers[emotion].noul),
+            error: null,
+            model,
+        };
+    }
+    catch (failure) {
+        options.signal?.throwIfAborted();
+        return {
+            probabilities: INSIDE_OUT_EMOTIONS.map(() => null),
+            error: failure instanceof Error ? failure.message : "Jev request failed",
+            model,
+        };
+    }
+}
+function loadRetryTargets(store, rubric, options) {
+    const failures = store.prepare(`SELECT interaction_id,source FROM inside_out
+    WHERE rubric=? AND error IS NOT NULL AND error<>? AND (? OR (error<>? AND reviewed_at<=?))
+    AND (? IS NULL OR session_id=?) ORDER BY reviewed_at,interaction_id`);
+    const pending = new Map();
+    for (const row of failures.all(rubric, PURGED_GRADE, Number(options.retry ?? false), CONTEXT_ERROR, options.retryCutoff, options.sessionId ?? null, options.sessionId ?? null)) {
+        const source = String(row.source);
+        let ids = pending.get(source);
+        if (!ids) {
+            ids = new Set();
+            pending.set(source, ids);
+        }
+        ids.add(String(row.interaction_id));
+    }
+    return pending;
+}
+async function reviewSource(reader, context, retryPass) {
+    const { apiKey, config, rubric, signal, retry, sessionId: scopedSessionId, result, statements } = context;
+    const budgetExhausted = () => result.reviewed + result.failed >= config.insideOut.maxInteractions;
+    signal?.throwIfAborted();
+    const prior = statements.checkpoint.get(reader.source, rubric);
+    const sessionId = reader.sessionId ?? prior?.session_id;
+    if (scopedSessionId && sessionId && scopedSessionId !== sessionId)
+        return;
+    if (!retryPass && prior?.signature === reader.signature) {
+        result.skippedSources++;
+        return;
+    }
+    let source;
+    try {
+        source = reader.read();
+    }
+    catch {
+        result.errors.push(`${reader.source}: unreadable transcript`);
+        return;
+    }
+    if (scopedSessionId && scopedSessionId !== source.sessionId)
+        return;
+    const after = !retryPass && prior?.revision === reader.revision ? Number(prior.last_seq) : 0;
+    result.sources++;
+    const cached = (id) => {
+        if (retryPass)
+            return !retryPass.retryIds.has(id);
+        const skip = !!statements.existing.get(id, rubric);
+        if (skip)
+            result.cached++;
+        return skip;
+    };
+    for (const interaction of interactions(source, config.insideOut.maxContextTokens, cached, after)) {
+        signal?.throwIfAborted();
+        if (budgetExhausted())
+            return;
+        // Recheck retry eligibility immediately before inference so purged grades are never re-sent to Jev.
+        if (retryPass && !statements.retryable.get(interaction.id, rubric, PURGED_GRADE, Number(retry ?? false), CONTEXT_ERROR, retryPass.retryCutoff)) {
+            continue;
+        }
+        const { probabilities, error, model } = await gradeInteraction(interaction, { apiKey, config, signal });
+        const saved = statements.save.run(interaction.id, rubric, source.sessionId, interaction.messageId, interaction.assistantId, interaction.human, interaction.sender, interaction.channel, source.source, interaction.targetAt, Date.now(), model, Number(interaction.trimmed), ...probabilities, error, statements.person?.get(interaction.channel, interaction.human, interaction.sender)?.person_id ?? null, PURGED_GRADE);
+        if (Number(saved.changes) > 0) {
+            if (error)
+                result.failed++;
+            else
+                result.reviewed++;
+        }
+    }
+    // Only exhausted snapshots advance: partial passes resume using the existing per-interaction cache.
+    if (!retryPass) {
+        statements.finish.run(source.source, rubric, source.sessionId, reader.signature, reader.revision, source.events.reduce((last, event) => Math.max(last, event.seq), 0));
+    }
+}
 export async function runInsideOut(options) {
     const { config, storePath } = options;
     if (!config.insideOut.enabled)
@@ -185,113 +295,72 @@ export async function runInsideOut(options) {
     try {
         const rubric = insideOutRubric(config.typesafe.endpoint);
         store = openInsideOutStore(storePath);
-        const person = tableExists(store, "person_identities")
-            ? store.prepare(`SELECT (${PERSON_MATCH}) person_id FROM (SELECT ? channel,? human_key,? sender_id) e`)
-            : undefined;
-        const existing = store.prepare("SELECT 1 FROM inside_out WHERE interaction_id=? AND rubric=?");
-        const save = store.prepare(`INSERT OR REPLACE INTO inside_out (
-      interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,channel,source,
-      target_at,reviewed_at,model,context_trimmed,joy,sadness,fear,anger,disgust,surprise,error,person_id
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-        const checkpoint = store.prepare("SELECT * FROM inside_out_checkpoints WHERE source=? AND rubric=?");
-        const finish = store.prepare(`INSERT OR REPLACE INTO inside_out_checkpoints
-      (source,rubric,session_id,signature,revision,last_seq) VALUES(?,?,?,?,?,?)`);
-        const failures = store.prepare(`SELECT interaction_id,source FROM inside_out
-      WHERE rubric=? AND error IS NOT NULL AND error<>? AND (? OR (error<>? AND reviewed_at<=?))
-      AND (? IS NULL OR session_id=?) ORDER BY reviewed_at,interaction_id`);
+        const context = {
+            apiKey,
+            config,
+            rubric,
+            signal: options.signal,
+            retry: options.retry,
+            sessionId: options.sessionId,
+            result,
+            statements: {
+                person: tableExists(store, "person_identities")
+                    ? store.prepare(`SELECT (${PERSON_MATCH}) person_id FROM (SELECT ? channel,? human_key,? sender_id) e`)
+                    : undefined,
+                existing: store.prepare("SELECT 1 FROM inside_out WHERE interaction_id=? AND rubric=?"),
+                retryable: store.prepare(`SELECT 1 FROM inside_out
+          WHERE interaction_id=? AND rubric=? AND error IS NOT NULL AND error<>?
+          AND (? OR (error<>? AND reviewed_at<=?))`),
+                save: store.prepare(`INSERT INTO inside_out (
+          interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,channel,source,
+          target_at,reviewed_at,model,context_trimmed,joy,sadness,fear,anger,disgust,surprise,error,person_id
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(interaction_id,rubric) DO UPDATE SET
+          session_id=excluded.session_id,
+          message_id=excluded.message_id,
+          assistant_id=excluded.assistant_id,
+          human_key=excluded.human_key,
+          sender_id=excluded.sender_id,
+          channel=excluded.channel,
+          source=excluded.source,
+          target_at=excluded.target_at,
+          reviewed_at=excluded.reviewed_at,
+          model=excluded.model,
+          context_trimmed=excluded.context_trimmed,
+          joy=excluded.joy,
+          sadness=excluded.sadness,
+          fear=excluded.fear,
+          anger=excluded.anger,
+          disgust=excluded.disgust,
+          surprise=excluded.surprise,
+          error=excluded.error,
+          person_id=excluded.person_id
+        WHERE inside_out.error IS NOT ?`),
+                checkpoint: store.prepare("SELECT * FROM inside_out_checkpoints WHERE source=? AND rubric=?"),
+                finish: store.prepare(`INSERT OR REPLACE INTO inside_out_checkpoints
+          (source,rubric,session_id,signature,revision,last_seq) VALUES(?,?,?,?,?,?)`),
+            },
+        };
+        const budgetExhausted = () => result.reviewed + result.failed >= config.insideOut.maxInteractions;
         // Discover unseen work across all sources first. Failures never rewind the forward cursor.
-        processing: for (const retrying of [false, true]) {
-            const pending = new Map();
-            if (retrying) {
-                for (const row of failures.all(rubric, PURGED_GRADE, Number(options.retry ?? false), CONTEXT_ERROR, Date.now() - 3600_000, options.sessionId ?? null, options.sessionId ?? null)) {
-                    const source = String(row.source);
-                    if (!pending.has(source))
-                        pending.set(source, new Set());
-                    pending.get(source).add(String(row.interaction_id));
-                }
-                if (!pending.size)
-                    break;
-            }
-            for await (const reader of readInsideOutSources(options, result.errors)) {
-                options.signal?.throwIfAborted();
-                const retryIds = pending.get(reader.source);
-                if (retrying && !retryIds)
-                    continue;
-                const prior = checkpoint.get(reader.source, rubric);
-                const sessionId = reader.sessionId ?? prior?.session_id;
-                if (options.sessionId && sessionId && options.sessionId !== sessionId)
-                    continue;
-                if (!retrying && prior?.signature === reader.signature) {
-                    result.skippedSources++;
-                    continue;
-                }
-                let source;
-                try {
-                    source = reader.read();
-                }
-                catch {
-                    result.errors.push(`${reader.source}: unreadable transcript`);
-                    continue;
-                }
-                if (options.sessionId && options.sessionId !== source.sessionId)
-                    continue;
-                const after = !retrying && prior?.revision === reader.revision ? Number(prior.last_seq) : 0;
-                result.sources++;
-                const cached = (id) => {
-                    if (retrying)
-                        return !retryIds?.has(id);
-                    const skip = !!existing.get(id, rubric);
-                    if (skip)
-                        result.cached++;
-                    return skip;
-                };
-                for (const interaction of interactions(source, config.insideOut.maxContextTokens, cached, after)) {
+        for await (const reader of readInsideOutSources(options, result.errors)) {
+            await reviewSource(reader, context);
+            if (budgetExhausted())
+                break;
+        }
+        if (!budgetExhausted()) {
+            const retryCutoff = Date.now() - 3600_000;
+            const pending = loadRetryTargets(store, rubric, { retry: options.retry, sessionId: options.sessionId, retryCutoff });
+            if (pending.size) {
+                for await (const reader of readInsideOutSources(options, result.errors)) {
                     options.signal?.throwIfAborted();
-                    if (result.reviewed + result.failed >= config.insideOut.maxInteractions)
-                        break processing;
-                    let probabilities = INSIDE_OUT_EMOTIONS.map(() => null), error = null, model = config.typesafe.model;
-                    try {
-                        if (interaction.oversized)
-                            throw new Error(CONTEXT_ERROR);
-                        let response;
-                        try {
-                            response = await decideWithModel({
-                                apiKey,
-                                endpoint: config.typesafe.endpoint,
-                                model: config.typesafe.model,
-                                timeoutMs: config.typesafe.timeoutMs,
-                                signal: options.signal,
-                            }, interaction.state, questions, { validateModel: false });
-                        }
-                        catch (err) {
-                            if (err instanceof Error && err.message === "Decision model returned invalid model field") {
-                                throw new Error("Decision model returned unexpected model");
-                            }
-                            throw err;
-                        }
-                        if (!matchesDecisionModel(response.model, config.typesafe.model)) {
-                            throw new Error("Decision model returned unexpected model");
-                        }
-                        probabilities = INSIDE_OUT_EMOTIONS.map(emotion => response.answers[emotion].noul);
-                        // Persist the requested alias so upstream date-snapshot rotations do not fragment baselines.
-                        model = config.typesafe.model;
-                    }
-                    catch (failure) {
-                        options.signal?.throwIfAborted();
-                        error = failure instanceof Error ? failure.message : "Jev request failed";
-                        probabilities = INSIDE_OUT_EMOTIONS.map(() => null);
-                    }
-                    save.run(interaction.id, rubric, source.sessionId, interaction.messageId, interaction.assistantId, interaction.human, interaction.sender, interaction.channel, source.source, interaction.targetAt, Date.now(), model, Number(interaction.trimmed), ...probabilities, error, person?.get(interaction.channel, interaction.human, interaction.sender)?.person_id ?? null);
-                    if (error)
-                        result.failed++;
-                    else
-                        result.reviewed++;
+                    const retryIds = pending.get(reader.source);
+                    if (!retryIds)
+                        continue;
+                    await reviewSource(reader, context, { retryIds, retryCutoff });
+                    if (budgetExhausted())
+                        break;
                 }
-                // Only exhausted snapshots advance: partial passes resume using the existing per-interaction cache.
-                if (!retrying)
-                    finish.run(source.source, rubric, source.sessionId, reader.signature, reader.revision, source.events.reduce((last, event) => Math.max(last, event.seq), 0));
-                if (result.reviewed + result.failed >= config.insideOut.maxInteractions)
-                    break processing;
             }
         }
         store.close();

@@ -110,6 +110,15 @@ export declare function emotionBaselineHistory(db: DatabaseSync, options?: {
     cumulative: Summary;
 }[];
 /**
+ * Fingerprint of refresh inputs only (settings, current week, People tables, and grades).
+ * Excludes derived output tables so a refresh can verify inputs stayed stable across a pass
+ * before certifying its post-pass fingerprint.
+ */
+export declare function baselineInputFingerprint(db: DatabaseSync, options: {
+    minInteractions: number;
+    now: number;
+}): string;
+/**
  * Changes whenever a refresh input could: grades, links, people, stored results, the current week,
  * grades crossing `now`, or settings. Equal fingerprints mean a refresh would write nothing.
  */

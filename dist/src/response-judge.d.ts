@@ -8,7 +8,7 @@ export declare const RESPONSE_STAGE_VERSIONS: {
     readonly retrospective: "retrospective-v9";
     readonly memory: "memory-v2-isolated";
 };
-type ResponseJudgeParams = {
+export type ResponseJudgeParams = {
     apiKey: string;
     endpoint?: string;
     model?: string;
@@ -192,9 +192,10 @@ export type ResponseStages = {
     retrospective: Awaited<ReturnType<typeof judgeResponseFollowup>>;
     memory: Awaited<ReturnType<typeof judgeMemoryOpportunity>>;
 };
-type StageCache = Partial<ResponseStages> & {
-    begin: (stages: (keyof ResponseStages)[]) => void;
-    save: <K extends keyof ResponseStages>(stage: K, result: ResponseStages[K]) => void;
+type JudgeStage = "quality" | "feedback" | "sentiment";
+type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
+    begin: (stages: JudgeStage[]) => void;
+    save: <K extends JudgeStage>(stage: K, result: ResponseStages[K]) => void;
 };
 /** Separate requests are deliberate: later feedback must not leak into the original quality grade. */
 export declare function judgeResponse(episode: ResponseEpisode, params: ResponseJudgeParams, sentimentEnabled?: boolean, cache?: StageCache): Promise<ResponseJudgment>;

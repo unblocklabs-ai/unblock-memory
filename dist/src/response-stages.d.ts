@@ -1,12 +1,7 @@
 import type { ResponseEpisode } from "./response-episodes.js";
+import { type ResponseJudgeParams } from "./response-judge.js";
 import type { ResponseAuditStore } from "./response-store.js";
-export declare function assessResponseStages(store: ResponseAuditStore, cohort: string, e: ResponseEpisode, params: {
-    apiKey: string;
-    endpoint?: string;
-    model?: string;
-    timeoutMs: number;
-    signal: AbortSignal;
-}, sentimentEnabled: boolean, usage: {
+export declare function assessResponseStages(store: ResponseAuditStore, cohort: string, e: ResponseEpisode, params: ResponseJudgeParams, sentimentEnabled: boolean, usage: {
     stageAttempts: number;
     stageCacheHits: number;
 }): Promise<{
@@ -16,20 +11,20 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
             outcome: {
                 type: "choice";
                 choice: "unknown" | "reported_shortfall" | "acknowledged_success";
-                confidence: number;
                 probabilities: {
                     [x: string]: number;
                     [x: number]: number;
                 };
+                confidence: number;
             };
             reason: {
                 type: "choice";
                 choice: "none_or_unclear" | "missing_requested_work" | "unnecessary_deferral" | "regression" | "incorrect_claim" | "wrong_scope" | "failed_delivery";
-                confidence: number;
                 probabilities: {
                     [x: string]: number;
                     [x: number]: number;
                 };
+                confidence: number;
             };
             correction: {
                 type: "noul";
@@ -53,29 +48,29 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         taskType: {
             type: "choice";
             choice: "question" | "action" | "other" | "artifact" | "discussion";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
         assessability: {
             type: "choice";
             choice: "assessable" | "not_assessable";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
         fitAssessability: {
             type: "choice";
             choice: "assessable" | "not_assessable";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
         underdelivery: {
             type: "noul";
@@ -84,62 +79,62 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         failureReason: {
             type: "choice";
             choice: "none_or_unclear" | "missing_requested_work" | "wrong_deliverable" | "missed_constraint" | "insufficient_answer_depth" | "unnecessary_deferral";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
         fulfillment: {
             type: "score";
-            confidence: number;
-            score: number;
             probabilities: {
                 "0": number;
                 "1": number;
                 "2": number;
                 "3": number;
             };
+            confidence: number;
+            score: number;
         };
         deliverableFit: {
             type: "score";
-            confidence: number;
-            score: number;
             probabilities: {
                 "0": number;
                 "1": number;
                 "2": number;
                 "3": number;
             };
+            confidence: number;
+            score: number;
         };
         consistency: {
             type: "choice";
             choice: "contradicted" | "not_assessable" | "consistent";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
     };
     feedback: {
         target: {
             type: "choice";
             choice: "delivery" | "mixed" | "unclear" | "current_answer" | "earlier_behavior" | "proactive_action" | "external" | "new_work";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
         feedbackType: {
             type: "choice";
             choice: "mixed" | "unrelated" | "unclear" | "acceptance" | "correction" | "continuation";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
         avoidableRework: {
             type: "noul";
@@ -157,11 +152,11 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         sentiment: {
             type: "choice";
             choice: "satisfied" | "dissatisfied" | "mixed" | "neutral" | "unrelated" | "unclear";
-            confidence: number;
             probabilities: {
                 [x: string]: number;
                 [x: number]: number;
             };
+            confidence: number;
         };
         annoyance: {
             type: "noul";
@@ -173,14 +168,14 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         dissatisfactionIntensity: {
             type: "score";
-            confidence: number;
-            score: number;
             probabilities: {
                 "0": number;
                 "1": number;
                 "2": number;
                 "3": number;
             };
+            confidence: number;
+            score: number;
         };
     }>;
 }>;

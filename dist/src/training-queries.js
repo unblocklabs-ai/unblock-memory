@@ -64,9 +64,8 @@ async function checkpoint(store, step, result, operation) {
     result.completed++;
     return value;
 }
-function save(store, step, value) {
-    const attempt = store.startStep(step.stage, step.id, step.request);
-    store.finishStep(step.stage, step.id, attempt, { result: value });
+function save(store, step, value, clearReview) {
+    store.saveStep(step.stage, step.id, step.request, value, clearReview);
     return value;
 }
 async function drain(tasks) {
@@ -169,10 +168,35 @@ function stepBelongsToJudge(info, judgeVersion) {
     }
     return true;
 }
-function stepBlocksJudge(store, stepId, judgeVersion) {
-    const info = store.stepScope(stepId);
-    return !!info && info.status !== "pending" && info.status !== "complete" && stepBelongsToJudge(info, judgeVersion);
+function isCorpusScopedRetrievalStep(info) {
+    return !!info && info.stage === "retrieve" && typeof info.request.corpusHash === "string";
 }
+/** Admission holds: defer corpus-scoped retrieval failures until the current corpusHash is known. */
+function blockedStepsForExample(store, reviews, judgeVersion, corpusHash) {
+    return reviews.flatMap(review => {
+        if (!("steps" in review.details))
+            return [];
+        if (review.reason === "evaluation-unresolved") {
+            if (review.scope && review.scope !== "__legacy__" && review.scope !== judgeVersion)
+                return [];
+            return review.details.steps.filter(id => {
+                const info = store.stepScope(id);
+                if (!info || info.status === "pending" || info.status === "complete" || !stepBelongsToJudge(info, judgeVersion))
+                    return false;
+                if (corpusHash === undefined)
+                    return !isCorpusScopedRetrievalStep(info);
+                return isCorpusScopedRetrievalStep(info) && info.request.corpusHash === corpusHash;
+            });
+        }
+        if (corpusHash !== undefined)
+            return [];
+        return review.details.steps.filter(id => {
+            const status = store.stepRecordStatus(id);
+            return status !== undefined && status !== "pending" && status !== "complete";
+        });
+    });
+}
+/** Export holds: any uncleared review row for this judge blocks exporting prior evaluations. */
 function reviewBlocksJudge(store, review, judgeVersion) {
     if (review.reason !== "evaluation-unresolved")
         return true;
@@ -185,34 +209,242 @@ function reviewBlocksJudge(store, review, judgeVersion) {
 function legacyUnresolvedMatchesJudge(store, judgeVersion) {
     return (details) => "steps" in details && details.steps.length > 0 && details.steps.every(id => stepBelongsToJudge(store.stepScope(id), judgeVersion));
 }
+function shouldStop(ctx) {
+    return ctx.stopped || ctx.result.budgetLimited;
+}
+function hasCallRoom(ctx) {
+    if (shouldStop(ctx))
+        return false;
+    if (ctx.options.maxCalls !== undefined && ctx.result.calls >= ctx.options.maxCalls) {
+        ctx.result.budgetLimited = true;
+        return false;
+    }
+    return true;
+}
+function resolveApiKey(ctx) {
+    return ctx.key ??= resolveTypeSafeApiKey(ctx.config.typesafe).then(value => {
+        if (!value)
+            throw new Error("TypeSafe is disabled or its credential is unavailable");
+        return value;
+    });
+}
+function resolveTeacher(ctx) {
+    return ctx.teacher ??= trainingTeacher(ctx.runtime, ctx.source.agentId);
+}
+async function openSnapshot(ctx, timestamp) {
+    // By default one source capture serves the whole run; an injected search owns its own capture.
+    if (ctx.createSearch)
+        return ctx.createSearch(ctx.source.stateDir, ctx.chatTypes, timestamp);
+    const sourceForCutoff = await (ctx.historicalSource ??= historicalTrainingSource(ctx.source.stateDir, ctx.chatTypes));
+    return sourceForCutoff(timestamp);
+}
+function judgePassageOnce(ctx, input, maxDate, hit) {
+    const request = contextJudgeRequest(input, maxDate, hit, ctx.config.typesafe.model);
+    const identity = jsonHash([ctx.judgeVersion, request]);
+    let pending = ctx.judgments.get(identity);
+    if (!pending) {
+        pending = (async () => {
+            const step = ctx.store.step("judge", { identity, request });
+            if (step.result) {
+                ctx.result.cached++;
+                return { id: step.id, result: step.result };
+            }
+            if (step.status !== "pending") {
+                ctx.result.blocked++;
+                return { id: step.id, result: undefined };
+            }
+            const credential = await resolveApiKey(ctx);
+            if (!hasCallRoom(ctx))
+                return { id: step.id, result: undefined };
+            return { id: step.id, result: await checkpoint(ctx.store, step, ctx.result, () => judgeTrainingPassage(request, credential, ctx.evaluationOptions)) };
+        })();
+        ctx.judgments.set(identity, pending);
+    }
+    return pending;
+}
+async function scoreLaneQueries(ctx, example, input, snapshot, lane, round, generation, generationId, problems) {
+    return drain(generation.queries.map(async (query) => {
+        try {
+            const score = ctx.store.step("score", { version: SELECTION_VERSION, lane, round, generationId, query,
+                sourceId: example.id, corpusHash: snapshot.corpusHash, judgeVersion: ctx.judgeVersion,
+                retrievalVersion: TRAINING_RETRIEVAL_VERSION });
+            if (score.result) {
+                ctx.result.cached++;
+                return score.result;
+            }
+            if (score.status !== "pending") {
+                problems.add(score.id);
+                ctx.result.blocked++;
+                return;
+            }
+            const retrieval = ctx.store.step("retrieve", { version: TRAINING_RETRIEVAL_VERSION, query, lane,
+                sourceId: example.id, maxDate: snapshot.maxDate, corpusHash: snapshot.corpusHash, options: TRAINING_SEARCH_OPTIONS });
+            if (!retrieval.result && retrieval.status === "pending" && !hasCallRoom(ctx))
+                return;
+            const retrieved = await checkpoint(ctx.store, retrieval, ctx.result, async () => ({ query, lane, maxDate: snapshot.maxDate,
+                corpusHash: snapshot.corpusHash, hits: await snapshot.search(query, lane) }));
+            if (!retrieved) {
+                problems.add(retrieval.id);
+                return;
+            }
+            if (!retrieval.result)
+                ctx.result.retrievals++;
+            const scored = await drain(retrieved.hits.map(hit => judgePassageOnce(ctx, input, snapshot.maxDate, hit)));
+            const missing = scored.filter(item => !item.result);
+            if (missing.length) {
+                for (const item of missing) {
+                    const record = ctx.store.stepRecordStatus(item.id);
+                    if (record && record !== "pending")
+                        problems.add(item.id);
+                }
+                return;
+            }
+            const probabilities = scored.map(item => item.result.probability);
+            return save(ctx.store, score, { query, lane, round, retrievalId: retrieval.id,
+                score: trainingQueryScore(probabilities), maxProbability: Math.max(0, ...probabilities), judgments: scored.map(item => item.id) });
+        }
+        catch (error) {
+            ctx.stopped = true;
+            throw error;
+        }
+    }));
+}
+async function reviseLaneOnce(ctx, example, input, lane, feedback) {
+    // The only feedback sent to Luna is this lane's exact earlier queries and scores.
+    const revision = ctx.store.step("generate", teacherRequest(example, lane, feedback));
+    let pending = ctx.revisions.get(revision.id);
+    if (!pending) {
+        pending = (async () => {
+            if (!revision.result && revision.status === "pending") {
+                const bytes = Buffer.byteLength(trainingTeacherMessage(input, lane, feedback)) + Buffer.byteLength(trainingTeacherPrompt(lane));
+                if (!hasCallRoom(ctx))
+                    return;
+                if (ctx.result.inputBytes + bytes > (ctx.options.maxInputBytes ?? 3_000_000)) {
+                    ctx.result.budgetLimited = true;
+                    return;
+                }
+                ctx.result.inputBytes += bytes;
+                resolveTeacher(ctx);
+            }
+            return checkpoint(ctx.store, revision, ctx.result, () => ctx.teacher(input, lane, feedback));
+        })();
+        ctx.revisions.set(revision.id, pending);
+    }
+    return { id: revision.id, result: await pending };
+}
+async function evaluateExample(ctx, example) {
+    const reviews = ctx.reviewsBySource.get(example.id) ?? [];
+    const preBlocked = blockedStepsForExample(ctx.store, reviews, ctx.judgeVersion);
+    // A known non-retrieval failure for this judge cannot resolve before manual retry.
+    // Do not scan its historical corpus or consume the example budget on every invocation.
+    if (preBlocked.length) {
+        ctx.result.blocked += preBlocked.length;
+        ctx.result.flagged++;
+        return;
+    }
+    const initial = LANES.map(lane => ({ lane, step: ctx.store.step("generate", teacherRequest(example, lane)) }));
+    if (initial.some(({ step }) => !step.result)) {
+        const blocked = initial.filter(({ step }) => !step.result && step.status !== "pending");
+        if (blocked.length) {
+            ctx.result.blocked += blocked.length;
+            ctx.result.flagged++;
+            ctx.store.flagReview(example, "generation-unresolved", { steps: blocked.map(({ step }) => step.id) });
+        }
+        else
+            ctx.result.awaitingTeacher++;
+        return;
+    }
+    if (ctx.options.maxExamples !== undefined && ctx.result.examples >= ctx.options.maxExamples)
+        return;
+    ctx.store.renew();
+    let snapshot;
+    try {
+        snapshot = await openSnapshot(ctx, example.timestamp);
+    }
+    catch (error) {
+        if (!(error instanceof HistoricalCorpusUnavailableError))
+            throw error;
+        ctx.store.flagReview(example, "historical-snapshot-unavailable", { timestamp: example.timestamp });
+        ctx.result.flagged++;
+        return;
+    }
+    try {
+        const retrievalBlocked = blockedStepsForExample(ctx.store, reviews, ctx.judgeVersion, snapshot.corpusHash);
+        if (retrievalBlocked.length) {
+            ctx.result.blocked += retrievalBlocked.length;
+            ctx.result.flagged++;
+            return;
+        }
+        const evaluation = ctx.store.step("evaluate", { version: SELECTION_VERSION, sourceId: example.id, inputHash: example.inputHash,
+            timestamp: example.timestamp, teacherIds: initial.map(({ step }) => step.id), corpusHash: snapshot.corpusHash,
+            retrievalVersion: TRAINING_RETRIEVAL_VERSION, judgeVersion: ctx.judgeVersion,
+            options: TRAINING_SEARCH_OPTIONS });
+        const clearReview = { sourceId: example.id, scope: ctx.judgeVersion,
+            matchesLegacyUnresolved: legacyUnresolvedMatchesJudge(ctx.store, ctx.judgeVersion) };
+        if (evaluation.result) {
+            ctx.result.cached++;
+            ctx.store.clearReview(clearReview.sourceId, clearReview.scope, clearReview.matchesLegacyUnresolved);
+            return;
+        }
+        if (evaluation.status !== "pending") {
+            ctx.result.blocked++;
+            ctx.result.flagged++;
+            ctx.store.flagReview(example, "evaluation-unresolved", { steps: [evaluation.id] }, ctx.judgeVersion);
+            return;
+        }
+        if (shouldStop(ctx) || (ctx.options.maxExamples !== undefined && ctx.result.examples >= ctx.options.maxExamples))
+            return;
+        ctx.result.examples++;
+        if (ctx.options.dryRun)
+            return;
+        const input = JSON.parse(example.inputJson);
+        const problems = new Set();
+        const lanes = await drain(initial.map(async ({ lane, step }) => {
+            try {
+                const first = await scoreLaneQueries(ctx, example, input, snapshot, lane, 1, step.result, step.id, problems);
+                if (first.some(item => !item) || shouldStop(ctx))
+                    return;
+                const feedback = first.map(item => ({ query: item.query, score: item.score }));
+                const revision = await reviseLaneOnce(ctx, example, input, lane, feedback);
+                if (!revision.result) {
+                    if (ctx.store.stepRecordStatus(revision.id))
+                        problems.add(revision.id);
+                    return;
+                }
+                const second = await scoreLaneQueries(ctx, example, input, snapshot, lane, 2, revision.result, revision.id, problems);
+                if (second.some(item => !item))
+                    return;
+                return { teacherIds: [step.id, revision.id], queries: [...first, ...second].filter((item) => !!item) };
+            }
+            catch (error) {
+                ctx.stopped = true;
+                throw error;
+            }
+        }));
+        if (problems.size) {
+            ctx.result.flagged++;
+            ctx.store.flagReview(example, "evaluation-unresolved", { steps: [...problems] }, ctx.judgeVersion);
+            return;
+        }
+        if (lanes.some(lane => !lane))
+            return; // Budget pause: completed operations remain reusable.
+        const queries = lanes.flatMap(lane => lane.queries);
+        const selected = selectTrainingQueries(queries);
+        save(ctx.store, evaluation, { sourceId: example.id, inputHash: example.inputHash, timestamp: example.timestamp,
+            corpusHash: snapshot.corpusHash, corpusReport: snapshot.report, teacherIds: lanes.flatMap(lane => lane.teacherIds), queries, selected, review: [] }, clearReview);
+        ctx.result.evaluated++;
+    }
+    finally {
+        await snapshot.close();
+    }
+}
 export async function evaluateTrainingQueries(source, store, config, runtime, options, createSearch) {
     bounds(options);
     const corpus = config.corpora.find(c => c.kind === "sessions");
     if (!corpus)
         throw new Error("Training retrieval requires a configured sessions corpus");
     const refreshed = collectTraining(source, store, { existingOnly: true });
-    const result = { ...summary(), retrievals: 0, evaluated: 0, awaitingTeacher: 0 };
     const concurrency = options.concurrency ?? TRAINING_EVALUATION_CONCURRENCY;
-    let historicalSource;
-    let key, teacher;
-    const apiKey = () => key ??= resolveTypeSafeApiKey(config.typesafe).then(value => {
-        if (!value)
-            throw new Error("TypeSafe is disabled or its credential is unavailable");
-        return value;
-    });
-    let stopped = false;
-    const shouldStop = () => stopped || result.budgetLimited;
-    const room = () => {
-        if (shouldStop())
-            return false;
-        if (options.maxCalls !== undefined && result.calls >= options.maxCalls) {
-            result.budgetLimited = true;
-            return false;
-        }
-        return true;
-    };
-    const judgments = new Map();
-    const revisions = new Map();
     const reviewsBySource = new Map();
     for (const review of store.reviews()) {
         const list = reviewsBySource.get(review.sourceId);
@@ -221,230 +453,76 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
         else
             reviewsBySource.set(review.sourceId, [review]);
     }
-    const judgeVersion = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
-    const evaluationOptions = { endpoint: config.typesafe.endpoint, model: config.typesafe.model };
-    const evaluate = async (example) => {
-        const blocked = (reviewsBySource.get(example.id) ?? []).flatMap(review => {
-            if (!("steps" in review.details))
-                return [];
-            if (review.reason === "evaluation-unresolved") {
-                if (review.scope && review.scope !== "__legacy__" && review.scope !== judgeVersion)
-                    return [];
-                return review.details.steps.filter(id => stepBlocksJudge(store, id, judgeVersion));
-            }
-            return review.details.steps.filter(id => {
-                const status = store.stepRecordStatus(id);
-                return status !== undefined && status !== "pending" && status !== "complete";
-            });
-        });
-        // A known failed example for this judge cannot resolve before manual retry. Do not scan its
-        // historical corpus or consume the example budget on every invocation.
-        if (blocked.length) {
-            result.blocked += blocked.length;
-            result.flagged++;
-            return;
-        }
-        const initial = LANES.map(lane => ({ lane, step: store.step("generate", teacherRequest(example, lane)) }));
-        if (initial.some(({ step }) => !step.result)) {
-            const blocked = initial.filter(({ step }) => !step.result && step.status !== "pending");
-            if (blocked.length) {
-                result.blocked += blocked.length;
-                result.flagged++;
-                store.flagReview(example, "generation-unresolved", { steps: blocked.map(({ step }) => step.id) });
-            }
-            else
-                result.awaitingTeacher++;
-            return;
-        }
-        if (options.maxExamples !== undefined && result.examples >= options.maxExamples)
-            return;
-        store.renew();
-        let snapshot;
-        try {
-            // By default one source capture serves the whole run; an injected search owns its own capture.
-            snapshot = createSearch
-                ? await createSearch(source.stateDir, corpus.chatTypes, example.timestamp)
-                : await (await (historicalSource ??= historicalTrainingSource(source.stateDir, corpus.chatTypes)))(example.timestamp);
-        }
-        catch (error) {
-            if (!(error instanceof HistoricalCorpusUnavailableError))
-                throw error;
-            store.flagReview(example, "historical-snapshot-unavailable", { timestamp: example.timestamp });
-            result.flagged++;
-            return;
-        }
-        try {
-            const evaluation = store.step("evaluate", { version: SELECTION_VERSION, sourceId: example.id, inputHash: example.inputHash,
-                timestamp: example.timestamp, teacherIds: initial.map(({ step }) => step.id), corpusHash: snapshot.corpusHash,
-                retrievalVersion: TRAINING_RETRIEVAL_VERSION, judgeVersion,
-                options: TRAINING_SEARCH_OPTIONS });
-            if (evaluation.result) {
-                result.cached++;
-                store.clearReview(example.id, judgeVersion, legacyUnresolvedMatchesJudge(store, judgeVersion));
-                return;
-            }
-            if (evaluation.status !== "pending") {
-                result.blocked++;
-                result.flagged++;
-                store.flagReview(example, "evaluation-unresolved", { steps: [evaluation.id] }, judgeVersion);
-                return;
-            }
-            if (shouldStop() || (options.maxExamples !== undefined && result.examples >= options.maxExamples))
-                return;
-            result.examples++;
-            if (options.dryRun)
-                return;
-            const input = JSON.parse(example.inputJson);
-            const problems = new Set();
-            const judge = (hit) => {
-                const request = contextJudgeRequest(input, snapshot.maxDate, hit, config.typesafe.model);
-                const identity = jsonHash([judgeVersion, request]);
-                let pending = judgments.get(identity);
-                if (!pending) {
-                    pending = (async () => {
-                        const step = store.step("judge", { identity, request });
-                        if (step.result) {
-                            result.cached++;
-                            return { id: step.id, result: step.result };
-                        }
-                        if (step.status !== "pending") {
-                            result.blocked++;
-                            return { id: step.id, result: undefined };
-                        }
-                        const credential = await apiKey();
-                        if (!room())
-                            return { id: step.id, result: undefined };
-                        return { id: step.id, result: await checkpoint(store, step, result, () => judgeTrainingPassage(request, credential, evaluationOptions)) };
-                    })();
-                    judgments.set(identity, pending);
-                }
-                return pending;
-            };
-            const scoreQueries = async (lane, round, generation, generationId) => await drain(generation.queries.map(async (query) => {
-                try {
-                    const score = store.step("score", { version: SELECTION_VERSION, lane, round, generationId, query,
-                        sourceId: example.id, corpusHash: snapshot.corpusHash, judgeVersion,
-                        retrievalVersion: TRAINING_RETRIEVAL_VERSION });
-                    if (score.result) {
-                        result.cached++;
-                        return score.result;
-                    }
-                    if (score.status !== "pending") {
-                        problems.add(score.id);
-                        result.blocked++;
-                        return;
-                    }
-                    const retrieval = store.step("retrieve", { version: TRAINING_RETRIEVAL_VERSION, query, lane,
-                        sourceId: example.id, maxDate: snapshot.maxDate, corpusHash: snapshot.corpusHash, options: TRAINING_SEARCH_OPTIONS });
-                    if (!retrieval.result && retrieval.status === "pending" && !room())
-                        return;
-                    const retrieved = await checkpoint(store, retrieval, result, async () => ({ query, lane, maxDate: snapshot.maxDate,
-                        corpusHash: snapshot.corpusHash, hits: await snapshot.search(query, lane) }));
-                    if (!retrieved) {
-                        problems.add(retrieval.id);
-                        return;
-                    }
-                    if (!retrieval.result)
-                        result.retrievals++;
-                    const scored = await drain(retrieved.hits.map(judge));
-                    const missing = scored.filter(item => !item.result);
-                    if (missing.length) {
-                        for (const item of missing) {
-                            const record = store.stepRecordStatus(item.id);
-                            if (record && record !== "pending")
-                                problems.add(item.id);
-                        }
-                        return;
-                    }
-                    const probabilities = scored.map(item => item.result.probability);
-                    return save(store, score, { query, lane, round, retrievalId: retrieval.id,
-                        score: trainingQueryScore(probabilities), maxProbability: Math.max(0, ...probabilities), judgments: scored.map(item => item.id) });
-                }
-                catch (error) {
-                    stopped = true;
-                    throw error;
-                }
-            }));
-            const lanes = await drain(initial.map(async ({ lane, step }) => {
-                try {
-                    const first = await scoreQueries(lane, 1, step.result, step.id);
-                    if (first.some(item => !item) || shouldStop())
-                        return;
-                    const feedback = first.map(item => ({ query: item.query, score: item.score }));
-                    // The only feedback sent to Luna is this lane's exact earlier queries and scores.
-                    const revision = store.step("generate", teacherRequest(example, lane, feedback));
-                    let pending = revisions.get(revision.id);
-                    if (!pending) {
-                        pending = (async () => {
-                            if (!revision.result && revision.status === "pending") {
-                                const bytes = Buffer.byteLength(trainingTeacherMessage(input, lane, feedback)) + Buffer.byteLength(trainingTeacherPrompt(lane));
-                                if (!room())
-                                    return;
-                                if (result.inputBytes + bytes > (options.maxInputBytes ?? 3_000_000)) {
-                                    result.budgetLimited = true;
-                                    return;
-                                }
-                                result.inputBytes += bytes;
-                                teacher ??= trainingTeacher(runtime, source.agentId);
-                            }
-                            return checkpoint(store, revision, result, () => teacher(input, lane, feedback));
-                        })();
-                        revisions.set(revision.id, pending);
-                    }
-                    const revised = await pending;
-                    if (!revised) {
-                        if (store.stepRecordStatus(revision.id))
-                            problems.add(revision.id);
-                        return;
-                    }
-                    const second = await scoreQueries(lane, 2, revised, revision.id);
-                    if (second.some(item => !item))
-                        return;
-                    return { teacherIds: [step.id, revision.id], queries: [...first, ...second].filter((item) => !!item) };
-                }
-                catch (error) {
-                    stopped = true;
-                    throw error;
-                }
-            }));
-            if (problems.size) {
-                result.flagged++;
-                store.flagReview(example, "evaluation-unresolved", { steps: [...problems] }, judgeVersion);
-                return;
-            }
-            if (lanes.some(lane => !lane))
-                return; // Budget pause: completed operations remain reusable.
-            const queries = lanes.flatMap(lane => lane.queries);
-            const selected = selectTrainingQueries(queries);
-            save(store, evaluation, { sourceId: example.id, inputHash: example.inputHash, timestamp: example.timestamp,
-                corpusHash: snapshot.corpusHash, corpusReport: snapshot.report, teacherIds: lanes.flatMap(lane => lane.teacherIds), queries, selected, review: [] });
-            store.clearReview(example.id, judgeVersion, legacyUnresolvedMatchesJudge(store, judgeVersion));
-            result.evaluated++;
-        }
-        finally {
-            await snapshot.close();
-        }
+    const ctx = {
+        source, store, config, runtime, options, chatTypes: corpus.chatTypes,
+        judgeVersion: memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint),
+        evaluationOptions: { endpoint: config.typesafe.endpoint, model: config.typesafe.model },
+        result: { ...summary(), retrievals: 0, evaluated: 0, awaitingTeacher: 0 },
+        reviewsBySource, judgments: new Map(), revisions: new Map(), createSearch, stopped: false,
     };
     const examples = store.queryExamples(options.threshold);
     let next = 0;
     await drain(Array.from({ length: Math.min(concurrency, examples.length) }, async () => {
-        while (!shouldStop() && (options.maxExamples === undefined || result.examples < options.maxExamples)) {
+        while (!shouldStop(ctx) && (options.maxExamples === undefined || ctx.result.examples < options.maxExamples)) {
             const example = examples[next++];
             if (!example)
                 return;
             try {
-                await evaluate(example);
+                await evaluateExample(ctx, example);
             }
             catch (error) {
-                stopped = true;
+                ctx.stopped = true;
                 throw error;
             }
         }
     }));
-    return { refreshed, ...result, concurrency, threshold: options.threshold ?? TRAINING_GATE_THRESHOLD,
+    return { refreshed, ...ctx.result, concurrency, threshold: options.threshold ?? TRAINING_GATE_THRESHOLD,
         retrievalMethod: "independent-lex10-vec10", callUnit: "teacher completion, retrieval operation or uncached passage judgment" };
 }
-export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD, judgeVersion = CONTEXT_JUDGE_VERSION) {
+export async function currentTrainingCorpusHashes(source, store, config, threshold = TRAINING_GATE_THRESHOLD, createSearch) {
+    const corpus = config.corpora.find(c => c.kind === "sessions");
+    if (!corpus)
+        throw new Error("Training retrieval requires a configured sessions corpus");
+    const examples = store.queryExamples(threshold);
+    const hashes = new Map();
+    if (!examples.length)
+        return hashes;
+    const sourceForCutoff = createSearch ? undefined : await historicalTrainingSource(source.stateDir, corpus.chatTypes);
+    for (const example of examples) {
+        store.renew();
+        const snapshot = createSearch
+            ? await createSearch(source.stateDir, corpus.chatTypes, example.timestamp)
+            : await sourceForCutoff(example.timestamp);
+        try {
+            const proven = snapshot.proven ?? (snapshot.report.sessions === 0 || snapshot.report.chunks > 0);
+            if (proven)
+                hashes.set(example.id, snapshot.corpusHash);
+        }
+        finally {
+            await snapshot.close();
+        }
+    }
+    return hashes;
+}
+function hasMatchingRetrievalProof(store, source, evaluation, expectedCorpusHash) {
+    if (!evaluation.corpusHash)
+        return false;
+    if (expectedCorpusHash !== undefined && evaluation.corpusHash !== expectedCorpusHash)
+        return false;
+    if (!evaluation.queries.length)
+        return false;
+    for (const query of evaluation.queries) {
+        const info = store.stepScope(query.retrievalId);
+        if (!info || info.stage !== "retrieve" || info.status !== "complete")
+            return false;
+        if (info.request.sourceId !== source.id || info.request.corpusHash !== evaluation.corpusHash)
+            return false;
+        if (info.request.lane !== query.lane || info.request.query !== query.query)
+            return false;
+    }
+    return true;
+}
+export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD, judgeVersion = CONTEXT_JUDGE_VERSION, options) {
     const active = new Map(store.queryExamples(threshold).map(e => [e.id, e]));
     const unresolved = new Set(store.reviews().filter(review => reviewBlocksJudge(store, review, judgeVersion)).map(review => review.sourceId));
     const exported = new Set();
@@ -452,8 +530,22 @@ export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD,
         const source = active.get(evaluation.sourceId);
         if (!source || source.inputHash !== evaluation.inputHash || source.timestamp !== evaluation.timestamp || exported.has(source.id))
             continue;
+        if (unresolved.has(source.id)) {
+            exported.add(source.id);
+            continue;
+        }
+        let expectedCorpusHash;
+        if (options?.corpusHashes !== undefined) {
+            expectedCorpusHash = options.corpusHashes.get(source.id);
+            if (!expectedCorpusHash) {
+                exported.add(source.id);
+                continue;
+            }
+            if (evaluation.corpusHash !== expectedCorpusHash)
+                continue;
+        }
         exported.add(source.id); // Never fall back to an older accepted corpus after a newer flagged result.
-        if (unresolved.has(source.id))
+        if (!hasMatchingRetrievalProof(store, source, evaluation, expectedCorpusHash))
             continue;
         if (!LANES.every(lane => evaluation.teacherIds.includes(store.step("generate", teacherRequest(source, lane)).id)))
             continue;

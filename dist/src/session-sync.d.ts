@@ -9,6 +9,7 @@ type IndexedSession = SessionMetadata & {
     projectionHash: string;
     documentPath: string;
     projectorVersion: number;
+    projectionKey?: string;
     sourceFingerprint?: string;
     messages?: SessionMessageSpan[];
 };
@@ -29,7 +30,7 @@ export type SessionSyncResult = {
     skipped: number;
     failed: number;
     embedded: number;
-    lastSuccessfulSyncAt: number;
+    lastSuccessfulSyncAt?: number;
     lastCheckedAt?: number;
     lastIndexedAt?: number;
     skipReason?: "no_changes" | "no_indexable_changes";

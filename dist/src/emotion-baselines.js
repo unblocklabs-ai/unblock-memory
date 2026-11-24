@@ -147,39 +147,77 @@ function compare(row, population, minimum) {
     };
     return { status: "ok", count, emotions: perEmotion(deviation) };
 }
+const EMPTY_POPULATION_DIGEST = createHash("sha256").digest("hex");
 /** Queue writes and commit them in short IMMEDIATE transactions. Only call between completed reads. */
 function batches(db) {
     const pending = [];
     const flush = () => {
         if (!pending.length)
             return;
+        const tx = { populationDigests: new Map() };
         immediateTransaction(db, () => { for (const write of pending)
-            write(); });
+            write(tx); });
         pending.length = 0;
     };
     return { write(change) { pending.push(change); if (pending.length >= BATCH)
             flush(); }, flush };
 }
-/**
- * One current, content-addressed snapshot per person, rubric, model and completed week.
- * Reads finish before each batch commits, so the shared store is never held for a whole pass.
- * No inference and no changes to raw grades.
- */
-export function refreshEmotionBaselines(db, options) {
-    const now = options.now ?? Date.now(), cutoff = weekStart(now), minimum = options.minInteractions;
-    if (!Number.isFinite(now) || !Number.isInteger(minimum) || minimum < 1)
-        throw new Error("Invalid baseline settings");
-    initializeEmotionBaselines(db);
-    let snapshots = 0, comparisons = 0;
-    const queue = batches(db), people = tableExists(db, "people");
+function loadPopulationDigests(db, person, rubric, model, now) {
+    if (!tableExists(db, "people"))
+        return { totalRows: 0, checkpoints: [] };
+    const rows = db.prepare(`SELECT ${GRADE} FROM inside_out e JOIN people p ON p.id=e.person_id
+    WHERE e.person_id=? AND e.rubric=? AND e.model=? AND ${COMPARABLE}
+    ORDER BY e.target_at,e.interaction_id`).iterate(person, rubric, model, now, now);
+    const digest = createHash("sha256");
+    const checkpoints = [];
+    let totalRows = 0;
+    let currentEnd;
+    for (const row of rows) {
+        const rowEnd = weekStart(Number(row.target_at)) + WEEK;
+        if (currentEnd !== undefined && rowEnd !== currentEnd) {
+            checkpoints.push({ end: currentEnd, digest: digest.copy().digest("hex") });
+        }
+        currentEnd = rowEnd;
+        digest.update(`|${gradeSignature(row)}`);
+        totalRows++;
+    }
+    if (currentEnd !== undefined) {
+        checkpoints.push({ end: currentEnd, digest: digest.digest("hex") });
+    }
+    return { totalRows, checkpoints };
+}
+function getPopulationDigests(tx, db, person, rubric, model, now) {
+    const key = JSON.stringify([person, rubric, model]);
+    let cached = tx.populationDigests.get(key);
+    if (!cached) {
+        cached = loadPopulationDigests(db, person, rubric, model, now);
+        tx.populationDigests.set(key, cached);
+    }
+    return cached;
+}
+function populationPrefixDigest(tx, db, person, rubric, model, now, end) {
+    const cached = getPopulationDigests(tx, db, person, rubric, model, now);
+    if (cached.totalRows === 0)
+        return end === Infinity ? EMPTY_POPULATION_DIGEST : null;
+    let match = null;
+    for (const checkpoint of cached.checkpoints) {
+        if (checkpoint.end <= end)
+            match = checkpoint.digest;
+        else
+            break;
+    }
+    return match;
+}
+function createGradeAssessor(db, queue, options, onComparison) {
+    const { now, minimum, recompare } = options;
     const prior = db.prepare(`SELECT id,result_json,json_extract(result_json,'$.status') status FROM inside_out_deviations
     WHERE interaction_id=? AND rubric=? AND grade_signature=? ORDER BY assessed_at DESC,rowid DESC LIMIT 1`);
     const save = db.prepare("INSERT OR IGNORE INTO inside_out_deviations VALUES (?,?,?,?,?,?,?,?)");
     const grade = db.prepare(`SELECT ${GRADE} FROM inside_out WHERE interaction_id=? AND rubric=?`);
-    const assess = (row, signature, decide) => {
+    return (row, signature, decide) => {
         const previous = prior.get(row.interaction_id, row.rubric, signature);
         // An existing assessment stands for its grade, except future_time: that only described the clock.
-        if (!options.recompare && previous && previous.status !== "future_time")
+        if (!recompare && previous && previous.status !== "future_time")
             return;
         const result = { version: VERSION, status: "insufficient_history", personId: row.person_id === null ? null : String(row.person_id),
             baselineId: null, baselineEnd: null, assessedAt: now, minInteractions: minimum, cumulative: null, weekly: null };
@@ -195,87 +233,86 @@ export function refreshEmotionBaselines(db, options) {
             const current = grade.get(row.interaction_id, row.rubric);
             if (!current || gradeSignature(current) !== signature)
                 return;
-            comparisons += Number(save.run(id, row.interaction_id, row.rubric, signature, now, result.baselineId, result.personId, JSON.stringify(result)).changes);
+            onComparison(Number(save.run(id, row.interaction_id, row.rubric, signature, now, result.baselineId, result.personId, JSON.stringify(result)).changes));
         });
     };
-    const populations = new Set();
-    if (people) {
-        const stored = db.prepare("SELECT week_start,id FROM person_emotion_baselines WHERE person_id=? AND rubric=? AND model=?");
-        const upsert = db.prepare(`INSERT INTO person_emotion_baselines VALUES (?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(person_id,rubric,model,week_start) DO UPDATE SET id=excluded.id,version=excluded.version,
-      week_end=excluded.week_end,computed_at=excluded.computed_at,weekly_json=excluded.weekly_json`);
-        const remove = db.prepare("DELETE FROM person_emotion_baselines WHERE person_id=? AND rubric=? AND model=? AND week_start=? AND id=?");
-        const populated = db.prepare("SELECT 1 FROM inside_out WHERE person_id=? AND rubric=? AND model=? LIMIT 1");
-        const page = db.prepare(`SELECT ${GRADE} FROM inside_out e WHERE e.person_id=? AND e.rubric=? AND e.model=? AND ${COMPARABLE}
-      AND (? IS NULL OR e.target_at>? OR (e.target_at=? AND e.interaction_id>?)) ORDER BY e.target_at,e.interaction_id LIMIT ?`);
-        const groups = db.prepare(`SELECT DISTINCT e.person_id,e.rubric,e.model FROM inside_out e JOIN people p ON p.id=e.person_id
-      WHERE ${COMPARABLE}`).all(now, now);
-        for (const group of groups) {
-            const { person_id: person, rubric, model } = group;
-            populations.add(JSON.stringify([person, rubric, model]));
-            const existing = new Map(stored.all(person, rubric, model).map(row => [Number(row.week_start), String(row.id)]));
-            function* rows() {
-                let last;
-                for (;;) {
-                    const batch = page.all(person, rubric, model, now, now, last?.target_at ?? null, last?.target_at ?? null, last?.target_at ?? null, last?.interaction_id ?? null, PAGE);
-                    yield* batch;
-                    if (batch.length < PAGE)
-                        return;
-                    last = batch.at(-1);
-                }
+}
+function* iterateComparableGrades(page, person, rubric, model, now) {
+    let last;
+    for (;;) {
+        const batch = page.all(person, rubric, model, now, now, last?.target_at ?? null, last?.target_at ?? null, last?.target_at ?? null, last?.interaction_id ?? null, PAGE);
+        yield* batch;
+        if (batch.length < PAGE)
+            return;
+        last = batch.at(-1);
+    }
+}
+function refreshPopulation(db, queue, assess, statements, group, options, onSnapshot) {
+    const { person, rubric, model } = group;
+    const { now, cutoff, minimum } = options;
+    const existing = new Map(statements.stored.all(person, rubric, model).map(row => [Number(row.week_start), String(row.id)]));
+    const source = iterateComparableGrades(statements.page, person, rubric, model, now);
+    let next = source.next(), previous;
+    const cumulative = histograms(), current = new Set();
+    const seenDigest = createHash("sha256");
+    let seenCount = 0;
+    for (let start = next.done ? cutoff : weekStart(Number(next.value.target_at)); !next.done || start < cutoff; start += WEEK) {
+        const end = start + WEEK, weekly = histograms(), signatures = [];
+        // Grades compare only with completed weeks before their own; this week joins afterwards.
+        let frozen;
+        while (!next.done && Number(next.value.target_at) < end) {
+            const row = next.value, signature = gradeSignature(row);
+            seenDigest.update(`|${signature}`);
+            seenCount++;
+            assess(row, signature, result => {
+                if (!previous)
+                    return;
+                frozen ??= { cumulative: ranks(cumulative), weekly: ranks(previous.weekly) };
+                result.baselineId = previous.id;
+                result.baselineEnd = previous.end;
+                result.cumulative = compare(row, frozen.cumulative, minimum);
+                result.weekly = compare(row, frozen.weekly, minimum);
+                result.status = result.cumulative.status;
+            });
+            if (start < cutoff) {
+                signatures.push(signature);
+                add(weekly, row);
             }
-            const source = rows();
-            let next = source.next(), previous;
-            const cumulative = histograms(), current = new Set();
-            for (let start = next.done ? cutoff : weekStart(Number(next.value.target_at)); !next.done || start < cutoff; start += WEEK) {
-                const end = start + WEEK, weekly = histograms(), signatures = [];
-                // Grades compare only with completed weeks before their own; this week joins afterwards.
-                let frozen;
-                while (!next.done && Number(next.value.target_at) < end) {
-                    const row = next.value, signature = gradeSignature(row);
-                    assess(row, signature, result => {
-                        if (!previous)
-                            return;
-                        frozen ??= { cumulative: ranks(cumulative), weekly: ranks(previous.weekly) };
-                        result.baselineId = previous.id;
-                        result.baselineEnd = previous.end;
-                        result.cumulative = compare(row, frozen.cumulative, minimum);
-                        result.weekly = compare(row, frozen.weekly, minimum);
-                        result.status = result.cumulative.status;
-                    });
-                    if (start < cutoff) {
-                        signatures.push(signature);
-                        add(weekly, row);
-                    }
-                    next = source.next();
+            next = source.next();
+        }
+        if (start >= cutoff)
+            continue;
+        merge(cumulative, weekly);
+        // Chained ids address the whole cumulative population without rehashing earlier weeks.
+        // Empty weeks are kept: a weekly comparison always means the preceding calendar week.
+        const id = jsonHash([VERSION, person, rubric, model, start, previous?.id ?? null, signatures]), json = encode(weekly);
+        current.add(start);
+        if (existing.get(start) !== id) {
+            const expectedPrefix = seenDigest.copy().digest("hex");
+            const hasSeenGrades = seenCount > 0;
+            queue.write(tx => {
+                // Fence against concurrent purges, relinks, regrades, or new grades affecting this week's prefix.
+                if (hasSeenGrades && populationPrefixDigest(tx, db, person, rubric, model, now, end) === expectedPrefix) {
+                    onSnapshot(Number(statements.upsert.run(person, rubric, model, start, id, VERSION, end, now, json).changes));
                 }
-                if (start >= cutoff)
-                    continue;
-                merge(cumulative, weekly);
-                // Chained ids address the whole cumulative population without rehashing earlier weeks.
-                // Empty weeks are kept: a weekly comparison always means the preceding calendar week.
-                const id = jsonHash([VERSION, person, rubric, model, start, previous?.id ?? null, signatures]), json = encode(weekly);
-                current.add(start);
-                if (existing.get(start) !== id)
-                    queue.write(() => {
-                        // A purge of this person since the read leaves no linked grades: never restore their distribution.
-                        if (populated.get(person, rubric, model))
-                            snapshots += Number(upsert.run(person, rubric, model, start, id, VERSION, end, now, json).changes);
-                    });
-                previous = { id, end, weekly };
-            }
-            // Weeks no longer backed by linked grades are replaced, not retained as revisions.
-            for (const [start, id] of existing)
-                if (!current.has(start))
-                    queue.write(() => { remove.run(person, rubric, model, start, id); });
+            });
+        }
+        previous = { id, end, weekly };
+    }
+    const expectedFull = seenDigest.digest("hex");
+    // Weeks no longer backed by linked grades are replaced, not retained as revisions.
+    for (const [start, id] of existing) {
+        if (!current.has(start)) {
+            queue.write(tx => {
+                if (populationPrefixDigest(tx, db, person, rubric, model, now, Infinity) === expectedFull) {
+                    statements.remove.run(person, rubric, model, start, id);
+                }
+            });
         }
     }
-    // Populations without linked grades (removed identity or person) lose their snapshots.
-    const drop = db.prepare("DELETE FROM person_emotion_baselines WHERE person_id=? AND rubric=? AND model=?");
-    for (const row of db.prepare("SELECT DISTINCT person_id,rubric,model FROM person_emotion_baselines").all()) {
-        if (!populations.has(JSON.stringify([row.person_id, row.rubric, row.model])))
-            queue.write(() => { drop.run(row.person_id, row.rubric, row.model); });
-    }
+}
+function assessNonComparableGrades(db, queue, assess, options) {
+    const { people, now } = options;
     // Everything not comparable records an explicit status, never a neutral score.
     const comparable = people ? `coalesce(${COMPARABLE} AND EXISTS (SELECT 1 FROM people p WHERE p.id=e.person_id),0)` : "0";
     const linked = people ? db.prepare("SELECT 1 FROM people WHERE id=?") : undefined;
@@ -300,6 +337,52 @@ export function refreshEmotionBaselines(db, options) {
         last = Number(batch.at(-1)._rowid);
         queue.flush();
     }
+}
+/**
+ * One current, content-addressed snapshot per person, rubric, model and completed week.
+ * Reads finish before each batch commits, so the shared store is never held for a whole pass.
+ * No inference and no changes to raw grades.
+ */
+export function refreshEmotionBaselines(db, options) {
+    const now = options.now ?? Date.now(), cutoff = weekStart(now), minimum = options.minInteractions;
+    if (!Number.isFinite(now) || !Number.isInteger(minimum) || minimum < 1)
+        throw new Error("Invalid baseline settings");
+    initializeEmotionBaselines(db);
+    let snapshots = 0, comparisons = 0;
+    const queue = batches(db), people = tableExists(db, "people");
+    const assess = createGradeAssessor(db, queue, { now, minimum, recompare: options.recompare }, changes => { comparisons += changes; });
+    const populations = new Set();
+    if (people) {
+        const statements = {
+            stored: db.prepare("SELECT week_start,id FROM person_emotion_baselines WHERE person_id=? AND rubric=? AND model=?"),
+            upsert: db.prepare(`INSERT INTO person_emotion_baselines VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(person_id,rubric,model,week_start) DO UPDATE SET id=excluded.id,version=excluded.version,
+        week_end=excluded.week_end,computed_at=excluded.computed_at,weekly_json=excluded.weekly_json`),
+            remove: db.prepare("DELETE FROM person_emotion_baselines WHERE person_id=? AND rubric=? AND model=? AND week_start=? AND id=?"),
+            page: db.prepare(`SELECT ${GRADE} FROM inside_out e WHERE e.person_id=? AND e.rubric=? AND e.model=? AND ${COMPARABLE}
+        AND (? IS NULL OR e.target_at>? OR (e.target_at=? AND e.interaction_id>?)) ORDER BY e.target_at,e.interaction_id LIMIT ?`),
+        };
+        const groups = db.prepare(`SELECT DISTINCT e.person_id,e.rubric,e.model FROM inside_out e JOIN people p ON p.id=e.person_id
+      WHERE ${COMPARABLE}`).all(now, now);
+        for (const group of groups) {
+            const { person_id: person, rubric, model } = group;
+            populations.add(JSON.stringify([person, rubric, model]));
+            refreshPopulation(db, queue, assess, statements, { person, rubric, model }, { now, cutoff, minimum }, changes => { snapshots += changes; });
+        }
+    }
+    // Populations without linked grades (removed identity or person) lose their snapshots.
+    const drop = db.prepare("DELETE FROM person_emotion_baselines WHERE person_id=? AND rubric=? AND model=?");
+    for (const row of db.prepare("SELECT DISTINCT person_id,rubric,model FROM person_emotion_baselines").all()) {
+        if (!populations.has(JSON.stringify([row.person_id, row.rubric, row.model]))) {
+            queue.write(tx => {
+                // Fence against concurrent links or new grades populating this person since the scan.
+                if (getPopulationDigests(tx, db, row.person_id, row.rubric, row.model, now).totalRows === 0) {
+                    drop.run(row.person_id, row.rubric, row.model);
+                }
+            });
+        }
+    }
+    assessNonComparableGrades(db, queue, assess, { people, now });
     queue.flush();
     return { snapshots, comparisons };
 }
@@ -366,21 +449,57 @@ function readBaselineHistory(db, options, limit) {
     return selected.map(row => snapshots.get(JSON.stringify([JSON.stringify([row.person_id, row.rubric, row.model]), row.week_start])));
 }
 /**
+ * Fingerprint of refresh inputs only (settings, current week, People tables, and grades).
+ * Excludes derived output tables so a refresh can verify inputs stayed stable across a pass
+ * before certifying its post-pass fingerprint.
+ */
+export function baselineInputFingerprint(db, options) {
+    const digest = createHash("sha256").update(JSON.stringify([VERSION, weekStart(options.now), options.minInteractions]));
+    if (tableExists(db, "people")) {
+        let count = 0;
+        digest.update("|people:");
+        for (const row of db.prepare("SELECT id FROM people ORDER BY id").iterate()) {
+            digest.update(`${JSON.stringify(row.id)},`);
+            count++;
+        }
+        digest.update(`#${count}`);
+    }
+    else {
+        digest.update("|people:-1");
+    }
+    if (tableExists(db, "person_identities")) {
+        let count = 0;
+        digest.update("|identities:");
+        for (const row of db.prepare("SELECT rowid,person_id,provider,account_scope,external_id FROM person_identities ORDER BY rowid").iterate()) {
+            digest.update(`${JSON.stringify([row.rowid, row.person_id, row.provider, row.account_scope, row.external_id])},`);
+            count++;
+        }
+        digest.update(`#${count}`);
+    }
+    else {
+        digest.update("|identities:-1");
+    }
+    if (tableExists(db, "inside_out")) {
+        const timing = db.prepare("SELECT count(*) n,sum(target_at<=?) due,sum(reviewed_at<=?) reviewed FROM inside_out").get(options.now, options.now);
+        digest.update(`|grades:${timing.n},${timing.due},${timing.reviewed}`);
+        // Regrades rewrite reviewed_at; links, time edits and purges rewrite person_id, target_at and error.
+        for (const row of db.prepare("SELECT rowid,person_id,target_at,reviewed_at,error FROM inside_out ORDER BY rowid").iterate()) {
+            digest.update(`|${JSON.stringify([row.rowid, row.person_id, row.target_at, row.reviewed_at, row.error])}`);
+        }
+    }
+    else {
+        digest.update("|grades:-1");
+    }
+    return digest.digest("hex");
+}
+/**
  * Changes whenever a refresh input could: grades, links, people, stored results, the current week,
  * grades crossing `now`, or settings. Equal fingerprints mean a refresh would write nothing.
  */
 export function baselineFingerprint(db, options) {
-    const digest = createHash("sha256").update(JSON.stringify([VERSION, schemaVersion(db) ?? null, weekStart(options.now), options.minInteractions]));
-    for (const table of ["people", "person_emotion_baselines", "inside_out_deviations"]) {
+    const digest = createHash("sha256").update(JSON.stringify([baselineInputFingerprint(db, options), schemaVersion(db) ?? null]));
+    for (const table of ["person_emotion_baselines", "inside_out_deviations"]) {
         digest.update(`|${tableExists(db, table) ? Number(db.prepare(`SELECT count(*) n FROM ${table}`).get().n) : -1}`);
-    }
-    if (tableExists(db, "inside_out")) {
-        const timing = db.prepare("SELECT count(*) n,sum(target_at<=?) due,sum(reviewed_at<=?) reviewed FROM inside_out").get(options.now, options.now);
-        digest.update(`|${timing.n},${timing.due},${timing.reviewed}`);
-        // Regrades rewrite reviewed_at; links and purges rewrite person_id and error.
-        for (const row of db.prepare("SELECT rowid,person_id,reviewed_at,error IS NULL ok FROM inside_out ORDER BY rowid").iterate()) {
-            digest.update(`|${row.rowid},${row.person_id},${row.reviewed_at},${row.ok}`);
-        }
     }
     return digest.digest("hex");
 }

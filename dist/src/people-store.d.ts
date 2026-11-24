@@ -141,32 +141,22 @@ export declare class PeopleStore {
     listActivePeople(limit?: number, offset?: number, includeInactive?: boolean): Person[];
     findIdentity(provider: string, accountScope: string, externalId: string): PersonIdentity | undefined;
     setInjection(personId: string, enabled: boolean): Person | undefined;
-    validateDossier(input: unknown): {
-        schemaVersion: 1;
-        blurb: string;
-        sections: {
-            category: "role" | "preferences" | "workingStyle" | "relationship";
-            claims: {
-                confidence?: "low" | "medium" | "high" | undefined;
-                scope?: string | undefined;
-                reviewedAt?: string | undefined;
-                expiresAt?: string | undefined;
-                statement: string;
-                evidence: {
-                    observedAt?: string | undefined;
-                    source: "session" | "memory" | "directory" | "manual";
-                    locator: string;
-                }[];
-                epistemicType: "observed" | "reported" | "agent_assessment";
-            }[];
-        }[];
-    };
+    validateDossier(input: unknown): PersonDossier;
     getDossierRevision(personId: string): string | null;
     isDossierVerified(personId: string): boolean;
+    getVerifiedDossier(personId: string): {
+        dossier: PersonDossier;
+        reviewedAt: string;
+    } | undefined;
     recordDossierVerification(personId: string, revision: string | null, verification: string): void;
     /** Returns undefined when the person does not exist. */
     replaceDossier(personId: string, reasonInput: string, input: unknown, expectedRevision?: string | null): PersonDossier | undefined;
-    deleteDossier(personId: string, reasonInput: string): boolean;
+    /** Atomically replaces a dossier, records its history revision, and binds verification to that revision. */
+    replaceVerifiedDossier(personId: string, reasonInput: string, input: unknown, verificationInput: string, expectedRevision?: string | null): {
+        dossier: PersonDossier;
+        changeId: string;
+    } | undefined;
+    deleteDossier(personId: string, reasonInput: string, expectedRevision?: string | null): boolean;
     getWhisperReceipt(threadKey: string, personId: string): {
         runId: string;
         contribution: string;

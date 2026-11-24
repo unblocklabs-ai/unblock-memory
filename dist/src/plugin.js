@@ -495,8 +495,8 @@ export function registerUnblockMemory(api) {
         api.on("gateway_start", () => runtime.startSessionSyncSchedule(api.config, (error) => {
             api.logger.warn(`unblock-memory scheduled session sync could not start: ${String(error)}`);
         }));
-        api.on("gateway_stop", () => runtime.stopSessionSyncSchedule());
     }
+    api.on("gateway_stop", () => runtime.close());
     let peopleWhisperer;
     const peopleStores = new PeopleStores({
         maxOpenTodos: config.people.todos.maxOpen,
