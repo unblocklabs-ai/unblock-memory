@@ -451,3 +451,72 @@ test("session cap evicts least-recently-used session and aborts its in-flight co
   resolveSlow(typeSafeResponse("skill_0"));
   assert.equal(await pending0, undefined);
 });
+
+test("delayed rebuild of a superseded run does not abort the active run, search skills, or advance cooldown", async t => {
+  let bSignal: AbortSignal | undefined;
+  let bStarted!: () => void;
+  let resolveB!: (value: Response) => void;
+  const bReady = new Promise<void>(resolve => { bStarted = resolve; });
+
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const request = JSON.parse(String(init?.body));
+    const currentRequest: string = request.state[0].currentRequest;
+    const candidateName: string = request.state[0].candidate.name;
+    if (currentRequest === "run B") {
+      bSignal = init?.signal ?? undefined;
+      bStarted();
+      return new Promise<Response>(resolve => { resolveB = resolve; });
+    }
+    return typeSafeResponse(candidateName === "alpha" ? "skill_0" : "none");
+  });
+
+  const h = harness([
+    { name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 },
+    { name: "beta", path: "/skills/beta/SKILL.md", score: 0.8 },
+  ], activeTypeSafe);
+  t.after(() => h.stop());
+
+  const context = (runId: string): HookContext => ({ trigger: "user", runId, agentId: "bill", sessionId: "session" });
+
+  // Run A (turn 1) emits alpha (cooldownTurns = 2, so alpha cools on turns 2 and 3, eligible again on turn 4).
+  const resultA = await h.before({ prompt: "run A", messages: [] }, context("run-A"));
+  assert.deepEqual(resultA, { appendContext: '<skill>This skill may be relevant: "/skills/alpha/SKILL.md"</skill>' });
+  assert.equal(h.queries.length, 1);
+
+  // Run B (turn 2) starts and stays in-flight while awaiting TypeSafe for beta.
+  const pendingB = h.before({ prompt: "run B", messages: [] }, context("run-B"));
+  await bReady;
+  assert.equal(h.queries.length, 2);
+  assert.equal(bSignal?.aborted, false);
+
+  // A delayed rebuild of superseded run A must return undefined without calling searchSkills or aborting B.
+  assert.equal(await h.before({ prompt: "run A rebuild", messages: [] }, context("run-A")), undefined);
+  assert.equal(h.queries.length, 2);
+  assert.equal(bSignal?.aborted, false);
+
+  // Run B finishes normally and emits beta; same-run replay of B returns B's cached hint.
+  resolveB(typeSafeResponse("skill_0"));
+  const resultB = await pendingB;
+  assert.deepEqual(resultB, { appendContext: '<skill>This skill may be relevant: "/skills/beta/SKILL.md"</skill>' });
+  assert.equal(await h.before({ prompt: "run B rebuild", messages: [] }, context("run-B")), resultB);
+  assert.equal(h.queries.length, 2);
+
+  // Another delayed rebuild of A after B completes is still ignored without calling searchSkills.
+  assert.equal(await h.before({ prompt: "run A late rebuild", messages: [] }, context("run-A")), undefined);
+  assert.equal(h.queries.length, 2);
+
+  // Cooldown turn counter was NOT advanced by the delayed rebuilds of A:
+  // Run C is turn 3, so both alpha (turn 1) and beta (turn 2) are still cooling.
+  assert.equal(await h.before({ prompt: "run C", messages: [] }, context("run-C")), undefined);
+  assert.equal(h.queries.length, 3);
+
+  // Run D is turn 4, when alpha comes off cooldown on schedule.
+  assert.deepEqual(await h.before({ prompt: "run D", messages: [] }, context("run-D")), {
+    appendContext: '<skill>This skill may be relevant: "/skills/alpha/SKILL.md"</skill>',
+  });
+  assert.equal(h.queries.length, 4);
+
+  // Older superseded run B is also still fenced without calling searchSkills.
+  assert.equal(await h.before({ prompt: "run B late rebuild", messages: [] }, context("run-B")), undefined);
+  assert.equal(h.queries.length, 4);
+});

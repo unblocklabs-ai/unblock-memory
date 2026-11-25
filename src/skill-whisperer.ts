@@ -12,6 +12,7 @@ import { isRecord } from "./guards.js";
 const CANDIDATE_LIMIT = 10;
 const TYPESAFE_CANDIDATE_LIMIT = 3;
 const MAX_SESSIONS = 1_000;
+const MAX_SEEN_RUNS = 64;
 export const SKILL_WHISPERER_TIMEOUT_MS = 3000;
 
 type SkillWhispererRuntime = {
@@ -27,6 +28,7 @@ type SkillWhispererRuntime = {
 type SessionState = {
   turn: number;
   lastRunId?: string;
+  seenRuns: Set<string>;
   result?: Promise<{ appendContext: string } | undefined>;
   controller?: AbortController;
   skills: Map<string, { suggested?: number; opened?: number }>;
@@ -78,7 +80,7 @@ export function registerSkillWhisperer(
         sessions.get(oldest)?.controller?.abort();
         sessions.delete(oldest);
       }
-      state = { turn: 0, skills: new Map() };
+      state = { turn: 0, seenRuns: new Set(), skills: new Map() };
     }
     touchSession(scope, state);
     return state;
@@ -91,7 +93,13 @@ export function registerSkillWhisperer(
     if (context.trigger !== "user" || !scope || !runId || !agentId) return;
     const state = stateFor(scope);
     if (state.lastRunId === runId) return state.result;
+    // Ignore delayed prompt rebuilds for already-superseded runs so they never abort or advance the latest run.
+    if (state.seenRuns.has(runId)) return undefined;
     state.controller?.abort();
+    if (state.lastRunId) {
+      state.seenRuns.add(state.lastRunId);
+      if (state.seenRuns.size > MAX_SEEN_RUNS) state.seenRuns.delete(state.seenRuns.values().next().value!);
+    }
     const controller = new AbortController();
     state.controller = controller;
     const { signal } = controller;
