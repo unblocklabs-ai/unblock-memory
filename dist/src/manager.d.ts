@@ -24,12 +24,15 @@ export type ManagerSessionConfig = {
     outputDir: string;
     timezone: string;
 };
-export type SkillSearchCandidate = {
+export type SkillCatalogEntry = {
     name: string;
     description: string;
     path: string;
+};
+export type SkillSearchCandidate = SkillCatalogEntry & {
     score: number;
 };
+export declare function readSkillCatalogEntry(path: string): SkillCatalogEntry;
 export declare function enableSecureDelete(store: QMDStore): void;
 export declare function cleanupRemovedDocuments(store: QMDStore, changedDocuments?: number): number;
 export declare function buildReadResult(params: {
@@ -271,6 +274,8 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     /** Shared discovery: exact trained recipe, scoped before either retrieval lane. */
     searchCandidates(queries: QueryPair, opts: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
+    listSkills(): Promise<SkillCatalogEntry[]>;
+    skillAliases(canonicalPath: string): readonly string[];
     searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
     readFile(params: {
         relPath: string;

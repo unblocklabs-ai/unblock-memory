@@ -14,7 +14,7 @@ settings; a rotated credential file is reread without a restart.
 | My Turn | `myTurn.enabled`; conversation access and prompt injection | No hint; normal turn | No hint; normal turn |
 | `memory_search` | Installed/enabled memory slot; configured corpora | Local retrieval-ranked leads with degraded warning | Successful judged siblings returned with a partial warning; total judging failure or unreadable key uses local retrieval fallback |
 | `memory_get` | Installed/enabled memory slot; configured corpora | Unchanged local indexed reads | Unchanged; its own indexing errors still matter |
-| Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Best local vector candidate meeting `minScore` | Exclude failed candidates; successful siblings may qualify; no vector fallback |
+| Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Local vector matches meeting `minScore` | Keep active skills and matches from successful batches; no vector-only fallback |
 | Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; deadline failures still suppress the turn; query-API failures fall back to deterministic local queries before decision model judging |
 | Complementary hints | Enabled Memory Whisperer + `complementaryHints` | No additional judgment; base hints also require a key | Keep baseline hints unless the total deadline expires |
 | Safety Whisperer | `safetyWhisperer.enabled`, at least one scenario, host hooks (conversation access and prompt injection) | Could not check: the turn proceeds without safety prompts (fails open) | Fails open; recorded as could-not-check, never as no match |
@@ -48,7 +48,7 @@ All plugin decision-model features use `plugins.entries.unblock-memory.config.de
 Older provider config keys are rejected. When upgrading, remove the old block and
 configure a credential for the endpoint you intend to use; do not copy the old key into the default route.
 
-Candidate scoring uses **one HTTP request per candidate**, with ranking done in code.
+Skill Whisperer scores up to 80 skills per HTTP request. Memory candidate scoring uses one request per candidate. Ranking happens in code.
 Related questions about the same candidate can share a request (for example, quality
 noise and evidence). Memory Whisperer launches up to six top fused eligible candidate requests together;
 the shared account's request/token limits still apply across simultaneous conversations
@@ -100,7 +100,7 @@ Missing/empty files or dotenv files without a matching key entry count as no key
 An explicit file never falls back to an unrelated environment key. Missing or
 unreadable credentials do not break normal memory functionality or Gateway startup;
 the feature-specific fallback/skip behavior above applies. **Unreadable files and
-provider errors are not Skill Whisperer's no-key fallback:** they suppress its hint.
+provider errors are not Skill Whisperer's no-key fallback:** they prevent new routing on any failed batch; active skills remain available.
 Use `memory_diagnostics` for credential availability; it does not verify provider
 acceptance. Keep secret files mode `600`, secret directories mode `700`, and keys
 out of Git, chat, shell arguments and logs.
@@ -243,7 +243,7 @@ contract; these tables explain their effects.
 | `skillWhisperer.enabled` | `true` with a `skills` corpus, else `false` | Needs appropriate host hook access; fixed 3-second total deadline; `false` opts out. An explicit `true` without a skills corpus logs a warning and stays inactive |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for decision model shortlist admission |
-| `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |
+| `skillWhisperer.cooldownTurns` | `10` | Legacy nonnegative integer, accepted for compatibility; no longer used |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, decision model key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
 | `memoryWhisperer.api.endpoint` | Empty | Optional query-model API URL. Unset or empty uses deterministic local queries. |
@@ -266,9 +266,6 @@ contract; these tables explain their effects.
 | `safetyWhisperer.scenarios[].excludedChannels` | `[]` | Up to 500 channels where only this scenario is skipped |
 | `safetyWhisperer.scenarios[].agentIds` | Unset (every agent) | Non-empty list limits the scenario to these agents when one config serves several; normalized like OpenClaw agent IDs (lowercase) |
 | `safetyWhisperer.scenarios[].enabled` | `true` | Disabled scenarios are never sent to the decision endpoint |
-
-Missing/empty key and unreadable/erroring key are different for Skill Whisperer:
-the former allows vector fallback; the latter suppresses the hint.
 
 ## People
 

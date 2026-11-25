@@ -14,7 +14,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
 import type { ExtractionConfig } from "./extraction-config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
-import { QmdMemoryManager, type ManagerSessionConfig } from "./manager.js";
+import { QmdMemoryManager, type ManagerSessionConfig, type SkillCatalogEntry } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
 import { unchangedSessionSync, type SessionSyncResult } from "./session-sync.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
@@ -384,7 +384,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #stateRoot: string;
   readonly #onError?: (error: unknown) => void;
   readonly #recallLedgerEnabled: boolean;
-  readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
+  readonly #managers = new Map<string, { manager: QmdMemoryManager; ready?: Promise<void> }>();
   readonly #closingManagers = new Map<string, Promise<void>>();
   readonly #activeSessionSyncs = new Map<string, Promise<void>>();
   readonly #pendingSessionSyncStarts = new Set<Promise<unknown>>();
@@ -489,7 +489,11 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     return names;
   }
 
-  async getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }) {
+  getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }) {
+    return this.#getManager(params, true);
+  }
+
+  async #getManager(params: { cfg: OpenClawConfig; agentId: string }, startMemory: boolean) {
     while (true) {
       const blocked = this.#admissionBlockedReason();
       if (blocked) {
@@ -500,23 +504,26 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         await closing.catch(() => undefined);
         continue;
       }
-      let pending = this.#managers.get(params.agentId);
-      if (!pending) {
-        pending = this.#createManager(params.cfg, params.agentId);
-        this.#managers.set(params.agentId, pending);
-      }
+      let entry = this.#managers.get(params.agentId);
       try {
-        const manager = await pending;
+        if (!entry) {
+          entry = { manager: this.#createManager(params.cfg, params.agentId) };
+          this.#managers.set(params.agentId, entry);
+        }
+        if (startMemory) {
+          entry.ready ??= this.#startManager(entry.manager);
+          await entry.ready;
+        }
         const blockedAfter = this.#admissionBlockedReason();
         if (blockedAfter) {
           return { manager: null, error: blockedAfter };
         }
-        if (this.#managers.get(params.agentId) !== pending) {
+        if (this.#managers.get(params.agentId) !== entry) {
           continue;
         }
-        return { manager };
+        return { manager: entry.manager };
       } catch (error) {
-        if (this.#managers.get(params.agentId) === pending) this.#managers.delete(params.agentId);
+        if (this.#managers.get(params.agentId) === entry) this.#managers.delete(params.agentId);
         return { manager: null, error: error instanceof Error ? error.message : String(error) };
       }
     }
@@ -775,9 +782,9 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     const activeSync = this.#activeSessionSyncs.get(this.#stateDir(agentId));
     if (activeSync) await activeSync.catch(() => undefined);
     const previousClose = this.#closingManagers.get(agentId);
-    const pending = this.#managers.get(agentId);
+    const entry = this.#managers.get(agentId);
     this.#managers.delete(agentId);
-    if (!previousClose && !pending) return;
+    if (!previousClose && !entry) return;
 
     const closing = (async () => {
       let closeError: unknown;
@@ -788,16 +795,17 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
           closeError = error;
         }
       }
-      if (pending) {
-        let manager: QmdMemoryManager | undefined;
+      if (entry) {
+        let startupFailed = false;
         try {
-          manager = await pending;
+          await entry.ready;
         } catch {
-          // Failed startup already cleaned up its own manager inside #createManager.
+          // Failed startup already cleaned up its own manager inside #startManager.
+          startupFailed = true;
         }
-        if (manager) {
+        if (!startupFailed) {
           try {
-            await manager.close();
+            await entry.manager.close();
           } catch (error) {
             closeError ??= error;
           }
@@ -874,13 +882,25 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     return manager.searchSkills(query, minScore, limit);
   }
 
+  async listSkills(params: { cfg: OpenClawConfig; agentId: string }): Promise<SkillCatalogEntry[]> {
+    // The first-use memory sync can load QMD embeddings; the catalog does not need it.
+    const { manager, error } = await this.#getManager(params, false);
+    if (!manager) throw new Error(error ?? "memory unavailable");
+    return manager.listSkills();
+  }
+
   resolveSkillPath(params: { cfg: OpenClawConfig; agentId: string }, path: string): string | undefined {
     const workspaceDir = resolveAgentWorkspaceDir(params.cfg, params.agentId);
     const skillCorpora = this.#corpora.filter((corpus) => corpus.kind === "skills");
-    return resolveConfiguredSkillPath(workspaceDir, path, resolveSources(workspaceDir, skillCorpora));
+    const sources = resolveSources(workspaceDir, skillCorpora);
+    const direct = resolveConfiguredSkillPath(workspaceDir, path, sources);
+    if (direct) return direct;
+    // A read can pin a configured alias even when its name lost catalog deduplication.
+    const aliases = this.#managers.get(params.agentId)?.manager.skillAliases(path) ?? [];
+    if (aliases.some(alias => resolveConfiguredSkillPath(workspaceDir, alias, sources) === path)) return path;
   }
 
-  async #createManager(cfg: OpenClawConfig, agentId: string): Promise<QmdMemoryManager> {
+  #createManager(cfg: OpenClawConfig, agentId: string): QmdMemoryManager {
     const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
     const stateDir = this.#stateDir(agentId);
     const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files" || corpus.kind === "skills");
@@ -890,7 +910,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       ? resolveSessionSource(sessions.outputDir, sessions.chatTypes)
       : undefined;
     if (sessionSource) sources.push(sessionSource);
-    const manager = new QmdMemoryManager({
+    return new QmdMemoryManager({
       workspaceDir,
       dbPath: join(stateDir, "index.sqlite"),
       curationPath: join(stateDir, MEMORY_DATABASE),
@@ -901,14 +921,16 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       sessions,
       trackRecallLocators: this.#recallLedgerEnabled,
     });
+  }
+
+  async #startManager(manager: QmdMemoryManager): Promise<void> {
     try {
       await manager.start();
     } catch (error) {
-      // The manager is not in the runtime's resolved cache yet, so we own cleanup.
+      // Release a failed startup before the cache can admit a replacement.
       await manager.close().catch(() => undefined);
       throw error;
     }
-    return manager;
   }
 
   #sessionConfig(cfg: OpenClawConfig, agentId: string): ManagerSessionConfig | undefined {

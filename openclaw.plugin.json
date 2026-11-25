@@ -95,7 +95,7 @@
     },
     "skillWhisperer.enabled": {
       "label": "Skill Whisperer",
-      "help": "Append at most one semantically relevant configured skill after the user prompt and any memory hints. Requires hook conversation access."
+      "help": "Append relevant configured skills and retain them for the session. With decision-model credentials, sends the current request, recent conversation, and skill names and descriptions to the configured endpoint. Requires hook conversation access."
     },
     "memoryWhisperer.enabled": {
       "label": "Memory Whisperer",
@@ -409,7 +409,7 @@
           "enabled": { "type": "boolean", "description": "Defaults to true when a corpus with kind \"skills\" is configured, otherwise false. An explicit true without one is ignored with a warning." },
           "historyMessages": { "type": "integer", "minimum": 0 },
           "minScore": { "type": "number", "minimum": 0, "maximum": 1 },
-          "cooldownTurns": { "type": "integer", "minimum": 0 }
+          "cooldownTurns": { "type": "integer", "minimum": 0, "description": "Accepted for compatibility; active skills no longer cool down." }
         }
       },
       "safetyWhisperer": {

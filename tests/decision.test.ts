@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
-import { judgeMemoryPassage, judgeQuality, selectSkill, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/decision-ranking.js";
+import { judgeMemoryPassage, judgeQuality, scoreSkillCatalog, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/decision-ranking.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "../src/training-judge.js";
 import { decisionModelScope, matchesDecisionModel, requestDecision, resolveDecisionCredential } from "../src/decision-client.js";
 
@@ -31,12 +31,19 @@ test("quality judgments keep evidence and noise independent and validate exact a
     await assert.rejects(judgeQuality(params), { code: "invalid_response" });
   }
 });
-const selection = {
+const skillCatalog = {
   apiKey: "test-secret", timeoutMs: 100,
-  currentRequest: "Deploy this project", history: [],
-  candidates: [{ name: "none", description: "Deploy software releases." }],
+  currentRequest: "Deploy this project",
+  history: [{ role: "assistant", content: "The release is ready for staging." }] as const,
+  candidates: [{ name: "release", description: "Deploy software releases." }],
 };
-const response = (noul: number) => Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { useful: { type: "noul", noul } } });
+const skills = (count: number) => Array.from({ length: count }, (_, index) => ({
+  name: `skill-${index}`, description: `Workflow ${index}`, path: `/private/skill-${index}/SKILL.md`,
+}));
+const skillAnswers = (count: number, scores: Record<number, number>) => Object.fromEntries(
+  Array.from({ length: count }, (_, index) => [`s_${index}`, { type: "noul", noul: scores[index] ?? 0.1 }]),
+);
+const skillResponse = (answers: unknown) => Response.json({ model: "liquid/d1.2-ultra-20261116", answers });
 
 test("credentials ignore obsolete keys and do not send ambient Codex credentials to custom endpoints", async (t) => {
   const previousLegacy = process.env.TYPESAFE_API_KEY;
@@ -92,10 +99,9 @@ test("credentials ignore obsolete keys and do not send ambient Codex credentials
   assert.equal(await resolveDecisionCredential(legacy), undefined);
 });
 
-test("selection scores one skill, uses default codex decisions endpoint/model with array state, and abstains below threshold", async (t) => {
-  let calls = 0;
-  t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof globalThis.fetch>) => {
-    calls++;
+test("79 or 80 skills share one default decision request, with ranked and capped matches", async (t) => {
+  const catalog = skills(80);
+  const fetch = t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof globalThis.fetch>) => {
     assert.equal(url, "https://codex.unblocklabs.ai/v1/decisions");
     assert.equal(init?.method, "POST");
     assert.deepEqual(init?.headers, { Authorization: "Bearer test-secret", "Content-Type": "application/json" });
@@ -103,17 +109,26 @@ test("selection scores one skill, uses default codex decisions endpoint/model wi
     assert.ok(init?.signal);
     const request = JSON.parse(String(init?.body));
     assert.equal(request.model, "liquid/d1.2-ultra");
-    assert.ok(Array.isArray(request.state) && request.state.length === 1);
-    assert.equal(request.state[0].currentRequest, "Deploy this project");
-    assert.deepEqual(request.state[0].candidate, { name: "none", description: "Deploy software releases." });
-    assert.equal(typeof request.questions.useful.instructions.question, "string");
-    assert.equal(request.questions.useful.type, "noul");
-    return response(calls === 1 ? 0.9 : 0.1);
+    const count = request.state[0].skills.length;
+    const expected = catalog.slice(0, count).map(({ name, description }, index) => ({ id: `s_${index}`, name, description }));
+    assert.deepEqual(request.state, [{ currentRequest: skillCatalog.currentRequest, history: skillCatalog.history, skills: expected }]);
+    assert.deepEqual(Object.keys(request.questions), expected.map(skill => skill.id));
+    for (const { id } of expected) {
+      const question = request.questions[id];
+      assert.equal(question.type, "noul");
+      assert.ok(JSON.stringify(question.instructions).includes(id));
+    }
+    const scores = { 0: 0.69, 1: 0.7, 2: 0.79, 20: 0.9, 78: 0.79 };
+    return skillResponse(skillAnswers(count, count === 79 ? scores : { ...scores, 40: 0.8, 79: 0.95 }));
   });
-  assert.equal(await selectSkill(selection), 0);
-  assert.equal(await selectSkill(selection), undefined);
-  assert.equal(await selectSkill({ ...selection, candidates: [] }), undefined);
-  assert.equal(calls, 2);
+  const tied = [{ index: 2, score: 0.79 }, { index: 78, score: 0.79 }];
+  assert.deepEqual(await scoreSkillCatalog({ ...skillCatalog, candidates: catalog.slice(0, 79) }),
+    [{ index: 20, score: 0.9 }, ...tied, { index: 1, score: 0.7 }]);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.deepEqual(await scoreSkillCatalog({ ...skillCatalog, candidates: catalog }),
+    [{ index: 79, score: 0.95 }, { index: 20, score: 0.9 }, { index: 40, score: 0.8 }, ...tied]);
+  assert.deepEqual(await scoreSkillCatalog({ ...skillCatalog, candidates: [] }), []);
+  assert.equal(fetch.mock.callCount(), 2);
 });
 
 test("the original route no longer implicitly requests its historical model", async (t) => {
@@ -153,29 +168,6 @@ test("model matching restricts suffixes to dated snapshots or jev-latest, scope 
     { code: "http_error", status: 503, retryAfter: false });
   fetch.mock.mockImplementation(async () => new Response("busy", { status: 503 }));
   await assert.rejects(requestDecision({ apiKey: "fake" }, {}, {}), { code: "http_error", status: 503, retryAfter: false });
-});
-
-test("HTTP and schema errors never expose provider content or retry", async (t) => {
-  const fetch = t.mock.method(globalThis, "fetch", async () => new Response("test-secret", { status: 529 }));
-  await assert.rejects(selectSkill(selection), { message: "Decision model HTTP 529", code: "http_error", status: 529 });
-  assert.equal(fetch.mock.callCount(), 1);
-  fetch.mock.mockImplementation(async () => response(2));
-  await assert.rejects(selectSkill(selection), { code: "invalid_response" });
-  fetch.mock.mockImplementation(async () => Response.json({ secret: "test-secret" }));
-  await assert.rejects(selectSkill(selection), { code: "invalid_response" });
-  fetch.mock.mockImplementation(async () => { throw new Error("test-secret network detail"); });
-  await assert.rejects(selectSkill(selection), { message: "Decision model request failed", code: "network_error" });
-});
-
-test("the request deadline aborts slow fetches", async (t) => {
-  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => new Promise<Response>((_resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("deadline did not abort")), 1000);
-    init?.signal?.addEventListener("abort", () => {
-      clearTimeout(timer);
-      reject(new Error("secret-bearing transport error"));
-    }, { once: true });
-  }));
-  await assert.rejects(selectSkill({ ...selection, timeoutMs: 20 }), { message: "Decision model request timed out", code: "timeout" });
 });
 
 const memoryJudgment = {
@@ -237,7 +229,7 @@ test("memory requests sanitize failures, do not retry, and honor the provider de
 test("shared transport preserves caller errors for HTTP, cancellation and invalid JSON failures", async t => {
   const params = { apiKey: "test-secret", timeoutMs: 100, signal: new AbortController().signal };
   const callers = [
-    { request: () => selectSkill(selection), error: "Decision model HTTP 529", status: true },
+    { request: () => scoreSkillCatalog(skillCatalog), error: "Decision model HTTP 529", status: true },
     { request: () => judgeMemory(), error: "Decision model HTTP 529", status: true },
     { request: () => judgeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
       error: "Decision model HTTP 529", status: true },
@@ -277,7 +269,7 @@ test("caller cancellation preserves quality, memory and review abort errors", as
   assert.equal(fetch.mock.callCount(), 0, "review must abort before fetch");
 });
 
-test("client distinguishes timeout, first caller cancellation, and body-read failure", async t => {
+test("client distinguishes timeout and caller cancellation from transport and body-read failures", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) =>
     new Promise<Response>((_resolve, reject) => {
       const keepAlive = setTimeout(() => reject(new Error("abort not delivered")), 1000);
@@ -291,6 +283,9 @@ test("client distinguishes timeout, first caller cancellation, and body-read fai
   controller.abort("private reason");
   await assert.rejects(cancelled, { code: "cancelled", message: "Decision model request cancelled" });
   assert.equal(fetch.mock.callCount(), 2);
+  fetch.mock.mockImplementation(async () => { throw new Error("private transport detail"); });
+  await assert.rejects(requestDecision({ apiKey: "private" }, {}, {}),
+    { code: "network_error", message: "Decision model request failed" });
   fetch.mock.mockImplementation(async () => new Response(new ReadableStream({
     start(controller) { controller.error(new Error("private body detail")); },
   })));
@@ -314,26 +309,81 @@ test("quality helper isolates requests and keeps scores aligned despite reversed
   assert.deepEqual(await quality, [{ noise: 0.1, evidence: 0.9 }, { noise: 0.8, evidence: 0.7 }]);
 });
 
-test("skill reranking isolates candidates, preserves successes, and breaks ties in retrieval order", async t => {
-  let mode = "partial";
-  const failures: number[] = [];
+test("oversized batches start together and map reversed replies by trusted index", async t => {
+  function responseGate() {
+    let release!: (response: Response) => void;
+    const promise = new Promise<Response>(resolve => { release = resolve; });
+    return { promise, resolve: release };
+  }
+  const full = responseGate();
+  const tail = responseGate();
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    const request = JSON.parse(String(init?.body));
-    const [state] = request.state;
-    assert.deepEqual(Object.keys(state).sort(), ["candidate", "currentRequest", "history"]);
-    assert.deepEqual(Object.keys(request.questions), ["useful"]);
-    if (state.candidate.name === "bad" && mode === "partial") return new Response("secret", { status: 403 });
-    return response(mode === "none" ? 0.69 : 0.8);
+    const [state] = JSON.parse(String(init?.body)).state;
+    if (state.skills[0].name === "skill-0") {
+      assert.equal(state.skills.length, 80);
+      assert.equal(state.skills[79].name, "skill-79");
+      return full.promise;
+    }
+    assert.deepEqual(state.skills.map(({ id, name }: { id: string; name: string }) => [id, name]),
+      [["s_0", "skill-80"], ["s_1", "skill-81"]]);
+    return tail.promise;
   });
-  const params = { ...selection, candidates: ["bad", "good", "tie"].map(name => ({ name, description: "test" })),
-    onCandidateFailure: (i: number) => { failures.push(i); } };
-  assert.equal(await selectSkill(params), 1);
-  assert.deepEqual(failures, [0]);
-  mode = "ties";
-  assert.equal(await selectSkill(params), 0);
-  mode = "none";
-  assert.equal(await selectSkill(params), undefined);
-  assert.equal(fetch.mock.callCount(), 9);
+  const result = scoreSkillCatalog({
+    ...skillCatalog, candidates: skills(82), timeoutMs: 1000, minUsefulness: 0.8, maxMatches: 2,
+  });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fetch.mock.callCount(), 2, "both requests start before either completes");
+    tail.resolve(skillResponse({
+      s_1: { type: "noul", noul: 0.8 },
+      s_0: { type: "noul", noul: 0.95, name: "skill-0", path: "/invented/SKILL.md" },
+    }));
+    await new Promise(resolve => setImmediate(resolve));
+    full.resolve(skillResponse(skillAnswers(80, { 0: 0.79, 79: 0.8 })));
+    assert.deepEqual(await result, [{ index: 80, score: 0.95 }, { index: 79, score: 0.8 }]);
+  } finally {
+    full.resolve(skillResponse({}));
+    tail.resolve(skillResponse({}));
+    await result.catch(() => {});
+  }
+});
+
+test("a failed catalog batch preserves other matches; all failures surface the first error without retrying", async t => {
+  let failAll = false;
+  const failures: { batch: number; error: unknown }[] = [];
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const [{ skills }] = JSON.parse(String(init?.body)).state;
+    if (skills[0].name === "skill-0") return new Response("private provider detail", { status: 403 });
+    if (failAll) return new Response("private provider detail", { status: 529 });
+    return skillResponse(skillAnswers(1, { 0: 0.9 }));
+  });
+  const params = {
+    ...skillCatalog, candidates: skills(3), batchSize: 2,
+    onBatchFailure: (batch: number, error: unknown) => { failures.push({ batch, error }); },
+  };
+  assert.deepEqual(await scoreSkillCatalog(params), [{ index: 2, score: 0.9 }]);
+  assert.deepEqual(failures.map(f => f.batch), [0]);
+  assert.match(String(failures[0].error), /Decision model HTTP 403/);
+  failAll = true;
+  await assert.rejects(scoreSkillCatalog(params), { message: "Decision model HTTP 403", code: "http_error", status: 403 });
+  assert.equal(fetch.mock.callCount(), 4);
+});
+
+test("catalog responses cannot substitute answer keys or malformed probabilities", async t => {
+  const fetch = t.mock.method(globalThis, "fetch");
+  const yes = { type: "noul", noul: 0.93 };
+  const params = { ...skillCatalog, candidates: skills(2) };
+  for (const answers of [
+    undefined,
+    { s_0: yes },
+    { s_0: yes, "skill-1": yes },
+    { s_0: yes, s_1: yes, s_2: yes },
+    { s_0: yes, s_1: { type: "score", noul: 0.93 } },
+    { s_0: yes, s_1: { type: "noul", noul: 2 } },
+  ]) {
+    fetch.mock.mockImplementation(async () => skillResponse(answers));
+    await assert.rejects(scoreSkillCatalog(params), { code: "invalid_response" });
+  }
 });
 
 test("offline and runtime use exactly the same blind request and retain raw probabilities and usage", async t => {

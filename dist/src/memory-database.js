@@ -24,9 +24,9 @@ function requireRegularFile(path) {
     if (file && !file.isFile())
         throw new Error("Memory database must be a regular file, not a symlink");
 }
-function enableWal(db) {
+function enableWal(db, busyTimeoutMs) {
     // Switching journal modes can return SQLITE_BUSY without invoking busy_timeout.
-    const deadline = Date.now() + DEFAULTS.sqlite.mainBusyTimeoutMs;
+    const deadline = Date.now() + busyTimeoutMs;
     for (;;) {
         try {
             db.exec("PRAGMA journal_mode=WAL");
@@ -40,7 +40,7 @@ function enableWal(db) {
     }
 }
 /** Separate domain stores share settings, not a monolithic data-access API. */
-export function openMemoryDatabase(path) {
+export function openMemoryDatabase(path, { busyTimeoutMs = DEFAULTS.sqlite.mainBusyTimeoutMs } = {}) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     requireRegularFile(path);
     const descriptor = openSync(path, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
@@ -52,8 +52,8 @@ export function openMemoryDatabase(path) {
     }
     const db = new DatabaseSync(path);
     try {
-        db.exec(`PRAGMA busy_timeout=${DEFAULTS.sqlite.mainBusyTimeoutMs}`);
-        enableWal(db);
+        db.exec(`PRAGMA busy_timeout=${busyTimeoutMs}`);
+        enableWal(db, busyTimeoutMs);
         db.exec(`PRAGMA foreign_keys=ON;
       PRAGMA trusted_schema=OFF;
       CREATE TABLE IF NOT EXISTS memory_schema (component TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT;`);

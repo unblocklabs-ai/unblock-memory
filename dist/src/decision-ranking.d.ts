@@ -1,6 +1,7 @@
+import { type NoulQuestion } from "@unblocklabs/decisions";
 import type { QueryConversation } from "./query-contract.js";
-/** Select from trusted candidates; never accept a provider-generated path or skill name. */
-export declare function selectSkill(params: {
+/** Rank independent applicability judgments; only code maps answers to catalog entries. */
+export declare function scoreSkillCatalog(params: {
     apiKey: string;
     endpoint?: string;
     model?: string;
@@ -15,8 +16,14 @@ export declare function selectSkill(params: {
         name: string;
         description: string;
     }[];
-    onCandidateFailure?: (index: number, error: unknown) => void;
-}): Promise<number | undefined>;
+    minUsefulness?: number;
+    maxMatches?: number;
+    batchSize?: number;
+    onBatchFailure?: (batchIndex: number, error: unknown) => void;
+}): Promise<Array<{
+    index: number;
+    score: number;
+}>>;
 export declare function qualityJudgeVersion(model?: string, endpoint?: string): string;
 export type QualityJudgment = {
     noise: number;
@@ -62,7 +69,7 @@ export declare function memoryUsefulnessRequest(conversation: QueryConversation,
         }[];
     };
     questions: {
-        readonly memory_0: import("@unblocklabs/decisions").NoulQuestion;
+        readonly memory_0: NoulQuestion;
     };
 };
 export declare function judgeMemoryPassage(request: ReturnType<typeof memoryUsefulnessRequest>, params: {

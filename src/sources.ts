@@ -133,6 +133,7 @@ export function resolveConfiguredSkillPath(
   let canonicalTarget: string;
   try {
     canonicalTarget = realpathSync(target);
+    if (!statSync(canonicalTarget).isFile()) return undefined;
   } catch {
     return undefined;
   }

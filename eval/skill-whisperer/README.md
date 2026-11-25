@@ -1,7 +1,7 @@
 # Skill Whisperer comparison
 
 An opt-in experiment; it does not change plugin runtime behavior or add dependencies.
-Both API arms reuse the production per-candidate Noul selector and shared transport.
+Both API arms use the production batched Noul router and report their top match.
 
 ## Run
 
@@ -14,18 +14,17 @@ node --env-file=.env --import tsx eval/skill-whisperer/compare.ts --live
 ```
 
 The default invocation validates fixtures without inference. `--live` uses
-`CODEX_LB_API_KEY`, real QMD local embeddings, and one decision request per skill
-per arm per case (up to 760 requests with the current 40-case/16-skill fixtures).
+`CODEX_LB_API_KEY`, real QMD local embeddings, and one decision request per arm
+per case (80 requests with the current 40-case/16-skill fixtures).
 It may download QMD's default embedding model if absent. It reads no fleet configs,
 conversation logs, memory documents, or dossiers. Only synthetic requests/history
 and snapshotted skill names/descriptions go to decision model. Source paths are not sent.
 
 Results, input/selector hashes, model ID, timings, token usage and the
 isolated QMD database remain in a unique ignored `reports/skill-whisperer/` directory.
-Each arm is checkpointed. Candidate requests run concurrently without retries.
-Candidate-level HTTP status and timing are logged without secrets. Partial failures
-preserve successful siblings, matching production, and are counted in the report.
-If every candidate fails, the run stops without substituting a prediction; incomplete
+Each arm is checkpointed. Batch-level HTTP status and timing are logged without
+secrets. Partial failures preserve successful batches, matching production.
+If every batch fails, the run stops without substituting a prediction; incomplete
 runs do not produce an aggregate report.
 
 ## Arms
@@ -42,6 +41,6 @@ order, and none qualifying means no hint. No threshold is fitted to these cases.
 The full-roster arm diagnoses shortlist loss but needs a
 larger-inventory test before a production recommendation.
 
-This evaluates fresh-turn selection, not cooldown behavior or whether an agent
-actually follows a suggestion. Existing whisperer tests cover hook/cooldown rules.
+This evaluates fresh-turn selection, not session persistence or whether an agent
+actually follows a suggestion. [Results](RESULTS.md) use the historical per-skill transport.
 Use an independently labeled, approved traffic sample before claiming fleet gains.

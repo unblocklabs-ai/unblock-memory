@@ -5,11 +5,12 @@ import { basename, dirname, relative, resolve, sep } from "node:path";
 import { EXTRACTED_COLLECTION, EXTRACTED_PREFIX, extractedRecords, extractedPath, extractedHit, extractedUri, syncExtractedIndex } from "./extraction-index.js";
 import chokidar from "chokidar";
 import picomatch from "picomatch";
+import { isScalar, parseDocument } from "yaml";
 import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
 import { CurationStore, chunkFingerprint, } from "./curation.js";
 import { projectionHash, readSessionManifest, sessionMetadataByPath, syncSessionProjections, PROJECTOR_VERSION, } from "./session-sync.js";
 import { parseSessionMessageSpans, sessionContextSpans, sessionSnippetMessages } from "./session-projector.js";
-import { parseSafeVirtualPath, sourceMatchesPath } from "./sources.js";
+import { parseSafeVirtualPath, resolveConfiguredSkillPath, sourceMatchesPath } from "./sources.js";
 import { auditQualityPage } from "./quality-audit.js";
 import { qualityTaskPresence } from "./quality-triage.js";
 import { reviewIndexedClaim } from "./evidence-review.js";
@@ -27,8 +28,8 @@ const MAX_READ_CHARS = DEFAULTS.memoryWhisperer.memoryGetMaxChars;
 const WATCH_DEBOUNCE_MS = DEFAULTS.sqlite.watchDebounceMs;
 const WATCH_RETRY_MS = DEFAULTS.sqlite.watchRetryMs;
 const MANAGER_CLOSED_ERROR = "QmdMemoryManager is closed";
-function readSkillDocuments(source) {
-    const documents = [];
+function readSkillSource(source) {
+    const entries = [];
     const visitedDirectories = new Set();
     const visit = (directory) => {
         let canonicalDirectory;
@@ -65,18 +66,37 @@ function readSkillDocuments(source) {
             if (kind !== "file" || basename(path).toLowerCase() !== "skill.md" ||
                 !picomatch.isMatch(relativePath, source.pattern, { dot: true }))
                 continue;
-            documents.push({ path, body: readFileSync(path, "utf8") });
+            entries.push(readSkillCatalogEntry(path));
         }
     };
     visit(source.root);
-    return documents;
+    return entries;
 }
 function frontmatterValue(body, key) {
-    const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\n|$)/u.exec(body)?.[1];
-    const raw = frontmatter?.split("\n")
-        .map((line) => new RegExp(`^${key}:\\s*(.+?)\\s*$`, "u").exec(line)?.[1])
-        .find((value) => value !== undefined);
-    return raw?.replace(/^(?:"(.*)"|'(.*)')$/u, "$1$2").trim();
+    const frontmatter = /^\uFEFF?---[ \t]*\r?\n((?:[^\n]*\n)*?)---[ \t]*(?:\r?\n|$)/u.exec(body)?.[1];
+    if (frontmatter === undefined)
+        return;
+    const document = parseDocument(frontmatter, { schema: "failsafe" });
+    const scalar = document.get(key, true);
+    // Some existing skills use unquoted punctuation that is invalid YAML.
+    if (!isScalar(scalar) && document.errors.length) {
+        const raw = new RegExp(`^${key}:[ \\t]*(.+)$`, "mu").exec(frontmatter)?.[1]?.trim();
+        if (raw)
+            return raw;
+    }
+    if (!isScalar(scalar) || typeof scalar.value !== "string")
+        return;
+    return scalar.type === "BLOCK_FOLDED" || scalar.type === "BLOCK_LITERAL"
+        ? scalar.value
+        : scalar.value.trim();
+}
+export function readSkillCatalogEntry(path) {
+    const body = readFileSync(path, "utf8");
+    return {
+        name: frontmatterValue(body, "name") || basename(dirname(path)),
+        description: frontmatterValue(body, "description") ?? "",
+        path,
+    };
 }
 function cosineSimilarity(left, right) {
     if (left.length !== right.length || left.length === 0)
@@ -236,6 +256,7 @@ export class QmdMemoryManager {
     #closePromise;
     #watcher;
     #watchReady;
+    #watchMemory = false;
     #watchTimer;
     #watchCollections = new Set();
     #watchError;
@@ -245,6 +266,7 @@ export class QmdMemoryManager {
     #sessionMetadata = new Map();
     #sessionManifest;
     #sessionManifestMtimeNs;
+    #skillCatalog;
     #skillIndex;
     #qualityAuditRunning = false;
     #reviewLifetime = new AbortController();
@@ -297,6 +319,7 @@ export class QmdMemoryManager {
             await this.#reloadSessionMetadata();
         }
         this.#assertOpen();
+        this.#watchMemory = true;
         this.#startWatcher();
         await this.sync({ reason: "first-use" });
         await this.#watchReady;
@@ -343,7 +366,11 @@ export class QmdMemoryManager {
             ignored: (path, stats) => Boolean(stats && !stats.isDirectory() && !path.toLowerCase().endsWith(".md")),
         });
         this.#watchReady = new Promise((resolve) => {
-            this.#watcher?.once("ready", resolve);
+            this.#watcher?.once("ready", () => {
+                // A cold catalog read can predate watcher readiness.
+                this.#invalidateSkills();
+                resolve();
+            });
             this.#watcher?.once("error", () => resolve());
         });
         this.#watcher.on("error", (error) => {
@@ -354,8 +381,8 @@ export class QmdMemoryManager {
                 return;
             const matchingSources = [...this.#sources.values()].filter((source) => source.kind !== "sessions" && sourceMatchesPath(source, path));
             if (matchingSources.some((source) => source.kind === "skills"))
-                this.#skillIndex = undefined;
-            if (!matchingSources.some((source) => source.kind !== "skills"))
+                this.#invalidateSkills();
+            if (!this.#watchMemory || !matchingSources.some((source) => source.kind !== "skills"))
                 return;
             for (const source of matchingSources)
                 if (source.kind !== "skills")
@@ -363,6 +390,10 @@ export class QmdMemoryManager {
             this.#dirty = true;
             this.#scheduleWatchSync();
         });
+    }
+    #invalidateSkills() {
+        this.#skillCatalog = undefined;
+        this.#skillIndex = undefined;
     }
     #scheduleWatchSync(retry = false) {
         if (this.#watchTimer)
@@ -1094,6 +1125,44 @@ export class QmdMemoryManager {
         const finalPaths = new Set(this.#currentExtracted(results.map(hit => hit.path), opts?.sessionFilter).map(extractedUri));
         return results.filter(hit => !hit.path.startsWith(EXTRACTED_PREFIX) || finalPaths.has(hit.path));
     }
+    async listSkills() {
+        return this.#getSkillCatalog().map((entry) => ({ ...entry }));
+    }
+    skillAliases(canonicalPath) {
+        this.#getSkillCatalog();
+        return this.#skillCatalog?.aliases.get(canonicalPath) ?? [];
+    }
+    #getSkillCatalog() {
+        this.#assertOpen();
+        if (!this.#hasSkills)
+            return [];
+        this.#startWatcher();
+        if (!this.#skillCatalog) {
+            const byName = new Map();
+            const aliases = new Map();
+            for (const source of this.#sources.values()) {
+                if (source.kind !== "skills")
+                    continue;
+                for (const entry of readSkillSource(source)) {
+                    const canonical = resolveConfiguredSkillPath(this.#workspaceDir, entry.path, [source]);
+                    if (!canonical)
+                        continue;
+                    if (canonical !== entry.path) {
+                        const paths = aliases.get(canonical);
+                        if (paths)
+                            paths.push(entry.path);
+                        else
+                            aliases.set(canonical, [entry.path]);
+                    }
+                    const key = entry.name.toLowerCase();
+                    if (!byName.has(key))
+                        byName.set(key, entry);
+                }
+            }
+            this.#skillCatalog = { entries: [...byName.values()], aliases };
+        }
+        return this.#skillCatalog.entries;
+    }
     async searchSkills(query, minScore, limit) {
         return this.#runFenced(async () => {
             if (!this.#hasSkills)
@@ -1108,20 +1177,7 @@ export class QmdMemoryManager {
             let skillIndex = this.#skillIndex;
             if (!skillIndex) {
                 const pending = (async () => {
-                    // Sources iterate in configuration order, so the first skill of a name wins.
-                    const byName = new Map();
-                    for (const source of this.#sources.values()) {
-                        if (source.kind !== "skills")
-                            continue;
-                        for (const document of readSkillDocuments(source)) {
-                            const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
-                            const key = name.toLowerCase();
-                            if (byName.has(key))
-                                continue;
-                            byName.set(key, { name, description: frontmatterValue(document.body, "description") ?? "", path: document.path });
-                        }
-                    }
-                    const skills = [...byName.values()];
+                    const skills = this.#getSkillCatalog();
                     const embeddings = await llm.embedBatch(skills.map((candidate) => formatDocForEmbedding(candidate.description, candidate.name, llm.embedModelName)));
                     return skills.flatMap((candidate, index) => {
                         const embedding = embeddings[index]?.embedding;

@@ -46,6 +46,13 @@ test("operational override files reject malformed JSON, unknown keys and invalid
     ['{"extraction":{"inputTargetTokens":31000}}', /token budgets conflict/u],
     ['{"training":{"leaseMs":9000}}', /heartbeats must be shorter/u],
     ['{"memoryWhisperer":{"defaultApiEndpoint":"file:///tmp/query"}}', /memoryWhisperer.defaultApiEndpoint/u],
+    ['{"skillWhisperer":{"maxDirectCatalogSkills":0}}', /skillWhisperer.maxDirectCatalogSkills/u],
+    ['{"skillWhisperer":{"catalogBatchSize":81}}', /skillWhisperer.catalogBatchSize/u],
+    ['{"skillWhisperer":{"maxMatchesPerTurn":1.5}}', /skillWhisperer.maxMatchesPerTurn/u],
+    ['{"skillWhisperer":{"maxActiveSkillsPerSession":0}}', /skillWhisperer.maxActiveSkillsPerSession/u],
+    ['{"skillWhisperer":{"maxInjectedChars":32001}}', /skillWhisperer.maxInjectedChars/u],
+    ['{"skillWhisperer":{"maxDescriptionChars":0}}', /skillWhisperer.maxDescriptionChars/u],
+    ['{"skillWhisperer":{"sessionRetentionDays":-1}}', /skillWhisperer.sessionRetentionDays/u],
   ] as const) {
     write(content);
     assert.throws(() => loadOperationalDefaults(file), expected);

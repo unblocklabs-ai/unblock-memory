@@ -406,7 +406,10 @@ export class QmdMemoryRuntime {
         }
         return names;
     }
-    async getMemorySearchManager(params) {
+    getMemorySearchManager(params) {
+        return this.#getManager(params, true);
+    }
+    async #getManager(params, startMemory) {
         while (true) {
             const blocked = this.#admissionBlockedReason();
             if (blocked) {
@@ -417,24 +420,27 @@ export class QmdMemoryRuntime {
                 await closing.catch(() => undefined);
                 continue;
             }
-            let pending = this.#managers.get(params.agentId);
-            if (!pending) {
-                pending = this.#createManager(params.cfg, params.agentId);
-                this.#managers.set(params.agentId, pending);
-            }
+            let entry = this.#managers.get(params.agentId);
             try {
-                const manager = await pending;
+                if (!entry) {
+                    entry = { manager: this.#createManager(params.cfg, params.agentId) };
+                    this.#managers.set(params.agentId, entry);
+                }
+                if (startMemory) {
+                    entry.ready ??= this.#startManager(entry.manager);
+                    await entry.ready;
+                }
                 const blockedAfter = this.#admissionBlockedReason();
                 if (blockedAfter) {
                     return { manager: null, error: blockedAfter };
                 }
-                if (this.#managers.get(params.agentId) !== pending) {
+                if (this.#managers.get(params.agentId) !== entry) {
                     continue;
                 }
-                return { manager };
+                return { manager: entry.manager };
             }
             catch (error) {
-                if (this.#managers.get(params.agentId) === pending)
+                if (this.#managers.get(params.agentId) === entry)
                     this.#managers.delete(params.agentId);
                 return { manager: null, error: error instanceof Error ? error.message : String(error) };
             }
@@ -670,9 +676,9 @@ export class QmdMemoryRuntime {
         if (activeSync)
             await activeSync.catch(() => undefined);
         const previousClose = this.#closingManagers.get(agentId);
-        const pending = this.#managers.get(agentId);
+        const entry = this.#managers.get(agentId);
         this.#managers.delete(agentId);
-        if (!previousClose && !pending)
+        if (!previousClose && !entry)
             return;
         const closing = (async () => {
             let closeError;
@@ -684,17 +690,18 @@ export class QmdMemoryRuntime {
                     closeError = error;
                 }
             }
-            if (pending) {
-                let manager;
+            if (entry) {
+                let startupFailed = false;
                 try {
-                    manager = await pending;
+                    await entry.ready;
                 }
                 catch {
-                    // Failed startup already cleaned up its own manager inside #createManager.
+                    // Failed startup already cleaned up its own manager inside #startManager.
+                    startupFailed = true;
                 }
-                if (manager) {
+                if (!startupFailed) {
                     try {
-                        await manager.close();
+                        await entry.manager.close();
                     }
                     catch (error) {
                         closeError ??= error;
@@ -765,12 +772,26 @@ export class QmdMemoryRuntime {
             throw new Error(error ?? "memory unavailable");
         return manager.searchSkills(query, minScore, limit);
     }
+    async listSkills(params) {
+        // The first-use memory sync can load QMD embeddings; the catalog does not need it.
+        const { manager, error } = await this.#getManager(params, false);
+        if (!manager)
+            throw new Error(error ?? "memory unavailable");
+        return manager.listSkills();
+    }
     resolveSkillPath(params, path) {
         const workspaceDir = resolveAgentWorkspaceDir(params.cfg, params.agentId);
         const skillCorpora = this.#corpora.filter((corpus) => corpus.kind === "skills");
-        return resolveConfiguredSkillPath(workspaceDir, path, resolveSources(workspaceDir, skillCorpora));
+        const sources = resolveSources(workspaceDir, skillCorpora);
+        const direct = resolveConfiguredSkillPath(workspaceDir, path, sources);
+        if (direct)
+            return direct;
+        // A read can pin a configured alias even when its name lost catalog deduplication.
+        const aliases = this.#managers.get(params.agentId)?.manager.skillAliases(path) ?? [];
+        if (aliases.some(alias => resolveConfiguredSkillPath(workspaceDir, alias, sources) === path))
+            return path;
     }
-    async #createManager(cfg, agentId) {
+    #createManager(cfg, agentId) {
         const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
         const stateDir = this.#stateDir(agentId);
         const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files" || corpus.kind === "skills");
@@ -781,7 +802,7 @@ export class QmdMemoryRuntime {
             : undefined;
         if (sessionSource)
             sources.push(sessionSource);
-        const manager = new QmdMemoryManager({
+        return new QmdMemoryManager({
             workspaceDir,
             dbPath: join(stateDir, "index.sqlite"),
             curationPath: join(stateDir, MEMORY_DATABASE),
@@ -792,15 +813,16 @@ export class QmdMemoryRuntime {
             sessions,
             trackRecallLocators: this.#recallLedgerEnabled,
         });
+    }
+    async #startManager(manager) {
         try {
             await manager.start();
         }
         catch (error) {
-            // The manager is not in the runtime's resolved cache yet, so we own cleanup.
+            // Release a failed startup before the cache can admit a replacement.
             await manager.close().catch(() => undefined);
             throw error;
         }
-        return manager;
     }
     #sessionConfig(cfg, agentId) {
         const corpus = this.#corpora.find(corpus => corpus.kind === "sessions");

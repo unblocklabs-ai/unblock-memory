@@ -1,8 +1,8 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 
 type Whisperer = "skill" | "memory" | "safety" | "myTurn";
-type Outcome = "missing_key" | "decision_disabled" | "no_candidates" | "rejected" | "cooldown" |
-  "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" |
+type Outcome = "missing_key" | "decision_disabled" | "no_candidates" | "rejected" |
+  "emitted" | "active_reused" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" |
   "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" |
   "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
 

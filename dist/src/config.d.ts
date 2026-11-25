@@ -71,6 +71,7 @@ export type UnblockMemoryConfig = {
         enabled: boolean;
         historyMessages: number;
         minScore: number;
+        /** Legacy fleet setting; active skills no longer cool down. */
         cooldownTurns: number;
     };
     memoryWhisperer: {

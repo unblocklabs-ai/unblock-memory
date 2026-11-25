@@ -7,6 +7,7 @@ import type { ExtractionConfig } from "./extraction-config.js";
 import type { AllowedDocumentPaths, QMDStore, VectorSearchResult } from "@unblocklabs/qmd";
 import chokidar, { type FSWatcher } from "chokidar";
 import picomatch from "picomatch";
+import { isScalar, parseDocument } from "yaml";
 import {
   ensureMemoryAnalysisSchema,
   latestAnalysisCollections,
@@ -54,7 +55,7 @@ import {
 } from "./session-sync.js";
 import { parseSessionMessageSpans, sessionContextSpans, sessionSnippetMessages,
   type SessionMetadata } from "./session-projector.js";
-import { parseSafeVirtualPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
+import { parseSafeVirtualPath, resolveConfiguredSkillPath, sourceMatchesPath, type ResolvedSource } from "./sources.js";
 import { auditQualityPage, type QualityCursor } from "./quality-audit.js";
 import { qualityTaskPresence } from "./quality-triage.js";
 import { reviewIndexedClaim } from "./evidence-review.js";
@@ -98,12 +99,13 @@ export type ManagerSessionConfig = {
   timezone: string;
 };
 
-export type SkillSearchCandidate = {
+export type SkillCatalogEntry = {
   name: string;
   description: string;
   path: string;
-  score: number;
 };
+
+export type SkillSearchCandidate = SkillCatalogEntry & { score: number };
 
 type AnalysisStore = ManagerStore & Pick<QMDStore, "internal">;
 
@@ -111,13 +113,8 @@ type SkillIndexEntry = SkillSearchCandidate & {
   embedding: number[];
 };
 
-type SkillDocument = {
-  path: string;
-  body: string;
-};
-
-function readSkillDocuments(source: ResolvedSource): SkillDocument[] {
-  const documents: SkillDocument[] = [];
+function readSkillSource(source: ResolvedSource): SkillCatalogEntry[] {
+  const entries: SkillCatalogEntry[] = [];
   const visitedDirectories = new Set<string>();
   const visit = (directory: string) => {
     let canonicalDirectory: string;
@@ -151,19 +148,36 @@ function readSkillDocuments(source: ResolvedSource): SkillDocument[] {
       const relativePath = relative(source.root, path).split(sep).join("/");
       if (kind !== "file" || basename(path).toLowerCase() !== "skill.md" ||
         !picomatch.isMatch(relativePath, source.pattern, { dot: true })) continue;
-      documents.push({ path, body: readFileSync(path, "utf8") });
+      entries.push(readSkillCatalogEntry(path));
     }
   };
   visit(source.root);
-  return documents;
+  return entries;
 }
 
 function frontmatterValue(body: string, key: "name" | "description"): string | undefined {
-  const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\n|$)/u.exec(body)?.[1];
-  const raw = frontmatter?.split("\n")
-    .map((line) => new RegExp(`^${key}:\\s*(.+?)\\s*$`, "u").exec(line)?.[1])
-    .find((value) => value !== undefined);
-  return raw?.replace(/^(?:"(.*)"|'(.*)')$/u, "$1$2").trim();
+  const frontmatter = /^\uFEFF?---[ \t]*\r?\n((?:[^\n]*\n)*?)---[ \t]*(?:\r?\n|$)/u.exec(body)?.[1];
+  if (frontmatter === undefined) return;
+  const document = parseDocument(frontmatter, { schema: "failsafe" });
+  const scalar = document.get(key, true);
+  // Some existing skills use unquoted punctuation that is invalid YAML.
+  if (!isScalar(scalar) && document.errors.length) {
+    const raw = new RegExp(`^${key}:[ \\t]*(.+)$`, "mu").exec(frontmatter)?.[1]?.trim();
+    if (raw) return raw;
+  }
+  if (!isScalar(scalar) || typeof scalar.value !== "string") return;
+  return scalar.type === "BLOCK_FOLDED" || scalar.type === "BLOCK_LITERAL"
+    ? scalar.value
+    : scalar.value.trim();
+}
+
+export function readSkillCatalogEntry(path: string): SkillCatalogEntry {
+  const body = readFileSync(path, "utf8");
+  return {
+    name: frontmatterValue(body, "name") || basename(dirname(path)),
+    description: frontmatterValue(body, "description") ?? "",
+    path,
+  };
 }
 
 function cosineSimilarity(left: readonly number[], right: readonly number[]): number {
@@ -360,6 +374,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   #closePromise?: Promise<void>;
   #watcher?: FSWatcher;
   #watchReady?: Promise<void>;
+  #watchMemory = false;
   #watchTimer?: NodeJS.Timeout;
   readonly #watchCollections = new Set<string>();
   #watchError?: string;
@@ -369,6 +384,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   #sessionMetadata = new Map<string, SessionMetadata>();
   #sessionManifest?: SessionManifest;
   #sessionManifestMtimeNs?: bigint;
+  #skillCatalog?: { entries: SkillCatalogEntry[]; aliases: Map<string, string[]> };
   #skillIndex?: Promise<SkillIndexEntry[]>;
   #qualityAuditRunning = false;
   #reviewLifetime = new AbortController();
@@ -437,6 +453,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       await this.#reloadSessionMetadata();
     }
     this.#assertOpen();
+    this.#watchMemory = true;
     this.#startWatcher();
     await this.sync({ reason: "first-use" });
     await this.#watchReady;
@@ -481,7 +498,11 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       ignored: (path, stats) => Boolean(stats && !stats.isDirectory() && !path.toLowerCase().endsWith(".md")),
     });
     this.#watchReady = new Promise((resolve) => {
-      this.#watcher?.once("ready", resolve);
+      this.#watcher?.once("ready", () => {
+        // A cold catalog read can predate watcher readiness.
+        this.#invalidateSkills();
+        resolve();
+      });
       this.#watcher?.once("error", () => resolve());
     });
     this.#watcher.on("error", (error) => {
@@ -491,12 +512,17 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       if (this.#closed) return;
       const matchingSources = [...this.#sources.values()].filter((source) =>
         source.kind !== "sessions" && sourceMatchesPath(source, path));
-      if (matchingSources.some((source) => source.kind === "skills")) this.#skillIndex = undefined;
-      if (!matchingSources.some((source) => source.kind !== "skills")) return;
+      if (matchingSources.some((source) => source.kind === "skills")) this.#invalidateSkills();
+      if (!this.#watchMemory || !matchingSources.some((source) => source.kind !== "skills")) return;
       for (const source of matchingSources) if (source.kind !== "skills") this.#watchCollections.add(source.collection);
       this.#dirty = true;
       this.#scheduleWatchSync();
     });
+  }
+
+  #invalidateSkills(): void {
+    this.#skillCatalog = undefined;
+    this.#skillIndex = undefined;
   }
 
   #scheduleWatchSync(retry = false): void {
@@ -1284,6 +1310,41 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     return results.filter(hit => !hit.path.startsWith(EXTRACTED_PREFIX) || finalPaths.has(hit.path));
   }
 
+  async listSkills(): Promise<SkillCatalogEntry[]> {
+    return this.#getSkillCatalog().map((entry) => ({ ...entry }));
+  }
+
+  skillAliases(canonicalPath: string): readonly string[] {
+    this.#getSkillCatalog();
+    return this.#skillCatalog?.aliases.get(canonicalPath) ?? [];
+  }
+
+  #getSkillCatalog(): readonly SkillCatalogEntry[] {
+    this.#assertOpen();
+    if (!this.#hasSkills) return [];
+    this.#startWatcher();
+    if (!this.#skillCatalog) {
+      const byName = new Map<string, SkillCatalogEntry>();
+      const aliases = new Map<string, string[]>();
+      for (const source of this.#sources.values()) {
+        if (source.kind !== "skills") continue;
+        for (const entry of readSkillSource(source)) {
+          const canonical = resolveConfiguredSkillPath(this.#workspaceDir, entry.path, [source]);
+          if (!canonical) continue;
+          if (canonical !== entry.path) {
+            const paths = aliases.get(canonical);
+            if (paths) paths.push(entry.path);
+            else aliases.set(canonical, [entry.path]);
+          }
+          const key = entry.name.toLowerCase();
+          if (!byName.has(key)) byName.set(key, entry);
+        }
+      }
+      this.#skillCatalog = { entries: [...byName.values()], aliases };
+    }
+    return this.#skillCatalog.entries;
+  }
+
   async searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]> {
     return this.#runFenced(async () => {
       if (!this.#hasSkills) return [];
@@ -1296,18 +1357,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       let skillIndex = this.#skillIndex;
       if (!skillIndex) {
         const pending = (async () => {
-          // Sources iterate in configuration order, so the first skill of a name wins.
-          const byName = new Map<string, Omit<SkillSearchCandidate, "score">>();
-          for (const source of this.#sources.values()) {
-            if (source.kind !== "skills") continue;
-            for (const document of readSkillDocuments(source)) {
-              const name = frontmatterValue(document.body, "name") || basename(dirname(document.path));
-              const key = name.toLowerCase();
-              if (byName.has(key)) continue;
-              byName.set(key, { name, description: frontmatterValue(document.body, "description") ?? "", path: document.path });
-            }
-          }
-          const skills = [...byName.values()];
+          const skills = this.#getSkillCatalog();
           const embeddings = await llm.embedBatch(
             skills.map((candidate) =>
               formatDocForEmbedding(candidate.description, candidate.name, llm.embedModelName)),

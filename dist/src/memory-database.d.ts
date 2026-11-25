@@ -1,7 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 export declare const MEMORY_DATABASE = "unblock-memory.sqlite";
 /** Separate domain stores share settings, not a monolithic data-access API. */
-export declare function openMemoryDatabase(path: string): DatabaseSync;
+export declare function openMemoryDatabase(path: string, { busyTimeoutMs }?: {
+    busyTimeoutMs?: number | undefined;
+}): DatabaseSync;
 /** Runs synchronous writes atomically; never pass an async callback. */
 export declare function immediateTransaction<T>(db: DatabaseSync, fn: () => T): T;
 export declare function tableExists(db: DatabaseSync, name: string): boolean;

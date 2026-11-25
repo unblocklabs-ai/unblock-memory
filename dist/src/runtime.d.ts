@@ -2,7 +2,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
 import type { ExtractionConfig } from "./extraction-config.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
-import { QmdMemoryManager } from "./manager.js";
+import { QmdMemoryManager, type SkillCatalogEntry } from "./manager.js";
 import { type SessionSyncResult } from "./session-sync.js";
 export type SessionSyncStatus = {
     status: "idle";
@@ -82,6 +82,10 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         cfg: OpenClawConfig;
         agentId: string;
     }, query: string, minScore: number, limit: number): Promise<import("./manager.js").SkillSearchCandidate[]>;
+    listSkills(params: {
+        cfg: OpenClawConfig;
+        agentId: string;
+    }): Promise<SkillCatalogEntry[]>;
     resolveSkillPath(params: {
         cfg: OpenClawConfig;
         agentId: string;

@@ -115,7 +115,7 @@ Everything below is off until you configure it.
 | Feature | What it does |
 | --- | --- |
 | [Session indexing](docs/retrieval.md#sessions) | Makes past conversations searchable. Group and channel chats by default; DMs only if you add them. |
-| [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill for a user message. Never runs it. Turns on when you add a `skills` corpus; works without a remote decision model. |
+| [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Routes relevant skills into a persistent per-session list. Never runs them. Turns on with a `skills` corpus; can also route locally. |
 | [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to three relevant past excerpts before the agent replies. Needs a configured decision endpoint (`decisionModel`); optionally uses a self-hosted query-generation API with local fallback. |
 | [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if the decision endpoint is unavailable. |
 | [My Turn](docs/configuration.md#my-turn) | Asks the configured decision model (default `liquid/d1.2-ultra` via Codex LB) whether a group/channel conversation needs this agent's response. Advises `NO_REPLY` only when silence is clearly favored; the agent keeps the final say. Opt-in; failures leave the turn unchanged. |

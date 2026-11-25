@@ -9,7 +9,8 @@ import { QmdMemoryManager } from "../../src/manager.js";
 import { resolveSources } from "../../src/sources.js";
 import { buildSkillWhispererQuery } from "../../src/whisperer-context.js";
 import { cases } from "./cases.js";
-import { selectSkill } from "../../src/decision-ranking.js";
+import { scoreSkillCatalog } from "../../src/decision-ranking.js";
+import { DEFAULTS } from "../../src/defaults.js";
 import { resolveConfig } from "../../src/config.js";
 import { resolveDecisionCredential } from "../../src/decision-client.js";
 
@@ -57,7 +58,8 @@ async function main() {
   if (args.some(arg => arg !== "--live")) throw new Error("Usage: compare.ts [--live]");
   if (!args.includes("--live")) {
     console.log(`${cases.length} synthetic cases, ${roster.length} snapshotted skills. No API calls made.`);
-    console.log(`Use --live with CODEX_LB_API_KEY for local embeddings and up to ${cases.length * (shortlistSize + roster.length)} independent decision requests. No conversation logs are read.`);
+    const batchSize = DEFAULTS.skillWhisperer.catalogBatchSize;
+    console.log(`Use --live with CODEX_LB_API_KEY for local embeddings and up to ${cases.length * (Math.ceil(shortlistSize / batchSize) + Math.ceil(roster.length / batchSize))} batched decision requests. No conversation logs are read.`);
     return;
   }
   const { decisionModel } = resolveConfig({});
@@ -71,7 +73,7 @@ async function main() {
     const directory = join(workspaceDir, "skills", skill.name);
     await mkdir(directory, { recursive: true });
     // Normalize YAML to single-line metadata so both selectors receive identical descriptions.
-    await writeFile(join(directory, "SKILL.md"), `---\nname: ${skill.name}\ndescription: ${skill.description.replace(/\s+/g, " ")}\n---\n`);
+    await writeFile(join(directory, "SKILL.md"), `---\nname: ${JSON.stringify(skill.name)}\ndescription: ${JSON.stringify(skill.description.replace(/\s+/g, " "))}\n---\n`);
   }
   const manager = new QmdMemoryManager({
     workspaceDir, dbPath: join(reportDir, "index.sqlite"),
@@ -85,7 +87,7 @@ async function main() {
     selectorHash: createHash("sha256").update(await readFile(new URL("../../src/decision-ranking.ts", import.meta.url))).digest("hex"),
     qmdPackage: JSON.parse(await readFile(join(root, "node_modules/@unblocklabs/qmd/package.json"), "utf8")).version as string,
     embeddingModelOverride: process.env.QMD_EMBED_MODEL ?? null,
-    selector: "production-per-candidate-noul", roster, cases,
+    selector: "production-batched-catalog-noul", roster, cases,
   };
   await writeFile(join(reportDir, "inputs.json"), JSON.stringify(metadata, null, 2));
   const checkpoint = () => writeFile(join(reportDir, "results.json"), JSON.stringify(rows, null, 2));
@@ -98,13 +100,13 @@ async function main() {
     const started = performance.now();
     const nativeFetch = globalThis.fetch;
     const usage = { input_tokens: 0, output_tokens: 0 };
-    const trace: { candidate: string; status?: number; elapsedMs?: number }[] = [];
+    const trace: { candidates: string[]; status: number; elapsedMs: number }[] = [];
     let failed = 0;
     globalThis.fetch = async (url, init) => {
       const start = performance.now();
       const body = JSON.parse(String(init?.body));
       const state = Array.isArray(body.state) ? body.state[0] : body.state;
-      const item = { candidate: String(state.candidate.name), status: 0, elapsedMs: 0 };
+      const item = { candidates: state.skills.map(({ name }: { name: string }) => name), status: 0, elapsedMs: 0 };
       trace.push(item);
       try {
         const response = await nativeFetch(url, init);
@@ -120,9 +122,9 @@ async function main() {
       } finally { item.elapsedMs = performance.now() - start; }
     };
     try {
-      const index = await selectSkill({ apiKey: apiKey!, endpoint, model: resolvedModel, timeoutMs: 30_000,
-        currentRequest: row.prompt, history: row.history, candidates: skills, onCandidateFailure: () => { failed++; } });
-      return { choice: index === undefined ? "none" : skills[index].name,
+      const [match] = await scoreSkillCatalog({ apiKey: apiKey!, endpoint, model: resolvedModel, timeoutMs: 30_000,
+        currentRequest: row.prompt, history: row.history, candidates: skills, maxMatches: 1, onBatchFailure: () => { failed++; } });
+      return { choice: match ? skills[match.index].name : "none",
         elapsedMs: performance.now() - started, requests: trace.length, failed, usage };
     } finally {
       globalThis.fetch = nativeFetch;
@@ -147,7 +149,7 @@ async function main() {
         baseline: candidates[0]?.score >= minScore ? candidates[0].name : "none" };
       rows.push(row);
       await checkpoint();
-      // Each arm uses the production selector: one concurrent request per skill.
+      // Each arm uses the production batched selector and records its best match.
       row.hybrid = await ask(row, candidates.slice(0, shortlistSize).map(candidate => candidate.name));
       await checkpoint();
       row.direct = await ask(row, roster.map(skill => skill.name));
@@ -199,9 +201,9 @@ async function main() {
     "- Hybrid uses the unthresholded top three. It deliberately replaces the 0.5 similarity gate; it is not merely a veto after that gate.",
     "- All arms see the same normalized descriptions and up to five prior messages. decision model gets explicit currentRequest/history fields; vector search uses the production flattened query.",
     "- Uses the production per-skill usefulness threshold; no threshold was fitted to these cases. Highest qualifying probability wins, ties retain retrieval order.",
-    "- Isolated fresh turns: cooldowns, path rejection, actual agent skill use, and downstream task success are not evaluated here.",
+    "- Isolated fresh turns: active-skill persistence, path rejection, actual agent skill use, and downstream task success are not evaluated here.",
     "- Local skills are snapshots, not Bill's configured inventory. No private conversations, dossiers, or memory documents were transmitted.",
-    "- Estimated cost uses successful responses and published input-token pricing, not an invoice; failed-request billing is unknown. Timings include HTTP overhead, not an SLA. No retries. attempts.jsonl records candidate-level statuses and latency.",
+    "- Estimated cost uses successful responses and published input-token pricing, not an invoice; failed-request billing is unknown. Timings include HTTP overhead, not an SLA. No retries. attempts.jsonl records batch statuses and latency.",
     "- Calls run in fixed vector/hybrid/direct order; cache, warm-up and time-of-run effects are not controlled. Do not infer a reliable speed advantage between API arms from this pass.",
   ];
   await writeFile(join(reportDir, "report.md"), lines.join("\n") + "\n");

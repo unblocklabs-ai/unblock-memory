@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, mkdtempDisposable, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -599,6 +599,47 @@ test("v2 Whisperer routes each query only to its lane across the approved corpus
   } finally { await manager.close(); }
 });
 
+test("lists YAML skill metadata in source order and refreshes it without opening QMD", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "unblock-memory-catalog-"));
+  const workspace = directory.path;
+  const descriptions = [
+    [">\n  Fold these\n  lines.", "Fold these lines.\n"],
+    [">-\n  Fold and\n  strip.", "Fold and strip."],
+    ["|+\n  Keep\n  both breaks.\n", "Keep\nboth breaks.\n\n"],
+    ["|\n  Literal\n  lines.", "Literal\nlines.\n"],
+    ["|-\n  Strip\n  the break.", "Strip\nthe break."],
+    ["Continue this\n  plain scalar.", "Continue this plain scalar."],
+    ['"Double: quoted."', "Double: quoted."],
+    ["'Single: quoted.'", "Single: quoted."],
+    ["Plain text.", "Plain text."],
+  ];
+  const expected = await Promise.all(descriptions.map(async ([scalar, description], i) => {
+    const name = `skill-${i}`;
+    const folder = join(workspace, "skills", name);
+    const path = join(folder, "SKILL.md");
+    await mkdir(folder, { recursive: true });
+    await writeFile(path, `---\nname: ${name}\ndescription: ${scalar}\n---\nOnly the frontmatter belongs in the catalog.\n`);
+    return { name, description, path };
+  }));
+  await mkdir(join(workspace, "duplicates"));
+  await writeFile(join(workspace, "duplicates", "SKILL.md"), "---\nname: SKILL-0\ndescription: Wrong source.\n---\n");
+  const manager = new QmdMemoryManager({
+    workspaceDir: workspace,
+    dbPath: join(workspace, "index.sqlite"),
+    sources: resolveSources(workspace, [{
+      name: "skills", kind: "skills", paths: ["skills/**/SKILL.md", "duplicates/SKILL.md"],
+    }]),
+    storeFactory: async () => { throw new Error("Catalog listing must not open QMD"); },
+  });
+  try {
+    assert.deepEqual(await manager.listSkills(), expected);
+    await writeFile(expected[0]!.path, "---\nname: skill-0\ndescription: Updated.\n---\n");
+    await waitFor(async () => (await manager.listSkills())[0]?.description === "Updated.", "catalog refresh");
+  } finally {
+    await manager.close();
+  }
+});
+
 test("keeps skills out of QMD while direct skill search watches frontmatter", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-search-skills-"));
   const dbPath = join(workspace, "index.sqlite");
@@ -608,7 +649,7 @@ test("keeps skills out of QMD while direct skill search watches frontmatter", as
   await mkdir(join(workspace, "global-target", "inspect"), { recursive: true });
   await symlink(join(workspace, "global-target"), join(workspace, "global-skills", "bundle"), "dir");
   await writeFile(join(workspace, "MEMORY.md"), "memory body\n");
-  const localSkill = "---\nname: deploy-helper\ndescription: Deploy releases safely.\n---\nLOCAL PROCEDURE MUST NOT BE EMBEDDED.\n";
+  const localSkill = "---\nname: deploy-helper\ndescription: >-\n  Deploy releases\n  safely.\n---\nLOCAL PROCEDURE MUST NOT BE EMBEDDED.\n";
   const globalSkill = "---\nname: deploy-helper\ndescription: Deploy releases globally.\n---\nGLOBAL PROCEDURE MUST NOT BE EMBEDDED.\n";
   const globalInspector = "---\nname: global-inspector\ndescription: Inspect global releases.\n---\nINSPECT PROCEDURE MUST NOT BE EMBEDDED.\n";
   await writeFile(join(workspace, "skills", "deploy", "SKILL.md"), localSkill);

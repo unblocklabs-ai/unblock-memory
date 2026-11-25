@@ -667,7 +667,6 @@ export function registerUnblockMemory(api) {
             api.logger.warn(`unblock-memory scheduled session sync could not start: ${String(error)}`);
         }));
     }
-    api.on("gateway_stop", () => runtime.close());
     let peopleWhisperer;
     const peopleStores = new PeopleStores({
         maxOpenTodos: config.people.todos.maxOpen,
@@ -707,6 +706,7 @@ export function registerUnblockMemory(api) {
         myTurn: registerMyTurn(api, config.myTurn, config.decisionModel, diagnostics),
         safety: registerSafetyWhisperer(api, config, diagnostics),
     });
+    api.on("gateway_stop", () => runtime.close());
     api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics, recallLedger), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx, recallLedger), { names: ["memory_get"] });
     api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {

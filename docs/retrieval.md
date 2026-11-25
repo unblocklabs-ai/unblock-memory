@@ -387,14 +387,14 @@ Excerpts are deduplicated by normalized content
 and overlapping source lines; recently injected content has a ten-user-turn cooldown
 by default. Cooldown state is in memory and resets on session end or Gateway restart.
 Memory and Skill Whisperer reuse their result when the host rebuilds the same run's
-prompt, without repeating retrieval or advancing cooldown.
+prompt, without repeating retrieval or routing.
 The complete hint payload is capped at 5,000 characters plus the wrapper tags;
 when multiple selected hints exceed that limit after JSON escaping, Memory
 Whisperer emits the highest-ranked complete hints that fit rather than slicing
 excerpts or dropping everything, and only records cooldown for emitted hints.
 
 All whisperer contributions share that appended block, in this order: `<memory>`,
-`<skill>`, then `<people>` when People Whisperer has an eligible blurb. Empty sections
+`<skills>`, then `<people>` when People Whisperer has an eligible blurb. Empty sections
 are omitted; no wrapper is emitted when none qualify. The independent whisperers
 run concurrently, and a failed contribution does not discard successful siblings.
 
@@ -495,61 +495,32 @@ bodies, or raw exceptions; exact query text is not retained by this telemetry.
 ## Skill Whisperer
 
 
-Skill Whisperer is a semantic reminder for user turns. It turns on by default once
-you configure one isolated `skills` corpus and authorize
-`plugins.entries.unblock-memory.hooks.allowConversationAccess`. Without a skills
-corpus it stays inactive: no prompt hook is registered and diagnostics report it
-disabled; an explicit `skillWhisperer.enabled: true` without one logs a warning.
-Set `skillWhisperer.enabled` to `false` to opt out. It
-embeds the current prompt plus the configured number of prior user/assistant
-messages, compares it with each configured skill's frontmatter `name` and
-`description`. With decision model enabled and a key available, the top three valid
-candidates are graded in separate concurrent decision model requests, without a vector-score cutoff.
-Each request sees only one skill's name/description plus the conversation. Code chooses
-the highest usefulness probability at or above **0.7**, with retrieval order breaking ties.
-If none qualifies, no skill is suggested; there is no vector fallback. This is an
-absolute per-skill usefulness judgment, not a multi-skill Choice distribution. Full skill
-procedures do not influence routing; no skill is invoked automatically.
+Skill Whisperer turns on with a configured `skills` corpus and requires
+`plugins.entries.unblock-memory.hooks.allowConversationAccess`. Set
+`skillWhisperer.enabled: false` to opt out. Once you verify your configured corpus
+covers the skills you want, you can set OpenClaw `skills.limits.maxSkillsInPrompt: 0`.
 
-The reminder follows memory, when present, in the same appended `<unblock_memory>`
-block: `<skill>This skill may be relevant: "/path/to/SKILL.md"</skill>`.
-It includes the path but does not repeat the skill name.
+With [decision-model credentials](configuration.md#shared-decision-model-credentials),
+it reads the catalog directly from skill frontmatter and scores unpinned skills
+in one request per 80 skills, without QMD embeddings. Catalogs above 150 skills
+are prefiltered by QMD. Without a key or with `decisionModel.enabled: false`, it
+uses local vector matches above `skillWhisperer.minScore`. Provider failures and
+the three-second routing deadline preserve existing skills without switching to
+vector-only routing. Superseded or ended runs emit nothing.
 
-See [shared decision model credentials](configuration.md#shared-decision-model-credentials) for key setup,
-rotation and the `enabled: true` / `timeoutMs: 1500` defaults.
+Up to five matches are added per turn, at a default usefulness threshold of
+0.7. Successful `read` calls on configured `SKILL.md` files also pin skills.
+The active list holds up to 15, survives Gateway restarts and compaction, and
+clears when the session ends. Inactive entries expire after 30 days. Skills
+appear in activation order in a `<skills>` block (up to 4,000 characters) after
+the user prompt. The block points to `SKILL.md`; it never runs the skill.
 
-If the decision model is disabled or no key is found, selection uses the original local
-vector process and `skillWhisperer.minScore`. With a key present, an API error,
-invalid response, or timeout excludes that candidate and logs a sanitized warning;
-successful siblings can still qualify. If all fail, no hint is emitted. It does
-not switch to vector-only selection. There are no automatic HTTP retries. Other
-credential-file read errors likewise produce a warning and no hint.
+**Privacy:** decision requests include up to 12,000 characters of current request
+and visible recent user/assistant text, plus candidate skill names and descriptions.
+Source paths, full skill procedures, system messages, and tool results are not
+added to the request. Disable `decisionModel.enabled` to keep routing local.
 
-The complete skill contribution has a fixed three-second deadline, including
-credential resolution, retrieval and provider calls. A slow skill lookup cannot
-hold up ready memory or people hints beyond that budget. Session teardown,
-superseding turns and Gateway shutdown cancel its wait and provider requests;
-shared indexing/embedding work can finish for other callers, but cannot trigger
-late decision model calls or hints for the cancelled run.
-
-**Privacy:** enabled decision-model selection sends up to 12,000 characters of current
-prompt/recent user-assistant text, plus the shortlisted names/descriptions, to the
-configured `decisionModel.endpoint` (defaulting to `https://codex.unblocklabs.ai/v1/decisions`,
-routed to OpenRouter's `liquid/d1.2-ultra`). Source-path fields, full skill procedures, tool-result
-messages, and system messages are excluded; dossiers and ordinary memory files are not read
-for this call. Material already quoted in user/assistant text can still be included.
-Disable `decisionModel.enabled` to keep Skill Whisperer entirely local.
-
-The defaults use five prior messages, a vector-only score threshold of `0.5`,
-and a ten-turn cooldown. A skill is cooling down after either a suggestion or a
-successful direct `read` of its indexed `SKILL.md`. When the selected
-skill is cooling down, no hint is emitted; Skill Whisperer does not fall through
-to a weaker match. When every shortlisted skill is cooling down, no decision requests are made.
-Cooldown state is per session and intentionally resets with
-the Gateway. Shell-command reads are not tracked.
-
-The `skills` corpus shares the existing QMD store and warm embedding model but
-is private to Skill Whisperer: it is excluded from ordinary `memory_search`
+The `skills` corpus is private to Skill Whisperer: it is excluded from ordinary `memory_search`
 (including `corpora: ["all"]`), `memory_get`, clustering, and memory-maintenance
 tasks. Paths are explicit by design; the plugin does not reconstruct
 OpenClaw's effective skill inventory from `openclaw.json`. Configured skill
