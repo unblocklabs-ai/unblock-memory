@@ -1,6 +1,8 @@
+import { DEFAULTS } from "./defaults.js";
 export function resolveResponseAudit(value, corpora) {
     const defaults = { enabled: false, sentimentEnabled: true, senderIds: [], chatTypes: ["direct"],
-        historyMessages: 6, lookbackDays: 30, maxEpisodes: 20, intervalMinutes: 60, memoryCorpora: [] };
+        historyMessages: DEFAULTS.responseAudit.defaultHistoryMessages, lookbackDays: DEFAULTS.responseAudit.defaultLookbackDays,
+        maxEpisodes: DEFAULTS.responseAudit.defaultMaxEpisodes, intervalMinutes: DEFAULTS.responseAudit.defaultIntervalMinutes, memoryCorpora: [] };
     if (value === undefined)
         return defaults;
     if (!value || typeof value !== "object" || Array.isArray(value))

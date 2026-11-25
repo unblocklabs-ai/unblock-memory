@@ -1,7 +1,8 @@
+import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
 import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, } from "./decision-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
-const SKILL_MIN_USEFULNESS = 0.7;
+const SKILL_MIN_USEFULNESS = DEFAULTS.skillWhisperer.minDecisionUsefulness;
 const SKILL_USEFUL_QUESTIONS = {
     useful: noul({
         question: "Would using the skill described by `candidate` materially help fulfill `currentRequest`?",

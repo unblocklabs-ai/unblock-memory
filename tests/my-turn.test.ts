@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import manifest from "../openclaw.plugin.json" with { type: "json" };
 import { resolveConfig } from "../src/config.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
 import type { registerMyTurn } from "../src/my-turn.js";
@@ -61,7 +60,6 @@ function transport(t: TestContext, respond: (body: RequestBody, init?: RequestIn
 
 test("My Turn defaults off and validates its public configuration", () => {
   assert.deepEqual(resolveConfig({}).myTurn, { enabled: false, historyMessages: 10, channels: {} });
-  assert.deepEqual(manifest.configSchema.properties.myTurn.default, resolveConfig({}).myTurn);
   assert.equal(harness({}).hooks.has("before_prompt_build"), false);
   assert.deepEqual(resolveConfig({ myTurn: { enabled: true, channels: { slack: {}, imessage: { enabled: false } } } }).myTurn,
     { enabled: true, historyMessages: 10, channels: { slack: { enabled: true }, imessage: { enabled: false } } });

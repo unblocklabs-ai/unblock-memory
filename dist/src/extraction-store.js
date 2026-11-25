@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createHash, randomUUID } from "node:crypto";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { jsonHash } from "./json-hash.js";
@@ -14,6 +15,7 @@ export function extractionPolicyFingerprint(params) {
         minSupport: params.minSupport,
         minRetention: params.minRetention,
         minReplacement: params.minReplacement,
+        extractorModel: params.extractorModel ?? null,
         validatorModel: params.validatorModel ?? null,
     });
 }
@@ -88,13 +90,13 @@ export class ExtractionStore {
     claim(scheduled, intervalMs) {
         const owner = randomUUID(), now = Date.now();
         const result = this.db.prepare(`UPDATE extraction_worker SET owner=?,lease_until=?,next_run=?
-      WHERE id=1 AND lease_until<? AND (?=0 OR next_run<=?)`).run(owner, now + 180_000, now + intervalMs, now, Number(scheduled), now);
+      WHERE id=1 AND lease_until<? AND (?=0 OR next_run<=?)`).run(owner, now + DEFAULTS.extraction.leaseMs, now + intervalMs, now, Number(scheduled), now);
         return result.changes ? owner : undefined;
     }
     renew(owner) {
         const now = Date.now();
         if (!this.db.prepare("UPDATE extraction_worker SET lease_until=? WHERE id=1 AND owner=? AND lease_until>=?")
-            .run(now + 180_000, owner, now).changes)
+            .run(now + DEFAULTS.extraction.leaseMs, owner, now).changes)
             throw new ExtractionLeaseLostError();
     }
     release(owner) { this.db.prepare("UPDATE extraction_worker SET owner=NULL,lease_until=0 WHERE id=1 AND owner=?").run(owner); }

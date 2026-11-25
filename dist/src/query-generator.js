@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { abortable, abortedByTimeout } from "./abortable.js";
@@ -211,8 +212,10 @@ export class ApiQueryGenerator {
         this.config = config;
     }
     async generate(conversation, signal) {
-        const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+        const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(DEFAULTS.memoryWhisperer.queryClientTimeoutMs)]);
         throwIfQueryAborted(requestSignal);
+        if (!this.config.endpoint)
+            throw new QueryApiError("unavailable");
         if (!this.config.apiKeyFile)
             throw new QueryApiError("credentials");
         let token;
@@ -257,7 +260,7 @@ export class ApiQueryGenerator {
                 if (done)
                     break;
                 size += value.byteLength;
-                if (size > 16_384)
+                if (size > DEFAULTS.memoryWhisperer.queryResponseMaxBytes)
                     throw new QueryApiError("invalid_response");
                 chunks.push(value);
             }

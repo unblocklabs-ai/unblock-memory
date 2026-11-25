@@ -1,7 +1,7 @@
 import type { VectorSearchResult } from "@unblocklabs/qmd";
 import { type SessionMessageSpan } from "./session-projector.js";
-export declare const MEMORY_PASSAGE_CHARS = 1200;
-export declare const MEMORY_PASSAGE_VERSION = "complete-excerpt-1200-v1";
+export declare const MEMORY_PASSAGE_CHARS: number;
+export declare const MEMORY_PASSAGE_VERSION: string;
 type Passage = Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">;
 type LocatedPassage = {
     path: string;

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import type { ChatType, UnblockMemoryConfig } from "./config.js";
 import type { QueryLane, QueryPair } from "./query-contract.js";
 import { collectTraining } from "./training.js";
@@ -16,7 +17,7 @@ import { jsonHash } from "./json-hash.js";
 type Source = { databasePath: string; agentId: string; stateDir: string };
 type Options = { maxExamples?: number; dryRun?: boolean; threshold?: number };
 const LANES = ["lex", "vec"] as const;
-const SELECTION_VERSION = "independent-lanes-top3-mean-v2";
+const SELECTION_VERSION = `independent-lanes-top${DEFAULTS.training.topScoreCount}-mean-v2`;
 const TARGET_POLICY = "best-per-lane-no-minimum-v1";
 export const TRAINING_EVALUATION_CONCURRENCY = 4;
 
@@ -129,9 +130,9 @@ export async function generateTrainingQueries(source: Source, store: TrainingSto
   return { refreshed, ...result, threshold: options.threshold ?? TRAINING_GATE_THRESHOLD, model: TRAINING_TEACHER_MODEL };
 }
 
-/** Raw top-three average, including values below runtime's injection threshold. */
+/** Raw top-score average, including values below runtime's injection threshold. */
 export function trainingQueryScore(probabilities: readonly number[]) {
-  const top = probabilities.toSorted((a, b) => b - a).slice(0, 3);
+  const top = probabilities.toSorted((a, b) => b - a).slice(0, DEFAULTS.training.topScoreCount);
   return top.length ? top.reduce((sum, value) => sum + value, 0) / top.length : 0;
 }
 

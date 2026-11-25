@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -259,7 +260,7 @@ function createUpdateTool(stores, config, runtime, ctx) {
     return {
         name: "memory_people_update",
         label: "Update People Memory",
-        description: "Curate ongoing interaction feedback during nightly dreaming for the exact person. Replace a complete dossier: identity blurb <=70 words; role/relationship, preferences and workingStyle sections. Cite original evidence for every claim; preserve verified existing claims and their scope. Agent-assessed lessons require reviewedAt and expiresAt within 30 days. Automatic review checks every statement; use source-specific manualVerification only after checking original sources yourself. Delete contradicted/stale claims with a reason. Context refreshes on the next user turn.",
+        description: `Curate ongoing interaction feedback during nightly dreaming for the exact person. Replace a complete dossier: identity blurb <=${DEFAULTS.people.backgroundMaxWords} words; role/relationship, preferences and workingStyle sections. Cite original evidence for every claim; preserve verified existing claims and their scope. Agent-assessed lessons require reviewedAt and expiresAt within 30 days. Automatic review checks every statement; use source-specific manualVerification only after checking original sources yourself. Delete contradicted/stale claims with a reason. Context refreshes on the next user turn.`,
         parameters: updateParameters,
         async execute(_toolCallId, raw, signal) {
             const input = Value.Parse(updateParameters, raw);

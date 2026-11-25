@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { isDeepStrictEqual } from "node:util";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { record, nonBlank } from "./guards.js";
@@ -95,7 +96,7 @@ export async function reconcilePeopleLearning(cron, cfg, config, active = () => 
             },
             sessionTarget: "isolated", wakeMode: "now", deleteAfterRun: false,
             payload: {
-                kind: "agentTurn", message: peopleLearningPrompt(kind, agentId), timeoutSeconds: kind === "nightly" ? 2700 : 3600,
+                kind: "agentTurn", message: peopleLearningPrompt(kind, agentId), timeoutSeconds: kind === "nightly" ? DEFAULTS.people.learningNightlyTimeoutSec : DEFAULTS.people.learningWeeklyTimeoutSec,
                 toolsAllow: LEARNING_TOOLS,
             },
             delivery: { mode: "none" }, failureAlert: false,

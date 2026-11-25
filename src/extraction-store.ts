@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createHash, randomUUID } from "node:crypto";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import type { ExtractionMessage, MemoryProposal } from "./extraction-model.js";
@@ -22,6 +23,7 @@ export function extractionPolicyFingerprint(params: {
   minSupport: number;
   minRetention: number;
   minReplacement: number;
+  extractorModel?: string;
   validatorModel?: string;
 }): string {
   return jsonHash({
@@ -30,6 +32,7 @@ export function extractionPolicyFingerprint(params: {
     minSupport: params.minSupport,
     minRetention: params.minRetention,
     minReplacement: params.minReplacement,
+    extractorModel: params.extractorModel ?? null,
     validatorModel: params.validatorModel ?? null,
   });
 }
@@ -103,13 +106,13 @@ export class ExtractionStore {
   claim(scheduled: boolean, intervalMs: number): string | undefined {
     const owner = randomUUID(), now = Date.now();
     const result = this.db.prepare(`UPDATE extraction_worker SET owner=?,lease_until=?,next_run=?
-      WHERE id=1 AND lease_until<? AND (?=0 OR next_run<=?)`).run(owner, now + 180_000, now + intervalMs, now, Number(scheduled), now);
+      WHERE id=1 AND lease_until<? AND (?=0 OR next_run<=?)`).run(owner, now + DEFAULTS.extraction.leaseMs, now + intervalMs, now, Number(scheduled), now);
     return result.changes ? owner : undefined;
   }
   renew(owner: string) {
     const now = Date.now();
     if (!this.db.prepare("UPDATE extraction_worker SET lease_until=? WHERE id=1 AND owner=? AND lease_until>=?")
-      .run(now + 180_000, owner, now).changes) throw new ExtractionLeaseLostError();
+      .run(now + DEFAULTS.extraction.leaseMs, owner, now).changes) throw new ExtractionLeaseLostError();
   }
   release(owner: string) { this.db.prepare("UPDATE extraction_worker SET owner=NULL,lease_until=0 WHERE id=1 AND owner=?").run(owner); }
   readCheckpoint(sessionId: string): (Checkpoint & { error: string | null }) | undefined {

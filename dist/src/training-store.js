@@ -1,10 +1,11 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { TRAINING_PREPARATION } from "./training-input.js";
 import { TRAINING_GATE_MODEL, TRAINING_GATE_THRESHOLD, TRAINING_GATE_VERSION } from "./training-gate.js";
 import { TRAINING_RECIPE_VERSION } from "./training-models.js";
 import { jsonHash } from "./json-hash.js";
-const LEASE_MS = 120_000;
+const LEASE_MS = DEFAULTS.training.leaseMs;
 export class TrainingStore {
     #db;
     #owner = randomUUID();
@@ -118,7 +119,7 @@ export class TrainingStore {
         }
         catch (error) {
             leaseError = error;
-        } }, 10_000);
+        } }, DEFAULTS.training.heartbeatMs);
         heartbeat.unref();
         try {
             const value = await fn();

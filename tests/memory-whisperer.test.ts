@@ -11,7 +11,7 @@ import { WhispererDiagnostics } from "../src/diagnostics.js";
 import { ApiQueryGenerator, QueryApiError, queryConversation } from "../src/query-generator.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 
-const config = { ...resolveConfig(undefined).memoryWhisperer, enabled: true, corpora: ["memory", "sessions"], cooldownTurns: 2 };
+const config = { ...resolveConfig({ memoryWhisperer: { api: { endpoint: "https://query.example.test" } } }).memoryWhisperer, enabled: true, corpora: ["memory", "sessions"], cooldownTurns: 2 };
 const decisionModel = resolveConfig({ decisionModel: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).decisionModel;
 const context = { trigger: "user", agentId: "bill", sessionId: "current", sessionKey: "key", runId: "run-1" };
 const logPrefix = "unblock-memory memory_whisperer ";
@@ -510,7 +510,7 @@ function deferred<T>() {
 
 function harness(
   hits: CorpusMemorySearchResult[] = [hit("Deploy only after approval")],
-  options: { config?: Partial<typeof config>; decisionModel?: ReturnType<typeof resolveConfig>["decisionModel"];
+  options: { config?: Partial<ReturnType<typeof resolveConfig>["memoryWhisperer"]>; decisionModel?: ReturnType<typeof resolveConfig>["decisionModel"];
     search?: () => Promise<CorpusMemorySearchResult[]>;
     hybrid?: (queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">) => Promise<CorpusMemorySearchResult[]> } = {},
 ) {
@@ -565,16 +565,12 @@ test("selected memory keeps delimiter-like source text inside the combined promp
 test("memory whisperer requires explicit, known non-skill corpora and bounded controls", () => {
   assert.deepEqual(resolveConfig(undefined).memoryWhisperer, {
     enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5, maxHints: 3, cooldownTurns: 10, timeoutMs: 3000,
-    api: { endpoint: "http://192.168.1.191:18087" },
+    api: { endpoint: "" },
   });
   assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.5);
   assert.equal(resolveConfig({ memoryWhisperer: { minUsefulness: 0.9, maxHints: 3 } }).memoryWhisperer.minUsefulness, 0.9);
   assert.equal(resolveConfig({ memoryWhisperer: { maxHints: 3 } }).memoryWhisperer.maxHints, 3);
-  assert.equal(manifest.configSchema.properties.memoryWhisperer.properties.minUsefulness.default, 0.5);
-  assert.equal(manifest.configSchema.properties.memoryWhisperer.default.minUsefulness, 0.5);
-  assert.equal(manifest.configSchema.properties.memoryWhisperer.properties.maxHints.default, 3);
   assert.equal(manifest.configSchema.properties.memoryWhisperer.properties.maxHints.maximum, 3);
-  assert.equal(manifest.configSchema.properties.memoryWhisperer.default.maxHints, 3);
   assert.deepEqual(resolveConfig({ memoryWhisperer: { enabled: true, corpora: ["memory", "memory"] } })
     .memoryWhisperer.corpora, ["memory"]);
   assert.throws(() => resolveConfig({ memoryWhisperer: { complementaryHints: "yes" } }), /complementaryHints/);
@@ -585,6 +581,25 @@ test("memory whisperer requires explicit, known non-skill corpora and bounded co
     { cooldownTurns: -1 }, { cooldownTurns: 1001 }, { cooldownTurns: "2" }, { timeoutMs: 0 }, { timeoutMs: 10001 }]) {
     assert.throws(() => resolveConfig({ memoryWhisperer: value }), /memoryWhisperer/);
   }
+});
+
+test("omitting the query endpoint uses deterministic retrieval without a generator request", async t => {
+  const config = resolveConfig({ memoryWhisperer: {
+    enabled: true, corpora: ["memory"], api: { apiKeyFile: "/unused/query-token" },
+  } }).memoryWhisperer;
+  const generation = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => {
+    assert.fail("No endpoint: remote query generation must not start");
+  });
+  const fetch = t.mock.method(globalThis, "fetch", async (url: string) => {
+    assert.match(url, /\/decisions$/u);
+    return response(0.95);
+  });
+  const h = harness(undefined, { config });
+  t.after(h.stop);
+  assert.match((await h.before(event, context))?.appendContext ?? "", /Deploy only after approval/u);
+  assert.equal(generation.mock.callCount(), 0);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.match(h.searches[0]?.query ?? "", /deploy/i);
 });
 
 

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
@@ -35,7 +36,7 @@ export function extractionHistory(messages, count) {
     if (!count)
         return [];
     const kept = [];
-    let remaining = 8_000;
+    let remaining = DEFAULTS.extraction.historyTokenBudget;
     for (const message of messages.slice(-count).reverse()) {
         const tokens = extractionMessageTokens(message);
         if (tokens <= remaining) {

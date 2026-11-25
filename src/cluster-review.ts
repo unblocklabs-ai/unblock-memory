@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { readAnalysisSummary, readCluster } from "./analysis.js";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
@@ -21,9 +22,9 @@ export async function reviewClusterIngestion(params: {
   const sources = new Map(params.sources.filter(source => source.kind !== "skills").map(source => [source.collection, source]));
   const read = params.read ?? (async <T>(run: () => T) => run());
   const snapshot = await read(() => {
-    const center = readCluster(params.db, params.clusterId, 3, 0, "representative");
+    const center = readCluster(params.db, params.clusterId, DEFAULTS.review.clusterCenterSamples, 0, "representative");
     if (center.status !== "ok" || center.stale) return { status: "unavailable" as const, reason: "Cluster missing or stale; refresh analysis first" };
-    const edge = readCluster(params.db, params.clusterId, 3, 0, "score_asc");
+    const edge = readCluster(params.db, params.clusterId, DEFAULTS.review.clusterEdgeSamples, 0, "score_asc");
     const candidates = [...new Map([...(center.members ?? []), ...(edge.members ?? [])].map(member => [`${member.hash}:${member.seq}`, member])).values()];
     const sample = candidates.flatMap(member => {
       const path = member.sourcePaths.find(path => parseSafeVirtualPath(path, sources));
@@ -31,7 +32,7 @@ export async function reviewClusterIngestion(params: {
       const safe = parseSafeVirtualPath(path, sources)!;
       // Reload the full chunk; analysis previews may be truncated. Never judge a silently cut prefix.
       const row = indexedChunk(params.db, safe, member);
-      if (!row || row.pos < 0 || row.chunk_len < 1 || row.pos + row.chunk_len > row.doc.length || row.chunk_len > 2000) return [];
+      if (!row || row.pos < 0 || row.chunk_len < 1 || row.pos + row.chunk_len > row.doc.length || row.chunk_len > DEFAULTS.review.maxClaimChars) return [];
       const text = row.doc.slice(row.pos, row.pos + row.chunk_len);
       return [{ path, hash: member.hash, seq: member.seq, from: row.doc.slice(0, row.pos).split("\n").length,
         fingerprint: chunkFingerprint(text), text }];
@@ -53,10 +54,10 @@ export async function reviewClusterIngestion(params: {
       if (!row || chunkFingerprint(row.doc.slice(row.pos, row.pos + row.chunk_len)) !== member.fingerprint) return { status: "unavailable" as const, reason: "Sample changed during review; retry" };
     }
     const members = sample.map(({ text: _text, ...member }, index) => ({ ...member, ...judgments[index],
-      flagged: judgments[index].defect !== "none_or_uncertain" && judgments[index].confidence >= 0.9 }));
+      flagged: judgments[index].defect !== "none_or_uncertain" && judgments[index].confidence >= DEFAULTS.review.minClusterConfidence }));
     const recurring = ["wrapper", "encoding", "boilerplate"].flatMap(defect => {
       const examples = members.filter(member => member.flagged && member.defect === defect);
-      return examples.length >= 2 ? [{ defect, examples: examples.map(member => ({ path: member.path, from: member.from, fingerprint: member.fingerprint })) }] : [];
+      return examples.length >= DEFAULTS.review.minClusterAgreeingExamples ? [{ defect, examples: examples.map(member => ({ path: member.path, from: member.from, fingerprint: member.fingerprint })) }] : [];
     });
     return { status: "ok" as const, runId: snapshot.runId, clusterId: params.clusterId, members, recurring,
       sampled: sample.length, considered: snapshot.considered, clusterSize: snapshot.clusterSize,

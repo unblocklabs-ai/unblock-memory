@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { basename } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
@@ -9,11 +10,11 @@ import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
 import { isRecord } from "./guards.js";
 
-const CANDIDATE_LIMIT = 10;
-const JUDGE_CANDIDATE_LIMIT = 3;
+const CANDIDATE_LIMIT = DEFAULTS.skillWhisperer.maxCandidates;
+const JUDGE_CANDIDATE_LIMIT = DEFAULTS.skillWhisperer.maxParallelJudges;
 const MAX_SESSIONS = 1_000;
 const MAX_SEEN_RUNS = 64;
-export const SKILL_WHISPERER_TIMEOUT_MS = 3000;
+export const SKILL_WHISPERER_TIMEOUT_MS = DEFAULTS.skillWhisperer.timeoutMs;
 
 type SkillWhispererRuntime = {
   searchSkills(

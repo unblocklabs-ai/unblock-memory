@@ -1,5 +1,6 @@
+import { DEFAULTS } from "./defaults.js";
 import { abortable } from "./abortable.js";
-import { extractWithLuna, validateExtractedMemory, EXTRACTION_VERSION, } from "./extraction-model.js";
+import { extractWithDecisionModel, validateExtractedMemory, EXTRACTION_VERSION, } from "./extraction-model.js";
 import { buildCompleteRevision, ExtractionLeaseLostError, extractionPolicyFingerprint, ExtractionStore, } from "./extraction-store.js";
 import { readExtractionPage } from "./extraction-source.js";
 import { extractionHistory, readExtractionChunk } from "./extraction-chunk.js";
@@ -30,10 +31,10 @@ async function validateProposals(params) {
     const standalone = [];
     const winnerByPredecessor = new Map();
     let rejected = 0;
-    for (let start = 0; start < proposals.length; start += 4) {
+    for (let start = 0; start < proposals.length; start += DEFAULTS.extraction.validatorBatchSize) {
         signal.throwIfAborted();
         // Isolated judgments overlap, but failed chunks drain before their lease is released.
-        const judgments = await Promise.allSettled(proposals.slice(start, start + 4).map(async (proposal, offset) => ({
+        const judgments = await Promise.allSettled(proposals.slice(start, start + DEFAULTS.extraction.validatorBatchSize).map(async (proposal, offset) => ({
             proposal,
             order: start + offset,
             judgment: await validate({
@@ -110,7 +111,7 @@ async function validateProposals(params) {
     return { accepted, rejected };
 }
 async function processSession(params) {
-    const { session, store, owner, config, agentId, agentName, runtime, since, version, policyFingerprint, apiKey, signal, leaseAbort, readPage, extract, validate, } = params;
+    const { session, store, owner, config, agentId, agentName, since, version, policyFingerprint, apiKey, signal, leaseAbort, readPage, extract, validate, } = params;
     const extractionConfig = config.extraction;
     const checkpoint = store.checkpoint(session, owner, since, policyFingerprint);
     const expectedCompleteRevision = session.sourceRevision === undefined
@@ -122,7 +123,7 @@ async function processSession(params) {
     let stage = "read";
     try {
         const existing = store.records(session.sessionId);
-        if (existing.length > 100 || JSON.stringify(existing.map(m => ({ id: m.id, text: m.text }))).length > 40_000) {
+        if (existing.length > DEFAULTS.extraction.maxExistingFacts || JSON.stringify(existing.map(m => ({ id: m.id, text: m.text }))).length > DEFAULTS.extraction.maxExistingChars) {
             throw new Error("Existing memories exceed review budget");
         }
         const existingFacts = existing.map(m => ({ id: m.id, text: m.text, observedAt: m.observedAt }));
@@ -158,7 +159,8 @@ async function processSession(params) {
         const messages = page.messages;
         const newIds = messages.filter(m => freshIds.has(m.id) && m.timestamp >= checkpoint.since).map(m => m.id);
         stage = "propose";
-        const proposals = newIds.length ? await extract(runtime, agentId, messages, newIds, existingFacts, signal) : [];
+        const proposals = newIds.length ? await extract({ messages, newIds, existing: existingFacts, apiKey, signal,
+            endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, minReplacement: extractionConfig.minReplacement }) : [];
         stage = "validate";
         const { accepted, rejected } = await validateProposals({
             proposals,
@@ -222,17 +224,17 @@ export async function runExtraction(params) {
         return { status: "not_due_or_busy" };
     }
     const leaseAbort = new AbortController();
-    const signal = AbortSignal.any([params.signal, leaseAbort.signal, AbortSignal.timeout(600_000)]);
+    const signal = AbortSignal.any([params.signal, leaseAbort.signal, AbortSignal.timeout(DEFAULTS.extraction.runTimeoutMs)]);
     const heartbeat = setInterval(() => { try {
         store.renew(owner);
     }
     catch (error) {
         leaseAbort.abort(error);
-    } }, 30_000);
+    } }, DEFAULTS.extraction.heartbeatMs);
     heartbeat.unref();
     let processed = 0, acceptedCount = 0, rejectedCount = 0, unchanged = 0, failed = 0;
     const readPage = params.readPage ?? readExtractionPage;
-    const extract = params.extract ?? extractWithLuna;
+    const extract = params.extract ?? extractWithDecisionModel;
     const validate = params.validate ?? validateExtractedMemory;
     const version = params.version ?? EXTRACTION_VERSION;
     const policyFingerprint = extractionPolicyFingerprint({
@@ -241,6 +243,7 @@ export async function runExtraction(params) {
         minSupport: config.minSupport,
         minRetention: config.minRetention,
         minReplacement: config.minReplacement,
+        extractorModel: params.config.decisionModel.model,
         validatorModel: params.config.decisionModel.model,
     });
     try {
@@ -271,7 +274,6 @@ export async function runExtraction(params) {
                 config: params.config,
                 agentId: params.agentId,
                 agentName: params.agentName,
-                runtime: params.runtime,
                 since: params.since,
                 version,
                 policyFingerprint,

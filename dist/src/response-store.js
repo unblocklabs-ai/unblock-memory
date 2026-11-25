@@ -1,11 +1,12 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { validateCachedStage } from "./response-judge.js";
 import { responseOutcome, RESPONSE_REPORT_VERSION } from "./response-outcome.js";
 import { ResponsePeople } from "./response-identity.js";
 import { ResponseReviews, RESPONSE_REVIEW_POLICY } from "./response-reviews.js";
-const MAX_RETRY_ATTEMPTS = 3;
-const RETRY_BACKOFF_MS = 600_000;
+const MAX_RETRY_ATTEMPTS = DEFAULTS.responseAudit.maxRetries;
+const RETRY_BACKOFF_MS = DEFAULTS.responseAudit.retryBackoffMs;
 /** Operator-only tables: not a memory corpus and never injected into agent prompts. */
 export class ResponseAuditStore {
     #db;
@@ -64,7 +65,7 @@ export class ResponseAuditStore {
         const token = randomUUID();
         const result = this.#db.prepare(`INSERT INTO response_lease VALUES(1,?,?)
       ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires WHERE response_lease.expires < ?`)
-            .run(token, now + 180_000, now);
+            .run(token, now + DEFAULTS.responseAudit.leaseMs, now);
         return result.changes ? token : undefined;
     }
     release(token) { this.#db.prepare("DELETE FROM response_lease WHERE token=?").run(token); }
@@ -271,7 +272,7 @@ export class ResponseAuditStore {
             if (bucket === "week")
                 date.setUTCDate(date.getUTCDate() - (date.getUTCDay() + 6) % 7);
             const week = date.toISOString().slice(0, 10);
-            const taskType = r.quality.taskType.confidence >= 0.8 ? r.quality.taskType.choice : "uncertain";
+            const taskType = r.quality.taskType.confidence >= DEFAULTS.responseAudit.scoreHigh ? r.quality.taskType.choice : "uncertain";
             const human = r.human ?? null;
             const key = JSON.stringify([week, taskType, r.agentModel, human?.key ?? null]);
             const g = groups.get(key) ?? createReportGroup(week, human, taskType, r.agentModel);
@@ -321,32 +322,32 @@ function createReportGroup(week, human, taskType, agentModel) {
 }
 function recordEpisodeInGroup(g, r) {
     g.evaluated++;
-    const underdelivery = r.quality.underdelivery.noul >= 0.8;
-    if (r.quality.underdelivery.noul <= 0.2 || underdelivery)
+    const underdelivery = r.quality.underdelivery.noul >= DEFAULTS.responseAudit.scoreHigh;
+    if (r.quality.underdelivery.noul <= DEFAULTS.responseAudit.scoreLow || underdelivery)
         g.underdeliveryCertain++;
     if (underdelivery) {
         g.underdelivery++;
-        const reason = r.quality.failureReason.confidence >= 0.8 ? r.quality.failureReason.choice : "uncertain";
+        const reason = r.quality.failureReason.confidence >= DEFAULTS.responseAudit.scoreHigh ? r.quality.failureReason.choice : "uncertain";
         g.failureReasons[reason] = (g.failureReasons[reason] ?? 0) + 1;
     }
-    if (r.quality.assessability.choice === "assessable" && r.quality.assessability.confidence >= 0.8) {
+    if (r.quality.assessability.choice === "assessable" && r.quality.assessability.confidence >= DEFAULTS.responseAudit.scoreHigh) {
         g.assessable++;
-        if (r.quality.fulfillment.confidence >= 0.8) {
+        if (r.quality.fulfillment.confidence >= DEFAULTS.responseAudit.scoreHigh) {
             g.fulfillmentScored++;
             g.fulfillmentSum += r.quality.fulfillment.score;
         }
     }
-    if (r.quality.fitAssessability.choice === "assessable" && r.quality.fitAssessability.confidence >= 0.8) {
+    if (r.quality.fitAssessability.choice === "assessable" && r.quality.fitAssessability.confidence >= DEFAULTS.responseAudit.scoreHigh) {
         g.fitAssessable++;
-        if (r.quality.deliverableFit.confidence >= 0.8) {
+        if (r.quality.deliverableFit.confidence >= DEFAULTS.responseAudit.scoreHigh) {
             g.deliverableFitScored++;
             g.deliverableSum += r.quality.deliverableFit.score;
         }
     }
-    const target = r.feedback.target.confidence >= 0.8 ? r.feedback.target.choice : "uncertain";
+    const target = r.feedback.target.confidence >= DEFAULTS.responseAudit.scoreHigh ? r.feedback.target.choice : "uncertain";
     g.feedbackTargets[target] = (g.feedbackTargets[target] ?? 0) + 1;
-    const laterCorrection = (r.retrospective.judgment?.correction.noul ?? 0) >= 0.8;
-    const deliveryAdmission = (r.retrospective.judgment?.deliveryAdmission.noul ?? 0) >= 0.8;
+    const laterCorrection = (r.retrospective.judgment?.correction.noul ?? 0) >= DEFAULTS.responseAudit.scoreHigh;
+    const deliveryAdmission = (r.retrospective.judgment?.deliveryAdmission.noul ?? 0) >= DEFAULTS.responseAudit.scoreHigh;
     const outcome = responseOutcome(r);
     const reportedShortfall = outcome.status === "reported_shortfall";
     if (reportedShortfall || outcome.status === "acknowledged_success") {
@@ -366,40 +367,40 @@ function recordEpisodeInGroup(g, r) {
         g.laterCorrections++;
     if (deliveryAdmission)
         g.deliveryAdmissions++;
-    if (r.feedback.feedbackType.confidence >= 0.8) {
+    if (r.feedback.feedbackType.confidence >= DEFAULTS.responseAudit.scoreHigh) {
         g.feedbackCertain++;
         if (r.feedback.feedbackType.choice === "acceptance")
             g.accepted++;
     }
     const burden = r.feedback.avoidableRework.noul;
-    if (burden <= 0.2 || burden >= 0.8) {
+    if (burden <= DEFAULTS.responseAudit.scoreLow || burden >= DEFAULTS.responseAudit.scoreHigh) {
         g.reworkCertain++;
-        if (burden >= 0.8)
+        if (burden >= DEFAULTS.responseAudit.scoreHigh)
             g.rework++;
     }
-    const memoryGap = r.feedback.memoryGap.noul >= 0.8;
+    const memoryGap = r.feedback.memoryGap.noul >= DEFAULTS.responseAudit.scoreHigh;
     const sentiment = r.feedback.sentiment;
-    const sentimentCertain = !!sentiment && sentiment.confidence >= 0.8 && sentiment.choice !== "unclear";
+    const sentimentCertain = !!sentiment && sentiment.confidence >= DEFAULTS.responseAudit.scoreHigh && sentiment.choice !== "unclear";
     const dissatisfied = sentimentCertain && ["dissatisfied", "mixed"].includes(sentiment.choice);
     if (sentiment)
         g.sentimentAssessed++;
     if (sentimentCertain)
         g.sentimentCertain++;
     const { annoyance, frustration, dissatisfactionIntensity: intensity } = r.feedback;
-    const annoyed = !!annoyance && annoyance.noul >= 0.8;
-    const frustrated = !!frustration && frustration.noul >= 0.8;
+    const annoyed = !!annoyance && annoyance.noul >= DEFAULTS.responseAudit.scoreHigh;
+    const frustrated = !!frustration && frustration.noul >= DEFAULTS.responseAudit.scoreHigh;
     if (annoyance && frustration) {
         g.emotionAssessed++;
         if (annoyed)
             g.annoyed++;
         if (frustrated)
             g.frustrated++;
-        if (annoyance.noul > 0.2 && annoyance.noul < 0.8)
+        if (annoyance.noul > DEFAULTS.responseAudit.scoreLow && annoyance.noul < DEFAULTS.responseAudit.scoreHigh)
             g.annoyanceUncertain++;
-        if (frustration.noul > 0.2 && frustration.noul < 0.8)
+        if (frustration.noul > DEFAULTS.responseAudit.scoreLow && frustration.noul < DEFAULTS.responseAudit.scoreHigh)
             g.frustrationUncertain++;
     }
-    if (intensity && intensity.confidence >= 0.8) {
+    if (intensity && intensity.confidence >= DEFAULTS.responseAudit.scoreHigh) {
         g.dissatisfactionIntensityScored++;
         g.intensitySum += intensity.score;
     }
@@ -407,7 +408,7 @@ function recordEpisodeInGroup(g, r) {
         g.memoryGap++;
     if (dissatisfied)
         g.dissatisfied++;
-    const signals = [underdelivery ? "clear_underdelivery" : "", burden >= 0.8 ? "avoidable_rework" : "", memoryGap ? "reported_memory_gap" : "", dissatisfied ? `dissatisfied:${target}` : "",
+    const signals = [underdelivery ? "clear_underdelivery" : "", burden >= DEFAULTS.responseAudit.scoreHigh ? "avoidable_rework" : "", memoryGap ? "reported_memory_gap" : "", dissatisfied ? `dissatisfied:${target}` : "",
         annoyed ? `annoyed:${target}` : "", frustrated ? `frustrated:${target}` : "",
         laterCorrection ? "later_correction" : "", deliveryAdmission ? "delivery_admission" : "", reportedShortfall ? "reported_shortfall" : ""].filter(Boolean);
     return { signals, outcome };

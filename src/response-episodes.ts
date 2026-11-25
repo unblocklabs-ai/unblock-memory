@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader } from "./agent-transcript.js";
 import type { ResponseAuditConfig } from "./response-config.js";
@@ -7,7 +8,7 @@ import { jsonHash } from "./json-hash.js";
 import { record } from "./guards.js";
 
 export const RESPONSE_EXTRACTOR_VERSION = 7;
-const MAX_EVENTS = 2000, MAX_SESSION_BYTES = 2_000_000, MAX_EPISODE_CHARS = 24_000;
+const { maxSessionEvents: MAX_EVENTS, maxSessionBytes: MAX_SESSION_BYTES, maxEpisodeChars: MAX_EPISODE_CHARS } = DEFAULTS.responseAudit;
 type Row = { seq: number; eventJson: string; createdAt: number };
 export type ResponseSession = { sessionId: string; accountId: string; chatType: string; conversationId: string };
 type Text = { seq: number; role: "user" | "assistant"; text: string };
@@ -157,7 +158,7 @@ export class ResponseTranscriptReader {
   constructor(path: string, agentId: string) {
     this.#db = new DatabaseSync(path, { readOnly: true });
     try {
-      this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
+      this.#db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.readerBusyTimeoutMs}`);
       this.#transcripts = new AgentTranscriptReader(this.#db, agentId, "Unsupported response-audit transcript schema or agent");
     } catch (error) { this.#db.close(); throw error; }
   }

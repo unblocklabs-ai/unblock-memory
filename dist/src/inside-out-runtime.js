@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { join, dirname } from "node:path";
 import { resolveAgentDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
@@ -126,7 +127,7 @@ export function registerInsideOut(api, config) {
         if (lifetime.signal.aborted)
             lifetime = new AbortController();
         // Local statistics remain available when inference is manual-only or lacks a key.
-        baselineTimer = setInterval(refresh, 86400_000);
+        baselineTimer = setInterval(refresh, DEFAULTS.insideOut.baselineRefreshMs);
         baselineTimer.unref();
         refresh();
         if (config.decisionModel.enabled && config.insideOut.intervalMinutes) {

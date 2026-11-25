@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { TRAINING_PREPARATION, type TrainingExample, type TrainingInput } from "./training-input.js";
@@ -10,7 +11,7 @@ import { jsonHash } from "./json-hash.js";
 
 type GateResult = Awaited<ReturnType<typeof judgeTrainingInput>>;
 type Job = { id: string; inputHash: string; inputJson: string };
-const LEASE_MS = 120_000;
+const LEASE_MS = DEFAULTS.training.leaseMs;
 export type TrainingSourceExample = { id: string; inputHash: string; inputJson: string; sessionId: string; timestamp: number };
 export type QueryEvaluation = { query: string; lane: QueryLane; round: TrainingRound; retrievalId: string;
   score: number; maxProbability: number; judgments: string[] };
@@ -128,7 +129,7 @@ export class TrainingStore {
         AND step_id IN (SELECT id FROM training_steps WHERE json_extract(request_json,'$.recipe')=?)`).run(TRAINING_RECIPE_VERSION);
     });
     let leaseError: unknown;
-    const heartbeat = setInterval(() => { try { this.renew(); } catch (error) { leaseError = error; } }, 10_000);
+    const heartbeat = setInterval(() => { try { this.renew(); } catch (error) { leaseError = error; } }, DEFAULTS.training.heartbeatMs);
     heartbeat.unref();
     try {
       const value = await fn();

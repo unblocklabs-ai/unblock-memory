@@ -1,12 +1,11 @@
 import type { UnblockMemoryConfig } from "./config.js";
-import { extractWithLuna, validateExtractedMemory } from "./extraction-model.js";
+import { extractWithDecisionModel, validateExtractedMemory } from "./extraction-model.js";
 import { type ExtractionSession } from "./extraction-store.js";
 import { readExtractionPage } from "./extraction-source.js";
 export declare function runExtraction(params: {
     config: UnblockMemoryConfig;
     storePath: string;
     agentId: string;
-    runtime: unknown;
     agentName: string;
     sessions: () => ExtractionSession[];
     signal: AbortSignal;
@@ -15,7 +14,7 @@ export declare function runExtraction(params: {
     scheduled?: boolean;
     version?: string;
     readPage?: typeof readExtractionPage;
-    extract?: typeof extractWithLuna;
+    extract?: typeof extractWithDecisionModel;
     validate?: typeof validateExtractedMemory;
 }): Promise<{
     status: "disabled";

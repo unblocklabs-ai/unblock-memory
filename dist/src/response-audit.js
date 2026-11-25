@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { setImmediate } from "node:timers/promises";
 import { abortable } from "./abortable.js";
 import { decisionModelScope, resolveDecisionCredential, DEFAULT_DECISION_MODEL } from "./decision-client.js";
@@ -21,7 +22,7 @@ export async function auditResponses(options) {
     const { config, agentId } = options;
     if (!config.responseAudit.enabled || !config.decisionModel.enabled)
         return { status: "disabled" };
-    const signal = AbortSignal.any([AbortSignal.timeout(120_000), ...(options.signal ? [options.signal] : [])]);
+    const signal = AbortSignal.any([AbortSignal.timeout(DEFAULTS.responseAudit.deadlineMs), ...(options.signal ? [options.signal] : [])]);
     const cohort = responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
     let key;
     if (!options.dryRun) {
@@ -192,7 +193,7 @@ function addCoverage(target, delta) {
         target[key] += delta[key];
 }
 async function assessMemoryOpportunity(store, cohort, e, feedback, options, params, usage) {
-    if (feedback.memoryGap.noul < 0.8 || !options.config.responseAudit.memoryCorpora.length) {
+    if (feedback.memoryGap.noul < DEFAULTS.responseAudit.scoreHigh || !options.config.responseAudit.memoryCorpora.length) {
         return { status: "not_requested", candidates: [] };
     }
     try {

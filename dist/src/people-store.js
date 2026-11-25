@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -66,7 +67,7 @@ export const PERSON_DOSSIER_WRITE_SCHEMA = Type.Object({
 export class DossierConflictError extends Error {
     constructor() { super("Dossier or person changed during review; inspect again before retrying"); }
 }
-const MAX_DOSSIER_JSON_BYTES = 64 * 1024;
+const MAX_DOSSIER_JSON_BYTES = DEFAULTS.people.dossierMaxBytes;
 function serializeDossier(dossier) {
     const json = JSON.stringify(dossier);
     if (Buffer.byteLength(json, "utf8") > MAX_DOSSIER_JSON_BYTES) {

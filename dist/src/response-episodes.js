@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
@@ -5,7 +6,7 @@ import { responseUserText } from "./response-text.js";
 import { jsonHash } from "./json-hash.js";
 import { record } from "./guards.js";
 export const RESPONSE_EXTRACTOR_VERSION = 7;
-const MAX_EVENTS = 2000, MAX_SESSION_BYTES = 2_000_000, MAX_EPISODE_CHARS = 24_000;
+const { maxSessionEvents: MAX_EVENTS, maxSessionBytes: MAX_SESSION_BYTES, maxEpisodeChars: MAX_EPISODE_CHARS } = DEFAULTS.responseAudit;
 /** Never deduce human identity from text or the user role alone. */
 export function responseEpisodes(session, rows, config) {
     const coverage = { completedResponses: 0, eligible: 0, noFeedback: 0,
@@ -175,7 +176,7 @@ export class ResponseTranscriptReader {
     constructor(path, agentId) {
         this.#db = new DatabaseSync(path, { readOnly: true });
         try {
-            this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
+            this.#db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.readerBusyTimeoutMs}`);
             this.#transcripts = new AgentTranscriptReader(this.#db, agentId, "Unsupported response-audit transcript schema or agent");
         }
         catch (error) {

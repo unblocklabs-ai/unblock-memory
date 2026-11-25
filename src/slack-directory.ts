@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { inspectReadOnlyChannelAccount } from "openclaw/plugin-sdk/directory-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { PeopleStore } from "./people-store.js";
@@ -80,12 +81,12 @@ export function createOpenClawSlackDirectory(params: {
       const cursors = new Set<string>();
       let cursor: string | undefined;
       while (entries.length < limit) {
-        const url = new URL("https://slack.com/api/users.list");
+        const url = new URL(DEFAULTS.people.slackApiUrl);
         url.searchParams.set("limit", String(Math.min(limit, 200)));
         if (cursor) url.searchParams.set("cursor", cursor);
         const response = await request(url, {
           headers: { authorization: `Bearer ${token}` },
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(DEFAULTS.people.slackTimeoutMs),
         });
         const payload = record(await response.json());
         if (!response.ok || payload?.ok !== true) {

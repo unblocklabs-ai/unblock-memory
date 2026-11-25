@@ -1,8 +1,7 @@
-import { Type, type Static } from "typebox";
 import type { ExtractionConfig } from "./extraction-config.js";
-export declare const EXTRACTION_VERSION = "lasting-facts-v11";
-export declare const EXTRACTION_INPUT_TARGET = 24000;
-export declare const EXTRACTION_INPUT_LIMIT = 28000;
+export declare const EXTRACTION_VERSION: string;
+export declare const EXTRACTION_INPUT_TARGET: number;
+export declare const EXTRACTION_INPUT_LIMIT: number;
 export type ExtractionMessage = {
     id: string;
     speaker: string;
@@ -17,21 +16,28 @@ export type PriorMemory = {
     text: string;
     observedAt?: number;
 };
-declare const proposalSchema: Type.TObject<{
-    memories: Type.TArray<Type.TObject<{
-        text: Type.TString;
-        replaces: Type.TUnion<[Type.TNull, Type.TString]>;
-        evidence: Type.TArray<Type.TObject<{
-            messageId: Type.TString;
-            quote: Type.TString;
-        }>>;
-    }>>;
-}>;
-export type MemoryProposal = Static<typeof proposalSchema>["memories"][number];
+export type MemoryProposal = {
+    text: string;
+    replaces: string | null;
+    evidence: {
+        messageId: string;
+        quote: string;
+    }[];
+};
 export declare function extractionOverhead(existing: PriorMemory[]): number;
 export declare function extractionMessageTokens(message: ExtractionMessage): number;
-/** A narrow capability boundary keeps this optional feature inert on older hosts. */
-export declare function extractWithLuna(runtime: unknown, agentId: string, messages: ExtractionMessage[], newIds: string[], existing: PriorMemory[], signal: AbortSignal): Promise<MemoryProposal[]>;
+type ProposeParams = {
+    messages: ExtractionMessage[];
+    newIds: string[];
+    existing: PriorMemory[];
+    apiKey: string;
+    endpoint?: string;
+    model?: string;
+    signal: AbortSignal;
+    timeoutMs?: number;
+    minReplacement?: number;
+};
+export declare function extractWithDecisionModel(params: ProposeParams): Promise<MemoryProposal[]>;
 export declare function validateExtractedMemory(params: {
     proposal: MemoryProposal;
     messages: ExtractionMessage[];

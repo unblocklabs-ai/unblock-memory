@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
 import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
@@ -7,7 +8,7 @@ import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
 import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
-import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
+import { messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { decideWithModel, estimateDecisionTokens, isDecisionTimeout, resolveDecisionCredential } from "./decision-client.js";
 
 export type MyTurnConfig = {
@@ -22,7 +23,7 @@ export function resolveMyTurn(value: unknown): MyTurnConfig {
   for (const key of Object.keys(config)) {
     if (!["enabled", "historyMessages", "channels"].includes(key)) throw new Error(`myTurn has unknown property: ${key}`);
   }
-  const enabled = config.enabled ?? false, historyMessages = config.historyMessages ?? 10;
+  const enabled = config.enabled ?? false, historyMessages = config.historyMessages ?? DEFAULTS.myTurn.defaultHistoryMessages;
   if (typeof enabled !== "boolean") throw new Error("myTurn.enabled must be a boolean");
   if (typeof historyMessages !== "number" || !Number.isInteger(historyMessages) || historyMessages < 1 || historyMessages > 50) {
     throw new Error("myTurn.historyMessages must be an integer between 1 and 50");
@@ -41,7 +42,7 @@ export function resolveMyTurn(value: unknown): MyTurnConfig {
   return { enabled, historyMessages, channels };
 }
 
-const DEADLINE_MS = 1500;
+const { timeoutMs: DEADLINE_MS, stateMaxTokens: MAX_STATE_TOKENS } = DEFAULTS.myTurn;
 const MAX_SESSIONS = 1_000;
 const MAX_SEEN_RUNS = 64;
 const HINT = "<my_turn>Your internal Decision API determined that you probably don’t need to respond to this conversation. " +
@@ -212,7 +213,7 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
           { validateModel: false },
         ), signal);
         if (sessions.get(scope) !== activeSession || activeSession.latest !== runId) { record("cancelled"); return; }
-        if (result.answers.should_respond.noul > 0.2) { record("no_match"); return; }
+        if (result.answers.should_respond.noul > DEFAULTS.myTurn.nudgeMaxProbability) { record("no_match"); return; }
         record("emitted");
         return { appendContext: HINT };
       } catch (error) {

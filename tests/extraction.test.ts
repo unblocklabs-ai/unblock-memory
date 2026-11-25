@@ -9,7 +9,7 @@ import test from "node:test";
 import { createStore } from "@unblocklabs/qmd";
 import { ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveConfig } from "../src/config.js";
-import { EXTRACTION_INPUT_TARGET, extractWithLuna, validateExtractedMemory, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
+import { EXTRACTION_INPUT_TARGET, extractWithDecisionModel, validateExtractedMemory, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
 import { buildCompleteRevision, ExtractionLeaseLostError, extractionPolicyFingerprint, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
 import { runExtraction } from "../src/extraction-worker.js";
 import { readExtractionPage, type ExtractionPage } from "../src/extraction-source.js";
@@ -49,17 +49,95 @@ test("extraction defaults off; approval must be a configured session subset", ()
   }
 });
 
-test("Luna invocation requires isolated model identity and strict JSON; no model fallback", async () => {
-  let called = 0;
-  const runtime = { llm: { async complete(input: { model: string; execution: { mode: string }; messages: unknown[] }) {
-    called++; assert.equal(input.model, "openai/gpt-5.6-luna"); assert.equal(input.execution.mode, "isolated-agent-runtime");
-    assert.equal(input.messages.length, 1);
-    return { text: JSON.stringify({ memories: [proposal] }), model: "gpt-5.6-luna", execution: input.execution };
-  } } };
-  assert.deepEqual(await extractWithLuna(runtime, "main", messages, ["m1"], [], signal()), [proposal]);
-  assert.equal(called, 1);
-  await assert.rejects(extractWithLuna({}, "main", messages, [], [], signal()), /runtime/);
-  await assert.rejects(extractWithLuna({ llm: { complete: async () => ({ text: "{}", model: "gpt-6-astra", execution: { mode: "direct-provider" } }) } }, "main", messages, [], [], signal()), /isolated Luna/);
+test("the worker stores a verbatim d1.2 proposal with no host LLM", async t => {
+  const f = await fixture();
+  const cfg = config({ decisionModel: { apiKey: "test-key", endpoint: "https://decisions.example/v1/decisions", model: "liquid/d1.2" } });
+  const source = [{ ...messages[0]!, text: "🎨 Note:  My favorite color is *red*.  " }];
+  const quote = "My favorite color is *red*.";
+  const fetch = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.model, "liquid/d1.2");
+    assert.equal(new Headers(init.headers).get("Authorization"), "Bearer test-key");
+    if (url.endsWith("/extractions")) {
+      assert.equal(body.fields.memories.type, "list");
+      assert.equal(body.fields.memories.items, "text");
+      const start = body.state.indexOf(quote) - 2;
+      return Response.json({ model: body.model, answers: { memories: {
+        value: [quote], spans: [[start, start + quote.length + 4]], confidences: [0.95], p_null: 0.03,
+      } } });
+    }
+    assert.equal(url, "https://decisions.example/v1/decisions");
+    assert.deepEqual(Object.keys(body.questions), ["supported", "useful"]);
+    return Response.json({ answers: {
+      supported: { type: "choice", choice: "supported", confidence: 0.99, probabilities: { supported: 0.99, contradicted: 0, unsupported: 0.01 } },
+      useful: { type: "noul", noul: 0.99 },
+    } });
+  });
+  const result = await runExtraction({ config: cfg, storePath: f.storePath, agentId: "main", agentName: "Bill",
+    sessions: () => [session], since: 0, signal: signal(), readPage: async () => page("c1", source) });
+  assert.equal(result.accepted, 1);
+  assert.deepEqual(fetch.mock.calls.map(call => call.arguments[0]), ["https://decisions.example/v1/extractions", "https://decisions.example/v1/decisions"]);
+  const store = new ExtractionStore(f.storePath);
+  try {
+    const [record] = store.records();
+    assert.equal(record?.text, `Bek: ${quote}`);
+    assert.deepEqual(record?.evidence, [{ messageId: "m1", quote }]);
+  } finally { store.close(); }
+});
+
+test("span mapping keeps a cross-turn exchange and rejects context-only, low confidence and duplicate spans", async t => {
+  const question: ExtractionMessage = { id: "q", speaker: "Bill", role: "assistant", text: 'Is your favorite color blue?', timestamp: 1000 };
+  const answer: ExtractionMessage = { ...messages[0]!, text: "No, it is red. I also like jazz.", timestamp: 2000 };
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    assert.match(url, /\/extractions$/u);
+    const { state, model } = JSON.parse(String(init.body));
+    const start = state.indexOf(question.text);
+    const end = state.indexOf("No, it is red.") + "No, it is red.".length;
+    return Response.json({ model, answers: { memories: {
+      value: ["resolved exchange", question.text, "I also like jazz.", "duplicate", 42, "  "],
+      spans: [[start, end], [start, start + question.text.length], [end + 1, end + 18], [start, end], [start, end], [start, end]],
+      confidences: [0.99, 0.99, 0.49, 0.99, 0.99, 0.99],
+    } } });
+  });
+  assert.deepEqual(await extractWithDecisionModel({ messages: [question, answer], newIds: ["m1"], existing: [], apiKey: "test", signal: signal() }), [{
+    text: "Bill: Is your favorite color blue? / Bek: No, it is red.", replaces: null,
+    evidence: [{ messageId: "q", quote: question.text }, { messageId: "m1", quote: "No, it is red." }],
+  }]);
+});
+
+test("no-span responses match exact new-message text; empty and null responses yield no proposals", async t => {
+  let answer: { value: unknown[] | null; p_null?: number } = { value: [messages[0]!.text, "invented"] };
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) =>
+    Response.json({ model: JSON.parse(String(init.body)).model, answers: { memories: answer } }));
+  const params = { messages: [{ ...messages[0]!, id: "old" }, ...messages], newIds: ["m1"], existing: [], apiKey: "test", signal: signal() };
+  assert.deepEqual(await extractWithDecisionModel(params), [{ ...proposal, text: `Bek: ${messages[0]!.text}` }]);
+  for (answer of [{ value: [] }, { value: null, p_null: 0.97 }, { value: [messages[0]!.text], p_null: 1 }]) {
+    assert.deepEqual(await extractWithDecisionModel(params), []);
+  }
+});
+
+test("replacement selection compares bounded choice winners and enforces the replacement probability", async t => {
+  const existing = Array.from({ length: 22 }, (_, i) => ({ id: i === 21 ? "none" : `id-${i}`, text: `prior fact ${i}` }));
+  let choices = 0;
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    if (url.endsWith("/extractions")) {
+      return Response.json({ model: body.model, answers: { memories: { value: [messages[0]!.text] } } });
+    }
+    choices++;
+    const criteria = body.questions.replacement.criteria;
+    assert.ok(criteria.none);
+    const keys = Object.keys(criteria);
+    assert.equal(keys.length, choices % 2 ? 21 : 3);
+    const winner = "prior_1", probability = choices % 2 ? 0.91 : 0.96;
+    return Response.json({ answers: { replacement: { type: "choice", choice: winner, confidence: probability,
+      probabilities: Object.fromEntries(keys.map(key => [key, key === winner ? probability : key === "none" ? 1 - probability : 0])),
+    } } });
+  });
+  const params = { messages, newIds: ["m1"], existing, apiKey: "test", signal: signal() };
+  assert.equal((await extractWithDecisionModel(params))[0]?.replaces, "none");
+  assert.equal((await extractWithDecisionModel({ ...params, minReplacement: 0.97 }))[0]?.replaces, null);
+  assert.equal(choices, 4);
 });
 
 test("missing quotes, unknown replacement ids and context-only citations never reach decision model", async t => {
@@ -134,7 +212,7 @@ test("commit is atomic, deduplicated, versioned and fenced by checkpoint and lea
 test("missing decision model key and disabled extraction do not open storage or call models", async () => {
   const f = await fixture();
   for (const cfg of [config({ decisionModel: { apiKeyFile: join(f.dir, "absent") } }), resolveConfig(undefined)]) {
-    const result = await runExtraction({ config: cfg, storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    const result = await runExtraction({ config: cfg, storePath: f.storePath, agentId: "main", agentName: "Bill",
       sessions: () => { assert.fail("must not scan source"); }, signal: signal() });
     assert.ok(["unavailable", "disabled"].includes(result.status)); assert.equal(existsSync(f.storePath), false);
   }
@@ -152,7 +230,7 @@ test("scheduled cadence survives reopening the store, while manual runs remain p
 
 test("incremental worker skips unchanged pages, retries failures and never loses its cursor", async () => {
   const f = await fixture(); let calls = 0, fail = true;
-  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {}, sessions: () => [session], since: 0, signal: signal(),
+  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0, signal: signal(),
     readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null) => cursor === "c1" ? page("c1", []) : page("c1"),
     extract: async () => { calls++; if (fail) throw new Error("private source must never leak into status"); return [proposal]; },
     validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) };
@@ -176,7 +254,7 @@ test("completed source revisions skip delta reads, while appends, resets and bro
   insertSession(db, { sessionId: "s1", chatType: "channel", message: { type: "message", message: { role: "user", content: messages[0]!.text } } });
   db.exec("ALTER TABLE session_windows ADD COLUMN updated_at INTEGER; ALTER TABLE session_windows ADD COLUMN transcript_updated_at INTEGER");
   let reads = 0, extractions = 0;
-  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {}, signal: signal(), since: 1000,
+  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", signal: signal(), since: 1000,
     sessions: () => extractionSessions(sourcePath, "main", ["channel"]),
     readPage: async (_agent: string, _name: string, _session: ExtractionSession, cursor: string | null): Promise<ExtractionPage> => {
       reads++;
@@ -205,7 +283,7 @@ test("completed source revisions skip delta reads, while appends, resets and bro
 
 test("rewrite during inference withdraws old evidence and discards the stale completion", async () => {
   const f = await fixture();
-  const result = await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {}, sessions: () => [session], since: 0, signal: signal(),
+  const result = await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0, signal: signal(),
     readPage: async (_id, _name, _s, cursor) => cursor === "c1" ? { kind: "reset", cursor: "new-generation" } : page("c1"),
     extract: async () => [proposal], validate: async () => ({ accepted: true, reason: "judged", scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) });
   assert.equal(result.accepted, 0);
@@ -217,17 +295,17 @@ test("single-session run does not withdraw another eligible session's memories",
   const owner = store.claim(false, 0)!; store.checkpoint(other, owner);
   store.commit({ session: other, expected: null, cursor: "c1", context: [], accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
   store.release(owner); store.close();
-  await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+  await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [session, other], sessionId: "s1", since: 0, signal: signal(), readPage: async () => page("c1", []) });
   const reopened = new ExtractionStore(f.storePath); assert.equal(reopened.records("s2").length, 1); reopened.close();
 });
 
 test("scheduled run resumes an approved historical backfill rather than skipping unfinished history", async () => {
   const f = await fixture(); let calls = 0;
-  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {}, sessions: () => [session], signal: signal(),
+  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", sessions: () => [session], signal: signal(),
     readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null) =>
       cursor === null ? page("c1", [{ ...messages[0]!, id: "context", text: "Hello" }]) : cursor === "c1" ? page("c2") : page("c2", []),
-    extract: async (_r: unknown, _a: string, _m: ExtractionMessage[], newIds: string[]) => { calls++; return newIds.includes("m1") ? [proposal] : []; },
+    extract: async ({ newIds }: { newIds: string[] }) => { calls++; return newIds.includes("m1") ? [proposal] : []; },
     validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) };
   await runExtraction({ ...opts, since: 0 });
   const next = await runExtraction({ ...opts, scheduled: true });
@@ -313,7 +391,7 @@ test("lost-lease fencing rejects checkpoint, error, and empty-page completion wr
 
   let stoleLease = false;
   await assert.rejects(runExtraction({
-    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [session], since: 0, signal: signal(),
     readPage: async () => {
       if (!stoleLease) {
@@ -339,7 +417,7 @@ test("empty-page completion clears a prior session error and updates complete_re
   const s = { ...session, sourceRevision: '["g1",1]' };
   // First run fails with source_unavailable, setting session error.
   const first = await runExtraction({
-    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [s], since: 0, signal: signal(),
     readPage: async () => ({ kind: "unavailable" }),
   });
@@ -353,7 +431,7 @@ test("empty-page completion clears a prior session error and updates complete_re
   // Second run returns an empty exhausted page; error must be cleared and complete_revision recorded.
   let reads = 0;
   const second = await runExtraction({
-    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [s], since: 0, signal: signal(),
     readPage: async () => { reads++; return page("c1", []); },
   });
@@ -369,7 +447,7 @@ test("empty-page completion clears a prior session error and updates complete_re
 
   // Third run with same sourceRevision and policy skips without calling readPage.
   const third = await runExtraction({
-    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [s], since: 0, signal: signal(),
     readPage: async () => { reads++; return page("c1", []); },
   });
@@ -385,7 +463,7 @@ test("policy and prompt version changes invalidate complete_revision and re-scan
   let reads = 0, extractions = 0;
 
   const makeOpts = (extraCfg: object = {}, version?: string) => ({
-    config: config(extraCfg), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    config: config(extraCfg), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [s], since: 0, signal: signal(), version,
     readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null) => {
       reads++;
@@ -475,7 +553,7 @@ test("multiple accepted proposals targeting the same predecessor pick one determ
   const repEarly: MemoryProposal = { text: "Bek's favorite color is green.", replaces: priorId, evidence: [{ messageId: "m2", quote: m2.text }] };
   const repLate: MemoryProposal = { text: "Bek's favorite color is yellow.", replaces: priorId, evidence: [{ messageId: "m3", quote: m3.text }] };
   const result = await runExtraction({
-    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [session], since: 0, signal: signal(),
     readPage: async (_id, _name, _s, cursor) => cursor === "c2" ? page("c2", []) : page("c2", [m2, m3]),
     extract: async () => [repEarly, repLate],
@@ -505,7 +583,6 @@ test("extraction-runtime gateway_stop aborts and drains in-flight RPC runs befor
   let rpcHandler: ((req: { params: unknown; respond: (ok: boolean, data?: unknown, err?: unknown) => void }) => Promise<void>) | undefined;
   const api = {
     config: { agents: { entries: { main: { workspace: tmpdir() } } } },
-    runtime: {},
     logger: { warn() {} },
     registerCli() {},
     on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); },
@@ -596,7 +673,7 @@ test("policy change and unversioned legacy partial cursors rewind before process
 
   const observedCursors: (string | null)[] = [];
   const makeOpts = (extraCfg: object = {}, version = "lasting-facts-v11") => ({
-    config: config(extraCfg), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    config: config(extraCfg), storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [s], since: 0, signal: signal(), version,
     readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null): Promise<ExtractionPage> => {
       observedCursors.push(cursor);
@@ -604,7 +681,7 @@ test("policy change and unversioned legacy partial cursors rewind before process
       if (cursor === "c1") return { kind: "page", cursor: "c2", hasMore: false, entryCount: 1, messages: [m2] };
       return { kind: "page", cursor: "c2", hasMore: false, entryCount: 0, messages: [] };
     },
-    extract: async (_r: unknown, _a: string, _msgs: ExtractionMessage[], newIds: string[]) =>
+    extract: async ({ newIds }: { newIds: string[] }) =>
       newIds.includes("m1") ? [p1] : newIds.includes("m2") ? [p2] : [],
     validate: async ({ proposal: prop, thresholds: t }: { proposal: MemoryProposal; thresholds: { minSupport: number } }) => ({
       accepted: prop.text === p2.text || t.minSupport <= 0.85,
@@ -617,8 +694,8 @@ test("policy change and unversioned legacy partial cursors rewind before process
   // Policy A (minSupport=0.9, maxBatches=1) commits partial cursor c1 (complete_revision remains NULL) and rejects p1.
   const cfgA = { extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, maxBatches: 1, minSupport: 0.9 } };
   const cfgB = { extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, maxBatches: 1, minSupport: 0.8 } };
-  const fpA = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgA).extraction, validatorModel: config(cfgA).decisionModel.model });
-  const fpB = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgB).extraction, validatorModel: config(cfgB).decisionModel.model });
+  const fpA = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgA).extraction, extractorModel: config(cfgA).decisionModel.model, validatorModel: config(cfgA).decisionModel.model });
+  const fpB = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgB).extraction, extractorModel: config(cfgB).decisionModel.model, validatorModel: config(cfgB).decisionModel.model });
 
   const r1 = await runExtraction(makeOpts(cfgA));
   assert.equal(r1.status, "completed");
@@ -737,7 +814,6 @@ test("extraction-runtime gateway_stop then gateway_start with extraction disable
   let rpcHandler: ((req: { params: unknown; respond: (ok: boolean, data?: unknown, err?: { code?: string; message?: string }) => void }) => Promise<void>) | undefined;
   const api = {
     config: { agents: { entries: { main: { workspace: tmpdir() } } } },
-    runtime: {},
     logger: { warn() {} },
     registerCli() {},
     on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); },

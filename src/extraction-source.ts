@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DatabaseSync } from "node:sqlite";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -10,7 +11,7 @@ import { projectMessage } from "./session-projector.js";
 export function extractionSessions(databasePath: string, agentId: string, chatTypes: ChatType[]): ExtractionSession[] {
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
-    db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=5000");
+    db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.mainBusyTimeoutMs}`);
     if (db.prepare("SELECT agent_id FROM schema_meta WHERE meta_key='primary'").get()?.agent_id !== agentId) {
       throw new Error("Wrong extraction source agent");
     }

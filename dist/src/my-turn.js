@@ -1,10 +1,11 @@
+import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
 import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { parseAgentSessionKey, parseThreadSessionSuffix } from "openclaw/plugin-sdk/routing";
 import { abortable } from "./abortable.js";
 import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
-import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
+import { messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { decideWithModel, estimateDecisionTokens, isDecisionTimeout, resolveDecisionCredential } from "./decision-client.js";
 export function resolveMyTurn(value) {
     const config = value === undefined ? {} : value;
@@ -14,7 +15,7 @@ export function resolveMyTurn(value) {
         if (!["enabled", "historyMessages", "channels"].includes(key))
             throw new Error(`myTurn has unknown property: ${key}`);
     }
-    const enabled = config.enabled ?? false, historyMessages = config.historyMessages ?? 10;
+    const enabled = config.enabled ?? false, historyMessages = config.historyMessages ?? DEFAULTS.myTurn.defaultHistoryMessages;
     if (typeof enabled !== "boolean")
         throw new Error("myTurn.enabled must be a boolean");
     if (typeof historyMessages !== "number" || !Number.isInteger(historyMessages) || historyMessages < 1 || historyMessages > 50) {
@@ -35,7 +36,7 @@ export function resolveMyTurn(value) {
     }
     return { enabled, historyMessages, channels };
 }
-const DEADLINE_MS = 1500;
+const { timeoutMs: DEADLINE_MS, stateMaxTokens: MAX_STATE_TOKENS } = DEFAULTS.myTurn;
 const MAX_SESSIONS = 1_000;
 const MAX_SEEN_RUNS = 64;
 const HINT = "<my_turn>Your internal Decision API determined that you probably don’t need to respond to this conversation. " +
@@ -205,7 +206,7 @@ export function registerMyTurn(api, config, decisionModel, diagnostics) {
                     record("cancelled");
                     return;
                 }
-                if (result.answers.should_respond.noul > 0.2) {
+                if (result.answers.should_respond.noul > DEFAULTS.myTurn.nudgeMaxProbability) {
                     record("no_match");
                     return;
                 }

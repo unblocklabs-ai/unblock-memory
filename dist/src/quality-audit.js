@@ -1,8 +1,9 @@
+import { DEFAULTS } from "./defaults.js";
 import { chunkFingerprint } from "./curation.js";
 import { parseSafeVirtualPath } from "./sources.js";
 import { judgeQuality, qualityJudgeVersion } from "./decision-ranking.js";
 import { qualityTriage } from "./quality-triage.js";
-const MAX_CHUNK_CHARS = 6000;
+const MAX_CHUNK_CHARS = DEFAULTS.quality.gradeMaxChars;
 /** A formatting clue, never proof that JSON or structured data is worthless. */
 export function qualityStructure(text) {
     if (!text.trim())
@@ -139,7 +140,7 @@ export async function auditQualityPage(params) {
                 path: row.path, reason, contentFingerprint: fingerprint,
                 detail: JSON.stringify({
                     path: `qmd://${source.collection}/${row.path}`, from: startLine, to: endLine,
-                    excerpt: text.slice(0, 400), excerptTruncated: text.length > 400,
+                    excerpt: text.slice(0, DEFAULTS.quality.previewChars), excerptTruncated: text.length > DEFAULTS.quality.previewChars,
                     indicator: structure === "empty" ? "deterministic_empty" :
                         structure === "encoded_message" ? "deterministic_encoding" : "decision",
                     ...judgment, policy,

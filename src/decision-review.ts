@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { choice, noul } from "@unblocklabs/decisions";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
 import { decideWithModel } from "./decision-client.js";
@@ -166,7 +167,7 @@ export async function reviewClaim(params: RequestOptions & {
 }) {
   const interaction = params.personBackground?.kind === "interaction";
   if (params.personBackground && !interaction && backgroundWordCount(params.claim) > PEOPLE_BACKGROUND_MAX_WORDS) {
-    throw new Error("Background snippet exceeds 70 words");
+    throw new Error(`Background snippet exceeds ${DEFAULTS.people.backgroundMaxWords} words`);
   }
   const state = {
     claim: params.claim,
@@ -188,8 +189,8 @@ export async function reviewClaim(params: RequestOptions & {
       confidence: answer.confidence,
       probabilities: answer.probabilities,
       background,
-      needsReview: answer.choice !== "supports" || answer.confidence < 0.9 ||
-        background.backgroundOnly < 0.9 || background.explicitSupport < 0.9,
+      needsReview: answer.choice !== "supports" || answer.confidence < DEFAULTS.review.minClaimSupport ||
+        background.backgroundOnly < DEFAULTS.review.minClaimSupport || background.explicitSupport < DEFAULTS.review.minClaimSupport,
     };
   }
   const { answers } = await decideWithModel(params, state, CLAIM_ONLY_QUESTIONS, { validateModel: false });
@@ -198,13 +199,13 @@ export async function reviewClaim(params: RequestOptions & {
     verdict: answer.choice,
     confidence: answer.confidence,
     probabilities: answer.probabilities,
-    needsReview: answer.choice !== "supports" || answer.confidence < 0.9,
+    needsReview: answer.choice !== "supports" || answer.confidence < DEFAULTS.review.minClaimSupport,
   };
 }
 
 /** Directional coverage, not topic similarity. Bounded at six comparisons of four ranked candidates. */
 export async function reviewMemoryRedundancy(params: RequestOptions & { excerpts: readonly string[] }) {
-  if (params.excerpts.length > 4) throw new Error("Too many redundancy candidates");
+  if (params.excerpts.length > DEFAULTS.review.maxRedundancyCandidates) throw new Error("Too many redundancy candidates");
   const pairs = params.excerpts.flatMap((_text, later) => params.excerpts.slice(0, later).map((_earlier, earlier) => ({ earlier, later })));
   if (!pairs.length) return [];
   return Promise.all(pairs.map(async ({ earlier, later }) => {
@@ -221,14 +222,14 @@ export async function reviewMemoryRedundancy(params: RequestOptions & { excerpts
 export function complementaryIndices(count: number, pairs: readonly { earlier: number; later: number; redundant: number }[], limit: number) {
   const selected: number[] = [];
   for (let index = 0; index < count && selected.length < limit; index++) {
-    if (!pairs.some(pair => pair.later === index && selected.includes(pair.earlier) && pair.redundant >= 0.9)) selected.push(index);
+    if (!pairs.some(pair => pair.later === index && selected.includes(pair.earlier) && pair.redundant >= DEFAULTS.review.minRedundancy)) selected.push(index);
   }
   return selected;
 }
 
 /** Classify defects per member. No cluster-wide judgment or generated repair instructions. */
 export async function reviewClusterDefects(params: RequestOptions & { excerpts: readonly string[] }) {
-  if (params.excerpts.length > 6) throw new Error("Too many cluster members");
+  if (params.excerpts.length > DEFAULTS.review.clusterCenterSamples + DEFAULTS.review.clusterEdgeSamples) throw new Error("Too many cluster members");
   if (!params.excerpts.length) return [];
   return Promise.all(params.excerpts.map(async excerpt => {
     const { answers } = await decideWithModel(

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fchmodSync, lstatSync, openSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -50,7 +51,7 @@ type LockAcquisition =
 const SESSION_SYNC_LOCK_FILE = "session-sync.lock.sqlite";
 const LEGACY_SESSION_SYNC_LOCK_FILE = "session-sync.lock";
 const SESSION_SYNC_STATUS_FILE = "session-sync-status.json";
-const LEASE_BUSY_TIMEOUT_MS = 5000;
+const LEASE_BUSY_TIMEOUT_MS = DEFAULTS.sqlite.mainBusyTimeoutMs;
 const MAX_LEASE_BUSY_RETRIES = 6;
 const heldSessionSyncLeaseTokens = new Set<string>();
 const LEASE_SCHEMA_SQL = `

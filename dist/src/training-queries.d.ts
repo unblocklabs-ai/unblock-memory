@@ -51,7 +51,7 @@ export declare function generateTrainingQueries(source: Source, store: TrainingS
         }[];
     };
 }>;
-/** Raw top-three average, including values below runtime's injection threshold. */
+/** Raw top-score average, including values below runtime's injection threshold. */
 export declare function trainingQueryScore(probabilities: readonly number[]): number;
 export declare function selectTrainingQueries(queries: readonly QueryEvaluation[]): QueryPair;
 export declare function evaluateTrainingQueries(source: Source, store: TrainingStore, config: UnblockMemoryConfig, runtime: unknown, options: Options & {

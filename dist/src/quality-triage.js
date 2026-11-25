@@ -1,11 +1,12 @@
+import { DEFAULTS } from "./defaults.js";
 import { chunkFingerprint } from "./curation.js";
 /** Routing hints only: low evidence is not permission to delete. */
 export function qualityTriage(noise, evidence, encodingDefect = false) {
-    if (noise < 0.8 && !encodingDefect)
+    if (noise < DEFAULTS.quality.triageNoiseThreshold && !encodingDefect)
         return "context_review";
-    if (evidence >= 0.8)
+    if (evidence >= DEFAULTS.quality.triageEvidenceHigh)
         return "preserve_evidence_repair";
-    if (evidence <= 0.2)
+    if (evidence <= DEFAULTS.quality.triageEvidenceLow)
         return "inspect_scaffolding";
     return "context_review";
 }

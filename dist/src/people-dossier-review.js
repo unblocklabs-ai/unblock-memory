@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { abortable } from "./abortable.js";
 import { isInteractionCategory } from "./people-background.js";
@@ -26,8 +27,8 @@ export async function reviewPersonDossier(params) {
             if (!match)
                 return unavailable("Every assertion needs exact qmd://path#Lstart-Lend evidence or explicit manual verification");
             const from = Number(match[2]), end = Number(match[3] ?? match[2]);
-            if (!Number.isSafeInteger(from) || !Number.isSafeInteger(end) || end < from || end - from >= 120)
-                return unavailable("Evidence ranges must contain 1–120 lines");
+            if (!Number.isSafeInteger(from) || !Number.isSafeInteger(end) || end < from || end - from >= DEFAULTS.review.maxCitationLines)
+                return unavailable(`Evidence ranges must contain 1–${DEFAULTS.review.maxCitationLines} lines`);
             const citation = { path: match[1], from, lines: end - from + 1 };
             citations.set(JSON.stringify(citation), citation);
         }
@@ -36,7 +37,7 @@ export async function reviewPersonDossier(params) {
         const review = { statement: check.statement, kind: check.kind, inferred: check.inferred, citations: [...citations.values()] };
         reviews.set(JSON.stringify(review), review);
     }
-    const deadline = AbortSignal.timeout(120_000);
+    const deadline = AbortSignal.timeout(DEFAULTS.people.primerTimeoutMs);
     const signal = params.signal ? AbortSignal.any([params.signal, deadline]) : deadline;
     try {
         signal.throwIfAborted();

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { resolveDecisionCredential, DecisionRequestError } from "./decision-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./decision-review.js";
 import { ApiQueryGenerator, compactJudgeConversation, fallbackQueries, QueryApiError, queryConversation } from "./query-generator.js";
@@ -5,11 +6,11 @@ import { QueryInputBudgetError } from "./query-contract.js";
 import { searchMemory, memoryPassageId } from "./memory-search.js";
 import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
-const MAX_JUDGE_CANDIDATES = 6;
-const MAX_GENERATION_TIMEOUT_MS = 1_500;
-const MAX_PAYLOAD_CHARS = 5_000;
-const MAX_SESSIONS = 1_000;
-const MAX_SEEN_RUNS = 64;
+const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
+const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
+const MAX_PAYLOAD_CHARS = DEFAULTS.memoryWhisperer.maxInjectedChars;
+const MAX_SESSIONS = DEFAULTS.memoryWhisperer.maxTrackedSessions;
+const MAX_SEEN_RUNS = DEFAULTS.memoryWhisperer.maxRunsPerSession;
 function encodeHints(items) {
     return JSON.stringify(items).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
 }
@@ -21,6 +22,13 @@ function failureFields(error) {
 async function generateQueriesWithFallback(params) {
     const { generator, conversation, timeoutMs, signal, turn, agentId, diagnostics, log } = params;
     turn.stage = "generation";
+    if (!generator) {
+        if (signal.aborted)
+            return;
+        turn.queryFallback = true;
+        diagnostics?.record(agentId, "memory", "generation_fallback");
+        return fallbackQueries(conversation);
+    }
     const generationStarted = performance.now();
     const endGeneration = startTiming("generationMs", turn.measurement, signal);
     const generationTimeoutMs = Math.min(MAX_GENERATION_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs / 2)));
@@ -57,7 +65,7 @@ async function selectComplementaryHints(params) {
     try {
         const pairs = await reviewMemoryRedundancy({
             apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, signal,
-            excerpts: ranked.map(candidate => candidate.excerpt),
+            excerpts: ranked.slice(0, DEFAULTS.review.maxRedundancyCandidates).map(candidate => candidate.excerpt),
         });
         selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]);
     }
@@ -94,7 +102,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
     if (!config.enabled || !decisionModel.enabled)
         return;
     const sessions = new Map();
-    const generator = new ApiQueryGenerator(config.api);
+    const generator = config.api.endpoint ? new ApiQueryGenerator(config.api) : undefined;
     const touchSession = (key, state) => {
         sessions.delete(key);
         sessions.set(key, state);
@@ -181,7 +189,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             }
             const search = await searchMemory(manager, queries, {
                 corpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: compactJudgeConversation(conversation),
-                asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: 4,
+                asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: DEFAULTS.memoryWhisperer.maxFinalists,
                 maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
                 onCandidates: observation => {
                     turn.measurement.retrievalMs = observation.retrievalMs;

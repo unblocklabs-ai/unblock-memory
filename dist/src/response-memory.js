@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DatabaseSync } from "node:sqlite";
 /** Current-index investigation only. No QMD manager startup, re-indexing or historical claims. */
 export function responseMemoryCandidates(indexPath, sources, episode) {
@@ -11,7 +12,7 @@ export function responseMemoryCandidates(indexPath, sources, episode) {
     const query = words.map(w => `"${w}"`).join(" OR ");
     const db = new DatabaseSync(indexPath, { readOnly: true });
     try {
-        db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
+        db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.readerBusyTimeoutMs}`);
         // Whole short indexed documents only: never call a truncated excerpt complete evidence.
         const rows = db.prepare(`SELECT d.collection,d.path,d.hash,c.doc text
       FROM documents_fts JOIN documents d ON d.id=documents_fts.rowid JOIN content c ON c.hash=d.hash

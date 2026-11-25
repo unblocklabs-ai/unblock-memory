@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -13,7 +14,7 @@ export class ResponsePeople {
             return;
         try {
             this.#db = new DatabaseSync(path, { readOnly: true });
-            this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
+            this.#db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.readerBusyTimeoutMs}`);
         }
         catch {
             this.#db?.close();

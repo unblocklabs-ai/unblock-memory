@@ -1,11 +1,13 @@
+import { DEFAULTS } from "./defaults.js";
 import type { ChatType, CorpusConfig } from "./config.js";
 
 export type ExtractionConfig = { enabled: boolean; publish: boolean; intervalMinutes: number;
   chatTypes: ChatType[]; historyMessages: number; maxBatches: number;
   minSupport: number; minRetention: number; minReplacement: number };
 export function resolveExtraction(value: unknown, corpora: readonly CorpusConfig[]): ExtractionConfig {
-  const defaults: ExtractionConfig = { enabled: false, publish: false, intervalMinutes: 60,
-    chatTypes: [], historyMessages: 6, maxBatches: 5, minSupport: 0.9, minRetention: 0.9, minReplacement: 0.9 };
+  const defaults: ExtractionConfig = { enabled: false, publish: false, intervalMinutes: DEFAULTS.extraction.intervalMinutes,
+    chatTypes: [], historyMessages: DEFAULTS.extraction.historyMessages, maxBatches: DEFAULTS.extraction.maxBatches,
+    minSupport: DEFAULTS.extraction.minSupport, minRetention: DEFAULTS.extraction.minRetention, minReplacement: DEFAULTS.extraction.minReplacement };
   if (value === undefined) return defaults;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("extraction must be an object");
   const v = value as Record<string, unknown>;

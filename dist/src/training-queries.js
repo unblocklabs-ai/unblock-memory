@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { collectTraining } from "./training.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { classifyDecisionFailure, resolveDecisionCredential } from "./decision-client.js";
@@ -7,7 +8,7 @@ import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from
 import { memoryJudgeVersion } from "./decision-ranking.js";
 import { jsonHash } from "./json-hash.js";
 const LANES = ["lex", "vec"];
-const SELECTION_VERSION = "independent-lanes-top3-mean-v2";
+const SELECTION_VERSION = `independent-lanes-top${DEFAULTS.training.topScoreCount}-mean-v2`;
 const TARGET_POLICY = "best-per-lane-no-minimum-v1";
 export const TRAINING_EVALUATION_CONCURRENCY = 4;
 function bounds(options) {
@@ -143,9 +144,9 @@ export async function generateTrainingQueries(source, store, runtime, options) {
     }));
     return { refreshed, ...result, threshold: options.threshold ?? TRAINING_GATE_THRESHOLD, model: TRAINING_TEACHER_MODEL };
 }
-/** Raw top-three average, including values below runtime's injection threshold. */
+/** Raw top-score average, including values below runtime's injection threshold. */
 export function trainingQueryScore(probabilities) {
-    const top = probabilities.toSorted((a, b) => b - a).slice(0, 3);
+    const top = probabilities.toSorted((a, b) => b - a).slice(0, DEFAULTS.training.topScoreCount);
     return top.length ? top.reduce((sum, value) => sum + value, 0) / top.length : 0;
 }
 export function selectTrainingQueries(queries) {

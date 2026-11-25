@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { classifyDecisionFailure, resolveDecisionCredential } from "./decision-client.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import { TrainingTranscriptReader, type TrainingInput } from "./training-input.js";
@@ -76,7 +77,7 @@ export async function runTraining(source: Source, store: TrainingStore, config: 
         let judgment: Awaited<ReturnType<typeof judgeTrainingInput>>;
         try {
           // Offline labeling has its own deadline, not Whisperer's latency-sensitive timeout.
-          judgment = await judgeTrainingInput(input, key!, AbortSignal.timeout(30_000),
+          judgment = await judgeTrainingInput(input, key!, AbortSignal.timeout(DEFAULTS.training.decisionTimeoutMs),
             { endpoint: config.decisionModel.endpoint, model: config.decisionModel.model });
         } catch (error) {
           const classified = classifyDecisionFailure(error);

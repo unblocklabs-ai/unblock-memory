@@ -1,17 +1,17 @@
+import { DEFAULTS } from "./defaults.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { Value } from "typebox/value";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { SafetyChannel, SafetyRequestor, SafetyScenario } from "./safety-config.js";
 import { estimateDecisionTokens, isDecisionTimeout, requestDecision, resolveDecisionCredential, NOUL_SCHEMA, DecisionRequestError } from "./decision-client.js";
-import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
+import { messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { CONVERSATION_INFO, conversationEnvelope, conversationUserText } from "./response-text.js";
 import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
 import { nonBlank, record } from "./guards.js";
 
-const MAX_SESSIONS = 1000;
-const RUNS_PER_SESSION = 4;
+const { stateMaxTokens: MAX_STATE_TOKENS, maxTrackedSessions: MAX_SESSIONS, maxRunsPerSession: RUNS_PER_SESSION } = DEFAULTS.safetyWhisperer;
 
 type SafetyPluginConfig = Pick<UnblockMemoryConfig, "safetyWhisperer" | "decisionModel" | "memoryWhisperer" | "skillWhisperer">;
 type Turn = { provider?: string; accountId?: string; senderId?: string; channelId?: string };

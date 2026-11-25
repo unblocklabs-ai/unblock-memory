@@ -31,6 +31,7 @@ export declare function extractionPolicyFingerprint(params: {
     minSupport: number;
     minRetention: number;
     minReplacement: number;
+    extractorModel?: string;
     validatorModel?: string;
 }): string;
 export declare function buildCompleteRevision(sourceRevision: string, policyFingerprint: string): string;

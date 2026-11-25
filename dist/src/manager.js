@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
@@ -20,9 +21,9 @@ import { expandSessionSearchHit, renderMemoryPassage } from "./memory-passage.js
 import { startTiming, timeStage, vectorTrace, vectorParts, unaccounted } from "./retrieval-timing.js";
 export { expandSessionSearchHit } from "./memory-passage.js";
 const DEFAULT_READ_LINES = 120;
-const MAX_READ_CHARS = 12_000;
-const WATCH_DEBOUNCE_MS = 250;
-const WATCH_RETRY_MS = 1_000;
+const MAX_READ_CHARS = DEFAULTS.memoryWhisperer.memoryGetMaxChars;
+const WATCH_DEBOUNCE_MS = DEFAULTS.sqlite.watchDebounceMs;
+const WATCH_RETRY_MS = DEFAULTS.sqlite.watchRetryMs;
 const MANAGER_CLOSED_ERROR = "QmdMemoryManager is closed";
 function readSkillDocuments(source) {
     const documents = [];
@@ -144,7 +145,7 @@ export function buildReadResult(params) {
     if (fileLines.at(-1) === "")
         fileLines.pop();
     const from = Math.max(1, Math.floor(params.from ?? 1));
-    const requestedLines = Math.max(1, Math.floor(params.lines ?? DEFAULT_READ_LINES));
+    const requestedLines = Math.min(DEFAULTS.memoryWhisperer.memoryGetMaxLines, Math.max(1, Math.floor(params.lines ?? DEFAULT_READ_LINES)));
     const selected = fileLines.slice(from - 1, from - 1 + requestedLines);
     let includedLines = 0;
     let length = 0;

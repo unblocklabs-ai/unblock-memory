@@ -2,7 +2,7 @@ import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plug
 import type { UnblockMemoryConfig } from "./config.js";
 import type { SkillSearchCandidate } from "./manager.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
-export declare const SKILL_WHISPERER_TIMEOUT_MS = 3000;
+export declare const SKILL_WHISPERER_TIMEOUT_MS: number;
 type SkillWhispererRuntime = {
     searchSkills(params: {
         cfg: OpenClawConfig;

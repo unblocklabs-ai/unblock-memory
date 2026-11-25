@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -119,7 +120,7 @@ export type PersonDossierChangeSummary = Omit<
   afterDossierBytes: number | null;
 };
 
-const MAX_DOSSIER_JSON_BYTES = 64 * 1024;
+const MAX_DOSSIER_JSON_BYTES = DEFAULTS.people.dossierMaxBytes;
 
 function serializeDossier(dossier: PersonDossier): string {
   const json = JSON.stringify(dossier);

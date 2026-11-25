@@ -38,6 +38,12 @@ not disable people tools/storage or erase dossiers.
 
 ## Shared decision model credentials
 
+Operational defaults are bundled in `defaults.json`. To override them, set
+`UNBLOCK_MEMORY_DEFAULTS_FILE` to an absolute path to a JSON file before starting
+the Gateway (or running a standalone command). Supply only the keys you want
+to change; unknown keys and invalid values fail startup. Explicit plugin config
+takes precedence for settings exposed there.
+
 All plugin decision-model features use `plugins.entries.unblock-memory.config.decisionModel`.
 Older provider config keys are rejected. When upgrading, remove the old block and
 configure a credential for the endpoint you intend to use; do not copy the old key into the default route.
@@ -240,7 +246,7 @@ contract; these tables explain their effects.
 | `skillWhisperer.cooldownTurns` | `10` | Nonnegative user-turn count; no fallback to weaker cooling-down alternatives |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, decision model key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
-| `memoryWhisperer.api.endpoint` | `http://192.168.1.191:18087` | Resident V2 query-model API base URL. Override with `http://127.0.0.1:18087` for a node hosting its own API (e.g. Theo). |
+| `memoryWhisperer.api.endpoint` | Empty | Optional query-model API URL. Unset or empty uses deterministic local queries. |
 | `memoryWhisperer.api.apiKeyFile` | unset | Absolute path to a file containing the API bearer token. Missing credentials, timeouts, or API failures fall back to deterministic local queries before decision model judging. |
 | `memoryWhisperer.mlx` | unset | Deprecated: old absolute `{pythonPath, modelPath}` values are accepted but ignored for upgrade compatibility. Remove after configuring `api`. |
 | `memoryWhisperer.minUsefulness` | `0.5` | 0–1, minimum Noul yes-probability per candidate; explicit overrides are preserved |

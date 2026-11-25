@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { join } from "node:path";
@@ -12,8 +13,8 @@ import { trainingCandidates } from "./training-candidates.js";
 import { MEMORY_PASSAGE_VERSION, renderMemoryPassage, duplicateMemoryPassage } from "./memory-passage.js";
 import type { QueryLane } from "./query-contract.js";
 
-export const TRAINING_RETRIEVAL_VERSION = `qmd-2.10.2-historical-lanes-depth10-v3:${MEMORY_PASSAGE_VERSION}`;
-export const TRAINING_SEARCH_OPTIONS = { vector: 10, bm25: 10, mergedLimit: null, rerank: false } as const;
+export const TRAINING_RETRIEVAL_VERSION = `qmd-2.10.2-historical-lanes-depth${DEFAULTS.training.retrievalDepth}-v3:${MEMORY_PASSAGE_VERSION}`;
+export const TRAINING_SEARCH_OPTIONS = { vector: DEFAULTS.training.retrievalDepth, bm25: DEFAULTS.training.retrievalDepth, mergedLimit: null, rerank: false } as const;
 export type TrainingHit = { path: string; corpus: string; text: string; dates: string[]; position: number;
   startLine: number; endLine: number; score: number; methods: string[] };
 type ChunkRow = { seq: number; pos: number; chunk_len: number; model: string; embed_fingerprint: string; embedding: Uint8Array };
@@ -138,7 +139,7 @@ async function captureSourceSessions(stateDir: string, chatTypes: readonly ChatT
     const extensionPath: unknown = extension.getLoadablePath();
     if (typeof extensionPath !== "string") throw new Error("QMD sqlite-vec path unavailable");
     sourceDb.loadExtension(extensionPath);
-    sourceDb.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=5000; BEGIN");
+    sourceDb.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.mainBusyTimeoutMs}; BEGIN`);
     settings = sourceDb.prepare("SELECT key,value FROM store_config WHERE key='embedding_chunk_strategy'").all<{ key: string; value: string }>();
     const manifestSessions = Object.values(manifest.sessions).sort((a, b) => a.documentPath.localeCompare(b.documentPath));
     if (!manifestSessions.length) {

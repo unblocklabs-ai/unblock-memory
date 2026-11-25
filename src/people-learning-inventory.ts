@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -347,7 +348,7 @@ export function inventoryPeople(options: {
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(options.databasePath, { readOnly: true });
-    db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=2000; BEGIN");
+    db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.peopleInventoryBusyTimeoutMs}; BEGIN`);
     const reader = new AgentTranscriptReader(db, agentId);
     // Scan the catalog, not session start dates or audit's capped candidate window.
     // Cold/inaccessible history cannot be proven irrelevant and remains explicit work.

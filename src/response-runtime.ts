@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { hasMemoryTable, MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
@@ -104,7 +105,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
     if (timer) clearInterval(timer);
     lifetime = new AbortController();
     // A minute poll honors durable due times without relying on process uptime.
-    timer = setInterval(tick, 60_000);
+    timer = setInterval(tick, DEFAULTS.responseAudit.pollIntervalMs);
     timer.unref();
     tick(); // New schedules wait one interval; overdue schedules get one bounded attempt.
   });

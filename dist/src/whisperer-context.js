@@ -1,6 +1,6 @@
-export const MAX_SKILL_QUERY_CHARS = 12_000;
+import { DEFAULTS } from "./defaults.js";
+export const MAX_SKILL_QUERY_CHARS = DEFAULTS.skillWhisperer.contextMaxChars;
 // Leaves room for the longest decision question under a 32k state-plus-question limit.
-export const MAX_STATE_TOKENS = 24_000;
 /** Only visible user/assistant text; never system, tool, image, or thinking blocks. */
 export function messageText(message) {
     if (!message || typeof message !== "object" || !("role" in message) || !("content" in message) ||

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { CorpusMemorySearchResult } from "./contracts.js";
@@ -10,11 +11,11 @@ import { searchMemory, memoryPassageId, type MemoryCandidateManager } from "./me
 import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
 
-const MAX_JUDGE_CANDIDATES = 6;
-const MAX_GENERATION_TIMEOUT_MS = 1_500;
-const MAX_PAYLOAD_CHARS = 5_000;
-const MAX_SESSIONS = 1_000;
-const MAX_SEEN_RUNS = 64;
+const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
+const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
+const MAX_PAYLOAD_CHARS = DEFAULTS.memoryWhisperer.maxInjectedChars;
+const MAX_SESSIONS = DEFAULTS.memoryWhisperer.maxTrackedSessions;
+const MAX_SEEN_RUNS = DEFAULTS.memoryWhisperer.maxRunsPerSession;
 
 function encodeHints(items: { source: string; lines: string; body: string }[]): string {
   return JSON.stringify(items).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
@@ -59,7 +60,7 @@ type TurnTelemetry = {
 type TurnLogger = (level: "info" | "warn", event: string, fields: Record<string, string | number | boolean | undefined>) => void;
 
 async function generateQueriesWithFallback(params: {
-  generator: ApiQueryGenerator;
+  generator?: ApiQueryGenerator;
   conversation: ReturnType<typeof queryConversation>;
   timeoutMs: number;
   signal: AbortSignal;
@@ -70,6 +71,12 @@ async function generateQueriesWithFallback(params: {
 }): Promise<QueryPair | undefined> {
   const { generator, conversation, timeoutMs, signal, turn, agentId, diagnostics, log } = params;
   turn.stage = "generation";
+  if (!generator) {
+    if (signal.aborted) return;
+    turn.queryFallback = true;
+    diagnostics?.record(agentId, "memory", "generation_fallback");
+    return fallbackQueries(conversation);
+  }
   const generationStarted = performance.now();
   const endGeneration = startTiming("generationMs", turn.measurement, signal);
   const generationTimeoutMs = Math.min(MAX_GENERATION_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs / 2)));
@@ -112,7 +119,7 @@ async function selectComplementaryHints(params: {
   try {
     const pairs = await reviewMemoryRedundancy({
       apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, signal,
-      excerpts: ranked.map(candidate => candidate.excerpt),
+      excerpts: ranked.slice(0, DEFAULTS.review.maxRedundancyCandidates).map(candidate => candidate.excerpt),
     });
     selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]!);
   } catch (error) {
@@ -154,7 +161,7 @@ export function registerMemoryWhisperer(
 ): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
   if (!config.enabled || !decisionModel.enabled) return;
   const sessions = new Map<string, SessionState>();
-  const generator = new ApiQueryGenerator(config.api);
+  const generator = config.api.endpoint ? new ApiQueryGenerator(config.api) : undefined;
   const touchSession = (key: string, state: SessionState) => {
     sessions.delete(key);
     sessions.set(key, state);
@@ -226,7 +233,7 @@ export function registerMemoryWhisperer(
       if (!manager) { turn.reason = "unavailable"; diagnostics?.record(agentId, "memory", "unavailable"); return; }
       const search = await searchMemory(manager, queries, {
         corpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: compactJudgeConversation(conversation),
-        asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: 4,
+        asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: DEFAULTS.memoryWhisperer.maxFinalists,
         maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
         onCandidates: observation => {
           turn.measurement.retrievalMs = observation.retrievalMs;

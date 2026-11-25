@@ -1,5 +1,6 @@
+import { DEFAULTS } from "./defaults.js";
 /** Keep identity brief; interaction preferences are stored separately with evidence. */
-export const PEOPLE_BACKGROUND_MAX_WORDS = 70;
+export const PEOPLE_BACKGROUND_MAX_WORDS = DEFAULTS.people.backgroundMaxWords;
 export const INTERACTION_DOSSIER_CATEGORIES = ["preferences", "workingStyle"];
 export const AGENT_LESSON_MAX_TTL_MS = 30 * 86400_000;
 export function isInteractionCategory(category) {

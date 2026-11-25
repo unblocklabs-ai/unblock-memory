@@ -1,5 +1,6 @@
+import { DEFAULTS } from "./defaults.js";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
-const DEFAULT_SAFETY_MIN_PROBABILITY = 0.4;
+const DEFAULT_SAFETY_MIN_PROBABILITY = DEFAULTS.safetyWhisperer.defaultMinProbability;
 const MAX_SCENARIOS = 20;
 const MAX_TEXT_CHARS = 2000;
 const MAX_ENTRIES = 500;
@@ -86,7 +87,7 @@ function scenario(value, index) {
     };
 }
 export function resolveSafetyWhisperer(value) {
-    const defaults = { enabled: false, historyMessages: 6, timeoutMs: 3000, excludedChannels: [], scenarios: [] };
+    const defaults = { enabled: false, historyMessages: DEFAULTS.safetyWhisperer.defaultHistoryMessages, timeoutMs: DEFAULTS.safetyWhisperer.defaultTimeoutMs, excludedChannels: [], scenarios: [] };
     if (value === undefined)
         return defaults;
     const config = record(value, "safetyWhisperer");

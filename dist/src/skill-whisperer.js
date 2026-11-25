@@ -1,14 +1,15 @@
+import { DEFAULTS } from "./defaults.js";
 import { basename } from "node:path";
 import { selectSkill } from "./decision-ranking.js";
 import { isDecisionTimeout, resolveDecisionCredential, DecisionRequestError } from "./decision-client.js";
 import { buildSkillWhispererQuery, MAX_SKILL_QUERY_CHARS, recentSkillMessages } from "./whisperer-context.js";
 import { abortable } from "./abortable.js";
 import { isRecord } from "./guards.js";
-const CANDIDATE_LIMIT = 10;
-const JUDGE_CANDIDATE_LIMIT = 3;
+const CANDIDATE_LIMIT = DEFAULTS.skillWhisperer.maxCandidates;
+const JUDGE_CANDIDATE_LIMIT = DEFAULTS.skillWhisperer.maxParallelJudges;
 const MAX_SESSIONS = 1_000;
 const MAX_SEEN_RUNS = 64;
-export const SKILL_WHISPERER_TIMEOUT_MS = 3000;
+export const SKILL_WHISPERER_TIMEOUT_MS = DEFAULTS.skillWhisperer.timeoutMs;
 function decisionConversation(prompt, messages) {
     const currentRequest = prompt.trim().slice(-MAX_SKILL_QUERY_CHARS);
     let remaining = MAX_SKILL_QUERY_CHARS - currentRequest.length;

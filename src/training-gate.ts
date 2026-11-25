@@ -1,10 +1,11 @@
+import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
 import { decideWithModel, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import type { TrainingInput } from "./training-input.js";
 
 export const TRAINING_GATE_VERSION = "historical-recall-v2";
 export const TRAINING_GATE_MODEL = DEFAULT_DECISION_MODEL;
-export const TRAINING_GATE_THRESHOLD = 0.7;
+export const TRAINING_GATE_THRESHOLD = DEFAULTS.training.gateThreshold;
 export const TRAINING_GATE_QUESTIONS = {
   recall_needed: noul(
     {
@@ -32,7 +33,7 @@ export async function judgeTrainingInput(input: TrainingInput, apiKey: string, s
   options?: { endpoint?: string; model?: string }) {
   const expectedModel = options?.model ?? DEFAULT_DECISION_MODEL;
   const result = await decideWithModel(
-    { apiKey, endpoint: options?.endpoint, model: expectedModel, signal },
+    { apiKey, endpoint: options?.endpoint, model: expectedModel, timeoutMs: DEFAULTS.training.decisionTimeoutMs, signal },
     input,
     TRAINING_GATE_QUESTIONS,
     { validateModel: true },

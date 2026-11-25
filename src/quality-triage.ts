@@ -1,11 +1,12 @@
+import { DEFAULTS } from "./defaults.js";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { chunkFingerprint, type MaintenanceTask } from "./curation.js";
 
 /** Routing hints only: low evidence is not permission to delete. */
 export function qualityTriage(noise: number, evidence: number, encodingDefect = false) {
-  if (noise < 0.8 && !encodingDefect) return "context_review" as const;
-  if (evidence >= 0.8) return "preserve_evidence_repair" as const;
-  if (evidence <= 0.2) return "inspect_scaffolding" as const;
+  if (noise < DEFAULTS.quality.triageNoiseThreshold && !encodingDefect) return "context_review" as const;
+  if (evidence >= DEFAULTS.quality.triageEvidenceHigh) return "preserve_evidence_repair" as const;
+  if (evidence <= DEFAULTS.quality.triageEvidenceLow) return "inspect_scaffolding" as const;
   return "context_review" as const;
 }
 

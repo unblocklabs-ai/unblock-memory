@@ -1,10 +1,10 @@
 import type { ChatType } from "./config.js";
 import type { SessionMessageSpan } from "./session-projector.js";
 import type { QueryLane } from "./query-contract.js";
-export declare const TRAINING_RETRIEVAL_VERSION = "qmd-2.10.2-historical-lanes-depth10-v3:complete-excerpt-1200-v1";
+export declare const TRAINING_RETRIEVAL_VERSION: string;
 export declare const TRAINING_SEARCH_OPTIONS: {
-    readonly vector: 10;
-    readonly bm25: 10;
+    readonly vector: number;
+    readonly bm25: number;
     readonly mergedLimit: null;
     readonly rerank: false;
 };

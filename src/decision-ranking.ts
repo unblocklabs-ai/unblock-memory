@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
 import type { QueryConversation } from "./query-contract.js";
 import {
@@ -7,7 +8,7 @@ import {
 } from "./decision-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 
-const SKILL_MIN_USEFULNESS = 0.7;
+const SKILL_MIN_USEFULNESS = DEFAULTS.skillWhisperer.minDecisionUsefulness;
 
 const SKILL_USEFUL_QUESTIONS = {
   useful: noul(

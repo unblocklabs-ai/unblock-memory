@@ -1,8 +1,9 @@
+import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
 import { decideWithModel, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 export const TRAINING_GATE_VERSION = "historical-recall-v2";
 export const TRAINING_GATE_MODEL = DEFAULT_DECISION_MODEL;
-export const TRAINING_GATE_THRESHOLD = 0.7;
+export const TRAINING_GATE_THRESHOLD = DEFAULTS.training.gateThreshold;
 export const TRAINING_GATE_QUESTIONS = {
     recall_needed: noul({
         question: "Would additional historical memory, beyond the supplied conversation, materially help answer `currentRequest`?",
@@ -24,7 +25,7 @@ export const TRAINING_GATE_QUESTIONS = {
 };
 export async function judgeTrainingInput(input, apiKey, signal, options) {
     const expectedModel = options?.model ?? DEFAULT_DECISION_MODEL;
-    const result = await decideWithModel({ apiKey, endpoint: options?.endpoint, model: expectedModel, signal }, input, TRAINING_GATE_QUESTIONS, { validateModel: true });
+    const result = await decideWithModel({ apiKey, endpoint: options?.endpoint, model: expectedModel, timeoutMs: DEFAULTS.training.decisionTimeoutMs, signal }, input, TRAINING_GATE_QUESTIONS, { validateModel: true });
     if (!result.usage) {
         throw new DecisionError("Invalid training gate response", "invalid_response");
     }

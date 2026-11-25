@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { existsSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
@@ -51,9 +52,9 @@ function linkInsideOutPeopleInDb(db) {
         const changes = db.prepare(`SELECT e.rowid id,${person} person_id FROM inside_out e
       WHERE e.person_id IS NOT ${person} AND e.error IS NOT ?`).all(PURGED_GRADE);
         const link = db.prepare("UPDATE inside_out SET person_id=? WHERE rowid=? AND error IS NOT ?");
-        for (let start = 0; start < changes.length; start += 500) {
+        for (let start = 0; start < changes.length; start += DEFAULTS.insideOut.batchSize) {
             immediateTransaction(db, () => {
-                for (const change of changes.slice(start, start + 500))
+                for (const change of changes.slice(start, start + DEFAULTS.insideOut.batchSize))
                     updated += Number(link.run(change.person_id, change.id, PURGED_GRADE).changes);
             });
         }

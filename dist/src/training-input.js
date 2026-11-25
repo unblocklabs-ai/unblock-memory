@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader } from "./agent-transcript.js";
 import { messageText } from "./whisperer-context.js";
@@ -28,7 +29,7 @@ export function trainingExamples(rows, renew) {
         history.push({ role, content });
     };
     for (const row of rows) {
-        if (renew && Date.now() - renewedAt >= 10_000) {
+        if (renew && Date.now() - renewedAt >= DEFAULTS.training.heartbeatMs) {
             renew();
             renewedAt = Date.now();
         }
@@ -135,7 +136,7 @@ export class TrainingTranscriptReader {
     constructor(path, agentId) {
         this.#db = new DatabaseSync(path, { readOnly: true });
         try {
-            this.#db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
+            this.#db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.readerBusyTimeoutMs}`);
             this.#transcripts = new AgentTranscriptReader(this.#db, agentId, "Unsupported training transcript schema or agent");
             const columns = this.#db.prepare("PRAGMA table_info(session_windows)").all().map(c => c.name);
             this.#lineage = ["parent_session_key", "spawned_by", "plugin_owner_id", "hook_external_content_source"].every(c => columns.includes(c));
@@ -159,7 +160,7 @@ export class TrainingTranscriptReader {
                 /:(?:cron|subagent|heartbeat|hook)(?::|$)/i.test(String(session.session_key)) ||
                 session.parent_session_key || session.spawned_by || session.plugin_owner_id || session.hook_external_content_source)
                 return null;
-            const snapshot = this.#transcripts.read(sessionId, { maxEvents: 50_000, maxBytes: 32_000_000 });
+            const snapshot = this.#transcripts.read(sessionId, { maxEvents: DEFAULTS.training.maxInputEvents, maxBytes: DEFAULTS.training.maxInputBytes });
             if (snapshot.kind === "oversized")
                 return { oversized: true };
             if (snapshot.kind !== "ready")

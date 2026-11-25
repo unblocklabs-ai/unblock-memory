@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { abortable, abortedByTimeout } from "./abortable.js";
@@ -194,8 +195,9 @@ export class ApiQueryGenerator {
   constructor(private readonly config: UnblockMemoryConfig["memoryWhisperer"]["api"]) {}
 
   async generate(conversation: QueryConversation, signal: AbortSignal): Promise<QueryPair> {
-    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(DEFAULTS.memoryWhisperer.queryClientTimeoutMs)]);
     throwIfQueryAborted(requestSignal);
+    if (!this.config.endpoint) throw new QueryApiError("unavailable");
     if (!this.config.apiKeyFile) throw new QueryApiError("credentials");
     let token: string;
     try { token = (await readFile(this.config.apiKeyFile, { encoding: "utf8", signal: requestSignal })).trim(); }
@@ -231,7 +233,7 @@ export class ApiQueryGenerator {
         const { done, value } = await abortable(reader.read(), requestSignal);
         if (done) break;
         size += value.byteLength;
-        if (size > 16_384) throw new QueryApiError("invalid_response");
+        if (size > DEFAULTS.memoryWhisperer.queryResponseMaxBytes) throw new QueryApiError("invalid_response");
         chunks.push(value);
       }
       throwIfQueryAborted(requestSignal);

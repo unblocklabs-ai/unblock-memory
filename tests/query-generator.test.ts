@@ -178,10 +178,10 @@ test("compactJudgeConversation caps history to two messages, 1500 total chars, a
   assert.ok(emojiRequest.currentRequest.length <= 1_500);
 });
 
-test("API defaults are off and Studio-bound; loopback override and legacy migration are safe", () => {
+test("API defaults to no endpoint; loopback override and legacy migration are safe", () => {
   const defaults = resolveConfig(undefined).memoryWhisperer;
   assert.equal(defaults.enabled, false);
-  assert.equal(defaults.api.endpoint, "http://192.168.1.191:18087");
+  assert.equal(defaults.api.endpoint, "");
   const local = resolveConfig({ memoryWhisperer: { api: { endpoint: "http://127.0.0.1:18087/", apiKeyFile: "/token" },
     mlx: { pythonPath: "/old/python", modelPath: "/old/model" } } }).memoryWhisperer;
   assert.deepEqual(local.api, { endpoint: "http://127.0.0.1:18087", apiKeyFile: "/token" });

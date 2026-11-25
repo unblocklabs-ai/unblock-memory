@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -23,7 +24,7 @@ export function registerExtraction(api, config, runtime, deps) {
         if (!listAgentIds(cfg).includes(agentId))
             throw new Error("Unknown extraction agent");
         return { agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
-            config, runtime: api.runtime, storePath: join(agentStateDir(agentId), MEMORY_DATABASE),
+            config, storePath: join(agentStateDir(agentId), MEMORY_DATABASE),
             sessions: () => extractionSessions(agentTranscriptDatabase(cfg, agentId), agentId, config.extraction.chatTypes) };
     };
     const run = (cfg, agentId, signal, since, sessionId, scheduled = false) => track((async () => {
@@ -51,8 +52,8 @@ export function registerExtraction(api, config, runtime, deps) {
             .action(async (opts) => {
             const since = opts.since === undefined ? undefined : dateOption(opts.since, 0);
             try {
-                // Native harnesses live in the Gateway, not the cold CLI metadata loader.
-                const result = await callGatewayFromCli("unblock-memory.extract", { timeout: "600000" }, { agentId: opts.agent, ...(since === undefined ? {} : { since }), ...(opts.session ? { sessionId: opts.session } : {}) });
+                // Transcript reads and scheduling belong to the running Gateway.
+                const result = await callGatewayFromCli("unblock-memory.extract", { timeout: String(DEFAULTS.extraction.runTimeoutMs) }, { agentId: opts.agent, ...(since === undefined ? {} : { since }), ...(opts.session ? { sessionId: opts.session } : {}) });
                 console.log(JSON.stringify(result, null, 2));
                 if (result.status === "unavailable" || (result.status === "completed" && result.failed))
                     process.exitCode = 1;
@@ -136,7 +137,7 @@ export function registerExtraction(api, config, runtime, deps) {
             lifetime = new AbortController();
         if (!config.extraction.enabled || !config.extraction.intervalMinutes || !config.decisionModel.enabled)
             return;
-        timer = setInterval(tick, 60_000);
+        timer = setInterval(tick, DEFAULTS.extraction.pollIntervalMs);
         timer.unref();
         tick();
     });

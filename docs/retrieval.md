@@ -409,8 +409,7 @@ are triggered by this feature beyond the memory manager's normal initialization.
 
 ### API query generation (Memory Whisperer remains off by default)
 
-Query generation always uses a resident V2 model API. Configure its credential file
-and explicitly enable Memory Whisperer only when ready:
+Memory Whisperer uses deterministic queries by default. To use a resident V2 query-model API, explicitly configure its endpoint and credential file:
 
 ```json
 {
@@ -419,20 +418,14 @@ and explicitly enable Memory Whisperer only when ready:
     "corpora": ["memory", "knowledge", "sessions"],
     "timeoutMs": 8000,
     "api": {
-      "endpoint": "http://192.168.1.191:18087",
+      "endpoint": "http://127.0.0.1:18087",
       "apiKeyFile": "/absolute/path/to/memory-query-api/api-token"
     }
   }
 }
 ```
 
-The Studio LAN endpoint is the default. Nodes outside this LAN (e.g. Theo) can host
-the same API/model themselves and override the endpoint with `http://127.0.0.1:18087`.
-The plugin does not launch Python, download weights, or manage the server. The host
-service must retain and warm the model and restart it after failure. The Studio
-service starts at Roman's login, uses bearer authentication and a client-IP allowlist;
-each new fleet client must be provisioned there before enabling hints. Plain HTTP is
-for the trusted LAN/loopback only; use TLS or a private tunnel across untrusted networks.
+The plugin does not launch or manage the server. Use plain HTTP only on trusted networks; use TLS or a private tunnel otherwise.
 Visible conversation text is sent to this endpoint, never tool outputs/thinking.
 Approve only corpora suitable for every audience of the agent.
 

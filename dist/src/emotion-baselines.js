@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createHash } from "node:crypto";
 import { immediateTransaction, tableExists } from "./memory-database.js";
 import { jsonHash } from "./json-hash.js";
@@ -12,8 +13,8 @@ const VERSION = "personal-deviation-v2";
 // 0.01-wide bins bound each stored distribution to 101 values per emotion, however long the history.
 const STEPS = 100;
 // Writers on the shared store wait for at most one short batch, never a whole refresh.
-const BATCH = 500;
-const PAGE = 2000;
+const BATCH = DEFAULTS.insideOut.batchSize;
+const PAGE = DEFAULTS.insideOut.readPageSize;
 const weekStart = (time) => MONDAY + Math.floor((time - MONDAY) / WEEK) * WEEK;
 const bin = (value) => Math.round(value * STEPS);
 const GRADE = `interaction_id,rubric,model,person_id,target_at,reviewed_at,error,${INSIDE_OUT_EMOTIONS.join(",")}`;

@@ -1,6 +1,8 @@
+import { DEFAULTS } from "./defaults.js";
 export function resolveExtraction(value, corpora) {
-    const defaults = { enabled: false, publish: false, intervalMinutes: 60,
-        chatTypes: [], historyMessages: 6, maxBatches: 5, minSupport: 0.9, minRetention: 0.9, minReplacement: 0.9 };
+    const defaults = { enabled: false, publish: false, intervalMinutes: DEFAULTS.extraction.intervalMinutes,
+        chatTypes: [], historyMessages: DEFAULTS.extraction.historyMessages, maxBatches: DEFAULTS.extraction.maxBatches,
+        minSupport: DEFAULTS.extraction.minSupport, minRetention: DEFAULTS.extraction.minRetention, minReplacement: DEFAULTS.extraction.minReplacement };
     if (value === undefined)
         return defaults;
     if (!value || typeof value !== "object" || Array.isArray(value))

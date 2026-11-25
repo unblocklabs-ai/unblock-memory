@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { setImmediate } from "node:timers/promises";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { ResolvedSource } from "./sources.js";
@@ -37,7 +38,7 @@ export type ResponseAuditOptions = {
 export async function auditResponses(options: ResponseAuditOptions) {
   const { config, agentId } = options;
   if (!config.responseAudit.enabled || !config.decisionModel.enabled) return { status: "disabled" as const };
-  const signal = AbortSignal.any([AbortSignal.timeout(120_000), ...(options.signal ? [options.signal] : [])]);
+  const signal = AbortSignal.any([AbortSignal.timeout(DEFAULTS.responseAudit.deadlineMs), ...(options.signal ? [options.signal] : [])]);
   const cohort = responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
   let key: string | undefined;
   if (!options.dryRun) {
@@ -183,7 +184,7 @@ async function assessMemoryOpportunity(
   params: ResponseJudgeParams,
   usage: { stageAttempts: number; stageCacheHits: number },
 ): Promise<ResponseResult["memory"]> {
-  if (feedback.memoryGap.noul < 0.8 || !options.config.responseAudit.memoryCorpora.length) {
+  if (feedback.memoryGap.noul < DEFAULTS.responseAudit.scoreHigh || !options.config.responseAudit.memoryCorpora.length) {
     return { status: "not_requested", candidates: [] };
   }
   try {

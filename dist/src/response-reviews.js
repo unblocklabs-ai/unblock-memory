@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { responseOutcome } from "./response-outcome.js";
 import { immediateTransaction } from "./memory-database.js";
@@ -54,8 +55,8 @@ export class ResponseReviews {
         const agentProbability = agentDirected.reduce((sum, key) => sum + f.target.probabilities[key], 0);
         const signals = [
             ...(outcome.status === "reported_shortfall" ? [{ family: "delivery_quality", detail: outcome }] : []),
-            ...(intensity && intensity.probabilities["2"] + intensity.probabilities["3"] >= 0.8 && agentProbability >= 0.8 &&
-                ((f.annoyance?.noul ?? 0) >= 0.8 || (f.frustration?.noul ?? 0) >= 0.8) ?
+            ...(intensity && intensity.probabilities["2"] + intensity.probabilities["3"] >= DEFAULTS.responseAudit.scoreHigh && agentProbability >= DEFAULTS.responseAudit.scoreHigh &&
+                ((f.annoyance?.noul ?? 0) >= DEFAULTS.responseAudit.scoreHigh || (f.frustration?.noul ?? 0) >= DEFAULTS.responseAudit.scoreHigh) ?
                 [{ family: "human_experience", detail: { target: f.target, sentiment: f.sentiment, annoyance: f.annoyance,
                             frustration: f.frustration, intensity } }] : []),
         ];

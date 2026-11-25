@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import type { TrainingInput } from "./training-input.js";
 import type { TrainingHit } from "./training-retrieval.js";
 import { MEMORY_JUDGE_VERSION, memoryUsefulnessRequest, judgeMemoryPassage } from "./decision-ranking.js";
@@ -12,5 +13,5 @@ export function contextJudgeRequest(input: TrainingInput, asOf: string, hit: Tra
 
 export async function judgeTrainingPassage(request: ReturnType<typeof contextJudgeRequest>, apiKey: string,
   options?: { endpoint?: string; model?: string }) {
-  return judgeMemoryPassage(request, { apiKey, endpoint: options?.endpoint, model: options?.model, timeoutMs: 30_000 });
+  return judgeMemoryPassage(request, { apiKey, endpoint: options?.endpoint, model: options?.model, timeoutMs: DEFAULTS.training.decisionTimeoutMs });
 }

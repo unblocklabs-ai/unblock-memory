@@ -1,7 +1,7 @@
 # Session memory extraction
 
-Opt-in lasting-fact extraction: **Luna proposes facts → code checks exact quotes →
-decision model checks support and retention → SQLite stores accepted facts → optional QMD search.**
+Opt-in lasting-fact extraction: **d1.2 selects transcript spans → code maps them to exact quotes →
+d1.2 checks support, retention, and corrections → SQLite stores accepted facts → optional QMD search.**
 It is independent of Inside Out: emotion scores do not select or strengthen memories.
 It never writes `MEMORY.md`, daily Markdown, or people dossiers.
 
@@ -34,28 +34,15 @@ and be a subset of the configured sessions corpus. This is channel agnostic.
 Configure [decision model credentials](configuration.md#shared-decision-model-credentials).
 Manual runs use the same Gateway-owned worker as scheduled runs; the Gateway must
 be running and the CLI caller needs `operator.admin`. Reports can be read offline.
-Requires host visible-transcript delta reads and working isolated LLM completion
-(validated on OpenClaw 2026.9.2 with Codex 0.159.2). The native harness must be
-installed through OpenClaw, not merely added to `plugins.load.paths`. Grant this
-host policy **alongside `config`** in the plugin entry:
+Extraction requires host visible-transcript delta reads and a decision-model key.
+It does not use host LLM completion or require a plugin `llm` grant. Missing
+decision-model credentials prevent source scans and model calls.
 
-```json
-{
-  "llm": {
-    "allowAgentIdOverride": true,
-    "allowModelOverride": true,
-    "allowedModels": ["openai/gpt-5.6-luna"],
-    "allowedCompletionModels": ["openai/gpt-5.6-luna"]
-  }
-}
-```
-
-Luna uses the host's configured agent runtime and credentials, with zero tools and
-no alternate-model/provider fallback. Missing decision-model credentials prevent source
-scans and model calls. Enabling approves sending selected conversation text to
-Luna and the configured decision endpoint (defaults to
-`https://codex.unblocklabs.ai/v1/decisions` → OpenRouter `liquid/d1.2-ultra`);
-tool calls/results and hidden thinking are removed first.
+Enabling extraction sends selected visible conversation text to the configured
+decision provider. The default is `liquid/d1.2-ultra` via
+`https://codex.unblocklabs.ai/v1/decisions`. A custom endpoint must support both
+`/decisions` and its sibling `/extractions`. Tool calls, tool results, and hidden
+thinking are removed first.
 
 ## Run, backfill, inspect
 
@@ -79,11 +66,16 @@ preferences, enduring project purposes, and adopted standing rules. Omit guesses
 hypotheticals, one-off tasks, temporary status, release/incident details, generic
 technical knowledge, and credentials. The original transcripts remain searchable.
 
-A blue guess followed by a human correction to red retains only the red preference.
-Each proposal needs exact supporting quotes and new-message evidence. decision model checks
-support and retention independently in one request; replacements also require an
-explicit update to the same fact. All applicable thresholds must pass, and support
-must select `supported`, even if its threshold is lowered.
+A blue guess followed by a human correction to red retains the resolved preference.
+Proposals store speaker-attributed verbatim quotes. If a reply needs the preceding
+question to make sense, the proposal can quote both turns. At least one quote must
+come from a new message. List items below 0.50 confidence are skipped when the
+provider supplies per-item confidence.
+
+If prior facts exist, a choice judgment looks for an explicit correction or update.
+A second decision checks support and retention, and rechecks any proposed replacement
+against the original evidence. All applicable thresholds must pass, and support must
+select `supported`, even if its threshold is lowered.
 
 The three thresholds accept 0–1 and default to 0.90. Lowering retention changes
 certainty about category membership, not the categories themselves. Agents can
@@ -113,14 +105,11 @@ The Gateway owns the scheduler; no cron/launchd job is added. Interval 0 means
 manual-only; the maximum is 1,440 minutes (daily). Defaults are disabled, unpublished,
 no approved chat types, hourly, six overlap messages, and five chunks per run.
 
-Chunks target 24k input tokens and cap at 28k, including Luna instructions, prior
-facts and overlap, leaving room for decision model's 32k state-plus-longest-question limit.
-`o200k_base` is a budgeting proxy, not an exact decision model/host token count. Quotes are
-limited to 512 characters each. Up to six overlap messages fit within 8k tokens by
-default. Oversized messages split losslessly with resumable offsets and original
-message-ID citations. A session above 100 retained facts or 40k characters of prior
-facts pauses rather than silently dropping comparison context. The output limit
-is advisory on some host runtimes; malformed/truncated JSON is retried, never saved.
+Chunks target 24k input tokens and cap at 28k using an `o200k_base` estimate.
+Quotes are limited to 512 characters, and overlap is capped at 8k tokens by default.
+Oversized messages split with resumable offsets and original message-ID citations.
+A session above 100 retained facts or 40k characters of prior facts pauses rather
+than silently dropping comparison context. Model errors leave the chunk uncommitted.
 
 This is a conservative v1, not a calibrated guarantee of memory recall or truth.
 Start with a single-session shadow run and inspect the retained facts before publishing.

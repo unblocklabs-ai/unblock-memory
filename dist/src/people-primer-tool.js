@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
@@ -11,7 +12,7 @@ const parameters = Type.Object({
     agentName: Type.Optional(Type.String({ pattern: "\\S", maxLength: 100,
         description: "Your human-facing name, e.g. Bill, when no agent identity name is configured. Never a person's name guessed from search results." })),
     draft: Type.Optional(Type.Object({
-        blurb: Type.String({ pattern: "\\S", maxLength: 1200, description: "Final background-only snippet, at most 70 words. Supplying a draft reviews it instead of running searches." }),
+        blurb: Type.String({ pattern: "\\S", maxLength: DEFAULTS.people.defaultWhispererMaxChars, description: `Final background-only snippet, at most ${DEFAULTS.people.backgroundMaxWords} words. Supplying a draft reviews it instead of running searches.` }),
         citations: Type.Array(Type.Object({
             path: Type.String({ pattern: "^qmd://", maxLength: 2000 }),
             from: Type.Integer({ minimum: 1 }), lines: Type.Integer({ minimum: 1, maximum: 120 }),
@@ -26,20 +27,20 @@ export function registerPeoplePrimerTool(api, runtime, stores, config) {
             return null;
         return {
             name: "memory_people_prime", label: "Prime Person Dossier",
-            description: "Prepare evidence about identity, organization, agent relationship, explicit interaction preferences and working-style feedback, including newer corrections. Supply draft to review only an identity blurb <=70 words. Dossier writes review all preference claims separately. Requires peoplePrimer and approved corpora; never writes dossiers.",
+            description: `Prepare evidence about identity, organization, agent relationship, explicit interaction preferences and working-style feedback, including newer corrections. Supply draft to review only an identity blurb <=${DEFAULTS.people.backgroundMaxWords} words. Dossier writes review all preference claims separately. Requires peoplePrimer and approved corpora; never writes dossiers.`,
             parameters,
             async execute(_id, params, signal) {
                 const { personId, agentName: suppliedName, draft } = Value.Parse(parameters, params);
                 if (!config.people.enabled || !config.peoplePrimer.enabled || !config.decisionModel.enabled)
                     return jsonResult({ status: "disabled" });
                 if (draft && backgroundWordCount(draft.blurb) > PEOPLE_BACKGROUND_MAX_WORDS) {
-                    return jsonResult({ status: "invalid", needsReview: true, reason: "Background snippet must not exceed 70 words" });
+                    return jsonResult({ status: "invalid", needsReview: true, reason: `Background snippet must not exceed ${DEFAULTS.people.backgroundMaxWords} words` });
                 }
                 const key = JSON.stringify([active.agentId, personId]);
                 if (running.has(key))
                     return jsonResult({ status: "busy" });
                 running.add(key);
-                const deadline = AbortSignal.timeout(120_000);
+                const deadline = AbortSignal.timeout(DEFAULTS.people.primerTimeoutMs);
                 const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
                 try {
                     combined.throwIfAborted();

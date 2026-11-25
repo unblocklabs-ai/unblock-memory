@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { join } from "node:path";
@@ -7,8 +8,8 @@ import { projectionHash, readSessionManifest } from "./session-sync.js";
 import { resolveSessionSource } from "./sources.js";
 import { trainingCandidates } from "./training-candidates.js";
 import { MEMORY_PASSAGE_VERSION, renderMemoryPassage, duplicateMemoryPassage } from "./memory-passage.js";
-export const TRAINING_RETRIEVAL_VERSION = `qmd-2.10.2-historical-lanes-depth10-v3:${MEMORY_PASSAGE_VERSION}`;
-export const TRAINING_SEARCH_OPTIONS = { vector: 10, bm25: 10, mergedLimit: null, rerank: false };
+export const TRAINING_RETRIEVAL_VERSION = `qmd-2.10.2-historical-lanes-depth${DEFAULTS.training.retrievalDepth}-v3:${MEMORY_PASSAGE_VERSION}`;
+export const TRAINING_SEARCH_OPTIONS = { vector: DEFAULTS.training.retrievalDepth, bm25: DEFAULTS.training.retrievalDepth, mergedLimit: null, rerank: false };
 /** Missing historical evidence is reviewable; unexpected SQLite/I/O failures remain fatal. */
 export class HistoricalCorpusUnavailableError extends Error {
 }
@@ -107,7 +108,7 @@ async function captureSourceSessions(stateDir, chatTypes) {
         if (typeof extensionPath !== "string")
             throw new Error("QMD sqlite-vec path unavailable");
         sourceDb.loadExtension(extensionPath);
-        sourceDb.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=5000; BEGIN");
+        sourceDb.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.mainBusyTimeoutMs}; BEGIN`);
         settings = sourceDb.prepare("SELECT key,value FROM store_config WHERE key='embedding_chunk_strategy'").all();
         const manifestSessions = Object.values(manifest.sessions).sort((a, b) => a.documentPath.localeCompare(b.documentPath));
         if (!manifestSessions.length) {

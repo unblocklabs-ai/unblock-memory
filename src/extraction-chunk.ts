@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
@@ -34,7 +35,7 @@ function prefixThatFits(message: ExtractionMessage, offset: number, budget: numb
 export function extractionHistory(messages: ExtractionMessage[], count: number): ExtractionMessage[] {
   if (!count) return [];
   const kept: ExtractionMessage[] = [];
-  let remaining = 8_000;
+  let remaining = DEFAULTS.extraction.historyTokenBudget;
   for (const message of messages.slice(-count).reverse()) {
     const tokens = extractionMessageTokens(message);
     if (tokens <= remaining) { kept.unshift(message); remaining -= tokens; continue; }

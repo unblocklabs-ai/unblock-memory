@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import type { QMDStore } from "@unblocklabs/qmd";
 import type { CurationStore, MaintenanceTask } from "./curation.js";
 import { chunkFingerprint } from "./curation.js";
@@ -10,7 +11,7 @@ type ChunkRow = {
   document_id: number; seq: number; collection: string; path: string;
   hash: string; pos: number; chunk_len: number; doc: string;
 };
-const MAX_CHUNK_CHARS = 6000;
+const MAX_CHUNK_CHARS = DEFAULTS.quality.gradeMaxChars;
 
 /** A formatting clue, never proof that JSON or structured data is worthless. */
 export function qualityStructure(text: string): "empty" | "encoded_message" | "serialized_message" | "plain_or_structured" {
@@ -141,7 +142,7 @@ export async function auditQualityPage(params: {
         path: row.path, reason, contentFingerprint: fingerprint,
         detail: JSON.stringify({
           path: `qmd://${source.collection}/${row.path}`, from: startLine, to: endLine,
-          excerpt: text.slice(0, 400), excerptTruncated: text.length > 400,
+          excerpt: text.slice(0, DEFAULTS.quality.previewChars), excerptTruncated: text.length > DEFAULTS.quality.previewChars,
           indicator: structure === "empty" ? "deterministic_empty" :
             structure === "encoded_message" ? "deterministic_encoding" : "decision",
           ...judgment, policy,

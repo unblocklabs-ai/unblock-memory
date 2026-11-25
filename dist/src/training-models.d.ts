@@ -2,7 +2,7 @@ import { Type, type Static } from "typebox";
 import type { TrainingInput } from "./training-input.js";
 import type { QueryLane } from "./query-contract.js";
 export declare const TRAINING_RECIPE_VERSION = "lex-vec-v2";
-export declare const TRAINING_TEACHER_MODEL = "openai/gpt-6-luna";
+export declare const TRAINING_TEACHER_MODEL: string;
 export declare const TRAINING_TEACHER_VERSION = "lex-vec-teacher-v2-xhigh";
 export type TrainingRound = 1 | 2;
 export type QueryFeedback = {

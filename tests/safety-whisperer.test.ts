@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import manifest from "../openclaw.plugin.json" with { type: "json" };
 import { resolveConfig, type UnblockMemoryConfig } from "../src/config.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
 import { resolveSafetyWhisperer } from "../src/safety-config.js";
@@ -76,15 +75,13 @@ function answers(probabilities: number[]) {
     answers: Object.fromEntries(probabilities.map((noul, index) => [`scenario_${index}`, { type: "noul", noul }])) });
 }
 
-test("disabled by default, validated, and the manifest agrees with the resolver", () => {
+test("disabled by default and validates scenarios", () => {
   const defaults = resolveConfig({}).safetyWhisperer;
   assert.deepEqual(defaults, { enabled: false, historyMessages: 6, timeoutMs: 3000, excludedChannels: [], scenarios: [] });
-  assert.deepEqual(manifest.configSchema.properties.safetyWhisperer.default, defaults);
   assert.equal(registerSafetyWhisperer({} as OpenClawPluginApi, { ...base, decisionModel }), undefined);
 
   const resolved = resolveConfig({ safetyWhisperer: example }).safetyWhisperer;
   assert.equal(resolved.scenarios[0].minProbability, 0.4);
-  assert.equal(manifest.configSchema.properties.safetyWhisperer.properties.scenarios.items.properties.minProbability.default, 0.4);
   assert.equal(resolved.scenarios[1].enabled, true);
   assert.deepEqual(resolved.scenarios[1].approvedRequestors, []);
   // The host lowercases provider, account and agent IDs and folds session-key channel IDs; sender IDs stay exact.

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { closeSync, constants, existsSync, fchmodSync, lstatSync, mkdirSync, openSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -30,7 +31,7 @@ function requireRegularFile(path: string): void {
 
 function enableWal(db: DatabaseSync): void {
   // Switching journal modes can return SQLITE_BUSY without invoking busy_timeout.
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + DEFAULTS.sqlite.mainBusyTimeoutMs;
   for (;;) {
     try {
       db.exec("PRAGMA journal_mode=WAL");
@@ -50,7 +51,7 @@ export function openMemoryDatabase(path: string): DatabaseSync {
   try { fchmodSync(descriptor, 0o600); } finally { closeSync(descriptor); }
   const db = new DatabaseSync(path);
   try {
-    db.exec("PRAGMA busy_timeout=5000");
+    db.exec(`PRAGMA busy_timeout=${DEFAULTS.sqlite.mainBusyTimeoutMs}`);
     enableWal(db);
     db.exec(`PRAGMA foreign_keys=ON;
       PRAGMA trusted_schema=OFF;

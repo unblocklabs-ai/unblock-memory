@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, unlink, utimes, writeFile } from "node:fs/promises";
@@ -183,7 +184,7 @@ function readSnapshot(params: {
 } {
   const db = new DatabaseSync(params.databasePath, { readOnly: true });
   try {
-    db.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; BEGIN");
+    db.exec(`PRAGMA query_only = ON; PRAGMA busy_timeout = ${DEFAULTS.sqlite.mainBusyTimeoutMs}; BEGIN`);
     assertSchema(db, params.agentId);
     const transcripts = new AgentTranscriptReader(db, params.agentId);
     const placeholders = params.chatTypes.map(() => "?").join(", ");

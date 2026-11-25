@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -80,7 +80,7 @@
       "help": "Model alias sent to the decision endpoint. Defaults to liquid/d1.2-ultra."
     },
     "decisionModel.apiKey": { "label": "Decision API Key", "sensitive": true },
-    "decisionModel.timeoutMs": { "label": "Decision Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, Skill Whisperer has a fixed 3-second total budget, and My Turn has a fixed 1.5-second total budget." },
+    "decisionModel.timeoutMs": { "label": "Decision Request Timeout", "help": "Per-request timeout, not the whole operation. People primer/dossier review use peoplePrimer.timeoutMs instead; Memory Whisperer has its own total deadline, Skill Whisperer and My Turn have their own total deadlines." },
     "decisionModel.apiKeyFile": {
       "label": "Decision API Key File",
       "help": "Absolute path to a plaintext API key or a dotenv file (CODEX_LB_API_KEY, or DECISION_MODEL_API_KEY for custom endpoints). Use a key for the configured endpoint."
@@ -136,10 +136,10 @@
         "type": "object", "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "default": false },
-          "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "default": 1440 },
-          "maxInteractions": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 100 },
-          "maxContextTokens": { "type": "integer", "minimum": 256, "maximum": 30000, "default": 30000 },
-          "baselineMinInteractions": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 20 }
+          "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 10080 },
+          "maxInteractions": { "type": "integer", "minimum": 1, "maximum": 10000 },
+          "maxContextTokens": { "type": "integer", "minimum": 256, "maximum": 30000 },
+          "baselineMinInteractions": { "type": "integer", "minimum": 1, "maximum": 10000 }
         }
       },
       "extraction": {
@@ -147,13 +147,13 @@
         "properties": {
           "enabled": { "type": "boolean", "default": false },
           "publish": { "type": "boolean", "default": false },
-          "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 1440, "default": 60 },
+          "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 1440 },
           "chatTypes": { "type": "array", "items": { "enum": ["direct", "channel", "group"] }, "default": [] },
-          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20, "default": 6 },
-          "maxBatches": { "type": "integer", "minimum": 1, "maximum": 50, "default": 5 },
-          "minSupport": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 },
-          "minRetention": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 },
-          "minReplacement": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 }
+          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20 },
+          "maxBatches": { "type": "integer", "minimum": 1, "maximum": 50 },
+          "minSupport": { "type": "number", "minimum": 0, "maximum": 1 },
+          "minRetention": { "type": "number", "minimum": 0, "maximum": 1 },
+          "minReplacement": { "type": "number", "minimum": 0, "maximum": 1 }
         }
       },
       "responseAudit": {
@@ -163,10 +163,10 @@
           "sentimentEnabled": { "type": "boolean", "default": true },
           "senderIds": { "type": "array", "maxItems": 50, "items": { "type": "string", "pattern": "\\S" }, "default": [] },
           "chatTypes": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "string", "enum": ["direct", "group", "channel"] }, "default": ["direct"] },
-          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20, "default": 6 },
-          "lookbackDays": { "type": "integer", "minimum": 1, "maximum": 90, "default": 30 },
-          "maxEpisodes": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
-          "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 1440, "default": 60 },
+          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20 },
+          "lookbackDays": { "type": "integer", "minimum": 1, "maximum": 90 },
+          "maxEpisodes": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "intervalMinutes": { "type": "integer", "minimum": 0, "maximum": 1440 },
           "memoryCorpora": { "type": "array", "maxItems": 50, "items": { "type": "string", "pattern": "\\S" }, "default": [] }
         }
       },
@@ -176,9 +176,9 @@
         "properties": {
           "enabled": { "type": "boolean", "default": false },
           "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
-          "minNoise": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 }
+          "minNoise": { "type": "number", "minimum": 0, "maximum": 1 }
         },
-        "default": { "enabled": false, "corpora": [], "minNoise": 0.8 }
+        "default": { "enabled": false, "corpora": [] }
       },
       "peoplePrimer": {
         "type": "object", "additionalProperties": false,
@@ -292,17 +292,16 @@
             "additionalProperties": false,
             "properties": {
               "enabled": { "type": "boolean", "default": false },
-              "maxChars": { "type": "integer", "minimum": 1, "maximum": 4000, "default": 1200 }
+              "maxChars": { "type": "integer", "minimum": 1, "maximum": 4000 }
             },
-            "default": { "enabled": false, "maxChars": 1200 }
+            "default": { "enabled": false }
           },
           "todos": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "maxOpen": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
-            },
-            "default": { "maxOpen": 1000 }
+              "maxOpen": { "type": "integer", "minimum": 1, "maximum": 10000 }
+            }
           },
           "learning": {
             "type": "object", "additionalProperties": false,
@@ -333,8 +332,7 @@
         },
         "default": {
           "enabled": false,
-          "whisperer": { "enabled": false, "maxChars": 1200 },
-          "todos": { "maxOpen": 1000 }
+          "whisperer": { "enabled": false }
         }
       },
       "decisionModel": {
@@ -346,13 +344,12 @@
           "endpoint": {
             "type": "string",
             "format": "uri",
-            "pattern": "^[Hh][Tt][Tt][Pp](?:[Ss]://(?:\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\\.?)|://(?:[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127\\.0\\.0\\.1|\\[::1\\]))(?::\\d+)?(?:/[^\\s?#]*)?$",
-            "default": "https://codex.unblocklabs.ai/v1/decisions"
+            "pattern": "^[Hh][Tt][Tt][Pp](?:[Ss]://(?:\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\\.?)|://(?:[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127\\.0\\.0\\.1|\\[::1\\]))(?::\\d+)?(?:/[^\\s?#]*)?$"
           },
           "model": { "type": "string", "pattern": "\\S" },
           "apiKey": { "type": "string", "pattern": "\\S" },
           "apiKeyFile": { "type": "string", "pattern": "\\S" },
-          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1500 }
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000 }
         }
       },
       "memoryWhisperer": {
@@ -361,12 +358,11 @@
         "properties": {
           "api": {
             "type": "object", "additionalProperties": false,
-            "description": "Authenticated resident query-model API. Override endpoint with a loopback URL for nodes outside the Studio LAN.",
+            "description": "Optional authenticated query-model API. An empty or omitted endpoint uses deterministic local queries unless overridden by operational defaults.",
             "properties": {
-              "endpoint": { "type": "string", "pattern": "^https?://", "default": "http://192.168.1.191:18087" },
+              "endpoint": { "type": "string", "pattern": "^(?:$|https?://)" },
               "apiKeyFile": { "type": "string", "pattern": "^/", "description": "Absolute path to the API bearer token file. When unset or unreadable, Memory Whisperer falls back to deterministic local queries." }
-            },
-            "default": { "endpoint": "http://192.168.1.191:18087" }
+            }
           },
           "mlx": {
             "type": "object", "additionalProperties": false,
@@ -377,25 +373,23 @@
               "modelPath": { "type": "string", "pattern": "^/" }
             }
           },
-          "complementaryHints": { "type": "boolean", "default": false, "description": "Optionally remove confidently redundant hints with up to six concurrent decision-model requests, one per directional pair. Uncertainty retains hints." },
+          "complementaryHints": { "type": "boolean", "default": false, "description": "Optionally remove confidently redundant hints with one decision-model request per directional pair. Uncertainty retains hints." },
           "enabled": { "type": "boolean", "default": false },
           "corpora": { "type": "array", "items": { "type": "string", "pattern": "\\S" }, "default": [] },
-          "minUsefulness": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
-          "maxHints": { "type": "integer", "minimum": 1, "maximum": 3, "default": 3 },
-          "cooldownTurns": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 10 },
-          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 3000 }
+          "minUsefulness": { "type": "number", "minimum": 0, "maximum": 1 },
+          "maxHints": { "type": "integer", "minimum": 1, "maximum": 3 },
+          "cooldownTurns": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000 }
         },
         "default": {
-          "enabled": false, "corpora": [], "minUsefulness": 0.5,
-          "maxHints": 3, "cooldownTurns": 10, "timeoutMs": 3000,
-          "api": { "endpoint": "http://192.168.1.191:18087" }
+          "enabled": false, "corpora": []
         }
       },
       "myTurn": {
         "type": "object", "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "default": false },
-          "historyMessages": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+          "historyMessages": { "type": "integer", "minimum": 1, "maximum": 50 },
           "channels": {
             "type": "object",
             "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]*$" },
@@ -406,21 +400,16 @@
             "default": {}
           }
         },
-        "default": { "enabled": false, "historyMessages": 10, "channels": {} }
+        "default": { "enabled": false, "channels": {} }
       },
       "skillWhisperer": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "description": "Defaults to true when a corpus with kind \"skills\" is configured, otherwise false. An explicit true without one is ignored with a warning." },
-          "historyMessages": { "type": "integer", "minimum": 0, "default": 5 },
-          "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
-          "cooldownTurns": { "type": "integer", "minimum": 0, "default": 10 }
-        },
-        "default": {
-          "historyMessages": 5,
-          "minScore": 0.5,
-          "cooldownTurns": 10
+          "historyMessages": { "type": "integer", "minimum": 0 },
+          "minScore": { "type": "number", "minimum": 0, "maximum": 1 },
+          "cooldownTurns": { "type": "integer", "minimum": 0 }
         }
       },
       "safetyWhisperer": {
@@ -429,8 +418,8 @@
         "description": "Optional prompt-level guardrail for sensitive request scenarios. Fails open when the check cannot run.",
         "properties": {
           "enabled": { "type": "boolean", "default": false },
-          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20, "default": 6 },
-          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 3000 },
+          "historyMessages": { "type": "integer", "minimum": 0, "maximum": 20 },
+          "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000 },
           "excludedChannels": {
             "type": "array",
             "maxItems": 500,
@@ -459,7 +448,7 @@
                 "enabled": { "type": "boolean", "default": true },
                 "instructions": { "type": "string", "pattern": "\\S", "maxLength": 2000, "description": "What requests this scenario covers, including exclusions." },
                 "flaggedPrompt": { "type": "string", "pattern": "\\S", "maxLength": 2000, "description": "Appended next to the human message when an unapproved requestor's message matches." },
-                "minProbability": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4, "description": "Minimum decision-model yes-probability that the current request is covered." },
+                "minProbability": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum decision-model yes-probability that the current request is covered." },
                 "agentIds": {
                   "type": "array",
                   "minItems": 1,
@@ -503,8 +492,6 @@
         },
         "default": {
           "enabled": false,
-          "historyMessages": 6,
-          "timeoutMs": 3000,
           "excludedChannels": [],
           "scenarios": []
         }

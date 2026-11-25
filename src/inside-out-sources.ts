@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -67,7 +68,7 @@ export async function* readInsideOutSources(paths: Paths, errors: string[]): Asy
   if (existsSync(paths.databasePath)) {
     const db = new DatabaseSync(paths.databasePath, { readOnly: true });
     try {
-      db.exec("PRAGMA busy_timeout=1000");
+      db.exec(`PRAGMA busy_timeout=${DEFAULTS.sqlite.readerBusyTimeoutMs}`);
       const transcripts = new AgentTranscriptReader(db, paths.agentId);
       const sessions = db.prepare(`SELECT w.session_id sessionId, COALESCE(w.channel,c.channel,'local') channel,
         COALESCE(w.account_id,c.account_id,'') account, COALESCE(r.generation,'') revision,

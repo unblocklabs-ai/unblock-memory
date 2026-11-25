@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
@@ -6,17 +7,17 @@ import { resolveDecisionCredential } from "./decision-client.js";
 import { safetyStatus } from "./safety-whisperer.js";
 import { abortable } from "./abortable.js";
 const claimParameters = Type.Object({
-    claim: Type.String({ pattern: "\\S", maxLength: 2000 }),
+    claim: Type.String({ pattern: "\\S", maxLength: DEFAULTS.review.maxClaimChars }),
     citations: Type.Array(Type.Object({
         path: Type.String({ pattern: "^qmd://", maxLength: 2000 }),
-        from: Type.Integer({ minimum: 1 }), lines: Type.Integer({ minimum: 1, maximum: 120 }),
+        from: Type.Integer({ minimum: 1 }), lines: Type.Integer({ minimum: 1, maximum: DEFAULTS.review.maxCitationLines }),
     }, { additionalProperties: false }), { minItems: 1, maxItems: 3 }),
 }, { additionalProperties: false });
 const clusterParameters = Type.Object({ clusterId: Type.String({ pattern: "^[0-9a-f]{10}$" }) }, { additionalProperties: false });
 const noParameters = Type.Object({}, { additionalProperties: false });
 /** Bound initialization as well as inference, without cancelling shared managers. */
 export async function reviewRequestContext(runtime, active, decisionModel, signal) {
-    const deadline = AbortSignal.timeout(30_000);
+    const deadline = AbortSignal.timeout(DEFAULTS.review.toolTimeoutMs);
     const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
     const apiKey = await abortable(resolveDecisionCredential(decisionModel), combined);
     if (!apiKey)

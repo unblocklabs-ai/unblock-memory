@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { createHash } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
@@ -14,7 +15,7 @@ export async function reviewIndexedClaim(params: {
   read?: <T>(run: () => T) => Promise<T>;
 }) {
   const unavailable = (reason: string) => ({ status: "unavailable" as const, verdict: "insufficient_evidence" as const, needsReview: true, reason });
-  if (!params.claim.trim() || params.claim.length > 2000 || !params.citations.length || params.citations.length > 3) return unavailable("Invalid review bounds");
+  if (!params.claim.trim() || params.claim.length > DEFAULTS.review.maxClaimChars || !params.citations.length || params.citations.length > 3) return unavailable("Invalid review bounds");
   params.signal.throwIfAborted();
   const sources = new Map(params.sources.filter(source => source.kind !== "skills").map(source => [source.collection, source]));
   const read = params.read ?? (async <T>(run: () => T) => run());
@@ -22,7 +23,7 @@ export async function reviewIndexedClaim(params: {
     const evidence: { path: string; from: number; lines: number; text: string; documentHash: string; excerptHash: string }[] = [];
     for (const citation of params.citations) {
       const safe = parseSafeVirtualPath(citation.path, sources);
-      if (!safe || !Number.isInteger(citation.from) || citation.from < 1 || !Number.isInteger(citation.lines) || citation.lines < 1 || citation.lines > 120) return unavailable("Evidence is unavailable or outside approved corpora");
+      if (!safe || !Number.isInteger(citation.from) || citation.from < 1 || !Number.isInteger(citation.lines) || citation.lines < 1 || citation.lines > DEFAULTS.review.maxCitationLines) return unavailable("Evidence is unavailable or outside approved corpora");
       const row = params.db.prepare(`SELECT d.hash, c.doc FROM documents d JOIN content c ON c.hash = d.hash
         WHERE d.active = 1 AND d.collection = ? AND d.path = ?`).get<{ hash: string; doc: string }>(safe.source.collection, safe.relativePath);
       if (!row) return unavailable("Evidence is not indexed");
@@ -37,7 +38,9 @@ export async function reviewIndexedClaim(params: {
   });
   if (snapshot.status !== "ready") return snapshot;
   const { evidence } = snapshot;
-  if (evidence.reduce((sum, item) => sum + item.text.length, 0) > 6000) return unavailable("Evidence exceeds 6000 characters; choose a narrower complete passage");
+  if (evidence.reduce((sum, item) => sum + item.text.length, 0) > DEFAULTS.review.maxCombinedCitationChars) {
+    return unavailable(`Evidence exceeds ${DEFAULTS.review.maxCombinedCitationChars} characters; choose a narrower complete passage`);
+  };
   const judgment = await reviewClaim({ ...params, evidence: evidence.map(item => item.text) });
   params.signal.throwIfAborted();
   return read(() => {

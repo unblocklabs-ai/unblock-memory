@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { DatabaseSync } from "node:sqlite";
 import type { ResolvedSource } from "./sources.js";
 import type { ResponseEpisode } from "./response-episodes.js";
@@ -12,7 +13,7 @@ export function responseMemoryCandidates(indexPath: string, sources: readonly Re
   const query = words.map(w => `"${w}"`).join(" OR ");
   const db = new DatabaseSync(indexPath, { readOnly: true });
   try {
-    db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000");
+    db.exec(`PRAGMA query_only=ON; PRAGMA busy_timeout=${DEFAULTS.sqlite.readerBusyTimeoutMs}`);
     // Whole short indexed documents only: never call a truncated excerpt complete evidence.
     const rows = db.prepare(`SELECT d.collection,d.path,d.hash,c.doc text
       FROM documents_fts JOIN documents d ON d.id=documents_fts.rowid JOIN content c ON c.hash=d.hash

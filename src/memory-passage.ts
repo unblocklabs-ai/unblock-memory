@@ -1,9 +1,10 @@
+import { DEFAULTS } from "./defaults.js";
 import type { VectorSearchResult } from "@unblocklabs/qmd";
 import { meetingRevisionAnnotation, meetingSpeakerSpans } from "./loggie-projection.js";
 import { sessionContextSpans, type SessionMessageSpan } from "./session-projector.js";
 
-export const MEMORY_PASSAGE_CHARS = 1200;
-export const MEMORY_PASSAGE_VERSION = "complete-excerpt-1200-v1";
+export const MEMORY_PASSAGE_CHARS = DEFAULTS.memoryWhisperer.judgmentExcerptChars;
+export const MEMORY_PASSAGE_VERSION = `complete-excerpt-${MEMORY_PASSAGE_CHARS}-v1`;
 type Passage = Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">;
 type LocatedPassage = { path: string; text: string; startLine: number; endLine: number };
 

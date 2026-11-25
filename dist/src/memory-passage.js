@@ -1,7 +1,8 @@
+import { DEFAULTS } from "./defaults.js";
 import { meetingRevisionAnnotation, meetingSpeakerSpans } from "./loggie-projection.js";
 import { sessionContextSpans } from "./session-projector.js";
-export const MEMORY_PASSAGE_CHARS = 1200;
-export const MEMORY_PASSAGE_VERSION = "complete-excerpt-1200-v1";
+export const MEMORY_PASSAGE_CHARS = DEFAULTS.memoryWhisperer.judgmentExcerptChars;
+export const MEMORY_PASSAGE_VERSION = `complete-excerpt-${MEMORY_PASSAGE_CHARS}-v1`;
 /** Same passage eligibility in target scoring and runtime hint selection. */
 export function duplicateMemoryPassage(passage, previous) {
     const normalized = (text) => text.replace(/\s+/gu, " ").trim();

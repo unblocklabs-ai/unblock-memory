@@ -120,9 +120,9 @@ test("decision model failure cannot commit earlier accepted facts or advance a c
   ], extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 } });
   let fail = true, active = 0, peak = 0;
   const source = ["one", "two", "three", "four", "five", "six"].map(id => message(id));
-  const opts = { config, storePath, runtime: {}, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0,
+  const opts = { config, storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0,
     signal: AbortSignal.timeout(30_000), readPage: fixture([source]),
-    extract: async (_r: unknown, _a: string, messages: ExtractionMessage[]) => messages.map(m => ({
+    extract: async ({ messages }: { messages: ExtractionMessage[] }) => messages.map(m => ({
       text: m.text, replaces: null, evidence: [{ messageId: m.id, quote: m.text }],
     })),
     validate: async ({ proposal }: { proposal: { text: string } }) => {
@@ -151,13 +151,13 @@ test("worker retries whole chunks, isolates sessions, maps split citations, and 
   const other = { ...session, sessionId: "s2" };
   const source = fixture([[message("original", " red".repeat(55_000))]]);
   let fail = true, calls = 0;
-  const opts = { config, storePath, agentId: "main", agentName: "Bill", runtime: {}, since: 0,
+  const opts = { config, storePath, agentId: "main", agentName: "Bill", since: 0,
     sessions: () => [{ ...session, sourceRevision: "stable-throughout-partial-chunks" }, other], signal: AbortSignal.timeout(60_000),
     readPage: (async (a,n,s,c) => s.sessionId === "s1" ? source(a,n,s,c) : fixture([[message("other")]])(a,n,s,c)) as typeof readExtractionPage,
-    extract: async (_r: unknown, _a: string, messages: ExtractionMessage[], ids: string[]) => {
+    extract: async ({ messages, newIds }: { messages: ExtractionMessage[]; newIds: string[] }) => {
       calls++; if (fail) throw new Error("inference failed");
       assert.ok(!messages.some(m => m.id === "other") || messages.length === 1);
-      const m = messages.find(m => ids.includes(m.id))!;
+      const m = messages.find(m => newIds.includes(m.id))!;
       return [{ text: m.id === "other" ? "Other fact." : "Bek likes red.", replaces: null, evidence: [{ messageId: m.id, quote: m.text.slice(0, 4) }] }];
     },
     validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }),
@@ -209,6 +209,7 @@ test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on re
     minSupport: config.extraction.minSupport,
     minRetention: config.extraction.minRetention,
     minReplacement: config.extraction.minReplacement,
+    extractorModel: config.decisionModel.model,
     validatorModel: config.decisionModel.model,
   });
   const store = new ExtractionStore(storePath);
@@ -225,7 +226,7 @@ test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on re
 
   const cleanSource = fixture([[message("m1", "Bek likes espresso.")]]);
   const workerOpts = {
-    config, storePath, agentId: "main", agentName: "Bill", runtime: {}, sessions: () => [session], since: 0,
+    config, storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0,
     signal: AbortSignal.timeout(30_000), readPage: cleanSource,
     extract: async () => [{ text: "Bek likes espresso.", replaces: null, evidence: [{ messageId: "m1", quote: "Bek likes espresso." }] }],
     validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: config.extraction }),

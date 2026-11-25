@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { MEMORY_JUDGE_VERSION, memoryUsefulnessRequest, judgeMemoryPassage } from "./decision-ranking.js";
 export const CONTEXT_JUDGE_VERSION = MEMORY_JUDGE_VERSION;
 export function contextJudgeRequest(input, asOf, hit, model) {
@@ -6,5 +7,5 @@ export function contextJudgeRequest(input, asOf, hit, model) {
     }, asOf, model);
 }
 export async function judgeTrainingPassage(request, apiKey, options) {
-    return judgeMemoryPassage(request, { apiKey, endpoint: options?.endpoint, model: options?.model, timeoutMs: 30_000 });
+    return judgeMemoryPassage(request, { apiKey, endpoint: options?.endpoint, model: options?.model, timeoutMs: DEFAULTS.training.decisionTimeoutMs });
 }

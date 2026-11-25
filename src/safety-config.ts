@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
 
 export type SafetyChannel = { name?: string; provider: string; accountId: string; channelId: string };
@@ -20,7 +21,7 @@ export type SafetyWhispererConfig = {
   scenarios: SafetyScenario[];
 };
 
-const DEFAULT_SAFETY_MIN_PROBABILITY = 0.4;
+const DEFAULT_SAFETY_MIN_PROBABILITY = DEFAULTS.safetyWhisperer.defaultMinProbability;
 const MAX_SCENARIOS = 20;
 const MAX_TEXT_CHARS = 2000;
 const MAX_ENTRIES = 500;
@@ -109,7 +110,7 @@ function scenario(value: unknown, index: number): SafetyScenario {
 }
 
 export function resolveSafetyWhisperer(value: unknown): SafetyWhispererConfig {
-  const defaults: SafetyWhispererConfig = { enabled: false, historyMessages: 6, timeoutMs: 3000, excludedChannels: [], scenarios: [] };
+  const defaults: SafetyWhispererConfig = { enabled: false, historyMessages: DEFAULTS.safetyWhisperer.defaultHistoryMessages, timeoutMs: DEFAULTS.safetyWhisperer.defaultTimeoutMs, excludedChannels: [], scenarios: [] };
   if (value === undefined) return defaults;
   const config = record(value, "safetyWhisperer");
   onlyKeys(config, ["enabled", "historyMessages", "timeoutMs", "excludedChannels", "scenarios"], "safetyWhisperer");

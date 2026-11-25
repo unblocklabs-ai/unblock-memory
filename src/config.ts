@@ -1,7 +1,6 @@
+import { DEFAULTS } from "./defaults.js";
 import { isAbsolute } from "node:path";
 import {
-  DEFAULT_DECISIONS_ENDPOINT,
-  DEFAULT_DECISIONS_MODEL,
   resolveDecisionConfig,
 } from "@unblocklabs/decisions";
 import { resolveExtraction, type ExtractionConfig } from "./extraction-config.js";
@@ -97,20 +96,20 @@ export type UnblockMemoryConfig = {
 
 export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
   enabled: false,
-  whisperer: { enabled: false, maxChars: 1200 },
-  todos: { maxOpen: 1000 },
+  whisperer: { enabled: false, maxChars: DEFAULTS.people.defaultWhispererMaxChars },
+  todos: { maxOpen: DEFAULTS.people.defaultTodosMaxOpen },
   learning: DEFAULT_LEARNING,
 };
 
 const DEFAULT_DECISION_MODEL_CONFIG: DecisionModelPluginConfig = {
   enabled: true,
-  endpoint: DEFAULT_DECISIONS_ENDPOINT,
-  model: DEFAULT_DECISIONS_MODEL,
-  timeoutMs: 1500,
+  endpoint: DEFAULTS.decisionModel.endpoint,
+  model: DEFAULTS.decisionModel.model,
+  timeoutMs: DEFAULTS.decisionModel.timeoutMs,
 };
 
 const DEFAULT_QUALITY_AUDIT: UnblockMemoryConfig["qualityAudit"] = {
-  enabled: false, corpora: [], minNoise: 0.8,
+  enabled: false, corpora: [], minNoise: DEFAULTS.quality.defaultMinNoise,
 };
 
 function resolveQualityAudit(value: unknown, corpora: readonly CorpusConfig[]): UnblockMemoryConfig["qualityAudit"] {
@@ -147,8 +146,8 @@ function resolveDecisionModel(value: unknown): DecisionModelPluginConfig {
   let resolved;
   try {
     resolved = resolveDecisionConfig({
-      endpoint: config.endpoint as string | undefined,
-      model: config.model === undefined ? DEFAULT_DECISIONS_MODEL : config.model as string,
+      endpoint: config.endpoint === undefined ? DEFAULTS.decisionModel.endpoint : config.endpoint as string,
+      model: config.model === undefined ? DEFAULTS.decisionModel.model : config.model as string,
       apiKey: config.apiKey as string | undefined,
       apiKeyFile: config.apiKeyFile as string | undefined,
       timeoutMs,
@@ -168,34 +167,36 @@ function resolveDecisionModel(value: unknown): DecisionModelPluginConfig {
 
 const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
   enabled: true,
-  historyMessages: 5,
-  minScore: 0.5,
-  cooldownTurns: 10,
+  historyMessages: DEFAULTS.skillWhisperer.defaultHistoryMessages,
+  minScore: DEFAULTS.skillWhisperer.defaultMinScore,
+  cooldownTurns: DEFAULTS.skillWhisperer.defaultCooldownTurns,
 };
 
 const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
-  enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5,
-  maxHints: 3, cooldownTurns: 10, timeoutMs: 3000,
-  api: { endpoint: "http://192.168.1.191:18087" },
+  enabled: false, complementaryHints: false, corpora: [], minUsefulness: DEFAULTS.memoryWhisperer.defaultMinUsefulness,
+  maxHints: DEFAULTS.memoryWhisperer.defaultMaxHints, cooldownTurns: DEFAULTS.memoryWhisperer.defaultCooldownTurns,
+  timeoutMs: DEFAULTS.memoryWhisperer.defaultTimeoutMs, api: { endpoint: DEFAULTS.memoryWhisperer.defaultApiEndpoint },
 };
 
 function resolveQueryApi(value: unknown): UnblockMemoryConfig["memoryWhisperer"]["api"] {
-  if (value === undefined) return { ...DEFAULT_MEMORY_WHISPERER.api };
+  if (value === undefined) value = {};
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("memoryWhisperer.api must be an object");
   const config = value as Record<string, unknown>;
   assertOnlyKeys(config, ["endpoint", "apiKeyFile"], "memoryWhisperer.api");
   const endpoint = config.endpoint ?? DEFAULT_MEMORY_WHISPERER.api.endpoint;
-  let url: URL;
-  try { url = new URL(typeof endpoint === "string" ? endpoint : ""); }
-  catch { throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL"); }
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL without credentials, query or fragment");
+  let url: URL | undefined;
+  if (endpoint !== "") {
+    try { url = new URL(typeof endpoint === "string" ? endpoint : ""); }
+    catch { throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL or empty"); }
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+      throw new Error("memoryWhisperer.api.endpoint must be an HTTP(S) URL without credentials, query or fragment");
+    }
   }
   const apiKeyFile = config.apiKeyFile;
   if (apiKeyFile !== undefined && (typeof apiKeyFile !== "string" || !isAbsolute(apiKeyFile))) {
     throw new Error("memoryWhisperer.api.apiKeyFile must be an absolute path");
   }
-  return { endpoint: url.href.replace(/\/$/u, ""), ...(apiKeyFile ? { apiKeyFile } : {}) };
+  return { endpoint: url?.href.replace(/\/$/u, "") ?? "", ...(apiKeyFile ? { apiKeyFile } : {}) };
 }
 
 function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]): UnblockMemoryConfig["memoryWhisperer"] {
@@ -225,7 +226,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora");
   }
   if (enabled && !selected.length) throw new Error("unblock-memory enabled memoryWhisperer requires explicit corpora");
-  const cooldownTurns = config.cooldownTurns ?? 10;
+  const cooldownTurns = config.cooldownTurns ?? DEFAULT_MEMORY_WHISPERER.cooldownTurns;
   if (typeof cooldownTurns !== "number" || !Number.isInteger(cooldownTurns) || cooldownTurns < 0 || cooldownTurns > 1000) {
     throw new Error("unblock-memory memoryWhisperer.cooldownTurns must be an integer between 0 and 1000");
   }
@@ -236,7 +237,7 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   return {
     enabled, complementaryHints, corpora: [...new Set(selected)], cooldownTurns, minUsefulness,
     maxHints: positiveInteger(config.maxHints, DEFAULT_MEMORY_WHISPERER.maxHints, "memoryWhisperer.maxHints", 3),
-    timeoutMs: positiveInteger(config.timeoutMs, 3000, "memoryWhisperer.timeoutMs", 10_000),
+    timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_MEMORY_WHISPERER.timeoutMs, "memoryWhisperer.timeoutMs", 10_000),
     api: resolveQueryApi(config.api),
   };
 }
@@ -485,9 +486,9 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
       "skillWhisperer",
     );
     const enabled = value.enabled ?? DEFAULT_SKILL_WHISPERER.enabled;
-    const historyMessages = value.historyMessages ?? 5;
-    const minScore = value.minScore ?? 0.5;
-    const cooldownTurns = value.cooldownTurns ?? 10;
+    const historyMessages = value.historyMessages ?? DEFAULT_SKILL_WHISPERER.historyMessages;
+    const minScore = value.minScore ?? DEFAULT_SKILL_WHISPERER.minScore;
+    const cooldownTurns = value.cooldownTurns ?? DEFAULT_SKILL_WHISPERER.cooldownTurns;
     if (typeof enabled !== "boolean")
       throw new Error("unblock-memory skillWhisperer.enabled must be a boolean");
     if (

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
@@ -55,7 +56,7 @@ const searchParameters = Type.Object({
 const getParameters = Type.Object({
     path: Type.String({ pattern: "\\S" }),
     from: Type.Optional(Type.Integer({ minimum: 1, description: "First source line, 1-based; default 1. Use nextFrom from a truncated read to continue." })),
-    lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "Requested lines; default 120, also bounded by 12,000 content characters." })),
+    lines: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULTS.memoryWhisperer.memoryGetMaxLines, description: `Requested lines; default 120, also bounded by ${DEFAULTS.memoryWhisperer.memoryGetMaxChars} content characters.` })),
 }, { additionalProperties: false });
 const syncSessionsParameters = Type.Object({
     force: Type.Optional(Type.Boolean()),
@@ -456,7 +457,7 @@ export function resolveFlushPlan(params = {}) {
     return {
         softThresholdTokens: nonNegativeInteger(configured?.softThresholdTokens, 4000),
         forceFlushTranscriptBytes: parseByteSize(configured?.forceFlushTranscriptBytes) ?? 2 * 1024 * 1024,
-        reserveTokensFloor: 20_000,
+        reserveTokensFloor: DEFAULTS.sqlite.flushReserveTokensFloor,
         ...(legacyModel ? { model: legacyModel } : {}),
         prompt: `Pre-compaction memory flush. Store durable memories only in ${target}. If it exists, append; never overwrite it or bootstrap files. Do not create timestamped variants. If nothing is durable, reply NO_REPLY.`,
         systemPrompt: `Capture durable memories in ${target}; append only and do not overwrite bootstrap files. Usually NO_REPLY is correct.`,

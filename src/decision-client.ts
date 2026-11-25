@@ -3,24 +3,24 @@ import {
   classifyDecisionFailure,
   createDecisionClient,
   DEFAULT_DECISIONS_ENDPOINT,
-  DEFAULT_DECISIONS_MODEL,
   DecisionError,
-  decisionModelScope,
+  decisionModelScope as sdkDecisionModelScope,
   matchesDecisionModel,
   resolveDecisionApiKey,
   resolveDecisionConfig,
   validateDecisionEndpoint,
   type DecisionResult,
+  type ExtractionResult,
+  type FieldMap,
   type QuestionMap,
 } from "@unblocklabs/decisions";
 import { Type } from "typebox";
 import type { UnblockMemoryConfig } from "./config.js";
+import { DEFAULTS } from "./defaults.js";
 
 export {
   classifyDecisionFailure,
-  decisionModelScope,
   matchesDecisionModel,
-  DEFAULT_DECISIONS_MODEL as DEFAULT_DECISION_MODEL,
   DecisionError as DecisionRequestError,
 };
 
@@ -37,7 +37,11 @@ type DecisionRequestOptions = {
   signal?: AbortSignal;
 };
 
-const DEFAULT_UNBOUNDED_TIMEOUT_MS = 60_000;
+export const DEFAULT_DECISION_MODEL = DEFAULTS.decisionModel.model;
+export function decisionModelScope(model = DEFAULT_DECISION_MODEL, endpoint = DEFAULTS.decisionModel.endpoint): string {
+  return sdkDecisionModelScope(model, endpoint);
+}
+
 const CODEX_ORIGIN = new URL(DEFAULT_DECISIONS_ENDPOINT).origin;
 
 /** A conservative estimate of serialized size, not a model-specific tokenizer. Non-ASCII is budgeted separately. */
@@ -65,11 +69,11 @@ export async function resolveDecisionCredential(
     }
     return trimmed;
   }
-  const endpoint = validateDecisionEndpoint(config.endpoint ?? DEFAULT_DECISIONS_ENDPOINT);
+  const endpoint = validateDecisionEndpoint(config.endpoint ?? DEFAULTS.decisionModel.endpoint);
   const codex = new URL(endpoint).origin === CODEX_ORIGIN;
   return resolveDecisionApiKey(resolveDecisionConfig({
     endpoint,
-    model: DEFAULT_DECISIONS_MODEL,
+    model: DEFAULT_DECISION_MODEL,
     apiKeyFile: config.apiKeyFile,
     ambientEnvKeys: codex ? ["CODEX_LB_API_KEY"] : [],
     fileEnvKeys: codex ? ["CODEX_LB_API_KEY"] : ["CODEX_LB_API_KEY", "DECISION_MODEL_API_KEY"],
@@ -78,12 +82,27 @@ export async function resolveDecisionCredential(
 
 function requestClient(params: DecisionRequestOptions, timeoutMs: number) {
   return createDecisionClient({
-    endpoint: params.endpoint,
-    model: params.model ?? DEFAULT_DECISIONS_MODEL,
+    endpoint: params.endpoint ?? DEFAULTS.decisionModel.endpoint,
+    model: params.model ?? DEFAULT_DECISION_MODEL,
     apiKey: params.apiKey,
     ambientEnvKeys: [],
     fileEnvKeys: [],
     timeoutMs,
+  });
+}
+
+/** Typed extraction call backed directly by @unblocklabs/decisions. */
+export async function extractWithModel<const F extends FieldMap>(
+  params: DecisionRequestOptions,
+  state: string,
+  fields: F,
+  options?: { validateModel?: boolean },
+): Promise<ExtractionResult<F>> {
+  const timeoutMs = params.timeoutMs ?? DEFAULTS.decisionModel.unboundedTimeoutMs;
+  return requestClient(params, timeoutMs).extract(state, fields, {
+    timeoutMs,
+    signal: params.signal,
+    validateModel: options?.validateModel ?? true,
   });
 }
 
@@ -94,7 +113,7 @@ export async function decideWithModel<const Q extends QuestionMap>(
   questions: Q,
   options?: { validateModel?: boolean; allowExtraAnswerKeys?: boolean },
 ): Promise<DecisionResult<Q>> {
-  const timeoutMs = params.timeoutMs ?? DEFAULT_UNBOUNDED_TIMEOUT_MS;
+  const timeoutMs = params.timeoutMs ?? DEFAULTS.decisionModel.unboundedTimeoutMs;
   return requestClient(params, timeoutMs).decide(state, questions, {
     timeoutMs,
     signal: params.signal,
@@ -112,7 +131,7 @@ export async function requestDecision(
   state: unknown,
   questions: unknown,
 ): Promise<unknown> {
-  const timeoutMs = params.timeoutMs ?? DEFAULT_UNBOUNDED_TIMEOUT_MS;
+  const timeoutMs = params.timeoutMs ?? DEFAULTS.decisionModel.unboundedTimeoutMs;
   return requestClient(params, timeoutMs).decideRaw(state, questions, {
     timeoutMs,
     signal: params.signal,

@@ -1,12 +1,12 @@
+import { DEFAULTS } from "./defaults.js";
 import { Value } from "typebox/value";
 import { estimateDecisionTokens, isDecisionTimeout, requestDecision, resolveDecisionCredential, NOUL_SCHEMA, DecisionRequestError } from "./decision-client.js";
-import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
+import { messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { CONVERSATION_INFO, conversationEnvelope, conversationUserText } from "./response-text.js";
 import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
 import { abortable } from "./abortable.js";
 import { nonBlank, record } from "./guards.js";
-const MAX_SESSIONS = 1000;
-const RUNS_PER_SESSION = 4;
+const { stateMaxTokens: MAX_STATE_TOKENS, maxTrackedSessions: MAX_SESSIONS, maxRunsPerSession: RUNS_PER_SESSION } = DEFAULTS.safetyWhisperer;
 class SafetyInputError extends Error {
 }
 /** Thread replies and forum topics belong to their parent conversation (`C1:thread:1712.01`, `-100:topic:5`). */

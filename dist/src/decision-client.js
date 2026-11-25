@@ -1,11 +1,15 @@
-import { abortedByTimeout, classifyDecisionFailure, createDecisionClient, DEFAULT_DECISIONS_ENDPOINT, DEFAULT_DECISIONS_MODEL, DecisionError, decisionModelScope, matchesDecisionModel, resolveDecisionApiKey, resolveDecisionConfig, validateDecisionEndpoint, } from "@unblocklabs/decisions";
+import { abortedByTimeout, classifyDecisionFailure, createDecisionClient, DEFAULT_DECISIONS_ENDPOINT, DecisionError, decisionModelScope as sdkDecisionModelScope, matchesDecisionModel, resolveDecisionApiKey, resolveDecisionConfig, validateDecisionEndpoint, } from "@unblocklabs/decisions";
 import { Type } from "typebox";
-export { classifyDecisionFailure, decisionModelScope, matchesDecisionModel, DEFAULT_DECISIONS_MODEL as DEFAULT_DECISION_MODEL, DecisionError as DecisionRequestError, };
+import { DEFAULTS } from "./defaults.js";
+export { classifyDecisionFailure, matchesDecisionModel, DecisionError as DecisionRequestError, };
 export const NOUL_SCHEMA = Type.Object({
     type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
 });
 export const NOUL_ANSWERS_SCHEMA = Type.Object({ answers: Type.Record(Type.String(), NOUL_SCHEMA) });
-const DEFAULT_UNBOUNDED_TIMEOUT_MS = 60_000;
+export const DEFAULT_DECISION_MODEL = DEFAULTS.decisionModel.model;
+export function decisionModelScope(model = DEFAULT_DECISION_MODEL, endpoint = DEFAULTS.decisionModel.endpoint) {
+    return sdkDecisionModelScope(model, endpoint);
+}
 const CODEX_ORIGIN = new URL(DEFAULT_DECISIONS_ENDPOINT).origin;
 /** A conservative estimate of serialized size, not a model-specific tokenizer. Non-ASCII is budgeted separately. */
 export function estimateDecisionTokens(value) {
@@ -31,11 +35,11 @@ export async function resolveDecisionCredential(config) {
         }
         return trimmed;
     }
-    const endpoint = validateDecisionEndpoint(config.endpoint ?? DEFAULT_DECISIONS_ENDPOINT);
+    const endpoint = validateDecisionEndpoint(config.endpoint ?? DEFAULTS.decisionModel.endpoint);
     const codex = new URL(endpoint).origin === CODEX_ORIGIN;
     return resolveDecisionApiKey(resolveDecisionConfig({
         endpoint,
-        model: DEFAULT_DECISIONS_MODEL,
+        model: DEFAULT_DECISION_MODEL,
         apiKeyFile: config.apiKeyFile,
         ambientEnvKeys: codex ? ["CODEX_LB_API_KEY"] : [],
         fileEnvKeys: codex ? ["CODEX_LB_API_KEY"] : ["CODEX_LB_API_KEY", "DECISION_MODEL_API_KEY"],
@@ -43,17 +47,26 @@ export async function resolveDecisionCredential(config) {
 }
 function requestClient(params, timeoutMs) {
     return createDecisionClient({
-        endpoint: params.endpoint,
-        model: params.model ?? DEFAULT_DECISIONS_MODEL,
+        endpoint: params.endpoint ?? DEFAULTS.decisionModel.endpoint,
+        model: params.model ?? DEFAULT_DECISION_MODEL,
         apiKey: params.apiKey,
         ambientEnvKeys: [],
         fileEnvKeys: [],
         timeoutMs,
     });
 }
+/** Typed extraction call backed directly by @unblocklabs/decisions. */
+export async function extractWithModel(params, state, fields, options) {
+    const timeoutMs = params.timeoutMs ?? DEFAULTS.decisionModel.unboundedTimeoutMs;
+    return requestClient(params, timeoutMs).extract(state, fields, {
+        timeoutMs,
+        signal: params.signal,
+        validateModel: options?.validateModel ?? true,
+    });
+}
 /** Typed decision call backed directly by @unblocklabs/decisions. */
 export async function decideWithModel(params, state, questions, options) {
-    const timeoutMs = params.timeoutMs ?? DEFAULT_UNBOUNDED_TIMEOUT_MS;
+    const timeoutMs = params.timeoutMs ?? DEFAULTS.decisionModel.unboundedTimeoutMs;
     return requestClient(params, timeoutMs).decide(state, questions, {
         timeoutMs,
         signal: params.signal,
@@ -66,7 +79,7 @@ export async function decideWithModel(params, state, questions, options) {
  * for callers that intentionally tolerate partial multi-question responses (e.g. Safety Whisperer).
  */
 export async function requestDecision(params, state, questions) {
-    const timeoutMs = params.timeoutMs ?? DEFAULT_UNBOUNDED_TIMEOUT_MS;
+    const timeoutMs = params.timeoutMs ?? DEFAULTS.decisionModel.unboundedTimeoutMs;
     return requestClient(params, timeoutMs).decideRaw(state, questions, {
         timeoutMs,
         signal: params.signal,

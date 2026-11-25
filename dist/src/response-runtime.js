@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { hasMemoryTable, MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
@@ -130,7 +131,7 @@ export function registerResponseAudit(api, config) {
             clearInterval(timer);
         lifetime = new AbortController();
         // A minute poll honors durable due times without relying on process uptime.
-        timer = setInterval(tick, 60_000);
+        timer = setInterval(tick, DEFAULTS.responseAudit.pollIntervalMs);
         timer.unref();
         tick(); // New schedules wait one interval; overdue schedules get one bounded attempt.
     });

@@ -1,3 +1,4 @@
+import { DEFAULTS } from "./defaults.js";
 import { classifyDecisionFailure, resolveDecisionCredential } from "./decision-client.js";
 import { TrainingTranscriptReader } from "./training-input.js";
 import { judgeTrainingInput, TRAINING_GATE_QUESTIONS } from "./training-gate.js";
@@ -81,7 +82,7 @@ export async function runTraining(source, store, config, options) {
                 let judgment;
                 try {
                     // Offline labeling has its own deadline, not Whisperer's latency-sensitive timeout.
-                    judgment = await judgeTrainingInput(input, key, AbortSignal.timeout(30_000), { endpoint: config.decisionModel.endpoint, model: config.decisionModel.model });
+                    judgment = await judgeTrainingInput(input, key, AbortSignal.timeout(DEFAULTS.training.decisionTimeoutMs), { endpoint: config.decisionModel.endpoint, model: config.decisionModel.model });
                 }
                 catch (error) {
                     const classified = classifyDecisionFailure(error);
