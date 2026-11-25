@@ -39,9 +39,10 @@ function handleResetOrMissing(
   sessionId: string,
   page: { kind: string; cursor?: string | null },
   owner: string,
+  policyFingerprint: string,
 ): page is { kind: "reset"; cursor: string | null } | { kind: "missing" } {
   if (page.kind !== "reset" && page.kind !== "missing") return false;
-  store.reset(sessionId, page.kind === "reset" ? (page.cursor ?? null) : null, owner);
+  store.reset(sessionId, page.kind === "reset" ? (page.cursor ?? null) : null, owner, policyFingerprint);
   return true;
 }
 
@@ -207,7 +208,7 @@ async function processSession(params: {
       store.error(session.sessionId, "source_unavailable", owner);
       return { processed: 1, accepted: 0, rejected: 0, unchanged: 0, failed: 1 };
     }
-    if (handleResetOrMissing(store, session.sessionId, page, owner)) {
+    if (handleResetOrMissing(store, session.sessionId, page, owner, policyFingerprint)) {
       return { processed: 1, accepted: 0, rejected: 0, unchanged: 0, failed: 0 };
     }
     if (!page.entryCount) {
@@ -216,6 +217,7 @@ async function processSession(params: {
         expected: checkpoint.cursor,
         owner,
         completeRevision: page.exhausted ? expectedCompleteRevision : undefined,
+        policyFingerprint,
       });
       return { processed: 0, accepted: 0, rejected: 0, unchanged: 1, failed: 0 };
     }
@@ -244,7 +246,7 @@ async function processSession(params: {
     void checkPending.catch(() => {});
     const check = await abortable(checkPending, signal);
     signal.throwIfAborted();
-    if (handleResetOrMissing(store, session.sessionId, check, owner)) {
+    if (handleResetOrMissing(store, session.sessionId, check, owner, policyFingerprint)) {
       return { processed: 1, accepted: 0, rejected, unchanged: 0, failed: 0 };
     }
     if (check.kind === "unavailable") throw new Error("Source changed during extraction");
@@ -260,6 +262,7 @@ async function processSession(params: {
       owner,
       version,
       completeRevision: page.exhausted ? expectedCompleteRevision : undefined,
+      policyFingerprint,
     });
     return { processed: 1, accepted: written, rejected, unchanged: 0, failed: 0 };
   } catch (error) {

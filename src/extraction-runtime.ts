@@ -95,7 +95,6 @@ export function registerExtraction(
       await Promise.allSettled([...activeRuns, ...(running ? [running] : [])]);
     }
   });
-  if (!config.extraction.enabled) return;
   const tick = () => {
     if (stopped || running || lifetime.signal.aborted) return;
     const signal = lifetime.signal;
@@ -116,7 +115,7 @@ export function registerExtraction(
     if (timer) clearInterval(timer);
     timer = undefined;
     if (lifetime.signal.aborted) lifetime = new AbortController();
-    if (!config.extraction.intervalMinutes || !config.typesafe.enabled) return;
+    if (!config.extraction.enabled || !config.extraction.intervalMinutes || !config.typesafe.enabled) return;
     timer = setInterval(tick, 60_000); timer.unref(); tick();
   });
 }

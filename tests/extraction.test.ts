@@ -4,11 +4,13 @@ import { mkdtemp } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { createStore } from "@unblocklabs/qmd";
+import { ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveConfig } from "../src/config.js";
-import { extractWithLuna, validateExtractedMemory, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
-import { ExtractionLeaseLostError, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
+import { EXTRACTION_INPUT_TARGET, extractWithLuna, validateExtractedMemory, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
+import { buildCompleteRevision, ExtractionLeaseLostError, extractionPolicyFingerprint, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
 import { runExtraction } from "../src/extraction-worker.js";
 import { readExtractionPage, type ExtractionPage } from "../src/extraction-source.js";
 import { registerExtraction } from "../src/extraction-runtime.js";
@@ -581,4 +583,195 @@ test("readExtractionPage propagates cancellation before and during host page rea
   assert.equal(readCalls, 1);
   midAbort.abort(new Error("lease aborted"));
   await assert.rejects(pending, /lease aborted/);
+});
+
+test("policy change and unversioned legacy partial cursors rewind before processing or certifying completion", async () => {
+  const f = await fixture();
+  const s = { ...session, sourceRevision: '["g1",2]' };
+  const m1: ExtractionMessage = { id: "m1", speaker: "Bek", role: "user", text: "I prefer dark roast coffee.", timestamp: 1000 };
+  const pad: ExtractionMessage = { id: "pad", speaker: "Bek", role: "user", text: " project".repeat(EXTRACTION_INPUT_TARGET), timestamp: 1500 };
+  const m2: ExtractionMessage = { id: "m2", speaker: "Bek", role: "user", text: "I live in Brooklyn.", timestamp: 2000 };
+  const p1: MemoryProposal = { text: "Bek prefers dark roast coffee.", replaces: null, evidence: [{ messageId: "m1", quote: m1.text }] };
+  const p2: MemoryProposal = { text: "Bek lives in Brooklyn.", replaces: null, evidence: [{ messageId: "m2", quote: m2.text }] };
+
+  const observedCursors: (string | null)[] = [];
+  const makeOpts = (extraCfg: object = {}, version = "lasting-facts-v11") => ({
+    config: config(extraCfg), storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
+    sessions: () => [s], since: 0, signal: signal(), version,
+    readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null): Promise<ExtractionPage> => {
+      observedCursors.push(cursor);
+      if (cursor === null) return { kind: "page", cursor: "c1", hasMore: true, entryCount: 2, messages: [m1, pad] };
+      if (cursor === "c1") return { kind: "page", cursor: "c2", hasMore: false, entryCount: 1, messages: [m2] };
+      return { kind: "page", cursor: "c2", hasMore: false, entryCount: 0, messages: [] };
+    },
+    extract: async (_r: unknown, _a: string, _msgs: ExtractionMessage[], newIds: string[]) =>
+      newIds.includes("m1") ? [p1] : newIds.includes("m2") ? [p2] : [],
+    validate: async ({ proposal: prop, thresholds: t }: { proposal: MemoryProposal; thresholds: { minSupport: number } }) => ({
+      accepted: prop.text === p2.text || t.minSupport <= 0.85,
+      reason: "judged" as const,
+      scores: { supported: prop.text === p2.text ? 0.99 : 0.85, useful: 0.99, replacement: 1 },
+      thresholds: config(extraCfg).extraction,
+    }),
+  });
+
+  // Policy A (minSupport=0.9, maxBatches=1) commits partial cursor c1 (complete_revision remains NULL) and rejects p1.
+  const cfgA = { extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, maxBatches: 1, minSupport: 0.9 } };
+  const cfgB = { extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, maxBatches: 1, minSupport: 0.8 } };
+  const fpA = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgA).extraction, validatorModel: config(cfgA).typesafe.model });
+  const fpB = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgB).extraction, validatorModel: config(cfgB).typesafe.model });
+
+  const r1 = await runExtraction(makeOpts(cfgA));
+  assert.equal(r1.status, "completed");
+  assert.equal(r1.accepted, 0);
+  assert.equal(r1.rejected, 1);
+  let store = new ExtractionStore(f.storePath);
+  try {
+    const cp = store.readCheckpoint(s.sessionId)!;
+    assert.equal(cp.cursor, "c1");
+    assert.equal(cp.completeRevision, null);
+    assert.equal(cp.policyFingerprint, fpA);
+    // Store-level fencing refuses to advance or certify a Policy A cursor under Policy B.
+    const owner = store.claim(false, 0)!;
+    try {
+      assert.throws(() => store.commit({
+        session: s, expected: "c1", cursor: "c2", context: [m2], accepted: [], owner,
+        version: "lasting-facts-v11", completeRevision: buildCompleteRevision(s.sourceRevision, fpB), policyFingerprint: fpB,
+      }), /checkpoint/);
+      assert.throws(() => store.completeEmpty({
+        sessionId: s.sessionId, expected: "c1", owner,
+        completeRevision: buildCompleteRevision(s.sourceRevision, fpB), policyFingerprint: fpB,
+      }), /checkpoint/);
+    } finally { store.release(owner); }
+  } finally { store.close(); }
+
+  // Policy B runs next: must rewind to cursor=null and reprocess page 1 (accepting p1) instead of resuming c1.
+  const r2 = await runExtraction(makeOpts(cfgB));
+  assert.equal(r2.status, "completed");
+  assert.equal(r2.accepted, 1);
+  assert.deepEqual(observedCursors, [null, "c1", null, "c1"], "Policy B must rewind instead of resuming Policy A's partial cursor");
+  store = new ExtractionStore(f.storePath);
+  try {
+    const cp = store.readCheckpoint(s.sessionId)!;
+    assert.equal(cp.cursor, "c1");
+    assert.equal(cp.completeRevision, null);
+    assert.equal(cp.policyFingerprint, fpB);
+    assert.deepEqual(store.records(s.sessionId).map(r => r.text), [p1.text]);
+  } finally { store.close(); }
+
+  // Second Policy B run resumes c1 cleanly, extracts p2, and certifies complete_revision under Policy B.
+  const r3 = await runExtraction(makeOpts(cfgB));
+  assert.equal(r3.status, "completed");
+  assert.equal(r3.accepted, 1);
+  store = new ExtractionStore(f.storePath);
+  try {
+    const cp = store.readCheckpoint(s.sessionId)!;
+    assert.equal(cp.cursor, "c2");
+    assert.equal(cp.completeRevision, buildCompleteRevision(s.sourceRevision, fpB));
+    assert.equal(cp.policyFingerprint, fpB);
+    assert.deepEqual(store.records(s.sessionId).map(r => r.text), [p1.text, p2.text]);
+  } finally { store.close(); }
+
+  // Third Policy B run skips without reopening delta.
+  const readsBeforeSkip = observedCursors.length;
+  const r4 = await runExtraction(makeOpts(cfgB));
+  assert.equal(r4.unchanged, 1);
+  assert.equal(observedCursors.length, readsBeforeSkip);
+
+  // Legacy pre-migration database with an unversioned partial cursor (no policy_fingerprint column) migrates and rewinds.
+  const legacy = await fixture();
+  const raw = new DatabaseSync(legacy.storePath);
+  try {
+    raw.exec(`
+      CREATE TABLE memory_schema (component TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT;
+      INSERT INTO memory_schema VALUES ('storage', 1), ('extraction', 1);
+      CREATE TABLE extraction_worker (
+        id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT, lease_until INTEGER NOT NULL DEFAULT 0,
+        next_run INTEGER NOT NULL DEFAULT 0, live_since INTEGER NOT NULL
+      ) STRICT;
+      INSERT INTO extraction_worker(id, live_since) VALUES (1, 0);
+      CREATE TABLE extraction_sessions (
+        session_id TEXT PRIMARY KEY, metadata TEXT NOT NULL CHECK(json_valid(metadata)), cursor TEXT,
+        extract_since INTEGER NOT NULL,
+        context TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(context)), updated_at INTEGER NOT NULL,
+        error TEXT, complete_revision TEXT
+      ) STRICT;
+      CREATE TABLE extracted_memories (
+        id TEXT NOT NULL, revision INTEGER NOT NULL, session_id TEXT NOT NULL REFERENCES extraction_sessions(session_id),
+        text TEXT NOT NULL, digest TEXT NOT NULL, evidence TEXT NOT NULL CHECK(json_valid(evidence)),
+        observed_at INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','superseded','withdrawn')),
+        judgment TEXT NOT NULL CHECK(json_valid(judgment)), prompt_version TEXT NOT NULL, created_at INTEGER NOT NULL,
+        PRIMARY KEY(id,revision)
+      ) STRICT;
+      CREATE UNIQUE INDEX extracted_current ON extracted_memories(id) WHERE status='active';
+      CREATE UNIQUE INDEX extracted_duplicate ON extracted_memories(session_id,digest) WHERE status='active';
+    `);
+    raw.prepare("INSERT INTO extraction_sessions(session_id,metadata,cursor,extract_since,context,updated_at,error,complete_revision) VALUES(?,?,?,?,?,?,NULL,NULL)")
+      .run(s.sessionId, JSON.stringify(s), "c1", 0, JSON.stringify([m1]), Date.now());
+  } finally { raw.close(); }
+
+  const legacyCursors: (string | null)[] = [];
+  const legacyRun = await runExtraction({
+    ...makeOpts(cfgB),
+    storePath: legacy.storePath,
+    readPage: async (_id, _name, _s, cursor) => {
+      legacyCursors.push(cursor);
+      if (cursor === null) return { kind: "page", cursor: "c1", hasMore: true, entryCount: 2, messages: [m1, pad] };
+      if (cursor === "c1") return { kind: "page", cursor: "c2", hasMore: false, entryCount: 1, messages: [m2] };
+      return { kind: "page", cursor: "c2", hasMore: false, entryCount: 0, messages: [] };
+    },
+  });
+  assert.equal(legacyRun.status, "completed");
+  assert.equal(legacyRun.accepted, 1);
+  assert.equal(legacyCursors[0], null, "unversioned legacy partial cursor must rewind to null");
+  const legacyStore = new ExtractionStore(legacy.storePath);
+  try {
+    const cp = legacyStore.readCheckpoint(s.sessionId)!;
+    assert.equal(cp.cursor, "c1");
+    assert.equal(cp.policyFingerprint, fpB);
+    assert.deepEqual(legacyStore.records(s.sessionId).map(r => r.text), [p1.text]);
+  } finally { legacyStore.close(); }
+});
+
+test("extraction-runtime gateway_stop then gateway_start with extraction disabled returns disabled on RPC", async () => {
+  const hooks = new Map<string, () => void | Promise<void>>();
+  let rpcHandler: ((req: { params: unknown; respond: (ok: boolean, data?: unknown, err?: { code?: string; message?: string }) => void }) => Promise<void>) | undefined;
+  const api = {
+    config: { agents: { entries: { main: { workspace: tmpdir() } } } },
+    runtime: {},
+    logger: { warn() {} },
+    registerCli() {},
+    on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); },
+    registerGatewayMethod(name: string, fn: typeof rpcHandler) { if (name === "unblock-memory.extract") rpcHandler = fn; },
+  } as unknown as OpenClawPluginApi;
+
+  const disabledConfig = resolveConfig(undefined);
+  assert.equal(disabledConfig.extraction.enabled, false);
+  let scheduledRuns = 0;
+  registerExtraction(api, disabledConfig, undefined, {
+    runExtraction: async ({ config: runCfg, scheduled }) => {
+      if (scheduled) scheduledRuns++;
+      return { status: runCfg.extraction.enabled ? ("completed" as const) : ("disabled" as const) } as Awaited<ReturnType<typeof runExtraction>>;
+    },
+  });
+
+  assert.ok(rpcHandler);
+  assert.ok(hooks.has("gateway_stop"));
+  assert.ok(hooks.has("gateway_start"), "gateway_start must be registered even when extraction is disabled");
+
+  const invoke = async () => {
+    let reply: { ok: boolean; data?: unknown; err?: { code?: string; message?: string } } | undefined;
+    await rpcHandler!({ params: { agentId: "main" }, respond: (ok, data, err) => { reply = { ok, data, err }; } });
+    return reply!;
+  };
+
+  assert.deepEqual(await invoke(), { ok: true, data: { status: "disabled" }, err: undefined });
+
+  await hooks.get("gateway_stop")!();
+  const whileStopped = await invoke();
+  assert.equal(whileStopped.ok, false);
+  assert.equal(whileStopped.err?.code, ErrorCodes.UNAVAILABLE);
+
+  await hooks.get("gateway_start")!();
+  assert.equal(scheduledRuns, 0, "gateway_start must not trigger scheduled ticks when extraction is disabled");
+  assert.deepEqual(await invoke(), { ok: true, data: { status: "disabled" }, err: undefined });
 });

@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { readExtractionPage, type ExtractionPage } from "../src/extraction-source.js";
 import { extractionHistory, readExtractionChunk } from "../src/extraction-chunk.js";
-import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageTokens, extractionOverhead, type ExtractionMessage } from "../src/extraction-model.js";
-import { ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
+import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, EXTRACTION_VERSION, extractionMessageTokens, extractionOverhead, type ExtractionMessage } from "../src/extraction-model.js";
+import { extractionPolicyFingerprint, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
 import { resolveConfig } from "../src/config.js";
 import { runExtraction } from "../src/extraction-worker.js";
 
@@ -202,15 +202,23 @@ test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on re
     { kind: "reset", cursor: null },
   );
 
-  // End-to-end worker test: seed a poisoned bookmark + stale active memory, then verify run 1 rewinds cleanly and run 2 re-extracts.
+  // End-to-end worker test: seed a poisoned bookmark + stale active memory under the current policy, then verify run 1 rewinds cleanly and run 2 re-extracts.
+  const currentPolicy = extractionPolicyFingerprint({
+    version: EXTRACTION_VERSION,
+    historyMessages: config.extraction.historyMessages,
+    minSupport: config.extraction.minSupport,
+    minRetention: config.extraction.minRetention,
+    minReplacement: config.extraction.minReplacement,
+    validatorModel: config.typesafe.model,
+  });
   const store = new ExtractionStore(storePath);
   try {
     const owner = store.claim(false, 0)!;
-    store.checkpoint(session, owner, 0);
+    store.checkpoint(session, owner, 0, currentPolicy);
     store.commit({
       session, expected: null, cursor: "unblock-extraction:v1:{poisoned", context: [],
       accepted: [{ proposal: { text: "Stale fact.", replaces: null, evidence: [{ messageId: "one", quote: "project" }] }, observedAt: 1000, judgment: {} }],
-      owner, version: "test",
+      owner, version: EXTRACTION_VERSION, policyFingerprint: currentPolicy,
     });
     store.release(owner);
   } finally { store.close(); }
