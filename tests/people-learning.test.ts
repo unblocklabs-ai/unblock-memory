@@ -1282,7 +1282,7 @@ test("exact agent-scoped legacy cron jobs and duplicates are recognized before a
   // Disabling alpha while reconciliation is incomplete immediately blocks even read-only tools on active legacy jobs.
   const disabledCfg: OpenClawConfig = {
     ...hostConfig,
-    plugins: { entries: { "unblock-memory": { config: { people: { enabled: true, whisperer: { enabled: true }, learning: { agents: { alpha: { enabled: false } } } } } } } },
+    plugins: { entries: { "unblock-memory": { config: { people: { enabled: true, whisperer: { enabled: true }, learning: { agents: { alpha: { enabled: false, legacyJobIds: ["legacy-by-id"] } } } } } } } },
   };
   await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: disabledCfg });
   const blockedLegacy = record(hooks.get("before_tool_call")!(
@@ -1291,6 +1291,21 @@ test("exact agent-scoped legacy cron jobs and duplicates are recognized before a
   ));
   assert.equal(blockedLegacy?.block, true);
   assert.match(String(blockedLegacy?.blockReason), /disabled/);
+
+  // Disabling People Whisperer globally must still recognize and disable configured legacyJobIds.
+  failDuplicateUpdate = false;
+  const whispererDisabledCfg: OpenClawConfig = {
+    ...hostConfig,
+    plugins: { entries: { "unblock-memory": { config: { people: { enabled: true, whisperer: { enabled: false }, learning: { agents: { alpha: { legacyJobIds: ["legacy-by-id"] } } } } } } } },
+  };
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: whispererDisabledCfg });
+  assert.equal(h.jobs.find(j => j.id === "legacy-by-id")?.enabled, false, "disabling People Whisperer must still disable configured legacyJobIds");
+  const blockedLegacyById = record(hooks.get("before_tool_call")!(
+    { toolName: "read", params: {} },
+    { config: whispererDisabledCfg, agentId: "alpha", sessionKey: "agent:alpha:cron:legacy-by-id:run:r4" },
+  ));
+  assert.equal(blockedLegacyById?.block, true, "disabling People Whisperer must keep configured legacyJobIds recognized and blocked");
+  assert.match(String(blockedLegacyById?.blockReason), /disabled/);
   await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
 });
 

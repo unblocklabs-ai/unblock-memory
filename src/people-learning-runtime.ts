@@ -456,7 +456,13 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
     rerun = false;
     const version = generation;
     const learning = config.people.enabled && config.people.whisperer.enabled ? config.people.learning
-      : { ...config.people.learning, enabled: false, agents: {} };
+      : {
+          ...config.people.learning,
+          enabled: false,
+          agents: Object.fromEntries(
+            Object.entries(config.people.learning.agents ?? {}).map(([id, agent]) => [id, { ...agent, enabled: false }]),
+          ),
+        };
     reconciliation = Promise.resolve()
       .then(async () => {
         const cron = getCron?.();
