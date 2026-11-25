@@ -64,7 +64,7 @@ function readSkillSource(source) {
             }
             const relativePath = relative(source.root, path).split(sep).join("/");
             if (kind !== "file" || basename(path).toLowerCase() !== "skill.md" ||
-                !picomatch.isMatch(relativePath, source.pattern, { dot: true }))
+                !picomatch.isMatch(relativePath, source.pattern, { dot: false }))
                 continue;
             entries.push(readSkillCatalogEntry(path));
         }

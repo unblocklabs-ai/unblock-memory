@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, mkdtempDisposable, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import chokidar from "chokidar";
@@ -15,7 +15,7 @@ import {
   type ManagerStore,
 } from "../src/manager.js";
 import { clusterReference, ensureMemoryAnalysisSchema } from "../src/analysis.js";
-import { resolveSessionSource, resolveSource, resolveSources } from "../src/sources.js";
+import { resolveConfiguredSkillPath, resolveSessionSource, resolveSource, resolveSources } from "../src/sources.js";
 import { createAgentDatabase } from "./helpers/session-database.js";
 import { reviewFixture } from "./helpers/review-store.js";
 import { projectSessionDocument } from "../src/session-projector.js";
@@ -1931,6 +1931,44 @@ test("failed reclustering preserves stale results and successful reclustering re
     assert.equal(summary.runId, "fresh");
     assert.equal(summary.stale, false);
     assert.equal((await manager.listClusters()).runId, "fresh");
+  } finally {
+    await manager.close();
+  }
+});
+
+test("skill catalog ignores hidden dot-directories like .archive unless explicitly configured", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-skill-dotdirs-"));
+  const archived = join(root, "skills", ".archive", "triage", "20261025-patch", "SKILL.md");
+  const live = join(root, "skills", "triage", "SKILL.md");
+  const explicitHidden = join(root, "skills", ".custom", "special", "SKILL.md");
+  for (const file of [archived, live, explicitHidden]) {
+    await mkdir(dirname(file), { recursive: true });
+  }
+  await writeFile(archived, "---\nname: triage\ndescription: stale archived patch\n---\n");
+  await writeFile(live, "---\nname: triage\ndescription: live triage workflow\n---\n");
+  await writeFile(explicitHidden, "---\nname: special\ndescription: explicit dot dir skill\n---\n");
+
+  const defaultSources = resolveSources(root, [
+    { name: "skills", kind: "skills", paths: ["skills/**/SKILL.md"] },
+  ]);
+  const manager = new QmdMemoryManager({
+    dbPath: join(root, "index.sqlite"),
+    workspaceDir: root,
+    sources: defaultSources,
+    keepModelsWarm: false,
+  });
+  try {
+    const listed = await manager.listSkills();
+    assert.deepEqual(listed.map(({ name, description, path }) => ({ name, description, path })), [
+      { name: "triage", description: "live triage workflow", path: live },
+    ]);
+    assert.equal(resolveConfiguredSkillPath(root, archived, defaultSources), undefined);
+    assert.equal(resolveConfiguredSkillPath(root, live, defaultSources), await realpath(live));
+
+    const explicitSources = resolveSources(root, [
+      { name: "skills", kind: "skills", paths: ["skills/.custom/**/SKILL.md"] },
+    ]);
+    assert.equal(resolveConfiguredSkillPath(root, explicitHidden, explicitSources), await realpath(explicitHidden));
   } finally {
     await manager.close();
   }

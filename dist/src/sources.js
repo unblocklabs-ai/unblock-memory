@@ -110,7 +110,7 @@ export function sourceMatchesPath(source, inputPath) {
     const relativePath = relative(source.root, target);
     if (escapes(relativePath))
         return false;
-    return picomatch.isMatch(relativePath.split(sep).join("/"), source.pattern, { dot: true });
+    return picomatch.isMatch(relativePath.split(sep).join("/"), source.pattern, { dot: source.kind !== "skills" });
 }
 export function parseSafeVirtualPath(virtualPath, sources) {
     const match = /^qmd:\/\/([^/]+)\/(.+)$/.exec(virtualPath.trim());
