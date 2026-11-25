@@ -82,7 +82,7 @@ openclaw memory-responses report --agent main --episode EPISODE_ID
 openclaw memory-responses report --agent main --sender SLACK_USER_ID --account ACCOUNT_SCOPE --bucket day --since 2026-09-01 --until 2026-10-01
 openclaw memory-responses report --agent main --person PERSON_ID
 openclaw memory-responses tasks --agent main
-openclaw memory-responses review --agent main --id TASK_ID --status deferred --reviewer human --note "Review the linked exchanges before changing preferences"
+openclaw memory-responses review --agent main --id TASK_ID --evidence-hash EVIDENCE_HASH --status deferred --reviewer human --note "Review the linked exchanges before changing preferences"
 openclaw memory-responses annotate --agent main --date 2026-09-18 --kind prompt --note "Known prompt revision deployed"
 openclaw memory-responses retry-failed --agent main
 ```

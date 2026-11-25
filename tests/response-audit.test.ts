@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
+import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "../src/config.js";
+import { registerResponseAudit } from "../src/response-runtime.js";
 import { RESPONSE_EXTRACTOR_VERSION, responseEpisodes, ResponseTranscriptReader } from "../src/response-episodes.js";
 import { auditResponses, responseCohort } from "../src/response-audit.js";
 import {
@@ -2013,4 +2017,132 @@ test("report trends group by stratum in linear time and pair exact previous peri
       ["model-b", "2026-09-07", "2026-09-14", -1, "descriptive_comparison"],
     ],
   );
+});
+
+test("memory-responses review CLI requires --evidence-hash and rejects stale evidence hashes after evidence replacement", async t => {
+  const root = await mkdtemp(join(tmpdir(), "response-cli-review-"));
+  const agentDir = join(root, "agents/main/agent");
+  await mkdir(agentDir, { recursive: true });
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = root;
+  t.after(() => {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+  });
+
+  const db = createAgentDatabase(join(agentDir, "openclaw-agent.sqlite"));
+  t.after(() => db.close());
+  insertSession(db, { sessionId: "s", chatType: "direct" });
+  for (const [i, row] of basic().entries()) {
+    db.prepare("INSERT INTO transcript_events VALUES(?,?,?,?)").run("s", row.seq, row.eventJson, row.createdAt);
+    db.prepare("INSERT INTO session_transcript_active_events VALUES(?,?,?,?)").run("s", i, row.seq, i);
+  }
+
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const result = payload(body);
+    if (body.questions.underdelivery) result.answers.underdelivery = { type: "noul", noul: 0.99 };
+    return Response.json(result);
+  });
+
+  const commanderPath = createRequire(import.meta.resolve("openclaw/plugin-sdk/session-store-runtime")).resolve("commander");
+  const { Command } = await import(pathToFileURL(commanderPath).href) as {
+    Command: new () => {
+      exitOverride(): unknown;
+      configureOutput(opts: { writeOut?: (s: string) => void; writeErr?: (s: string) => void }): unknown;
+      parseAsync(argv: string[]): Promise<unknown>;
+    };
+  };
+
+  const hostConfig = { agents: { entries: { main: { agentDir, workspace: root } } } } as unknown as OpenClawConfig;
+  const runCli = async (args: string[]): Promise<unknown> => {
+    const program = new Command();
+    program.exitOverride();
+    program.configureOutput({ writeOut() {}, writeErr() {} });
+    const api = {
+      config: hostConfig,
+      registerCli: (fn: (ctx: { program: unknown; config: OpenClawConfig }) => void) => fn({ program, config: hostConfig }),
+      on() {},
+    } as unknown as OpenClawPluginApi;
+    registerResponseAudit(api, config);
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...parts: unknown[]) => { lines.push(parts.map(String).join(" ")); };
+    try {
+      await program.parseAsync(["node", "openclaw", "memory-responses", ...args]);
+    } finally {
+      console.log = origLog;
+    }
+    return lines.length > 0 ? JSON.parse(lines.at(-1)!) : undefined;
+  };
+
+  const audit1 = await runCli(["audit", "--agent", "main"]) as { status: string };
+  assert.equal(audit1.status, "ok");
+
+  const tasks1 = await runCli(["tasks", "--agent", "main"]) as {
+    tasks: Array<{ id: string; status: string; inputHash: string; evidenceHash: string; evidenceStatus: string }>;
+    capped: boolean;
+  };
+  assert.equal(tasks1.tasks.length, 1);
+  const oldTask = tasks1.tasks[0]!;
+  assert.equal(oldTask.evidenceStatus, "current");
+  assert.equal(oldTask.status, "pending");
+  assert.ok(oldTask.evidenceHash.length > 0);
+
+  // Missing --evidence-hash must be rejected by the CLI before deciding.
+  await assert.rejects(
+    runCli(["review", "--agent", "main", "--id", oldTask.id, "--status", "dismissed", "--reviewer", "human", "--note", "Missing hash"]),
+    /evidence-hash/,
+  );
+
+  // Replace evidence under the same task ID (updated feedback -> new inputHash & evidenceHash).
+  db.prepare("UPDATE transcript_events SET event_json=? WHERE seq=3")
+    .run(JSON.stringify({ type: "message", message: user("Updated feedback after evidence A.") }));
+  const audit2 = await runCli(["audit", "--agent", "main"]) as { status: string };
+  assert.equal(audit2.status, "ok");
+
+  const tasks2 = await runCli(["tasks", "--agent", "main", "--id", oldTask.id]) as {
+    tasks: Array<{ id: string; status: string; inputHash: string; evidenceHash: string; evidenceStatus: string }>;
+  };
+  assert.equal(tasks2.tasks.length, 1);
+  const newTask = tasks2.tasks[0]!;
+  assert.equal(newTask.id, oldTask.id);
+  assert.equal(newTask.evidenceStatus, "current");
+  assert.notEqual(newTask.evidenceHash, oldTask.evidenceHash);
+  assert.notEqual(newTask.inputHash, oldTask.inputHash);
+
+  // Submitting a review with the old evidence hash must reject without mutating task state or decision log.
+  await assert.rejects(
+    runCli([
+      "review", "--agent", "main", "--id", oldTask.id, "--evidence-hash", oldTask.evidenceHash,
+      "--status", "dismissed", "--reviewer", "human", "--note", "Stale dismissal against evidence A",
+    ]),
+    /evidence revision mismatch/,
+  );
+
+  const storePath = join(root, "agents/main/unblock-memory/unblock-memory.sqlite");
+  const cohort = responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
+  const store = new ResponseAuditStore(storePath);
+  t.after(() => store.close());
+  assert.equal(store.reviews.list(cohort, oldTask.id)[0]!.status, "pending");
+  assert.equal(store.reviews.decisions(oldTask.id, cohort).length, 0);
+
+  // Submitting a review with the new evidence hash succeeds and records the new evidence hash.
+  const reviewed = await runCli([
+    "review", "--agent", "main", "--id", oldTask.id, "--evidence-hash", newTask.evidenceHash,
+    "--status", "dismissed", "--reviewer", "human", "--note", "Verified dismissal against evidence B",
+  ]) as Array<{ id: string; status: string; evidenceHash: string }>;
+  assert.equal(reviewed.length, 1);
+  assert.equal(reviewed[0]!.id, oldTask.id);
+  assert.equal(reviewed[0]!.status, "dismissed");
+  assert.equal(reviewed[0]!.evidenceHash, newTask.evidenceHash);
+
+  const decisions = store.reviews.decisions(oldTask.id, cohort);
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0]!.status, "dismissed");
+  assert.equal(decisions[0]!.reviewerKind, "human");
+  assert.equal(decisions[0]!.note, "Verified dismissal against evidence B");
+  assert.equal(decisions[0]!.cohort, cohort);
+  assert.equal(decisions[0]!.inputHash, newTask.inputHash);
+  assert.equal(decisions[0]!.evidenceHash, newTask.evidenceHash);
 });
