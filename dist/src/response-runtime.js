@@ -81,9 +81,10 @@ export function registerResponseAudit(api, config) {
         root.command("review").requiredOption("--id <id>", "Task ID").requiredOption("--status <status>", "pending, resolved, dismissed or deferred")
             .requiredOption("--reviewer <kind>", "human or agent: provenance, not an authorization grant")
             .requiredOption("--note <text>", "Evidence-based decision; no automatic whisperer write")
+            .requiredOption("--evidence-hash <hash>", "Evidence hash returned by memory-responses tasks")
             .option("--agent <id>", "Agent id", "main")
             .action((opts) => withStore(opts.agent, (store, cohort) => {
-            store.reviews.decide(cohort, opts.id, opts.status, opts.reviewer, opts.note);
+            store.reviews.decide(cohort, opts.id, opts.status, opts.reviewer, opts.note, undefined, { expectedEvidenceHash: opts.evidenceHash });
             return store.reviews.list(cohort, opts.id);
         }));
         root.command("annotate").option("--agent <id>", "Agent id", "main").requiredOption("--date <date>", "UTC date YYYY-MM-DD")

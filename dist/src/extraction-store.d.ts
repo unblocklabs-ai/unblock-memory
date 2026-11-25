@@ -10,6 +10,7 @@ type Checkpoint = {
     context: ExtractionMessage[];
     since: number;
     completeRevision: string | null;
+    policyFingerprint: string | null;
 };
 export type ExtractedRecord = {
     id: string;
@@ -46,12 +47,14 @@ export declare class ExtractionStore {
     }) | undefined;
     checkpoint(session: ExtractionSession, owner: string, since?: number, policyFingerprint?: string): Checkpoint;
     records(sessionId?: string, paths?: readonly string[]): ExtractedRecord[];
-    reset(sessionId: string, cursor: string | null, owner: string): void;
+    reset(sessionId: string, cursor: string | null, owner: string, policyFingerprint?: string): void;
+    private assertCheckpointFenced;
     completeEmpty(params: {
         sessionId: string;
         expected: string | null;
         owner: string;
         completeRevision?: string;
+        policyFingerprint?: string;
     }): void;
     commit(params: {
         session: ExtractionSession;
@@ -66,6 +69,7 @@ export declare class ExtractionStore {
         owner: string;
         version: string;
         completeRevision?: string;
+        policyFingerprint?: string;
     }): number;
     error(sessionId: string, code: string, owner: string): void;
     report(): {

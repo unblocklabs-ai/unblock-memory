@@ -4,10 +4,10 @@ import { buildCompleteRevision, ExtractionLeaseLostError, extractionPolicyFinger
 import { readExtractionPage } from "./extraction-source.js";
 import { extractionHistory, readExtractionChunk } from "./extraction-chunk.js";
 import { resolveTypeSafeApiKey } from "./typesafe-client.js";
-function handleResetOrMissing(store, sessionId, page, owner) {
+function handleResetOrMissing(store, sessionId, page, owner, policyFingerprint) {
     if (page.kind !== "reset" && page.kind !== "missing")
         return false;
-    store.reset(sessionId, page.kind === "reset" ? (page.cursor ?? null) : null, owner);
+    store.reset(sessionId, page.kind === "reset" ? (page.cursor ?? null) : null, owner, policyFingerprint);
     return true;
 }
 function scoreField(judgment, key) {
@@ -141,7 +141,7 @@ async function processSession(params) {
             store.error(session.sessionId, "source_unavailable", owner);
             return { processed: 1, accepted: 0, rejected: 0, unchanged: 0, failed: 1 };
         }
-        if (handleResetOrMissing(store, session.sessionId, page, owner)) {
+        if (handleResetOrMissing(store, session.sessionId, page, owner, policyFingerprint)) {
             return { processed: 1, accepted: 0, rejected: 0, unchanged: 0, failed: 0 };
         }
         if (!page.entryCount) {
@@ -150,6 +150,7 @@ async function processSession(params) {
                 expected: checkpoint.cursor,
                 owner,
                 completeRevision: page.exhausted ? expectedCompleteRevision : undefined,
+                policyFingerprint,
             });
             return { processed: 0, accepted: 0, rejected: 0, unchanged: 1, failed: 0 };
         }
@@ -175,7 +176,7 @@ async function processSession(params) {
         void checkPending.catch(() => { });
         const check = await abortable(checkPending, signal);
         signal.throwIfAborted();
-        if (handleResetOrMissing(store, session.sessionId, check, owner)) {
+        if (handleResetOrMissing(store, session.sessionId, check, owner, policyFingerprint)) {
             return { processed: 1, accepted: 0, rejected, unchanged: 0, failed: 0 };
         }
         if (check.kind === "unavailable")
@@ -191,6 +192,7 @@ async function processSession(params) {
             owner,
             version,
             completeRevision: page.exhausted ? expectedCompleteRevision : undefined,
+            policyFingerprint,
         });
         return { processed: 1, accepted: written, rejected, unchanged: 0, failed: 0 };
     }

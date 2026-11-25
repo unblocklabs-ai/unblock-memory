@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 declare const PERSON_DOSSIER_SCHEMA: Type.TObject<{
     schemaVersion: Type.TLiteral<1>;
@@ -103,6 +104,12 @@ export type Company = {
     createdAt: string;
     updatedAt: string;
 };
+/**
+ * Records a dossier verification inside the caller's existing SQLite write transaction.
+ * Callers sharing `unblock-memory.sqlite` use this to commit dossier verifications
+ * atomically with learning-receipt completion without nesting BEGIN IMMEDIATE.
+ */
+export declare function recordDossierVerificationInTransaction(db: DatabaseSync, personId: string, revision: string | null, verification: string, now?: string): void;
 export declare class PeopleStore {
     #private;
     constructor(path: string, options: {

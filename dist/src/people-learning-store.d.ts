@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import type { ReviewManifest } from "./people-learning-inventory.js";
 export declare const LEARNING_RECEIPT_SCHEMA: Type.TObject<{
@@ -106,7 +107,6 @@ export declare class PeopleLearningStore {
         coverage: unknown;
     };
     planMissedWindows(manifest: ReviewManifest): void;
-    matchesRevision(id: string, expectedRevision?: string): boolean;
     get(id: string): {
         manifest: ReviewManifest;
         manifestRevision: string;
@@ -153,11 +153,18 @@ export declare class PeopleLearningStore {
         status: string;
         coverage: unknown;
     }[];
-    checkpoint(id: string, input: unknown, now?: number, checkSaves?: (receipt: LearningReceipt) => string[], finalize?: (receiptId: string) => void, expectedManifestRevision?: string): {
+    checkpoint(id: string, input: unknown, now?: number, checkSaves?: (receipt: LearningReceipt, manifest: ReviewManifest) => string[], finalize?: (receiptId: string, db: DatabaseSync, manifest: ReviewManifest) => void, expectedManifestRevision?: string, options?: {
+        collectAssertions?: (manifest: ReviewManifest) => ReviewManifest["assertions"];
+        beforeManifestCommit?: (manifest: ReviewManifest) => void;
+        shouldFinalize?: (manifest: ReviewManifest) => boolean;
+    }): {
+        backlog: {
+            id: string;
+            status: string;
+            coverage: unknown;
+        }[];
         receiptId: string;
         manifestRevision: string;
-        backlog: ReturnType<PeopleLearningStore["backlog"]>;
-    } & {
         status: "partial" | "complete" | "invalid";
         expectedPeople: number;
         expectedSessions: number;

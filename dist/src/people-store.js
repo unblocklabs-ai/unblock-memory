@@ -148,6 +148,71 @@ function company(row) {
         updatedAt: row.updated_at,
     };
 }
+function ensureDossierVerificationTable(db) {
+    db.exec(`CREATE TABLE IF NOT EXISTS person_dossier_verification (
+    person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
+    revision TEXT NOT NULL, verification TEXT NOT NULL, verified_at TEXT NOT NULL
+  ) STRICT`);
+}
+function insertDossierChangeRow(db, params) {
+    const id = randomUUID();
+    db.prepare(`
+      INSERT INTO person_dossier_changes
+        (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `)
+        .run(id, params.personId, params.action, params.beforeDossierJson, params.afterDossierJson, params.reason, params.changedAt);
+    return id;
+}
+function upsertDossierVerificationRow(db, personId, revision, verification, verifiedAt) {
+    db.prepare(`
+      INSERT INTO person_dossier_verification (person_id, revision, verification, verified_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(person_id) DO UPDATE SET
+        revision = excluded.revision,
+        verification = excluded.verification,
+        verified_at = excluded.verified_at
+    `)
+        .run(personId, revision, verification, verifiedAt);
+}
+/**
+ * Records a dossier verification inside the caller's existing SQLite write transaction.
+ * Callers sharing `unblock-memory.sqlite` use this to commit dossier verifications
+ * atomically with learning-receipt completion without nesting BEGIN IMMEDIATE.
+ */
+export function recordDossierVerificationInTransaction(db, personId, revision, verification, now = new Date().toISOString()) {
+    const normalizedVerification = required(verification, "verification");
+    ensureDossierVerificationTable(db);
+    const latestChange = db
+        .prepare("SELECT id, action, after_dossier_json FROM person_dossier_changes WHERE person_id = ? ORDER BY rowid DESC LIMIT 1")
+        .get(personId);
+    if ((latestChange?.id ?? null) !== revision)
+        throw new DossierConflictError();
+    const existing = db
+        .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
+        .get(personId);
+    if (!existing)
+        throw new DossierConflictError();
+    let verifiedRevision = revision;
+    if (verifiedRevision === null) {
+        // Pre-v4 dossiers have no change revision. Establish a baseline snapshot
+        // without rewriting their data or pretending the old write happened now.
+        verifiedRevision = insertDossierChangeRow(db, {
+            personId,
+            action: "replace",
+            beforeDossierJson: existing.dossier_json,
+            afterDossierJson: existing.dossier_json,
+            reason: "Legacy baseline after complete source validation",
+            changedAt: now,
+        });
+    }
+    else if (!latestChange ||
+        latestChange.action !== "replace" ||
+        latestChange.after_dossier_json !== existing.dossier_json) {
+        throw new DossierConflictError();
+    }
+    upsertDossierVerificationRow(db, personId, verifiedRevision, normalizedVerification, now);
+}
 export class PeopleStore {
     #db;
     #maxOpenTodos;
@@ -445,68 +510,20 @@ export class PeopleStore {
         this.#ensureDossierVerification();
         const now = new Date().toISOString();
         immediateTransaction(this.#db, () => {
-            const latestChange = this.#db
-                .prepare("SELECT id, action, after_dossier_json FROM person_dossier_changes WHERE person_id = ? ORDER BY rowid DESC LIMIT 1")
-                .get(personId);
-            if ((latestChange?.id ?? null) !== revision)
-                throw new DossierConflictError();
-            const existing = this.#db
-                .prepare("SELECT dossier_json FROM person_dossiers WHERE person_id = ?")
-                .get(personId);
-            if (!existing)
-                throw new DossierConflictError();
-            let verifiedRevision = revision;
-            if (verifiedRevision === null) {
-                // Pre-v4 dossiers have no change revision. Establish a baseline snapshot
-                // without rewriting their data or pretending the old write happened now.
-                verifiedRevision = this.#insertDossierChange({
-                    personId,
-                    action: "replace",
-                    beforeDossierJson: existing.dossier_json,
-                    afterDossierJson: existing.dossier_json,
-                    reason: "Legacy baseline after complete source validation",
-                    changedAt: now,
-                });
-            }
-            else if (!latestChange ||
-                latestChange.action !== "replace" ||
-                latestChange.after_dossier_json !== existing.dossier_json) {
-                throw new DossierConflictError();
-            }
-            this.#upsertDossierVerification(personId, verifiedRevision, normalizedVerification, now);
+            recordDossierVerificationInTransaction(this.#db, personId, revision, normalizedVerification, now);
         });
     }
     #ensureDossierVerification() {
         if (this.#dossierVerificationReady)
             return;
-        this.#db.exec(`CREATE TABLE IF NOT EXISTS person_dossier_verification (
-      person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
-      revision TEXT NOT NULL, verification TEXT NOT NULL, verified_at TEXT NOT NULL
-    ) STRICT`);
+        ensureDossierVerificationTable(this.#db);
         this.#dossierVerificationReady = true;
     }
     #insertDossierChange(params) {
-        const id = randomUUID();
-        this.#db
-            .prepare(`
-        INSERT INTO person_dossier_changes
-          (id, person_id, action, before_dossier_json, after_dossier_json, reason, changed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `)
-            .run(id, params.personId, params.action, params.beforeDossierJson, params.afterDossierJson, params.reason, params.changedAt);
-        return id;
+        return insertDossierChangeRow(this.#db, params);
     }
     #upsertDossierVerification(personId, revision, verification, verifiedAt) {
-        this.#db
-            .prepare(`
-        INSERT INTO person_dossier_verification (person_id, revision, verification, verified_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(person_id) DO UPDATE SET
-          revision = excluded.revision,
-          verification = excluded.verification,
-          verified_at = excluded.verified_at
-      `)
-            .run(personId, revision, verification, verifiedAt);
+        upsertDossierVerificationRow(this.#db, personId, revision, verification, verifiedAt);
     }
     #writeDossier(personId, reasonInput, input, expectedRevision, verificationInput) {
         const { dossier, dossierJson } = this.#parseAndSerializeDossier(input);

@@ -57,7 +57,7 @@ export class ExtractionStore {
         session_id TEXT PRIMARY KEY, metadata TEXT NOT NULL CHECK(json_valid(metadata)), cursor TEXT,
         extract_since INTEGER NOT NULL,
         context TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(context)), updated_at INTEGER NOT NULL,
-        error TEXT, complete_revision TEXT
+        error TEXT, complete_revision TEXT, policy_fingerprint TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS extracted_memories (
         id TEXT NOT NULL, revision INTEGER NOT NULL, session_id TEXT NOT NULL REFERENCES extraction_sessions(session_id),
@@ -72,6 +72,9 @@ export class ExtractionStore {
     `);
             if (!this.db.prepare("SELECT 1 FROM pragma_table_info('extraction_sessions') WHERE name='complete_revision'").get()) {
                 this.db.exec("ALTER TABLE extraction_sessions ADD COLUMN complete_revision TEXT");
+            }
+            if (!this.db.prepare("SELECT 1 FROM pragma_table_info('extraction_sessions') WHERE name='policy_fingerprint'").get()) {
+                this.db.exec("ALTER TABLE extraction_sessions ADD COLUMN policy_fingerprint TEXT");
             }
             this.db.prepare("INSERT OR IGNORE INTO extraction_worker(id,live_since) VALUES(1,?)").run(Date.now());
         }
@@ -96,7 +99,7 @@ export class ExtractionStore {
     }
     release(owner) { this.db.prepare("UPDATE extraction_worker SET owner=NULL,lease_until=0 WHERE id=1 AND owner=?").run(owner); }
     readCheckpoint(sessionId) {
-        const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision,error FROM extraction_sessions WHERE session_id=?").get(sessionId);
+        const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision,policy_fingerprint,error FROM extraction_sessions WHERE session_id=?").get(sessionId);
         if (!row)
             return undefined;
         return {
@@ -104,36 +107,55 @@ export class ExtractionStore {
             context: JSON.parse(String(row.context)),
             since: Number(row.extract_since),
             completeRevision: row.complete_revision,
+            policyFingerprint: row.policy_fingerprint,
             error: row.error,
         };
     }
     checkpoint(session, owner, since, policyFingerprint) {
         return immediateTransaction(this.db, () => {
             this.renew(owner);
-            this.db.prepare(`INSERT INTO extraction_sessions(session_id,metadata,updated_at,extract_since) VALUES(?,?,?,?)
+            this.db.prepare(`INSERT INTO extraction_sessions(session_id,metadata,updated_at,extract_since,policy_fingerprint) VALUES(?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET metadata=excluded.metadata WHERE metadata IS NOT excluded.metadata`)
-                .run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince());
-            const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision FROM extraction_sessions WHERE session_id=?").get(session.sessionId);
+                .run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince(), policyFingerprint ?? null);
+            const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision,policy_fingerprint FROM extraction_sessions WHERE session_id=?").get(session.sessionId);
+            const storedCursor = row.cursor;
+            const storedCompleteRevision = row.complete_revision;
+            const storedPolicy = row.policy_fingerprint;
             if (since !== undefined && since < Number(row.extract_since)) {
                 // A broader explicitly approved backfill replays this session. Existing facts are
                 // supplied to Luna and exact duplicates are ignored; history is never deleted.
-                this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=? WHERE session_id=?").run(since, session.sessionId);
-                return { cursor: null, context: [], since, completeRevision: null };
+                const nextPolicy = policyFingerprint ?? storedPolicy;
+                this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=?,policy_fingerprint=? WHERE session_id=?")
+                    .run(since, nextPolicy, session.sessionId);
+                return { cursor: null, context: [], since, completeRevision: null, policyFingerprint: nextPolicy };
             }
-            const storedCompleteRevision = row.complete_revision;
-            if (policyFingerprint !== undefined && storedCompleteRevision !== null) {
-                const parsed = parseCompleteRevision(storedCompleteRevision);
-                if (parsed && parsed.policy !== policyFingerprint) {
-                    // A prompt or retention-policy change replays the session with existing facts retained.
-                    this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL WHERE session_id=?").run(session.sessionId);
-                    return { cursor: null, context: [], since: Number(row.extract_since), completeRevision: null };
+            if (policyFingerprint !== undefined) {
+                const completeRevisionPolicyMismatch = storedCompleteRevision !== null && parseCompleteRevision(storedCompleteRevision)?.policy !== policyFingerprint;
+                if ((storedCursor !== null || storedCompleteRevision !== null) && (storedPolicy !== policyFingerprint || completeRevisionPolicyMismatch)) {
+                    // A prompt or retention-policy change (or unversioned legacy cursor) replays the
+                    // session from the start with existing facts retained so completion covers the full scan.
+                    this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,policy_fingerprint=? WHERE session_id=?")
+                        .run(policyFingerprint, session.sessionId);
+                    return { cursor: null, context: [], since: Number(row.extract_since), completeRevision: null, policyFingerprint };
+                }
+                if (storedPolicy !== policyFingerprint) {
+                    this.db.prepare("UPDATE extraction_sessions SET policy_fingerprint=? WHERE session_id=?")
+                        .run(policyFingerprint, session.sessionId);
+                    return {
+                        cursor: storedCursor,
+                        context: JSON.parse(String(row.context)),
+                        since: Number(row.extract_since),
+                        completeRevision: storedCompleteRevision,
+                        policyFingerprint,
+                    };
                 }
             }
             return {
-                cursor: row.cursor,
+                cursor: storedCursor,
                 context: JSON.parse(String(row.context)),
                 since: Number(row.extract_since),
                 completeRevision: storedCompleteRevision,
+                policyFingerprint: storedPolicy,
             };
         });
     }
@@ -148,22 +170,39 @@ export class ExtractionStore {
             .map(r => ({ id: String(r.id), revision: Number(r.revision), text: String(r.text), sessionId: String(r.session_id),
             observedAt: Number(r.observed_at), evidence: JSON.parse(String(r.evidence)), metadata: JSON.parse(String(r.metadata)), judgment: JSON.parse(String(r.judgment)) }));
     }
-    reset(sessionId, cursor, owner) {
+    reset(sessionId, cursor, owner, policyFingerprint) {
         immediateTransaction(this.db, () => {
             this.renew(owner);
             this.db.prepare("UPDATE extracted_memories SET status='withdrawn' WHERE session_id=? AND status='active'").run(sessionId);
-            this.db.prepare("UPDATE extraction_sessions SET cursor=?,context='[]',complete_revision=NULL,error=NULL,updated_at=? WHERE session_id=?")
-                .run(cursor, Date.now(), sessionId);
+            this.db.prepare("UPDATE extraction_sessions SET cursor=?,context='[]',complete_revision=NULL,policy_fingerprint=?,error=NULL,updated_at=? WHERE session_id=?")
+                .run(cursor, policyFingerprint ?? null, Date.now(), sessionId);
         });
+    }
+    assertCheckpointFenced(current, expected, policyFingerprint, completeRevision) {
+        if (!current || current.cursor !== expected)
+            throw new Error("Extraction checkpoint changed");
+        const storedPolicy = current.policy_fingerprint;
+        if (policyFingerprint !== undefined) {
+            if (expected !== null ? storedPolicy !== policyFingerprint : storedPolicy !== null && storedPolicy !== policyFingerprint) {
+                throw new Error("Extraction checkpoint changed");
+            }
+        }
+        const nextPolicy = policyFingerprint ?? storedPolicy;
+        if (completeRevision !== undefined) {
+            const parsed = parseCompleteRevision(completeRevision);
+            if (parsed && parsed.policy !== null && nextPolicy !== parsed.policy) {
+                throw new Error("Extraction checkpoint changed");
+            }
+        }
+        return nextPolicy;
     }
     completeEmpty(params) {
         immediateTransaction(this.db, () => {
             this.renew(params.owner);
-            const current = this.db.prepare("SELECT cursor FROM extraction_sessions WHERE session_id=?").get(params.sessionId);
-            if (!current || current.cursor !== params.expected)
-                throw new Error("Extraction checkpoint changed");
-            this.db.prepare("UPDATE extraction_sessions SET updated_at=?,complete_revision=?,error=NULL WHERE session_id=?")
-                .run(Date.now(), params.completeRevision ?? null, params.sessionId);
+            const current = this.db.prepare("SELECT cursor,policy_fingerprint FROM extraction_sessions WHERE session_id=?").get(params.sessionId);
+            const nextPolicy = this.assertCheckpointFenced(current, params.expected, params.policyFingerprint, params.completeRevision);
+            this.db.prepare("UPDATE extraction_sessions SET updated_at=?,complete_revision=?,policy_fingerprint=?,error=NULL WHERE session_id=?")
+                .run(Date.now(), params.completeRevision ?? null, nextPolicy, params.sessionId);
         });
     }
     commit(params) {
@@ -171,9 +210,8 @@ export class ExtractionStore {
             let written = 0;
             const replaced = new Set();
             this.renew(params.owner);
-            const current = this.db.prepare("SELECT cursor FROM extraction_sessions WHERE session_id=?").get(params.session.sessionId);
-            if (!current || current.cursor !== params.expected)
-                throw new Error("Extraction checkpoint changed");
+            const current = this.db.prepare("SELECT cursor,policy_fingerprint FROM extraction_sessions WHERE session_id=?").get(params.session.sessionId);
+            const nextPolicy = this.assertCheckpointFenced(current, params.expected, params.policyFingerprint, params.completeRevision);
             for (const { proposal, observedAt, judgment } of params.accepted) {
                 const digest = memoryDigest(proposal.text);
                 const duplicate = this.db.prepare("SELECT id FROM extracted_memories WHERE session_id=? AND digest=? AND status='active'")
@@ -197,8 +235,8 @@ export class ExtractionStore {
                     .run(id, revision, params.session.sessionId, proposal.text.trim(), digest, JSON.stringify(proposal.evidence), observedAt, JSON.stringify(judgment), params.version, Date.now());
                 written++;
             }
-            this.db.prepare("UPDATE extraction_sessions SET cursor=?,context=?,updated_at=?,complete_revision=?,error=NULL WHERE session_id=?")
-                .run(params.cursor, JSON.stringify(params.context), Date.now(), params.completeRevision ?? null, params.session.sessionId);
+            this.db.prepare("UPDATE extraction_sessions SET cursor=?,context=?,updated_at=?,complete_revision=?,policy_fingerprint=?,error=NULL WHERE session_id=?")
+                .run(params.cursor, JSON.stringify(params.context), Date.now(), params.completeRevision ?? null, nextPolicy, params.session.sessionId);
             return written;
         });
     }
