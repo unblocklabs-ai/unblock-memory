@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": { "onStartup": true },
@@ -55,7 +55,7 @@
     "responseAudit.enabled": { "label": "Response Quality Audit", "help": "Opt in to background decision-model evaluation (default: Codex LB -> OpenRouter Liquid d1.2-ultra) of approved Slack humans. Operator-only reports; no prompt or memory writes." },
     "responseAudit.sentimentEnabled": { "label": "Human Sentiment Analysis", "help": "Default on within an enabled, approved response audit. Includes annoyance, frustration and expressed intensity; does not imply agent fault." },
     "responseAudit.intervalMinutes": { "label": "Response Audit Interval (minutes)", "help": "Shared cadence for quality and enabled sentiment analysis. Unchanged successful exchanges are cached. Zero means manual-only." },
-    "responseAudit.senderIds": { "label": "Approved Human Sender IDs", "help": "Explicit human Slack user IDs whose exchanges may be sent to the configured decision model. Also requires trusted human identity or owner metadata; explicit bots are always excluded." },
+    "responseAudit.senderIds": { "label": "Approved Human Sender IDs", "help": "Explicit human Slack user IDs whose exchanges may be sent to the configured decision model, or [\"*\"] to approve all verified Slack humans. Still requires trusted human identity or owner metadata; explicit bots and unverified senders are always excluded." },
     "responseAudit.memoryCorpora": { "label": "Response Audit Memory Evidence", "help": "Optional configured file corpora approved for current-index memory-gap investigation. Does not prove historical availability." },
     "qualityAudit.enabled": {
       "label": "Memory Quality Audit",

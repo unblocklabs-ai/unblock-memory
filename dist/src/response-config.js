@@ -24,7 +24,8 @@ export function resolveResponseAudit(value, corpora) {
         }
         return [...new Set(raw.map(x => x.trim()))];
     };
-    const senderIds = strings("senderIds"), chatTypes = strings("chatTypes"), memoryCorpora = strings("memoryCorpora");
+    const rawSenderIds = strings("senderIds"), chatTypes = strings("chatTypes"), memoryCorpora = strings("memoryCorpora");
+    const senderIds = rawSenderIds.includes("*") ? ["*"] : rawSenderIds;
     if (!chatTypes.length || !chatTypes.every((x) => ["direct", "group", "channel"].includes(x))) {
         throw new Error("responseAudit.chatTypes must specify direct, group or channel");
     }

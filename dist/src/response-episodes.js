@@ -7,6 +7,13 @@ import { jsonHash } from "./json-hash.js";
 import { record } from "./guards.js";
 export const RESPONSE_EXTRACTOR_VERSION = 7;
 const { maxSessionEvents: MAX_EVENTS, maxSessionBytes: MAX_SESSION_BYTES, maxEpisodeChars: MAX_EPISODE_CHARS } = DEFAULTS.responseAudit;
+function isApprovedSender(senderIds, senderId) {
+    return senderId.trim().length > 0 && (senderIds.includes("*") || senderIds.includes(senderId));
+}
+function isHumanSender(meta) {
+    const identity = record(meta?.senderIdentity);
+    return identity?.senderKind !== "bot" && (identity?.senderKind === "human" || meta?.senderIsOwner === true);
+}
 /** Never deduce human identity from text or the user role alone. */
 export function responseEpisodes(session, rows, config) {
     const coverage = { completedResponses: 0, eligible: 0, noFeedback: 0,
@@ -82,11 +89,10 @@ export function responseEpisodes(session, rows, config) {
         if (m.role === "toolResult")
             continue; // Tool bodies/thinking are never sent.
         if (m.role === "user") {
-            const identity = record(meta?.senderIdentity), transport = record(meta?.transport);
+            const transport = record(meta?.transport);
             const senderId = meta?.senderId;
-            const human = identity?.senderKind !== "bot" && (identity?.senderKind === "human" || meta?.senderIsOwner === true);
-            if (m.provenance !== undefined || !human ||
-                typeof senderId !== "string" || !config.senderIds.includes(senderId) ||
+            if (m.provenance !== undefined || !isHumanSender(meta) ||
+                typeof senderId !== "string" || !isApprovedSender(config.senderIds, senderId) ||
                 transport?.channel !== "slack" || transport.conversationRef !== session.conversationId) {
                 filterOut();
                 continue;
@@ -216,9 +222,9 @@ export class ResponseTranscriptReader {
                         catch {
                             return false;
                         }
-                        const message = record(event?.message), sender = record(message?.__openclaw)?.senderId;
-                        return event?.type === "message" && message?.role === "user" &&
-                            typeof sender === "string" && config.senderIds.includes(sender);
+                        const message = record(event?.message), meta = record(message?.__openclaw), sender = meta?.senderId;
+                        return event?.type === "message" && message?.role === "user" && isHumanSender(meta) &&
+                            typeof sender === "string" && isApprovedSender(config.senderIds, sender);
                     });
                     if (approved)
                         sessions.push(session);

@@ -13,7 +13,7 @@ This reads the host transcript database directly: it does not require a `session
 corpus, People Primer, whisperers or clustering. Configure [shared decision model
 credentials](configuration.md#shared-decision-model-credentials) separately. Begin with
 the dry-run command below before requesting inference.
-Only approved Slack sender IDs with trusted `senderKind: human` or owner metadata
+Only approved Slack sender IDs (or `senderIds: ["*"]` for all verified Slack humans) with trusted `senderKind: human` or owner metadata
 qualify (older Slack records use unknown senderKind even for known owners).
 Explicit bots, unverified identities, internal messages, other senders and thread changes form
 hard boundaries. Synthetic delivery mirrors and gateway-injected answers are excluded.

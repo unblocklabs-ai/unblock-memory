@@ -211,6 +211,24 @@ test("explicitly approved trusted owners work with older unknown identity metada
   }
 });
 
+test("senderIds wildcard ['*'] grades all verified Slack humans while still excluding bots and unverified senders", () => {
+  const wildcardConfig = resolveConfig({
+    responseAudit: { enabled: true, senderIds: ["*", "U_EXTRA"], intervalMinutes: 0 },
+  }).responseAudit;
+  assert.deepEqual(wildcardConfig.senderIds, ["*"]);
+  const meta = user("x").__openclaw;
+  const alice = (text: string) => user(text, { __openclaw: { ...meta, senderId: "U_ALICE", senderIdentity: { senderKind: "human" } } });
+  const bot = (text: string) => user(text, { __openclaw: { ...meta, senderId: "U_BOT", senderIdentity: { senderKind: "bot" } } });
+  const unverified = (text: string) => user(text, { __openclaw: { ...meta, senderId: "U_UNKNOWN", senderIdentity: { senderKind: "unknown" } } });
+
+  const ok = responseEpisodes(session, rows([alice("Help me"), answer("Done"), alice("Thanks!"), answer("Welcome")]), wildcardConfig);
+  assert.equal(ok.episodes.length, 1);
+  assert.equal(ok.episodes[0]!.senderId, "U_ALICE");
+
+  assert.equal(responseEpisodes(session, rows([bot("Automated ping"), answer("Ack"), bot("Ok"), answer("Done")]), wildcardConfig).episodes.length, 0);
+  assert.equal(responseEpisodes(session, rows([unverified("Hi"), answer("Hello"), unverified("Thanks"), answer("Bye")]), wildcardConfig).episodes.length, 0);
+});
+
 test("quality request cannot see later feedback; schema errors and provider errors fail safely", async t => {
   const e = responseEpisodes(session, basic(), config.responseAudit).episodes[0]!;
   let n = 0;
