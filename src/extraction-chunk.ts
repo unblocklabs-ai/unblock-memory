@@ -2,7 +2,8 @@ import { DEFAULTS } from "./defaults.js";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
-import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageTokens, extractionOverhead, type ExtractionMessage, type PriorMemory } from "./extraction-model.js";
+import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageBytes, extractionMessageTokens, extractionOverhead,
+  extractionValidationTranscriptBudget, type ExtractionMessage, type PriorMemory } from "./extraction-model.js";
 import { readExtractionPage } from "./extraction-source.js";
 import type { ExtractionSession } from "./extraction-store.js";
 import { jsonHash } from "./json-hash.js";
@@ -20,11 +21,12 @@ function fragment(message: ExtractionMessage, start: number, end: number): Extra
 function boundary(text: string, end: number) {
   return end > 0 && end < text.length && /[\uD800-\uDBFF]/u.test(text[end - 1]!) && /[\uDC00-\uDFFF]/u.test(text[end]!) ? end - 1 : end;
 }
-function prefixThatFits(message: ExtractionMessage, offset: number, budget: number) {
+function prefixThatFits(message: ExtractionMessage, offset: number, tokens: number, bytes: number) {
   let low = offset, high = message.text.length;
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
-    if (extractionMessageTokens(fragment(message, offset, boundary(message.text, mid))) <= budget) low = mid;
+    const part = fragment(message, offset, boundary(message.text, mid));
+    if (extractionMessageBytes(part) <= bytes && extractionMessageTokens(part) <= tokens) low = mid;
     else high = mid - 1;
   }
   const end = boundary(message.text, low);
@@ -32,19 +34,25 @@ function prefixThatFits(message: ExtractionMessage, offset: number, budget: numb
   return end;
 }
 
-export function extractionHistory(messages: ExtractionMessage[], count: number): ExtractionMessage[] {
+export function extractionHistory(messages: ExtractionMessage[], count: number, existing: PriorMemory[] = []): ExtractionMessage[] {
   if (!count) return [];
   const kept: ExtractionMessage[] = [];
   let remaining = DEFAULTS.extraction.historyTokenBudget;
+  // Give history the same share of the validation byte budget as of the input token budget.
+  let remainingBytes = Math.floor(extractionValidationTranscriptBudget(existing) * remaining / EXTRACTION_INPUT_LIMIT);
   for (const message of messages.slice(-count).reverse()) {
     const tokens = extractionMessageTokens(message);
-    if (tokens <= remaining) { kept.unshift(message); remaining -= tokens; continue; }
+    const bytes = extractionMessageBytes(message);
+    if (tokens <= remaining && bytes <= remainingBytes) {
+      kept.unshift(message); remaining -= tokens; remainingBytes -= bytes; continue;
+    }
     if (!kept.length) {
       // Keep the tail of a very large message as overlap, rather than dropping it.
       let low = 0, high = message.text.length;
       while (low < high) {
         const mid = Math.floor((low + high) / 2);
-        if (extractionMessageTokens(fragment(message, boundary(message.text, mid), message.text.length)) <= remaining) high = mid;
+        const part = fragment(message, boundary(message.text, mid), message.text.length);
+        if (extractionMessageBytes(part) <= remainingBytes && extractionMessageTokens(part) <= remaining) high = mid;
         else low = mid + 1;
       }
       const start = low < message.text.length && boundary(message.text, low) !== low ? low + 1 : low;
@@ -85,6 +93,8 @@ export async function readExtractionChunk(params: { agentId: string; agentName: 
   let cursor = resume ? resume.before : params.cursor;
   const messages = [...params.context];
   let tokens = extractionOverhead(params.existing) + messages.reduce((n, m) => n + extractionMessageTokens(m), 0);
+  let bytes = messages.reduce((n, m) => n + extractionMessageBytes(m), 0);
+  const byteLimit = extractionValidationTranscriptBudget(params.existing);
   let entryCount = 0;
   const newIds: string[] = [];
   for (;;) {
@@ -117,14 +127,15 @@ export async function readExtractionChunk(params: { agentId: string; agentName: 
       if (offset >= message.text.length) throw new Error("Invalid extraction text offset");
       const candidate = offset ? fragment(message, offset, message.text.length) : message;
       const cost = extractionMessageTokens(candidate);
-      if (tokens + cost > EXTRACTION_INPUT_LIMIT) {
+      const byteCost = extractionMessageBytes(candidate);
+      if (tokens + cost > EXTRACTION_INPUT_LIMIT || bytes + byteCost > byteLimit) {
         if (newIds.length) return finish(i, offset);
-        const end = prefixThatFits(message, offset, EXTRACTION_INPUT_TARGET - tokens);
+        const end = prefixThatFits(message, offset, EXTRACTION_INPUT_TARGET - tokens, byteLimit - bytes);
         const part = fragment(message, offset, end);
         messages.push(part); newIds.push(part.id);
         return finish(i, end);
       }
-      messages.push(candidate); newIds.push(candidate.id); tokens += cost;
+      messages.push(candidate); newIds.push(candidate.id); tokens += cost; bytes += byteCost;
       if (tokens >= EXTRACTION_INPUT_TARGET) return finish(i + 1);
     }
     resume = undefined;

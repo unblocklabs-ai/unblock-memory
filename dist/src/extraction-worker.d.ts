@@ -1,5 +1,5 @@
 import type { UnblockMemoryConfig } from "./config.js";
-import { extractWithDecisionModel, validateExtractedMemory } from "./extraction-model.js";
+import { extractWithDecisionModel, validateExtractedMemories } from "./extraction-model.js";
 import { type ExtractionSession } from "./extraction-store.js";
 import { readExtractionPage } from "./extraction-source.js";
 export declare function runExtraction(params: {
@@ -15,7 +15,7 @@ export declare function runExtraction(params: {
     version?: string;
     readPage?: typeof readExtractionPage;
     extract?: typeof extractWithDecisionModel;
-    validate?: typeof validateExtractedMemory;
+    validate?: typeof validateExtractedMemories;
 }): Promise<{
     status: "disabled";
     reason?: undefined;

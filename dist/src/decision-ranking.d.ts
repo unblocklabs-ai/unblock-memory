@@ -29,7 +29,7 @@ export type QualityJudgment = {
     noise: number;
     evidence: number;
 };
-/** These are indicators for review, never authorization to delete or rewrite. */
+/** Judge one bounded pack. These indicators never authorize deletion or rewriting. */
 export declare function judgeQuality(params: {
     apiKey: string;
     endpoint?: string;

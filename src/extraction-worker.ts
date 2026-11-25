@@ -3,7 +3,7 @@ import { abortable } from "./abortable.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import {
   extractWithDecisionModel,
-  validateExtractedMemory,
+  validateExtractedMemories,
   EXTRACTION_VERSION,
   type ExtractionMessage,
   type MemoryProposal,
@@ -20,7 +20,7 @@ import { readExtractionPage } from "./extraction-source.js";
 import { extractionHistory, readExtractionChunk } from "./extraction-chunk.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 
-type ValidationJudgment = Awaited<ReturnType<typeof validateExtractedMemory>>;
+type ValidationJudgment = Awaited<ReturnType<typeof validateExtractedMemories>>[number];
 type AcceptedCandidate = {
   proposal: MemoryProposal;
   observedAt: number;
@@ -68,7 +68,7 @@ async function validateProposals(params: {
   apiKey: string;
   config: UnblockMemoryConfig;
   signal: AbortSignal;
-  validate: typeof validateExtractedMemory;
+  validate: typeof validateExtractedMemories;
 }) {
   const { proposals, messages, newIds, existing, apiKey, config, signal, validate } = params;
   const messageById = new Map(messages.map(m => [m.id, m]));
@@ -77,76 +77,56 @@ async function validateProposals(params: {
   const winnerByPredecessor = new Map<string, AcceptedCandidate>();
   let rejected = 0;
 
-  for (let start = 0; start < proposals.length; start += DEFAULTS.extraction.validatorBatchSize) {
-    signal.throwIfAborted();
-    // Isolated judgments overlap, but failed chunks drain before their lease is released.
-    const judgments = await Promise.allSettled(
-      proposals.slice(start, start + DEFAULTS.extraction.validatorBatchSize).map(async (proposal, offset) => ({
-        proposal,
-        order: start + offset,
-        judgment: await validate({
-          proposal,
-          messages,
-          newIds,
-          existing,
-          apiKey,
-          endpoint: config.decisionModel.endpoint,
-          model: config.decisionModel.model,
-          signal,
-          thresholds: config.extraction,
-        }),
-      })),
-    );
-    const failure = judgments.find(result => result.status === "rejected");
-    if (failure) throw failure.reason;
-
-    for (const result of judgments) {
-      if (result.status !== "fulfilled") continue;
-      const { proposal, judgment, order } = result.value;
-      if (!judgment.accepted) {
-        rejected++;
-        continue;
+  signal.throwIfAborted();
+  const judgments = proposals.length ? await validate({
+    proposals, messages, newIds, existing: existing.map(({ id, text, observedAt }) => ({ id, text, observedAt })),
+    apiKey, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, signal, thresholds: config.extraction,
+  }) : [];
+  for (const [order, proposal] of proposals.entries()) {
+    const judgment = judgments[order]!;
+    if (!judgment.accepted) {
+      rejected++;
+      continue;
+    }
+    let observedAt = -Infinity;
+    let missingEvidence = false;
+    const mappedEvidence: MemoryProposal["evidence"] = [];
+    for (const item of proposal.evidence) {
+      const message = messageById.get(item.messageId);
+      if (!message) {
+        missingEvidence = true;
+        break;
       }
-      let observedAt = -Infinity;
-      let missingEvidence = false;
-      const mappedEvidence: MemoryProposal["evidence"] = [];
-      for (const item of proposal.evidence) {
-        const message = messageById.get(item.messageId);
-        if (!message) {
-          missingEvidence = true;
-          break;
-        }
-        if (message.timestamp > observedAt) observedAt = message.timestamp;
-        mappedEvidence.push({ ...item, messageId: message.sourceMessageId ?? item.messageId });
-      }
-      if (missingEvidence || !Number.isFinite(observedAt)) {
-        rejected++;
-        continue;
-      }
-      const prior = proposal.replaces ? existingById.get(proposal.replaces) : undefined;
-      if (proposal.replaces && (!prior || prior.observedAt > observedAt)) {
-        rejected++;
-        continue;
-      }
-      const candidate: AcceptedCandidate = {
-        proposal: { ...proposal, evidence: mappedEvidence },
-        judgment,
-        observedAt,
-        order,
-      };
-      if (proposal.replaces) {
-        const incumbent = winnerByPredecessor.get(proposal.replaces);
-        if (!incumbent) {
-          winnerByPredecessor.set(proposal.replaces, candidate);
-        } else {
-          if (isBetterReplacement(candidate, incumbent)) {
-            winnerByPredecessor.set(proposal.replaces, candidate);
-          }
-          rejected++;
-        }
+      if (message.timestamp > observedAt) observedAt = message.timestamp;
+      mappedEvidence.push({ ...item, messageId: message.sourceMessageId ?? item.messageId });
+    }
+    if (missingEvidence || !Number.isFinite(observedAt)) {
+      rejected++;
+      continue;
+    }
+    const prior = proposal.replaces ? existingById.get(proposal.replaces) : undefined;
+    if (proposal.replaces && (!prior || prior.observedAt > observedAt)) {
+      rejected++;
+      continue;
+    }
+    const candidate: AcceptedCandidate = {
+      proposal: { ...proposal, evidence: mappedEvidence },
+      judgment,
+      observedAt,
+      order,
+    };
+    if (proposal.replaces) {
+      const incumbent = winnerByPredecessor.get(proposal.replaces);
+      if (!incumbent) {
+        winnerByPredecessor.set(proposal.replaces, candidate);
       } else {
-        standalone.push(candidate);
+        if (isBetterReplacement(candidate, incumbent)) {
+          winnerByPredecessor.set(proposal.replaces, candidate);
+        }
+        rejected++;
       }
+    } else {
+      standalone.push(candidate);
     }
   }
 
@@ -171,7 +151,7 @@ async function processSession(params: {
   leaseAbort: AbortController;
   readPage: typeof readExtractionPage;
   extract: typeof extractWithDecisionModel;
-  validate: typeof validateExtractedMemory;
+  validate: typeof validateExtractedMemories;
 }): Promise<SessionOutcome> {
   const {
     session, store, owner, config, agentId, agentName, since,
@@ -198,7 +178,7 @@ async function processSession(params: {
       agentName,
       session,
       cursor: checkpoint.cursor,
-      context: extractionHistory(checkpoint.context, extractionConfig.historyMessages),
+      context: extractionHistory(checkpoint.context, extractionConfig.historyMessages, existingFacts),
       existing: existingFacts,
       signal,
       readPage,
@@ -252,7 +232,7 @@ async function processSession(params: {
     }
     if (check.kind === "unavailable") throw new Error("Source changed during extraction");
 
-    const context = extractionHistory(messages, extractionConfig.historyMessages);
+    const context = extractionHistory(messages, extractionConfig.historyMessages, existingFacts);
     stage = "commit";
     const written = store.commit({
       session,
@@ -280,7 +260,7 @@ async function processSession(params: {
 export async function runExtraction(params: { config: UnblockMemoryConfig; storePath: string; agentId: string;
   agentName: string; sessions: () => ExtractionSession[]; signal: AbortSignal;
   since?: number; sessionId?: string; scheduled?: boolean; version?: string; readPage?: typeof readExtractionPage;
-  extract?: typeof extractWithDecisionModel; validate?: typeof validateExtractedMemory }) {
+  extract?: typeof extractWithDecisionModel; validate?: typeof validateExtractedMemories }) {
   const config = params.config.extraction;
   if (!config.enabled) return { status: "disabled" as const };
   params.signal.throwIfAborted();
@@ -297,7 +277,7 @@ export async function runExtraction(params: { config: UnblockMemoryConfig; store
   let processed = 0, acceptedCount = 0, rejectedCount = 0, unchanged = 0, failed = 0;
   const readPage = params.readPage ?? readExtractionPage;
   const extract = params.extract ?? extractWithDecisionModel;
-  const validate = params.validate ?? validateExtractedMemory;
+  const validate = params.validate ?? validateExtractedMemories;
   const version = params.version ?? EXTRACTION_VERSION;
   const policyFingerprint = extractionPolicyFingerprint({
     version,

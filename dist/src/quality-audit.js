@@ -2,6 +2,7 @@ import { DEFAULTS } from "./defaults.js";
 import { chunkFingerprint } from "./curation.js";
 import { parseSafeVirtualPath } from "./sources.js";
 import { judgeQuality, qualityJudgeVersion } from "./decision-ranking.js";
+import { packDecisionState } from "./decision-packs.js";
 import { qualityTriage } from "./quality-triage.js";
 const MAX_CHUNK_CHARS = DEFAULTS.quality.gradeMaxChars;
 /** A formatting clue, never proof that JSON or structured data is worthless. */
@@ -82,26 +83,37 @@ export async function auditQualityPage(params) {
             const structure = qualityStructure(text);
             const judgment = eligible && text.length <= MAX_CHUNK_CHARS
                 ? curation.qualityJudgment(cacheKey) : undefined;
-            return { row, source, text, fingerprint, cacheKey, structure, judgment, eligible };
+            const sourceKind = source.kind === "sessions" ? "sessions" : "files";
+            return { row, source, text, chunk: { text, sourceKind }, fingerprint, cacheKey, structure, judgment, eligible };
         });
         const missing = [...new Map(batch.filter(item => item.eligible && item.text.length <= MAX_CHUNK_CHARS &&
                 item.structure !== "empty" && !item.judgment).map(item => [item.cacheKey, item])).values()];
-        const answers = await Promise.allSettled(missing.map(async (item) => (await judgeQuality({
-            apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs: params.timeoutMs, signal,
-            chunks: [{ text: item.text, sourceKind: item.source.kind === "sessions" ? "sessions" : "files" }],
-        }))[0]));
+        const packs = packDecisionState(missing, DEFAULTS.quality.judgeBatchSize, DEFAULTS.quality.judgeBatchMaxChars, items => ({ chunks: items.map(item => item.chunk) }));
+        const oversized = new Set();
+        const jobs = [];
+        for (const { items, state } of packs) {
+            if (state)
+                jobs.push(judgeQuality({
+                    apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs: params.timeoutMs, signal,
+                    chunks: state.chunks,
+                }).then(answers => items.map(({ cacheKey, row }, index) => ({ cacheKey, row, judgment: answers[index] }))));
+            else
+                oversized.add(items[0].cacheKey);
+        }
+        const answers = await Promise.allSettled(jobs);
         check();
         const fresh = new Map();
-        for (const [index, answer] of answers.entries()) {
+        for (const answer of answers) {
             if (answer.status !== "fulfilled")
                 continue;
-            const { cacheKey, row } = missing[index];
-            if (!current.get(row.document_id, row.collection, row.path, row.hash, row.seq, row.pos, row.chunk_len))
-                continue;
-            fresh.set(cacheKey, answer.value);
-            // Keep successful sibling judgments even if the cursor stops at a failed candidate.
-            curation.cacheQualityJudgment(cacheKey, answer.value);
-            judged++;
+            for (const { cacheKey, row, judgment } of answer.value) {
+                if (!current.get(row.document_id, row.collection, row.path, row.hash, row.seq, row.pos, row.chunk_len))
+                    continue;
+                fresh.set(cacheKey, judgment);
+                // Keep successful sibling judgments even if the cursor stops at a failed candidate.
+                curation.cacheQualityJudgment(cacheKey, judgment);
+                judged++;
+            }
         }
         for (const item of batch) {
             check();
@@ -114,7 +126,7 @@ export async function auditQualityPage(params) {
                 advance();
                 continue;
             }
-            if (text.length > MAX_CHUNK_CHARS) {
+            if (text.length > MAX_CHUNK_CHARS || oversized.has(cacheKey)) {
                 skippedOversized++;
                 advance();
                 continue;

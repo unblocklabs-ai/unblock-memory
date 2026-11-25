@@ -59,10 +59,9 @@ async function generateQueriesWithFallback(params) {
 }
 async function selectComplementaryHints(params) {
     const { ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log } = params;
-    let selected = ranked.slice(0, config.maxHints);
-    const redundantIds = new Set();
+    const baseline = { selected: ranked.slice(0, config.maxHints), redundantIds: new Set() };
     if (!config.complementaryHints || config.maxHints <= 1 || ranked.length <= 1) {
-        return { selected, redundantIds };
+        return baseline;
     }
     turn.stage = "redundancy";
     try {
@@ -70,17 +69,11 @@ async function selectComplementaryHints(params) {
             apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, signal,
             excerpts: ranked.slice(0, DEFAULTS.review.maxRedundancyCandidates).map(candidate => candidate.excerpt),
         });
-        const selectedIndices = complementaryIndices(ranked.length, pairs, config.maxHints);
-        const chosen = [];
-        for (let index = 0; index < ranked.length && chosen.length < config.maxHints; index++) {
-            const isRedundant = pairs.some(pair => pair.later === index && chosen.includes(pair.earlier) && pair.redundant >= DEFAULTS.review.minRedundancy);
-            if (isRedundant)
-                redundantIds.add(ranked[index].id);
-            else
-                chosen.push(index);
-        }
-        selected = selectedIndices.map(index => ranked[index]);
-        return { selected, redundantIds };
+        const { selected, redundant } = complementaryIndices(ranked.length, pairs, config.maxHints);
+        return {
+            selected: selected.map(index => ranked[index]),
+            redundantIds: new Set(redundant.map(index => ranked[index].id)),
+        };
     }
     catch (error) {
         // Preserve the original useful candidates when the optional refinement is unavailable.
@@ -88,7 +81,7 @@ async function selectComplementaryHints(params) {
             diagnostics?.record(agentId, "memory", "redundancy_unavailable");
             log("warn", "redundancy_unavailable", failureFields(error));
         }
-        return { selected, redundantIds };
+        return baseline;
     }
 }
 function renderBoundedHints(selected) {

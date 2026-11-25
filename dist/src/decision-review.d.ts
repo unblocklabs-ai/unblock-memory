@@ -31,19 +31,24 @@ export declare function reviewClaim(params: RequestOptions & {
     needsReview: boolean;
     background?: undefined;
 }>;
-/** Directional coverage, not topic similarity. Bounded at six comparisons of four ranked candidates. */
+type RedundancyPair = {
+    earlier: number;
+    later: number;
+};
+/** Directional coverage, not topic similarity. Each pack shares its referenced excerpts. */
 export declare function reviewMemoryRedundancy(params: RequestOptions & {
     excerpts: readonly string[];
 }): Promise<{
+    redundant: number;
     earlier: number;
     later: number;
-    redundant: number;
 }[]>;
-export declare function complementaryIndices(count: number, pairs: readonly {
-    earlier: number;
-    later: number;
+export declare function complementaryIndices(count: number, pairs: readonly (RedundancyPair & {
     redundant: number;
-}[], limit: number): number[];
+})[], limit: number): {
+    selected: number[];
+    redundant: number[];
+};
 /** Classify defects per member. No cluster-wide judgment or generated repair instructions. */
 export declare function reviewClusterDefects(params: RequestOptions & {
     excerpts: readonly string[];

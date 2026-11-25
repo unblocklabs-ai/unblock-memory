@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { resolveConfig } from "../src/config.js";
 import { CurationStore } from "../src/curation.js";
 import { auditQualityPage, qualityStructure } from "../src/quality-audit.js";
 import { resolveSource } from "../src/sources.js";
+import { DEFAULTS } from "../src/defaults.js";
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "unblock-quality-"));
@@ -31,8 +32,16 @@ async function fixture() {
   return { db, curation, source, insert,
     params: { db, curation, sources: [source], apiKey: "fake", timeoutMs: 1000,
       minNoise: 0.9, signal: new AbortController().signal, isActive: () => true },
-    close: async () => { curation.close(); await store.close(); },
+    close: async () => { curation.close(); await store.close(); await rm(root, { recursive: true, force: true }); },
   };
+}
+
+type QualityRequest = { state: [{ chunks: { text: string }[] }] };
+function qualityResponse(request: QualityRequest, noise: number, evidence: number) {
+  return Response.json({ answers: Object.fromEntries(request.state[0].chunks.flatMap((_, index) => [
+    [`noise_${index}`, { type: "noul", noul: noise }],
+    [`evidence_${index}`, { type: "noul", noul: evidence }],
+  ])) });
 }
 
 test("quality audit requires explicit known corpus approval", () => {
@@ -58,9 +67,8 @@ test("double-encoded messages are encoding indicators even when the content is u
   const f = await fixture(); t.after(f.close);
   f.insert(JSON.stringify(JSON.stringify({ role: "user", content: "Deploy only with approval" })));
   f.insert(JSON.stringify({ role: "user", content: "Deploy only with approval" }));
-  t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {
-    noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.95 },
-  } }));
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) =>
+    qualityResponse(JSON.parse(String(init?.body)), 0.1, 0.95));
   const result = await auditQualityPage(f.params);
   assert.equal(result.flagged, 1);
   assert.equal(result.groups[0].reason, "possible_double_encoded_message");
@@ -119,12 +127,12 @@ test("multi-chunk pages preserve UTF-16 slices without repeatedly materializing 
   let pos = 0;
   chunks.forEach((text, seq) => { insert.run(hash, seq, pos, text.length); pos += text.length; });
   const requested: string[] = [];
+  const packSizes: number[] = [];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
-    const request = JSON.parse(String(init?.body));
-    requested.push(request.state[0].chunks[0].text);
-    return Response.json({ answers: {
-      noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.95 },
-    } });
+    const request: QualityRequest = JSON.parse(String(init?.body));
+    requested.push(...request.state[0].chunks.map(chunk => chunk.text));
+    packSizes.push(request.state[0].chunks.length);
+    return qualityResponse(request, 0.1, 0.95);
   });
   let materializedChars = 0;
   const countBody = (row: unknown) => {
@@ -150,10 +158,12 @@ test("multi-chunk pages preserve UTF-16 slices without repeatedly materializing 
   assert.equal(first.scanned, 20);
   assert.equal(first.done, false);
   assert.deepEqual(requested, chunks.slice(0, 20));
+  assert.deepEqual(packSizes, [6, 6, 6, 2], "20 chunks use four count-bounded fetches");
   assert.ok(materializedChars <= 2 * body.length, `materialized ${materializedChars} characters for one document`);
   const second = await auditQualityPage({ ...f.params, after: first.next, limit: 20 });
   assert.equal(second.done, true);
   assert.deepEqual(requested, chunks);
+  assert.deepEqual(packSizes, [6, 6, 6, 2, 5]);
 });
 
 test("failure, cancellation and changed index content cannot produce stale findings", async t => {
@@ -184,48 +194,57 @@ test("failure, cancellation and changed index content cannot produce stale findi
 test("oversized chunks are reported, never silently truncated; empty content needs no API call", async t => {
   const f = await fixture(); t.after(f.close);
   f.insert("x".repeat(6001));
+  f.insert(`escaped ${"\u0001".repeat(3100)}`);
   f.insert("   ");
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected"); });
   const result = await auditQualityPage(f.params);
   assert.equal(result.done, true);
-  assert.equal(result.skippedOversized, 1);
+  assert.equal(result.skippedOversized, 2);
   assert.equal(result.flagged, 1);
   assert.equal(result.groups[0].reason, "empty_content");
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test("partial pages resume after completed work and a changed fingerprint gets a new review", async t => {
+test("byte-bounded packs preserve later cache writes when the cursor stops at a failed pack", async t => {
   const f = await fixture(); t.after(f.close);
-  for (let i = 0; i < 5; i++) f.insert(`noise ${i}`);
-  let calls = 0;
-  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    if (++calls === 2) return new Response("failure", { status: 529 });
-    const request = JSON.parse(String(init?.body));
-    return Response.json({ answers: Object.fromEntries(Object.keys(request.questions)
-      .map(key => [key, { type: "noul", noul: key.startsWith("noise") ? 0.98 : 0.05 }])) });
+  for (let i = 0; i < 7; i++) f.insert(`noise ${i} ${"🚀".repeat(1700)}`);
+  const packs: string[][] = [];
+  let fail = true;
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const request: QualityRequest = JSON.parse(String(init?.body));
+    assert.ok(Buffer.byteLength(JSON.stringify(request.state)) <= DEFAULTS.quality.judgeBatchMaxChars);
+    const captions = request.state[0].chunks.map(chunk => chunk.text.slice(0, 7));
+    packs.push(captions);
+    if (fail && captions[0] === "noise 2") return new Response("failure", { status: 529 });
+    return qualityResponse(request, 0.98, 0.05);
   });
   const first = await auditQualityPage(f.params);
   assert.equal(first.status, "partial");
-  assert.equal(first.scanned, 2);
-  assert.equal(first.next?.documentId, 1);
-  assert.equal(f.curation.listTasks({ limit: 10 }).length, 1);
-  assert.equal((await auditQualityPage({ ...f.params, after: first.next })).done, true);
-  assert.equal(f.curation.listTasks({ limit: 10 }).length, 5);
+  assert.equal(first.scanned, 3);
+  assert.equal(first.judged, 5);
+  assert.equal(first.next?.documentId, 2);
+  assert.equal(f.curation.listTasks({ limit: 10 }).length, 2);
+  assert.deepEqual(packs, [["noise 0", "noise 1"], ["noise 2", "noise 3"], ["noise 4", "noise 5"], ["noise 6"]]);
+  fail = false;
+  const resumed = await auditQualityPage({ ...f.params, after: first.next });
+  assert.equal(resumed.done, true);
+  assert.equal(resumed.cached, 3);
+  assert.deepEqual(packs.slice(4), [["noise 2", "noise 3"]]);
+  assert.equal(f.curation.listTasks({ limit: 10 }).length, 7);
   const task = f.curation.listTasks({ limit: 10 }).find(item => item.path === "hash-1.md")!;
   f.curation.updateTask({ id: task.id, status: "irrelevant" });
   f.db.prepare("UPDATE documents SET active = 0 WHERE hash = 'hash-1'").run();
   f.insert("changed noise", f.source.collection, "changed.md");
   await auditQualityPage(f.params);
-  assert.equal(fetch.mock.callCount(), 7, "successful sibling judgments are reused; only the failed or changed chunk is requested again");
-  assert.equal(f.curation.listTasks({ limit: 10 }).length, 5);
+  assert.deepEqual(packs.slice(5), [["changed"]]);
+  assert.equal(f.curation.listTasks({ limit: 10 }).length, 7);
 });
 
 test("an inbox write failure never advances past unfinished work", async t => {
   const f = await fixture(); t.after(f.close);
   f.insert("noise one"); f.insert("noise two");
-  t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {
-    noise_0: { type: "noul", noul: 1 }, evidence_0: { type: "noul", noul: 0 },
-  } }));
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) =>
+    qualityResponse(JSON.parse(String(init?.body)), 1, 0));
   const original = f.curation.addTask.bind(f.curation);
   let calls = 0;
   t.mock.method(f.curation, "addTask", (candidate: Parameters<CurationStore["addTask"]>[0]) => {

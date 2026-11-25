@@ -5,12 +5,18 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { readExtractionPage, type ExtractionPage } from "../src/extraction-source.js";
 import { extractionHistory, readExtractionChunk } from "../src/extraction-chunk.js";
-import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, EXTRACTION_VERSION, extractionMessageTokens, extractionOverhead, type ExtractionMessage } from "../src/extraction-model.js";
+import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, EXTRACTION_VERSION, extractionMessageTokens, extractionOverhead,
+  type ExtractionMessage, type validateExtractedMemories } from "../src/extraction-model.js";
 import { extractionPolicyFingerprint, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
 import { resolveConfig } from "../src/config.js";
 import { runExtraction } from "../src/extraction-worker.js";
+import { DEFAULTS } from "../src/defaults.js";
 
 const session: ExtractionSession = { sessionId: "s1", sessionKey: "agent:main:slack:channel:test", chatType: "channel", startedAt: 1 };
+type ValidationParams = Parameters<typeof validateExtractedMemories>[0];
+const acceptAll = async ({ proposals, thresholds }: ValidationParams) => proposals.map(() => ({
+  accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds,
+}));
 const message = (id: string, text = id): ExtractionMessage => ({ id, text, speaker: "Bek", role: "user", timestamp: 1000 });
 function fixture(pages: ExtractionMessage[][], toolPages = new Set<number>()): typeof readExtractionPage {
   return async (_a, _n, _s, cursor) => {
@@ -84,6 +90,24 @@ test("single oversized Unicode message splits losslessly and resumes through ser
   for (const piece of pieces) { assert.equal(piece.sourceMessageId, "giant"); assert.equal(Buffer.from(piece.text).toString(), piece.text); }
 });
 
+test("the transcript reader fragments oversized serialized state even when tokens fit", async () => {
+  const original = message("wide", " configuration".repeat(18_000));
+  assert.ok(extractionMessageTokens(original) < EXTRACTION_INPUT_TARGET);
+  assert.ok(Buffer.byteLength(original.text) > DEFAULTS.extraction.validatorBatchMaxChars);
+  const read = fixture([[original]]);
+  const first = await readExtractionChunk(params(read));
+  assert.equal(first.kind, "page");
+  if (first.kind !== "page") return;
+  assert.equal(first.exhausted, false);
+  assert.ok(first.cursor.startsWith("unblock-extraction:"));
+  const second = await readExtractionChunk(params(read, first.cursor, extractionHistory(first.messages, 6)));
+  assert.equal(second.kind, "page");
+  if (second.kind !== "page") return;
+  assert.equal(second.exhausted, true);
+  const parts = [...first.messages, ...second.messages.filter(m => second.newIds.includes(m.id))];
+  assert.equal(parts.map(m => m.text).join(""), original.text);
+});
+
 test("source rewrites discard a chunk collected across pages and partial bookmarks", async () => {
   const reset = { kind: "reset", cursor: "new-generation" } as const;
   const result = await readExtractionChunk(params(async (_a,_n,_s,cursor): Promise<ExtractionPage> => cursor
@@ -113,33 +137,43 @@ test("partial-page append is safe, changed pending content resets instead of sil
   assert.deepEqual(await readExtractionChunk(params(fixture([[original[0]!, message("two", "rewritten")]]), first.cursor)), { kind: "reset", cursor: null });
 });
 
-test("decision model failure cannot commit earlier accepted facts or advance a collected chunk", async () => {
+test("a later validation pack failure cannot commit earlier accepted facts or advance the chunk", async t => {
   const dir = await mkdtemp(join(tmpdir(), "extraction-validation-retry-")), storePath = join(dir, "memory.sqlite");
   const config = resolveConfig({ decisionModel: { apiKey: "test" }, corpora: [
     { name: "memory", kind: "files", paths: ["memory/**/*.md"] }, { name: "sessions", kind: "sessions", chatTypes: ["channel"] },
   ], extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 } });
-  let fail = true, active = 0, peak = 0;
+  let fail = true;
+  const packSizes: number[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const { state: [state], questions } = JSON.parse(String(init.body));
+    packSizes.push(state.proposals.length);
+    if (fail && state.proposals.some((proposal: { text: string }) => proposal.text === "six")) {
+      return new Response(null, { status: 503 });
+    }
+    return Response.json({ answers: Object.fromEntries(Object.entries(questions).map(([key, question]) => [key,
+      (question as { type: string }).type === "choice"
+        ? { type: "choice", choice: "supported", confidence: 1, probabilities: { supported: 1, contradicted: 0, unsupported: 0 } }
+        : { type: "noul", noul: 1 },
+    ])) });
+  });
   const source = ["one", "two", "three", "four", "five", "six"].map(id => message(id));
   const opts = { config, storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0,
     signal: AbortSignal.timeout(30_000), readPage: fixture([source]),
     extract: async ({ messages }: { messages: ExtractionMessage[] }) => messages.map(m => ({
       text: m.text, replaces: null, evidence: [{ messageId: m.id, quote: m.text }],
     })),
-    validate: async ({ proposal }: { proposal: { text: string } }) => {
-      peak = Math.max(peak, ++active);
-      await new Promise<void>(resolve => setImmediate(resolve));
-      active--;
-      if (fail && proposal.text === "two") throw new Error("API unavailable");
-      return { accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction };
-    },
   };
   assert.equal((await runExtraction(opts)).failed, 1);
-  assert.equal(peak, 4, "proposal validation overlaps within a four-call bound");
-  assert.equal(active, 0, "failed chunks drain every in-flight validation before releasing the lease");
+  assert.deepEqual(packSizes, [4, 2]);
   const store = new ExtractionStore(storePath);
-  try { assert.equal(store.readCheckpoint(session.sessionId)?.cursor, null); assert.deepEqual(store.records(), []); }
+  try {
+    assert.equal(store.readCheckpoint(session.sessionId)?.cursor, null);
+    assert.equal(store.readCheckpoint(session.sessionId)?.error, "validate_failed");
+    assert.deepEqual(store.records(), []);
+  }
   finally { store.close(); }
   fail = false; assert.equal((await runExtraction(opts)).accepted, source.length);
+  assert.deepEqual(packSizes, [4, 2, 4, 2]);
 });
 
 test("worker retries whole chunks, isolates sessions, maps split citations, and makes zero unchanged calls", async () => {
@@ -160,7 +194,7 @@ test("worker retries whole chunks, isolates sessions, maps split citations, and 
       const m = messages.find(m => newIds.includes(m.id))!;
       return [{ text: m.id === "other" ? "Other fact." : "Bek likes red.", replaces: null, evidence: [{ messageId: m.id, quote: m.text.slice(0, 4) }] }];
     },
-    validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }),
+    validate: acceptAll,
   };
   assert.equal((await runExtraction(opts)).failed, 2);
   const failed = new ExtractionStore(storePath); assert.equal(failed.readCheckpoint(session.sessionId)?.cursor, null); failed.close();
@@ -229,7 +263,7 @@ test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on re
     config, storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0,
     signal: AbortSignal.timeout(30_000), readPage: cleanSource,
     extract: async () => [{ text: "Bek likes espresso.", replaces: null, evidence: [{ messageId: "m1", quote: "Bek likes espresso." }] }],
-    validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: config.extraction }),
+    validate: acceptAll,
   };
 
   // Run 1: cleanly resets poisoned bookmark (failed === 0, processed === 1, cursor -> null, old facts withdrawn).

@@ -8,6 +8,8 @@ import { registerMemoryWhisperer } from "../src/memory-whisperer.js";
 import { expandSessionSearchHit } from "../src/manager.js";
 import type { QueryPair } from "../src/query-contract.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
+import { DEFAULTS } from "../src/defaults.js";
+import { reviewMemoryRedundancy } from "../src/decision-review.js";
 import { ApiQueryGenerator, QueryApiError, queryConversation } from "../src/query-generator.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 
@@ -398,54 +400,59 @@ test("memory whisperer prefers host currentUserMessage and cleanly skips empty m
   assert.equal(h.diagnostics.snapshot("bill").memory.failed, undefined);
 });
 
-test("complementary hints skip a confident paraphrase but retain contradictory evidence", async t => {
-  let calls = 0;
-  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
-    calls++;
+test("one complementary review covers six directional pairs and keeps contradictions", async t => {
+  const excerpts = ["Staging was approved", "Approval granted for staging", "Mira owns deploys", "Approval was revoked"];
+  const scores = [0.99, 0.98, 0.97, 0.96];
+  const keys = ["pair_0_1", "pair_0_2", "pair_1_2", "pair_0_3", "pair_1_3", "pair_2_3"];
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     const [state] = request.state;
-    if (request.questions.memory_0) return response(state.candidates[0].excerpt === "Staging was approved" ? 0.99 :
-      state.candidates[0].excerpt === "Approval granted for staging" ? 0.98 : 0.97);
-    assert.equal(state.excerpts.length, 2);
-    assert.match(JSON.stringify(request.questions), /contradiction/);
-    return Response.json({ answers: {
-      pair_0: { type: "noul", noul: state.excerpts[1] === "Approval granted for staging" ? 0.99 : 0.01 },
-    } });
+    if (request.questions.memory_0) return response(scores[excerpts.indexOf(state.candidates[0].excerpt)] ?? 0.1);
+    assert.deepEqual(state.excerpts, excerpts.map((text, id) => ({ id, text })));
+    assert.deepEqual(Object.keys(request.questions).sort(), [...keys].sort());
+    for (const key of keys) {
+      const [, earlier, later] = key.split("_");
+      const question = request.questions[key];
+      assert.match(question.instructions.question, new RegExp(`id ${later} .* by the excerpt with id ${earlier}\\?`));
+      assert.match(question.criteria.false.definition, /attribution, date, qualification, independent observation or contradiction/);
+    }
+    return Response.json({ answers: Object.fromEntries(keys.map(key =>
+      [key, { type: "noul", noul: key === "pair_0_1" ? 0.90 : 0.01 }])) });
   });
-  const h = harness([hit("Staging was approved"), hit("Approval granted for staging"), hit("Approval was revoked")],
-    { config: { complementaryHints: true, maxHints: 2 } });
+  const h = harness(excerpts.map(text => hit(text)), { config: { complementaryHints: true } });
+  t.after(() => h.stop());
   const result = await h.before(event, context);
   assert.ok(result);
-  assert.match(result.appendContext, /Staging was approved/);
-  assert.match(result.appendContext, /Approval was revoked/);
-  assert.doesNotMatch(result.appendContext, /Approval granted/);
-  assert.equal(calls, 6); // Three passage judgments + three redundancy judgments.
+  const bodies = (JSON.parse(result.appendContext.split("\n")[1]!) as { body: string }[]).map(e => e.body);
+  assert.deepEqual(bodies, [excerpts[0], excerpts[2], excerpts[3]]);
+  assert.equal(fetch.mock.callCount(), 5); // Four passage judgments plus one redundancy call.
   assert.equal(h.diagnostics.snapshot("bill").memory.emitted, 1);
+});
 
-  // Default maxHints: 3 with 4 ranked candidates replaces a redundant candidate using the 4th slot.
-  calls = 0;
-  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
-    calls++;
-    const request = JSON.parse(String(init?.body));
-    const [state] = request.state;
-    if (request.questions.memory_0) {
-      const scores: Record<string, number> = {
-        "Fact A": 0.99, "Fact A paraphrase": 0.98, "Fact B": 0.97, "Fact C": 0.96,
-      };
-      return response(scores[state.candidates[0].excerpt] ?? 0.1);
-    }
-    return Response.json({ answers: {
-      pair_0: { type: "noul", noul: state.excerpts[1] === "Fact A paraphrase" ? 0.99 : 0.01 },
-    } });
+test("complementary review splits over the serialized byte limit without dropping pairs", async t => {
+  const seen = new Set<string>();
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const { state, questions } = JSON.parse(String(init?.body)) as {
+      state: [{ excerpts: { id: number; text: string }[] }];
+      questions: Record<string, unknown>;
+    };
+    assert.ok(Buffer.byteLength(JSON.stringify(state)) <= DEFAULTS.review.maxRedundancyChars);
+    const ids = new Set(state[0].excerpts.map(({ id }) => String(id)));
+    return Response.json({ answers: Object.fromEntries(Object.keys(questions).map(key => {
+      const [, earlier, later] = key.split("_");
+      assert.ok(earlier && later && ids.has(earlier) && ids.has(later));
+      assert.ok(!seen.has(key));
+      seen.add(key);
+      return [key, { type: "noul", noul: 0.1 }];
+    })) });
   });
-  const three = harness([hit("Fact A"), hit("Fact A paraphrase"), hit("Fact B"), hit("Fact C")],
-    { config: { complementaryHints: true } });
-  t.after(() => three.stop());
-  const threeResult = await three.before(event, context);
-  assert.ok(threeResult);
-  const threeBodies = (JSON.parse(threeResult.appendContext.split("\n")[1]!) as { body: string }[]).map(e => e.body);
-  assert.deepEqual(threeBodies, ["Fact A", "Fact B", "Fact C"]);
-  assert.equal(calls, 10); // Four passage judgments + six directional pair checks.
+  const params = { apiKey: "test", timeoutMs: 1000, signal: new AbortController().signal };
+  const excerpts = Array.from({ length: 4 }, (_, index) => `${index}:${"雪".repeat(2400)}`);
+  const result = await reviewMemoryRedundancy({ ...params, excerpts });
+  assert.ok(fetch.mock.callCount() > 1 && fetch.mock.callCount() < 6);
+  assert.equal(result.length, 6);
+  await assert.rejects(reviewMemoryRedundancy({ ...params, excerpts: ["short", "雪".repeat(9000)] }), /state budget/);
+  assert.equal(seen.size, 6);
 });
 
 test("redundancy uncertainty or failure preserves baseline hints and stays inside the turn deadline", async t => {
@@ -454,12 +461,22 @@ test("redundancy uncertainty or failure preserves baseline hints and stays insid
     const request = JSON.parse(String(init?.body));
     if (request.questions.memory_0) return response(request.state[0].candidates[0].excerpt === "first fact" ? 0.99 : 0.98);
     if (mode === "failure") throw new Error("secret response");
+    if (mode === "request-timeout") {
+      const signal = init?.signal;
+      assert.ok(signal);
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
     if (mode === "wait") return new Promise<Response>(() => {});
-    return Response.json({ answers: { pair_0: { type: "noul", noul: 0.5 } } });
+    return Response.json({ answers: { pair_0_1: { type: "noul", noul: 0.5 } } });
   });
-  for (const value of ["uncertain", "failure", "wait"]) {
+  for (const value of ["uncertain", "failure", "request-timeout", "wait"]) {
     mode = value;
-    const h = harness([hit("first fact"), hit("second fact")], { config: { complementaryHints: true, timeoutMs: 30 } });
+    const h = harness([hit("first fact"), hit("second fact")], {
+      config: { complementaryHints: true, timeoutMs: value === "wait" ? 30 : 500 },
+      decisionModel: value === "request-timeout" ? { ...decisionModel, timeoutMs: 20 } : decisionModel,
+    });
     const result = await h.before(event, context);
     if (value === "wait") {
       assert.equal(result, undefined);
@@ -469,7 +486,9 @@ test("redundancy uncertainty or failure preserves baseline hints and stays insid
       assert.match(result.appendContext, /first fact/);
       assert.match(result.appendContext, /second fact/);
     }
-    if (value === "failure") assert.equal(h.diagnostics.snapshot("bill").memory.redundancy_unavailable, 1);
+    if (value === "failure" || value === "request-timeout") {
+      assert.equal(h.diagnostics.snapshot("bill").memory.redundancy_unavailable, 1);
+    }
     assert.equal(JSON.stringify(h.diagnostics.snapshot("bill")).includes("secret"), false);
     h.stop();
   }

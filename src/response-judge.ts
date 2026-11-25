@@ -581,89 +581,55 @@ export async function judgeResponse(
     evidenceLimit: "Visible conversation only. Artifacts, tool results and external facts are not provided.",
   };
 
-  let quality: ResponseQuality;
-  if (cache?.quality) {
-    quality = validateCachedQuality(cache.quality);
-  } else {
+  const assessQuality = async (): Promise<ResponseQuality> => {
+    if (cache?.quality) return validateCachedQuality(cache.quality);
     cache?.begin(["quality"]);
     const { answers } = await decideWithModel(params, state, QUALITY_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-    quality = {
-      taskType: answers.taskType,
-      assessability: answers.assessability,
-      fitAssessability: answers.fitAssessability,
-      underdelivery: answers.underdelivery,
-      failureReason: answers.failureReason,
+    const quality = qualityFields({
+      ...answers,
       fulfillment: toFourLevelScore(answers.fulfillment),
       deliverableFit: toFourLevelScore(answers.deliverableFit),
-      consistency: answers.consistency,
-    };
+    });
     cache?.save("quality", quality);
-  }
-
-  const needFeedback = !cache?.feedback;
-  const needSentiment = sentimentEnabled && !cache?.sentiment;
-  if (!needFeedback && !needSentiment) {
-    const cachedFeedback = validateCachedFeedback(cache!.feedback);
-    const cachedSentiment = sentimentEnabled && cache?.sentiment ? validateCachedSentiment(cache.sentiment) : undefined;
-    return {
-      quality,
-      feedback: { ...cachedFeedback, ...(cachedSentiment ?? {}) },
-    };
-  }
-
-  const cachedFeedback = !needFeedback ? validateCachedFeedback(cache!.feedback) : undefined;
-  const cachedSentiment = sentimentEnabled && !needSentiment ? validateCachedSentiment(cache?.sentiment) : undefined;
-
-  const feedbackState = { ...state, feedback: episode.feedback };
-  cache?.begin([...(needFeedback ? ["feedback" as const] : []), ...(needSentiment ? ["sentiment" as const] : [])]);
-
-  let feedbackBase: ResponseFeedbackBase;
-  let sentimentResult: ResponseSentiment | undefined;
-
-  if (needFeedback && needSentiment) {
-    const { answers } = await decideWithModel(params, feedbackState, FEEDBACK_WITH_SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-    feedbackBase = {
-      feedbackType: answers.feedbackType,
-      target: answers.target,
-      avoidableRework: answers.avoidableRework,
-      repeatedConstraint: answers.repeatedConstraint,
-      memoryGap: answers.memoryGap,
-    };
-    sentimentResult = {
-      sentiment: answers.sentiment,
-      annoyance: answers.annoyance,
-      frustration: answers.frustration,
-      dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity),
-    };
-    cache?.save("feedback", feedbackBase);
-    cache?.save("sentiment", sentimentResult);
-  } else if (needFeedback) {
-    const { answers } = await decideWithModel(params, feedbackState, FEEDBACK_BASE_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-    feedbackBase = {
-      feedbackType: answers.feedbackType,
-      target: answers.target,
-      avoidableRework: answers.avoidableRework,
-      repeatedConstraint: answers.repeatedConstraint,
-      memoryGap: answers.memoryGap,
-    };
-    cache?.save("feedback", feedbackBase);
-    sentimentResult = cachedSentiment;
-  } else {
-    feedbackBase = cachedFeedback!;
-    const { answers } = await decideWithModel(params, feedbackState, SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-    sentimentResult = {
-      sentiment: answers.sentiment,
-      annoyance: answers.annoyance,
-      frustration: answers.frustration,
-      dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity),
-    };
-    cache?.save("sentiment", sentimentResult);
-  }
-
-  return {
-    quality,
-    feedback: { ...feedbackBase, ...(sentimentResult ? sentimentFields(sentimentResult) : {}) },
+    return quality;
   };
+
+  const assessFeedback = async (): Promise<ResponseFeedback> => {
+    const cachedFeedback = cache?.feedback ? validateCachedFeedback(cache.feedback) : undefined;
+    const cachedSentiment = sentimentEnabled && cache?.sentiment ? validateCachedSentiment(cache.sentiment) : undefined;
+    const feedbackState = { ...state, feedback: episode.feedback };
+    if (!cachedFeedback && sentimentEnabled && !cachedSentiment) {
+      cache?.begin(["feedback", "sentiment"]);
+      const { answers } = await decideWithModel(params, feedbackState, FEEDBACK_WITH_SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
+      const feedback = feedbackBaseFields(answers);
+      const sentiment = sentimentFields({ ...answers, dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity) });
+      cache?.save("feedback", feedback);
+      cache?.save("sentiment", sentiment);
+      return { ...feedback, ...sentiment };
+    }
+
+    let feedback = cachedFeedback;
+    if (!feedback) {
+      cache?.begin(["feedback"]);
+      const { answers } = await decideWithModel(params, feedbackState, FEEDBACK_BASE_QUESTIONS, PROJECTED_DECISION_OPTIONS);
+      feedback = feedbackBaseFields(answers);
+      cache?.save("feedback", feedback);
+    }
+    let sentiment = cachedSentiment;
+    if (sentimentEnabled && !sentiment) {
+      cache?.begin(["sentiment"]);
+      const { answers } = await decideWithModel(params, feedbackState, SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
+      sentiment = sentimentFields({ ...answers, dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity) });
+      cache?.save("sentiment", sentiment);
+    }
+    return { ...feedback, ...sentiment };
+  };
+
+  // Each request saves its own result before we propagate a sibling's failure.
+  const [quality, feedback] = await Promise.allSettled([assessQuality(), assessFeedback()]);
+  if (quality.status === "rejected") throw quality.reason;
+  if (feedback.status === "rejected") throw feedback.reason;
+  return { quality: quality.value, feedback: feedback.value };
 }
 
 /** Later evidence is kept in a third request and never changes the original grade. */

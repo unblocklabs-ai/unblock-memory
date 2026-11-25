@@ -72,10 +72,11 @@ question to make sense, the proposal can quote both turns. At least one quote mu
 come from a new message. List items below 0.50 confidence are skipped when the
 provider supplies per-item confidence.
 
-If prior facts exist, a choice judgment looks for an explicit correction or update.
-A second decision checks support and retention, and rechecks any proposed replacement
-against the original evidence. All applicable thresholds must pass, and support must
-select `supported`, even if its threshold is lowered.
+If prior facts exist, separate choice questions share a request and look for an
+explicit correction or update. Validation shares the dated transcript across up
+to four proposals per request, checking support, retention, and any proposed
+replacement against that proposal's own evidence. All applicable thresholds must
+pass, and support must select `supported`, even if its threshold is lowered.
 
 The three thresholds accept 0–1 and default to 0.90. Lowering retention changes
 certainty about category membership, not the categories themselves. Agents can

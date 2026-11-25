@@ -48,15 +48,10 @@ All plugin decision-model features use `plugins.entries.unblock-memory.config.de
 Older provider config keys are rejected. When upgrading, remove the old block and
 configure a credential for the endpoint you intend to use; do not copy the old key into the default route.
 
-Skill Whisperer scores up to 80 skills per HTTP request. Memory candidate scoring uses one request per candidate. Ranking happens in code.
-Related questions about the same candidate can share a request (for example, quality
-noise and evidence). Memory Whisperer launches up to six top fused eligible candidate requests together;
-the shared account's request/token limits still apply across simultaneous conversations
-and nodes. There is no automatic retry in the latency-sensitive whisperers.
-
-Not every judgment is reranking: claim verification retains the cited sources for
-one claim, response auditing grades one episode, and redundancy compares one pair.
-These evidence relationships are deliberately preserved, not split into unrelated scores.
+Skill Whisperer scores up to 80 skills per HTTP request. Memory Whisperer scores
+up to six candidates in parallel, one request per candidate, then batches the
+directional redundancy checks for its finalists. There is no automatic retry
+in the latency-sensitive whisperers.
 
 ```json
 {
@@ -395,10 +390,10 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | --- | --- |
 | Skill selection | Bounded visible current/recent conversation + shortlisted skill names/descriptions; not skill procedures or source-path fields |
 | Memory hints | Same 8,192-token/24,000-byte visible conversation as training goes to the configured query API (when available); decision model passage judging receives the compacted conversation (current request plus at most two prior visible messages, bounded to 1,500 characters) plus one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per candidate, capped at the top 6 RRF-fused eligible passages from at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
-| Complementarity | Up to 4 already-qualified excerpts for pairwise redundancy checks |
-| People primer | Person identity, agent name, approved retrieved excerpts and source/session metadata; all indexed sessions eligible if approved, not just the current chat |
+| Complementarity | Up to 4 already-qualified excerpts, shared by up to 6 directional redundancy checks per request |
+| People primer | Person identity, agent name, and up to 4 approved retrieved excerpts with their source/session metadata per request (16,000 serialized state bytes); all indexed sessions eligible if approved, not just the current chat |
 | Dossier save/draft review | Proposed blurb, person/agent names and 1–3 exact approved indexed evidence ranges, at most 6,000 characters total; existing dossier is not evidence |
-| Chunk quality | Up to 4 complete chunks of at most 6,000 characters each per request + source kinds; no conversation or source-path fields |
+| Chunk quality | Up to 6 complete chunks of at most 6,000 characters each, with source kinds (18,000 serialized state bytes per request); no conversation or source-path fields |
 | Ordinary claim review | One proposed claim + up to 3 approved indexed ranges, at most 6,000 characters total |
 | Cluster review | Up to 6 eligible complete sampled chunks, each at most 2,000 characters; conclusions only concern the sample |
 | Response audit | Approved visible request/answer/context/feedback and bounded later response evidence, separated by assessment stage; optional current-index whole-short-document evidence from approved file corpora |

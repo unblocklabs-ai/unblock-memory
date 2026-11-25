@@ -26,6 +26,8 @@ export type MemoryProposal = {
 };
 export declare function extractionOverhead(existing: PriorMemory[]): number;
 export declare function extractionMessageTokens(message: ExtractionMessage): number;
+export declare function extractionMessageBytes(message: ExtractionMessage): number;
+export declare function extractionValidationTranscriptBudget(existing: PriorMemory[]): number;
 type ProposeParams = {
     messages: ExtractionMessage[];
     newIds: string[];
@@ -38,21 +40,10 @@ type ProposeParams = {
     minReplacement?: number;
 };
 export declare function extractWithDecisionModel(params: ProposeParams): Promise<MemoryProposal[]>;
-export declare function validateExtractedMemory(params: {
-    proposal: MemoryProposal;
-    messages: ExtractionMessage[];
-    newIds: string[];
-    existing: PriorMemory[];
-    apiKey: string;
-    endpoint?: string;
-    model?: string;
-    signal: AbortSignal;
-    thresholds: Pick<ExtractionConfig, "minSupport" | "minRetention" | "minReplacement">;
-}): Promise<{
-    accepted: boolean;
+type ValidationThresholds = Pick<ExtractionConfig, "minSupport" | "minRetention" | "minReplacement">;
+type ValidationJudgment = {
+    accepted: false;
     reason: "invalid_evidence";
-    scores?: undefined;
-    thresholds?: undefined;
 } | {
     accepted: boolean;
     reason: "judged";
@@ -61,6 +52,17 @@ export declare function validateExtractedMemory(params: {
         useful: number;
         replacement: number;
     };
-    thresholds: Pick<ExtractionConfig, "minSupport" | "minRetention" | "minReplacement">;
-}>;
+    thresholds: ValidationThresholds;
+};
+export declare function validateExtractedMemories(params: {
+    proposals: readonly MemoryProposal[];
+    messages: ExtractionMessage[];
+    newIds: string[];
+    existing: PriorMemory[];
+    apiKey: string;
+    endpoint?: string;
+    model?: string;
+    signal: AbortSignal;
+    thresholds: ValidationThresholds;
+}): Promise<ValidationJudgment[]>;
 export {};

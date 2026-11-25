@@ -6,9 +6,11 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "../src/config.js";
+import { DEFAULTS } from "../src/defaults.js";
 import { registerResponseAudit } from "../src/response-runtime.js";
 import { RESPONSE_EXTRACTOR_VERSION, responseEpisodes, ResponseTranscriptReader } from "../src/response-episodes.js";
 import { auditResponses, responseCohort } from "../src/response-audit.js";
@@ -909,25 +911,42 @@ test("exact checkpoints skip extraction; only changed follow-up stages are asses
   assert.equal(requests.length, 4);
 });
 
-test("stage successes survive later API failure and only failed stages retry", async t => {
+test("independent response requests overlap, persist successes, and retry only failed stages after backoff", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { db, options } = await fixture(); t.after(() => db.close());
-  let fail = true; const seen: string[][] = [];
+  let fail = true, inFlight = 0, peakInFlight = 0;
+  const seen: string[] = [];
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
-    const body = JSON.parse(String(init.body)); seen.push(Object.keys(body.questions));
-    if (fail && body.questions.feedbackType) throw new Error("synthetic provider failure");
+    const body = JSON.parse(String(init.body));
+    const stage = body.questions.fulfillment ? "quality" : body.questions.feedbackType ? "feedback" : "retrospective";
+    seen.push(stage);
+    peakInFlight = Math.max(peakInFlight, ++inFlight);
+    await nextTurn();
+    if (stage === "retrospective") await nextTurn(); // Settle after the failed feedback request.
+    inFlight--;
+    if (fail && stage === "feedback") throw new Error("synthetic provider failure");
     return Response.json(payload(body));
   });
-  assert.equal((await auditResponses(options)).coverage?.failed, 1);
-  assert.equal((await auditResponses(options)).coverage?.attempted, 0);
+  const first = await auditResponses(options);
+  assert.equal(peakInFlight, 3, "all three independent HTTP requests must overlap");
+  assert.deepEqual([...seen].sort(), ["feedback", "quality", "retrospective"]);
+  assert.equal(first.coverage?.failed, 1);
+  assert.equal(first.coverage?.evaluated, 0);
+  assert.equal(first.coverage?.stageAttempts, 4);
   const state = new DatabaseSync(options.storePath); t.after(() => state.close());
-  const store = new ResponseAuditStore(options.storePath); t.after(() => store.close());
-  assert.equal(store.retryFailed(responseCohort(config.responseAudit)).stages, 2);
-  assert.equal(state.prepare("SELECT attempts FROM response_stages WHERE stage='quality'").get()!.attempts, 1);
+  const stages = () => Object.fromEntries(state.prepare("SELECT stage,status,attempts FROM response_stages").all()
+    .map(row => [String(row.stage), [row.status, row.attempts]]));
+  assert.deepEqual(stages(), { quality: ["ok", 1], retrospective: ["ok", 1], feedback: ["failed", 1], sentiment: ["failed", 1] });
+
+  assert.equal((await auditResponses(options)).coverage?.attempted, 0);
+  assert.equal(seen.length, 3);
+  t.mock.timers.tick(DEFAULTS.responseAudit.retryBackoffMs);
   fail = false;
   const next = await auditResponses(options);
-  assert.equal(next.coverage?.evaluated, 1); assert.equal(next.coverage?.stageCacheHits, 1);
-  assert.equal(seen.filter(keys => keys.includes("fulfillment")).length, 1);
-  assert.equal(state.prepare("SELECT COUNT(*) n FROM response_stages WHERE status='ok'").get()!.n, 4);
+  assert.equal(next.coverage?.evaluated, 1);
+  assert.equal(next.coverage?.stageCacheHits, 2);
+  assert.deepEqual(seen.slice(3), ["feedback"]);
+  assert.deepEqual(stages(), { quality: ["ok", 1], retrospective: ["ok", 1], feedback: ["ok", 2], sentiment: ["ok", 2] });
 });
 
 test("fair durable cursor lets another session run before a busy session backlog", async t => {

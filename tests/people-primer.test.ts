@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Value } from "typebox/value";
@@ -12,13 +12,14 @@ import { primePersonDossier } from "../src/people-primer.js";
 import { registerPeoplePrimerTool } from "../src/people-primer-tool.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 import type { CorpusMemorySearchResult } from "../src/contracts.js";
+import { DEFAULTS } from "../src/defaults.js";
 
 const config = resolveConfig({ people: { enabled: true }, peoplePrimer: { enabled: true, corpora: ["memory"] } });
 async function fixture(t: test.TestContext) {
   const root = await mkdtemp(join(tmpdir(), "people-primer-"));
   const path = join(root, "people.sqlite");
   const store = new PeopleStore(path, { maxOpenTodos: 10, maxBlurbChars: 1200 });
-  t.after(() => store.close());
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
   const person = store.upsertIdentity({ provider: "slack", accountScope: "default", externalId: "U123", displayName: "Mira" }).person;
   return { root, path, store, personId: person.id, agentName: "Bill", config: config.peoplePrimer,
     apiKey: "fake-secret", signal: new AbortController().signal };
@@ -27,12 +28,20 @@ function hit(overrides: Partial<CorpusMemorySearchResult> = {}): CorpusMemorySea
   return { path: "qmd://memory/mira.md", startLine: 2, endLine: 4, snippet: "Mira leads support and asks for concise updates.",
     score: 0.7, source: "memory", corpus: "memory", ...overrides };
 }
+type PrimerRequest = {
+  state: [{ excerpts: { excerpt: string; source: { corpus: string } }[] }];
+  questions: Record<string, { instructions: { scope: string } }>;
+};
+function primerResponse(request: PrimerRequest, values: Record<string, number> = {}) {
+  return Response.json({ answers: Object.fromEntries(Object.keys(request.questions).map(k =>
+    [k, { type: "noul", noul: values[k] ?? values[k.replace(/_\d+$/, "")] ?? 0.95 }])) });
+}
 function mockJudge(t: test.TestContext, values: Record<string, number> = {}) {
-  const requests: { state: Record<string, unknown>; questions: Record<string, unknown> }[] = [];
+  const requests: PrimerRequest[] = [];
   t.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
     requests.push(body);
-    return Response.json({ answers: Object.fromEntries(Object.keys(body.questions).map(k => [k, { type: "noul", noul: values[k] ?? 0.95 }])) });
+    return primerResponse(body, values);
   });
   return requests;
 }
@@ -61,16 +70,53 @@ test("all eligible shortlist hits are graded, cross-question spans deduplicate, 
   } });
   assert.equal(result.status, "ok");
   assert.equal(searches, 5);
-  assert.equal(requests.length, 30, "not just five final evidence items");
+  assert.equal(requests.length, 8, "all 30 uncached excerpts are graded in count-bounded packs");
+  assert.deepEqual(requests.map(request => request.state[0].excerpts.length), [4, 4, 4, 4, 4, 4, 4, 2]);
   assert.equal(result.stats?.uniqueCandidates, 30);
   assert.equal(result.questions?.[0].qualifying, 30);
   assert.equal(result.questions?.[0].evidence.length, 3);
   assert.equal(result.questions?.[0].coverage, "evidence_found");
   assert.equal(result.evidence?.length, 3, "shared excerpts are not repeated across questions");
   assert.equal(result.questions?.[0].evidence[0].evidenceId, result.evidence?.[0].id);
-  assert.equal(Object.keys(requests[0].questions).length, 9);
+  assert.equal(Object.keys(requests[0].questions).length, 36);
   assert.equal(JSON.stringify(requests[0]).includes("qmd://"), false);
   assert.equal(f.store.getDossier(f.personId), undefined);
+});
+
+test("primer splits by serialized bytes, retries failed packs and keeps evidence scoped per excerpt", async t => {
+  const f = await fixture(t);
+  const hits = Array.from({ length: 5 }, (_, i) => hit({ path: `qmd://memory/${i}.md`,
+    snippet: `Candidate ${i}: ${"🚀".repeat(1800)}` }));
+  const packs: string[][] = [];
+  let fail = true;
+  t.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const body: PrimerRequest = JSON.parse(String(init?.body));
+    const [{ excerpts }] = body.state;
+    packs.push(excerpts.map(item => item.excerpt));
+    assert.ok(Buffer.byteLength(JSON.stringify(body.state)) <= DEFAULTS.people.primerBatchMaxChars);
+    for (const [key, question] of Object.entries(body.questions)) {
+      const index = Number(key.split("_").at(-1));
+      assert.ok(excerpts[index]);
+      assert.equal(excerpts[index].source.corpus, "memory");
+      assert.ok(question.instructions.scope.includes(`excerpts[${index}]`));
+    }
+    if (fail && excerpts[0].excerpt === hits[2].snippet) return new Response("unavailable", { status: 529 });
+    return primerResponse(body, { aboutPerson_1: 0.05 });
+  });
+  const run = () => primePersonDossier({ ...f, search: async () => hits });
+  const partial = await run();
+  assert.equal(partial.status, "partial");
+  assert.equal(partial.stats?.failed, 2);
+  assert.equal(partial.stats?.requests, 3);
+  assert.deepEqual(packs.map(pack => pack.length), [2, 2, 1]);
+  assert.deepEqual(partial.evidence?.map(item => item.path), [hits[0].path, hits[4].path]);
+  fail = false;
+  const complete = await run();
+  assert.equal(complete.status, "ok");
+  assert.equal(complete.stats?.cached, 3);
+  assert.equal(complete.stats?.requests, 1);
+  assert.deepEqual(packs[3], hits.slice(2, 4).map(item => item.snippet));
+  assert.deepEqual(complete.evidence?.map(item => item.path), [hits[0].path, hits[2].path, hits[4].path]);
 });
 
 test("cache follows evidence changes, never treats existing dossiers as evidence", async t => {
@@ -90,7 +136,7 @@ test("cache follows evidence changes, never treats existing dossiers as evidence
   f.store.replaceDossier(f.personId, "New role", { schemaVersion: 1, blurb: "Mira leads product", sections: [] });
   await run();
   assert.equal(requests.length, 2);
-  assert.equal(requests.some(r => Object.hasOwn(r.state, "currentDossier")), false);
+  assert.equal(requests.some(r => Object.hasOwn(r.state[0], "currentDossier")), false);
 });
 
 test("each background gate independently rejects activity profiles; missing answers stay unknown", async t => {
@@ -136,11 +182,15 @@ test("cache stores only numerical answers, not provider echoes", async t => {
 test("threshold, approval, oversized and duplicate hits are filtered before egress", async t => {
   const f = await fixture(t), requests = mockJudge(t);
   const result = await primePersonDossier({ ...f, search: async () => [hit(), hit(), hit({ score: 0.1 }),
-    hit({ corpus: "private", snippet: "PRIVATE_NEVER_SEND" }), hit({ snippet: "x".repeat(6001) })] });
+    hit({ corpus: "private", snippet: "PRIVATE_NEVER_SEND" }), hit({ snippet: "x".repeat(6001) }),
+    hit({ snippet: `OVERSIZED_WIRE_STATE${"\u0001".repeat(3000)}` })] });
   assert.equal(requests.length, 1);
-  assert.equal(result.questions?.[0].eligible, 1);
+  assert.equal(result.questions?.[0].eligible, 2);
   assert.equal(result.questions?.[0].oversized, 1);
+  assert.equal(result.status, "partial");
+  assert.equal(result.stats?.failed, 1);
   assert.equal(JSON.stringify(requests).includes("PRIVATE_NEVER_SEND"), false);
+  assert.equal(JSON.stringify(requests).includes("OVERSIZED_WIRE_STATE"), false);
 });
 
 test("wrong-person evidence is excluded and uncertainty is visible", async t => {

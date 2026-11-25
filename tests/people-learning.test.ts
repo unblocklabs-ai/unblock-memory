@@ -902,13 +902,15 @@ test("older in-flight analysis cannot overwrite or regress a newer analysis resu
   const call = async (params: unknown) => JSON.parse(String(record((await tool.execute("sig", params)).content[0])!.text));
 
   const inv = await call({ action: "inventory", kind: "weekly" });
-  let releaseOldFetch: (() => void) | undefined;
-  const oldFetchStarted = new Promise<void>(resolve => {
-    t.mock.method(globalThis, "fetch", async () => {
-      resolve();
-      await new Promise<void>(done => { releaseOldFetch = done; });
-      return new Response("upstream error", { status: 503 });
-    });
+  let startOldFetch!: () => void;
+  let releaseOldFetch!: () => void;
+  const oldFetchStarted = new Promise<void>(resolve => { startOldFetch = resolve; });
+  const oldFetchRelease = new Promise<void>(resolve => { releaseOldFetch = resolve; });
+  t.after(releaseOldFetch);
+  t.mock.method(globalThis, "fetch", async () => {
+    startOldFetch();
+    await oldFetchRelease;
+    return new Response("upstream error", { status: 503 });
   });
 
   // Start slow older signals call (cohort U1) which blocks inside fetch.
@@ -924,7 +926,7 @@ test("older in-flight analysis cannot overwrite or regress a newer analysis resu
   assert.equal(newerSignals.status, "complete");
 
   // Unblock slow older call; it must be fenced and never overwrite the newer complete analysis.
-  releaseOldFetch!();
+  releaseOldFetch();
   const olderSignals = await slowOlder;
   assert.equal(olderSignals.stale, true);
   assert.equal(olderSignals.status, "unresolved");

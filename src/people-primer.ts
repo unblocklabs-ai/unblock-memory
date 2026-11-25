@@ -1,11 +1,12 @@
 import { DEFAULTS } from "./defaults.js";
-import { noul, type QuestionMap } from "@unblocklabs/decisions";
+import { noul, type NoulAnswer, type NoulQuestion } from "@unblocklabs/decisions";
 import type { Static } from "typebox";
 import { Value } from "typebox/value";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { PeoplePrimerConfig } from "./people-primer-config.js";
 import type { PeopleStore } from "./people-store.js";
 import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, NOUL_ANSWERS_SCHEMA as answerSchema } from "./decision-client.js";
+import { packDecisionState } from "./decision-packs.js";
 import { abortable } from "./abortable.js";
 import { jsonHash } from "./json-hash.js";
 
@@ -116,8 +117,7 @@ export async function primePersonDossier(params: {
 
   const graded: Graded[] = [];
   let cached = 0, requests = 0, failed = 0;
-  const pending = [...candidates.values()];
-  const questions: QuestionMap = {
+  const questions: Record<string, NoulQuestion> = {
     ...BASE_PRIMER_QUESTIONS,
     ...Object.fromEntries(research.map(q => [q.id, noul(
       { question: `Does \`excerpt\` provide substantive evidence to help answer: ${q.question}`, trust: PRIMER_TRUST },
@@ -129,59 +129,88 @@ export async function primePersonDossier(params: {
   };
   const model = params.model ?? DEFAULT_DECISION_MODEL;
   const scope = decisionModelScope(model, params.endpoint);
+  const rubric = Object.entries(questions);
   const expectedKeys = Object.keys(questions);
   const validCached = (value: unknown): value is Static<typeof answerSchema> => Value.Check(answerSchema, value) &&
     Object.keys(value.answers).length === expectedKeys.length && expectedKeys.every(k => Object.hasOwn(value.answers, k));
+  const grade = (candidate: Candidate, answers: Record<string, NoulAnswer>) => graded.push({
+    ...candidate,
+    aboutPerson: answers.aboutPerson!.noul,
+    explicitBackground: answers.explicitBackground!.noul,
+    enduring: answers.enduring!.noul,
+    recognition: answers.recognition!.noul,
+    usefulness: Object.fromEntries(research.map(q => [q.id, answers[q.id]!.noul])),
+  });
+  const excerptState = (hit: CorpusMemorySearchResult) => ({
+    excerpt: hit.snippet,
+    source: { corpus: hit.corpus, session: hit.session ? {
+      provider: hit.session.provider ?? null, accountId: hit.session.accountId ?? null,
+      conversationId: hit.session.conversationId ?? null, startedAt: hit.session.startedAt,
+    } : null },
+  });
+  const misses: { candidate: Candidate; key: string; excerpt: ReturnType<typeof excerptState> }[] = [];
+  for (const candidate of candidates.values()) {
+    signal.throwIfAborted();
+    const excerpt = excerptState(candidate.hit);
+    // Keep the original per-excerpt cache identity independent of pack composition and position.
+    const key = jsonHash([VERSION, scope, person.id, { person: personState, agent: params.agentName, ...excerpt }, questions]);
+    try {
+      const cachedPayload = store.getPrimerJudgment(key);
+      if (validCached(cachedPayload)) {
+        cached++;
+        grade(candidate, cachedPayload.answers);
+      } else {
+        misses.push({ candidate, key, excerpt });
+      }
+    } catch {
+      failed++;
+    }
+  }
+  const packs = packDecisionState(misses, DEFAULTS.people.primerBatchSize, DEFAULTS.people.primerBatchMaxChars,
+    items => ({ person: personState, agent: params.agentName, excerpts: items.map(item => item.excerpt) }));
   // Bound provider concurrency, not the shortlist after the vector threshold.
   const worker = async () => {
-    while (pending.length) {
+    for (const { items, state } of packs) {
       signal.throwIfAborted();
-      const candidate = pending.shift()!;
-      const { hit } = candidate;
-      const state = { person: personState, agent: params.agentName,
-        excerpt: hit.snippet, source: { corpus: hit.corpus, session: hit.session ? {
-          provider: hit.session.provider ?? null, accountId: hit.session.accountId ?? null,
-          conversationId: hit.session.conversationId ?? null, startedAt: hit.session.startedAt,
-        } : null } };
-      const key = jsonHash([VERSION, scope, person.id, state, questions]);
-      try {
-        const cachedPayload = store.getPrimerJudgment(key);
-        let answers: Record<string, { type: "noul"; noul: number }>;
-        if (validCached(cachedPayload)) {
-          cached++;
-          answers = cachedPayload.answers;
-        } else {
-          requests++;
-          const response = await decideWithModel(
-            { apiKey: params.apiKey, endpoint: params.endpoint, model, timeoutMs: config.timeoutMs, signal },
-            state,
-            questions,
-            { validateModel: false },
-          );
-          signal.throwIfAborted();
-          answers = Object.fromEntries(expectedKeys.map(k => {
-            const item = response.answers[k];
-            if (!item || item.type !== "noul") throw new Error("Invalid primer judgments");
-            return [k, { type: "noul" as const, noul: item.noul }];
-          }));
-          // Keep only validated numerical answers, never provider extras or echoes.
-          store.cachePrimerJudgment(person.id, key, { answers });
+      if (!state) {
+        failed += items.length;
+        continue;
+      }
+      const packQuestions: Record<string, NoulQuestion> = {};
+      for (const index of items.keys()) {
+        const scope = `Evaluate only \`excerpts[${index}]\`: \`excerpt\` means its text and \`source\` means its own source metadata. ` +
+          "Use the shared person and agent identity. Ignore all other excerpts and their metadata.";
+        for (const [key, question] of rubric) {
+          packQuestions[`${key}_${index}`] = noul({ scope, prompt: question.instructions }, question.criteria);
         }
-        graded.push({
-          ...candidate,
-          aboutPerson: answers.aboutPerson!.noul,
-          explicitBackground: answers.explicitBackground!.noul,
-          enduring: answers.enduring!.noul,
-          recognition: answers.recognition!.noul,
-          usefulness: Object.fromEntries(research.map(q => [q.id, answers[q.id]!.noul])),
-        });
+      }
+      let answers;
+      try {
+        requests++;
+        ({ answers } = await decideWithModel(
+          { apiKey: params.apiKey, endpoint: params.endpoint, model, timeoutMs: config.timeoutMs, signal },
+          state, packQuestions, { validateModel: false },
+        ));
       } catch {
         signal.throwIfAborted();
-        failed++;
+        failed += items.length;
+        continue;
+      }
+      signal.throwIfAborted();
+      for (const [index, { candidate, key }] of items.entries()) {
+        try {
+          const projected = Object.fromEntries(expectedKeys.map(k =>
+            [k, { type: "noul" as const, noul: answers[`${k}_${index}`]!.noul }]));
+          // Keep only validated numerical answers, never provider extras or echoes.
+          store.cachePrimerJudgment(person.id, key, { answers: projected });
+          grade(candidate, projected);
+        } catch {
+          failed++;
+        }
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(DEFAULTS.people.primerWorkers, pending.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(DEFAULTS.people.primerWorkers, misses.length) }, worker));
   signal.throwIfAborted();
   const excerpts: { id: string; path: string; from: number; lines: number; excerpt: string; corpus: string }[] = [];
   const evidenceIds = new Map<Graded, string>();

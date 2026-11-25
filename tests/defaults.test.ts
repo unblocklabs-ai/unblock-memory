@@ -59,6 +59,36 @@ test("operational override files reject malformed JSON, unknown keys and invalid
   }
 });
 
+test("decision pack limits are bounded startup overrides", t => {
+  const { file, write } = overrideFixture(t);
+  const limits = {
+    extraction: {
+      replacementOptionsPerChoice: 20,
+      replacementBatchSize: 5,
+      replacementBatchMaxChars: 60_000,
+      validatorBatchSize: 4,
+      validatorBatchMaxChars: 240_000,
+    },
+    review: { maxRedundancyPairs: 6, maxRedundancyChars: 24_000 },
+    quality: { judgeBatchSize: 6, judgeBatchMaxChars: 18_000 },
+    people: { primerBatchSize: 4, primerBatchMaxChars: 16_000 },
+  } as const;
+  write("{}");
+  const bundled = loadOperationalDefaults(file);
+  for (const section of Object.keys(limits) as (keyof typeof limits)[]) {
+    for (const [key, max] of Object.entries(limits[section])) {
+      assert.equal(Object.entries(bundled[section]).find(([name]) => name === key)?.[1], max);
+      const writeLimit = (value: number) => write(JSON.stringify({ [section]: { [key]: value } }));
+      writeLimit(max - 1);
+      assert.equal(Object.entries(loadOperationalDefaults(file)[section]).find(([name]) => name === key)?.[1], max - 1);
+      for (const invalid of [0, max + 1]) {
+        writeLimit(invalid);
+        assert.throws(() => loadOperationalDefaults(file), { message: `Invalid operational default ${section}.${key}: wrong type or out of range` });
+      }
+    }
+  }
+});
+
 test("training accepts only the isolated completion name derived from the configured teacher", t => {
   const { file, write } = overrideFixture(t);
   write(JSON.stringify({ training: { teacherModel: "custom/replacement-teacher", candidatesPerRound: 2 } }));

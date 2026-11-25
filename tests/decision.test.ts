@@ -293,20 +293,24 @@ test("client distinguishes timeout and caller cancellation from transport and bo
     { code: "network_error", message: "Decision model request failed" });
 });
 
-test("quality helper isolates requests and keeps scores aligned despite reversed completion", { timeout: 2000 }, async t => {
-  const pending: { body: { state: [{ chunks: { text: string }[] }] };
-    resolve: (response: Response) => void }[] = [];
-  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => new Promise<Response>(resolve => {
-    pending.push({ body: JSON.parse(String(init?.body)), resolve });
-  }));
-  const quality = judgeQuality({ apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal,
-    chunks: [{ text: "first", sourceKind: "files" }, { text: "second", sourceKind: "sessions" }] });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(pending.length, 2, "both requests start before either completes");
-  assert.deepEqual(pending.map(p => p.body.state[0].chunks.map(c => c.text)), [["first"], ["second"]]);
-  pending[1].resolve(Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { noise_0: { type: "noul", noul: 0.8 }, evidence_0: { type: "noul", noul: 0.7 } } }));
-  pending[0].resolve(Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { noise_0: { type: "noul", noul: 0.1 }, evidence_0: { type: "noul", noul: 0.9 } } }));
-  assert.deepEqual(await quality, [{ noise: 0.1, evidence: 0.9 }, { noise: 0.8, evidence: 0.7 }]);
+test("quality pack keeps useful JSON independent of a neighboring noisy wrapper", async t => {
+  const chunks = [{ text: '{"retryCount":3}', sourceKind: "files" },
+    { text: "Serialized message with an important decision", sourceKind: "sessions" }] as const;
+  const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const { state, questions } = JSON.parse(String(init?.body));
+    assert.deepEqual(state[0].chunks, chunks);
+    for (const index of chunks.keys()) {
+      assert.match(questions[`noise_${index}`].instructions.scope, new RegExp(`chunks\\[${index}\\]`));
+      assert.match(questions[`evidence_${index}`].instructions.scope, new RegExp(`chunks\\[${index}\\]`));
+    }
+    return Response.json({ answers: {
+      evidence_1: { type: "noul", noul: 0.94 }, noise_1: { type: "noul", noul: 0.96 },
+      evidence_0: { type: "noul", noul: 0.93 }, noise_0: { type: "noul", noul: 0.1 },
+    } });
+  });
+  const quality = await judgeQuality({ apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal, chunks });
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.deepEqual(quality, [{ noise: 0.1, evidence: 0.93 }, { noise: 0.96, evidence: 0.94 }]);
 });
 
 test("oversized batches start together and map reversed replies by trusted index", async t => {

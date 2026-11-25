@@ -49,21 +49,27 @@ test("scheduler waits for its interval, prevents overlap, and cancels in-flight 
   const hooks = new Map<string, () => void | Promise<void>>();
   const api = { config: { agents: { entries: { main: { agentDir, workspace: root } } } }, registerCli() {},
     on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); }, logger: { warn() {} } } as unknown as OpenClawPluginApi;
-  let started!: () => void, calls = 0;
+  let started!: () => void;
+  const signals: (AbortSignal | null | undefined)[] = [];
   const ready = new Promise<void>(resolve => { started = resolve; });
-  t.mock.method(globalThis, "fetch", () => { calls++; started(); return new Promise<Response>(() => {}); });
+  t.mock.method(globalThis, "fetch", (_url: string, init: RequestInit) => {
+    signals.push(init.signal);
+    if (signals.length === 3) started();
+    return new Promise<Response>(() => {});
+  });
   t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
   registerResponseAudit(api, resolveConfig({ decisionModel: { apiKey: "fake" },
     responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 1 } }));
   await hooks.get("gateway_start")!();
   await new Promise<void>(resolve => setImmediate(resolve));
-  assert.equal(calls, 0);
+  assert.equal(signals.length, 0);
   t.mock.timers.tick(60_000); await ready;
   t.mock.timers.tick(60_000); await Promise.resolve();
-  assert.equal(calls, 1);
+  assert.equal(signals.length, 3);
   await hooks.get("gateway_stop")!();
+  assert.ok(signals.every(signal => signal?.aborted));
   t.mock.timers.tick(600_000); await Promise.resolve();
-  assert.equal(calls, 1);
+  assert.equal(signals.length, 3);
 });
 
 test("durable schedule survives reopen, claims once, catches up once and applies cadence changes", async () => {

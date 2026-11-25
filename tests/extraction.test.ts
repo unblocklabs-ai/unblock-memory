@@ -9,7 +9,8 @@ import test from "node:test";
 import { createStore } from "@unblocklabs/qmd";
 import { ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveConfig } from "../src/config.js";
-import { EXTRACTION_INPUT_TARGET, extractWithDecisionModel, validateExtractedMemory, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
+import { DEFAULTS } from "../src/defaults.js";
+import { EXTRACTION_INPUT_TARGET, extractWithDecisionModel, validateExtractedMemories, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
 import { buildCompleteRevision, ExtractionLeaseLostError, extractionPolicyFingerprint, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
 import { runExtraction } from "../src/extraction-worker.js";
 import { readExtractionPage, type ExtractionPage } from "../src/extraction-source.js";
@@ -29,6 +30,12 @@ const config = (extra: object = {}) => resolveConfig({
   decisionModel: { apiKey: "test-key" }, extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 }, ...extra });
 const signal = () => new AbortController().signal;
 const thresholds = config().extraction;
+type ValidationParams = Parameters<typeof validateExtractedMemories>[0];
+const acceptAll = async ({ proposals, thresholds }: ValidationParams) => proposals.map(() => ({
+  accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds,
+}));
+const validateOne = async ({ proposal, ...params }: Omit<ValidationParams, "proposals"> & { proposal: MemoryProposal }) =>
+  (await validateExtractedMemories({ ...params, proposals: [proposal] }))[0]!;
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "extracted-memory-test-"));
   return { dir, storePath: join(dir, "unblock-memory.sqlite") };
@@ -49,11 +56,13 @@ test("extraction defaults off; approval must be a configured session subset", ()
   }
 });
 
-test("the worker stores a verbatim d1.2 proposal with no host LLM", async t => {
+test("the worker validates four verbatim d1.2 proposals with one dated transcript and no host LLM", async t => {
   const f = await fixture();
   const cfg = config({ decisionModel: { apiKey: "test-key", endpoint: "https://decisions.example/v1/decisions", model: "liquid/d1.2" } });
-  const source = [{ ...messages[0]!, text: "🎨 Note:  My favorite color is *red*.  " }];
-  const quote = "My favorite color is *red*.";
+  const quotes = ["My favorite color is *red*.", "I drink dark roast coffee.", "I prefer rain to snow.", "I start work at six."];
+  const source = quotes.map((quote, i) => ({ ...messages[0]!, id: `m${i + 1}`, timestamp: (i + 1) * 1000,
+    text: i === 0 ? `🎨 Note:  ${quote}  ` : quote }));
+  const validationRequests: { state: unknown; questions: Record<string, { instructions: unknown }> }[] = [];
   const fetch = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body));
     assert.equal(body.model, "liquid/d1.2");
@@ -61,27 +70,44 @@ test("the worker stores a verbatim d1.2 proposal with no host LLM", async t => {
     if (url.endsWith("/extractions")) {
       assert.equal(body.fields.memories.type, "list");
       assert.equal(body.fields.memories.items, "text");
-      const start = body.state.indexOf(quote) - 2;
+      const spans = quotes.map((quote, i) => {
+        const start = body.state.indexOf(quote);
+        const padding = i === 0 ? 2 : 0;
+        return [start - padding, start + quote.length + padding];
+      });
       return Response.json({ model: body.model, answers: { memories: {
-        value: [quote], spans: [[start, start + quote.length + 4]], confidences: [0.95], p_null: 0.03,
+        value: quotes, spans, p_null: 0.03,
       } } });
     }
     assert.equal(url, "https://decisions.example/v1/decisions");
-    assert.deepEqual(Object.keys(body.questions), ["supported", "useful"]);
-    return Response.json({ answers: {
-      supported: { type: "choice", choice: "supported", confidence: 0.99, probabilities: { supported: 0.99, contradicted: 0, unsupported: 0.01 } },
-      useful: { type: "noul", noul: 0.99 },
-    } });
+    validationRequests.push(body);
+    return Response.json({ answers: Object.fromEntries(Object.entries(body.questions).map(([key, question]) => [key,
+      (question as { type: string }).type === "choice"
+        ? { type: "choice", choice: "supported", confidence: 0.99, probabilities: { supported: 0.99, contradicted: 0, unsupported: 0.01 } }
+        : { type: "noul", noul: key === "retain_2" ? 0.1 : 0.99 },
+    ])) });
   });
   const result = await runExtraction({ config: cfg, storePath: f.storePath, agentId: "main", agentName: "Bill",
     sessions: () => [session], since: 0, signal: signal(), readPage: async () => page("c1", source) });
-  assert.equal(result.accepted, 1);
   assert.deepEqual(fetch.mock.calls.map(call => call.arguments[0]), ["https://decisions.example/v1/extractions", "https://decisions.example/v1/decisions"]);
+  assert.equal(result.accepted, 3);
+  assert.equal(result.rejected, 1);
+  const { state, questions } = validationRequests[0]!;
+  assert.deepEqual(state, [{
+    messages: source.map(message => ({ ...message, sourceDate: new Date(message.timestamp).toISOString() })),
+    newMessageIds: source.map(message => message.id),
+    proposals: quotes.map((quote, i) => ({ text: `Bek: ${quote}`, replaces: null, evidence: [{ messageId: source[i]!.id, quote }], prior: null })),
+  }]);
+  for (const i of quotes.keys()) {
+    for (const rubric of ["support", "retain"]) {
+      assert.match(JSON.stringify(questions[`${rubric}_${i}`]!.instructions), new RegExp(`proposals\\[${i}\\]`));
+    }
+  }
   const store = new ExtractionStore(f.storePath);
   try {
-    const [record] = store.records();
-    assert.equal(record?.text, `Bek: ${quote}`);
-    assert.deepEqual(record?.evidence, [{ messageId: "m1", quote }]);
+    const records = store.records();
+    assert.deepEqual(records.map(record => record.text).sort(), [quotes[0], quotes[1], quotes[3]].map(quote => `Bek: ${quote}`).sort());
+    assert.deepEqual(records.find(record => record.text === `Bek: ${quotes[0]}`)?.evidence, [{ messageId: "m1", quote: quotes[0] }]);
   } finally { store.close(); }
 });
 
@@ -116,8 +142,8 @@ test("no-span responses match exact new-message text; empty and null responses y
   }
 });
 
-test("replacement selection compares bounded choice winners and enforces the replacement probability", async t => {
-  const existing = Array.from({ length: 22 }, (_, i) => ({ id: i === 21 ? "none" : `id-${i}`, text: `prior fact ${i}` }));
+test("replacement selection sends five independently normalized choice blocks once per proposal", async t => {
+  const existing = Array.from({ length: 100 }, (_, i) => ({ id: i === 81 ? "none" : `id-${i}`, text: `prior fact ${i}` }));
   let choices = 0;
   t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body));
@@ -125,44 +151,52 @@ test("replacement selection compares bounded choice winners and enforces the rep
       return Response.json({ model: body.model, answers: { memories: { value: [messages[0]!.text] } } });
     }
     choices++;
-    const criteria = body.questions.replacement.criteria;
-    assert.ok(criteria.none);
-    const keys = Object.keys(criteria);
-    assert.equal(keys.length, choices % 2 ? 21 : 3);
-    const winner = "prior_1", probability = choices % 2 ? 0.91 : 0.96;
-    return Response.json({ answers: { replacement: { type: "choice", choice: winner, confidence: probability,
-      probabilities: Object.fromEntries(keys.map(key => [key, key === winner ? probability : key === "none" ? 1 - probability : 0])),
-    } } });
+    assert.ok(Buffer.byteLength(String(init.body)) <= DEFAULTS.extraction.replacementBatchMaxChars);
+    return Response.json({ answers: Object.fromEntries(Object.entries(body.questions).map(([key, question]) => {
+      const { criteria } = question as { criteria: Record<string, { text: string } | string> };
+      assert.ok(criteria.none);
+      const keys = Object.keys(criteria);
+      assert.equal(keys.length, 21);
+      const winner = "prior_1", prior = criteria[winner];
+      const probability = typeof prior === "object" && /^prior fact 81\b/u.test(prior.text) ? 0.96 : 0.91;
+      return [key, { type: "choice", choice: winner, confidence: probability,
+        probabilities: Object.fromEntries(keys.map(option => [option, option === winner ? probability : option === "none" ? 1 - probability : 0])),
+      }];
+    })) });
   });
   const params = { messages, newIds: ["m1"], existing, apiKey: "test", signal: signal() };
   assert.equal((await extractWithDecisionModel(params))[0]?.replaces, "none");
+  assert.equal(choices, 1);
   assert.equal((await extractWithDecisionModel({ ...params, minReplacement: 0.97 }))[0]?.replaces, null);
-  assert.equal(choices, 4);
+  assert.equal(choices, 2);
+  const widePriors = existing.map(prior => ({ ...prior, text: `${prior.text} ${"世界".repeat(125)}` }));
+  assert.equal((await extractWithDecisionModel({ ...params, existing: widePriors }))[0]?.replaces, "none");
+  assert.equal(choices, 4, "the same five blocks require two requests only when their serialized bytes exceed the cap");
 });
 
 test("missing quotes, unknown replacement ids and context-only citations never reach decision model", async t => {
   t.mock.method(globalThis, "fetch", () => { assert.fail("invalid evidence must not be sent"); });
   for (const p of [{ ...proposal, evidence: [{ messageId: "m1", quote: "blue" }] }, { ...proposal, replaces: "unknown" }, proposal]) {
-    const result = await validateExtractedMemory({ proposal: p, messages, newIds: p === proposal ? [] : ["m1"], existing: [], apiKey: "test", signal: signal(), thresholds });
+    const result = await validateOne({ proposal: p, messages, newIds: p === proposal ? [] : ["m1"], existing: [], apiKey: "test", signal: signal(), thresholds });
     assert.equal(result.accepted, false); assert.equal(result.reason, "invalid_evidence");
   }
 });
 
 test("all three validation dimensions must meet the gate; malformed responses fail closed", async t => {
   let support = 0.98, useful = 0.98, replacement = 0.98;
-  t.mock.method(globalThis, "fetch", async () => Response.json({ answers: { supported: { type: "choice", choice: "supported", confidence: support, probabilities: { supported: support, unsupported: 1-support, contradicted: 0 } },
-    ...Object.fromEntries(Object.entries({ useful, replacement }).map(([k,noul]) => [k,{ type: "noul", noul }])) } }));
+  t.mock.method(globalThis, "fetch", async () => Response.json({ answers: { support_0: { type: "choice", choice: "supported", confidence: support, probabilities: { supported: support, unsupported: 1-support, contradicted: 0 } },
+    retain_0: { type: "noul", noul: useful }, replace_0: { type: "noul", noul: replacement } } }));
   const params = { proposal: { ...proposal, replaces: "prior" }, messages, newIds: ["m1"], existing: [{ id: "prior", text: "Bek likes blue." }], apiKey: "test", signal: signal(), thresholds };
-  assert.equal((await validateExtractedMemory(params)).accepted, true);
-  useful = 0.89; assert.equal((await validateExtractedMemory(params)).accepted, false);
-  assert.equal((await validateExtractedMemory({ ...params, thresholds: { ...thresholds, minRetention: 0.85 } })).accepted, true);
-  useful = 0.98; support = 0.89; assert.equal((await validateExtractedMemory(params)).accepted, false);
-  support = 0.98; replacement = 0.5; assert.equal((await validateExtractedMemory(params)).accepted, false);
-  assert.equal((await validateExtractedMemory({ ...params, thresholds: { ...thresholds, minReplacement: 0.5 } })).accepted, true);
+  assert.equal((await validateOne(params)).accepted, true);
+  useful = 0.89; assert.equal((await validateOne(params)).accepted, false);
+  assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minRetention: 0.85 } })).accepted, true);
+  useful = 0.98; support = 0.89; assert.equal((await validateOne(params)).accepted, false);
+  support = 0.98; replacement = 0.5; assert.equal((await validateOne(params)).accepted, false);
+  assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minReplacement: 0.5 } })).accepted, true);
   support = 0.8;
-  assert.equal((await validateExtractedMemory({ ...params, thresholds: { ...thresholds, minSupport: 0.8, minReplacement: 0.5 } })).accepted, true);
-  assert.equal((await validateExtractedMemory({ ...params, thresholds: { ...thresholds, minRetention: 0.1 } })).accepted, false);
-  replacement = NaN; await assert.rejects(validateExtractedMemory(params), /invalid noul answer/i);
+  assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minSupport: 0.8, minReplacement: 0.5 } })).accepted, true);
+  assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minRetention: 0.1 } })).accepted, false);
+  replacement = NaN; await assert.rejects(validateOne(params), /invalid noul answer/i);
 });
 
 test("citations preserve source formatting; separated spans must be separate quotes", async t => {
@@ -170,18 +204,18 @@ test("citations preserve source formatting; separated spans must be separate quo
   t.mock.method(globalThis, "fetch", async () => {
     calls++;
     return Response.json({ answers: {
-      supported: { type: "choice", choice: "supported", confidence: 0.99, probabilities: { supported: 0.99, unsupported: 0.01, contradicted: 0 } },
-      useful: { type: "noul", noul: 0.99 },
+      support_0: { type: "choice", choice: "supported", confidence: 0.99, probabilities: { supported: 0.99, unsupported: 0.01, contradicted: 0 } },
+      retain_0: { type: "noul", noul: 0.99 },
     } });
   });
   const source = [{ ...messages[0]!, text: "Classify by *effect*, not verb.\n\nSearch via POST is still a read." }];
   const input = { messages: source, newIds: ["m1"], existing: [], apiKey: "test", signal: signal(), thresholds };
   const fact = { ...proposal, text: "The classifier uses effect, not verb; POST search can be read." };
   for (const quote of ["Classify by effect, not verb.", "Classify by *effect*, not verb. Search via POST is still a read."]) {
-    assert.equal((await validateExtractedMemory({ ...input, proposal: { ...fact, evidence: [{ messageId: "m1", quote }] } })).reason, "invalid_evidence");
+    assert.equal((await validateOne({ ...input, proposal: { ...fact, evidence: [{ messageId: "m1", quote }] } })).reason, "invalid_evidence");
   }
   assert.equal(calls, 0);
-  assert.equal((await validateExtractedMemory({ ...input, proposal: { ...fact, evidence: [
+  assert.equal((await validateOne({ ...input, proposal: { ...fact, evidence: [
     { messageId: "m1", quote: "Classify by *effect*, not verb." },
     { messageId: "m1", quote: "Search via POST is still a read." },
   ] } })).accepted, true);
@@ -233,7 +267,7 @@ test("incremental worker skips unchanged pages, retries failures and never loses
   const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0, signal: signal(),
     readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null) => cursor === "c1" ? page("c1", []) : page("c1"),
     extract: async () => { calls++; if (fail) throw new Error("private source must never leak into status"); return [proposal]; },
-    validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) };
+    validate: acceptAll };
   assert.equal((await runExtraction(opts)).status, "completed");
   const check = new ExtractionStore(f.storePath); assert.equal(check.readCheckpoint(session.sessionId)?.cursor, null); check.close();
   fail = false;
@@ -285,7 +319,7 @@ test("rewrite during inference withdraws old evidence and discards the stale com
   const f = await fixture();
   const result = await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0, signal: signal(),
     readPage: async (_id, _name, _s, cursor) => cursor === "c1" ? { kind: "reset", cursor: "new-generation" } : page("c1"),
-    extract: async () => [proposal], validate: async () => ({ accepted: true, reason: "judged", scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) });
+    extract: async () => [proposal], validate: acceptAll });
   assert.equal(result.accepted, 0);
   const store = new ExtractionStore(f.storePath); assert.deepEqual(store.records(), []); assert.equal(store.readCheckpoint(session.sessionId)?.cursor, "new-generation"); store.close();
 });
@@ -306,7 +340,7 @@ test("scheduled run resumes an approved historical backfill rather than skipping
     readPage: async (_id: string, _name: string, _s: ExtractionSession, cursor: string | null) =>
       cursor === null ? page("c1", [{ ...messages[0]!, id: "context", text: "Hello" }]) : cursor === "c1" ? page("c2") : page("c2", []),
     extract: async ({ newIds }: { newIds: string[] }) => { calls++; return newIds.includes("m1") ? [proposal] : []; },
-    validate: async () => ({ accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds: resolveConfig(undefined).extraction }) };
+    validate: acceptAll };
   await runExtraction({ ...opts, since: 0 });
   const next = await runExtraction({ ...opts, scheduled: true });
   assert.equal(next.accepted, 1); assert.equal(calls, 2);
@@ -470,12 +504,12 @@ test("policy and prompt version changes invalidate complete_revision and re-scan
       return cursor === "c1" ? page("c1", []) : page("c1", [messages[0]!, m2]);
     },
     extract: async () => { extractions++; return [proposal, p2]; },
-    validate: async ({ proposal: prop, thresholds: t }: { proposal: MemoryProposal; thresholds: { minSupport: number } }) => ({
+    validate: async ({ proposals, thresholds: t }: ValidationParams) => proposals.map(prop => ({
       accepted: prop.text === proposal.text || t.minSupport <= 0.85,
       reason: "judged" as const,
       scores: { supported: prop.text === proposal.text ? 0.99 : 0.85, useful: 0.99, replacement: 1 },
       thresholds: config(extraCfg).extraction,
-    }),
+    })),
   });
 
   // Initial scan under default minSupport=0.9 accepts only proposal 1.
@@ -557,11 +591,7 @@ test("multiple accepted proposals targeting the same predecessor pick one determ
     sessions: () => [session], since: 0, signal: signal(),
     readPage: async (_id, _name, _s, cursor) => cursor === "c2" ? page("c2", []) : page("c2", [m2, m3]),
     extract: async () => [repEarly, repLate],
-    validate: async () => ({
-      accepted: true, reason: "judged" as const,
-      scores: { supported: 0.99, useful: 0.99, replacement: 0.99 },
-      thresholds: config().extraction,
-    }),
+    validate: acceptAll,
   });
   assert.equal(result.status, "completed");
   assert.equal(result.accepted, 1);
@@ -683,12 +713,12 @@ test("policy change and unversioned legacy partial cursors rewind before process
     },
     extract: async ({ newIds }: { newIds: string[] }) =>
       newIds.includes("m1") ? [p1] : newIds.includes("m2") ? [p2] : [],
-    validate: async ({ proposal: prop, thresholds: t }: { proposal: MemoryProposal; thresholds: { minSupport: number } }) => ({
+    validate: async ({ proposals, thresholds: t }: ValidationParams) => proposals.map(prop => ({
       accepted: prop.text === p2.text || t.minSupport <= 0.85,
       reason: "judged" as const,
       scores: { supported: prop.text === p2.text ? 0.99 : 0.85, useful: 0.99, replacement: 1 },
       thresholds: config(extraCfg).extraction,
-    }),
+    })),
   });
 
   // Policy A (minSupport=0.9, maxBatches=1) commits partial cursor c1 (complete_revision remains NULL) and rejects p1.

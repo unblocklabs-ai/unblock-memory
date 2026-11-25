@@ -3,6 +3,7 @@ import { judgeResponse, judgeResponseFollowup, RESPONSE_STAGE_VERSIONS, } from "
 import { decisionModelScope, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import { jsonHash } from "./json-hash.js";
 export async function assessResponseStages(store, cohort, e, params, sentimentEnabled, usage) {
+    params.signal.throwIfAborted();
     const scope = decisionModelScope(params.model ?? DEFAULT_DECISION_MODEL, params.endpoint);
     const original = { before: e.before, request: e.request, answer: e.answer, contextLimited: e.contextLimited };
     const feedback = { ...original, feedback: e.feedback };
@@ -31,14 +32,24 @@ export async function assessResponseStages(store, cohort, e, params, sentimentEn
         },
     };
     usage.stageCacheHits += Number(!!cache.quality) + Number(!!cache.feedback) + Number(!!cache.sentiment);
-    const judgment = await judgeResponse(e, params, sentimentEnabled, cache);
-    let retrospective = store.stage(cohort, e, "retrospective", keys.retrospective);
-    if (retrospective)
-        usage.stageCacheHits++;
-    if (!retrospective) {
+    const assessRetrospective = async () => {
+        params.signal.throwIfAborted();
+        const cached = store.stage(cohort, e, "retrospective", keys.retrospective);
+        if (cached) {
+            usage.stageCacheHits++;
+            return cached;
+        }
         cache.begin(["retrospective"]);
-        retrospective = await judgeResponseFollowup(e, params);
+        const retrospective = await judgeResponseFollowup(e, params);
         cache.save("retrospective", retrospective);
-    }
-    return { ...judgment, retrospective };
+        return retrospective;
+    };
+    const [judgment, retrospective] = await Promise.allSettled([
+        judgeResponse(e, params, sentimentEnabled, cache), assessRetrospective(),
+    ]);
+    if (judgment.status === "rejected")
+        throw judgment.reason;
+    if (retrospective.status === "rejected")
+        throw retrospective.reason;
+    return { ...judgment.value, retrospective: retrospective.value };
 }
