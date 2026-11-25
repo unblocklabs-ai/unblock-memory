@@ -6,12 +6,20 @@ export function runtimeConfig(ctx: OpenClawPluginToolContext): OpenClawConfig | 
   return ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
 }
 
-export function getContext(ctx: OpenClawPluginToolContext): { cfg: OpenClawConfig; agentId: string; requestContext: MemoryRequestContext } | undefined {
+export function getContext(ctx: OpenClawPluginToolContext): {
+  cfg: OpenClawConfig;
+  agentId: string;
+  requestContext: MemoryRequestContext;
+  requesterSenderId?: string;
+  runId?: string;
+} | undefined {
   const cfg = runtimeConfig(ctx);
   if (!cfg || !ctx.agentId) return undefined;
   return {
     cfg,
     agentId: ctx.agentId,
+    requesterSenderId: typeof ctx.requesterSenderId === "string" ? ctx.requesterSenderId : undefined,
+    runId: typeof ctx.runId === "string" ? ctx.runId : undefined,
     requestContext: {
       sessionKey: ctx.sessionKey,
       sessionId: ctx.sessionId,

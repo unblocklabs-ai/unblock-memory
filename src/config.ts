@@ -10,6 +10,7 @@ import { DEFAULT_LEARNING, resolvePeopleLearning, type PeopleLearningConfig } fr
 import { resolveInsideOut, type InsideOutConfig } from "./inside-out.js";
 import { resolveSafetyWhisperer, type SafetyWhispererConfig } from "./safety-config.js";
 import { resolveMyTurn, type MyTurnConfig } from "./my-turn.js";
+import { resolveRecallLedger, type RecallLedgerConfig } from "./recall-ledger.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -92,6 +93,7 @@ export type UnblockMemoryConfig = {
     api: { endpoint: string; apiKeyFile?: string };
   };
   safetyWhisperer: SafetyWhispererConfig;
+  recallLedger: RecallLedgerConfig;
 };
 
 export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
@@ -431,7 +433,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -532,5 +534,6 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     insideOut: resolveInsideOut(config.insideOut),
     memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
     safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
+    recallLedger: resolveRecallLedger(config.recallLedger),
     decisionModel: resolveDecisionModel(config.decisionModel) };
 }

@@ -6,4 +6,6 @@ export declare function getContext(ctx: OpenClawPluginToolContext): {
     cfg: OpenClawConfig;
     agentId: string;
     requestContext: MemoryRequestContext;
+    requesterSenderId?: string;
+    runId?: string;
 } | undefined;

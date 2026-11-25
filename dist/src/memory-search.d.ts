@@ -1,6 +1,7 @@
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { QueryConversation, QueryPair } from "./query-contract.js";
 import { type RetrievalTimings } from "./retrieval-timing.js";
+import { type RecallHitDisposition, type RecallHitLocator } from "./recall-ledger.js";
 export type MemoryCandidateManager = {
     searchCandidates(queries: QueryPair, options: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
 };
@@ -16,6 +17,16 @@ export type MemorySearchObservation = RetrievalTimings & {
 export type MemoryRanking = {
     rankingMode: "decision" | "retrieval";
     fallbackReason?: "key_unavailable" | "all_judgments_failed";
+};
+export type RecallCandidateTrace = {
+    hit: CorpusMemorySearchResult;
+    passageId: string;
+    locator: RecallHitLocator;
+    retrievalRank: number;
+    retrievalScore: number;
+    usefulnessScore?: number;
+    disposition: RecallHitDisposition | "passed";
+    finalRank?: number;
 };
 /** Both entry points use the same complete passages and independent usefulness judgments. */
 export declare function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
@@ -37,6 +48,7 @@ export declare function searchMemory(manager: MemoryCandidateManager, queries: Q
         elapsedMs: number;
         error?: unknown;
     }) => void;
+    onTrace?: (candidates: RecallCandidateTrace[]) => void;
 }): Promise<MemorySearchObservation & MemoryRanking & {
     results: CorpusMemorySearchResult[];
 }>;

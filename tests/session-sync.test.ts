@@ -127,6 +127,7 @@ test("incrementally projects only configured active sessions and indexes changed
   assert.doesNotMatch(document, /Abandoned branch/);
   assert.equal(session.projectorVersion, PROJECTOR_VERSION);
   assert.deepEqual(session.messages, [{ type: "user", name: "Bek", timestamp: "2026-08-25 14:32:09 UTC",
+    timestampMs: Date.UTC(2026, 7, 25, 14, 32, 9),
     start: document.indexOf("## User"), bodyStart: document.indexOf("Hello memory"), end: document.length - 1 }]);
   assert.equal((await stat(outputDir)).mode & 0o777, 0o700);
   assert.equal((await stat(join(outputDir, session.documentPath))).mode & 0o777, 0o600);

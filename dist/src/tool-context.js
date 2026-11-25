@@ -9,6 +9,8 @@ export function getContext(ctx) {
     return {
         cfg,
         agentId: ctx.agentId,
+        requesterSenderId: typeof ctx.requesterSenderId === "string" ? ctx.requesterSenderId : undefined,
+        runId: typeof ctx.runId === "string" ? ctx.runId : undefined,
         requestContext: {
             sessionKey: ctx.sessionKey,
             sessionId: ctx.sessionId,

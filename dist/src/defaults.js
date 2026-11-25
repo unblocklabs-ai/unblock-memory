@@ -41,6 +41,9 @@ const ranges = {
     "insideOut.defaultMaxInteractions": [1, 10000],
     "insideOut.defaultMaxContextTokens": [256, 30_000],
     "insideOut.defaultBaselineMinInteractions": [1, 10000],
+    "recallLedger.defaultRetentionDays": [1, 3650],
+    "recallLedger.maxQueueSize": [1, 10000],
+    "recallLedger.shutdownTimeoutMs": [100, 10000],
 };
 function record(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);

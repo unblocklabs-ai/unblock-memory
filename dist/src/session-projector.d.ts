@@ -42,6 +42,7 @@ export type SessionMessageSpan = {
     type: "user" | "assistant";
     name: string;
     timestamp: string;
+    timestampMs?: number;
     start: number;
     bodyStart: number;
     end: number;
@@ -51,6 +52,7 @@ export type SessionContextSpans = {
         start: number;
         end: number;
         timestamp: string;
+        timestampMs?: number;
     };
     turn: {
         start: number;

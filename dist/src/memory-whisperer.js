@@ -6,6 +6,7 @@ import { QueryInputBudgetError } from "./query-contract.js";
 import { searchMemory, memoryPassageId } from "./memory-search.js";
 import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
+import { nonBlank } from "./guards.js";
 const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
 const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
 const MAX_PAYLOAD_CHARS = DEFAULTS.memoryWhisperer.maxInjectedChars;
@@ -59,15 +60,27 @@ async function generateQueriesWithFallback(params) {
 async function selectComplementaryHints(params) {
     const { ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log } = params;
     let selected = ranked.slice(0, config.maxHints);
-    if (!config.complementaryHints || config.maxHints <= 1 || ranked.length <= 1)
-        return selected;
+    const redundantIds = new Set();
+    if (!config.complementaryHints || config.maxHints <= 1 || ranked.length <= 1) {
+        return { selected, redundantIds };
+    }
     turn.stage = "redundancy";
     try {
         const pairs = await reviewMemoryRedundancy({
             apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, signal,
             excerpts: ranked.slice(0, DEFAULTS.review.maxRedundancyCandidates).map(candidate => candidate.excerpt),
         });
-        selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]);
+        const selectedIndices = complementaryIndices(ranked.length, pairs, config.maxHints);
+        const chosen = [];
+        for (let index = 0; index < ranked.length && chosen.length < config.maxHints; index++) {
+            const isRedundant = pairs.some(pair => pair.later === index && chosen.includes(pair.earlier) && pair.redundant >= DEFAULTS.review.minRedundancy);
+            if (isRedundant)
+                redundantIds.add(ranked[index].id);
+            else
+                chosen.push(index);
+        }
+        selected = selectedIndices.map(index => ranked[index]);
+        return { selected, redundantIds };
     }
     catch (error) {
         // Preserve the original useful candidates when the optional refinement is unavailable.
@@ -75,8 +88,8 @@ async function selectComplementaryHints(params) {
             diagnostics?.record(agentId, "memory", "redundancy_unavailable");
             log("warn", "redundancy_unavailable", failureFields(error));
         }
+        return { selected, redundantIds };
     }
-    return selected;
 }
 function renderBoundedHints(selected) {
     // Bound the complete injected payload without slicing individual excerpts into misleading prefixes.
@@ -98,7 +111,86 @@ function renderBoundedHints(selected) {
     }
     return { emitted, rendered };
 }
-export function registerMemoryWhisperer(api, runtime, config, decisionModel, diagnostics) {
+function splitChannelThread(value) {
+    if (!value)
+        return {};
+    const lower = value.toLowerCase();
+    const threadIdx = lower.lastIndexOf(":thread:");
+    const topicIdx = lower.lastIndexOf(":topic:");
+    const splitAt = Math.max(threadIdx, topicIdx);
+    if (splitAt > 0) {
+        const markerLen = splitAt === threadIdx ? ":thread:".length : ":topic:".length;
+        return {
+            channelId: value.slice(0, splitAt).toLowerCase(),
+            threadId: nonBlank(value.slice(splitAt + markerLen)),
+        };
+    }
+    return { channelId: lower };
+}
+function chatTypeFromSessionKey(sessionKey) {
+    if (!sessionKey)
+        return undefined;
+    const match = /:(direct|group|channel):/iu.exec(sessionKey);
+    return match?.[1]?.toLowerCase();
+}
+function whispererOrigin(context, sessionKey) {
+    const provider = nonBlank(context.messageProvider)?.toLowerCase();
+    const accountId = nonBlank(context.accountId)?.toLowerCase();
+    const senderId = nonBlank(context.senderId);
+    const rawChannel = nonBlank(context.chatId) ?? nonBlank(context.channelId);
+    const split = splitChannelThread(rawChannel);
+    const channelId = split.channelId && split.channelId !== provider ? split.channelId : undefined;
+    const threadId = split.threadId ?? nonBlank(context.threadId);
+    const chatType = nonBlank(context.chatType)?.toLowerCase() ?? chatTypeFromSessionKey(sessionKey);
+    return { provider, accountId, senderId, channelId, threadId, chatType };
+}
+function buildRecallHits(traces, emittedRanks, selectedIds, redundantIds) {
+    return traces.map((trace) => {
+        let disposition;
+        let finalRank = trace.finalRank;
+        if (trace.disposition === "passed") {
+            const emittedRank = emittedRanks.get(trace.passageId);
+            if (emittedRank !== undefined) {
+                disposition = "emitted";
+                finalRank = emittedRank;
+            }
+            else if (selectedIds.has(trace.passageId)) {
+                disposition = "payload_limit";
+                finalRank = undefined;
+            }
+            else {
+                disposition = redundantIds.has(trace.passageId) ? "redundant" : "rank_limit";
+                finalRank = undefined;
+            }
+        }
+        else {
+            disposition = trace.disposition;
+        }
+        return {
+            rawLeafId: trace.locator.rawLeafId,
+            passageId: trace.passageId,
+            docHash: trace.locator.docHash,
+            qmdSeq: trace.locator.qmdSeq,
+            chunkPos: trace.locator.chunkPos,
+            chunkLen: trace.locator.chunkLen,
+            corpus: trace.hit.corpus,
+            sourcePath: trace.hit.path,
+            startLine: trace.hit.startLine,
+            endLine: trace.hit.endLine,
+            targetSessionId: trace.hit.session?.sessionId,
+            extractedId: trace.hit.extracted?.id,
+            extractedRevision: trace.hit.extracted?.revision,
+            observedAtMs: trace.locator.observedAtMs,
+            observedAtBasis: trace.locator.observedAtBasis,
+            retrievalRank: trace.retrievalRank,
+            retrievalScore: trace.retrievalScore,
+            usefulnessScore: trace.usefulnessScore,
+            disposition,
+            finalRank,
+        };
+    });
+}
+export function registerMemoryWhisperer(api, runtime, config, decisionModel, diagnostics, recallLedger) {
     if (!config.enabled || !decisionModel.enabled)
         return;
     const sessions = new Map();
@@ -161,6 +253,40 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
         }
         const { signal } = state.controller;
         const timer = setTimeout(() => state.controller.abort(new DOMException("Memory deadline", "TimeoutError")), config.timeoutMs);
+        const createdAtMs = Date.now();
+        const rawMessageId = nonBlank(event.currentUserMessageId);
+        const eventKey = `whisperer:${scope}:${rawMessageId ?? runId}`;
+        const origin = whispererOrigin(context, sessionKey);
+        let generatedQueries;
+        let traces = [];
+        let ledgerRecorded = false;
+        const recordLedger = (outcome, rankingMode = "decision", emittedRanks = new Map(), selectedIds = new Set(), redundantIds = new Set()) => {
+            if (!recallLedger || ledgerRecorded)
+                return;
+            ledgerRecorded = true;
+            recallLedger.writer.enqueue(recallLedger.dbPathForAgent(agentId), {
+                kind: "query",
+                record: {
+                    eventKey,
+                    createdAtMs,
+                    agentId,
+                    source: "whisperer",
+                    sessionId,
+                    sessionKey,
+                    runId,
+                    ...origin,
+                    lexQuery: generatedQueries?.lex,
+                    vecQuery: generatedQueries?.vec,
+                    queryFallback: turn.queryFallback,
+                    corpora,
+                    rankingMode,
+                    decisionModel: decisionModel.model,
+                    minUsefulness: config.minUsefulness,
+                    outcome,
+                    hits: buildRecallHits(traces, emittedRanks, selectedIds, redundantIds),
+                },
+            });
+        };
         const run = async () => {
             const conversation = queryConversation(event.prompt, event.messages, currentUserMessage);
             turn.stage = "credentials";
@@ -170,6 +296,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             if (!apiKey) {
                 turn.reason = "missing_key";
                 diagnostics?.record(agentId, "memory", "missing_key");
+                recordLedger("missing_key");
                 return;
             }
             const queries = await generateQueriesWithFallback({
@@ -177,6 +304,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             });
             if (!queries || signal.aborted)
                 return;
+            generatedQueries = queries;
             turn.queryCount = 2;
             turn.stage = "retrieval";
             const { manager } = await timeStage("setupMs", turn.measurement, signal, () => runtime.getMemorySearchManager({ cfg: api.config, agentId }));
@@ -185,6 +313,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             if (!manager) {
                 turn.reason = "unavailable";
                 diagnostics?.record(agentId, "memory", "unavailable");
+                recordLedger("unavailable");
                 return;
             }
             const search = await searchMemory(manager, queries, {
@@ -210,6 +339,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                         log("info", "candidate_completed", fields);
                     }
                 },
+                ...(recallLedger ? { onTrace: (recorded) => { traces = recorded; } } : {}),
             });
             if (signal.aborted || sessions.get(key) !== state)
                 return;
@@ -217,30 +347,36 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             if (!search.eligible) {
                 turn.reason = "no_candidates";
                 diagnostics?.record(agentId, "memory", "no_candidates");
+                recordLedger("empty", search.rankingMode);
                 return;
             }
             if (!search.requestsSucceeded) {
                 turn.reason = "all_candidates_failed";
                 turn.measurement.outcome = "failed";
                 diagnostics?.record(agentId, "memory", "failed");
+                recordLedger("failed", search.rankingMode);
                 return;
             }
             const ranked = search.results.map(hit => ({ hit, excerpt: hit.snippet, id: memoryPassageId(hit.snippet) }));
             if (!ranked.length) {
                 turn.reason = "rejected";
                 diagnostics?.record(agentId, "memory", "rejected");
+                recordLedger("rejected", search.rankingMode);
                 return;
             }
-            const selected = await selectComplementaryHints({
+            const { selected, redundantIds } = await selectComplementaryHints({
                 ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log,
             });
             if (signal.aborted || sessions.get(key) !== state)
                 return;
             turn.stage = "render";
             const { emitted, rendered } = renderBoundedHints(selected);
+            const selectedIds = new Set(selected.map(candidate => candidate.id));
+            const emittedRanks = new Map(emitted.map((candidate, index) => [candidate.id, index + 1]));
             if (!emitted.length) {
                 turn.reason = "payload_limit";
                 diagnostics?.record(agentId, "memory", "payload_limit");
+                recordLedger("rejected", search.rankingMode, emittedRanks, selectedIds, redundantIds);
                 return;
             }
             for (const candidate of emitted)
@@ -251,6 +387,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             turn.reason = "emitted";
             turn.measurement.results = emitted.length;
             turn.measurement.contextChars = appendContext.length;
+            recordLedger("emitted", search.rankingMode, emittedRanks, selectedIds, redundantIds);
             return { appendContext };
         };
         // Prompt rebuilds need the same context, not another retrieval or an empty hook result.
@@ -265,12 +402,16 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                     turn.reason = "input_too_large";
                     turn.measurement.outcome = "skipped";
                     diagnostics?.record(agentId, "memory", "input_too_large");
+                    if (sessions.get(key) === state)
+                        recordLedger("skipped");
                     return;
                 }
                 turn.reason = "stage_failed";
                 turn.measurement.outcome = "failed";
                 diagnostics?.record(agentId, "memory", "failed");
                 log("warn", "stage_failed", failureFields(error));
+                if (sessions.get(key) === state)
+                    recordLedger("failed");
                 return;
             }
             finally {
@@ -279,6 +420,8 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 if (signal.aborted) {
                     turn.measurement.outcome = timedOut ? "timed_out" : "cancelled";
                     turn.reason = timedOut ? "deadline" : "cancelled";
+                    if (sessions.get(key) === state)
+                        recordLedger(timedOut ? "timed_out" : "cancelled");
                 }
                 diagnostics?.measureMemory(agentId, turn.measurement);
                 log("info", "completed", {

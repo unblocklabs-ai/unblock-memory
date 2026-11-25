@@ -43,13 +43,14 @@ export type SessionMessageSpan = {
   type: "user" | "assistant";
   name: string;
   timestamp: string;
+  timestampMs?: number;
   start: number;
   bodyStart: number;
   end: number;
 };
 
 export type SessionContextSpans = {
-  message: { start: number; end: number; timestamp: string };
+  message: { start: number; end: number; timestamp: string; timestampMs?: number };
   turn: { start: number; end: number };
 };
 
@@ -214,7 +215,7 @@ export function projectSessionDocument(input: SessionProjectionInput): {
     content += `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ${timestamp}\n\n`;
     const bodyStart = content.length;
     content += message.text;
-    spans.push({ type: message.role, name: message.speaker, timestamp, start, bodyStart, end: content.length });
+    spans.push({ type: message.role, name: message.speaker, timestamp, timestampMs: message.timestamp, start, bodyStart, end: content.length });
   }
   return { content: `${content}\n`, messages: spans };
 }
@@ -258,6 +259,7 @@ export function sessionContextSpans(
     start: markers[containing]!.start,
     end: markers[containing + 1]?.start ?? content.length,
     timestamp: markers[containing]!.timestamp,
+    ...(markers[containing]!.timestampMs !== undefined ? { timestampMs: markers[containing]!.timestampMs } : {}),
   };
   let turnStart = containing;
   while (turnStart > 0 && markers[turnStart]!.type !== "user") turnStart -= 1;

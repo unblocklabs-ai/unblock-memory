@@ -121,6 +121,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         analysisExecutable?: string;
         analysisRunner?: AnalysisRunner;
         sessions?: ManagerSessionConfig;
+        trackRecallLocators?: boolean;
     });
     start(): Promise<void>;
     syncExtracted(): Promise<void>;

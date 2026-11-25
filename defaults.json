@@ -158,5 +158,11 @@
     "watchDebounceMs": 250,
     "watchRetryMs": 1000,
     "flushReserveTokensFloor": 20000
+  },
+  "recallLedger": {
+    "defaultRetentionDays": 90,
+    "maxQueueSize": 256,
+    "pruneIntervalMs": 3600000,
+    "shutdownTimeoutMs": 3500
   }
 }

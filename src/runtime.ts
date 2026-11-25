@@ -383,6 +383,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #keepEmbeddingModelWarm: boolean;
   readonly #stateRoot: string;
   readonly #onError?: (error: unknown) => void;
+  readonly #recallLedgerEnabled: boolean;
   readonly #managers = new Map<string, Promise<QmdMemoryManager>>();
   readonly #closingManagers = new Map<string, Promise<void>>();
   readonly #activeSessionSyncs = new Map<string, Promise<void>>();
@@ -463,6 +464,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       keepEmbeddingModelWarm?: boolean;
       stateRoot?: string;
       extraction?: ExtractionConfig;
+      recallLedgerEnabled?: boolean;
       onError?: (error: unknown) => void;
     } = {},
   ) {
@@ -471,7 +473,20 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     this.#analysisExecutable = options.analysisExecutable;
     this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
     this.#stateRoot = options.stateRoot ?? resolveStateDir();
+    this.#recallLedgerEnabled = options.recallLedgerEnabled ?? false;
     this.#onError = options.onError;
+  }
+
+  memoryDatabasePath(agentId: string): string {
+    return join(this.#stateDir(agentId), MEMORY_DATABASE);
+  }
+
+  searchableCorpora(): string[] {
+    const names = this.#corpora.filter((corpus) => corpus.kind !== "skills").map((corpus) => corpus.name);
+    if (this.#extraction?.enabled && this.#extraction.publish && !names.includes("extracted")) {
+      names.push("extracted");
+    }
+    return names;
   }
 
   async getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }) {
@@ -884,6 +899,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       keepModelsWarm: this.#keepEmbeddingModelWarm,
       analysisExecutable: this.#analysisExecutable,
       sessions,
+      trackRecallLocators: this.#recallLedgerEnabled,
     });
     try {
       await manager.start();

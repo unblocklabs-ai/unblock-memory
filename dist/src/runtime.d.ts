@@ -48,8 +48,11 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         keepEmbeddingModelWarm?: boolean;
         stateRoot?: string;
         extraction?: ExtractionConfig;
+        recallLedgerEnabled?: boolean;
         onError?: (error: unknown) => void;
     });
+    memoryDatabasePath(agentId: string): string;
+    searchableCorpora(): string[];
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;
         agentId: string;

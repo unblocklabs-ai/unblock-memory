@@ -19,6 +19,8 @@ import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 import { trainingCandidates } from "./training-candidates.js";
 import { expandSessionSearchHit, renderMemoryPassage } from "./memory-passage.js";
 import { startTiming, timeStage, vectorTrace, vectorParts, unaccounted } from "./retrieval-timing.js";
+import { attachHitLocator, parseDailyFilenameDateMs, sha256Text } from "./recall-ledger.js";
+import { memoryPassageId } from "./memory-search.js";
 export { expandSessionSearchHit } from "./memory-passage.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = DEFAULTS.memoryWhisperer.memoryGetMaxChars;
@@ -224,6 +226,7 @@ export class QmdMemoryManager {
     #analysisExecutable;
     #analysisRunner;
     #sessions;
+    #trackRecallLocators;
     #store;
     #storePromise;
     #curation;
@@ -286,6 +289,7 @@ export class QmdMemoryManager {
         this.#analysisExecutable = params.analysisExecutable;
         this.#analysisRunner = params.analysisRunner ?? runAnalysisWorker;
         this.#sessions = params.sessions;
+        this.#trackRecallLocators = params.trackRecallLocators ?? false;
     }
     async start() {
         this.#assertOpen();
@@ -976,6 +980,27 @@ export class QmdMemoryManager {
     }
     async #renderSearchHits(hits, store, opts, whisperer = false) {
         const tokenizer = store.internal?.llm;
+        const vectorDb = this.#trackRecallLocators ? store.internal?.db : undefined;
+        let seqStmt;
+        if (vectorDb) {
+            try {
+                seqStmt = vectorDb.prepare("SELECT seq FROM content_vectors WHERE hash = ? AND pos = ? AND chunk_len = ? LIMIT 1");
+            }
+            catch {
+                seqStmt = undefined;
+            }
+        }
+        const lookupQmdSeq = (docHash, pos, len) => {
+            if (!seqStmt)
+                return undefined;
+            try {
+                const row = seqStmt.get(docHash, pos, len);
+                return typeof row?.seq === "number" && Number.isInteger(row.seq) ? row.seq : undefined;
+            }
+            catch {
+                return undefined;
+            }
+        };
         const results = [];
         const current = new Map(this.#currentExtracted(hits.map(hit => hit.file), opts?.sessionFilter).map(r => [extractedUri(r), r]));
         for (const hit of hits) {
@@ -987,12 +1012,27 @@ export class QmdMemoryManager {
             const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
             if (collection === EXTRACTED_COLLECTION) {
                 const record = current.get(hit.file);
-                if (record && record.text.length <= (opts?.maxSnippetChars ?? Infinity))
-                    results.push(extractedHit(record, hit.score));
+                if (record && record.text.length <= (opts?.maxSnippetChars ?? Infinity)) {
+                    const item = extractedHit(record, hit.score);
+                    if (this.#trackRecallLocators) {
+                        const docHash = sha256Text(record.text);
+                        attachHitLocator(item, {
+                            rawLeafId: memoryPassageId(hit.bestChunk || record.text),
+                            docHash,
+                            qmdSeq: lookupQmdSeq(docHash, hit.chunkPos, hit.chunkLen),
+                            chunkPos: hit.chunkPos,
+                            chunkLen: hit.chunkLen,
+                            observedAtMs: Number.isFinite(record.observedAt) ? record.observedAt : undefined,
+                            observedAtBasis: Number.isFinite(record.observedAt) ? "extracted" : "unknown",
+                        });
+                    }
+                    results.push(item);
+                }
                 continue;
             }
-            const corpus = collection ? this.#sources.get(collection)?.corpus : undefined;
-            if (!corpus)
+            const source = collection ? this.#sources.get(collection) : undefined;
+            const corpus = source?.corpus;
+            if (!corpus || !source)
                 continue;
             const relativePath = collection && hit.file.startsWith(`qmd://${collection}/`)
                 ? hit.file.slice(`qmd://${collection}/`.length)
@@ -1007,9 +1047,9 @@ export class QmdMemoryManager {
                     projection.projectionHash === projectionHash(hit.body)
                     ? projection.messages : parseSessionMessageSpans(hit.body)
                 : undefined;
-            const messageTimestamp = messages
-                ? sessionContextSpans(hit.body, hit.chunkPos, messages)?.message.timestamp
-                : undefined;
+            const contextSpan = messages ? sessionContextSpans(hit.body, hit.chunkPos, messages) : undefined;
+            const messageTimestamp = contextSpan?.message.timestamp;
+            const messageTimestampMs = contextSpan?.message.timestampMs;
             const selected = whisperer ? await renderMemoryPassage(hit, messages)
                 : corpus === "sessions" && this.#sessions && tokenizer
                     ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text), opts?.maxSnippetChars, messages)
@@ -1017,7 +1057,7 @@ export class QmdMemoryManager {
             if (!selected?.text)
                 continue;
             const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
-            results.push({
+            const item = {
                 path: hit.file,
                 ...span,
                 score: hit.score,
@@ -1029,7 +1069,26 @@ export class QmdMemoryManager {
                 ...(session ? { session } : {}),
                 ...(messageTimestamp ? { messageTimestamp } : {}),
                 citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
-            });
+            };
+            if (this.#trackRecallLocators) {
+                const docHash = sha256Text(hit.body);
+                const isMemoryDateSource = corpus !== "sessions" && relativePath !== undefined && (corpus === "memory" || basename(source.root) === "memory" || /(?:^|\/)memory\//u.test(relativePath));
+                const fileDateMs = isMemoryDateSource && relativePath ? parseDailyFilenameDateMs(relativePath) : undefined;
+                attachHitLocator(item, {
+                    rawLeafId: memoryPassageId(hit.bestChunk),
+                    docHash,
+                    qmdSeq: lookupQmdSeq(docHash, hit.chunkPos, hit.chunkLen),
+                    chunkPos: hit.chunkPos,
+                    chunkLen: hit.chunkLen,
+                    observedAtMs: messageTimestampMs ?? fileDateMs,
+                    observedAtBasis: messageTimestampMs !== undefined
+                        ? "session_message"
+                        : fileDateMs !== undefined
+                            ? "filename_date"
+                            : "unknown",
+                });
+            }
+            results.push(item);
         }
         // Expansion above can yield; recheck only derived hits once more before returning.
         const finalPaths = new Set(this.#currentExtracted(results.map(hit => hit.path), opts?.sessionFilter).map(extractedUri));

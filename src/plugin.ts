@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { DEFAULTS } from "./defaults.js";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -25,13 +26,15 @@ import { registerResponseAudit } from "./response-runtime.js";
 import { registerInsideOut } from "./inside-out-runtime.js";
 import { registerMemoryTraining } from "./training-runtime.js";
 import { resolveTimezone } from "./session-projector.js";
-import { searchMemory } from "./memory-search.js";
+import { searchMemory, type RecallCandidateTrace } from "./memory-search.js";
 import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
 import type { RetrievalObservation } from "./retrieval-telemetry.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
 import { registerPeopleLearning, registerPeopleLearningCli } from "./people-learning-runtime.js";
+import { nonBlank } from "./guards.js";
+import { RecallLedgerWriter, type RecallHitRecord, type RecallQueryOutcome } from "./recall-ledger.js";
 
 function managerUnavailable(error?: string) {
   return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
@@ -95,7 +98,73 @@ const syncSessionsParameters = Type.Object(
 
 const syncStatusParameters = Type.Object({}, { additionalProperties: false });
 
-function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext, decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics: WhispererDiagnostics) {
+type RecallLedgerSink = {
+  writer: RecallLedgerWriter;
+  dbPathForAgent: (agentId: string) => string;
+};
+
+function toolOrigin(active: NonNullable<ReturnType<typeof getContext>>) {
+  const provider = nonBlank(active.requestContext.messageChannel)?.toLowerCase();
+  const accountId = nonBlank(active.requestContext.agentAccountId)?.toLowerCase();
+  const senderId = nonBlank(active.requesterSenderId);
+  const rawChannel = nonBlank(active.requestContext.nativeChannelId);
+  const lower = rawChannel?.toLowerCase();
+  const threadIdx = lower ? lower.lastIndexOf(":thread:") : -1;
+  const topicIdx = lower ? lower.lastIndexOf(":topic:") : -1;
+  const splitAt = Math.max(threadIdx, topicIdx);
+  const baseChannel = rawChannel && splitAt > 0 ? rawChannel.slice(0, splitAt).toLowerCase() : lower;
+  const deliveryThread = active.requestContext.deliveryContext?.threadId;
+  const deliveryThreadStr = typeof deliveryThread === "number" ? String(deliveryThread) : nonBlank(deliveryThread);
+  const threadId = rawChannel && splitAt > 0
+    ? nonBlank(rawChannel.slice(splitAt + (splitAt === threadIdx ? ":thread:".length : ":topic:".length)))
+    : deliveryThreadStr;
+  const chatType = /:(direct|group|channel):/iu.exec(active.requestContext.sessionKey ?? "")?.[1]?.toLowerCase();
+  return {
+    provider,
+    accountId,
+    senderId,
+    channelId: baseChannel && baseChannel !== provider ? baseChannel : undefined,
+    threadId,
+    chatType,
+  };
+}
+
+function toolEventScope(active: NonNullable<ReturnType<typeof getContext>>): string {
+  return nonBlank(active.runId) ?? nonBlank(active.requestContext.sessionId) ?? nonBlank(active.requestContext.sessionKey) ?? active.agentId;
+}
+
+function toolTraceToHits(traces: readonly RecallCandidateTrace[]): RecallHitRecord[] {
+  return traces.map((trace) => ({
+    rawLeafId: trace.locator.rawLeafId,
+    passageId: trace.passageId,
+    docHash: trace.locator.docHash,
+    qmdSeq: trace.locator.qmdSeq,
+    chunkPos: trace.locator.chunkPos,
+    chunkLen: trace.locator.chunkLen,
+    corpus: trace.hit.corpus,
+    sourcePath: trace.hit.path,
+    startLine: trace.hit.startLine,
+    endLine: trace.hit.endLine,
+    targetSessionId: trace.hit.session?.sessionId,
+    extractedId: trace.hit.extracted?.id,
+    extractedRevision: trace.hit.extracted?.revision,
+    observedAtMs: trace.locator.observedAtMs,
+    observedAtBasis: trace.locator.observedAtBasis,
+    retrievalRank: trace.retrievalRank,
+    retrievalScore: trace.retrievalScore,
+    usefulnessScore: trace.usefulnessScore,
+    disposition: trace.disposition === "passed" ? "returned" : trace.disposition,
+    finalRank: trace.finalRank,
+  }));
+}
+
+function createSearchTool(
+  runtime: QmdMemoryRuntime,
+  ctx: OpenClawPluginToolContext,
+  decisionModel: UnblockMemoryConfig["decisionModel"],
+  diagnostics: WhispererDiagnostics,
+  recallLedger?: RecallLedgerSink,
+) {
   const active = getContext(ctx);
   if (!active) return null;
   return {
@@ -104,9 +173,49 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
     description:
       "Search this agent's memory corpora with BM25 and vector queries. The configured decision endpoint (Codex LB by default) receives the semantic query and candidate passages to rank usefulness. If judging is unavailable, returns unjudged retrieval leads without applying minUsefulness. Supply keywords in bm25Query and the information needed in vectorQuery. Skills are excluded. Inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
     parameters: searchParameters,
-    async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+    async execute(toolCallId: string, params: unknown, signal?: AbortSignal) {
       const started = performance.now();
+      const createdAtMs = Date.now();
       const measurement: RetrievalObservation = { outcome: "failed", elapsedMs: 0 };
+      const eventKey = `tool:${toolEventScope(active)}:${nonBlank(toolCallId) ?? randomUUID()}`;
+      let parsedQueries: { lex: string; vec: string } | undefined;
+      let effectiveCorpora: string[] = runtime.searchableCorpora();
+      let sessionFilterJson: string | undefined;
+      let requestedMinUsefulness: number | undefined;
+      let ledgerRecorded = false;
+      const enqueueToolQuery = (
+        outcome: RecallQueryOutcome,
+        rankingMode: "decision" | "retrieval",
+        hits: readonly RecallHitRecord[] = [],
+        fallbackReason?: "key_unavailable" | "all_judgments_failed",
+      ) => {
+        if (!recallLedger || ledgerRecorded) return;
+        ledgerRecorded = true;
+        recallLedger.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
+          kind: "query",
+          record: {
+            eventKey,
+            createdAtMs,
+            agentId: active.agentId,
+            source: "tool",
+            sessionId: active.requestContext.sessionId,
+            sessionKey: active.requestContext.sessionKey,
+            runId: active.runId,
+            ...toolOrigin(active),
+            lexQuery: parsedQueries?.lex,
+            vecQuery: parsedQueries?.vec,
+            queryFallback: false,
+            corpora: effectiveCorpora,
+            sessionFilterJson,
+            rankingMode,
+            fallbackReason,
+            decisionModel: decisionModel.model,
+            minUsefulness: requestedMinUsefulness ?? 0.7,
+            outcome,
+            hits,
+          },
+        });
+      };
       try {
         signal?.throwIfAborted();
         const {
@@ -118,18 +227,29 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
           minUsefulness,
         } = Value.Parse(searchParameters, params);
         const queries = { lex: bm25Query.trim(), vec: vectorQuery.trim() };
-        // Reject oversized explicit inputs before credential resolution or any service call.
+        const normalizedCorpora = corpora?.map((corpus) => corpus.trim());
+        effectiveCorpora = normalizedCorpora?.length && !normalizedCorpora.includes("all")
+          ? normalizedCorpora
+          : runtime.searchableCorpora();
+        sessionFilterJson = sessionFilter ? JSON.stringify(sessionFilter) : undefined;
+        requestedMinUsefulness = minUsefulness;
+        // Reject oversized explicit inputs before credential resolution, query capture, or any service call.
         prepareQueryConversation([], queries.lex);
         const { conversation } = prepareQueryConversation([], queries.vec);
+        parsedQueries = queries;
         let apiKey: string | undefined;
         try { apiKey = await resolveDecisionCredential(decisionModel); }
         catch { /* Explicit search can still return local evidence; never expose credential errors. */ }
         signal?.throwIfAborted();
         const { manager, error } = await runtime.getMemorySearchManager(active);
         measurement.setupMs = performance.now() - started;
-        if (!manager) return jsonResult({ results: [], error: error ?? "memory unavailable" });
+        if (!manager) {
+          enqueueToolQuery("unavailable", "decision");
+          return jsonResult({ results: [], error: error ?? "memory unavailable" });
+        }
+        let traces: RecallCandidateTrace[] = [];
         const search = await searchMemory(manager, queries, {
-          corpora: corpora?.map((corpus) => corpus.trim()),
+          corpora: normalizedCorpora,
           sessionFilter,
           maxResults,
           minUsefulness,
@@ -139,6 +259,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
           onCandidates: ({ retrievalMs, candidates, eligible }) => {
             Object.assign(measurement, { retrievalMs, candidates, eligible });
           },
+          ...(recallLedger ? { onTrace: (recorded: RecallCandidateTrace[]) => { traces = recorded; } } : {}),
         });
         measurement.requestsSucceeded = search.requestsSucceeded;
         measurement.requestsFailed = search.requestsFailed;
@@ -147,6 +268,14 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
         measurement.results = search.results.length;
         measurement.contextChars = search.results.reduce((sum, hit) => sum + hit.snippet.length, 0);
         measurement.outcome = search.rankingMode === "retrieval" ? "degraded" : search.requestsFailed ? "partial" : search.results.length ? "ok" : "empty";
+        if (recallLedger && !signal?.aborted) {
+          const ledgerOutcome: RecallQueryOutcome = measurement.outcome === "ok"
+            ? "tool_ok"
+            : measurement.outcome === "empty" && search.eligible > 0 && search.rankingMode === "decision"
+            ? "rejected"
+            : measurement.outcome;
+          enqueueToolQuery(ledgerOutcome, search.rankingMode, toolTraceToHits(traces), search.fallbackReason);
+        }
         // Compact only the public tool response; internal ranking and consumers keep
         // full-precision scores and the host's source/citation compatibility fields.
         const payload = {
@@ -169,7 +298,14 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
           details: payload,
         };
       } catch (error) {
-        if (error instanceof QueryInputBudgetError) measurement.outcome = "skipped";
+        if (error instanceof QueryInputBudgetError) {
+          measurement.outcome = "skipped";
+          enqueueToolQuery("skipped", "decision");
+        } else if (signal?.aborted) {
+          enqueueToolQuery(abortedByTimeout(signal) ? "timed_out" : "cancelled", "decision");
+        } else {
+          enqueueToolQuery("failed", "decision");
+        }
         throw error;
       } finally {
         measurement.elapsedMs = performance.now() - started;
@@ -184,7 +320,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
   };
 }
 
-function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext) {
+function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext, recallLedger?: RecallLedgerSink) {
   const active = getContext(ctx);
   if (!active) return null;
   return {
@@ -192,19 +328,68 @@ function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext
     label: "Memory Get",
     description: "Read an exact indexed qmd:// source path returned by memory tools. Defaults to 120 lines, bounded to 12,000 content characters. Check truncated/nextFrom and continue when present; not_found or unavailable is not a successful empty read.",
     parameters: getParameters,
-    async execute(_toolCallId: string, params: unknown) {
+    async execute(toolCallId: string, params: unknown) {
+      const readAtMs = Date.now();
       const { path: untrimmedPath, from, lines } = Value.Parse(getParameters, params);
       const path = untrimmedPath.trim();
+      const eventKey = `get:${toolEventScope(active)}:${nonBlank(toolCallId) ?? randomUUID()}`;
       const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) return managerUnavailable(error);
-      return jsonResult(
-        await manager.readFile({
+      if (!manager) {
+        recallLedger?.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
+          kind: "read",
+          record: {
+            eventKey,
+            readAtMs,
+            agentId: active.agentId,
+            sessionId: active.requestContext.sessionId,
+            runId: active.runId,
+            sourcePath: path,
+            startLine: from,
+            lineCount: lines,
+            status: "unavailable",
+          },
+        });
+        return managerUnavailable(error);
+      }
+      try {
+        const result = await manager.readFile({
           relPath: path,
           from,
           lines,
           requestContext: active.requestContext,
-        }),
-      );
+        });
+        recallLedger?.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
+          kind: "read",
+          record: {
+            eventKey,
+            readAtMs,
+            agentId: active.agentId,
+            sessionId: active.requestContext.sessionId,
+            runId: active.runId,
+            sourcePath: result.path || path,
+            startLine: result.status === "ok" ? (result.from ?? from) : from,
+            lineCount: result.status === "ok" ? (result.lines ?? lines) : lines,
+            status: result.status,
+          },
+        });
+        return jsonResult(result);
+      } catch (readError) {
+        recallLedger?.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
+          kind: "read",
+          record: {
+            eventKey,
+            readAtMs,
+            agentId: active.agentId,
+            sessionId: active.requestContext.sessionId,
+            runId: active.runId,
+            sourcePath: path,
+            startLine: from,
+            lineCount: lines,
+            status: "unavailable",
+          },
+        });
+        throw readError;
+      }
     },
   };
 }
@@ -554,6 +739,7 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     analysisExecutable: config.analysis.executable,
     keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
     extraction: config.extraction,
+    recallLedgerEnabled: config.recallLedger.enabled,
   });
   registerExtraction(api, config, runtime);
   const capability = {
@@ -589,20 +775,33 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     api.on("gateway_stop", () => peopleStores.closeAll());
   }
   const diagnostics = WhispererDiagnostics.shared();
+  const recallLedger: RecallLedgerSink | undefined = config.recallLedger.enabled
+    ? {
+        writer: new RecallLedgerWriter({
+          retentionDays: config.recallLedger.retentionDays,
+          onError: (error) => api.logger.warn(`unblock-memory recall_ledger write failed: ${String(error)}`),
+          onDrop: () => api.logger.warn("unblock-memory recall_ledger queue full; dropped event"),
+        }),
+        dbPathForAgent: (agentId) => runtime.memoryDatabasePath(agentId),
+      }
+    : undefined;
+  if (recallLedger) {
+    api.on("gateway_stop", () => recallLedger.writer.close());
+  }
   // The manifest sets no default for `enabled`, so true here was written by the operator.
   const skillSettings = (api.pluginConfig as { skillWhisperer?: { enabled?: unknown } } | undefined)?.skillWhisperer;
   if (skillSettings?.enabled === true && !config.skillWhisperer.enabled) {
     api.logger.warn('unblock-memory skillWhisperer.enabled is true but no corpus has kind "skills"; Skill Whisperer is inactive');
   }
   registerWhispererPrompt(api, {
-    memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics),
+    memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics, recallLedger),
     skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics),
     people: peopleWhisperer,
     myTurn: registerMyTurn(api, config.myTurn, config.decisionModel, diagnostics),
     safety: registerSafetyWhisperer(api, config, diagnostics),
   });
-  api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics), { names: ["memory_search"] });
-  api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
+  api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics, recallLedger), { names: ["memory_search"] });
+  api.registerTool((ctx) => createGetTool(runtime, ctx, recallLedger), { names: ["memory_get"] });
   api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
     names: ["memory_sync_sessions"],
   });

@@ -174,7 +174,7 @@ export function projectSessionDocument(input) {
         content += `## ${message.role === "user" ? "User" : "Assistant"} — ${message.speaker} — ${timestamp}\n\n`;
         const bodyStart = content.length;
         content += message.text;
-        spans.push({ type: message.role, name: message.speaker, timestamp, start, bodyStart, end: content.length });
+        spans.push({ type: message.role, name: message.speaker, timestamp, timestampMs: message.timestamp, start, bodyStart, end: content.length });
     }
     return { content: `${content}\n`, messages: spans };
 }
@@ -215,6 +215,7 @@ export function sessionContextSpans(content, position, markers = parseSessionMes
         start: markers[containing].start,
         end: markers[containing + 1]?.start ?? content.length,
         timestamp: markers[containing].timestamp,
+        ...(markers[containing].timestampMs !== undefined ? { timestampMs: markers[containing].timestampMs } : {}),
     };
     let turnStart = containing;
     while (turnStart > 0 && markers[turnStart].type !== "user")

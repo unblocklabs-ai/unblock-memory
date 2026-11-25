@@ -2,8 +2,23 @@ import { createHash } from "node:crypto";
 import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "./decision-ranking.js";
 import { startTiming, retrievalParts, unaccounted } from "./retrieval-timing.js";
+import { copyHitLocator, getHitLocator, parseDailyFilenameDateMs } from "./recall-ledger.js";
 export function memoryPassageId(text) {
     return createHash("sha256").update(text.replace(/\s+/gu, " ").trim()).digest("hex");
+}
+function resolveLocator(hit, passageId) {
+    const existing = getHitLocator(hit);
+    if (existing)
+        return existing;
+    const extractedMs = hit.extracted?.observedAt ? Date.parse(hit.extracted.observedAt) : Number.NaN;
+    if (Number.isFinite(extractedMs)) {
+        return { rawLeafId: passageId, observedAtMs: extractedMs, observedAtBasis: "extracted" };
+    }
+    const fileDateMs = hit.corpus !== "sessions" ? parseDailyFilenameDateMs(hit.path) : undefined;
+    if (fileDateMs !== undefined) {
+        return { rawLeafId: passageId, observedAtMs: fileDateMs, observedAtBasis: "filename_date" };
+    }
+    return { rawLeafId: passageId, observedAtBasis: "unknown" };
 }
 /** Both entry points use the same complete passages and independent usefulness judgments. */
 export async function searchMemory(manager, queries, options) {
@@ -27,18 +42,54 @@ export async function searchMemory(manager, queries, options) {
     signal?.throwIfAborted();
     const observation = { retrievalMs: timings.retrievalMs ?? 0, judgeMs: 0,
         candidates: hits.length, eligible: 0, requestsSucceeded: 0, requestsFailed: 0 };
+    const trackTrace = Boolean(options.onTrace);
     const candidates = [];
+    const traces = [];
+    const traceByCandidate = new Map();
     const endCandidatePrep = startTiming("candidatePrepMs", timings, signal);
     try {
+        let retrievalRank = 0;
         for (const hit of hits) {
             // Defense in depth before disclosing passages to the external judge.
             if (options.corpora && !options.corpora.includes("all") && !options.corpora.includes(hit.corpus))
                 continue;
             const excerpt = hit.snippet.trim();
-            if (!excerpt || excerpt.length > MEMORY_PASSAGE_CHARS || options.excludedPassages?.has(memoryPassageId(excerpt)) ||
-                duplicateMemoryPassage({ ...hit, text: excerpt }, candidates.map(candidate => ({ ...candidate, text: candidate.snippet }))))
+            if (!excerpt || excerpt.length > MEMORY_PASSAGE_CHARS)
                 continue;
-            candidates.push({ ...hit, snippet: excerpt });
+            const passageId = memoryPassageId(excerpt);
+            if (options.excludedPassages?.has(passageId)) {
+                if (trackTrace) {
+                    retrievalRank++;
+                    traces.push({
+                        hit: { ...hit, snippet: excerpt },
+                        passageId,
+                        locator: resolveLocator(hit, passageId),
+                        retrievalRank,
+                        retrievalScore: hit.score,
+                        disposition: "cooldown",
+                    });
+                }
+                continue;
+            }
+            if (duplicateMemoryPassage({ ...hit, text: excerpt }, candidates.map(candidate => ({ ...candidate, text: candidate.snippet }))))
+                continue;
+            const candidate = { ...hit, snippet: excerpt };
+            if (trackTrace)
+                copyHitLocator(hit, candidate);
+            candidates.push(candidate);
+            if (trackTrace) {
+                retrievalRank++;
+                const trace = {
+                    hit: candidate,
+                    passageId,
+                    locator: resolveLocator(candidate, passageId),
+                    retrievalRank,
+                    retrievalScore: hit.score,
+                    disposition: "unjudged_cap",
+                };
+                traces.push(trace);
+                traceByCandidate.set(candidate, trace);
+            }
         }
     }
     finally {
@@ -46,16 +97,30 @@ export async function searchMemory(manager, queries, options) {
     }
     observation.eligible = candidates.length;
     options.onCandidates?.(observation);
-    const fallback = (reason) => ({
-        ...timings, ...observation, rankingMode: "retrieval", fallbackReason: reason,
+    const fallback = (reason) => {
         // Stable retrieval-score ordering (fused RRF scores from discovery) before maxResults truncation.
         // These retrieval scores are not decision model usefulness probabilities.
-        results: [...candidates].sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5),
-    });
+        const ranked = [...candidates].sort((a, b) => b.score - a.score);
+        const limit = options.maxResults ?? 5;
+        const results = ranked.slice(0, limit);
+        if (trackTrace) {
+            for (const [index, candidate] of results.entries()) {
+                const trace = traceByCandidate.get(candidate);
+                if (trace) {
+                    trace.disposition = "returned";
+                    trace.finalRank = index + 1;
+                }
+            }
+            options.onTrace?.(traces);
+        }
+        return { ...timings, ...observation, rankingMode: "retrieval", fallbackReason: reason, results };
+    };
     if (!options.apiKey) {
         signal?.throwIfAborted();
         if (options.allowRetrievalFallback)
             return fallback("key_unavailable");
+        if (trackTrace)
+            options.onTrace?.(traces);
         return { ...timings, ...observation, rankingMode: "decision", results: [] };
     }
     const maxJudge = typeof options.maxJudgeCandidates === "number" && Number.isFinite(options.maxJudgeCandidates)
@@ -64,12 +129,14 @@ export async function searchMemory(manager, queries, options) {
     const judgePool = maxJudge !== undefined
         ? [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge)
         : candidates;
+    const minUsefulness = options.minUsefulness ?? 0.7;
     const apiKey = options.apiKey;
     const endJudge = startTiming("judgeMs", timings, signal);
     let judged;
     try {
         judged = (await Promise.all(judgePool.map(async (hit, candidateIndex) => {
             const requestStarted = performance.now();
+            const trace = trackTrace ? traceByCandidate.get(hit) : undefined;
             try {
                 const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(options.conversation, {
                     excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
@@ -79,14 +146,23 @@ export async function searchMemory(manager, queries, options) {
                 signal?.throwIfAborted();
                 observation.requestsSucceeded++;
                 options.onJudgment?.({ candidateIndex, elapsedMs: performance.now() - requestStarted });
+                if (trace) {
+                    trace.usefulnessScore = probability;
+                    trace.disposition = probability >= minUsefulness ? "rank_limit" : "below_threshold";
+                }
                 // Discovery reciprocal ranks are not vector similarity or usefulness.
                 const { vectorScore: _vectorScore, textScore: _textScore, ...result } = hit;
-                return [{ ...result, score: probability }];
+                const scored = { ...result, score: probability };
+                if (trackTrace)
+                    copyHitLocator(hit, scored);
+                return [{ result: scored, trace }];
             }
             catch (error) {
                 if (signal?.aborted)
                     return [];
                 observation.requestsFailed++;
+                if (trace)
+                    trace.disposition = "judge_failed";
                 options.onJudgment?.({ candidateIndex, elapsedMs: performance.now() - requestStarted, error });
                 return [];
             }
@@ -99,6 +175,18 @@ export async function searchMemory(manager, queries, options) {
     observation.judgeMs = timings.judgeMs ?? 0;
     if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
         return fallback("all_judgments_failed");
-    return { ...timings, ...observation, rankingMode: "decision", results: judged.filter(hit => hit.score >= (options.minUsefulness ?? 0.7))
-            .sort((a, b) => b.score - a.score).slice(0, options.maxResults ?? 5) };
+    const passed = judged
+        .filter(({ result }) => result.score >= minUsefulness)
+        .sort((a, b) => b.result.score - a.result.score)
+        .slice(0, options.maxResults ?? 5);
+    if (trackTrace) {
+        for (const [index, entry] of passed.entries()) {
+            if (entry.trace) {
+                entry.trace.disposition = "passed";
+                entry.trace.finalRank = index + 1;
+            }
+        }
+        options.onTrace?.(traces);
+    }
+    return { ...timings, ...observation, rankingMode: "decision", results: passed.map(entry => entry.result) };
 }

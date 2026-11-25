@@ -5,6 +5,7 @@ import { type PeopleLearningConfig } from "./people-learning-config.js";
 import { type InsideOutConfig } from "./inside-out.js";
 import { type SafetyWhispererConfig } from "./safety-config.js";
 import { type MyTurnConfig } from "./my-turn.js";
+import { type RecallLedgerConfig } from "./recall-ledger.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -86,6 +87,7 @@ export type UnblockMemoryConfig = {
         };
     };
     safetyWhisperer: SafetyWhispererConfig;
+    recallLedger: RecallLedgerConfig;
 };
 export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];
 export declare function resolveConfig(value: unknown): UnblockMemoryConfig;
