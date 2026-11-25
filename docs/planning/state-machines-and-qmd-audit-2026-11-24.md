@@ -1,13 +1,22 @@
 # Architectural Audit: `@unblocklabs/qmd` Friction & Implicit State Machines
 
-> **Post-Migration Re-Audit (2026-11-24 · Independent Neon + GPT-6.2 verification at `unblock-memory@0dc6dd0`, `qmd@4c60f75`):**
-> - **Part 1 QMD Corrections:**
->   - Local `node_modules/@unblocklabs/qmd` drift is **resolved** (now `3.0.4`, matching pin); QMD `main@4c60f75` has migrated off legacy `typesafe-query.ts` onto `@unblocklabs/decisions@^0.1.2` (unreleased to npm).
->   - **Premise fixes:** `exportEmbeddedSnapshot` does **not** exist in QMD (remove "just re-export"); `node-llama-cpp` `LlamaEmbeddingContext` already serializes evaluation per context (manager `#operationChain` is SQLite/lifecycle admission, not raw llama.cpp concurrency); durable curation already lives in `curation.sqlite` (only analysis tables/projected annotations remain in `index.sqlite`).
-> - **Part 2 State-Machine Corrections:**
->   - Section 3 Low (`typesafe-client.ts` provider transport/cancellation) moved into `@unblocklabs/decisions@0.1.2`.
->   - `src/mlx-query-worker.py` (Section 3 High) is **dead code** (zero callers in `src/`, `scripts/`, or `tests/`); skip.
->   - **All 5 Top-5 Fix-First Invariant Traps remain open** and are scheduled as **Batch 1 (5 strictly file-disjoint Neon swarm slices: A People Dossier, B Response Audit, C Inside Out, D Training Proof, E Session Sync & Manager Lifecycle)**. Extraction lease/cursor fencing, People Learning receipt-to-inventory binding, and atomic Python dataset publication follow in **Batch 2**.
+> **Post-Batch 2 Re-Audit (2026-11-24 · GPT-6.2 `--effort high` source audit at `unblock-memory@def90e4`, `qmd@4c60f75`, `decisions@4c94845`):**
+> - **Overall Scoreboard (92 audited entries — 6 QMD items, 5 Top-5 traps, 81 state-machine rows across §§1–10):** **16 CLOSED · 35 PARTIALLY CLOSED · 40 OPEN · 1 OUT OF SCOPE** (`src/mlx-query-worker.py` has no in-repo caller, though `package.json` & `docs/retrieval.md` still ship it for standalone use).
+> - **Top-5 Fix-First Invariant Traps:**
+>   - **CLOSED (3/5):** #1 Dossier verification/revision binding (`people-tools.ts`, `people-store.ts`, `people-hooks.ts`), #2 Response Audit memory-stage independent retry (`response-store.ts`, `response-audit.ts`, `response-judge.ts`), #3 Inside Out purge tombstones + pre/post-pass fingerprint & generation fencing (`inside-out.ts`, `inside-out-store.ts`, `emotion-baselines.ts`).
+>   - **PARTIALLY CLOSED (2/5):**
+>     - #4 Training proof: missing/failed/uncertified manifests & stale retrieval blockers are fixed, **remaining edge:** mixed backed + eligible unbacked pre-cutoff sessions in a nonempty manifest can still return `proven: true` (`src/training-retrieval.ts:165-169, 188-204, 277-295`).
+>     - #5 Session Sync ownership & proof: atomic `0o600` SQLite `BEGIN IMMEDIATE` lease (`session-sync.lock.sqlite`), reload/close admission fences (`prepareReload`), and `failedSessions` tracking are shipped; **remaining edges:** unchanged fast-path checks file existence rather than bytes, and status JSON commits separately from index/manifest (`src/session-sync.ts`, `src/runtime.ts`).
+> - **Batch 2 Closed / Substantially Hardened Areas:**
+>   - **CLOSED:** Manager queue/lazy handles/shutdown (§1 #90), Safety Whisperer & Prompt fan-in (§3 #116–117, #119), Advisory claim/cluster review (§4 #133), Response episode builder & identity (§5 #140, #146), Extraction session scan/cursor/policy-fingerprint & poisoned fragment bookmark rewind (§7 #173–174), Inside Out baseline worker & freshness cache (§8 #187), Python atomic dataset directory publication (§9 #204), Fleet CSV scanner (§10 #210).
+>   - **PARTIALLY CLOSED (major invariants landed; narrow edges remain):** Per-agent manager cache (#89), Session Sync ownership/timer/manifest (#100–101, #103–104), Memory/Skill/My-Turn whisperers (#113–115), Response retries/stage DAG/review freshness + CLI `--evidence-hash` (#142–144), People dossier delete optional `expectedRevision` & thread correlation (#156, #158), People Learning cron recognition/reconcile, atomic artifacts, manifest-revision CAS & single-tx verification (#161–162, #164–166), Extraction scheduler & predecessor conflict guard (#172, #175), Inside Out schedules/grades/baselines (#182, #185, #188), Training lease/ledger/evaluation/JSONL export/Python dataset (#195, #197–199, #201–203).
+> - **Part 1 QMD Friction (0 CLOSED · 3 PARTIALLY CLOSED · 3 OPEN):**
+>   - Local `node_modules/@unblocklabs/qmd` drift is resolved (`3.0.4` matches pin) and QMD `main@4c60f75` migrated off `typesafe-query.ts` onto `@unblocklabs/decisions@^0.1.2`, **still unreleased** (publish QMD `3.1.0`, then bump plugin pin + lockfile).
+>   - Durable curation already moved to `unblock-memory.sqlite` (`curation.sqlite` is legacy import only); `node-llama-cpp` `LlamaEmbeddingContext` already locks per context; `exportEmbeddedSnapshot` does **not** exist in QMD.
+>   - **Deferred post-release:** QMD public helper APIs (snapshot read/in-memory store, virtual collections, public embed/token/chunk/maintenance helpers, whole-doc FTS, core package split).
+> - **Worth Addressing Before Release vs Post-Release:**
+>   - *Before release (if feature used):* Mixed backed/unbacked pre-cutoff training proof (`training-retrieval.ts`), watch-failure retry retention (`manager.ts:478-500`), explicit fleet restart/health verification (`typesafe-fleet-remote.mjs:89-150`), plus the **legacy `typesafe` credential-recipient upgrade hazard** tracked in `decisions-sdk-plan-2026-11-24.md`.
+>   - *Safe post-release:* Extraction publication receipt (#176), Response Audit lease write fencing (#145), People Learning whole-window analysis coverage & cold-start cron gap (#162, #166), Inside Out cross-process grade lock & source snapshot (#182–186), Cluster/Curation/Quality medium cleanups (§4 #129–132), QMD helper APIs.
 
 **Mode:** Read-only audit (zero files modified)
 **Scope:** `@unblocklabs/qmd` integration surface (`package.json` `3.0.4`, installed `node_modules/@unblocklabs/qmd` `3.0.2`) + full `index.ts`, `src/`, and `scripts/` implicit state-machine audit by **GPT-6.2 Sol** (`high` effort).
