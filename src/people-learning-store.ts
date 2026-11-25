@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { openMemoryDatabase, immediateTransaction } from "./memory-database.js";
@@ -218,12 +219,15 @@ export class PeopleLearningStore {
     return this.#db.prepare("SELECT status,checked_at,json_extract(result,'$.basis') basis FROM people_learning_analysis WHERE run_id=?").get(id);
   }
 
+  #rememberInventory(snapshot: ReviewManifest) {
+    this.#db.prepare("INSERT OR IGNORE INTO people_learning_inventories VALUES (?,?,?,?)")
+      .run(jsonHash(snapshot), snapshot.id, JSON.stringify(snapshot), snapshot.refreshedAt ?? snapshot.createdAt);
+  }
+
   begin(manifest: ReviewManifest, beforeCommit?: (manifest: ReviewManifest) => void) {
     if (manifest.agentId !== this.agentId) throw new Error("Cross-agent review manifest");
     return immediateTransaction(this.#db, () => {
       const previous = this.#getRunRow(manifest.id);
-      const remember = (snapshot: ReviewManifest) => this.#db.prepare("INSERT OR IGNORE INTO people_learning_inventories VALUES (?,?,?,?)")
-        .run(jsonHash(snapshot), snapshot.id, JSON.stringify(snapshot), snapshot.refreshedAt ?? snapshot.createdAt);
       if (previous && !manifest.inventoryPending) {
         const prior = previous.manifest;
         if (prior.kind !== manifest.kind || JSON.stringify(prior.window) !== JSON.stringify(manifest.window)) throw new Error("Review window changed");
@@ -253,7 +257,7 @@ export class PeopleLearningStore {
         const { refreshedAt: _oldRefresh, ...oldComparable } = prior;
         if (jsonHash(next) === jsonHash(oldComparable)) {
           beforeCommit?.(previous.manifest);
-          remember(previous.manifest);
+          this.#rememberInventory(previous.manifest);
           return this.#toPublicRun(previous);
         }
         const sourcesChanged = jsonHash([prior.sessions, prior.sourceGaps, prior.roster]) !== jsonHash([sessions, sourceGaps, roster]);
@@ -261,7 +265,7 @@ export class PeopleLearningStore {
         const nextRevision = manifestRevision(nextManifest);
         // Publish the manifest artifact BEFORE committing the ledger/run row pointing to it.
         beforeCommit?.(nextManifest);
-        remember(previous.manifest);
+        this.#rememberInventory(previous.manifest);
         const gapIds = new Set(sourceGaps.map(g => g.id));
         const receipt = previous.receipt ? {
           ...previous.receipt,
@@ -273,7 +277,10 @@ export class PeopleLearningStore {
           sourceGapReviews: sourcesChanged ? [] : previous.receipt.sourceGapReviews.filter(r => gapIds.has(r.sourceGapId)),
           analysis: sourcesChanged ? { status: "unresolved" as const, reason: "Source inventory changed; recheck analysis" } : previous.receipt.analysis,
         } : undefined;
-        const reopenedRevision = sourcesChanged && previous.receipt ? nextRevision : previous.reopenedRevision;
+        // Record reopened_revision whenever a run's manifest refreshes (even before
+        // any receipt was saved) so an unversioned receipt for an earlier export
+        // can never mark the refreshed manifest complete.
+        const reopenedRevision = nextRevision;
         if (sourcesChanged) this.#db.prepare("DELETE FROM people_learning_analysis WHERE run_id=?").run(nextManifest.id);
         this.#db.prepare("UPDATE people_learning_runs SET manifest=?,receipt=?,status='partial',coverage=?,reopened_revision=? WHERE id=?")
           .run(
@@ -283,16 +290,16 @@ export class PeopleLearningStore {
             reopenedRevision,
             nextManifest.id,
           );
-        remember(nextManifest);
+        this.#rememberInventory(nextManifest);
       } else if (!previous) {
         // Publish the manifest artifact BEFORE committing the ledger/run row pointing to it.
         beforeCommit?.(manifest);
         this.#db.prepare("INSERT INTO people_learning_runs (id,manifest,receipt,status,coverage,reopened_revision) VALUES (?,?,NULL,'partial',?,NULL)")
           .run(manifest.id, JSON.stringify(manifest), JSON.stringify({ missing: ["receipt"], unresolved: manifest.sourceGaps.map(g => g.id) }));
-        remember(manifest);
+        this.#rememberInventory(manifest);
       } else {
-        remember(previous.manifest);
-        remember(manifest);
+        this.#rememberInventory(previous.manifest);
+        this.#rememberInventory(manifest);
       }
       return this.get(manifest.id)!;
     });
@@ -339,13 +346,6 @@ export class PeopleLearningStore {
     };
   }
 
-  matchesRevision(id: string, expectedRevision?: string): boolean {
-    const row = this.#getRunRow(id);
-    if (!row) return false;
-    if (expectedRevision !== undefined) return expectedRevision === row.manifestRevision;
-    return row.reopenedRevision === null;
-  }
-
   get(id: string) {
     const row = this.#getRunRow(id);
     return row ? this.#toPublicRun(row) : undefined;
@@ -376,25 +376,36 @@ export class PeopleLearningStore {
   #publishFinalized(
     id: string,
     pending: StagedCheckpoint,
+    manifest: ReviewManifest,
     result: { receiptId: string; manifestRevision: string; backlog: ReturnType<PeopleLearningStore["backlog"]> } & CoverageResult,
-    finalize: (receiptId: string) => void,
+    finalize: (receiptId: string, db: DatabaseSync, manifest: ReviewManifest) => void,
   ) {
-    // PeopleStore uses a separate connection to this database. Persist pending
-    // work before releasing our transaction; publish complete only after its
-    // verification writes succeed. A crash/failure leaves resumable backlog.
-    try { finalize(result.receiptId); }
-    catch { return result; }
+    // Run staged-revision freshness check, ALL dossier verification writes (on this.#db),
+    // and final completion UPDATE inside ONE atomic SQLite transaction. If the staged
+    // revision changed or any person's verification fails, the entire transaction rolls
+    // back and zero newly verified dossiers become visible.
     const { receiptId: _pendingId, manifestRevision: revision, backlog: _backlog, ...pendingCoverage } = result;
     const coverage = { ...pendingCoverage, status: "complete" as const, unresolved: result.unresolved.filter(r => r !== "dossier-verification") };
     const receiptId = jsonHash([result.receiptId, "verified"]);
-    const published = immediateTransaction(this.#db, () => {
-      const updated = this.#db.prepare("UPDATE people_learning_runs SET status='complete',coverage=? WHERE id=? AND manifest=? AND receipt=? AND coverage=? AND status='partial'")
-        .run(JSON.stringify(coverage), id, pending.manifest, pending.receipt, pending.coverage);
-      if (!updated.changes) return false;
-      this.#db.prepare("INSERT INTO people_learning_receipts VALUES (?,?,?,?,?)")
-        .run(receiptId, id, pending.receipt, JSON.stringify(coverage), new Date(Date.now()).toISOString());
-      return true;
-    });
+    let published = false;
+    try {
+      published = immediateTransaction(this.#db, () => {
+        const current = this.#db.prepare(
+          "SELECT 1 FROM people_learning_runs WHERE id=? AND manifest=? AND receipt=? AND coverage=? AND status='partial'",
+        ).get(id, pending.manifest, pending.receipt, pending.coverage);
+        if (!current) return false;
+        finalize(result.receiptId, this.#db, manifest);
+        const updated = this.#db.prepare(
+          "UPDATE people_learning_runs SET status='complete',coverage=? WHERE id=? AND manifest=? AND receipt=? AND coverage=? AND status='partial'",
+        ).run(JSON.stringify(coverage), id, pending.manifest, pending.receipt, pending.coverage);
+        if (!updated.changes) throw new Error("Staged checkpoint changed during finalization");
+        this.#db.prepare("INSERT INTO people_learning_receipts VALUES (?,?,?,?,?)")
+          .run(receiptId, id, pending.receipt, JSON.stringify(coverage), new Date(Date.now()).toISOString());
+        return true;
+      });
+    } catch {
+      return { ...result, backlog: this.backlog() };
+    }
     return published ? { ...coverage, receiptId, manifestRevision: revision, backlog: this.backlog() } : { ...result, backlog: this.backlog() };
   }
 
@@ -402,14 +413,20 @@ export class PeopleLearningStore {
     id: string,
     input: unknown,
     now = Date.now(),
-    checkSaves?: (receipt: LearningReceipt) => string[],
-    finalize?: (receiptId: string) => void,
+    checkSaves?: (receipt: LearningReceipt, manifest: ReviewManifest) => string[],
+    finalize?: (receiptId: string, db: DatabaseSync, manifest: ReviewManifest) => void,
     expectedManifestRevision?: string,
+    options?: {
+      collectAssertions?: (manifest: ReviewManifest) => ReviewManifest["assertions"];
+      beforeManifestCommit?: (manifest: ReviewManifest) => void;
+      shouldFinalize?: (manifest: ReviewManifest) => boolean;
+    },
   ) {
     const patch = Value.Parse(LEARNING_RECEIPT_SCHEMA, input);
     let staged: StagedCheckpoint | undefined;
+    let stagedManifest: ReviewManifest | undefined;
     const result = immediateTransaction(this.#db, () => {
-      const run = this.#getRunRow(id);
+      let run = this.#getRunRow(id);
       if (!run) throw new Error("Unknown review run");
       if (run.manifest.inventoryPending) throw new Error("Inventory the missed window before checkpointing it");
       const revisionErrors: string[] = [];
@@ -421,7 +438,7 @@ export class PeopleLearningStore {
       if (suppliedRevision !== undefined && suppliedRevision !== run.manifestRevision) {
         revisionErrors.push(`Stale manifest revision: expected ${run.manifestRevision}, got ${suppliedRevision}`);
       } else if (suppliedRevision === undefined && run.reopenedRevision !== null) {
-        revisionErrors.push(`Manifest was refreshed after prior checkpoint; provide current manifestRevision ${run.manifestRevision}`);
+        revisionErrors.push(`Manifest was refreshed; provide current manifestRevision ${run.manifestRevision}`);
       }
       if (revisionErrors.length) {
         const coverage: CoverageResult = {
@@ -438,11 +455,59 @@ export class PeopleLearningStore {
           .run(receiptId, id, JSON.stringify(patch), JSON.stringify(coverage), new Date(now).toISOString());
         return { receiptId, manifestRevision: run.manifestRevision, ...coverage, backlog: this.backlog() };
       }
-      const receipt = this.#mergeReceipt(run.receipt, patch, expectedManifestRevision);
+
+      // Revision is CAS-verified inside BEGIN IMMEDIATE. Only now expand newly
+      // acquired dossier assertions — never touching sessions, roster, or sourceGaps.
+      let assertionsExpanded = false;
+      if (options?.collectAssertions) {
+        const discovered = options.collectAssertions(run.manifest);
+        const mergedAssertions = [...new Map([...run.manifest.assertions, ...discovered].map(a => [a.id, a])).values()];
+        if (jsonHash(mergedAssertions) !== jsonHash(run.manifest.assertions)) {
+          assertionsExpanded = true;
+          const nextManifest: ReviewManifest = {
+            ...run.manifest,
+            assertions: mergedAssertions,
+            refreshedAt: new Date(now).toISOString(),
+          };
+          const nextRevision = manifestRevision(nextManifest);
+          options.beforeManifestCommit?.(nextManifest);
+          this.#rememberInventory(run.manifest);
+          const updatedPriorReceipt = run.receipt ? {
+            ...run.receipt,
+            manifestRevision: run.receipt.manifestRevision !== undefined ? nextRevision : undefined,
+          } : undefined;
+          this.#db.prepare("UPDATE people_learning_runs SET manifest=?,receipt=?,status='partial',coverage=?,reopened_revision=? WHERE id=?")
+            .run(
+              JSON.stringify(nextManifest),
+              updatedPriorReceipt ? JSON.stringify(updatedPriorReceipt) : null,
+              JSON.stringify(updatedPriorReceipt ? verifyLearningCoverage(nextManifest, updatedPriorReceipt, now) : { missing: ["receipt"] }),
+              nextRevision,
+              id,
+            );
+          this.#rememberInventory(nextManifest);
+          run = {
+            ...run,
+            manifest: nextManifest,
+            manifestRevision: nextRevision,
+            receipt: updatedPriorReceipt,
+            status: "partial",
+            reopenedRevision: nextRevision,
+          };
+        }
+      }
+
+      const patchForMerge = assertionsExpanded && patch.manifestRevision !== undefined
+        ? { ...patch, manifestRevision: run.manifestRevision }
+        : patch;
+      const mergedExpectedRevision = assertionsExpanded
+        ? (expectedManifestRevision !== undefined ? run.manifestRevision : undefined)
+        : expectedManifestRevision;
+      const receipt = this.#mergeReceipt(run.receipt, patchForMerge, mergedExpectedRevision);
       const coverage = verifyLearningCoverage(run.manifest, receipt, now);
-      coverage.errors.push(...checkSaves?.(receipt) ?? []);
+      coverage.errors.push(...checkSaves?.(receipt, run.manifest) ?? []);
       if (coverage.errors.length) coverage.status = "invalid";
-      if (coverage.status === "complete" && finalize) {
+      const needsFinalize = Boolean(finalize && (options?.shouldFinalize ? options.shouldFinalize(run.manifest) : true));
+      if (coverage.status === "complete" && needsFinalize) {
         coverage.status = "partial";
         coverage.unresolved.push("dossier-verification");
       }
@@ -453,12 +518,15 @@ export class PeopleLearningStore {
         this.#db.prepare("UPDATE people_learning_runs SET receipt=?,status=?,coverage=? WHERE id=?")
           .run(JSON.stringify(receipt), coverage.status, JSON.stringify(coverage), id);
       }
-      if (coverage.unresolved.includes("dossier-verification")) staged = {
-        manifest: JSON.stringify(run.manifest), receipt: JSON.stringify(receipt), coverage: JSON.stringify(coverage),
-      };
+      if (coverage.unresolved.includes("dossier-verification")) {
+        staged = {
+          manifest: JSON.stringify(run.manifest), receipt: JSON.stringify(receipt), coverage: JSON.stringify(coverage),
+        };
+        stagedManifest = run.manifest;
+      }
       return { receiptId, manifestRevision: run.manifestRevision, ...coverage, backlog: this.backlog() };
     });
-    if (!finalize || !staged || !result.unresolved.includes("dossier-verification")) return result;
-    return this.#publishFinalized(id, staged, result, finalize);
+    if (!finalize || !staged || !stagedManifest || !result.unresolved.includes("dossier-verification")) return result;
+    return this.#publishFinalized(id, staged, stagedManifest, result, finalize);
   }
 }

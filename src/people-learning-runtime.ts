@@ -8,7 +8,7 @@ import { listAgentIds, jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveAgentWorkspaceDir, resolveStateDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import { resolveConfig, type UnblockMemoryConfig } from "./config.js";
-import { PeopleStores } from "./people-store.js";
+import { PeopleStores, recordDossierVerificationInTransaction } from "./people-store.js";
 import { inventoryPeople, dossierAssertions, privateJson, type ReviewKind, type ReviewManifest } from "./people-learning-inventory.js";
 import { PeopleLearningStore, LEARNING_RECEIPT_SCHEMA, manifestRevision, type LearningReceipt } from "./people-learning-store.js";
 import { learningForAgent } from "./people-learning-config.js";
@@ -30,7 +30,7 @@ const LEARNING_PARAMETERS = Type.Union([
   Type.Object({
     action: Type.Literal("checkpoint"),
     runId: Type.String(),
-    manifestRevision: Type.Optional(Type.String({ pattern: "\\S" })),
+    manifestRevision: Type.String({ pattern: "\\S" }),
     receipt: LEARNING_RECEIPT_SCHEMA,
   }, { additionalProperties: false }),
 ]);
@@ -339,7 +339,8 @@ function handleInspectAction(options: {
     if (prior && prior.status !== "complete" && !params.runId.startsWith("legacy:")) {
       beginReview(cfg, config, stores, agentId, prior.manifest.kind, stateRoot, prior.manifest.window.localDay, prior.manifest.window.timezone);
     }
-    return jsonResult({ run: ledger.get(params.runId), backlog: ledger.backlog() });
+    const run = ledger.get(params.runId);
+    return jsonResult({ run, manifestRevision: run?.manifestRevision, backlog: ledger.backlog() });
   });
 }
 
@@ -351,51 +352,50 @@ function handleCheckpointAction(options: {
   paths: ReviewPaths;
 }) {
   const { params, config, stores, agentId, paths } = options;
+  const people = stores.get(agentId);
   return withLearningStore(paths.storePath, agentId, ledger => {
-    let run = ledger.get(params.runId);
-    if (!run) throw new Error("Unknown review run");
-    const suppliedRevision = params.manifestRevision ?? params.receipt.manifestRevision;
-    const conflictingRevision = params.manifestRevision !== undefined &&
-      params.receipt.manifestRevision !== undefined &&
-      params.manifestRevision !== params.receipt.manifestRevision;
-    if (conflictingRevision || !ledger.matchesRevision(params.runId, suppliedRevision)) {
-      return jsonResult(ledger.checkpoint(params.runId, params.receipt, Date.now(), undefined, undefined, params.manifestRevision));
-    }
-    const people = stores.get(agentId);
-    // A participant may have acquired a dossier since the inventory.
-    // Expand expectations before accepting a weekly checkpoint.
-    const current = [...reviewCohort(run.manifest)].flatMap(personId => {
-      const dossier = people.getDossier(personId)?.dossier;
-      return dossier ? dossierAssertions(personId, dossier) : [];
-    });
-    run = ledger.begin(
-      { ...run.manifest, assertions: [...new Map([...run.manifest.assertions, ...current].map(a => [a.id, a])).values()] },
-      published => { publishManifest(paths.root, published); },
+    let verificationTargets: { personId: string; revision: string | null }[] = [];
+    // Validate revision, expand newly acquired dossier assertions (without ever calling
+    // ledger.begin() or mutating sessions/roster/sourceGaps), and merge the receipt inside
+    // one immediateTransaction; then commit dossier verifications + completion atomically.
+    const coverage = ledger.checkpoint(
+      params.runId,
+      params.receipt,
+      Date.now(),
+      (receipt, manifest) => {
+        verificationTargets = manifest.fullValidation
+          ? [...new Set(manifest.assertions.map(a => a.personId))]
+              .filter(personId => people.getDossier(personId))
+              .map(personId => ({ personId, revision: people.getDossierRevision(personId) }))
+          : [];
+        const errors = saveErrors(receipt, manifest, stores, agentId);
+        const approved = isAnalysisApproved(config);
+        const analysis = ledger.analysis(params.runId);
+        if (approved && receipt.analysis.status !== "unresolved" &&
+            (receipt.analysis.status !== "complete" || analysis?.status !== "complete" || analysis.basis !== analysisBasis(config, manifest))) {
+          errors.push("Approved analysis has not completed for this cohort and inventory; preserve unresolved analysis backlog");
+        }
+        if (!approved && receipt.analysis.status !== "not_approved") {
+          errors.push("External analysis is not approved; do not invent analysis results");
+        }
+        return errors;
+      },
+      (receiptId, db, manifest) => {
+        if (!manifest.fullValidation) return;
+        for (const { personId, revision } of verificationTargets) {
+          recordDossierVerificationInTransaction(db, personId, revision, `Complete source validation receipt ${receiptId}`);
+        }
+      },
+      params.manifestRevision,
+      {
+        collectAssertions: manifest => [...reviewCohort(manifest)].flatMap(personId => {
+          const dossier = people.getDossier(personId)?.dossier;
+          return dossier ? dossierAssertions(personId, dossier) : [];
+        }),
+        beforeManifestCommit: published => { publishManifest(paths.root, published); },
+        shouldFinalize: manifest => manifest.fullValidation,
+      },
     );
-    const verificationTargets = [...new Set(run.manifest.assertions.map(a => a.personId))]
-      .filter(personId => people.getDossier(personId))
-      .map(personId => ({ personId, revision: people.getDossierRevision(personId) }));
-    const receiptForRun = params.receipt.manifestRevision !== undefined
-      ? { ...params.receipt, manifestRevision: run.manifestRevision }
-      : params.receipt;
-    // Validate the merged checkpoint, including saved dispositions from earlier attempts.
-    const coverage = ledger.checkpoint(params.runId, receiptForRun, Date.now(), receipt => {
-      const errors = saveErrors(receipt, run.manifest, stores, agentId);
-      const approved = isAnalysisApproved(config);
-      const analysis = ledger.analysis(params.runId);
-      if (approved && receipt.analysis.status !== "unresolved" &&
-          (receipt.analysis.status !== "complete" || analysis?.status !== "complete" || analysis.basis !== analysisBasis(config, run.manifest))) {
-        errors.push("Approved analysis has not completed for this cohort and inventory; preserve unresolved analysis backlog");
-      }
-      if (!approved && receipt.analysis.status !== "not_approved") {
-        errors.push("External analysis is not approved; do not invent analysis results");
-      }
-      return errors;
-    }, run.manifest.fullValidation ? receiptId => {
-      for (const { personId, revision } of verificationTargets) {
-        people.recordDossierVerification(personId, revision, `Complete source validation receipt ${receiptId}`);
-      }
-    } : undefined, run.manifestRevision);
     return jsonResult(coverage);
   });
 }
@@ -513,13 +513,16 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
     },
     async stop() {
       live = false;
-      const stopVersion = ++generation;
+      generation++;
       rerun = false;
       startupRetries = 0;
       clearRetry();
       await reconciliation?.catch(() => {});
       await followUp?.catch(() => {});
-      if (stopVersion === generation) recognizedJobs = [];
+      // Do NOT clear recognizedJobs here: on service reload (stop -> start),
+      // a transient reconcile failure in start() would otherwise leave
+      // before_tool_call failing open. recognizedJobs is only replaced on an
+      // authoritative full snapshot from reconcilePeopleLearning.
     },
   });
   api.on("gateway_start", () => reconcile());

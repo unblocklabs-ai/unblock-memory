@@ -344,7 +344,9 @@ test("recovered inventories expand the backlog and preserve the original snapsho
     f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='recovered' AND seq=1").run(JSON.stringify(event));
   };
   setImage("first-image");
-  const withImage = ledger.begin(f.inventory()).manifest, receipt = receiptFor(withImage);
+  const withImageRun = ledger.begin(f.inventory());
+  const withImage = withImageRun.manifest, receipt = receiptFor(withImage);
+  receipt.manifestRevision = withImageRun.manifestRevision;
   receipt.sourceGapReviews = withImage.sourceGaps.map(g => ({ sourceGapId: g.id, status: "resolved", reason: "Verified original attachment",
     sourceRefs: ["native:recovered:1"], reviewedAt: "2026-11-16T04:00:00Z" }));
   assert.equal(ledger.checkpoint(withImage.id, receipt, Date.parse("2026-11-16T05:00:00Z")).status, "complete");
@@ -497,7 +499,7 @@ test("registered service reconciles after startup/reload and only exposes privat
   proposed.peopleReviews = [];
   proposed.assertionReviews = proposed.assertionReviews.map(r => ({ ...r, disposition: "retired", reviewedAt: checkedAt, correctionsCheckedAt: checkedAt }));
   const checkpoint = async (receipt: LearningReceipt) => {
-    const response = await tool.execute("checkpoint", { action: "checkpoint", runId: runManifest.id, receipt });
+    const response = await tool.execute("checkpoint", { action: "checkpoint", runId: runManifest.id, manifestRevision: result.manifestRevision, receipt });
     return JSON.parse(String(record(response.content[0])!.text));
   };
   const unsaved = await checkpoint(proposed);
@@ -568,16 +570,18 @@ test("weekly checkpoints discover every statement in a newly saved participant d
   legacyDb.prepare("DELETE FROM person_dossier_changes WHERE person_id=?").run(f.a);
   legacyDb.close();
   assert.equal(f.people.getDossierRevision(f.a), null, "pre-v4 state has no change revision");
-  const incomplete = await call({ action: "checkpoint", runId: manifest.id, receipt: receiptFor(manifest) });
+  const incomplete = await call({ action: "checkpoint", runId: manifest.id, manifestRevision: initial.manifestRevision, receipt: receiptFor(manifest) });
   assert.equal(incomplete.status, "partial");
   assert.equal(incomplete.expectedAssertions, 2);
+  assert.notEqual(incomplete.manifestRevision, initial.manifestRevision);
   const changedTimezone = { ...hostConfig, agents: { ...hostConfig.agents, defaults: { workspace, userTimezone: "America/New_York" } } };
   await hooks.get("cron_reconciled")!({}, { config: changedTimezone });
   const refreshed = await call({ action: "inspect", runId: manifest.id });
   assert.equal(refreshed.run.manifest.window.timezone, "UTC");
+  assert.equal(refreshed.manifestRevision, refreshed.run.manifestRevision);
   const receipt = receiptFor(refreshed.run.manifest);
   receipt.peopleReviews = [];
-  const completed = await call({ action: "checkpoint", runId: manifest.id, receipt });
+  const completed = await call({ action: "checkpoint", runId: manifest.id, manifestRevision: refreshed.manifestRevision, receipt });
   assert.equal(completed.status, "complete");
   assert.equal(f.people.isDossierVerified(f.a), true);
   const manualConfig = { people: { enabled: true, whisperer: { enabled: true } },
@@ -593,7 +597,7 @@ test("weekly checkpoints discover every statement in a newly saved participant d
   await hooks.get("cron_reconciled")!({}, { config: { ...hostConfig, plugins: { entries: { "unblock-memory": {
     config: { ...automatic, responseAudit: { ...automatic.responseAudit, senderIds: ["U1"] } },
   } } } } });
-  const wrongCohort = await call({ action: "checkpoint", runId: manifest.id,
+  const wrongCohort = await call({ action: "checkpoint", runId: manifest.id, manifestRevision: refreshed.manifestRevision,
     receipt: { ...receipt, analysis: { status: "complete", reason: "Previously completed analysis" } } });
   assert.equal(wrongCohort.status, "invalid", "a prior approval cohort cannot certify newly approved work");
   const legacyRoot = join(workspace, "logs/people-reflection"); mkdirSync(legacyRoot, { recursive: true });
@@ -1116,4 +1120,461 @@ test("missing or throwing getCron schedules retries and transient reconcile fail
   assert.equal(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession), undefined);
   assert.ok(await factory!(alphaSession));
   await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
+});
+
+test("service reload (stop -> start) with transient getCron or cron.list failures preserves recognizedJobs", async t => {
+  const root = mkdtempSync(join(tmpdir(), "people-learning-stop-retain-"));
+  const stores = new PeopleStores({ stateRoot: root, maxOpenTodos: 10, maxBlurbChars: 1200 });
+  t.after(() => stores.closeAll());
+  const hostConfig: OpenClawConfig = { agents: { defaults: { userTimezone: "UTC" }, entries: { alpha: {} } } };
+  const h = hostCron([{
+    id: "durable-alpha-nightly",
+    agentId: "alpha",
+    declarationKey: "unblock-memory:people-learning:alpha:nightly",
+    name: "unblock-memory:people-learning:alpha:nightly",
+    enabled: true,
+  }]);
+  const warns: string[] = [];
+  let service: OpenClawPluginService | undefined, factory: OpenClawPluginToolFactory | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const api = {
+    config: hostConfig,
+    pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+    logger: { warn(m: string) { warns.push(m); } },
+    registerService(v: OpenClawPluginService) { service = v; },
+    registerTool(v: OpenClawPluginToolFactory) { factory = v; },
+    on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, enabled(), stores);
+
+  let mode: "ok" | "no_cron" | "list_fail" = "ok";
+  const baseList = h.cron.list.bind(h.cron);
+  h.cron.list = async (input) => {
+    if (mode === "list_fail") throw new Error("transient reload cron.list failure");
+    return baseList(input);
+  };
+  const startCtx = (config: OpenClawConfig) => ({
+    config,
+    stateDir: root,
+    logger: api.logger,
+    getCron: () => mode === "no_cron"
+      ? (undefined as unknown as ReturnType<NonNullable<Parameters<OpenClawPluginService["start"]>[0]["getCron"]>>)
+      : { ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 },
+  });
+
+  service!.start(startCtx(hostConfig));
+  await hooks.get("gateway_start")!({}, {});
+  const alphaSession = { config: hostConfig, agentId: "alpha", sessionKey: "agent:alpha:cron:durable-alpha-nightly:run:r1" };
+  assert.equal(record(hooks.get("before_tool_call")!({ toolName: "exec", params: {} }, alphaSession))?.block, true);
+  assert.equal(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession), undefined);
+
+  // Stop followed by start with missing getCron() must NOT fail open.
+  await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
+  mode = "no_cron";
+  service!.start(startCtx(hostConfig));
+  await hooks.get("gateway_start")!({}, {});
+  assert.equal(record(hooks.get("before_tool_call")!({ toolName: "exec", params: {} }, alphaSession))?.block, true,
+    "stop -> start with missing getCron must keep blocking forbidden tools");
+  assert.equal(record(hooks.get("before_tool_call")!({ toolName: "memory_people_update", params: { action: "restore" } }, alphaSession))?.block, true);
+  assert.equal(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession), undefined);
+
+  // Stop followed by start disabling alpha while cron.list() fails transiently must block disabled-agent calls.
+  await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
+  mode = "list_fail";
+  const disabledCfg: OpenClawConfig = {
+    ...hostConfig,
+    plugins: { entries: { "unblock-memory": { config: { people: { enabled: true, whisperer: { enabled: true }, learning: { agents: { alpha: { enabled: false } } } } } } } },
+  };
+  service!.start(startCtx(disabledCfg));
+  await hooks.get("gateway_start")!({}, {});
+  const blockedDisabled = record(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession));
+  assert.equal(blockedDisabled?.block, true, "stop -> start disabling agent with transient cron.list failure must still block all tools");
+  assert.match(String(blockedDisabled?.blockReason), /disabled/);
+  assert.equal(await factory!(alphaSession), null);
+
+  // Recovery with an authoritative full snapshot restores normal enforcement.
+  mode = "ok";
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: hostConfig });
+  assert.equal(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, alphaSession), undefined);
+  assert.equal(record(hooks.get("before_tool_call")!({ toolName: "exec", params: {} }, alphaSession))?.block, true);
+  assert.ok(await factory!(alphaSession));
+  await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
+});
+
+test("exact agent-scoped legacy cron jobs and duplicates are recognized before any scheduler mutation", async t => {
+  const root = mkdtempSync(join(tmpdir(), "people-learning-legacy-recognize-"));
+  const stores = new PeopleStores({ stateRoot: root, maxOpenTodos: 10, maxBlurbChars: 1200 });
+  t.after(() => stores.closeAll());
+  const pluginConfig = {
+    people: { enabled: true, whisperer: { enabled: true }, learning: { agents: { alpha: { legacyJobIds: ["legacy-by-id"] } } } },
+  };
+  const hostConfig: OpenClawConfig = {
+    agents: { defaults: { userTimezone: "UTC" }, entries: { alpha: {} } },
+    plugins: { entries: { "unblock-memory": { config: pluginConfig } } },
+  };
+  const h = hostCron([
+    { id: "legacy-weekly-orig", agentId: "alpha", name: "People Whisperer — full weekly statement validation", enabled: true },
+    { id: "legacy-weekly-dup", agentId: "alpha", name: "People Whisperer — full weekly statement validation", enabled: true },
+    {
+      id: "legacy-by-id", agentId: "alpha", name: "Custom legacy nightly", enabled: true,
+      payload: { kind: "agentTurn", message: "Follow people-nightly-dreaming.md strictly" } as Job["payload"],
+    },
+    { id: "other-agent-legacy", agentId: "other", name: "People Whisperer — full weekly statement validation", enabled: true },
+  ]);
+  let failAdd = true;
+  let failDuplicateUpdate = false;
+  const baseAdd = h.cron.add.bind(h.cron);
+  const baseUpdate = h.cron.update.bind(h.cron);
+  h.cron.add = async (input) => {
+    if (failAdd) throw new Error("transient cron.add failure during legacy migration");
+    return baseAdd(input);
+  };
+  h.cron.update = async (id, patch) => {
+    if (failDuplicateUpdate && id === "legacy-weekly-dup") throw new Error("transient duplicate disable failure");
+    return baseUpdate(id, patch);
+  };
+
+  const warns: string[] = [];
+  let service: OpenClawPluginService | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const api = {
+    config: hostConfig,
+    pluginConfig,
+    logger: { warn(m: string) { warns.push(m); } },
+    registerService(v: OpenClawPluginService) { service = v; },
+    registerTool() {},
+    on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, resolveConfig(pluginConfig), stores);
+  service!.start({
+    config: hostConfig, stateDir: root, logger: api.logger,
+    getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }),
+  });
+  await hooks.get("gateway_start")!({}, {});
+  assert.ok(warns.some(w => w.includes("transient cron.add failure")));
+
+  // All exact agent-scoped legacy matches are restricted even though cron.add failed before any mutation.
+  for (const jobId of ["legacy-weekly-orig", "legacy-weekly-dup", "legacy-by-id"]) {
+    const ctx = { config: hostConfig, agentId: "alpha", sessionKey: `agent:alpha:cron:${jobId}:run:r1` };
+    assert.equal(record(hooks.get("before_tool_call")!({ toolName: "exec", params: {} }, ctx))?.block, true,
+      `active legacy job ${jobId} must block forbidden tools when cron.add throws`);
+    assert.equal(hooks.get("before_tool_call")!({ toolName: "read", params: {} }, ctx), undefined);
+  }
+  // Unconfigured/unrelated agent's legacy job is NOT claimed.
+  assert.equal(hooks.get("before_tool_call")!(
+    { toolName: "exec", params: {} },
+    { config: hostConfig, agentId: "other", sessionKey: "agent:other:cron:other-agent-legacy:run:r1" },
+  ), undefined);
+
+  // If cron.add succeeds but disabling a duplicate throws partway through, both primary and duplicate stay restricted.
+  failAdd = false;
+  failDuplicateUpdate = true;
+  await hooks.get("cron_reconciled")!({ reason: "retry" }, { config: hostConfig });
+  assert.ok(warns.some(w => w.includes("transient duplicate disable failure")));
+  const createdWeekly = h.jobs.find(j => j.declarationKey === "unblock-memory:people-learning:alpha:weekly")!;
+  assert.ok(createdWeekly);
+  for (const jobId of [createdWeekly.id, "legacy-weekly-orig", "legacy-weekly-dup"]) {
+    const ctx = { config: hostConfig, agentId: "alpha", sessionKey: `agent:alpha:cron:${jobId}:run:r2` };
+    assert.equal(record(hooks.get("before_tool_call")!({ toolName: "message", params: {} }, ctx))?.block, true,
+      `job ${jobId} must stay restricted after partial duplicate disable failure`);
+  }
+
+  // Disabling alpha while reconciliation is incomplete immediately blocks even read-only tools on active legacy jobs.
+  const disabledCfg: OpenClawConfig = {
+    ...hostConfig,
+    plugins: { entries: { "unblock-memory": { config: { people: { enabled: true, whisperer: { enabled: true }, learning: { agents: { alpha: { enabled: false } } } } } } } },
+  };
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: disabledCfg });
+  const blockedLegacy = record(hooks.get("before_tool_call")!(
+    { toolName: "read", params: {} },
+    { config: disabledCfg, agentId: "alpha", sessionKey: "agent:alpha:cron:legacy-weekly-dup:run:r3" },
+  ));
+  assert.equal(blockedLegacy?.block, true);
+  assert.match(String(blockedLegacy?.blockReason), /disabled/);
+  await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
+});
+
+test("pre-checkpoint manifest refresh rejects stale/unversioned receipts and concurrent refresh before assertion expansion preserves new sessions without bogus sourceGaps", async t => {
+  let now = Date.parse("2026-11-16T05:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  const f = fixture(); t.after(() => { f.db.close(); f.stores.closeAll(); });
+  f.add("dm", "workspace", "direct");
+  const setImage = (data: string) => {
+    const event = JSON.parse(String(f.db.prepare("SELECT event_json FROM transcript_events WHERE session_id='dm' AND seq=1").get()!.event_json));
+    event.message.content = [{ type: "text", text: "Use this image" }, { type: "image", mimeType: "image/png", data }];
+    f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='dm' AND seq=1").run(JSON.stringify(event));
+  };
+
+  // (a) Store-level: refresh from export A to export B BEFORE any checkpoint was saved.
+  setImage("export-A");
+  const ledger = new PeopleLearningStore(join(f.root, "pre-first-checkpoint.sqlite"), "alpha"); t.after(() => ledger.close());
+  const runA = ledger.begin(f.inventory("nightly"));
+  const receiptA = receiptFor(runA.manifest);
+  receiptA.sourceGapReviews = runA.manifest.sourceGaps.map(g => ({
+    sourceGapId: g.id, status: "resolved", reason: "Verified export A",
+    sourceRefs: ["native:dm:1"], reviewedAt: new Date(now).toISOString(),
+  }));
+
+  now += 60_000;
+  setImage("export-B");
+  const runB = ledger.begin(f.inventory("nightly"));
+  assert.notEqual(runB.manifestRevision, runA.manifestRevision);
+  assert.equal(runB.receipt, undefined, "no receipt has been saved yet");
+
+  // Unversioned receipt citing export A must NOT complete export B.
+  const unversionedA = ledger.checkpoint(runA.manifest.id, receiptA, now);
+  assert.equal(unversionedA.status, "invalid");
+  assert.ok(unversionedA.errors.some(e => e.includes("Manifest was refreshed")));
+  assert.equal(ledger.get(runA.manifest.id)!.status, "partial");
+
+  // Stale versioned receipt citing export A is also rejected.
+  const staleA = ledger.checkpoint(runA.manifest.id, { ...receiptA, manifestRevision: runA.manifestRevision }, now + 1);
+  assert.equal(staleA.status, "invalid");
+  assert.ok(staleA.errors.some(e => e.includes("Stale manifest revision")));
+  assert.equal(ledger.get(runA.manifest.id)!.status, "partial");
+
+  // Receipt bound to export B succeeds.
+  const validB = ledger.checkpoint(runA.manifest.id, { ...receiptA, manifestRevision: runB.manifestRevision }, now + 2);
+  assert.equal(validB.status, "complete");
+
+  // (b) Runtime-level: live checkpoint requires manifestRevision, and a concurrent refresh
+  // landing before checkpoint assertion expansion cannot be overwritten with bogus sourceGaps.
+  f.people.deleteDossier(f.a, "Start weekly without dossier for alpha participant");
+  f.people.deleteDossier(f.b, "Start weekly without dossier for beta participant");
+  // Reset dm back to clean text (no image gap) so sourceGaps starts empty.
+  const cleanMsg = {
+    role: "user", content: "Please explain, no edits.",
+    __openclaw: { senderId: "U1", senderIdentity: { senderKind: "human" }, transport: { channel: "slack", accountId: "workspace", conversationRef: "conversation-dm" } },
+  };
+  f.db.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='dm' AND seq=1").run(JSON.stringify({ type: "message", message: cleanMsg }));
+
+  const workspace = join(f.root, "workspace-toctou"); mkdirSync(workspace);
+  const hostConfig: OpenClawConfig = { agents: { defaults: { workspace, userTimezone: "UTC" }, entries: { alpha: { workspace, agentDir: f.root } } } };
+  const h = hostCron();
+  let service: OpenClawPluginService | undefined, factory: OpenClawPluginToolFactory | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const api = {
+    config: hostConfig, pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+    logger: { warn(m: string) { assert.fail(m); } },
+    registerService(v: OpenClawPluginService) { service = v; },
+    registerTool(v: OpenClawPluginToolFactory) { factory = v; },
+    on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, enabled(), f.stores);
+  service!.start({ config: hostConfig, stateDir: f.root, logger: api.logger,
+    getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }) });
+  await hooks.get("gateway_start")!({}, {});
+  const weeklyJob = h.jobs.find(j => String(j.name).endsWith(":weekly"))!;
+  const tool = await factory!({ config: hostConfig, agentId: "alpha", sessionKey: `agent:alpha:cron:${weeklyJob.id}:run:r1` });
+  assert.ok(tool && !Array.isArray(tool));
+  const call = async (params: unknown) => JSON.parse(String(record((await tool.execute("toctou", params)).content[0])!.text));
+
+  const inv1 = await call({ action: "inventory", kind: "weekly" });
+  assert.deepEqual(inv1.manifest.sessions.map((s: { sessionId: string }) => s.sessionId), ["dm"]);
+  assert.deepEqual(inv1.manifest.sourceGaps, []);
+  assert.equal(inv1.manifest.assertions.length, 0);
+
+  // Live checkpoint omitting manifestRevision is rejected at the schema boundary.
+  await assert.rejects(
+    tool.execute("missing-rev", { action: "checkpoint", runId: inv1.manifest.id, receipt: receiptFor(inv1.manifest) }),
+  );
+
+  // Concurrent refresh adds a new session (dm2) while participant f.a also acquires a new dossier.
+  now += 60_000;
+  f.add("dm2", "other", "group");
+  f.people.replaceDossier(f.a, "New dossier acquired before concurrent refresh", { schemaVersion: 1, blurb: "Leads delivery.", sections: [] });
+  const inv2 = await call({ action: "inventory", kind: "weekly" });
+  assert.notEqual(inv2.manifestRevision, inv1.manifestRevision);
+  assert.deepEqual(inv2.manifest.sessions.map((s: { sessionId: string }) => s.sessionId).sort(), ["dm", "dm2"]);
+  assert.deepEqual(inv2.manifest.sourceGaps, []);
+  const assertionsAfterInv2 = inv2.manifest.assertions.map((a: { id: string }) => a.id);
+
+  // Also give f.b a dossier right before the stale checkpoint to verify stale checkpoint never expands assertions either.
+  f.people.replaceDossier(f.b, "New dossier for second participant", { schemaVersion: 1, blurb: "Owns ops.", sections: [] });
+
+  // Stale checkpoint citing inv1.manifestRevision must reject cleanly WITHOUT calling begin()
+  // or introducing bogus missing-session sourceGaps or mutating assertions.
+  const staleReceipt = receiptFor(inv1.manifest);
+  staleReceipt.peopleReviews = [];
+  const rejected = await call({
+    action: "checkpoint",
+    runId: inv1.manifest.id,
+    manifestRevision: inv1.manifestRevision,
+    receipt: staleReceipt,
+  });
+  assert.equal(rejected.status, "invalid");
+  assert.ok(rejected.errors.some((e: string) => e.includes("Stale manifest revision")));
+
+  const ledgerCheck = new PeopleLearningStore(join(f.root, "agents/alpha/unblock-memory/unblock-memory.sqlite"), "alpha");
+  t.after(() => ledgerCheck.close());
+  const storedAfterReject = ledgerCheck.get(inv1.manifest.id)!;
+  assert.equal(storedAfterReject.manifestRevision, inv2.manifestRevision, "stale checkpoint must not mutate manifest revision");
+  assert.deepEqual(storedAfterReject.manifest.sessions.map(s => s.sessionId).sort(), ["dm", "dm2"],
+    "new session from concurrent refresh must remain intact");
+  assert.deepEqual(storedAfterReject.manifest.sourceGaps, [],
+    "stale checkpoint must not inject bogus missing-session sourceGaps");
+  assert.deepEqual(storedAfterReject.manifest.assertions.map(a => a.id), assertionsAfterInv2,
+    "stale checkpoint must not mutate assertions");
+
+  // Current checkpoint citing inv2.manifestRevision expands ONLY f.b's newly acquired assertions
+  // while keeping sessions and sourceGaps intact.
+  const currentReceipt = receiptFor(inv2.manifest);
+  currentReceipt.peopleReviews = [];
+  const expanded = await call({
+    action: "checkpoint",
+    runId: inv2.manifest.id,
+    manifestRevision: inv2.manifestRevision,
+    receipt: currentReceipt,
+  });
+  assert.equal(expanded.status, "partial");
+  assert.notEqual(expanded.manifestRevision, inv2.manifestRevision);
+  assert.equal(expanded.expectedAssertions, assertionsAfterInv2.length + 1);
+  const storedAfterExpand = ledgerCheck.get(inv2.manifest.id)!;
+  assert.deepEqual(storedAfterExpand.manifest.sessions.map(s => s.sessionId).sort(), ["dm", "dm2"]);
+  assert.deepEqual(storedAfterExpand.manifest.sourceGaps, []);
+  await service!.stop!({ config: hostConfig, stateDir: f.root, logger: api.logger });
+});
+
+test("finalization commits staged-revision check, all dossier verifications, and receipt completion atomically", async t => {
+  const setupRuntime = async (nowRef: { value: number }) => {
+    const f = fixture();
+    t.after(() => { f.db.close(); f.stores.closeAll(); });
+    // Mark only the two active people (f.a, f.b) unverified; keep f.inactive verified.
+    const storePath = join(f.root, "agents/alpha/unblock-memory/unblock-memory.sqlite");
+    const setupDb = new DatabaseSync(storePath);
+    try {
+      setupDb.prepare("DELETE FROM person_dossier_verification WHERE person_id IN (?, ?)").run(f.a, f.b);
+    } finally { setupDb.close(); }
+    assert.equal(f.people.isDossierVerified(f.a), false);
+    assert.equal(f.people.isDossierVerified(f.b), false);
+    f.add("dm", "workspace", "direct");
+    f.add("grp", "other", "group");
+
+    const workspace = join(f.root, "workspace-atomic-finalize"); mkdirSync(workspace);
+    const hostConfig: OpenClawConfig = { agents: { defaults: { workspace, userTimezone: "UTC" }, entries: { alpha: { workspace, agentDir: f.root } } } };
+    const h = hostCron();
+    let service: OpenClawPluginService | undefined, factory: OpenClawPluginToolFactory | undefined;
+    const hooks = new Map<string, (...args: unknown[]) => unknown>();
+    const api = {
+      config: hostConfig, pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+      logger: { warn(m: string) { assert.fail(m); } },
+      registerService(v: OpenClawPluginService) { service = v; },
+      registerTool(v: OpenClawPluginToolFactory) { factory = v; },
+      on(name: string, fn: (...args: unknown[]) => unknown) { hooks.set(name, fn); },
+    } as unknown as OpenClawPluginApi;
+    registerPeopleLearning(api, enabled(), f.stores);
+    service!.start({ config: hostConfig, stateDir: f.root, logger: api.logger,
+      getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }) });
+    await hooks.get("gateway_start")!({}, {});
+    const weeklyJob = h.jobs.find(j => String(j.name).endsWith(":weekly"))!;
+    const tool = await factory!({ config: hostConfig, agentId: "alpha", sessionKey: `agent:alpha:cron:${weeklyJob.id}:run:r1` });
+    assert.ok(tool && !Array.isArray(tool));
+    const call = async (params: unknown) => JSON.parse(String(record((await tool.execute("fin", params)).content[0])!.text));
+    t.after(async () => { await service!.stop!({ config: hostConfig, stateDir: f.root, logger: api.logger }); });
+    void nowRef;
+    return { f, storePath, call };
+  };
+
+  // (a) Concurrent inventory refresh racing finalization leaves ZERO newly verified dossiers.
+  {
+    const nowRef = { value: Date.parse("2026-11-16T05:00:00Z") };
+    const dateMock = t.mock.method(Date, "now", () => nowRef.value);
+    const { f, storePath, call } = await setupRuntime(nowRef);
+    const inv = await call({ action: "inventory", kind: "weekly" });
+    const preV4Db = new DatabaseSync(storePath);
+    try { preV4Db.prepare("DELETE FROM person_dossier_changes WHERE person_id=?").run(f.a); }
+    finally { preV4Db.close(); }
+    assert.equal(f.people.getDossierRevision(f.a), null);
+    const receipt = receiptFor(inv.manifest);
+    receipt.peopleReviews = [];
+    nowRef.value += 120_000;
+
+    const originalExec = DatabaseSync.prototype.exec;
+    let triggerConcurrentRefresh = true;
+    const execMock = t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+      const result = originalExec.call(this, sql);
+      if (sql === "COMMIT" && triggerConcurrentRefresh) {
+        triggerConcurrentRefresh = false;
+        const concurrent = new PeopleLearningStore(storePath, "alpha");
+        try {
+          concurrent.begin({
+            ...inv.manifest,
+            sourceGaps: [{ id: "concurrent-refresh-gap", reason: "Concurrent inventory refresh landed before finalization" }],
+          });
+        } finally { concurrent.close(); }
+      }
+      return result;
+    });
+
+    const raced = await call({ action: "checkpoint", runId: inv.manifest.id, manifestRevision: inv.manifestRevision, receipt });
+    execMock.mock.restore();
+    dateMock.mock.restore();
+
+    assert.equal(raced.status, "partial");
+    assert.equal(f.people.isDossierVerified(f.a), false, "concurrent refresh racing finalization must leave person #1 unverified");
+    assert.equal(f.people.isDossierVerified(f.b), false, "concurrent refresh racing finalization must leave person #2 unverified");
+    assert.equal(f.people.getDossierRevision(f.a), null, "concurrent refresh racing finalization must not insert legacy baseline change");
+    const checkLedger = new PeopleLearningStore(storePath, "alpha");
+    t.after(() => checkLedger.close());
+    assert.equal(checkLedger.get(inv.manifest.id)!.status, "partial");
+  }
+
+  // (b) Verification failure on person #2 rolls back person #1's verification cleanly.
+  {
+    const nowRef = { value: Date.parse("2026-11-16T05:00:00Z") };
+    const dateMock = t.mock.method(Date, "now", () => nowRef.value);
+    const { f, storePath, call } = await setupRuntime(nowRef);
+    const inv = await call({ action: "inventory", kind: "weekly" });
+    const assertionPeople = [...new Set((inv.manifest as ReviewManifest).assertions.map(a => a.personId))];
+    assert.equal(assertionPeople.length, 2, "exactly two active unverified people are queued for verification");
+    const [firstPersonId, secondPersonId] = assertionPeople as [string, string];
+    // Make person #1 (processed FIRST) a pre-v4 null-revision dossier so we prove BOTH
+    // its baseline change insert AND its verification row roll back when person #2 fails.
+    const preV4Db = new DatabaseSync(storePath);
+    try { preV4Db.prepare("DELETE FROM person_dossier_changes WHERE person_id=?").run(firstPersonId); }
+    finally { preV4Db.close(); }
+    assert.equal(f.people.getDossierRevision(firstPersonId), null);
+    const secondOriginalDossier = f.people.getDossier(secondPersonId)!.dossier;
+    const receipt = receiptFor(inv.manifest);
+    receipt.peopleReviews = [];
+    nowRef.value += 120_000;
+
+    const originalExec = DatabaseSync.prototype.exec;
+    let mutateSecondPerson = true;
+    const execMock = t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+      const result = originalExec.call(this, sql);
+      if (sql === "COMMIT" && mutateSecondPerson) {
+        mutateSecondPerson = false;
+        // Mutate person #2's dossier between staging and atomic finalization so person #1 succeeds
+        // inside Transaction 2 and person #2 then throws DossierConflictError, forcing full rollback.
+        f.people.replaceDossier(secondPersonId, "Concurrent edit right before finalization", secondOriginalDossier);
+      }
+      return result;
+    });
+
+    const failedFinalize = await call({ action: "checkpoint", runId: inv.manifest.id, manifestRevision: inv.manifestRevision, receipt });
+    execMock.mock.restore();
+
+    assert.equal(failedFinalize.status, "partial");
+    assert.ok(failedFinalize.unresolved.includes("dossier-verification"));
+    assert.equal(f.people.isDossierVerified(firstPersonId), false, "person #1 verification must roll back when person #2 fails");
+    assert.equal(f.people.getDossierRevision(firstPersonId), null, "person #1 pre-v4 baseline change must also roll back cleanly");
+    assert.equal(f.people.isDossierVerified(secondPersonId), false, "person #2 remains unverified");
+    const checkLedger = new PeopleLearningStore(storePath, "alpha");
+    t.after(() => checkLedger.close());
+    assert.equal(checkLedger.get(inv.manifest.id)!.status, "partial");
+
+    // Retrying cleanly commits both person #1 and person #2 verifications together with completion.
+    nowRef.value += 60_000;
+    const retryReceipt = {
+      ...receipt,
+      changes: [{ personId: secondPersonId, changeId: f.people.getDossierRevision(secondPersonId)! }],
+    };
+    const completed = await call({ action: "checkpoint", runId: inv.manifest.id, manifestRevision: inv.manifestRevision, receipt: retryReceipt });
+    dateMock.mock.restore();
+    assert.equal(completed.status, "complete");
+    assert.equal(f.people.isDossierVerified(firstPersonId), true);
+    assert.equal(f.people.isDossierVerified(secondPersonId), true);
+    assert.equal(checkLedger.get(inv.manifest.id)!.status, "complete");
+  }
 });
