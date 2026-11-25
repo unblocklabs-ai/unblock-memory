@@ -1,10 +1,10 @@
-import { noul } from "@unblocklabs/decisions";
+import { LEGACY_SYSTEMONE_ENDPOINT, noul } from "@unblocklabs/decisions";
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { stripReasoningTagsFromText } from "openclaw/plugin-sdk/text-chunking";
 import { messageText } from "./whisperer-context.js";
 import { conversationUserText } from "./response-text.js";
-import { decideWithModel, estimateJevTokens, LEGACY_SYSTEMONE_ENDPOINT, matchesDecisionModel, resolveTypeSafeApiKey, } from "./typesafe-client.js";
+import { decideWithModel, estimateDecisionTokens, matchesDecisionModel, resolveDecisionCredential, } from "./decision-client.js";
 import { readInsideOutSources } from "./inside-out-sources.js";
 import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHistory } from "./emotion-baselines.js";
 import { PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
@@ -15,6 +15,7 @@ const RUBRIC = "emotion-presence-v2";
 const CONTEXT_ERROR = "Target reply and preceding assistant exceed context budget";
 function insideOutRubric(endpoint) {
     const canonical = endpoint.replace(/\/+$/u, "");
+    // Keep the rubric key used by existing databases for the original endpoint.
     return canonical === LEGACY_SYSTEMONE_ENDPOINT ? RUBRIC : `${RUBRIC}@${canonical}`;
 }
 const meanings = {
@@ -115,12 +116,12 @@ function* interactions(source, budget, cached, after) {
         const id = assistant >= 0 ? jsonHash([source.sessionId, message.id]) : "";
         if (assistant >= 0 && !cached(id)) {
             const selected = [{ message: history[assistant], position: assistant }];
-            let size = estimateJevTokens({ history: selected.map(s => s.message), target: message });
+            let size = estimateDecisionTokens({ history: selected.map(s => s.message), target: message });
             const oversized = size > budget;
             for (let i = history.length - 1; !oversized && i >= 0; i--) {
                 if (i === assistant)
                     continue;
-                const cost = estimateJevTokens(history[i]) + 2;
+                const cost = estimateDecisionTokens(history[i]) + 2;
                 if (size + cost > budget)
                     break;
                 selected.push({ message: history[i], position: i });
@@ -172,7 +173,7 @@ export async function repairInsideOutIdentities(options) {
 }
 async function gradeInteraction(interaction, options) {
     // Persist the requested alias so upstream date-snapshot rotations do not fragment baselines.
-    const model = options.config.typesafe.model;
+    const model = options.config.decisionModel.model;
     try {
         if (interaction.oversized)
             throw new Error(CONTEXT_ERROR);
@@ -180,9 +181,9 @@ async function gradeInteraction(interaction, options) {
         try {
             response = await decideWithModel({
                 apiKey: options.apiKey,
-                endpoint: options.config.typesafe.endpoint,
+                endpoint: options.config.decisionModel.endpoint,
                 model,
-                timeoutMs: options.config.typesafe.timeoutMs,
+                timeoutMs: options.config.decisionModel.timeoutMs,
                 signal: options.signal,
             }, interaction.state, questions, { validateModel: false });
         }
@@ -205,7 +206,7 @@ async function gradeInteraction(interaction, options) {
         options.signal?.throwIfAborted();
         return {
             probabilities: INSIDE_OUT_EMOTIONS.map(() => null),
-            error: failure instanceof Error ? failure.message : "Jev request failed",
+            error: failure instanceof Error ? failure.message : "Decision model request failed",
             model,
         };
     }
@@ -262,7 +263,7 @@ async function reviewSource(reader, context, retryPass) {
         signal?.throwIfAborted();
         if (budgetExhausted())
             return;
-        // Recheck retry eligibility immediately before inference so purged grades are never re-sent to Jev.
+        // Recheck retry eligibility immediately before inference so purged grades are never re-sent to the decision model.
         if (retryPass && !statements.retryable.get(interaction.id, rubric, PURGED_GRADE, Number(retry ?? false), CONTEXT_ERROR, retryPass.retryCutoff)) {
             continue;
         }
@@ -284,16 +285,16 @@ export async function runInsideOut(options) {
     const { config, storePath } = options;
     if (!config.insideOut.enabled)
         return { status: "disabled" };
-    const apiKey = await resolveTypeSafeApiKey(config.typesafe);
+    const apiKey = await resolveDecisionCredential(config.decisionModel);
     if (!apiKey)
-        throw new Error("Inside Out requires a configured TypeSafe API key");
+        throw new Error("Inside Out requires a configured decision model API key");
     if (running.has(storePath))
         throw new Error("Inside Out is already running for this agent");
     running.add(storePath);
     let store;
     const result = { reviewed: 0, cached: 0, failed: 0, sources: 0, skippedSources: 0, errors: [] };
     try {
-        const rubric = insideOutRubric(config.typesafe.endpoint);
+        const rubric = insideOutRubric(config.decisionModel.endpoint);
         store = openInsideOutStore(storePath);
         const context = {
             apiKey,

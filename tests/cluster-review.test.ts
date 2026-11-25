@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { reviewClusterIngestion } from "../src/cluster-review.js";
 import { reviewFixture } from "./helpers/review-store.js";
-import type { reviewClusterDefects } from "../src/typesafe-review.js";
+import type { reviewClusterDefects } from "../src/decision-review.js";
 
 function answer(defect: Awaited<ReturnType<typeof reviewClusterDefects>>[number]["defect"], confidence = 0.99) {
   return { type: "choice", choice: defect, confidence,

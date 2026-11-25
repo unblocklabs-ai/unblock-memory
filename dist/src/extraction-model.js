@@ -3,9 +3,9 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { Tiktoken } from "js-tiktoken/lite";
 import o200kBase from "js-tiktoken/ranks/o200k_base";
-import { decideWithModel } from "./typesafe-client.js";
+import { decideWithModel } from "./decision-client.js";
 export const EXTRACTION_VERSION = "lasting-facts-v11";
-// Jev allows 32k for state plus its longest question. Leave room for validation
+// Budget 32k for state plus its longest question. Leave room for validation
 // instructions, proposal evidence and tokenizer differences, not just Luna input.
 export const EXTRACTION_INPUT_TARGET = 24_000;
 export const EXTRACTION_INPUT_LIMIT = 28_000;

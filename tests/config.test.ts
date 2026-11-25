@@ -1,33 +1,34 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
+import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 import { DEFAULT_CORPORA, DEFAULT_PEOPLE_CONFIG, resolveConfig } from "../src/config.js";
 
-test("TypeSafe is enabled by default with optional explicit credentials, endpoint, and model", () => {
-  const defaultTypeSafe = {
+test("Decision model is enabled by default with optional explicit credentials, endpoint, and model", () => {
+  const defaultDecisionModel = {
     enabled: true,
     endpoint: "https://codex.unblocklabs.ai/v1/decisions",
     model: "liquid/d1.2-ultra",
     timeoutMs: 1500,
   };
-  assert.deepEqual(resolveConfig(undefined).typesafe, defaultTypeSafe);
-  assert.deepEqual(resolveConfig({}).typesafe, defaultTypeSafe);
-  assert.deepEqual(resolveConfig({ typesafe: { apiKey: " fake-key " } }).typesafe,
-    { ...defaultTypeSafe, apiKey: "fake-key" });
-  assert.deepEqual(resolveConfig({ typesafe: { enabled: false, apiKeyFile: " /tmp/typesafe.env ", timeoutMs: 500 } }).typesafe,
-    { ...defaultTypeSafe, enabled: false, timeoutMs: 500, apiKeyFile: "/tmp/typesafe.env" });
-  assert.deepEqual(resolveConfig({ typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone///" } }).typesafe,
-    { ...defaultTypeSafe, endpoint: "https://api.typesafe.ai/v1/systemone", model: "jev-1.13.0" });
-  assert.deepEqual(resolveConfig({ typesafe: { endpoint: "https://other.example/v1/decisions/", model: " custom/model " } }).typesafe,
-    { ...defaultTypeSafe, endpoint: "https://other.example/v1/decisions", model: "custom/model" });
+  assert.deepEqual(resolveConfig(undefined).decisionModel, defaultDecisionModel);
+  assert.deepEqual(resolveConfig({}).decisionModel, defaultDecisionModel);
+  assert.deepEqual(resolveConfig({ decisionModel: { apiKey: " fake-key " } }).decisionModel,
+    { ...defaultDecisionModel, apiKey: "fake-key" });
+  assert.deepEqual(resolveConfig({ decisionModel: { enabled: false, apiKeyFile: " /tmp/decisionModel.env ", timeoutMs: 500 } }).decisionModel,
+    { ...defaultDecisionModel, enabled: false, timeoutMs: 500, apiKeyFile: "/tmp/decisionModel.env" });
+  assert.deepEqual(resolveConfig({ decisionModel: { endpoint: "https://other.example/v1/decisions///" } }).decisionModel,
+    { ...defaultDecisionModel, endpoint: "https://other.example/v1/decisions" });
+  assert.equal(resolveConfig({ decisionModel: { endpoint: LEGACY_SYSTEMONE_ENDPOINT } }).decisionModel.model, defaultDecisionModel.model);
+  assert.deepEqual(resolveConfig({ decisionModel: { endpoint: "https://other.example/v1/decisions/", model: " custom/model " } }).decisionModel,
+    { ...defaultDecisionModel, endpoint: "https://other.example/v1/decisions", model: "custom/model" });
   for (const loopback of ["http://127.0.0.1:8787/v1/decisions", "http://localhost:8787/v1/decisions", "http://[::1]:8787/v1/decisions"]) {
-    assert.equal(resolveConfig({ typesafe: { endpoint: loopback } }).typesafe.endpoint, loopback);
+    assert.equal(resolveConfig({ decisionModel: { endpoint: loopback } }).decisionModel.endpoint, loopback);
   }
-  for (const typesafe of [false, [], { enabled: "yes" }, { apiKey: " " }, { apiKeyFile: "relative" },
+  for (const decisionModel of [false, [], { enabled: "yes" }, { apiKey: " " }, { apiKeyFile: "relative" },
     { apiKey: "fake", apiKeyFile: "/tmp/key" }, { unknownKey: true },
     { endpoint: "ftp://other.example" }, { endpoint: "http://other.example/v1/decisions" },
-    { endpoint: "http://api.typesafe.ai/v1/systemone" }, { endpoint: "https://" },
+    { endpoint: "https://" },
     { endpoint: "https://:443/v1/decisions" },
     { endpoint: " https://codex.unblocklabs.ai/v1/decisions " },
     { endpoint: "https://codex.unblocklabs.ai/v1/decisions path" },
@@ -36,17 +37,11 @@ test("TypeSafe is enabled by default with optional explicit credentials, endpoin
     { endpoint: "https://other.example/v1?x=1" }, { endpoint: "https://other.example/v1#frag" },
     { model: " " }, { model: 123 }, { model: "liquid/d1.2-ultra-20261116" },
     { timeoutMs: 0 }, { timeoutMs: 10001 }, { timeoutMs: 1.2 }]) {
-    assert.throws(() => resolveConfig({ typesafe }), /typesafe/);
+    assert.throws(() => resolveConfig({ decisionModel }), /decisionModel/);
   }
 });
 
-test("manifest schema omits static model default and agrees with runtime endpoint validation", async () => {
-  const dmSchema = manifest.configSchema.properties.decisionModel;
-  const tsSchema = manifest.configSchema.properties.typesafe;
-  assert.equal("default" in dmSchema.properties.model, false, "manifest must not inject liquid/d1.2-ultra before endpoint-based inference");
-  assert.equal("default" in tsSchema.properties.model, false, "manifest must not inject liquid/d1.2-ultra before endpoint-based inference");
-  assert.equal("default" in dmSchema, false, "decisionModel must not materialize a static object default that conflicts with the deprecated typesafe alias");
-  assert.equal("default" in tsSchema, false, "deprecated typesafe alias must not materialize a static object default");
+test("host and runtime reject the old provider key and unsafe endpoint forms", async () => {
   const { validateJsonSchemaValue } = await import(import.meta.resolve("openclaw/plugin-sdk/json-schema-runtime")) as {
     validateJsonSchemaValue: (args: {
       schema: Record<string, unknown>;
@@ -63,24 +58,28 @@ test("manifest schema omits static model default and agrees with runtime endpoin
   });
   for (const valid of [
     "https://codex.unblocklabs.ai/v1/decisions",
-    "https://api.typesafe.ai/v1/systemone",
     "https://other.example/v1/decisions",
     "http://127.0.0.1:8787/v1/decisions",
     "http://localhost:8787/v1/decisions",
     "http://[::1]:8787/v1/decisions",
   ]) {
-    assert.equal(validate({ decisionModel: { endpoint: valid } }).ok, true, valid);
-    assert.equal(validate({ typesafe: { endpoint: valid } }).ok, true, valid);
+    const host = validate({ decisionModel: { endpoint: valid } });
+    assert.equal(host.ok, true, valid);
+    assert.equal(resolveConfig(host.value).decisionModel.endpoint, valid);
   }
-  assert.equal(validate({ decisionModel: { apiKey: "a" }, typesafe: { apiKey: "b" } }).ok, false, "rejects specifying both decisionModel and typesafe");
-  assert.throws(() => resolveConfig({ decisionModel: { apiKey: "a" }, typesafe: { apiKey: "b" } }), /decisionModel or typesafe, not both/);
-  const dmResolved = resolveConfig({ decisionModel: { endpoint: "https://other.example/v1/decisions", model: "custom/m", apiKey: "k" } });
-  assert.deepEqual(dmResolved.decisionModel, dmResolved.typesafe);
-  assert.equal(dmResolved.decisionModel.model, "custom/m");
+  const canonicalized = validate({ decisionModel: { endpoint: "HTTPS://other.example./v1/decisions" } });
+  assert.equal(canonicalized.ok, true);
+  assert.equal(resolveConfig(canonicalized.value).decisionModel.endpoint, "https://other.example./v1/decisions");
+  const legacy = { typesafe: { apiKey: "old-key" } };
+  for (const value of [legacy, { ...legacy, decisionModel: { apiKey: "new-key" } }]) {
+    assert.equal(validate(value).ok, false);
+    assert.throws(() => resolveConfig(value), /config has unknown property/);
+  }
   for (const invalid of [
     "https://",
     "https://:443/v1/decisions",
-    "http://api.typesafe.ai/v1/systemone",
+    "https://other.example:65536/v1/decisions",
+    "https://[:::]/v1/decisions",
     "http://other.example/v1/decisions",
     "https://user:pass@other.example/v1",
     "https://other.example/v1?",
@@ -90,17 +89,13 @@ test("manifest schema omits static model default and agrees with runtime endpoin
     "https://codex.unblocklabs.ai/v1/decisions path",
     " https://codex.unblocklabs.ai/v1/decisions ",
   ]) {
-    assert.equal(validate({ typesafe: { endpoint: invalid } }).ok, false, invalid);
+    assert.equal(validate({ decisionModel: { endpoint: invalid } }).ok, false, invalid);
+    assert.throws(() => resolveConfig({ decisionModel: { endpoint: invalid } }), /decisionModel/);
   }
   const emptyRes = validate({});
   assert.equal(emptyRes.ok, true);
-  assert.equal(resolveConfig(emptyRes.value).typesafe.endpoint, "https://codex.unblocklabs.ai/v1/decisions");
-  assert.equal(resolveConfig(emptyRes.value).typesafe.model, "liquid/d1.2-ultra");
-  const legacyRes = validate({ typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone" } });
-  assert.equal(legacyRes.ok, true);
-  assert.equal("model" in ((legacyRes.value?.typesafe as Record<string, unknown>) ?? {}), false);
-  assert.equal(resolveConfig(legacyRes.value).typesafe.model, "jev-1.13.0");
-  assert.ok(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8").length > 0);
+  assert.equal(resolveConfig(emptyRes.value).decisionModel.endpoint, "https://codex.unblocklabs.ai/v1/decisions");
+  assert.equal(resolveConfig(emptyRes.value).decisionModel.model, "liquid/d1.2-ultra");
 });
 
 test("uses the canonical memory corpus when corpora are absent", () => {

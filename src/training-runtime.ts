@@ -9,8 +9,8 @@ import { TrainingStore } from "./training-store.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
 import { collectTraining, runTraining } from "./training.js";
 import { currentTrainingCorpusHashes, generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, TRAINING_EVALUATION_CONCURRENCY } from "./training-queries.js";
-import { memoryJudgeVersion } from "./typesafe.js";
-import { decisionModelScope } from "./typesafe-client.js";
+import { memoryJudgeVersion } from "./decision-ranking.js";
+import { decisionModelScope } from "./decision-client.js";
 import { dateOption } from "./date-option.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
@@ -91,7 +91,7 @@ export function registerMemoryTraining(api: OpenClawPluginApi, config: UnblockMe
     const withStore = async <T>(agent: string, options: { create?: boolean; readOnly?: boolean }, fn: (store: TrainingStore, source: ReturnType<typeof paths>) => T | Promise<T>) => {
       const source = paths(cfg, agent);
       if (!options.create && !existsSync(source.storePath)) throw new Error("No training database; run memory-training collect first");
-      const store = new TrainingStore(source.storePath, source.agentId, decisionModelScope(config.typesafe.model, config.typesafe.endpoint));
+      const store = new TrainingStore(source.storePath, source.agentId, decisionModelScope(config.decisionModel.model, config.decisionModel.endpoint));
       try { return await (options.readOnly ? fn(store, source) : store.locked(() => fn(store, source))); } finally { store.close(); }
     };
     root.command("collect").option("--agent <id>", "Agent id", "main")
@@ -164,7 +164,7 @@ export function registerMemoryTraining(api: OpenClawPluginApi, config: UnblockMe
         const threshold = thresholdOption(opts.threshold);
         const result = await withStore(opts.agent, {}, async (store, source) => {
           collectTraining(source, store, { existingOnly: true });
-          const judgeVersion = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+          const judgeVersion = memoryJudgeVersion(config.decisionModel.model, config.decisionModel.endpoint);
           const data = opts.stage === "query-training"
             ? exportQueryTraining(store, threshold, judgeVersion, {
                 corpusHashes: await currentTrainingCorpusHashes(source, store, config, threshold),

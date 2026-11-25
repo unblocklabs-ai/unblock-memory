@@ -1,6 +1,6 @@
 import { setImmediate } from "node:timers/promises";
 import { abortable } from "./abortable.js";
-import { decisionModelScope, resolveTypeSafeApiKey, TYPESAFE_MODEL } from "./typesafe-client.js";
+import { decisionModelScope, resolveDecisionCredential, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader } from "./response-episodes.js";
 import { responseRubricVersion, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity, } from "./response-judge.js";
 import { ResponseAuditStore } from "./response-store.js";
@@ -8,7 +8,7 @@ import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
 import { ResponsePeople } from "./response-identity.js";
 import { jsonHash } from "./json-hash.js";
-export function responseCohort(config, model = TYPESAFE_MODEL, endpoint) {
+export function responseCohort(config, model = DEFAULT_DECISION_MODEL, endpoint) {
     return responseRubricVersion(model, endpoint) + ":" + jsonHash({
         extractor: RESPONSE_EXTRACTOR_VERSION, historyMessages: config.historyMessages,
         stages: RESPONSE_STAGE_VERSIONS,
@@ -19,20 +19,20 @@ export function responseCohort(config, model = TYPESAFE_MODEL, endpoint) {
 /** All inference is outside memory's mutation queue and outside transcript DB transactions. */
 export async function auditResponses(options) {
     const { config, agentId } = options;
-    if (!config.responseAudit.enabled || !config.typesafe.enabled)
+    if (!config.responseAudit.enabled || !config.decisionModel.enabled)
         return { status: "disabled" };
     const signal = AbortSignal.any([AbortSignal.timeout(120_000), ...(options.signal ? [options.signal] : [])]);
-    const cohort = responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
+    const cohort = responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
     let key;
     if (!options.dryRun) {
         try {
-            key = await abortable(resolveTypeSafeApiKey(config.typesafe), signal);
+            key = await abortable(resolveDecisionCredential(config.decisionModel), signal);
         }
         catch {
             return { status: "unavailable", reason: "Credentials unavailable or audit cancelled" };
         }
         if (!key)
-            return { status: "unavailable", reason: "TypeSafe API key not configured" };
+            return { status: "unavailable", reason: "Decision model API key not configured" };
     }
     let reader, store, lease;
     let people;
@@ -116,8 +116,8 @@ export async function auditResponses(options) {
                 store.attempted(cohort, e, Date.now());
                 try {
                     const params = {
-                        apiKey: key, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
-                        timeoutMs: config.typesafe.timeoutMs, signal,
+                        apiKey: key, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model,
+                        timeoutMs: config.decisionModel.timeoutMs, signal,
                     };
                     const result = existing
                         ? {
@@ -199,7 +199,7 @@ async function assessMemoryOpportunity(store, cohort, e, feedback, options, para
         const approved = options.sources.filter(s => options.config.responseAudit.memoryCorpora.includes(s.corpus));
         const candidates = responseMemoryCandidates(options.indexPath, approved, e);
         const memoryKey = jsonHash([
-            decisionModelScope(options.config.typesafe.model, options.config.typesafe.endpoint),
+            decisionModelScope(options.config.decisionModel.model, options.config.decisionModel.endpoint),
             RESPONSE_STAGE_VERSIONS.memory,
             e.id, e.session, e.senderId, e.request, e.answer, e.feedback, candidates,
             [...options.config.responseAudit.memoryCorpora].sort(),

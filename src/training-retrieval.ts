@@ -276,6 +276,9 @@ export async function historicalTrainingSource(stateDir: string, chatTypes: read
     const createStore = openStore ?? (await import("@unblocklabs/qmd")).createStore;
     const { corpusHash, maxDate, report, metadata, documents, dimensions, unprovenBeforeCutoff } =
       await selectCutoffDocuments(captured, chatTypes, cutoff);
+    if (report.sessions && unprovenBeforeCutoff) {
+      throw new HistoricalCorpusUnavailableError("Historical snapshot cannot prove a complete cutoff; sync sessions before evaluating training queries");
+    }
     const proven = report.sessions > 0 ? report.chunks > 0 : !unprovenBeforeCutoff;
     let closed = false;
     let indexed: Promise<QMDStore> | undefined;

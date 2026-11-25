@@ -83,7 +83,7 @@ const updateParameters = Type.Union([
         reason: Type.String({ pattern: "\\S", maxLength: 500 }),
         agentName: Type.Optional(Type.String({ pattern: "\\S", maxLength: 100 })),
         manualVerification: Type.Optional(Type.String({ pattern: "\\S", maxLength: 400,
-            description: "Source-specific attestation that you checked every saved claim, its scope and any newer corrections. Distinguish explicit preferences from provisional agent lessons. Skips TypeSafe; recorded as manual. Never use as a blind retry switch." })),
+            description: "Source-specific attestation that you checked every saved claim, its scope and any newer corrections. Distinguish explicit preferences from provisional agent lessons. Skips automated review; recorded as manual. Never use as a blind retry switch." })),
     }, { additionalProperties: false }),
     Type.Object({
         action: Type.Literal("delete_dossier"),
@@ -174,7 +174,7 @@ async function handleReplaceDossier(params) {
     }
     const audit = review.status === "manual"
         ? `Manual verification: ${review.note}`
-        : "TypeSafe review passed for every dossier assertion (person-interaction-v1)";
+        : "Decision model review passed for every dossier assertion (person-interaction-v1)";
     try {
         const saved = store.replaceVerifiedDossier(input.personId, `${input.reason}\n${audit}`, proposed, audit, revision);
         if (!saved)
@@ -183,7 +183,7 @@ async function handleReplaceDossier(params) {
             status: "ok",
             saved: true,
             changeId: saved.changeId,
-            verification: review.status === "manual" ? "manual" : "typesafe",
+            verification: review.status === "manual" ? "manual" : "decision",
             dossier: saved.dossier,
             review,
         });

@@ -2,7 +2,7 @@ import type { QMDStore } from "@unblocklabs/qmd";
 import type { CurationStore, MaintenanceTask } from "./curation.js";
 import { chunkFingerprint } from "./curation.js";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
-import { judgeTypeSafeQuality, qualityJudgeVersion, type QualityJudgment } from "./typesafe.js";
+import { judgeQuality, qualityJudgeVersion, type QualityJudgment } from "./decision-ranking.js";
 import { qualityTriage } from "./quality-triage.js";
 
 export type QualityCursor = { documentId: number; seq: number };
@@ -100,7 +100,7 @@ export async function auditQualityPage(params: {
     });
     const missing = [...new Map(batch.filter(item => item.eligible && item.text.length <= MAX_CHUNK_CHARS &&
       item.structure !== "empty" && !item.judgment).map(item => [item.cacheKey, item])).values()];
-    const answers = await Promise.allSettled(missing.map(async item => (await judgeTypeSafeQuality({
+    const answers = await Promise.allSettled(missing.map(async item => (await judgeQuality({
       apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs: params.timeoutMs, signal,
       chunks: [{ text: item.text, sourceKind: item.source.kind === "sessions" ? "sessions" : "files" }],
     }))[0]));
@@ -143,7 +143,7 @@ export async function auditQualityPage(params: {
           path: `qmd://${source.collection}/${row.path}`, from: startLine, to: endLine,
           excerpt: text.slice(0, 400), excerptTruncated: text.length > 400,
           indicator: structure === "empty" ? "deterministic_empty" :
-            structure === "encoded_message" ? "deterministic_encoding" : "typesafe",
+            structure === "encoded_message" ? "deterministic_encoding" : "decision",
           ...judgment, policy,
           triage,
           instruction: "Inspect original source and ingestion before acting. Verify source/index after any authorized repair. Never manually edit generated session projections.",

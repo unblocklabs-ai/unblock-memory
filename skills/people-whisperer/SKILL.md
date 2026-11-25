@@ -23,7 +23,7 @@ Research original sources using `memory_people_prime`, `memory_search` and
 preferences and working-style feedback, including corrections. Sync sessions with
 `memory_sync_sessions` and inspect `memory_sync_status` when needed. Existing
 dossiers and the agent's earlier assertions are not independent evidence. Do not
-send evidence outside the approved corpora to TypeSafe.
+send evidence outside the approved corpora to the decision endpoint.
 
 ## Store a compact, sourced dossier
 

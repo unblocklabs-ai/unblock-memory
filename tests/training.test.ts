@@ -14,7 +14,7 @@ import { collectTraining, runTraining } from "../src/training.js";
 import { judgeTrainingInput } from "../src/training-gate.js";
 import { compressAgentTranscripts, createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
-const config = resolveConfig({ typesafe: { apiKey: "private-test-key" } });
+const config = resolveConfig({ decisionModel: { apiKey: "private-test-key" } });
 const user = (content: string, extra = {}) => ({ role: "user", content,
   __openclaw: { senderId: "human", senderIdentity: { senderKind: "human" } }, ...extra });
 const assistant = (content: string, extra = {}) => ({ role: "assistant", content, stopReason: "stop", ...extra });
@@ -161,7 +161,7 @@ test("positives, negatives and identical inputs across sessions are cached; repe
     assert.equal(first.calls, 2);
     assert.equal(first.inputTokens, 246);
     assert.equal(collectTraining(f.source, f.store).unchanged, 3);
-    assert.equal((await runTraining(f.source, f.store, resolveConfig({ typesafe: { enabled: false } }), bounds)).calls, 0);
+    assert.equal((await runTraining(f.source, f.store, resolveConfig({ decisionModel: { enabled: false } }), bounds)).calls, 0);
     assert.equal(f.store.status(0.7).positive, 1);
     assert.equal(f.store.status(0.99).positive, 0);
     const exported = [...f.store.exportRows(0.7)];
@@ -276,7 +276,7 @@ test("paid calls and serialized input have hard bounds; dry run and missing key 
     assert.equal((await runTraining(f.source, f.store, config, { ...bounds, dryRun: true })).calls, 0);
     assert.equal((await runTraining(f.source, f.store, config, { ...bounds, maxExamples: 1 })).calls, 1);
     await assert.rejects(runTraining(f.source, f.store, config, { ...bounds, maxExamples: NaN }), /Invalid training/);
-    await assert.rejects(runTraining(f.source, f.store, resolveConfig({ typesafe: { enabled: false } }), bounds), /credential/);
+    await assert.rejects(runTraining(f.source, f.store, resolveConfig({ decisionModel: { enabled: false } }), bounds), /credential/);
     assert.equal(f.store.pending(100).length, 1);
   });
 });

@@ -39,12 +39,13 @@ export function readRows(text) {
 }
 
 // No key, filename, host or CSV value is interpolated into this remote shell program.
-const bootstrap = `let s='';for await(const c of process.stdin)s+=c;try{const p=JSON.parse(s);const m=await import('data:text/javascript;base64,'+p.source);console.log('TYPESAFE_FLEET_RESULT '+JSON.stringify(await m.deploy(p.options)))}catch{console.log('TYPESAFE_FLEET_RESULT '+JSON.stringify({status:'failed',stage:'bootstrap'}))}`;
+const resultPrefix = "DECISION_FLEET_RESULT ";
+const bootstrap = `let s='';for await(const c of process.stdin)s+=c;try{const p=JSON.parse(s);const m=await import('data:text/javascript;base64,'+p.source);console.log('${resultPrefix}'+JSON.stringify(await m.deploy(p.options)))}catch{console.log('${resultPrefix}'+JSON.stringify({status:'failed',stage:'bootstrap'}))}`;
 export const remoteCommand = 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; exec node --input-type=module -e ' + "'" + bootstrap.replaceAll("'", "'\\''") + "'";
 
 export function safeReport(stdout) {
-  const line = stdout.split("\n").findLast(line => line.startsWith("TYPESAFE_FLEET_RESULT "));
-  const value = JSON.parse(line?.slice(22) ?? "null");
+  const line = stdout.split("\n").findLast(line => line.startsWith(resultPrefix));
+  const value = JSON.parse(line?.slice(resultPrefix.length) ?? "null");
   if (!value || !["planned", "configured", "unchanged", "failed"].includes(value.status)) throw new Error("Invalid host response");
   return { status: value.status,
     stage: ["inspect", "validate_patch", "write_key", "configure", "verify", "restart", "health", "complete", "bootstrap"].includes(value.stage) ? value.stage : "unknown",
@@ -55,26 +56,21 @@ export function safeReport(stdout) {
 export function main(args) {
   const [path, ...flags] = args;
   if (!path || path === "--help") {
-    console.log("Usage: node scripts/typesafe-fleet.mjs KEYS.csv [--provider codex|typesafe] [--apply] [--restart]\nDefault: read-only dry-run for Codex LB (https://codex.unblocklabs.ai/v1/decisions). Blank keys are skipped. --restart requires --apply.");
+    console.log("Usage: node scripts/decision-fleet.mjs KEYS.csv [--apply] [--restart]\nDefault: read-only dry-run for Codex LB (https://codex.unblocklabs.ai/v1/decisions). Blank keys are skipped. --restart requires --apply.");
     return 0;
   }
-  let provider = "codex";
   let apply = false;
   let restart = false;
-  for (let i = 0; i < flags.length; i++) {
-    const flag = flags[i];
+  for (const flag of flags) {
     if (flag === "--apply") apply = true;
     else if (flag === "--restart") restart = true;
-    else if (flag === "--provider") {
-      provider = flags[++i] ?? "";
-      if (!["codex", "typesafe"].includes(provider)) throw new Error("Invalid provider");
-    } else throw new Error("Invalid flags");
+    else throw new Error("Invalid flags");
   }
   if (restart && !apply) throw new Error("Invalid flags");
   const stat = statSync(path);
   if (!stat.isFile() || stat.size > 1_000_000 || (stat.mode & 0o077) || stat.uid !== process.getuid()) throw new Error("CSV must be your private regular file (chmod 600), at most 1 MB");
   const rows = readRows(readFileSync(path, "utf8"));
-  const source = readFileSync(new URL("./typesafe-fleet-remote.mjs", import.meta.url)).toString("base64");
+  const source = readFileSync(new URL("./decision-fleet-remote.mjs", import.meta.url)).toString("base64");
   // Resolve every endpoint before writes, catching aliases mapping to the same SSH user/host/port.
   const endpoints = new Set();
   for (const row of rows.filter(row => row.apiKey)) {
@@ -92,7 +88,7 @@ export function main(args) {
     if (row.apiKey) {
       const child = spawnSync("ssh", ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", row.host, remoteCommand], {
-        input: JSON.stringify({ source, options: { apiKey: row.apiKey, apply, restart, provider } }),
+        input: JSON.stringify({ source, options: { apiKey: row.apiKey, apply, restart } }),
         encoding: "utf8", timeout: 600_000, maxBuffer: 2_000_000, stdio: ["pipe", "pipe", "pipe"],
       });
       if (child.status !== 0 || child.error) result = { status: "failed", stage: "ssh_or_timeout" };

@@ -66,19 +66,19 @@ if (mode === "prepare") {
   }
   const { judgeResponse, judgeResponseFollowup, responseRubricVersion } = await imp("response-judge");
   const { responseOutcome, RESPONSE_REPORT_VERSION } = await imp("response-outcome");
-  const { resolveTypeSafeApiKey } = await imp("typesafe-client");
-  const apiKey = await resolveTypeSafeApiKey(config.typesafe); assert.ok(apiKey);
+  const { resolveDecisionCredential } = await imp("decision-client");
+  const apiKey = await resolveDecisionCredential(config.decisionModel); assert.ok(apiKey);
   const results = [];
   for (const e of evidence) {
     const label = labels.rows.find(r => r.id === e.id);
-    const params = { apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model, timeoutMs: 10000, signal: AbortSignal.timeout(30000) };
+    const params = { apiKey, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, timeoutMs: 10000, signal: AbortSignal.timeout(30000) };
     const judgment = await judgeResponse(e, params), retrospective = await judgeResponseFollowup(e, params);
     const outcome = responseOutcome({ ...judgment, retrospective });
     results.push({ id: e.id, inputHash: e.inputHash, expected: label.expected, outcome, judgment, retrospective });
   }
   const positives = results.filter(r => r.expected === "reported_shortfall");
   const negatives = results.filter(r => r.expected !== "reported_shortfall");
-  const summary = { rubric: responseRubricVersion(config.typesafe.model, config.typesafe.endpoint), reportVersion: RESPONSE_REPORT_VERSION, reviewerType: labels.reviewerType,
+  const summary = { rubric: responseRubricVersion(config.decisionModel.model, config.decisionModel.endpoint), reportVersion: RESPONSE_REPORT_VERSION, reviewerType: labels.reviewerType,
     evidenceSha256: labels.evidenceSha256, total: results.length, exact: results.filter(r => r.expected === r.outcome.status).length,
     positiveExamples: positives.length, negativeExamples: negatives.length,
     falseFlags: negatives.filter(r => r.outcome.status === "reported_shortfall").length,

@@ -1,6 +1,6 @@
 import type { QueryConversation } from "./query-contract.js";
 /** Select from trusted candidates; never accept a provider-generated path or skill name. */
-export declare function selectTypeSafeSkill(params: {
+export declare function selectSkill(params: {
     apiKey: string;
     endpoint?: string;
     model?: string;
@@ -23,7 +23,7 @@ export type QualityJudgment = {
     evidence: number;
 };
 /** These are indicators for review, never authorization to delete or rewrite. */
-export declare function judgeTypeSafeQuality(params: {
+export declare function judgeQuality(params: {
     apiKey: string;
     endpoint?: string;
     model?: string;

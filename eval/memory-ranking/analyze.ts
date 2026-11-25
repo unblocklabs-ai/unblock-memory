@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import type { SearchCase } from "./cases.js";
 import type { Hit } from "./ranking.js";
 
-type ScoredHit = Hit & { typesafe_score: number | null; typesafe_status: string };
+type ScoredHit = Hit & { decision_score: number | null; decision_status: string };
 export type Result = SearchCase & { hits: ScoredHit[] };
 export type Label = { caseId: string; hitId: string; grade: number; reason: string; uncertain: boolean };
 const mean = (values: (number | null)[]) => { const valid = values.filter((x): x is number => x !== null); return valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : null; };
@@ -24,15 +24,15 @@ export function analyze(results: Result[], labels: Label[]) {
   const evaluate = (clean: boolean, eligibleOnly = false) => {
     const cases = results.filter(r => r.conversation).map(r => {
       // Compare all rankers on identical successfully scored candidates; report omissions separately.
-      const hits = r.hits.filter(h => h.typesafe_status === "complete" && h.typesafe_score !== null &&
+      const hits = r.hits.filter(h => h.decision_status === "complete" && h.decision_score !== null &&
         (!eligibleOnly || h.whisperer_eligible) &&
         (!clean || (!h.same_session && h.temporal !== "at_or_after_request")));
       const ideal = hits.map(h => grade(r, h)).sort((a, b) => b - a);
       const useful = hits.filter(h => grade(r, h) >= 2).length;
       const rankers = {
-        // Preserve production's stable candidate order for tied TypeSafe scores,
+        // Preserve production's stable candidate order for tied decision model scores,
         // and QMD's actual output order for tied RRF scores, not arbitrary hashes.
-        typesafe: hits.toSorted((a, b) => b.typesafe_score! - a.typesafe_score!),
+        decisionModel: hits.toSorted((a, b) => b.decision_score! - a.decision_score!),
         rrf: hits.toSorted((a, b) => a.rrf_rank - b.rrf_rank),
         vector: hits.filter(h => h.vector_rank !== undefined).sort((a, b) => a.vector_rank! - b.vector_rank!),
         bm25: hits.filter(h => h.bm25_rank !== undefined).sort((a, b) => a.bm25_rank! - b.bm25_rank!),
@@ -49,7 +49,7 @@ export function analyze(results: Result[], labels: Label[]) {
       return { caseId: r.id, turn: `${r.sessionId}:${r.userEventSeq}`, bm25Query: r.bm25Query, vectorQuery: r.vectorQuery,
         candidates: hits.length, useful, scores };
     });
-    const aggregate = (turnBalanced: boolean) => Object.fromEntries(["typesafe", "rrf", "vector", "bm25"].map(name => [name,
+    const aggregate = (turnBalanced: boolean) => Object.fromEntries(["decisionModel", "rrf", "vector", "bm25"].map(name => [name,
       Object.fromEntries(["top1Useful", "top1Grade", "bestAt2", "ndcgAt2", "ndcgAt5", "usefulRecallAt2"].map(metric => {
         const groups = new Map<string, (number | null)[]>();
         for (const item of cases) {
@@ -61,15 +61,15 @@ export function analyze(results: Result[], labels: Label[]) {
       }))]));
     return { cases, perQuery: aggregate(false), perTurn: aggregate(true) };
   };
-  const predicted = results.flatMap(r => r.conversation ? r.hits.filter(h => h.typesafe_score !== null && h.typesafe_status === "complete")
-    .map(h => ({ score: h.typesafe_score!, useful: grade(r, h) >= 2 })) : []);
+  const predicted = results.flatMap(r => r.conversation ? r.hits.filter(h => h.decision_score !== null && h.decision_status === "complete")
+    .map(h => ({ score: h.decision_score!, useful: grade(r, h) >= 2 })) : []);
   const bins = Array.from({ length: 5 }, (_, i) => {
     const values = predicted.filter(p => Math.min(4, Math.floor(p.score * 5)) === i);
     return { range: [i / 5, (i + 1) / 5], count: values.length, meanPrediction: mean(values.map(v => v.score)),
       referenceUsefulRate: mean(values.map(v => Number(v.useful))) };
   });
   return { searches: results.length, turns: new Set(results.map(r => `${r.sessionId}:${r.userEventSeq}`)).size,
-    hits: results.reduce((n, r) => n + r.hits.length, 0), manuallyLabeled: labels.length, typesafeScored: predicted.length,
+    hits: results.reduce((n, r) => n + r.hits.length, 0), manuallyLabeled: labels.length, decisionScored: predicted.length,
     uncertainLabels: labels.filter(l => l.uncertain).length,
     postRequestSessionHits: results.flatMap(r => r.hits).filter(h => h.temporal === "at_or_after_request").length,
     oversizedForWhisperer: results.flatMap(r => r.hits).filter(h => !h.whisperer_eligible).length,

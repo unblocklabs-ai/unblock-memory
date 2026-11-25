@@ -1,5 +1,5 @@
 import { Value } from "typebox/value";
-import { estimateJevTokens, isTypeSafeTimeout, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
+import { estimateDecisionTokens, isDecisionTimeout, requestDecision, resolveDecisionCredential, NOUL_SCHEMA, DecisionRequestError } from "./decision-client.js";
 import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { CONVERSATION_INFO, conversationEnvelope, conversationUserText } from "./response-text.js";
 import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
@@ -54,13 +54,13 @@ export function safetyConversation(prompt, messages, historyMessages, senderId) 
     const envelope = conversationEnvelope(prompt, senderId);
     // An unrecognized wrapper is judged whole, minus the identity header: over-flagging beats missing a request.
     const currentRequest = envelope?.text ?? prompt.trim().replace(CONVERSATION_INFO, "").trim();
-    const baseTokens = estimateJevTokens({ currentRequest, history: [] });
+    const baseTokens = estimateDecisionTokens({ currentRequest, history: [] });
     if (baseTokens > MAX_STATE_TOKENS)
         throw new SafetyInputError("Current request exceeds the safety check budget");
     // Thread starter, reply target and chat history since the last reply resolve "answer the question above".
     const lines = envelope?.context?.split("\n") ?? [];
     const contextBudget = takeRecentWithinTokens(lines, {
-        maxTokens: MAX_STATE_TOKENS, usedTokens: baseTokens, estimateTokens: estimateJevTokens,
+        maxTokens: MAX_STATE_TOKENS, usedTokens: baseTokens, estimateTokens: estimateDecisionTokens,
     });
     const channelContext = contextBudget.items.join("\n").trim();
     let last = messages.length - 1;
@@ -70,7 +70,7 @@ export function safetyConversation(prompt, messages, historyMessages, senderId) 
         last--;
     const { items: history } = takeRecentWithinTokens(messages, {
         endIndex: last, maxItems: historyMessages, maxTokens: MAX_STATE_TOKENS, usedTokens: contextBudget.usedTokens,
-        estimateTokens: estimateJevTokens, transform: historyMessage,
+        estimateTokens: estimateDecisionTokens, transform: historyMessage,
     });
     return { currentRequest, ...(channelContext ? { channelContext } : {}), history };
 }
@@ -102,11 +102,11 @@ function scenarioQuestion(policy) {
 async function judgeSafetyScenarios(apiKey, signal, state, scenarios, options) {
     const key = (index) => `scenario_${index}`;
     const questions = Object.fromEntries(scenarios.map((scenario, index) => [key(index), scenarioQuestion(scenario.instructions)]));
-    const result = await requestTypeSafe({ apiKey, endpoint: options?.endpoint, model: options?.model, signal }, state, questions);
+    const result = await requestDecision({ apiKey, endpoint: options?.endpoint, model: options?.model, signal }, state, questions);
     const answers = record(record(result)?.answers) ?? {};
     return scenarios.map((_scenario, index) => {
         const answer = answers[key(index)];
-        return Value.Check(TYPESAFE_NOUL_SCHEMA, answer) && Number.isFinite(answer.noul) ? answer.noul : undefined;
+        return Value.Check(NOUL_SCHEMA, answer) && Number.isFinite(answer.noul) ? answer.noul : undefined;
     });
 }
 function safetyContext(prompts) {
@@ -122,8 +122,8 @@ function queueMode(value) {
         "other" : undefined;
 }
 function disabledReason(hooks, config) {
-    if (!config.typesafe.enabled)
-        return "typesafe_disabled";
+    if (!config.decisionModel.enabled)
+        return "decision_disabled";
     if (hooks.allowConversationAccess !== true)
         return "conversation_access_not_allowed";
     if (hooks.allowPromptInjection === false)
@@ -158,7 +158,7 @@ export function safetyStatus(cfg, config) {
         ...(warnings.length ? { warnings } : {}), ...(timeoutTooShort ? { hostTimeoutMs, slowestWhispererMs: slowestMs } : {}) };
 }
 export function registerSafetyWhisperer(api, plugin, diagnostics) {
-    const config = plugin.safetyWhisperer, typesafe = plugin.typesafe;
+    const config = plugin.safetyWhisperer, decisionModel = plugin.decisionModel;
     if (!config.enabled)
         return;
     const status = safetyStatus(api.config, plugin);
@@ -204,22 +204,22 @@ export function registerSafetyWhisperer(api, plugin, diagnostics) {
                 recordOutcome("empty_request");
                 return;
             }
-            const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
+            const apiKey = await abortable(resolveDecisionCredential(decisionModel), signal);
             if (!apiKey) {
-                recordOutcome(typesafe.enabled ? "missing_key" : "typesafe_disabled");
+                recordOutcome(decisionModel.enabled ? "missing_key" : "decision_disabled");
                 if (!warnedMissingKey) {
-                    api.logger.warn(`unblock-memory safety whisperer could not check: ${typesafe.enabled ? "TypeSafe key unavailable" : "TypeSafe disabled"}`);
+                    api.logger.warn(`unblock-memory safety whisperer could not check: ${decisionModel.enabled ? "decision model key unavailable" : "decision model disabled"}`);
                 }
                 warnedMissingKey = true;
                 return;
             }
             warnedMissingKey = false;
-            const probabilities = await abortable(judgeSafetyScenarios(apiKey, signal, state, scenarios, { endpoint: typesafe.endpoint, model: typesafe.model }), signal);
+            const probabilities = await abortable(judgeSafetyScenarios(apiKey, signal, state, scenarios, { endpoint: decisionModel.endpoint, model: decisionModel.model }), signal);
             const unanswered = probabilities.filter(probability => probability === undefined).length;
             const matched = scenarios.filter((scenario, index) => (probabilities[index] ?? -1) >= scenario.minProbability);
             if (!matched.length) {
                 if (unanswered)
-                    throw new TypeSafeRequestError("Invalid safety response", "invalid_response");
+                    throw new DecisionRequestError("Invalid safety response", "invalid_response");
                 recordOutcome("no_match");
                 return;
             }
@@ -235,12 +235,12 @@ export function registerSafetyWhisperer(api, plugin, diagnostics) {
         }
         catch (error) {
             // Fail open by design, but never silently: "could not check" is recorded separately from "no match".
-            const outcome = error instanceof SafetyInputError ? "input_too_large" : isTypeSafeTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed";
+            const outcome = error instanceof SafetyInputError ? "input_too_large" : isDecisionTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed";
             recordOutcome(outcome);
             if (outcome !== "cancelled") {
                 warn({ event: "check_failed", agentId, runId: context.runId, outcome, eligibleScenarios: scenarios.length,
-                    errorCode: error instanceof TypeSafeRequestError ? error.code : undefined,
-                    httpStatus: error instanceof TypeSafeRequestError ? error.status : undefined });
+                    errorCode: error instanceof DecisionRequestError ? error.code : undefined,
+                    httpStatus: error instanceof DecisionRequestError ? error.status : undefined });
             }
             // The requestor controls message size, so an oversized message gets every eligible prompt rather than none.
             if (outcome === "input_too_large")

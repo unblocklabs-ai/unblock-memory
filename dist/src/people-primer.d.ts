@@ -1,7 +1,7 @@
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { PeoplePrimerConfig } from "./people-primer-config.js";
 import type { PeopleStore } from "./people-store.js";
-/** Evidence preparation only. Search is local; approved excerpts go to TypeSafe.
+/** Evidence preparation only. Search is local; approved excerpts go to the decision endpoint.
  * No identity inference, generated claims, dossier writes or automatic injection. */
 export declare function primePersonDossier(params: {
     personId: string;

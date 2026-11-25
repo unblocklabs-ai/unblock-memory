@@ -115,7 +115,7 @@ export function registerExtraction(
     if (timer) clearInterval(timer);
     timer = undefined;
     if (lifetime.signal.aborted) lifetime = new AbortController();
-    if (!config.extraction.enabled || !config.extraction.intervalMinutes || !config.typesafe.enabled) return;
+    if (!config.extraction.enabled || !config.extraction.intervalMinutes || !config.decisionModel.enabled) return;
     timer = setInterval(tick, 60_000); timer.unref(); tick();
   });
 }

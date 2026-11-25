@@ -27,8 +27,8 @@ node_modules to the node's existing plugin dependencies. Run its compiled
 The helper reads the agent database, uses SQLite backup to snapshot the QMD index,
 and opens only that copy for retrieval. It does not index, re-embed stored documents,
 update config, or invoke the gateway. It uses the node's existing embedding cache
-and TypeSafe credential resolver; credentials are never copied into outputs.
-Queries require local embedding inference; every merged hit gets one paid TypeSafe
+and decision model credential resolver; credentials are never copied into outputs.
+Queries require local embedding inference; every merged hit gets one paid decision model
 request. Native QMD searches run serially; candidate judgments run concurrently.
 
 For a preselected historical sample, pass `--cases /absolute/frozen-cases.jsonl`
@@ -41,7 +41,7 @@ Only Memory Whisperer-approved non-skill corpora are searched, further intersect
 with any original tool-call corpus selection. Retrieve **10 vector plus 10 BM25
 documents across that scope total**, selecting one matching passage per document.
 This differs intentionally from production Whisperer's per-collection depth.
-The candidate adapter and TypeSafe usefulness rubric are production code.
+The candidate adapter and decision model usefulness rubric are production code.
 
 ## Artifacts
 
@@ -49,9 +49,9 @@ The candidate adapter and TypeSafe usefulness rubric are production code.
 - `cases.jsonl`: both actual retrieval queries, call/session provenance, frozen 230m-ready context.
 - `retrieval.jsonl`: deduplicated passages, raw per-method scores and **one-based**
   ranks, QMD RRF score/rank, dates, eligibility flags, retrieval latency.
-- `judgments.jsonl`: write-ahead attempts and terminal results, per-hit TypeSafe
+- `judgments.jsonl`: write-ahead attempts and terminal results, per-hit decision model
   usefulness/latency or explicit failure. No hidden retries.
-- `results.jsonl`: joined per-query results. Unavailable TypeSafe scores are null,
+- `results.jsonl`: joined per-query results. Unavailable decision model scores are null,
   never zero. Missing method scores/ranks are omitted, not fabricated.
 - `blind/`: shuffled, score-free passages plus grading instructions. Give only
   this directory to a fresh reviewer with no inherited score/history context.
@@ -92,9 +92,9 @@ node --import tsx eval/memory-ranking/analyze.ts \
 This checks label completeness and reports top-1 usefulness, nDCG@2/@5, useful
 recall@2, per-query and per-turn averages, and Noul calibration against the
 reference labels. Compare **rankings**, not numerical distances between RRF and
-TypeSafe scores. Report TypeSafe failures explicitly and compare rankers on the
+decision model scores. Report decision model failures explicitly and compare rankers on the
 same successfully scored candidate set.
-Tied TypeSafe scores keep candidate input order; tied RRF scores keep QMD's
+Tied decision model scores keep candidate input order; tied RRF scores keep QMD's
 actual output order. A third comparison also excludes oversized passages.
 
 ## Limits
@@ -117,7 +117,7 @@ Offline checks: `tsc -p eval/memory-ranking/tsconfig.json --noEmit` and
 
 ## Frozen-input prompt trials
 
-`prompt-trial.ts` reuses the shared TypeSafe client without changing the installed
+`prompt-trial.ts` reuses the shared decision model client without changing the installed
 plugin. Supply JSONL rows `{id, state}`, with `id` the SHA-256 of
 `JSON.stringify(state)`. Deduplicate exact states before running; keep the mapping
 back to query-hit pairs and reference labels outside the request state.

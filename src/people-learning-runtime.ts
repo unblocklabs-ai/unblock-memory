@@ -63,11 +63,11 @@ function isLearningAuthorized(cfg: OpenClawConfig, config: UnblockMemoryConfig, 
 }
 
 function isAnalysisApproved(config: UnblockMemoryConfig): boolean {
-  return config.responseAudit.enabled && config.typesafe.enabled && config.responseAudit.intervalMinutes > 0;
+  return config.responseAudit.enabled && config.decisionModel.enabled && config.responseAudit.intervalMinutes > 0;
 }
 
 function auditCohort(config: UnblockMemoryConfig) {
-  return responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
+  return responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
 }
 
 function publishManifest(root: string, manifest: ReviewManifest): string {

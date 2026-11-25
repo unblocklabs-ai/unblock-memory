@@ -1,5 +1,5 @@
-import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
+import { resolveDecisionCredential, DecisionRequestError } from "./decision-client.js";
+import { complementaryIndices, reviewMemoryRedundancy } from "./decision-review.js";
 import { ApiQueryGenerator, compactJudgeConversation, fallbackQueries, QueryApiError, queryConversation } from "./query-generator.js";
 import { QueryInputBudgetError } from "./query-contract.js";
 import { searchMemory, memoryPassageId } from "./memory-search.js";
@@ -14,7 +14,7 @@ function encodeHints(items) {
     return JSON.stringify(items).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
 }
 function failureFields(error) {
-    return error instanceof TypeSafeRequestError || error instanceof QueryApiError
+    return error instanceof DecisionRequestError || error instanceof QueryApiError
         ? { errorCode: error.code, httpStatus: error.status }
         : { errorCode: "unexpected" };
 }
@@ -49,14 +49,14 @@ async function generateQueriesWithFallback(params) {
     }
 }
 async function selectComplementaryHints(params) {
-    const { ranked, config, typesafe, apiKey, signal, turn, agentId, diagnostics, log } = params;
+    const { ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log } = params;
     let selected = ranked.slice(0, config.maxHints);
     if (!config.complementaryHints || config.maxHints <= 1 || ranked.length <= 1)
         return selected;
     turn.stage = "redundancy";
     try {
         const pairs = await reviewMemoryRedundancy({
-            apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, signal,
+            apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, signal,
             excerpts: ranked.map(candidate => candidate.excerpt),
         });
         selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]);
@@ -90,8 +90,8 @@ function renderBoundedHints(selected) {
     }
     return { emitted, rendered };
 }
-export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnostics) {
-    if (!config.enabled || !typesafe.enabled)
+export function registerMemoryWhisperer(api, runtime, config, decisionModel, diagnostics) {
+    if (!config.enabled || !decisionModel.enabled)
         return;
     const sessions = new Map();
     const generator = new ApiQueryGenerator(config.api);
@@ -156,7 +156,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
         const run = async () => {
             const conversation = queryConversation(event.prompt, event.messages, currentUserMessage);
             turn.stage = "credentials";
-            const apiKey = await timeStage("setupMs", turn.measurement, signal, () => resolveTypeSafeApiKey(typesafe));
+            const apiKey = await timeStage("setupMs", turn.measurement, signal, () => resolveDecisionCredential(decisionModel));
             if (signal.aborted)
                 return;
             if (!apiKey) {
@@ -180,7 +180,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 return;
             }
             const search = await searchMemory(manager, queries, {
-                corpora, signal, apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, conversation: compactJudgeConversation(conversation),
+                corpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: compactJudgeConversation(conversation),
                 asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: 4,
                 maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
                 onCandidates: observation => {
@@ -191,7 +191,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                     turn.stage = "judgment";
                 },
                 onJudgment: ({ candidateIndex, elapsedMs, error }) => {
-                    const fields = { stage: "judgment", candidateIndex, elapsedMs, timeoutMs: typesafe.timeoutMs };
+                    const fields = { stage: "judgment", candidateIndex, elapsedMs, timeoutMs: decisionModel.timeoutMs };
                     if (error !== undefined) {
                         turn.requestsFailed++;
                         diagnostics?.record(agentId, "memory", "judge_candidate_failed");
@@ -224,7 +224,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                 return;
             }
             const selected = await selectComplementaryHints({
-                ranked, config, typesafe, apiKey, signal, turn, agentId, diagnostics, log,
+                ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log,
             });
             if (signal.aborted || sessions.get(key) !== state)
                 return;
@@ -283,7 +283,7 @@ export function registerMemoryWhisperer(api, runtime, config, typesafe, diagnost
                     judgedCandidates: turn.requestsSucceeded,
                     partial: turn.requestsSucceeded > 0 && turn.requestsFailed > 0,
                     timeoutMs: config.timeoutMs,
-                    requestTimeoutMs: typesafe.timeoutMs,
+                    requestTimeoutMs: decisionModel.timeoutMs,
                 });
                 if (signal.aborted)
                     diagnostics?.record(agentId, "memory", timedOut ? "timed_out" : "cancelled");

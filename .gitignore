@@ -4,5 +4,5 @@ node_modules/
 reports/
 .env
 __pycache__/
-typesafe-fleet*.csv
-!scripts/typesafe-fleet.example.csv
+*-fleet*.csv
+!scripts/decision-fleet.example.csv

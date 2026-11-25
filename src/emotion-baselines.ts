@@ -653,7 +653,7 @@ export function baselineFingerprint(db: DatabaseSync, options: { minInteractions
 
 /**
  * Delete one person's baselines and assessment history. With `grades`, also erase their six
- * probabilities and person link, keeping a tombstone so the reply is never sent to Jev again.
+ * probabilities and person link, keeping a tombstone so the reply is never sent to the decision model again.
  */
 export function purgeEmotionProfile(db: DatabaseSync, personId: string, options: { grades?: boolean } = {}) {
   const counts = { baselines: 0, assessments: 0, grades: 0 };

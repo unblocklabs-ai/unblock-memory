@@ -25,6 +25,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
         .filter(c => config.responseAudit.memoryCorpora.includes(c.name))) };
   };
   api.registerCli(({ program, config: cfg }) => {
+    const cohort = () => responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
     const root = program.command("memory-responses").description("Operator-only response quality audits and evidence-linked trend reports");
     root.command("audit").option("--agent <id>", "Agent id", "main").option("--dry-run", "Preview bounded coverage without inference or audit writes")
       .action(async (opts: { agent: string; dryRun?: boolean }) => {
@@ -38,12 +39,12 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
       .option("--account <scope>", "Provider account scope; requires --sender").option("--person <id>", "Linked people-store person ID")
       .option("--task-type <type>", "Task classification").option("--model <id>", "Agent model")
       .action((opts: { agent: string; episode?: string; since?: string; until?: string; bucket: string; sender?: string; account?: string; person?: string; taskType?: string; model?: string }) => {
+        if (opts.bucket !== "day" && opts.bucket !== "week") throw new Error("Bucket must be day or week");
         if (!config.responseAudit.enabled) { console.log(JSON.stringify({ status: "disabled" })); return; }
         const { storePath } = options(cfg, opts.agent);
         if (!hasMemoryTable(storePath, "response_results")) { console.log(JSON.stringify({ status: "not_run" })); return; }
         const store = new ResponseAuditStore(storePath);
-        if (opts.bucket !== "day" && opts.bucket !== "week") { store.close(); throw new Error("Bucket must be day or week"); }
-        try { console.log(JSON.stringify(store.report(responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint), dateOption(opts.since, Date.now() - config.responseAudit.lookbackDays * 86400_000), opts.episode,
+        try { console.log(JSON.stringify(store.report(cohort(), dateOption(opts.since, Date.now() - config.responseAudit.lookbackDays * 86400_000), opts.episode,
           { until: dateOption(opts.until, Number.MAX_SAFE_INTEGER), bucket: opts.bucket, senderId: opts.sender,
             accountScope: opts.account, personId: opts.person, taskType: opts.taskType, agentModel: opts.model }), null, 2)); }
         finally { store.close(); }
@@ -53,7 +54,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
       const { storePath } = options(cfg, agent);
       if (!hasMemoryTable(storePath, "response_results")) throw new Error("Response audit has not run");
       const store = new ResponseAuditStore(storePath);
-      try { console.log(JSON.stringify(fn(store, responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint)), null, 2)); }
+      try { console.log(JSON.stringify(fn(store, cohort()), null, 2)); }
       finally { store.close(); }
     };
     root.command("tasks").description("Operator-only response reviews; never automatically writes memories or preferences")
@@ -79,7 +80,7 @@ export function registerResponseAudit(api: OpenClawPluginApi, config: UnblockMem
       .option("--agent <id>", "Agent id", "main")
       .action((opts: { agent: string }) => withStore(opts.agent, (store, cohort) => store.retryFailed(cohort)));
   }, { descriptors: [{ name: "memory-responses", description: "Audit human-agent exchanges and report quality signals", hasSubcommands: true }] });
-  if (api.registrationMode === "cli-metadata" || !config.responseAudit.enabled || !config.typesafe.enabled || !config.responseAudit.intervalMinutes) return;
+  if (api.registrationMode === "cli-metadata" || !config.responseAudit.enabled || !config.decisionModel.enabled || !config.responseAudit.intervalMinutes) return;
   let timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined, lifetime = new AbortController();
   const tick = () => {
     if (running || lifetime.signal.aborted) return;

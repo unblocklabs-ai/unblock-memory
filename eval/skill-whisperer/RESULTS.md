@@ -2,7 +2,7 @@
 
 **Promising enough for a broader evaluation; not a production accuracy claim.**
 No plugin runtime changes, fleet configuration changes, or Bill SSH tests were made.
-The TypeSafe skill guided the closed-choice + explicit no-match design.
+The decision model skill guided the closed-choice + explicit no-match design.
 
 ## Setup
 
@@ -12,7 +12,7 @@ The TypeSafe skill guided the closed-choice + explicit no-match design.
   cancellations, and follow-ups requiring history. Several labels allow alternatives.
 - Actual production QMD `searchSkills` with the default embeddinggemma model;
   @unblocklabs/qmd 2.9.4, unblock-memory source at `91bfcb0`.
-- TypeSafe pinned to `jev-1.13.0`; same descriptions and conversation content,
+- decision model pinned to `jev-1.13.0`; same descriptions and conversation content,
   with explicit current-request/history fields rather than the vector query's flattening.
 - No fitted confidence threshold, generative judge, or changed labels after results.
 - Fixture/prompt hash: `1b4859aa2f9beab42fce11900ecb201ff36844c94653bdcf0175264a0297e3fc`.
@@ -22,8 +22,8 @@ The TypeSafe skill guided the closed-choice + explicit no-match design.
 | Selector | Correct | False hints on no-skill cases | Wrong skills | Missed skills | Warm p50 | p95 |
 |---|---:|---:|---:|---:|---:|---:|
 | Current vector top-one, minimum 0.5 | 24/40 | 1 | 2 | 13 | 19 ms | 24 ms |
-| Vector top-three, then TypeSafe + none | 40/40 | 0 | 0 | 0 | 203 ms | 805 ms |
-| Full test roster, TypeSafe + none | 40/40 | 0 | 0 | 0 | 183 ms | 301 ms |
+| Vector top-three, then decision model + none | 40/40 | 0 | 0 | 0 | 203 ms | 805 ms |
+| Full test roster, decision model + none | 40/40 | 0 | 0 | 0 | 183 ms | 301 ms |
 
 The hybrid arm removes the 0.5 gate and judges the unthresholded top three. Keeping
 that gate would preserve its missed candidates. Top-three retrieval contained an
@@ -36,11 +36,11 @@ but did not close the gap on this fixture. These are not held-out tuning results
 
 Examples:
 - A request for an image of a LEGO car selected the LEGO engineering skill under
-  vector search; both TypeSafe arms chose imagegen.
+  vector search; both decision model arms chose imagegen.
 - Translating the words “create a Linear ticket” triggered Linear under vector
-  search; TypeSafe chose none.
+  search; decision model chose none.
 - A new PDF inspection task after LEGO discussion still selected LEGO under vector
-  search; TypeSafe chose PDF.
+  search; decision model chose PDF.
 
 ## Latency, failures and cost
 
@@ -58,7 +58,7 @@ Examples:
 
 ## Recommendation
 
-Keep local candidate retrieval and evaluate TypeSafe as the applicability decision,
+Keep local candidate retrieval and evaluate decision model as the applicability decision,
 including none, rather than as a veto after the existing high similarity gate.
 Also keep direct full-roster selection as a comparison: it worked here, but 16
 skills cannot establish scaling behavior for a fleet inventory.

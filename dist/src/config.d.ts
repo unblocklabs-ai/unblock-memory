@@ -43,8 +43,6 @@ export type UnblockMemoryConfig = {
         executable?: string;
     };
     decisionModel: DecisionModelPluginConfig;
-    /** @deprecated Alias for decisionModel. */
-    typesafe: DecisionModelPluginConfig;
     qualityAudit: {
         enabled: boolean;
         corpora: readonly string[];

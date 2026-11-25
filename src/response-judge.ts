@@ -5,12 +5,12 @@ import { abortable } from "./abortable.js";
 import {
   decideWithModel,
   decisionModelScope,
-  TYPESAFE_MODEL,
-  TYPESAFE_NOUL_SCHEMA as noulSchema,
-} from "./typesafe-client.js";
+  DEFAULT_DECISION_MODEL,
+  NOUL_SCHEMA as noulSchema,
+} from "./decision-client.js";
 import type { ResponseEpisode } from "./response-episodes.js";
 
-export function responseRubricVersion(model = TYPESAFE_MODEL, endpoint?: string): string {
+export function responseRubricVersion(model = DEFAULT_DECISION_MODEL, endpoint?: string): string {
   return `${decisionModelScope(model, endpoint)}:response-v10`;
 }
 export const RESPONSE_STAGE_VERSIONS = {

@@ -1,10 +1,8 @@
 # Decision-provider keys over SSH
 
-Use the local Node script to deploy Codex LB keys (`--provider codex`, default) or
-legacy TypeSafe keys (`--provider typesafe`); no VNC needed. Requires Node 22+,
-existing SSH aliases/known hosts, OpenClaw on each target's PATH, and an
-endpoint-aware `unblock-memory` release on each target (one that accepts
-`typesafe.endpoint`). The script also checks common Homebrew, `.local/bin` and
+Deploy Codex LB keys over SSH. Requires Node 22+, existing SSH aliases/known
+hosts, OpenClaw on each target's PATH, and an `unblock-memory` manifest that
+accepts `decisionModel`. The script also checks common Homebrew, `.local/bin` and
 `.npm-global/bin` paths.
 One row targets one user's default OpenClaw installation; multiple profiles on the
 same SSH endpoint are deliberately unsupported. The `agent` column is a label.
@@ -18,30 +16,23 @@ paths, so its displayed placeholder is not used to compare credentials.
    ```sh
    mkdir -p "$HOME/.config/unblock-memory"
    chmod 700 "$HOME/.config/unblock-memory"
-   install -m 600 scripts/typesafe-fleet.example.csv "$HOME/.config/unblock-memory/typesafe-fleet.csv"
+   install -m 600 scripts/decision-fleet.example.csv "$HOME/.config/unblock-memory/decision-fleet.csv"
    ```
 
-2. Fill its `api_key` cells with **Codex LB keys** (`--provider codex`, default) —
-   or **legacy TypeSafe keys** ONLY if you will pass `--provider typesafe` below.
-   Never run the default `codex` command against a CSV containing TypeSafe keys.
-   Add/remove host rows as needed. Blank keys skip that row. Do not paste keys into
+2. Fill its `api_key` cells with **Codex LB keys**. Add/remove host rows as needed.
+   Blank keys skip that row. Do not paste keys into
    chat or command arguments. CSV quotes/CRLF/BOM are supported. Restore `chmod 600`
    if your editor changes it.
 3. Preview (contacts hosts, but does not deploy keys, patch config or restart):
 
    ```sh
-   # Default: Codex LB (CODEX_LB_API_KEY -> https://codex.unblocklabs.ai/v1/decisions)
-   node scripts/typesafe-fleet.mjs "$HOME/.config/unblock-memory/typesafe-fleet.csv"
-   # Legacy TypeSafe (TYPESAFE_API_KEY -> https://api.typesafe.ai/v1/systemone)
-   node scripts/typesafe-fleet.mjs "$HOME/.config/unblock-memory/typesafe-fleet.csv" --provider typesafe
+   node scripts/decision-fleet.mjs "$HOME/.config/unblock-memory/decision-fleet.csv"
    ```
 
 4. Apply after inspecting the plan:
 
    ```sh
-   node scripts/typesafe-fleet.mjs "$HOME/.config/unblock-memory/typesafe-fleet.csv" --apply --restart
-   # Or, for legacy TypeSafe keys:
-   node scripts/typesafe-fleet.mjs "$HOME/.config/unblock-memory/typesafe-fleet.csv" --provider typesafe --apply --restart
+   node scripts/decision-fleet.mjs "$HOME/.config/unblock-memory/decision-fleet.csv" --apply --restart
    ```
 
 `--apply` without `--restart` writes configuration but leaves required restarts to
@@ -54,16 +45,18 @@ OpenClaw's own reload behavior.
 
 ## What changes
 
-- A dedicated `<config directory>/secrets/unblock-memory-decisions.env` (`CODEX_LB_API_KEY`, default `--provider codex`)
-  or `secrets/unblock-memory-typesafe.env` (`TYPESAFE_API_KEY`, with `--provider typesafe`), mode 600,
-  in a mode-700 directory. The key is transmitted through encrypted SSH stdin, not
+- A dedicated `<config directory>/secrets/unblock-memory-decisions.env` (`CODEX_LB_API_KEY`),
+  mode 600 in a mode-700 directory. The key is transmitted through encrypted SSH stdin, not
   arguments/environment/logs. Atomic replacement supports subsequent rotations.
-- Only `plugins.entries.unblock-memory.config.typesafe`: set `enabled: true`, pin `endpoint`
-  (`https://codex.unblocklabs.ai/v1/decisions` for `codex`, `https://api.typesafe.ai/v1/systemone` for `typesafe`),
-  clear any cross-provider `model` pin (preserving same-provider `model` pins on key rotation) or inline `apiKey`, and point `apiKeyFile` at the new file. Other
-  decision-provider settings (e.g. timeout), plugin settings and audit approvals are preserved.
-- Native `openclaw config patch` validates before writing. A private
-  `secrets/typesafe-backup-UUID/` retains the previous config and previous managed
+- Under `plugins.entries.unblock-memory.config`, write `decisionModel` with
+  `enabled: true`, the Codex LB endpoint and the new `apiKeyFile`. Clear any
+  inline `apiKey` and model pins tied to another endpoint. Remove the retired
+  config section, preserving only its timeout when the new section lacks one.
+  Other plugin settings and audit approvals are preserved.
+- Native `openclaw config patch` validates before writing. If the upgraded
+  manifest rejects only the retired config key, the script validates a private
+  temporary replacement before atomically replacing the config on apply. A private
+  `secrets/decision-backup-UUID/` retains the previous config and previous managed
   key when present. Backups can contain secrets; keep them private and remove when
   no longer needed. The script never automatically restores old config over newer
   edits. Partial failures are reported, not described as a rollback.
@@ -83,6 +76,6 @@ the plan; on apply they describe confirmed writes. A failed CLI may have written
 before failing, so do not assume `false` proves nothing changed.
 
 Keep the CSV local with mode 600; avoid spreadsheets that cloud-sync it. The repo
-ignores `typesafe-fleet*.csv` except the blank example. Delete the populated CSV
+ignores `*-fleet*.csv` except the blank example. Delete the populated CSV
 after deployment or retain it only in encrypted storage. Never check secrets into
 Git, even when a filename is ignored.

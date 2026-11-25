@@ -2,14 +2,14 @@ import {
   abortedByTimeout,
   classifyDecisionFailure,
   createDecisionClient,
+  DEFAULT_DECISIONS_ENDPOINT,
   DEFAULT_DECISIONS_MODEL,
   DecisionError,
   decisionModelScope,
-  defaultDecisionModel,
-  LEGACY_SYSTEMONE_ENDPOINT,
   matchesDecisionModel,
   resolveDecisionApiKey,
   resolveDecisionConfig,
+  validateDecisionEndpoint,
   type DecisionResult,
   type QuestionMap,
 } from "@unblocklabs/decisions";
@@ -19,17 +19,15 @@ import type { UnblockMemoryConfig } from "./config.js";
 export {
   classifyDecisionFailure,
   decisionModelScope,
-  defaultDecisionModel,
-  LEGACY_SYSTEMONE_ENDPOINT,
   matchesDecisionModel,
-  DEFAULT_DECISIONS_MODEL as TYPESAFE_MODEL,
-  DecisionError as TypeSafeRequestError,
+  DEFAULT_DECISIONS_MODEL as DEFAULT_DECISION_MODEL,
+  DecisionError as DecisionRequestError,
 };
 
-export const TYPESAFE_NOUL_SCHEMA = Type.Object({
+export const NOUL_SCHEMA = Type.Object({
   type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
 });
-export const TYPESAFE_NOUL_ANSWERS_SCHEMA = Type.Object({ answers: Type.Record(Type.String(), TYPESAFE_NOUL_SCHEMA) });
+export const NOUL_ANSWERS_SCHEMA = Type.Object({ answers: Type.Record(Type.String(), NOUL_SCHEMA) });
 
 type DecisionRequestOptions = {
   apiKey: string;
@@ -40,21 +38,22 @@ type DecisionRequestOptions = {
 };
 
 const DEFAULT_UNBOUNDED_TIMEOUT_MS = 60_000;
+const CODEX_ORIGIN = new URL(DEFAULT_DECISIONS_ENDPOINT).origin;
 
 /** A conservative estimate of serialized size, not a model-specific tokenizer. Non-ASCII is budgeted separately. */
-export function estimateJevTokens(value: unknown): number {
+export function estimateDecisionTokens(value: unknown): number {
   let n = 0;
   for (const c of JSON.stringify(value)) n += c.codePointAt(0)! < 128 ? 1 / 3 : 2;
   return Math.ceil(n);
 }
 
 /** A decision-model deadline: the request's own timeout, or the caller's timed-out signal. */
-export function isTypeSafeTimeout(error: unknown, signal: AbortSignal): boolean {
+export function isDecisionTimeout(error: unknown, signal: AbortSignal): boolean {
   return (error instanceof DecisionError && error.code === "timeout") || abortedByTimeout(signal);
 }
 
 /** Explicit credentials take precedence; a missing explicit file never selects another key. */
-export async function resolveTypeSafeApiKey(
+export async function resolveDecisionCredential(
   config: Pick<UnblockMemoryConfig["decisionModel"], "enabled" | "apiKey" | "apiKeyFile"> & { endpoint?: string },
 ): Promise<string | undefined> {
   if (!config.enabled) return undefined;
@@ -66,19 +65,26 @@ export async function resolveTypeSafeApiKey(
     }
     return trimmed;
   }
-  let resolved;
-  try {
-    resolved = resolveDecisionConfig({
-      endpoint: config.endpoint,
-      apiKeyFile: config.apiKeyFile,
-    });
-  } catch (error) {
-    if (error instanceof DecisionError && error.code === "invalid_config" && !config.apiKeyFile) {
-      return undefined;
-    }
-    throw error;
-  }
-  return resolveDecisionApiKey(resolved);
+  const endpoint = validateDecisionEndpoint(config.endpoint ?? DEFAULT_DECISIONS_ENDPOINT);
+  const codex = new URL(endpoint).origin === CODEX_ORIGIN;
+  return resolveDecisionApiKey(resolveDecisionConfig({
+    endpoint,
+    model: DEFAULT_DECISIONS_MODEL,
+    apiKeyFile: config.apiKeyFile,
+    ambientEnvKeys: codex ? ["CODEX_LB_API_KEY"] : [],
+    fileEnvKeys: codex ? ["CODEX_LB_API_KEY"] : ["CODEX_LB_API_KEY", "DECISION_MODEL_API_KEY"],
+  }));
+}
+
+function requestClient(params: DecisionRequestOptions, timeoutMs: number) {
+  return createDecisionClient({
+    endpoint: params.endpoint,
+    model: params.model ?? DEFAULT_DECISIONS_MODEL,
+    apiKey: params.apiKey,
+    ambientEnvKeys: [],
+    fileEnvKeys: [],
+    timeoutMs,
+  });
 }
 
 /** Typed decision call backed directly by @unblocklabs/decisions. */
@@ -89,13 +95,7 @@ export async function decideWithModel<const Q extends QuestionMap>(
   options?: { validateModel?: boolean; allowExtraAnswerKeys?: boolean },
 ): Promise<DecisionResult<Q>> {
   const timeoutMs = params.timeoutMs ?? DEFAULT_UNBOUNDED_TIMEOUT_MS;
-  const client = createDecisionClient({
-    endpoint: params.endpoint,
-    model: params.model,
-    apiKey: params.apiKey,
-    timeoutMs,
-  });
-  return client.decide(state, questions, {
+  return requestClient(params, timeoutMs).decide(state, questions, {
     timeoutMs,
     signal: params.signal,
     validateModel: options?.validateModel ?? true,
@@ -107,19 +107,13 @@ export async function decideWithModel<const Q extends QuestionMap>(
  * Low-level raw JSON decision request backed by @unblocklabs/decisions `decideRaw()`,
  * for callers that intentionally tolerate partial multi-question responses (e.g. Safety Whisperer).
  */
-export async function requestTypeSafe(
+export async function requestDecision(
   params: DecisionRequestOptions,
   state: unknown,
   questions: unknown,
 ): Promise<unknown> {
   const timeoutMs = params.timeoutMs ?? DEFAULT_UNBOUNDED_TIMEOUT_MS;
-  const client = createDecisionClient({
-    endpoint: params.endpoint,
-    model: params.model,
-    apiKey: params.apiKey,
-    timeoutMs,
-  });
-  return client.decideRaw(state, questions, {
+  return requestClient(params, timeoutMs).decideRaw(state, questions, {
     timeoutMs,
     signal: params.signal,
   });

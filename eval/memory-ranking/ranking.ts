@@ -15,7 +15,7 @@ export type Hit = {
 };
 export type Retrieval = { caseId: string; elapsedMs: number; hits: Hit[]; error?: string };
 export type Judgment = { caseId: string; hitId: string; inputHash: string; status: "attempted" | "complete" | "failed";
-  typesafe_score?: number; elapsedMs?: number; error?: string; httpStatus?: number };
+  decision_score?: number; elapsedMs?: number; error?: string; httpStatus?: number };
 type Projection = Pick<SessionManifest["sessions"][string], "projectionHash" | "messages">;
 
 export function fusePassages(candidates: Awaited<ReturnType<typeof trainingCandidates>>, rrf: Rrf) {

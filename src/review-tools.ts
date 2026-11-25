@@ -6,7 +6,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { resolveDecisionCredential } from "./decision-client.js";
 import { safetyStatus } from "./safety-whisperer.js";
 import { abortable } from "./abortable.js";
 
@@ -22,14 +22,14 @@ const noParameters = Type.Object({}, { additionalProperties: false });
 
 /** Bound initialization as well as inference, without cancelling shared managers. */
 export async function reviewRequestContext(runtime: QmdMemoryRuntime, active: NonNullable<ReturnType<typeof getContext>>,
-  typesafe: UnblockMemoryConfig["typesafe"], signal?: AbortSignal) {
+  decisionModel: UnblockMemoryConfig["decisionModel"], signal?: AbortSignal) {
   const deadline = AbortSignal.timeout(30_000);
   const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), combined);
-  if (!apiKey) return { status: "unavailable", reason: "TypeSafe API key not configured" } as const;
+  const apiKey = await abortable(resolveDecisionCredential(decisionModel), combined);
+  if (!apiKey) return { status: "unavailable", reason: "Decision model API key not configured" } as const;
   const { manager } = await abortable(runtime.getMemorySearchManager(active), combined);
   if (!manager) return { status: "unavailable", reason: "Memory manager unavailable" } as const;
-  return { status: "ready", manager, apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal: combined, timeoutMs: typesafe.timeoutMs } as const;
+  return { status: "ready", manager, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, signal: combined, timeoutMs: decisionModel.timeoutMs } as const;
 }
 
 export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRuntime, config: UnblockMemoryConfig, diagnostics: WhispererDiagnostics) {
@@ -38,19 +38,19 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
     if (!active) return null;
     return {
       name: "memory_diagnostics", label: "Memory Diagnostics",
-      description: "Read content-free manual-search and whisperer telemetry, configuration state, projection version and index readiness. Does not call TypeSafe.",
+      description: "Read content-free manual-search and whisperer telemetry, configuration state, projection version and index readiness. Does not call decision model.",
       parameters: noParameters,
       async execute(_id: string, params: unknown) {
         Value.Parse(noParameters, params);
         let credential: "disabled" | "available" | "missing" | "unreadable" = "disabled";
-        if (config.typesafe.enabled) {
-          try { credential = await resolveTypeSafeApiKey(config.typesafe) ? "available" : "missing"; }
+        if (config.decisionModel.enabled) {
+          try { credential = await resolveDecisionCredential(config.decisionModel) ? "available" : "missing"; }
           catch { credential = "unreadable"; }
         }
         const result = { status: "ok", credential,
-          enabled: { skill: config.skillWhisperer.enabled, memory: config.memoryWhisperer.enabled && config.typesafe.enabled,
+          enabled: { skill: config.skillWhisperer.enabled, memory: config.memoryWhisperer.enabled && config.decisionModel.enabled,
             complementaryHints: config.memoryWhisperer.complementaryHints, qualityAudit: config.qualityAudit.enabled, evidenceReview: config.evidenceReview.enabled,
-            safety: config.safetyWhisperer.enabled, myTurn: config.myTurn.enabled && config.typesafe.enabled },
+            safety: config.safetyWhisperer.enabled, myTurn: config.myTurn.enabled && config.decisionModel.enabled },
           safety: safetyStatus(api.config, config),
           whisperers: diagnostics.snapshot(active.agentId) };
         try {
@@ -66,13 +66,13 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
     if (!active) return null;
     return {
       name: "memory_review_claim", label: "Review Memory Claim",
-      description: "Before a knowledge or dossier write, check one proposed atomic claim against cited indexed source lines. TypeSafe advisory only; does not write, authorize writes, or establish current truth. Requires evidenceReview approval for every cited corpus.",
+      description: "Before a knowledge or dossier write, check one proposed atomic claim against cited indexed source lines. decision model advisory only; does not write, authorize writes, or establish current truth. Requires evidenceReview approval for every cited corpus.",
       parameters: claimParameters,
       async execute(_id: string, params: unknown, signal?: AbortSignal) {
         const parsed = Value.Parse(claimParameters, params);
-        if (!config.evidenceReview.enabled || !config.typesafe.enabled) return jsonResult({ status: "disabled" });
+        if (!config.evidenceReview.enabled || !config.decisionModel.enabled) return jsonResult({ status: "disabled" });
         try {
-          const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
+          const context = await reviewRequestContext(runtime, active, config.decisionModel, signal);
           if (context.status !== "ready") return jsonResult(context);
           return jsonResult(await context.manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora,
             apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
@@ -86,13 +86,13 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
     if (!active) return null;
     return {
       name: "memory_review_cluster", label: "Review Cluster Ingestion",
-      description: "Inspect up to six complete center/edge cluster members for recurring ingestion defects. Uses qualityAudit approved corpora and TypeSafe. Does not modify tasks, sources or clusters; findings apply only to sampled members.",
+      description: "Inspect up to six complete center/edge cluster members for recurring ingestion defects. Uses qualityAudit approved corpora and decision model. Does not modify tasks, sources or clusters; findings apply only to sampled members.",
       parameters: clusterParameters,
       async execute(_id: string, params: unknown, signal?: AbortSignal) {
         const parsed = Value.Parse(clusterParameters, params);
-        if (!config.qualityAudit.enabled || !config.typesafe.enabled) return jsonResult({ status: "disabled" });
+        if (!config.qualityAudit.enabled || !config.decisionModel.enabled) return jsonResult({ status: "disabled" });
         try {
-          const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
+          const context = await reviewRequestContext(runtime, active, config.decisionModel, signal);
           if (context.status !== "ready") return jsonResult(context);
           return jsonResult(await context.manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora,
             apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));

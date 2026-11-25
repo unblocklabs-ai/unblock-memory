@@ -1,5 +1,5 @@
 export const MAX_SKILL_QUERY_CHARS = 12_000;
-// Leaves room for the longest decision question under Jev's 32k state-plus-question limit.
+// Leaves room for the longest decision question under a 32k state-plus-question limit.
 export const MAX_STATE_TOKENS = 24_000;
 
 /** Only visible user/assistant text; never system, tool, image, or thinking blocks. */

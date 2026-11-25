@@ -41,7 +41,7 @@ retrieval changes were introduced. The runtime quality cache version becomes
   This diagnostic group is not a prevalence sample.
 - 40 synthetic Skill Whisperer cases with frozen top-three shortlists from the
   earlier evaluation; 12 newly labeled synthetic Memory Whisperer cases; 8
-  existing synthetic quality cases. Labels were not sent to TypeSafe.
+  existing synthetic quality cases. Labels were not sent to decision model.
 - Two passes per format, alternating execution order: 500 successful requests.
   The runner verified identical state hashes per pair/repeat and exact model IDs.
 - Real corpus text and detailed snapshots stayed on Bill in a mode-700 directory,

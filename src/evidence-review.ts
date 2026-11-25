@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { parseSafeVirtualPath, type ResolvedSource } from "./sources.js";
-import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
-import { reviewTypeSafeClaim } from "./typesafe-review.js";
+import { decisionModelScope, DEFAULT_DECISION_MODEL } from "./decision-client.js";
+import { reviewClaim } from "./decision-review.js";
 
 export type EvidenceCitation = { path: string; from: number; lines: number };
 
@@ -38,7 +38,7 @@ export async function reviewIndexedClaim(params: {
   if (snapshot.status !== "ready") return snapshot;
   const { evidence } = snapshot;
   if (evidence.reduce((sum, item) => sum + item.text.length, 0) > 6000) return unavailable("Evidence exceeds 6000 characters; choose a narrower complete passage");
-  const judgment = await reviewTypeSafeClaim({ ...params, evidence: evidence.map(item => item.text) });
+  const judgment = await reviewClaim({ ...params, evidence: evidence.map(item => item.text) });
   params.signal.throwIfAborted();
   return read(() => {
     for (const item of evidence) {
@@ -48,7 +48,7 @@ export async function reviewIndexedClaim(params: {
     }
     return { status: "ok" as const, ...judgment,
       evidence: evidence.map(({ text: _text, ...citation }) => citation),
-      policy: `${decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint)}:${params.personBackground?.kind === "interaction" ? "person-interaction-v1" : params.personBackground ? "person-background-v2" : "claim-v1"}`,
+      policy: `${decisionModelScope(params.model ?? DEFAULT_DECISION_MODEL, params.endpoint)}:${params.personBackground?.kind === "interaction" ? "person-interaction-v1" : params.personBackground ? "person-background-v2" : "claim-v1"}`,
       scope: "Advisory support check against cited indexed excerpts only, not current truth or authorization to write. Verify original sources and identity before promotion." };
   });
 }

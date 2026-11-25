@@ -39,7 +39,7 @@ for (const failure of ["401", "402", "429", "503", "timeout", "network", "invali
     // Automatic recall does not opt in to degraded evidence.
     const strict = await searchMemory(manager, queries, { ...options, allowRetrievalFallback: false });
     assert.deepEqual(strict.results, []);
-    assert.equal(strict.rankingMode, "typesafe_usefulness");
+    assert.equal(strict.rankingMode, "decision");
     assert.equal(strict.fallbackReason, undefined);
   });
 }
@@ -55,7 +55,7 @@ test("partial success never mixes retrieval scores; valid rejection never trigge
     partial = isPartial;
     const result = await searchMemory(manager, queries, options);
     assert.equal(result.requestsSucceeded, isPartial ? 1 : 2);
-    assert.equal(result.rankingMode, "typesafe_usefulness");
+    assert.equal(result.rankingMode, "decision");
     assert.equal(result.fallbackReason, undefined);
     assert.deepEqual(result.results, []);
   }
@@ -97,19 +97,16 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
   test(`public tool returns explicitly labeled retrieval evidence with ${credential} credential`, async t => {
     let providerCalls = 0;
     t.mock.method(globalThis, "fetch", async () => { providerCalls++; throw new Error("must not call provider"); });
-    const previousTypeSafe = process.env.TYPESAFE_API_KEY;
     const previousCodex = process.env.CODEX_LB_API_KEY;
-    delete process.env.TYPESAFE_API_KEY;
     delete process.env.CODEX_LB_API_KEY;
     t.after(() => {
-      if (previousTypeSafe === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = previousTypeSafe;
       if (previousCodex === undefined) delete process.env.CODEX_LB_API_KEY; else process.env.CODEX_LB_API_KEY = previousCodex;
     });
     type Tool = { execute(id: string, params: unknown): Promise<{ details: Record<string, unknown> }> };
     let factory: ((ctx: OpenClawPluginToolContext) => Tool) | undefined;
     let diagnosticsFactory: typeof factory;
     registerUnblockMemory({
-      pluginConfig: { typesafe: credential === "disabled" ? { enabled: false, apiKey: "ignored" }
+      pluginConfig: { decisionModel: credential === "disabled" ? { enabled: false, apiKey: "ignored" }
         : credential === "unreadable" ? { apiKeyFile: "/dev/null/not-a-file" } : {} },
       registerCli() {}, registerService() {}, on() {}, registerGatewayMethod() {},
       registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
@@ -148,7 +145,7 @@ test("no eligible evidence with available ranking is empty, not a failed-judge f
   t.mock.method(globalThis, "fetch", async () => { calls++; throw new Error("unexpected"); });
   const result = await searchMemory({ searchCandidates: async () => [] }, queries, options);
   assert.deepEqual(result.results, []);
-  assert.equal(result.rankingMode, "typesafe_usefulness");
+  assert.equal(result.rankingMode, "decision");
   assert.equal(result.fallbackReason, undefined);
   assert.equal(calls, 0);
 });

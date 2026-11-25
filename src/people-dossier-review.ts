@@ -6,7 +6,7 @@ import { isInteractionCategory } from "./people-background.js";
 import type { Person, PersonDossier } from "./people-store.js";
 import type { QmdMemoryRuntime } from "./runtime.js";
 import type { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { resolveDecisionCredential } from "./decision-client.js";
 
 /** Review every saved assertion against its own evidence, including interaction lessons. */
 export async function reviewPersonDossier(params: {
@@ -20,8 +20,8 @@ export async function reviewPersonDossier(params: {
 }) {
   const unavailable = (reason: string) => ({ status: "unavailable" as const, needsReview: true, reason });
   const { config, runtime, active, person, dossier } = params;
-  if (!config.peoplePrimer.enabled || !config.typesafe.enabled) {
-    return unavailable("TypeSafe background review is disabled; verify manually before saving");
+  if (!config.peoplePrimer.enabled || !config.decisionModel.enabled) {
+    return unavailable("decision model background review is disabled; verify manually before saving");
   }
   const checks = [
     { statement: dossier.blurb, kind: undefined, inferred: false,
@@ -51,8 +51,8 @@ export async function reviewPersonDossier(params: {
   const signal = params.signal ? AbortSignal.any([params.signal, deadline]) : deadline;
   try {
     signal.throwIfAborted();
-    const apiKey = await abortable(resolveTypeSafeApiKey(config.typesafe), signal);
-    if (!apiKey) return unavailable("TypeSafe API key not configured; verify manually before saving");
+    const apiKey = await abortable(resolveDecisionCredential(config.decisionModel), signal);
+    if (!apiKey) return unavailable("Decision model API key not configured; verify manually before saving");
     const { manager } = await abortable(runtime.getMemorySearchManager(active), signal);
     if (!manager) return unavailable("Memory index unavailable; verify manually before saving");
     const agentName = resolveAgentIdentity(active.cfg, active.agentId)?.name?.trim() || params.agentName?.trim() || "the assistant";
@@ -62,7 +62,7 @@ export async function reviewPersonDossier(params: {
         personBackground: { name: person.preferredName ?? person.displayName,
           agentName,
           ...(check.kind ? { kind: check.kind, inferred: check.inferred } : {}) },
-        corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
+        corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model,
         timeoutMs: config.peoplePrimer.timeoutMs, signal,
       }), signal);
       if (review.status !== "ok" || review.needsReview) return review;

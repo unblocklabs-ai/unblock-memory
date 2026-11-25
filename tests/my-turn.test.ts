@@ -13,14 +13,14 @@ const credentials = { apiKey: "fake-secret", timeoutMs: 1500 };
 
 // Exercise the real plugin registration, config resolver, shared prompt composition, and HTTP client.
 // Only the host registration surface and external transport are replaced.
-function harness(myTurn: unknown = { enabled: true }, typesafe: unknown = credentials, safetyWhisperer?: unknown) {
+function harness(myTurn: unknown = { enabled: true }, decisionModel: unknown = credentials, safetyWhisperer?: unknown) {
   const hooks = new Map<string, ((...args: never[]) => unknown)[]>();
   const warnings: string[] = [];
   const api = {
     config: { agents: { entries: { bill: { identity: { name: "Bill" } } } },
       messages: { queue: { mode: "followup" } },
       plugins: { entries: { "unblock-memory": { hooks: { allowConversationAccess: true } } } } },
-    pluginConfig: { myTurn, typesafe, ...(safetyWhisperer ? { safetyWhisperer } : {}) },
+    pluginConfig: { myTurn, decisionModel, ...(safetyWhisperer ? { safetyWhisperer } : {}) },
     logger: { warn(message: string) { warnings.push(message); } },
     on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, [...hooks.get(name) ?? [], handler]); },
     registerCli() {}, registerService() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
@@ -91,7 +91,7 @@ test("only a clear quiet judgment adds an advisory, never rewrites the human mes
   assert.ok(WhispererDiagnostics.shared().snapshot("bill").myTurn.emitted);
 });
 
-test("disabled providers, DMs, unknown routes and internal wakes never call Jev", async t => {
+test("disabled providers, DMs, unknown routes and internal wakes never call the decision model", async t => {
   const api = transport(t);
   const h = harness({ enabled: true, channels: { imessage: { enabled: false } } });
   for (const overrides of [
@@ -157,7 +157,7 @@ test("the window includes only verified human messages, including the trigger on
   assert.deepEqual(api.bodies[2].state.agent, { id: "other", name: "other" });
 });
 
-test("unverified bundled context is omitted and oversized human input skips instead of misleading Jev", async t => {
+test("unverified bundled context is omitted and oversized human input skips instead of misleading the decision model", async t => {
   const api = transport(t);
   const h = harness();
   const chatter = "Chat history since last reply: ⟦openclaw:ctx⟧\n#123 Mo: Can Bill check this?";
@@ -202,11 +202,11 @@ test("unverified and non-human triggers skip My Turn, not delivery of the origin
   assert.equal(api.fetch.mock.callCount(), 0);
 });
 
-test("missing credentials, disabled TypeSafe and all provider/response failures leave turns unchanged", async t => {
+test("missing credentials, disabled decision model and all provider/response failures leave turns unchanged", async t => {
   const api = transport(t);
-  for (const typesafe of [{ enabled: false, apiKey: "fake" }, { apiKeyFile: "/nonexistent/my-turn-test-key" },
+  for (const decisionModel of [{ enabled: false, apiKey: "fake" }, { apiKeyFile: "/nonexistent/my-turn-test-key" },
     { apiKeyFile: process.cwd() }]) {
-    assert.equal(await harness({ enabled: true }, typesafe).before(event(), context()), undefined);
+    assert.equal(await harness({ enabled: true }, decisionModel).before(event(), context()), undefined);
   }
   assert.equal(api.fetch.mock.callCount(), 0);
   const h = harness();

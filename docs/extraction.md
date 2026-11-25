@@ -1,7 +1,7 @@
 # Session memory extraction
 
 Opt-in lasting-fact extraction: **Luna proposes facts → code checks exact quotes →
-Jev checks support and retention → SQLite stores accepted facts → optional QMD search.**
+decision model checks support and retention → SQLite stores accepted facts → optional QMD search.**
 It is independent of Inside Out: emotion scores do not select or strengthen memories.
 It never writes `MEMORY.md`, daily Markdown, or people dossiers.
 
@@ -31,7 +31,7 @@ and be a subset of the configured sessions corpus. This is channel agnostic.
 }
 ```
 
-Configure [TypeSafe credentials](configuration.md#typesafe-and-whisperers).
+Configure [decision model credentials](configuration.md#shared-decision-model-credentials).
 Manual runs use the same Gateway-owned worker as scheduled runs; the Gateway must
 be running and the CLI caller needs `operator.admin`. Reports can be read offline.
 Requires host visible-transcript delta reads and working isolated LLM completion
@@ -54,8 +54,8 @@ Luna uses the host's configured agent runtime and credentials, with zero tools a
 no alternate-model/provider fallback. Missing decision-model credentials prevent source
 scans and model calls. Enabling approves sending selected conversation text to
 Luna and the configured decision endpoint (defaults to
-`https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter `liquid/d1.2-ultra`, or
-`https://api.typesafe.ai/v1/systemone` when overridden); tool calls/results and hidden thinking are removed first.
+`https://codex.unblocklabs.ai/v1/decisions` → OpenRouter `liquid/d1.2-ultra`);
+tool calls/results and hidden thinking are removed first.
 
 ## Run, backfill, inspect
 
@@ -80,7 +80,7 @@ hypotheticals, one-off tasks, temporary status, release/incident details, generi
 technical knowledge, and credentials. The original transcripts remain searchable.
 
 A blue guess followed by a human correction to red retains only the red preference.
-Each proposal needs exact supporting quotes and new-message evidence. Jev checks
+Each proposal needs exact supporting quotes and new-message evidence. decision model checks
 support and retention independently in one request; replacements also require an
 explicit update to the same fact. All applicable thresholds must pass, and support
 must select `supported`, even if its threshold is lowered.
@@ -114,8 +114,8 @@ manual-only; the maximum is 1,440 minutes (daily). Defaults are disabled, unpubl
 no approved chat types, hourly, six overlap messages, and five chunks per run.
 
 Chunks target 24k input tokens and cap at 28k, including Luna instructions, prior
-facts and overlap, leaving room for Jev's 32k state-plus-longest-question limit.
-`o200k_base` is a budgeting proxy, not an exact Jev/host token count. Quotes are
+facts and overlap, leaving room for decision model's 32k state-plus-longest-question limit.
+`o200k_base` is a budgeting proxy, not an exact decision model/host token count. Quotes are
 limited to 512 characters each. Up to six overlap messages fit within 8k tokens by
 default. Oversized messages split losslessly with resumable offsets and original
 message-ID citations. A session above 100 retained facts or 40k characters of prior

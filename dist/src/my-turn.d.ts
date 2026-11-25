@@ -9,4 +9,4 @@ export type MyTurnConfig = {
     }>;
 };
 export declare function resolveMyTurn(value: unknown): MyTurnConfig;
-export declare function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig, typesafe: UnblockMemoryConfig["typesafe"], diagnostics?: WhispererDiagnostics): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined;
+export declare function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig, decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined;

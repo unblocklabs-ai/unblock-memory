@@ -1,4 +1,4 @@
-import { MEMORY_JUDGE_VERSION, memoryUsefulnessRequest, judgeMemoryPassage } from "./typesafe.js";
+import { MEMORY_JUDGE_VERSION, memoryUsefulnessRequest, judgeMemoryPassage } from "./decision-ranking.js";
 export const CONTEXT_JUDGE_VERSION = MEMORY_JUDGE_VERSION;
 export function contextJudgeRequest(input, asOf, hit, model) {
     return memoryUsefulnessRequest(input, {

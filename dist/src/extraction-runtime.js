@@ -134,7 +134,7 @@ export function registerExtraction(api, config, runtime, deps) {
         timer = undefined;
         if (lifetime.signal.aborted)
             lifetime = new AbortController();
-        if (!config.extraction.enabled || !config.extraction.intervalMinutes || !config.typesafe.enabled)
+        if (!config.extraction.enabled || !config.extraction.intervalMinutes || !config.decisionModel.enabled)
             return;
         timer = setInterval(tick, 60_000);
         timer.unref();

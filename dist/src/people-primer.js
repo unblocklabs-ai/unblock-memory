@@ -1,6 +1,6 @@
 import { noul } from "@unblocklabs/decisions";
 import { Value } from "typebox/value";
-import { decideWithModel, decisionModelScope, defaultDecisionModel, TYPESAFE_NOUL_ANSWERS_SCHEMA as answerSchema } from "./typesafe-client.js";
+import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, NOUL_ANSWERS_SCHEMA as answerSchema } from "./decision-client.js";
 import { abortable } from "./abortable.js";
 import { jsonHash } from "./json-hash.js";
 const VERSION = "people-primer-interaction-v1";
@@ -38,7 +38,7 @@ function questionsFor(name, agent) {
         { id: "workingStyle", question: `What explicit feedback describes how ${agent} should communicate or collaborate with ${name}, with what scope and exceptions?` },
     ];
 }
-/** Evidence preparation only. Search is local; approved excerpts go to TypeSafe.
+/** Evidence preparation only. Search is local; approved excerpts go to the decision endpoint.
  * No identity inference, generated claims, dossier writes or automatic injection. */
 export async function primePersonDossier(params) {
     const { store, config, signal } = params;
@@ -97,7 +97,7 @@ export async function primePersonDossier(params) {
                 false: "Only a topic/name match, activity summary, psychological profile, ambiguous attribution or no substantive answer.",
             })])),
     };
-    const model = params.model ?? defaultDecisionModel(params.endpoint);
+    const model = params.model ?? DEFAULT_DECISION_MODEL;
     const scope = decisionModelScope(model, params.endpoint);
     const expectedKeys = Object.keys(questions);
     const validCached = (value) => Value.Check(answerSchema, value) &&

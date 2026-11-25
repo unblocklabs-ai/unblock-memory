@@ -1,9 +1,9 @@
 import { RESPONSE_EXTRACTOR_VERSION } from "./response-episodes.js";
 import { judgeResponse, judgeResponseFollowup, RESPONSE_STAGE_VERSIONS, } from "./response-judge.js";
-import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
+import { decisionModelScope, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import { jsonHash } from "./json-hash.js";
 export async function assessResponseStages(store, cohort, e, params, sentimentEnabled, usage) {
-    const scope = decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint);
+    const scope = decisionModelScope(params.model ?? DEFAULT_DECISION_MODEL, params.endpoint);
     const original = { before: e.before, request: e.request, answer: e.answer, contextLimited: e.contextLimited };
     const feedback = { ...original, feedback: e.feedback };
     const evidence = {

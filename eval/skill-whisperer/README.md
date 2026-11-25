@@ -14,11 +14,11 @@ node --env-file=.env --import tsx eval/skill-whisperer/compare.ts --live
 ```
 
 The default invocation validates fixtures without inference. `--live` uses
-`TYPESAFE_API_KEY`, real QMD local embeddings, and one TypeSafe request per skill
+`CODEX_LB_API_KEY`, real QMD local embeddings, and one decision request per skill
 per arm per case (up to 760 requests with the current 40-case/16-skill fixtures).
 It may download QMD's default embedding model if absent. It reads no fleet configs,
 conversation logs, memory documents, or dossiers. Only synthetic requests/history
-and snapshotted skill names/descriptions go to TypeSafe. Source paths are not sent.
+and snapshotted skill names/descriptions go to decision model. Source paths are not sent.
 
 Results, input/selector hashes, model ID, timings, token usage and the
 isolated QMD database remain in a unique ignored `reports/skill-whisperer/` directory.
@@ -31,7 +31,7 @@ runs do not produce an aggregate report.
 ## Arms
 
 1. Production `QmdMemoryManager.searchSkills` plus its default 0.5 gate.
-2. The same query's top three, **without** that gate, scored independently by TypeSafe.
+2. The same query's top three, **without** that gate, scored independently by decision model.
 3. Independent per-skill scoring over the entire 16-skill fixture roster.
 
 Labels are fixed in `cases.ts`, permit multiple valid skills, and are never sent
@@ -45,8 +45,3 @@ larger-inventory test before a production recommendation.
 This evaluates fresh-turn selection, not cooldown behavior or whether an agent
 actually follows a suggestion. Existing whisperer tests cover hook/cooldown rules.
 Use an independently labeled, approved traffic sample before claiming fleet gains.
-
-References checked 2026-09-24:
-- https://docs.typesafe.ai/api
-- https://docs.typesafe.ai/cookbooks/rerank_typesafe
-- https://docs.typesafe.ai/models

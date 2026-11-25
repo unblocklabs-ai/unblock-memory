@@ -1,8 +1,7 @@
 // Synthetic cases only; never reads corpus data. Default invocation makes no API calls.
-import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
 import { resolveConfig } from "../../src/config.js";
-import { judgeTypeSafeQuality } from "../../src/typesafe.js";
-import { resolveTypeSafeApiKey } from "../../src/typesafe-client.js";
+import { judgeQuality } from "../../src/decision-ranking.js";
+import { resolveDecisionCredential } from "../../src/decision-client.js";
 import { qualityStructure } from "../../src/quality-audit.js";
 
 const cases = [
@@ -23,20 +22,19 @@ const cases = [
 
 async function main() {
   const args = process.argv.slice(2);
+  if (args.some(arg => arg !== "--live")) throw new Error("Usage: check.ts [--live]");
   if (!args.includes("--live")) {
-    console.log(`${cases.length} synthetic quality-audit cases. Use --live with CODEX_LB_API_KEY (or --legacy with TYPESAFE_API_KEY) for inference.`);
+    console.log(`${cases.length} synthetic quality-audit cases. Use --live with CODEX_LB_API_KEY for inference.`);
     return;
   }
-  const decisionModel = resolveConfig({
-    decisionModel: args.includes("--legacy") ? { endpoint: LEGACY_SYSTEMONE_ENDPOINT } : undefined,
-  }).decisionModel;
-  const apiKey = await resolveTypeSafeApiKey(decisionModel);
+  const { decisionModel } = resolveConfig({});
+  const apiKey = await resolveDecisionCredential(decisionModel);
   if (!apiKey) throw new Error("Decision model credential is required for the configured endpoint");
   const rows = [];
   const started = Date.now();
   for (let offset = 0; offset < cases.length; offset += 4) {
     const batch = cases.slice(offset, offset + 4);
-    const answers = await judgeTypeSafeQuality({
+    const answers = await judgeQuality({
       apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: 10_000,
       signal: new AbortController().signal,
       chunks: batch.map(item => ({ text: item.text, sourceKind: "files" })),

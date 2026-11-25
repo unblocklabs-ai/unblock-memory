@@ -585,7 +585,7 @@ test("weekly checkpoints discover every statement in a newly saved participant d
   assert.equal(completed.status, "complete");
   assert.equal(f.people.isDossierVerified(f.a), true);
   const manualConfig = { people: { enabled: true, whisperer: { enabled: true } },
-    typesafe: { enabled: true, apiKey: "fake" }, responseAudit: { enabled: true, senderIds: ["U1"], intervalMinutes: 0 } };
+    decisionModel: { enabled: true, apiKey: "fake" }, responseAudit: { enabled: true, senderIds: ["U1"], intervalMinutes: 0 } };
   await hooks.get("cron_reconciled")!({}, { config: { ...hostConfig, plugins: { entries: { "unblock-memory": { config: manualConfig } } } } });
   t.mock.method(globalThis, "fetch", () => { assert.fail("Scheduled review must not start manual-only provider calls"); });
   const signals = await call({ action: "signals", runId: manifest.id });
@@ -871,7 +871,7 @@ test("older in-flight analysis cannot overwrite or regress a newer analysis resu
   const workspace = join(f.root, "workspace-analysis"); mkdirSync(workspace);
   const automaticU1 = {
     people: { enabled: true, whisperer: { enabled: true } },
-    typesafe: { enabled: true, apiKey: "fake" },
+    decisionModel: { enabled: true, apiKey: "fake" },
     responseAudit: { enabled: true, senderIds: ["U1"], intervalMinutes: 45, lookbackDays: 30 },
   };
   const automaticNoOne = {

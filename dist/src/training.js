@@ -1,4 +1,4 @@
-import { classifyDecisionFailure, resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { classifyDecisionFailure, resolveDecisionCredential } from "./decision-client.js";
 import { TrainingTranscriptReader } from "./training-input.js";
 import { judgeTrainingInput, TRAINING_GATE_QUESTIONS } from "./training-gate.js";
 /** A full active-branch rescan is cheap/local; only changed exact inputs need inference. */
@@ -56,9 +56,9 @@ export async function runTraining(source, store, config, options) {
     const result = { refreshed, pendingSelected: jobs.length, calls: 0, completed: 0, failed: 0, ambiguous: 0,
         inputBytes: 0, inputTokens: 0, outputTokens: 0, budgetLimited: false };
     // Resolve only when there is work. Reruns with no pending inputs need no credentials.
-    const key = jobs.length && !options.dryRun ? await resolveTypeSafeApiKey(config.typesafe) : undefined;
+    const key = jobs.length && !options.dryRun ? await resolveDecisionCredential(config.decisionModel) : undefined;
     if (jobs.length && !options.dryRun && !key)
-        throw new Error("TypeSafe is disabled or its credential is unavailable");
+        throw new Error("Decision model is disabled or its credential is unavailable");
     let next = 0, stopped = false;
     const workers = await Promise.allSettled(Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
         while (!stopped && !result.budgetLimited) {
@@ -81,7 +81,7 @@ export async function runTraining(source, store, config, options) {
                 let judgment;
                 try {
                     // Offline labeling has its own deadline, not Whisperer's latency-sensitive timeout.
-                    judgment = await judgeTrainingInput(input, key, AbortSignal.timeout(30_000), { endpoint: config.typesafe.endpoint, model: config.typesafe.model });
+                    judgment = await judgeTrainingInput(input, key, AbortSignal.timeout(30_000), { endpoint: config.decisionModel.endpoint, model: config.decisionModel.model });
                 }
                 catch (error) {
                     const classified = classifyDecisionFailure(error);

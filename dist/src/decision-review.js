@@ -1,6 +1,6 @@
 import { choice, noul } from "@unblocklabs/decisions";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
-import { decideWithModel } from "./typesafe-client.js";
+import { decideWithModel } from "./decision-client.js";
 const RELATION_CRITERIA = {
     supports: { definition: "The evidence directly supports the whole claim with its exact qualifications." },
     contradicts: { definition: "The evidence explicitly conflicts with the claim, including a wrong entity, date, or negation." },
@@ -121,7 +121,7 @@ const CLUSTER_DEFECT_QUESTIONS = {
     }),
 };
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
-export async function reviewTypeSafeClaim(params) {
+export async function reviewClaim(params) {
     const interaction = params.personBackground?.kind === "interaction";
     if (params.personBackground && !interaction && backgroundWordCount(params.claim) > PEOPLE_BACKGROUND_MAX_WORDS) {
         throw new Error("Background snippet exceeds 70 words");

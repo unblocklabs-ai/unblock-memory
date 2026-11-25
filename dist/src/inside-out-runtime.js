@@ -15,7 +15,7 @@ export function registerInsideOut(api, config) {
     };
     api.registerCli(({ program, config: cfg }) => {
         const root = program.command("memory-emotions").description("Inside Out: review human replies and analyze emotion probabilities");
-        root.command("link-people").description("Backfill or refresh People identity links without Jev")
+        root.command("link-people").description("Backfill or refresh People identity links without the decision model")
             .option("--agent <id>", "Agent id", "main")
             .option("--repair-identities", "Recover legacy sender/channel metadata for unlinked reviews")
             .action(async (opts) => {
@@ -34,7 +34,7 @@ export function registerInsideOut(api, config) {
             if ("failed" in result && (result.failed || result.errors.length || result.baselineError))
                 process.exitCode = 1;
         });
-        root.command("baseline-refresh").description("Update local weekly baselines and missing comparisons; no Jev calls")
+        root.command("baseline-refresh").description("Update local weekly baselines and missing comparisons; no inference")
             .option("--agent <id>", "Agent id", "main")
             .option("--recompare", "Append revised comparisons using newly available historical grades; preserve earlier results")
             .action(async (opts) => {
@@ -46,7 +46,7 @@ export function registerInsideOut(api, config) {
             .action((opts) => {
             console.log(JSON.stringify(reportInsideOutBaselines(paths(cfg, opts.agent).storePath, { personId: opts.person, since: opts.since ? dateOption(opts.since, 0) : undefined, limit: Number(opts.limit) }), null, 2));
         });
-        root.command("purge").description("Delete one person's emotion baselines and assessment history; no Jev calls")
+        root.command("purge").description("Delete one person's emotion baselines and assessment history; no inference")
             .requiredOption("--person <id>", "Exact PeopleSQL person ID").option("--agent <id>", "Agent id", "main")
             .option("--grades", "Also erase this person's raw emotion grades; tombstones keep those replies from being regraded")
             .action((opts) => {
@@ -129,7 +129,7 @@ export function registerInsideOut(api, config) {
         baselineTimer = setInterval(refresh, 86400_000);
         baselineTimer.unref();
         refresh();
-        if (config.typesafe.enabled && config.insideOut.intervalMinutes) {
+        if (config.decisionModel.enabled && config.insideOut.intervalMinutes) {
             timer = setInterval(tick, config.insideOut.intervalMinutes * 60_000);
             timer.unref();
             tick();

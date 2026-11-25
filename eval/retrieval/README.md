@@ -1,6 +1,6 @@
 # Retrieval lab
 
-Local synthetic comparison; no TypeSafe call or live OpenClaw corpus access.
+Local synthetic comparison; no decision model call or live OpenClaw corpus access.
 QMD may download its embedding model if not already cached.
 
 ```sh

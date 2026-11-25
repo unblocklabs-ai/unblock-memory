@@ -9,7 +9,7 @@ default. Select named corpora, or use `["all"]` alone. An empty list or unknown
 name is an error. Supply `bm25Query` (distinctive keywords/names) and
 `vectorQuery` (a natural-language question describing the information needed).
 Each lane retrieves ten candidates; complete passages are deduplicated and
-independently judged by TypeSafe against `vectorQuery`. No query generation or
+independently judged against `vectorQuery`. No query generation or
 recall gate runs. Default: **5 results**, `minUsefulness: 0.7`;
 `maxResults` is 1–20 and `minUsefulness` is 0–1. The old `query` and vector
 `minScore` parameters are removed, not silently reinterpreted.
@@ -21,7 +21,7 @@ Example tool input (the `memory` corpus exists by default):
 ```
 
 Results use compact JSON and carry `path`, `startLine`, `endLine`, `snippet`,
-`corpus`, and a `score`. With `rankingMode: "typesafe_usefulness"`, this is a
+`corpus`, and a `score`. With `rankingMode: "decision"`, this is a
 usefulness probability rounded to hundredths; ranking and threshold filtering
 still use full precision. With `rankingMode: "retrieval"`, passage-level
 reciprocal rank fusion (RRF, `k = 60`, with QMD's top-rank bonuses) scores
@@ -74,8 +74,9 @@ Search snippets are leads. Inspect attribution, qualifications, dates and adjace
 context before relying on a factual claim. An old plan is not proof it happened,
 and memory does not grant permission to act. No results may mean the wrong corpus,
 a high threshold, an unsynced session or an unavailable index—not absence of the fact.
-When enabled and configured, TypeSafe receives the semantic query, candidate
-excerpts, dates, corpus and source paths. If disabled, missing/unreadable credentials,
+When enabled and configured, the decision endpoint receives the semantic query,
+candidate excerpts, dates, corpus and source paths. The default route is Codex LB →
+OpenRouter `liquid/d1.2-ultra`. If disabled, missing/unreadable credentials,
 or **all** eligible usefulness requests fail (including billing HTTP 402, timeouts,
 network or invalid responses), explicit search returns local retrieval-ranked leads.
 The response includes `rankingMode: "retrieval"`, `scoreMeaning: "retrieval_rank"`,
@@ -119,7 +120,7 @@ Both `memorySearch` and `memoryWhisperer` also report per-call stage measurement
   `vectorScanMs`, `hydrationMs`, and `vectorMappingMs`. Repeated scan/hydration stages are summed;
   `vectorScanAttempts` counts native scans. Embedding time includes any lazy model/context setup.
 - `passageMs`: rendering merged candidates; `candidatePrepMs`: eligibility checks and deduplication
-  before disclosure to TypeSafe. `judgeMs` covers the concurrent candidate judgments, not their sum.
+  before disclosure to the decision endpoint. `judgeMs` covers the concurrent candidate judgments, not their sum.
 - `vectorOtherMs` and `retrievalOtherMs` expose time outside measured child stages. `otherMs` accounts
   for the remaining manual tool execution; Whisperer tracks individual stage timings without a
   separate whole-run residual. Parent durations must not be added to their child durations.
@@ -135,7 +136,7 @@ path, credential or session identifier is retained; samples are process-local an
 Corpora and session filters select evidence; they are not audience ACLs. Normal
 tools can access this agent's configured non-skill corpora, not just its current
 chat. Only index material suitable for the agent's tool callers. Per-feature
-TypeSafe allowlists do not restrict ordinary retrieval.
+decision model allowlists do not restrict ordinary retrieval.
 
 ## QMD entry points
 
@@ -290,7 +291,7 @@ incomplete envelopes leave the entire message unchanged rather than blocking syn
 The companion QMD semantic-chunking update skips only source-confirmed standalone
 REM heading/marker spans and orphan closing fences. Reflections and useful text
 remain searchable, with original source offsets. These are deterministic rules,
-not TypeSafe judgments; audit flags never authorize automatic memory deletion.
+not decision model judgments; audit flags never authorize automatic memory deletion.
 
 The plugin installs its exact release-pinned QMD dependency (see
 [package metadata](../package.json)). Projector/chunker version changes refresh derived
@@ -318,7 +319,7 @@ or `memory_get`. Enable it in the plugin config with an explicit corpus allowlis
 ```
 
 Requires `hooks.allowConversationAccess: true` on the plugin entry, prompt
-injection permission, and [shared TypeSafe credentials](configuration.md#shared-typesafe-credentials).
+injection permission, and [shared decision model credentials](configuration.md#shared-decision-model-credentials).
 An empty allowlist is invalid when enabled; `all`, unknown names, and `skills`
 are not accepted. When `sessions` is enabled for Memory Whisperer, automatic recall
 can retrieve across this agent's indexed sessions. The sessions corpus's `chatTypes`
@@ -341,9 +342,9 @@ complete approved collection scope (not ten per collection) and fusing them via
 passage-level RRF (`k = 60`, with QMD top-rank bonuses). The lexical adapter
 uses literal OR keywords; quotation marks do not enable exact-phrase matching.
 After deduplication and cooldown filtering, Whisperer sends at most the top **six**
-fused candidates to TypeSafe, paired with a compact conversation context (the
+fused candidates to the decision endpoint, paired with a compact conversation context (the
 current request plus at most the last two visible messages, bounded to 1,500
-characters). TypeSafe evaluates one independent Noul question per candidate in
+characters). decision model evaluates one independent Noul question per candidate in
 its own concurrent HTTP request: would a careful assistant use a specific factual
 detail from the excerpt when answering the current request? Partial answers and
 concrete leads count; repeated facts, topic/name matches without answer content,
@@ -360,7 +361,7 @@ Explicit configured thresholds are preserved. Evaluate it on your own conversati
 current request and most recent whole messages are retained; an oversized current
 request skips automatic memory before query generation or retrieval.
 Diagnostics count `input_too_large`; completed logs report `outcome: "skipped"` and
-`reason: "input_too_large"`, without recording the input. Each TypeSafe usefulness
+`reason: "input_too_large"`, without recording the input. Each decision model usefulness
 request receives the compacted conversation (at most 1,500 characters across the
 current request and up to two prior visible messages) plus one complete
 1,200-character excerpt, its corpus/source path, all represented message timestamps,
@@ -397,10 +398,10 @@ All whisperer contributions share that appended block, in this order: `<memory>`
 are omitted; no wrapper is emitted when none qualify. The independent whisperers
 run concurrently, and a failed contribution does not discard successful siblings.
 
-Unlike Skill Whisperer, **disabled TypeSafe, a missing key, or no qualifying successful
+Unlike Skill Whisperer, **disabled decision model, a missing key, or no qualifying successful
 judgments means no memory hint**—there is no vector-only fallback. A failed candidate
 does not discard successful siblings. The overall process
-has a 3-second deadline, with the shared 1.5-second TypeSafe request deadline inside it;
+has a 3-second deadline, with the shared 1.5-second decision model request deadline inside it;
 neither performs retries. Timed-out or superseded runs cannot inject late hints.
 Already-running local QMD work may finish in the background, but does not keep the
 agent waiting beyond the deadline. No new indexing, clustering, or summarization runs
@@ -447,7 +448,7 @@ between that private worker protocol and the HTTP API below.
 missing credentials, timeouts (capped at half the whisperer deadline, up to 1.5s),
 and HTTP failures log `generation_fallback` and fall back to deterministic local
 `lex`/`vec` extraction rather than aborting retrieval; all fallback hits still pass
-through TypeSafe usefulness judging.
+through decision model usefulness judging.
 Turn cancellation aborts HTTP and prevents late hints; already-running server-side
 generation may finish independently. Gateway shutdown does not stop the shared API.
 Old `mlx` config is accepted but ignored; remove it after migrating.
@@ -479,7 +480,7 @@ scores.
 Query output requires exactly the two nonempty string fields `lex` and `vec`;
 surrounding whitespace is trimmed. Old query arrays are not accepted. Unparseable,
 timed-out, or unavailable v2 output falls back to deterministic local `lex`/`vec`
-queries for that turn and still requires TypeSafe passage judgments.
+queries for that turn and still requires decision model passage judgments.
 Nothing changes in manual `memory_search` beyond passage-level RRF scoring in
 shared candidate discovery. The default total deadline remains three seconds;
 measure the full path before choosing a larger explicit budget.
@@ -509,8 +510,8 @@ disabled; an explicit `skillWhisperer.enabled: true` without one logs a warning.
 Set `skillWhisperer.enabled` to `false` to opt out. It
 embeds the current prompt plus the configured number of prior user/assistant
 messages, compares it with each configured skill's frontmatter `name` and
-`description`. With TypeSafe enabled and a key available, the top three valid
-candidates are graded in separate concurrent TypeSafe requests, without a vector-score cutoff.
+`description`. With decision model enabled and a key available, the top three valid
+candidates are graded in separate concurrent decision model requests, without a vector-score cutoff.
 Each request sees only one skill's name/description plus the conversation. Code chooses
 the highest usefulness probability at or above **0.7**, with retrieval order breaking ties.
 If none qualifies, no skill is suggested; there is no vector fallback. This is an
@@ -521,10 +522,10 @@ The reminder follows memory, when present, in the same appended `<unblock_memory
 block: `<skill>This skill may be relevant: "/path/to/SKILL.md"</skill>`.
 It includes the path but does not repeat the skill name.
 
-See [shared TypeSafe credentials](configuration.md#shared-typesafe-credentials) for key setup,
+See [shared decision model credentials](configuration.md#shared-decision-model-credentials) for key setup,
 rotation and the `enabled: true` / `timeoutMs: 1500` defaults.
 
-If TypeSafe is disabled or no key is found, selection uses the original local
+If the decision model is disabled or no key is found, selection uses the original local
 vector process and `skillWhisperer.minScore`. With a key present, an API error,
 invalid response, or timeout excludes that candidate and logs a sanitized warning;
 successful siblings can still qualify. If all fail, no hint is emitted. It does
@@ -536,22 +537,21 @@ credential resolution, retrieval and provider calls. A slow skill lookup cannot
 hold up ready memory or people hints beyond that budget. Session teardown,
 superseding turns and Gateway shutdown cancel its wait and provider requests;
 shared indexing/embedding work can finish for other callers, but cannot trigger
-late Jev calls or hints for the cancelled run.
+late decision model calls or hints for the cancelled run.
 
 **Privacy:** enabled decision-model selection sends up to 12,000 characters of current
 prompt/recent user-assistant text, plus the shortlisted names/descriptions, to the
-configured `typesafe.endpoint` (defaulting to `https://codex.unblocklabs.ai/v1/decisions`,
-routed to OpenRouter's `liquid/d1.2-ultra`; or `https://api.typesafe.ai/v1/systemone` with
-`jev-1.13.0` when overridden). Source-path fields, full skill procedures, tool-result
+configured `decisionModel.endpoint` (defaulting to `https://codex.unblocklabs.ai/v1/decisions`,
+routed to OpenRouter's `liquid/d1.2-ultra`). Source-path fields, full skill procedures, tool-result
 messages, and system messages are excluded; dossiers and ordinary memory files are not read
 for this call. Material already quoted in user/assistant text can still be included.
-Disable `typesafe.enabled` to keep Skill Whisperer entirely local.
+Disable `decisionModel.enabled` to keep Skill Whisperer entirely local.
 
 The defaults use five prior messages, a vector-only score threshold of `0.5`,
 and a ten-turn cooldown. A skill is cooling down after either a suggestion or a
 successful direct `read` of its indexed `SKILL.md`. When the selected
 skill is cooling down, no hint is emitted; Skill Whisperer does not fall through
-to a weaker match. When every shortlisted skill is cooling down, Jev is skipped.
+to a weaker match. When every shortlisted skill is cooling down, no decision requests are made.
 Cooldown state is per session and intentionally resets with
 the Gateway. Shell-command reads are not tracked.
 
@@ -573,7 +573,7 @@ rebuild the skill index from the updated configuration.
 - `memory_diagnostics` reports credential **availability only**, per-agent process-local
   whisperer counters, projection version, old indexed-session projection count, and
   embedding readiness. Counters are bounded to 100 agents and reset on restart.
-  This is not a complete people/response feature-status report; it makes no TypeSafe
+  This is not a complete people/response feature-status report; it makes no decision model
   request, but can initialize the memory manager/index on first use.
   No prompts, excerpts, paths, keys, or provider error bodies enter these counters.
   Parser cleanup/budget-skip counts are persisted with the latest completed
@@ -608,12 +608,12 @@ Optional plugin config fragment (corpora must already be configured):
 ```
 
 Both additions default off. Claim review sends the proposed claim and approved
-source excerpts to TypeSafe; cluster review sends one approved sampled excerpt per request.
+source excerpts to the decision endpoint; cluster review sends one approved sampled excerpt per request.
 Complementary hints use up to six concurrent directional-pair requests over at most four already-useful
 candidates. Each request sees only its pair, not the other candidates. Only redundancy probability >=0.9
 removes a hint; distinct evidence and contradictions should remain. Provider errors
 retain baseline hints, while the existing total turn deadline/cancellation still
-suppresses late results. Missing keys or disabled TypeSafe never enable these calls.
+suppresses late results. Missing keys or disabled decision model never enable these calls.
 The retrieval corpus/session boundaries are unchanged.
 
 ## Memory quality audit
@@ -634,8 +634,8 @@ configured decision endpoint (defaults to `https://codex.unblocklabs.ai/v1/decis
 ```
 
 This is a plugin config fragment; both corpora must already be configured.
-Off by default. Uses the shared TypeSafe credentials and request timeout. Missing
-credentials or disabled TypeSafe produces no audit. Approval includes transmission
+Off by default. Uses the shared decision model credentials and request timeout. Missing
+credentials or disabled decision model produces no audit. Approval includes transmission
 of full eligible chunks and visibility of findings to all audiences using the agent.
 Unlike Memory Whisperer, approving `sessions` includes **all indexed sessions** in
 that corpus, including configured direct conversations. Only approve that when intended.

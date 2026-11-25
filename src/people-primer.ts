@@ -4,7 +4,7 @@ import { Value } from "typebox/value";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { PeoplePrimerConfig } from "./people-primer-config.js";
 import type { PeopleStore } from "./people-store.js";
-import { decideWithModel, decisionModelScope, defaultDecisionModel, TYPESAFE_NOUL_ANSWERS_SCHEMA as answerSchema } from "./typesafe-client.js";
+import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, NOUL_ANSWERS_SCHEMA as answerSchema } from "./decision-client.js";
 import { abortable } from "./abortable.js";
 import { jsonHash } from "./json-hash.js";
 
@@ -61,7 +61,7 @@ function questionsFor(name: string, agent: string) {
 type Candidate = { hit: CorpusMemorySearchResult };
 type Graded = Candidate & { aboutPerson: number; explicitBackground: number; enduring: number; recognition: number; usefulness: Record<string, number> };
 
-/** Evidence preparation only. Search is local; approved excerpts go to TypeSafe.
+/** Evidence preparation only. Search is local; approved excerpts go to the decision endpoint.
  * No identity inference, generated claims, dossier writes or automatic injection. */
 export async function primePersonDossier(params: {
   personId: string;
@@ -126,7 +126,7 @@ export async function primePersonDossier(params: {
       },
     )])),
   };
-  const model = params.model ?? defaultDecisionModel(params.endpoint);
+  const model = params.model ?? DEFAULT_DECISION_MODEL;
   const scope = decisionModelScope(model, params.endpoint);
   const expectedKeys = Object.keys(questions);
   const validCached = (value: unknown): value is Static<typeof answerSchema> => Value.Check(answerSchema, value) &&

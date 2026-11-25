@@ -32,7 +32,7 @@ knowledge.
 ## Investigate
 
 For suspected ingestion defects, `memory_review_cluster` inspects a bounded
-center/edge sample using TypeSafe when quality auditing is enabled. Its findings
+center/edge sample using the decision model when quality auditing is enabled. Its findings
 apply only to those members; a shared label is a hypothesis, not permission to
 discard a cluster. Inspect original sources before proposing an ingestion fix.
 

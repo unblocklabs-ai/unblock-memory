@@ -21,7 +21,7 @@ Enable People Whisperer as usual:
 }
 ```
 
-Learning defaults on only when both switches are on. It does not enable TypeSafe,
+Learning defaults on only when both switches are on. It does not enable decision model,
 People Primer, response audits, additional senders, or new corpora.
 
 Optional settings under `people.learning`:
@@ -220,7 +220,7 @@ analysis attempts.
    Install the reviewed tarball with `openclaw plugins install /absolute/path/package.tgz`.
 4. Merge the People Whisperer settings above into
    `plugins.entries.unblock-memory.config`. Preserve existing hook permissions,
-   tool policies, corpus approvals, TypeSafe settings and response-audit sender
+   tool policies, corpus approvals, decision model settings and response-audit sender
    approvals. Set the host timezone or explicit per-agent overrides.
 5. Synchronize exact local identities using the existing PeopleSQL directory
    workflow (`memory_people_sync` where approved). Confirm the roster, accounts,

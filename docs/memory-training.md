@@ -6,8 +6,8 @@ changes, memory writes, live-index mutation or automatic background inference.
 ## Recipe
 
 1. Collect eligible historical user turns and preceding visible conversation.
-2. Configured decision model (default `liquid/d1.2-ultra` via `https://codex.unblocklabs.ai/v1/decisions`,
-   or `jev-1.13.0` when overridden to `https://api.typesafe.ai/v1/systemone`) recall probability **>=0.7** gates query generation.
+2. Recall probability **>=0.7** from the configured decision model gates query generation.
+   The default is `liquid/d1.2-ultra` via Codex LB.
    Preserve negative labels for audit; greetings do not need query targets.
 3. Isolated `openai/gpt-6-luna`, **xhigh**, generates **five distinct queries per
    lane**: discriminating BM25 keywords for `lex`, semantic natural language for
@@ -15,7 +15,7 @@ changes, memory writes, live-index mutation or automatic background inference.
 4. Retrieve ten matches per query using **only its lane's backend**, from the
    originating agent's historical sessions. Use the same complete-excerpt renderer
    and **1,200-character limit** as runtime, with no merged passage-count cap.
-5. The shared runtime TypeSafe `noul` grader judges each distinct passage in its
+5. The shared runtime decision model `noul` grader judges each distinct passage in its
    own request against the **original conversation**. It receives as-of time and
    passage source/date context, never query, rank, retrieval score, or backend.
 6. Score each query by the **mean of its three highest raw probabilities**. Average
@@ -167,7 +167,7 @@ recall probability, corpus coverage and teacher/retrieval/judgment provenance.
 Recall-gate exports include negatives. Export revalidates input sources but does
 not rerun retrieval; evaluate first if a fresh corpus assessment is desired.
 Export reselects targets from saved completed scores, including older v2 evaluations
-excluded only for no useful evidence. It makes no new Luna/TypeSafe calls, records
+excluded only for no useful evidence. It makes no new Luna/decision model calls, records
 the current target policy, and leaves original checkpoint/attempt records untouched.
 
 Freeze one **recall-gate export per node after recall labeling and before selecting
@@ -185,7 +185,7 @@ historical timestamp; changed/out-of-cohort targets are rejected rather than cha
 the evaluation population. Use the actual
 **LFM2.5-230M-Base** tokenizer and an explicit causal-LM input/target format before
 fine-tuning; the byte guard is additional to the token limit. Runtime abstention remains
-a separate TypeSafe gate; positive-only query training does not teach abstention.
+a separate decision model gate; positive-only query training does not teach abstention.
 
 The repository helper uses a pinned official tokenizer revision and chat template,
 with assistant-only loss labels, a 32,768-token total-sequence ceiling, and deterministic

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
-import type { QualityJudgment } from "./typesafe.js";
+import type { QualityJudgment } from "./decision-ranking.js";
 
 const TEMPORAL_BASES = ["path", "frontmatter", "session", "agent_verified"] as const;
 export type TemporalBasis = typeof TEMPORAL_BASES[number];

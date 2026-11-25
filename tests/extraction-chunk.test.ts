@@ -113,9 +113,9 @@ test("partial-page append is safe, changed pending content resets instead of sil
   assert.deepEqual(await readExtractionChunk(params(fixture([[original[0]!, message("two", "rewritten")]]), first.cursor)), { kind: "reset", cursor: null });
 });
 
-test("TypeSafe failure cannot commit earlier accepted facts or advance a collected chunk", async () => {
+test("decision model failure cannot commit earlier accepted facts or advance a collected chunk", async () => {
   const dir = await mkdtemp(join(tmpdir(), "extraction-validation-retry-")), storePath = join(dir, "memory.sqlite");
-  const config = resolveConfig({ typesafe: { apiKey: "test" }, corpora: [
+  const config = resolveConfig({ decisionModel: { apiKey: "test" }, corpora: [
     { name: "memory", kind: "files", paths: ["memory/**/*.md"] }, { name: "sessions", kind: "sessions", chatTypes: ["channel"] },
   ], extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 } });
   let fail = true, active = 0, peak = 0;
@@ -144,7 +144,7 @@ test("TypeSafe failure cannot commit earlier accepted facts or advance a collect
 
 test("worker retries whole chunks, isolates sessions, maps split citations, and makes zero unchanged calls", async () => {
   const dir = await mkdtemp(join(tmpdir(), "extraction-chunks-")), storePath = join(dir, "memory.sqlite");
-  const config = resolveConfig({ typesafe: { apiKey: "test" }, corpora: [
+  const config = resolveConfig({ decisionModel: { apiKey: "test" }, corpora: [
     { name: "memory", kind: "files", paths: ["memory/**/*.md"] },
     { name: "sessions", kind: "sessions", chatTypes: ["channel"] },
   ], extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 } });
@@ -174,7 +174,7 @@ test("worker retries whole chunks, isolates sessions, maps split citations, and 
 
 test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on retry instead of looping forever", async () => {
   const dir = await mkdtemp(join(tmpdir(), "extraction-poisoned-bookmark-")), storePath = join(dir, "memory.sqlite");
-  const config = resolveConfig({ typesafe: { apiKey: "test" }, corpora: [
+  const config = resolveConfig({ decisionModel: { apiKey: "test" }, corpora: [
     { name: "memory", kind: "files", paths: ["memory/**/*.md"] },
     { name: "sessions", kind: "sessions", chatTypes: ["channel"] },
   ], extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 } });
@@ -209,7 +209,7 @@ test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on re
     minSupport: config.extraction.minSupport,
     minRetention: config.extraction.minRetention,
     minReplacement: config.extraction.minReplacement,
-    validatorModel: config.typesafe.model,
+    validatorModel: config.decisionModel.model,
   });
   const store = new ExtractionStore(storePath);
   try {

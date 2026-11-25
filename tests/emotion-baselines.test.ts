@@ -16,7 +16,7 @@ import { runInsideOut, reportInsideOut, refreshInsideOutBaselines, reportInsideO
 import { openInsideOutStore, refreshWithFingerprint } from "../src/inside-out-store.js";
 
 // Owns the persisted statistical contract: real PeopleSQL identities, transcript grading,
-// snapshot refresh, operator export and immutable historical comparisons. Only Jev is offline.
+// snapshot refresh, operator export and immutable historical comparisons. Only the decision model is offline.
 test("person-relative grading uses preceding weeks and preserves comparisons across backfill and identity changes", async t => {
   const root = await mkdtemp(join(tmpdir(), "emotion-baselines-")), sessionsDir = join(root, "sessions");
   await mkdir(sessionsDir);
@@ -61,10 +61,10 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
         __openclaw: { senderIdentity: { senderKind: "human", id: "same", pluginId: "slack", accountId: "one" } } } },
   ].map(e => JSON.stringify(e)).join("\n"));
   await runInsideOut({ agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath: path,
-    config: resolveConfig({ typesafe: { apiKey: "offline", model: "other-model", timeoutMs: 1000 },
+    config: resolveConfig({ decisionModel: { apiKey: "offline", model: "other-model", timeoutMs: 1000 },
       insideOut: { enabled: true, intervalMinutes: 0, maxInteractions: 100 } }) });
   await saveTranscript();
-  const config = resolveConfig({ typesafe: { apiKey: "offline", timeoutMs: 1000 },
+  const config = resolveConfig({ decisionModel: { apiKey: "offline", timeoutMs: 1000 },
     insideOut: { enabled: true, intervalMinutes: 0, maxInteractions: 100 } });
   const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath: path, config };
   await runInsideOut(options);
@@ -165,7 +165,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   assert.equal(emptyWeek.weekly.joy.count, 0);
   add("after-gap", "one", "0.8", firstWeek + 4 * week + 1000);
   await saveTranscript();
-  await runInsideOut({ ...options, config: resolveConfig({ typesafe: { apiKey: "offline", timeoutMs: 1000 },
+  await runInsideOut({ ...options, config: resolveConfig({ decisionModel: { apiKey: "offline", timeoutMs: 1000 },
     insideOut: { enabled: true, intervalMinutes: 0, maxInteractions: 1 } }) });
   const afterGap = deviation("after-gap");
   assert.equal(afterGap.baselineEnd, firstWeek + 4 * week);
@@ -175,7 +175,7 @@ test("person-relative grading uses preceding weeks and preserves comparisons acr
   assert.equal(deviation("after-gap").baselineId, emptyWeek.id);
   assert.equal(calls, beforeCalls + 2);
 
-  // Purging grades leaves tombstones: never relinked, compared, or sent to Jev again, even on --retry.
+  // Purging grades leaves tombstones: never relinked, compared, or sent to the decision model again, even on --retry.
   const purged = purgeInsideOutPerson(path, expressive, { grades: true });
   assert.ok(purged.grades > 0 && purged.assessments > 0 && purged.baselines > 0);
   await runInsideOut({ ...options, retry: true });
@@ -211,7 +211,7 @@ test("new grades use history linked since the preceding grading run", async t =>
     ...Array.from({ length: 20 }, (_, i) => reply(`old-${i}`, firstWeek + 1000 + i))];
   const save = () => writeFile(join(sessionsDir, "s.jsonl"), events.map(e => JSON.stringify(e)).join("\n"));
   const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath,
-    config: resolveConfig({ typesafe: { apiKey: "offline" }, insideOut: { enabled: true, intervalMinutes: 0 } }) };
+    config: resolveConfig({ decisionModel: { apiKey: "offline" }, insideOut: { enabled: true, intervalMinutes: 0 } }) };
   await save();
   await runInsideOut(options);
   assert.ok(reportInsideOut(storePath).every(row => row.person_id === null));
@@ -232,7 +232,7 @@ test("new grades use history linked since the preceding grading run", async t =>
 
 const WEEK = 7 * 86400_000, FIRST_WEEK = Date.UTC(2026, 0, 5);
 const EMOTIONS = ["joy", "sadness", "fear", "anger", "disgust", "surprise"] as const;
-/** Linked grades written straight to the store: statistics need neither transcripts nor Jev. */
+/** Linked grades written straight to the store: statistics need neither transcripts nor the decision model. */
 async function gradedStore(people: { account: string; grades: number; weeks: number }[]) {
   const root = await mkdtemp(join(tmpdir(), "emotion-store-")), path = join(root, "unblock-memory.sqlite");
   const store = new PeopleStore(path, { maxOpenTodos: 100, maxBlurbChars: 1000 });
@@ -461,7 +461,7 @@ test("a failed baseline refresh never turns a saved grading run into a failure",
   blocker.exec("INSERT INTO memory_schema VALUES ('emotion-baselines',99)");
   blocker.close();
   const result = await runInsideOut({ agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath,
-    config: resolveConfig({ typesafe: { apiKey: "offline" }, insideOut: { enabled: true, intervalMinutes: 0 } }) });
+    config: resolveConfig({ decisionModel: { apiKey: "offline" }, insideOut: { enabled: true, intervalMinutes: 0 } }) });
   assert.ok("reviewed" in result);
   assert.equal(result.reviewed, 1);
   assert.match(result.baselineError ?? "", /Unsupported Inside Out baseline storage version/);

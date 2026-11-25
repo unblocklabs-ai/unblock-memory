@@ -6,7 +6,7 @@ type RequestOptions = {
     signal: AbortSignal;
 };
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
-export declare function reviewTypeSafeClaim(params: RequestOptions & {
+export declare function reviewClaim(params: RequestOptions & {
     claim: string;
     evidence: readonly string[];
     personBackground?: {

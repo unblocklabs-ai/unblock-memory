@@ -1,6 +1,6 @@
 import { chunkFingerprint } from "./curation.js";
 import { parseSafeVirtualPath } from "./sources.js";
-import { judgeTypeSafeQuality, qualityJudgeVersion } from "./typesafe.js";
+import { judgeQuality, qualityJudgeVersion } from "./decision-ranking.js";
 import { qualityTriage } from "./quality-triage.js";
 const MAX_CHUNK_CHARS = 6000;
 /** A formatting clue, never proof that JSON or structured data is worthless. */
@@ -85,7 +85,7 @@ export async function auditQualityPage(params) {
         });
         const missing = [...new Map(batch.filter(item => item.eligible && item.text.length <= MAX_CHUNK_CHARS &&
                 item.structure !== "empty" && !item.judgment).map(item => [item.cacheKey, item])).values()];
-        const answers = await Promise.allSettled(missing.map(async (item) => (await judgeTypeSafeQuality({
+        const answers = await Promise.allSettled(missing.map(async (item) => (await judgeQuality({
             apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs: params.timeoutMs, signal,
             chunks: [{ text: item.text, sourceKind: item.source.kind === "sessions" ? "sessions" : "files" }],
         }))[0]));
@@ -141,7 +141,7 @@ export async function auditQualityPage(params) {
                     path: `qmd://${source.collection}/${row.path}`, from: startLine, to: endLine,
                     excerpt: text.slice(0, 400), excerptTruncated: text.length > 400,
                     indicator: structure === "empty" ? "deterministic_empty" :
-                        structure === "encoded_message" ? "deterministic_encoding" : "typesafe",
+                        structure === "encoded_message" ? "deterministic_encoding" : "decision",
                     ...judgment, policy,
                     triage,
                     instruction: "Inspect original source and ingestion before acting. Verify source/index after any authorized repair. Never manually edit generated session projections.",

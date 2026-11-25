@@ -82,16 +82,16 @@ test("real BM25 plus vector union retains raw method scores, uses actual QMD RRF
     assert.equal("bm25Query" in blind, false);
     assert.equal("vectorQuery" in blind, false);
     const labels: Label[] = result.hits.map(h => ({ caseId: "c", hitId: h.id, grade: h === first ? 3 : 0, reason: "fixture", uncertain: false }));
-    const scored = { ...item, hits: result.hits.map(h => ({ ...h, typesafe_score: h === first ? 0.9 : 0.1, typesafe_status: "complete" })) };
+    const scored = { ...item, hits: result.hits.map(h => ({ ...h, decision_score: h === first ? 0.9 : 0.1, decision_status: "complete" })) };
     const summary = analyze([scored], labels);
-    assert.equal(summary.allCandidates.perQuery.typesafe!.ndcgAt2, 1);
+    assert.equal(summary.allCandidates.perQuery.decisionModel!.ndcgAt2, 1);
     assert.equal(summary.allCandidates.perQuery.rrf!.ndcgAt2, 1);
     const tied = { ...scored, hits: scored.hits.map((h, i) => ({ ...h, id: i ? "a" : "z",
-      typesafe_score: 0.8, rrf_score: 0.05, rrf_rank: i + 1 })) };
+      decision_score: 0.8, rrf_score: 0.05, rrf_rank: i + 1 })) };
     const tiedSummary = analyze([tied], tied.hits.map(h => ({ caseId: "c", hitId: h.id,
       grade: 2, reason: "tie fixture", uncertain: false })));
     assert.deepEqual(tiedSummary.allCandidates.cases[0]!.scores.rrf!.topHitIds, ["z", "a"]);
-    assert.deepEqual(tiedSummary.allCandidates.cases[0]!.scores.typesafe!.topHitIds, ["z", "a"]);
+    assert.deepEqual(tiedSummary.allCandidates.cases[0]!.scores.decisionModel!.topHitIds, ["z", "a"]);
     assert.throws(() => analyze([scored], labels.slice(1)), /Incomplete/);
     assert.throws(() => analyze([scored], [...labels, labels[0]!]), /duplicate/);
     const api = await import(new URL("./store.js", import.meta.resolve("@unblocklabs/qmd")).href);

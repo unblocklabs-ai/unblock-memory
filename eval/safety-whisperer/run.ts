@@ -5,7 +5,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "../../src/config.js";
 import { resolveSafetyWhisperer } from "../../src/safety-config.js";
 import { registerSafetyWhisperer } from "../../src/safety-whisperer.js";
-import { TYPESAFE_MODEL } from "../../src/typesafe-client.js";
+import { DEFAULT_DECISION_MODEL } from "../../src/decision-client.js";
 import { cases, scenarios } from "./cases.js";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -17,7 +17,7 @@ for (const c of cases) {
   if (c.expected.some(id => !scenarios.some(s => s.id === id))) throw new Error(`${c.id} expects an unknown scenario`);
 }
 if (!process.argv.includes("--live")) {
-  console.log(`${cases.length} cases over ${scenarios.length} scenarios are valid; pass --live to call TypeSafe.`);
+  console.log(`${cases.length} cases over ${scenarios.length} scenarios are valid; pass --live to call decision model.`);
   process.exit(0);
 }
 
@@ -29,7 +29,7 @@ const api = {
   logger: { warn: (message: string) => console.error(message) },
   on() {},
 } as unknown as OpenClawPluginApi;
-const before = registerSafetyWhisperer(api, { ...resolveConfig({ typesafe: { enabled: true, timeoutMs: 10_000 } }), safetyWhisperer })!;
+const before = registerSafetyWhisperer(api, { ...resolveConfig({ decisionModel: { enabled: true, timeoutMs: 10_000 } }), safetyWhisperer })!;
 
 const realFetch = globalThis.fetch;
 let answers: Record<string, { noul: number }> | undefined;
@@ -45,7 +45,7 @@ for (const [index, c] of cases.entries()) {
   const started = performance.now();
   await before({ prompt: c.prompt, messages: c.history ?? [] }, { trigger: "user", agentId: "eval", sessionId: `eval-${index}`,
     runId: `eval-${index}`, messageProvider: "slack", accountId: "eval", senderId: "U_EVAL", chatId: "C_EVAL" });
-  if (!answers) throw new Error(`${c.id}: no TypeSafe answers; see warnings above`);
+  if (!answers) throw new Error(`${c.id}: no decision model answers; see warnings above`);
   const probabilities = Object.fromEntries(scenarios.map((s, i) => [s.id, answers![`scenario_${i}`].noul]));
   rows.push({ ...c, probabilities, elapsedMs: Math.round(performance.now() - started) });
 }
@@ -59,7 +59,7 @@ const summary = thresholds.map(threshold => {
   return { threshold, errors };
 });
 
-console.log(`model ${TYPESAFE_MODEL}; ${rows.length} cases\n`);
+console.log(`model ${DEFAULT_DECISION_MODEL}; ${rows.length} cases\n`);
 console.log("| case | expected | " + scenarios.map(s => s.id).join(" | ") + " | ms |");
 console.log("| --- | --- | " + scenarios.map(() => "---").join(" | ") + " | --- |");
 for (const row of rows) {
@@ -72,5 +72,5 @@ for (const { threshold, errors } of summary) {
 const directory = join(root, "reports", "safety-whisperer");
 await mkdir(directory, { recursive: true });
 const file = join(directory, `${new Date().toISOString().replace(/[:.]/gu, "-")}.json`);
-await writeFile(file, JSON.stringify({ model: TYPESAFE_MODEL, rows, summary }, null, 2));
+await writeFile(file, JSON.stringify({ model: DEFAULT_DECISION_MODEL, rows, summary }, null, 2));
 console.log(`\nreport: ${file}`);

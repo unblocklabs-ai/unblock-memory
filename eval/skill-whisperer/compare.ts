@@ -9,15 +9,13 @@ import { QmdMemoryManager } from "../../src/manager.js";
 import { resolveSources } from "../../src/sources.js";
 import { buildSkillWhispererQuery } from "../../src/whisperer-context.js";
 import { cases } from "./cases.js";
-import { selectTypeSafeSkill } from "../../src/typesafe.js";
-import { DEFAULT_DECISIONS_ENDPOINT, LEGACY_SYSTEMONE_ENDPOINT, LEGACY_SYSTEMONE_MODEL } from "@unblocklabs/decisions";
-import { TYPESAFE_MODEL } from "../../src/typesafe-client.js";
+import { selectSkill } from "../../src/decision-ranking.js";
+import { resolveConfig } from "../../src/config.js";
+import { resolveDecisionCredential } from "../../src/decision-client.js";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
-const model = TYPESAFE_MODEL;
 const minScore = 0.5;
 const shortlistSize = 3;
-const legacyInputPricePerMillion = 0.042; // Legacy TypeSafe Jev published pricing, checked 2026-09-17.
 
 const rosterSchema = Type.Array(Type.Object({
   name: Type.String(), description: Type.String(), source: Type.String(),
@@ -56,17 +54,16 @@ async function main() {
     if (!names.has(label)) throw new Error(`Unknown fixture label: ${label}`);
   }
   const args = process.argv.slice(2);
-  if (args.some(arg => !["--live", "--legacy"].includes(arg))) throw new Error("Usage: compare.ts [--live] [--legacy]");
+  if (args.some(arg => arg !== "--live")) throw new Error("Usage: compare.ts [--live]");
   if (!args.includes("--live")) {
     console.log(`${cases.length} synthetic cases, ${roster.length} snapshotted skills. No API calls made.`);
-    console.log(`Use --live with CODEX_LB_API_KEY (or --legacy with TYPESAFE_API_KEY) for local embeddings and up to ${cases.length * (shortlistSize + roster.length)} independent decision requests. No conversation logs are read.`);
+    console.log(`Use --live with CODEX_LB_API_KEY for local embeddings and up to ${cases.length * (shortlistSize + roster.length)} independent decision requests. No conversation logs are read.`);
     return;
   }
-  const legacy = args.includes("--legacy");
-  const endpoint = legacy ? LEGACY_SYSTEMONE_ENDPOINT : DEFAULT_DECISIONS_ENDPOINT;
-  const resolvedModel = legacy ? LEGACY_SYSTEMONE_MODEL : model;
-  const apiKey = (legacy ? process.env.TYPESAFE_API_KEY : process.env.CODEX_LB_API_KEY)?.trim();
-  if (!apiKey) throw new Error(`Set ${legacy ? "TYPESAFE_API_KEY" : "CODEX_LB_API_KEY"} using --env-file=.env`);
+  const { decisionModel } = resolveConfig({});
+  const { endpoint, model: resolvedModel } = decisionModel;
+  const apiKey = await resolveDecisionCredential(decisionModel);
+  if (!apiKey) throw new Error("Set CODEX_LB_API_KEY using --env-file=.env");
   const reportDir = resolve(root, "reports", "skill-whisperer", new Date().toISOString().replace(/[:.]/g, "-"));
   await mkdir(reportDir, { recursive: true });
   const workspaceDir = join(reportDir, "workspace");
@@ -81,12 +78,11 @@ async function main() {
     sources: resolveSources(workspaceDir, [{ name: "skills", kind: "skills", paths: ["skills/**/SKILL.md"] }]),
   });
   const rows: Row[] = [];
-  const inputPricePerMillion = legacy ? legacyInputPricePerMillion : null;
   const metadata = {
-    endpoint, model: resolvedModel, minScore, shortlistSize, historyMessages: 5, inputPricePerMillion,
+    endpoint, model: resolvedModel, minScore, shortlistSize, historyMessages: 5, inputPricePerMillion: null,
     gitHead: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(),
     fixtureHash: createHash("sha256").update(JSON.stringify({ roster, cases })).digest("hex"),
-    selectorHash: createHash("sha256").update(await readFile(new URL("../../src/typesafe.ts", import.meta.url))).digest("hex"),
+    selectorHash: createHash("sha256").update(await readFile(new URL("../../src/decision-ranking.ts", import.meta.url))).digest("hex"),
     qmdPackage: JSON.parse(await readFile(join(root, "node_modules/@unblocklabs/qmd/package.json"), "utf8")).version as string,
     embeddingModelOverride: process.env.QMD_EMBED_MODEL ?? null,
     selector: "production-per-candidate-noul", roster, cases,
@@ -124,7 +120,7 @@ async function main() {
       } finally { item.elapsedMs = performance.now() - start; }
     };
     try {
-      const index = await selectTypeSafeSkill({ apiKey: apiKey!, endpoint, model: resolvedModel, timeoutMs: 30_000,
+      const index = await selectSkill({ apiKey: apiKey!, endpoint, model: resolvedModel, timeoutMs: 30_000,
         currentRequest: row.prompt, history: row.history, candidates: skills, onCandidateFailure: () => { failed++; } });
       return { choice: index === undefined ? "none" : skills[index].name,
         elapsedMs: performance.now() - started, requests: trace.length, failed, usage };
@@ -143,7 +139,8 @@ async function main() {
     for (const item of cases) {
       const history = item.history ?? [];
       const started = performance.now();
-      const candidates = await manager.searchSkills(buildSkillWhispererQuery(item.prompt, history, 5), -1, roster.length);
+      const candidates = await manager.searchSkills(buildSkillWhispererQuery(item.prompt,
+        history.slice(-5).map(({ role, content }) => ({ role, text: content }))), -1, roster.length);
       const vectorMs = performance.now() - started;
       const row: Row = { ...item, history, vectorMs,
         candidates: candidates.map(({ name, score }) => ({ name, score })),
@@ -171,7 +168,7 @@ async function main() {
       missedSkill: predictions.filter(({ row, choice }) => row.expected.length && choice === "none").length,
       p50Ms: quantile(latencies, 0.5), p95Ms: quantile(latencies, 0.95), inputTokens,
       failedRequests: rows.reduce((sum, row) => sum + (arm === "baseline" ? 0 : row[arm]!.failed), 0),
-      estimatedUsd: inputPricePerMillion === null ? null : inputTokens / 1_000_000 * inputPricePerMillion };
+      estimatedUsd: null };
   });
   const positive = rows.filter(row => row.expected.length);
   const top3Coverage = positive.filter(row => row.candidates.slice(0, shortlistSize).some(candidate => row.expected.includes(candidate.name))).length;
@@ -188,19 +185,19 @@ async function main() {
     `${rows.length} authored synthetic cases; ${roster.length} snapshotted skills. Endpoint: ${endpoint}; model: ${resolvedModel}.`, "",
     "| Selector | Correct | False hint on no-skill | Wrong skill | Missed skill | p50 ms | p95 ms | Input tokens | Estimated USD |",
     "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ...metrics.map(m => `| ${m.arm} | ${m.correct}/${rows.length} | ${m.falseHints} | ${m.wrongSkill} | ${m.missedSkill} | ${m.p50Ms} | ${m.p95Ms} | ${m.inputTokens} | ${m.estimatedUsd === null ? "n/a" : m.estimatedUsd.toFixed(6)} |`), "",
+    ...metrics.map(m => `| ${m.arm} | ${m.correct}/${rows.length} | ${m.falseHints} | ${m.wrongSkill} | ${m.missedSkill} | ${m.p50Ms} | ${m.p95Ms} | ${m.inputTokens} | n/a |`), "",
     `Top-three retrieval coverage: ${top3Coverage}/${positive.length} positive cases. Ungated vector top-one accuracy: ${ungatedTop1Correct}/${rows.length}.`,
     `Cold local initialization + roster embedding: ${Math.round(coldStartMs)} ms, excluded from warm latency.`, "",
     "## Vector threshold sensitivity (post-hoc diagnostic, not held-out tuning)", "",
     ...thresholdSensitivity.map(item => `- Threshold ${item.threshold}: ${item.correct}/${rows.length} correct.`), "",
     "## Per-case results", "",
-    "| Case | Kind | Accepted | Vector | Shortlist + TypeSafe | Full-roster TypeSafe |",
+    "| Case | Kind | Accepted | Vector | Shortlist + decision model | Full-roster decision model |",
     "|---|---|---|---|---|---|",
     ...rows.map(row => `| ${row.id} | ${row.kind} | ${row.expected.join(', ') || 'none'} | ${row.baseline} | ${selected(row, 'hybrid')} | ${selected(row, 'direct')} |`), "",
     "## Interpretation limits", "",
     "- Labels and selection prompt were authored before calls, but this is a small synthetic smoke evaluation, not blinded or representative fleet traffic.",
     "- Hybrid uses the unthresholded top three. It deliberately replaces the 0.5 similarity gate; it is not merely a veto after that gate.",
-    "- All arms see the same normalized descriptions and up to five prior messages. TypeSafe gets explicit currentRequest/history fields; vector search uses the production flattened query.",
+    "- All arms see the same normalized descriptions and up to five prior messages. decision model gets explicit currentRequest/history fields; vector search uses the production flattened query.",
     "- Uses the production per-skill usefulness threshold; no threshold was fitted to these cases. Highest qualifying probability wins, ties retain retrieval order.",
     "- Isolated fresh turns: cooldowns, path rejection, actual agent skill use, and downstream task success are not evaluated here.",
     "- Local skills are snapshots, not Bill's configured inventory. No private conversations, dossiers, or memory documents were transmitted.",

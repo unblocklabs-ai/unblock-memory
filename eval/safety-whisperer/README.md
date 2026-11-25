@@ -2,7 +2,7 @@
 
 An opt-in check of scenario wording and `minProbability`. It drives the production
 hook (config resolver, identity filtering, history shaping and the single batched
-TypeSafe request) with `minProbability: 0`, records each scenario's probability,
+decision model request) with `minProbability: 0`, records each scenario's probability,
 and reports errors at several thresholds.
 
 ## Run
@@ -16,9 +16,9 @@ node --env-file=.env --import tsx eval/safety-whisperer/run.ts --live
 ```
 
 The default invocation validates fixtures without inference. `--live` uses
-`TYPESAFE_API_KEY` and sends one request per case (22 with the current fixtures).
+`CODEX_LB_API_KEY` and sends one request per case (22 with the current fixtures).
 Only the synthetic messages in `cases.ts` and the scenario instructions go to
-TypeSafe. A JSON report is written to the ignored `reports/safety-whisperer/`.
+decision model. A JSON report is written to the ignored `reports/safety-whisperer/`.
 
 Edit `cases.ts` to test your own scenarios before relying on them: include direct
 asks, follow-ups, compound requests, look-alike topics the scenario must not cover,

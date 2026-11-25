@@ -155,7 +155,7 @@ function readSnapshot(params) {
                     try {
                         const snapshot = transcripts.read(window.sessionId);
                         if (snapshot.kind === "ready")
-                            events.set(window.sessionId, snapshot.rows.map(row => ({ ...row, sessionId: window.sessionId })));
+                            events.set(window.sessionId, snapshot.rows);
                         else
                             unavailable.add(window.sessionId);
                     }

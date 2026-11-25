@@ -64,7 +64,7 @@ function linkInsideOutPeopleInDb(db: DatabaseSync) {
 }
 
 /**
- * Refresh People links without loading transcripts or calling Jev. Known accounts stay exact.
+ * Refresh People links without loading transcripts or calling the decision model. Known accounts stay exact.
  * Purged grades stay unlinked. Matching is a read; only changed links are written, in short batches.
  */
 export function linkInsideOutPeople(path: string) {

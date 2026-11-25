@@ -26,7 +26,7 @@ const messages: ExtractionMessage[] = [{ id: "m1", speaker: "Bek", role: "user",
 const proposal: MemoryProposal = { text: "Bek's favorite color is red.", replaces: null, evidence: [{ messageId: "m1", quote: messages[0]!.text }] };
 const config = (extra: object = {}) => resolveConfig({
   corpora: [{ name: "memory", kind: "files", paths: ["memory/**/*.md"] }, { name: "sessions", kind: "sessions", chatTypes: ["channel"] }],
-  typesafe: { apiKey: "test-key" }, extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 }, ...extra });
+  decisionModel: { apiKey: "test-key" }, extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0 }, ...extra });
 const signal = () => new AbortController().signal;
 const thresholds = config().extraction;
 async function fixture() {
@@ -62,7 +62,7 @@ test("Luna invocation requires isolated model identity and strict JSON; no model
   await assert.rejects(extractWithLuna({ llm: { complete: async () => ({ text: "{}", model: "gpt-6-astra", execution: { mode: "direct-provider" } }) } }, "main", messages, [], [], signal()), /isolated Luna/);
 });
 
-test("missing quotes, unknown replacement ids and context-only citations never reach TypeSafe", async t => {
+test("missing quotes, unknown replacement ids and context-only citations never reach decision model", async t => {
   t.mock.method(globalThis, "fetch", () => { assert.fail("invalid evidence must not be sent"); });
   for (const p of [{ ...proposal, evidence: [{ messageId: "m1", quote: "blue" }] }, { ...proposal, replaces: "unknown" }, proposal]) {
     const result = await validateExtractedMemory({ proposal: p, messages, newIds: p === proposal ? [] : ["m1"], existing: [], apiKey: "test", signal: signal(), thresholds });
@@ -131,9 +131,9 @@ test("commit is atomic, deduplicated, versioned and fenced by checkpoint and lea
   } finally { store.close(); }
 });
 
-test("missing TypeSafe key and disabled extraction do not open storage or call models", async () => {
+test("missing decision model key and disabled extraction do not open storage or call models", async () => {
   const f = await fixture();
-  for (const cfg of [config({ typesafe: { apiKeyFile: join(f.dir, "absent") } }), resolveConfig(undefined)]) {
+  for (const cfg of [config({ decisionModel: { apiKeyFile: join(f.dir, "absent") } }), resolveConfig(undefined)]) {
     const result = await runExtraction({ config: cfg, storePath: f.storePath, agentId: "main", agentName: "Bill", runtime: {},
       sessions: () => { assert.fail("must not scan source"); }, signal: signal() });
     assert.ok(["unavailable", "disabled"].includes(result.status)); assert.equal(existsSync(f.storePath), false);
@@ -617,8 +617,8 @@ test("policy change and unversioned legacy partial cursors rewind before process
   // Policy A (minSupport=0.9, maxBatches=1) commits partial cursor c1 (complete_revision remains NULL) and rejects p1.
   const cfgA = { extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, maxBatches: 1, minSupport: 0.9 } };
   const cfgB = { extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, maxBatches: 1, minSupport: 0.8 } };
-  const fpA = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgA).extraction, validatorModel: config(cfgA).typesafe.model });
-  const fpB = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgB).extraction, validatorModel: config(cfgB).typesafe.model });
+  const fpA = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgA).extraction, validatorModel: config(cfgA).decisionModel.model });
+  const fpB = extractionPolicyFingerprint({ version: "lasting-facts-v11", ...config(cfgB).extraction, validatorModel: config(cfgB).decisionModel.model });
 
   const r1 = await runExtraction(makeOpts(cfgA));
   assert.equal(r1.status, "completed");

@@ -5,7 +5,7 @@ import { abortable } from "./abortable.js";
 import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
 import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
-import { decideWithModel, estimateJevTokens, isTypeSafeTimeout, resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { decideWithModel, estimateDecisionTokens, isDecisionTimeout, resolveDecisionCredential } from "./decision-client.js";
 export function resolveMyTurn(value) {
     const config = value === undefined ? {} : value;
     if (!isRecord(config))
@@ -112,7 +112,7 @@ function buildMyTurnState(params) {
         currentMessage,
         history: [],
     };
-    const baseTokens = estimateJevTokens(state);
+    const baseTokens = estimateDecisionTokens(state);
     // Never advise silence after silently truncating the current human request.
     if (baseTokens > MAX_STATE_TOKENS)
         return { ok: false, reason: "input_too_large" };
@@ -121,12 +121,12 @@ function buildMyTurnState(params) {
         maxItems: historyMessages - 1,
         maxTokens: MAX_STATE_TOKENS,
         usedTokens: baseTokens,
-        estimateTokens: estimateJevTokens,
+        estimateTokens: estimateDecisionTokens,
         transform: humanMessage,
     }).items;
     return { ok: true, state };
 }
-export function registerMyTurn(api, config, typesafe, diagnostics) {
+export function registerMyTurn(api, config, decisionModel, diagnostics) {
     if (!config.enabled)
         return;
     const sessions = new Map();
@@ -149,8 +149,8 @@ export function registerMyTurn(api, config, typesafe, diagnostics) {
         const provider = groupProvider(scope, agentId);
         if (!provider || provider !== context.messageProvider?.toLowerCase() || config.channels[provider]?.enabled === false)
             return;
-        if (!typesafe.enabled) {
-            diagnostics?.record(agentId, "myTurn", "typesafe_disabled");
+        if (!decisionModel.enabled) {
+            diagnostics?.record(agentId, "myTurn", "decision_disabled");
             return;
         }
         let session = sessions.get(scope);
@@ -195,12 +195,12 @@ export function registerMyTurn(api, config, typesafe, diagnostics) {
                     record(built.reason);
                     return;
                 }
-                const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
+                const apiKey = await abortable(resolveDecisionCredential(decisionModel), signal);
                 if (!apiKey) {
                     record("missing_key");
                     return;
                 }
-                const result = await abortable(decideWithModel({ apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal, timeoutMs: typesafe.timeoutMs }, built.state, SHOULD_RESPOND_QUESTIONS, { validateModel: false }), signal);
+                const result = await abortable(decideWithModel({ apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, signal, timeoutMs: decisionModel.timeoutMs }, built.state, SHOULD_RESPOND_QUESTIONS, { validateModel: false }), signal);
                 if (sessions.get(scope) !== activeSession || activeSession.latest !== runId) {
                     record("cancelled");
                     return;
@@ -217,7 +217,7 @@ export function registerMyTurn(api, config, typesafe, diagnostics) {
                     record("partial_response");
                     return;
                 }
-                record(isTypeSafeTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed");
+                record(isDecisionTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed");
                 // All failures, including exhausted credits, leave the agent's turn unchanged. Never log content or keys.
                 return;
             }

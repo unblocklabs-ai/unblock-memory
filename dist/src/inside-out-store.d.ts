@@ -3,7 +3,7 @@ import { refreshEmotionBaselines } from "./emotion-baselines.js";
 export declare const PERSON_MATCH = "SELECT min(i.person_id) person_id FROM person_identities i\n  WHERE i.provider=e.channel AND i.external_id=e.sender_id\n  AND (i.account_scope=json_extract(e.human_key,'$[1]') OR substr(json_extract(e.human_key,'$[1]'),1,8)='session:')\n  HAVING count(DISTINCT i.person_id)=1";
 export declare function openInsideOutStore(path: string): DatabaseSync;
 /**
- * Refresh People links without loading transcripts or calling Jev. Known accounts stay exact.
+ * Refresh People links without loading transcripts or calling the decision model. Known accounts stay exact.
  * Purged grades stay unlinked. Matching is a read; only changed links are written, in short batches.
  */
 export declare function linkInsideOutPeople(path: string): {

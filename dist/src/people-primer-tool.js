@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { getContext } from "./tool-context.js";
-import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { resolveDecisionCredential } from "./decision-client.js";
 import { primePersonDossier } from "./people-primer.js";
 import { abortable } from "./abortable.js";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
@@ -30,7 +30,7 @@ export function registerPeoplePrimerTool(api, runtime, stores, config) {
             parameters,
             async execute(_id, params, signal) {
                 const { personId, agentName: suppliedName, draft } = Value.Parse(parameters, params);
-                if (!config.people.enabled || !config.peoplePrimer.enabled || !config.typesafe.enabled)
+                if (!config.people.enabled || !config.peoplePrimer.enabled || !config.decisionModel.enabled)
                     return jsonResult({ status: "disabled" });
                 if (draft && backgroundWordCount(draft.blurb) > PEOPLE_BACKGROUND_MAX_WORDS) {
                     return jsonResult({ status: "invalid", needsReview: true, reason: "Background snippet must not exceed 70 words" });
@@ -43,9 +43,9 @@ export function registerPeoplePrimerTool(api, runtime, stores, config) {
                 const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
                 try {
                     combined.throwIfAborted();
-                    const apiKey = await abortable(resolveTypeSafeApiKey(config.typesafe), combined);
+                    const apiKey = await abortable(resolveDecisionCredential(config.decisionModel), combined);
                     if (!apiKey)
-                        return jsonResult({ status: "unavailable", reason: "TypeSafe API key not configured" });
+                        return jsonResult({ status: "unavailable", reason: "Decision model API key not configured" });
                     const store = stores.get(active.agentId);
                     const person = store.getPerson(personId);
                     if (!person || person.status !== "active")
@@ -60,10 +60,10 @@ export function registerPeoplePrimerTool(api, runtime, stores, config) {
                     if (draft)
                         return jsonResult(await manager.reviewClaim({ claim: draft.blurb, citations: draft.citations,
                             personBackground: { name: person.preferredName ?? person.displayName, agentName },
-                            corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.typesafe.endpoint, model: config.typesafe.model,
+                            corpora: config.peoplePrimer.corpora, apiKey, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model,
                             timeoutMs: config.peoplePrimer.timeoutMs, signal: combined }));
                     return jsonResult(await primePersonDossier({ personId, agentName, store, config: config.peoplePrimer, apiKey,
-                        endpoint: config.typesafe.endpoint, model: config.typesafe.model, signal: combined,
+                        endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, signal: combined,
                         search: (query, options) => manager.search(query, { ...options, requestContext: active.requestContext }) }));
                 }
                 catch {

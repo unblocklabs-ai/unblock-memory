@@ -1,7 +1,7 @@
 import { readAnalysisSummary, readCluster } from "./analysis.js";
 import { parseSafeVirtualPath } from "./sources.js";
-import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
-import { reviewClusterDefects } from "./typesafe-review.js";
+import { decisionModelScope, DEFAULT_DECISION_MODEL } from "./decision-client.js";
+import { reviewClusterDefects } from "./decision-review.js";
 import { chunkFingerprint } from "./curation.js";
 function indexedChunk(db, safe, member) {
     return db.prepare(`SELECT c.doc, v.pos, v.chunk_len FROM documents d JOIN content c ON c.hash = d.hash
@@ -61,6 +61,6 @@ export async function reviewClusterIngestion(params) {
         });
         return { status: "ok", runId: snapshot.runId, clusterId: params.clusterId, members, recurring,
             sampled: sample.length, considered: snapshot.considered, clusterSize: snapshot.clusterSize,
-            policy: `${decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint)}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
+            policy: `${decisionModelScope(params.model ?? DEFAULT_DECISION_MODEL, params.endpoint)}:cluster-defects-v2-isolated`, scope: "Center/edge sample of approved complete chunks only. Recurring labels are hypotheses, not proof of a shared cause or permission to change any member. Unreviewed members remain unknown." };
     });
 }

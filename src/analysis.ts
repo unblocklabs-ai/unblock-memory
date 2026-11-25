@@ -727,7 +727,7 @@ export function readCluster(
   }
   const limit = Math.max(1, Math.min(MAX_MEMBER_LIMIT, Math.floor(requestedLimit)));
   const offset = Math.max(0, Math.floor(requestedOffset));
-  const total = availableSize(db, run.id, clusterId);
+  const total = clusterId === -1 ? row.available_size : availableSize(db, run.id, clusterId);
   const pageMembers = members(db, run.id, clusterId, limit, offset, sort, temporal);
   const nextOffset = offset + pageMembers.length;
   const hasMore = nextOffset < total;

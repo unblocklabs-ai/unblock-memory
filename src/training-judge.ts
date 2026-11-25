@@ -1,6 +1,6 @@
 import type { TrainingInput } from "./training-input.js";
 import type { TrainingHit } from "./training-retrieval.js";
-import { MEMORY_JUDGE_VERSION, memoryUsefulnessRequest, judgeMemoryPassage } from "./typesafe.js";
+import { MEMORY_JUDGE_VERSION, memoryUsefulnessRequest, judgeMemoryPassage } from "./decision-ranking.js";
 
 export const CONTEXT_JUDGE_VERSION = MEMORY_JUDGE_VERSION;
 

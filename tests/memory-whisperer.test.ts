@@ -12,7 +12,7 @@ import { ApiQueryGenerator, QueryApiError, queryConversation } from "../src/quer
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 
 const config = { ...resolveConfig(undefined).memoryWhisperer, enabled: true, corpora: ["memory", "sessions"], cooldownTurns: 2 };
-const typesafe = resolveConfig({ typesafe: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).typesafe;
+const decisionModel = resolveConfig({ decisionModel: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).decisionModel;
 const context = { trigger: "user", agentId: "bill", sessionId: "current", sessionKey: "key", runId: "run-1" };
 const logPrefix = "unblock-memory memory_whisperer ";
 const event = { prompt: "Deploy this", messages: [{ role: "user", content: "Use project alpha" }] };
@@ -24,7 +24,7 @@ type End = (event: { sessionId: string; sessionKey?: string }, context: Context)
 
 beforeEach(t => { if ("mock" in t) t.mock.method(ApiQueryGenerator.prototype, "generate", async () => ({ lex: "test lexical", vec: "test semantic" })); });
 
-test("API generation caps TypeSafe passage judgments to top 6 with compact context and reuses prompt rebuilds", { timeout: 2000 }, async t => {
+test("API generation caps decision model passage judgments to top 6 with compact context and reuses prompt rebuilds", { timeout: 2000 }, async t => {
   const judged = deferred<void>(), release = deferred<void>();
   const queries = { lex: "generated A", vec: "generated B" };
   t.mock.method(ApiQueryGenerator.prototype, "generate", async (conversation: ReturnType<typeof queryConversation>) => {
@@ -123,7 +123,7 @@ test("one failed candidate preserves other judgments, score alignment, and safe 
         }
         return response(excerpt === "private evidence 4" ? 0.99 : excerpt === "private evidence 5" ? 0.98 : 0.1);
       });
-      const h = harness([], { config: { minUsefulness: 0.5, maxHints: 2 }, typesafe: { ...typesafe, timeoutMs: 30 },
+      const h = harness([], { config: { minUsefulness: 0.5, maxHints: 2 }, decisionModel: { ...decisionModel, timeoutMs: 30 },
         hybrid: async () => Array.from({ length: 12 }, (_, i) => hit(`private evidence ${i}`, { score: 1 - i / 100 })) });
       t.after(() => h.stop());
       const result = await h.before({ prompt: dmPrompt, messages: [] }, context);
@@ -212,7 +212,7 @@ test("partial judgments cannot bypass total deadline or session cancellation", a
   }
 });
 
-test("query API failures and inner timeouts fall back to deterministic lex/vec queries and still judge with TypeSafe", async t => {
+test("query API failures and inner timeouts fall back to deterministic lex/vec queries and still judge with decision model", async t => {
   for (const mode of ["invalid_response", "unavailable", "credentials", "inner_timeout"] as const) {
     await t.test(mode, async t => {
       t.mock.method(ApiQueryGenerator.prototype, "generate", async (_conversation: unknown, signal: AbortSignal) => {
@@ -243,7 +243,7 @@ test("query API failures and inner timeouts fall back to deterministic lex/vec q
     });
   }
 
-  // Fallback queries still obey TypeSafe usefulness filtering and session cancellation.
+  // Fallback queries still obey decision model usefulness filtering and session cancellation.
   t.mock.method(ApiQueryGenerator.prototype, "generate", async () => { throw new QueryApiError("invalid_response"); });
   t.mock.method(globalThis, "fetch", async () => response(0.2));
   const rejected = harness([hit("weak match")]);
@@ -268,7 +268,7 @@ test("query API failures and inner timeouts fall back to deterministic lex/vec q
 });
 
 test("oversized input is reported as skipped before provider calls, including prompt rebuilds", async t => {
-  const fetch = t.mock.method(globalThis, "fetch", async () => { assert.fail("Oversized input reached TypeSafe"); });
+  const fetch = t.mock.method(globalThis, "fetch", async () => { assert.fail("Oversized input reached decision model"); });
   const generation = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => { assert.fail("Oversized input reached query generation"); });
   for (const prompt of ["private ".repeat(3001), "🚀".repeat(4000)]) {
     const h = harness();
@@ -483,7 +483,7 @@ test("content-free memory diagnostics distinguish no candidates, rejected, missi
   const rejected = harness();
   await rejected.before(event, context);
   assert.equal(rejected.diagnostics.snapshot("bill").memory.rejected, 1);
-  const missing = harness([], { typesafe: resolveConfig({ typesafe: { enabled: true, apiKeyFile: "/nonexistent/unblock-test.env", timeoutMs: 10 } }).typesafe });
+  const missing = harness([], { decisionModel: resolveConfig({ decisionModel: { enabled: true, apiKeyFile: "/nonexistent/unblock-test.env", timeoutMs: 10 } }).decisionModel });
   await missing.before(event, context);
   assert.equal(missing.diagnostics.snapshot("bill").memory.missing_key, 1);
   fetch.mock.mockImplementation(async () => { throw new Error("secret-text"); });
@@ -510,7 +510,7 @@ function deferred<T>() {
 
 function harness(
   hits: CorpusMemorySearchResult[] = [hit("Deploy only after approval")],
-  options: { config?: Partial<typeof config>; typesafe?: ReturnType<typeof resolveConfig>["typesafe"];
+  options: { config?: Partial<typeof config>; decisionModel?: ReturnType<typeof resolveConfig>["decisionModel"];
     search?: () => Promise<CorpusMemorySearchResult[]>;
     hybrid?: (queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">) => Promise<CorpusMemorySearchResult[]> } = {},
 ) {
@@ -532,7 +532,7 @@ function harness(
         return options.search ? options.search() : hits;
       }) } };
     },
-  }, { ...config, ...options.config }, options.typesafe ?? typesafe, diagnostics);
+  }, { ...config, ...options.config }, options.decisionModel ?? decisionModel, diagnostics);
   return { hooks, warnings, logs, searches, diagnostics, lookups: () => lookups,
     before: before as Before,
     end: hooks.get("session_end") as unknown as End,
@@ -655,8 +655,8 @@ test("recalls other sessions with a session ID or only a key, while excluding un
 test("disabled features and missing credentials cause no retrieval or provider calls", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected"); });
   assert.equal(harness([], { config: { enabled: false } }).hooks.size, 0);
-  assert.equal(harness([], { typesafe: { ...typesafe, enabled: false } }).hooks.size, 0);
-  const h = harness(undefined, { typesafe: resolveConfig({ typesafe: { enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-memory-whisperer/key" } }).typesafe });
+  assert.equal(harness([], { decisionModel: { ...decisionModel, enabled: false } }).hooks.size, 0);
+  const h = harness(undefined, { decisionModel: resolveConfig({ decisionModel: { enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-memory-whisperer/key" } }).decisionModel });
   assert.equal(await h.before(event, context), undefined);
   assert.equal(h.lookups(), 0);
   assert.equal(fetch.mock.callCount(), 0);
@@ -695,7 +695,7 @@ test("no useful hits and errors do not fall back or consume cooldown; logs never
   assert.equal(failed.warnings.join().includes("private memory"), false);
 });
 
-test("retrieval deadline returns promptly and late hits cannot trigger TypeSafe", async t => {
+test("retrieval deadline returns promptly and late hits cannot trigger decision model", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => response(0.99));
   const pending = deferred<CorpusMemorySearchResult[]>();
   const h = harness([], { config: { timeoutMs: 20 }, search: () => pending.promise });
@@ -707,7 +707,7 @@ test("retrieval deadline returns promptly and late hits cannot trigger TypeSafe"
   assert.equal(sample.judgeMs, undefined, "ranking never started");
   pending.resolve([hit("too late")]);
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fetch.mock.callCount(), 0); // Late hits never trigger TypeSafe passage judgments.
+  assert.equal(fetch.mock.callCount(), 0); // Late hits never trigger decision model passage judgments.
   assert.deepEqual(h.diagnostics.snapshot("bill").telemetry.operations.memoryWhisperer!.slowestRecent[0], sample,
     "late work cannot rewrite an already recorded deadline sample");
 });
@@ -843,7 +843,7 @@ test("delayed replay of a superseded run does not replace the latest run or re-e
   const second = await h.before(event, { ...context, runId: "run-2" });
   assert.match(second?.appendContext ?? "", /second fact/);
 
-  // A delayed rebuild for superseded run-1 must be ignored without replacing run-2 or calling TypeSafe.
+  // A delayed rebuild for superseded run-1 must be ignored without replacing run-2 or calling decision model.
   const callsBeforeReplay = fetch.mock.callCount();
   assert.equal(await h.before(event, { ...context, runId: "run-1" }), undefined);
   assert.equal(fetch.mock.callCount(), callsBeforeReplay);

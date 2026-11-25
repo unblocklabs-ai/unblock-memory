@@ -13,7 +13,7 @@ import { trainingExamples } from "../src/training-input.js";
 import { trainingCandidates } from "../src/training-candidates.js";
 import { renderMemoryPassage } from "../src/memory-passage.js";
 import { QmdMemoryManager } from "../src/manager.js";
-import { judgeMemoryPassage, memoryUsefulnessRequest } from "../src/typesafe.js";
+import { judgeMemoryPassage, memoryUsefulnessRequest } from "../src/decision-ranking.js";
 import { contextJudgeRequest, judgeTrainingPassage } from "../src/training-judge.js";
 
 const queries = Array.from({length: 10}, (_, i) => `Atlas decision ${i}`);
@@ -177,7 +177,7 @@ test("real QMD snapshot removes future FTS text and crossing vectors before eith
     assert.equal(snapshot.report.excludedChunks, 1);
     assert.equal(snapshot.report.truncated, 1);
     assert.equal(creates, 0); // Fingerprint/cache checks never materialize a search index.
-    t.mock.method(globalThis, "fetch", async () => { assert.fail("Discovery must not call TypeSafe"); });
+    t.mock.method(globalThis, "fetch", async () => { assert.fail("Discovery must not call the decision model"); });
     const parallel = await Promise.all(queries.map(query => snapshot.search(query, "vec")));
     assert.equal(creates, 1); // Concurrent first searches share one lazy index.
     assert.equal(peakEmbeddings, 1); // Native context is never entered concurrently.
@@ -393,6 +393,42 @@ test("missing or unbacked session manifest throws HistoricalCorpusUnavailableErr
     await assert.rejects(unspanned.search("Historical fact", "lex"), error => error instanceof HistoricalCorpusUnavailableError);
     await assert.rejects(unspanned.search("Historical fact", "vec"), error => error instanceof HistoricalCorpusUnavailableError);
   } finally { await unspanned.close(); }
+});
+
+test("a backed session with vectors cannot prove a cutoff with an eligible unbacked session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "training-partial-coverage-"));
+  const source = resolveSessionSource(join(root, "sessions"), ["direct"]);
+  const original = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {
+    [source.collection]: { path: source.root, pattern: "**/*.md" },
+  } } });
+  const projection = projectSessionDocument({ sessionId: "backed", chatType: "direct", agentName: "Bill", timezone: "UTC", startedAt: 10_000,
+    events: [{ createdAt: 20_000, eventJson: JSON.stringify({ type: "message", message: { role: "assistant", content: "Historical fact" } }) }],
+  })!;
+  const hash = createHash("sha256").update(projection.content).digest("hex");
+  const span = projection.messages[0]!;
+  try {
+    original.internal.insertContent(hash, projection.content, "now");
+    original.internal.insertDocument(source.collection, "backed.md", "Transcript", hash, "now", "now");
+    original.internal.ensureVecTable(2);
+    original.internal.insertEmbedding(hash, 0, span.start, new Float32Array([1, 0]),
+      original.internal.llm!.embedModelName, "now", 1, undefined, span.end - span.start);
+  } finally { await original.close(); }
+  writeFileSync(join(root, "sessions-manifest.json"), JSON.stringify({
+    version: 1, lastSuccessfulSyncAt: 100_000, indexSignature: "sig-v1", sessions: {
+      backed: { sessionId: "backed", chatType: "direct", startedAt: 10_000,
+        projectionHash: hash, documentPath: "backed.md", messages: projection.messages },
+      missing: { sessionId: "missing", chatType: "direct", startedAt: 50_000,
+        projectionHash: "0".repeat(64), documentPath: "missing.md" },
+    },
+  }));
+
+  const capture = await historicalTrainingSource(root, ["direct"]);
+  const earlier = await capture(40_000);
+  try {
+    assert.equal(earlier.report.chunks, 1);
+    assert.equal(earlier.proven, true);
+  } finally { await earlier.close(); }
+  await assert.rejects(capture(100_000), HistoricalCorpusUnavailableError);
 });
 
 test("validly proven empty cutoff returns [] cleanly for both lanes without materializing QMD", async () => {

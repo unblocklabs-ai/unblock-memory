@@ -5,6 +5,11 @@ import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
+const KEY_FILENAME = "unblock-memory-decisions.env";
+const ENDPOINT = "https://codex.unblocklabs.ai/v1/decisions";
+const LEGACY_CONFIG_KEY = "typesafe";
+const CONFIG_SECTION = "plugins.entries.unblock-memory.config";
+
 function cliJson(output) {
   // Some plugins log a registration line before the CLI's JSON result.
   for (let index = 0; index < output.length; index++) {
@@ -14,11 +19,22 @@ function cliJson(output) {
   throw new Error("invalid_cli_json");
 }
 
-function command(args, input = "") {
+function command(args, input = "", env = {}) {
   const child = spawnSync("openclaw", args, { input, encoding: "utf8", timeout: 60_000, maxBuffer: 2_000_000,
-    env: { ...process.env, NO_COLOR: "1" }, stdio: ["pipe", "pipe", "pipe"] });
+    env: { ...process.env, ...env, NO_COLOR: "1" }, stdio: ["pipe", "pipe", "pipe"] });
   // CLI diagnostics can contain config secrets. Never return them to the caller.
-  if (child.error || child.status !== 0) throw new Error("command_failed");
+  if (child.error || child.status !== 0) {
+    const error = new Error("command_failed");
+    if (!child.error && child.status === 1 && args[0] === "config" && args[1] === "validate") {
+      try {
+        const result = cliJson(child.stdout);
+        error.retiredKeyRejected = result.valid === false && result.issues?.length === 1 &&
+          result.issues[0].path === CONFIG_SECTION &&
+          result.issues[0].message === `invalid config: must not have additional properties: "${LEGACY_CONFIG_KEY}"`;
+      } catch { /* No structured validation failure. */ }
+    }
+    throw error;
+  }
   return child.stdout;
 }
 
@@ -39,49 +55,72 @@ function privateWrite(path, bytes) {
   try { writeFileSync(fd, bytes); } finally { closeSync(fd); }
 }
 
-const PROVIDERS = {
-  codex: {
-    file: "unblock-memory-decisions.env",
-    envKey: "CODEX_LB_API_KEY",
-    endpoint: "https://codex.unblocklabs.ai/v1/decisions",
-  },
-  typesafe: {
-    file: "unblock-memory-typesafe.env",
-    envKey: "TYPESAFE_API_KEY",
-    endpoint: "https://api.typesafe.ai/v1/systemone",
-  },
-};
+function withPrivateConfig(configPath, bytes, use) {
+  // A sibling preserves relative includes during validation and permits atomic rename.
+  const temporary = join(dirname(configPath), `.decision-config-${randomUUID()}.json`);
+  privateWrite(temporary, bytes);
+  try { return use(temporary); }
+  finally { if (existsSync(temporary)) unlinkSync(temporary); }
+}
 
-export async function deploy({ apiKey, apply, restart, provider = "codex" }, cli = command) {
+function usesDefaultEndpoint(endpoint) {
+  if (endpoint === undefined) return true;
+  try { return new URL(endpoint).href.replace(/\/+$/, "") === ENDPOINT; }
+  catch { return false; }
+}
+
+export async function deploy({ apiKey, apply, restart }, cli = command) {
   const report = { status: "failed", stage: "inspect", configChanged: false, keyChanged: false, restart: "not_needed" };
   try {
-    const target = PROVIDERS[provider];
-    if (!target) throw new Error("invalid_provider");
     if (typeof apiKey !== "string" || !/^[\x21-\x7e]{8,4096}$/.test(apiKey) || /["'`\\]/.test(apiKey)) throw new Error("invalid_key");
     const configPath = cliJson(cli(["config", "file", "--json"])).path;
     safePath(configPath);
     const initialConfig = readFileSync(configPath);
-    cli(["config", "validate", "--json"]);
     // config get redacts apiKeyFile as well as the key. Compare authored values
     // locally, never emit them. Unsupported JSON5/include-only entries fail closed.
-    const entry = JSON.parse(initialConfig.toString("utf8")).plugins?.entries?.["unblock-memory"];
+    const authored = JSON.parse(initialConfig.toString("utf8"));
+    const entry = authored.plugins?.entries?.["unblock-memory"];
     if (!entry || entry.enabled === false) throw new Error("plugin_not_enabled");
-    const targetKey = entry.config?.decisionModel !== undefined ? "decisionModel" : "typesafe";
-    const current = entry.config?.[targetKey] ?? {};
+    const current = entry.config?.decisionModel ?? {};
+    const oldConfig = Object.hasOwn(entry.config ?? {}, LEGACY_CONFIG_KEY);
+    // Transfer only a provider-independent setting, never the old route, model, or credentials.
+    const oldTimeout = entry.config?.[LEGACY_CONFIG_KEY]?.timeoutMs;
+    const migrateTimeout = current.timeoutMs === undefined && Number.isInteger(oldTimeout) && oldTimeout >= 1 && oldTimeout <= 10_000;
     const secrets = join(dirname(configPath), "secrets");
-    const keyFile = join(secrets, target.file);
+    const keyFile = join(secrets, KEY_FILENAME);
     safePath(secrets, true); safePath(keyFile);
-    const bytes = Buffer.from(`${target.envKey}="${apiKey}"\n`);
+    const bytes = Buffer.from(`CODEX_LB_API_KEY="${apiKey}"\n`);
     const priorKey = existsSync(keyFile) ? readFileSync(keyFile) : undefined;
-    const clearModel = Object.hasOwn(current, "model") && current.endpoint !== target.endpoint;
-    const configChanged = current.enabled === false || current.apiKeyFile !== keyFile ||
-      current.endpoint !== target.endpoint || Object.hasOwn(current, "apiKey") || clearModel;
+    const clearModel = Object.hasOwn(current, "model") && !usesDefaultEndpoint(current.endpoint);
+    const configChanged = oldConfig || current.enabled === false || current.apiKeyFile !== keyFile ||
+      current.endpoint !== ENDPOINT || Object.hasOwn(current, "apiKey");
     const keyChanged = !priorKey?.equals(bytes);
+    const modelPatch = { enabled: true, endpoint: ENDPOINT, apiKey: null, apiKeyFile: keyFile,
+      ...(clearModel ? { model: null } : {}), ...(migrateTimeout ? { timeoutMs: oldTimeout } : {}) };
     const patch = JSON.stringify({ plugins: { entries: { "unblock-memory": { config: {
-      [targetKey]: { enabled: true, endpoint: target.endpoint, ...(clearModel ? { model: null } : {}), apiKey: null, apiKeyFile: keyFile },
+      decisionModel: modelPatch,
+      ...(oldConfig ? { [LEGACY_CONFIG_KEY]: null } : {}),
     } } } } });
+    let migration;
+    try { cli(["config", "validate", "--json"]); }
+    catch (error) {
+      if (!oldConfig || error.retiredKeyRejected !== true ||
+          process.env.OPENCLAW_CONFIG_READONLY === "1" || process.env.OPENCLAW_NIX_MODE === "1") throw error;
+      // Native patch requires an already-valid config, so it cannot delete a rejected alias.
+      const candidate = structuredClone(authored);
+      const next = candidate.plugins.entries["unblock-memory"].config;
+      next.decisionModel = { ...current, ...modelPatch };
+      delete next[LEGACY_CONFIG_KEY];
+      delete next.decisionModel.apiKey;
+      if (clearModel) delete next.decisionModel.model;
+      migration = JSON.stringify(candidate, null, 2) + "\n";
+    }
     report.stage = "validate_patch";
-    if (configChanged) cli(["config", "patch", "--stdin", "--dry-run", "--json"], patch);
+    if (migration) withPrivateConfig(configPath, migration, temporary => {
+      const validation = cliJson(cli(["config", "validate", "--json"], "", { OPENCLAW_CONFIG_PATH: temporary }));
+      if (validation.valid !== true || validation.path !== temporary) throw new Error("candidate_not_validated");
+    });
+    else if (configChanged) cli(["config", "patch", "--stdin", "--dry-run", "--json"], patch);
     if (restart && configChanged && !cli(["gateway", "restart", "--help"]).includes("--wait")) throw new Error("restart_unsupported");
     if (!apply) return { ...report, status: "planned", stage: "complete", configChanged, keyChanged,
       restart: configChanged ? "required" : "not_needed" };
@@ -94,13 +133,13 @@ export async function deploy({ apiKey, apply, restart, provider = "codex" }, cli
     mkdirSync(secrets, { recursive: true, mode: 0o700 }); chmodSync(secrets, 0o700);
     // A private rollback snapshot is retained; never print its contents or old keys.
     if (configChanged || keyChanged) {
-      const backup = join(secrets, `typesafe-backup-${randomUUID()}`);
+      const backup = join(secrets, `decision-backup-${randomUUID()}`);
       mkdirSync(backup, { mode: 0o700 });
       privateWrite(join(backup, "openclaw.json"), initialConfig);
-      if (priorKey) privateWrite(join(backup, target.file), priorKey);
+      if (priorKey) privateWrite(join(backup, KEY_FILENAME), priorKey);
     }
     if (keyChanged) {
-      const temporary = join(secrets, `.typesafe-${randomUUID()}.tmp`);
+      const temporary = join(secrets, `.decision-${randomUUID()}.tmp`);
       try { privateWrite(temporary, bytes); renameSync(temporary, keyFile); }
       finally { if (existsSync(temporary)) unlinkSync(temporary); }
       report.keyChanged = true;
@@ -109,25 +148,34 @@ export async function deploy({ apiKey, apply, restart, provider = "codex" }, cli
     report.stage = "configure";
     if (configChanged) {
       report.restart = "required";
-      cli(["config", "patch", "--stdin"], patch);
+      if (migration) withPrivateConfig(configPath, migration, temporary => {
+        safePath(configPath);
+        if (!initialConfig.equals(readFileSync(configPath))) throw new Error("config_changed_during_preflight");
+        renameSync(temporary, configPath);
+      });
+      else cli(["config", "patch", "--stdin"], patch);
       report.configChanged = true;
     }
     report.stage = "verify";
     cli(["config", "validate", "--json"]);
     const after = JSON.parse(readFileSync(configPath, "utf8")).plugins?.entries?.["unblock-memory"];
-    const afterSection = after.config?.[targetKey];
+    const afterSection = after?.config?.decisionModel;
     if (afterSection?.apiKeyFile !== keyFile || afterSection.enabled === false ||
-        afterSection.endpoint !== target.endpoint ||
+        afterSection.endpoint !== ENDPOINT ||
+        Object.hasOwn(after.config, LEGACY_CONFIG_KEY) ||
         Object.hasOwn(afterSection, "apiKey") ||
+        (migrateTimeout && afterSection.timeoutMs !== oldTimeout) ||
         (clearModel ? Object.hasOwn(afterSection, "model") : afterSection.model !== current.model)) {
       throw new Error("config_mismatch");
     }
     // Check plugin settings outside the intended decision-provider leaves, including audit approvals.
     const strip = value => {
       const copy = structuredClone(value);
-      if (copy.config?.[targetKey]) {
-        for (const key of ["enabled", "endpoint", "model", "apiKey", "apiKeyFile"]) delete copy.config[targetKey][key];
-        if (!Object.keys(copy.config[targetKey]).length) delete copy.config[targetKey];
+      if (copy.config) delete copy.config[LEGACY_CONFIG_KEY];
+      if (copy.config?.decisionModel) {
+        for (const key of ["enabled", "endpoint", "model", "apiKey", "apiKeyFile"]) delete copy.config.decisionModel[key];
+        if (migrateTimeout) delete copy.config.decisionModel.timeoutMs;
+        if (!Object.keys(copy.config.decisionModel).length) delete copy.config.decisionModel;
       }
       if (copy.config && !Object.keys(copy.config).length) delete copy.config;
       return copy;

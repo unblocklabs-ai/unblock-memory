@@ -1,6 +1,6 @@
 import { choice, noul } from "@unblocklabs/decisions";
 import { backgroundWordCount, PEOPLE_BACKGROUND_MAX_WORDS } from "./people-background.js";
-import { decideWithModel } from "./typesafe-client.js";
+import { decideWithModel } from "./decision-client.js";
 
 type RequestOptions = { apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal: AbortSignal };
 
@@ -159,7 +159,7 @@ const CLUSTER_DEFECT_QUESTIONS = {
 } as const;
 
 /** The source is an indexed snapshot, not proof of current truth or permission to write. */
-export async function reviewTypeSafeClaim(params: RequestOptions & {
+export async function reviewClaim(params: RequestOptions & {
   claim: string;
   evidence: readonly string[];
   personBackground?: { name: string; agentName: string; kind?: "interaction"; inferred?: boolean };

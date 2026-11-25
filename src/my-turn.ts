@@ -8,7 +8,7 @@ import { abortable } from "./abortable.js";
 import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
 import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
-import { decideWithModel, estimateJevTokens, isTypeSafeTimeout, resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { decideWithModel, estimateDecisionTokens, isDecisionTimeout, resolveDecisionCredential } from "./decision-client.js";
 
 export type MyTurnConfig = {
   enabled: boolean;
@@ -133,7 +133,7 @@ function buildMyTurnState(params: {
     currentMessage,
     history: [],
   };
-  const baseTokens = estimateJevTokens(state);
+  const baseTokens = estimateDecisionTokens(state);
   // Never advise silence after silently truncating the current human request.
   if (baseTokens > MAX_STATE_TOKENS) return { ok: false, reason: "input_too_large" };
   state.history = takeRecentWithinTokens(messages, {
@@ -141,14 +141,14 @@ function buildMyTurnState(params: {
     maxItems: historyMessages - 1,
     maxTokens: MAX_STATE_TOKENS,
     usedTokens: baseTokens,
-    estimateTokens: estimateJevTokens,
+    estimateTokens: estimateDecisionTokens,
     transform: humanMessage,
   }).items;
   return { ok: true, state };
 }
 
 export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
-  typesafe: UnblockMemoryConfig["typesafe"], diagnostics?: WhispererDiagnostics,
+  decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics,
 ): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
   if (!config.enabled) return;
   type Run = { controller: AbortController; result: Promise<{ appendContext: string } | undefined> };
@@ -171,7 +171,7 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
     if (isRecord(provenance) && provenance.kind !== "external_user") return;
     const provider = groupProvider(scope, agentId);
     if (!provider || provider !== context.messageProvider?.toLowerCase() || config.channels[provider]?.enabled === false) return;
-    if (!typesafe.enabled) { diagnostics?.record(agentId, "myTurn", "typesafe_disabled"); return; }
+    if (!decisionModel.enabled) { diagnostics?.record(agentId, "myTurn", "decision_disabled"); return; }
     let session = sessions.get(scope);
     if (session && session.sessionId !== context.sessionId) { stop(scope); session = undefined; }
     if (session) {
@@ -203,10 +203,10 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
           historyMessages: config.historyMessages,
         });
         if (!built.ok) { record(built.reason); return; }
-        const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
+        const apiKey = await abortable(resolveDecisionCredential(decisionModel), signal);
         if (!apiKey) { record("missing_key"); return; }
         const result = await abortable(decideWithModel(
-          { apiKey, endpoint: typesafe.endpoint, model: typesafe.model, signal, timeoutMs: typesafe.timeoutMs },
+          { apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, signal, timeoutMs: decisionModel.timeoutMs },
           built.state,
           SHOULD_RESPOND_QUESTIONS,
           { validateModel: false },
@@ -220,7 +220,7 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
           record("partial_response");
           return;
         }
-        record(isTypeSafeTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed");
+        record(isDecisionTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed");
         // All failures, including exhausted credits, leave the agent's turn unchanged. Never log content or keys.
         return;
       } finally { clearTimeout(timer); }

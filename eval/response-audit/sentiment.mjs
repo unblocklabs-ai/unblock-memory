@@ -1,30 +1,29 @@
 // Bounded live check using invented text only. Never reads user transcripts.
-// Usage: node sentiment.mjs PLUGIN KEYFILE OUTPUT [--legacy | --endpoint=URL --model=ID]
+// Usage: node sentiment.mjs PLUGIN KEYFILE OUTPUT [--endpoint=URL] [--model=ID]
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const rawArgs = process.argv.slice(2);
+assert.ok(rawArgs.every(a => !a.startsWith("--") || /^--(?:endpoint|model)=.+$/u.test(a)), "Unknown or empty option");
 const positional = rawArgs.filter(a => !a.startsWith("--"));
 const [plugin, keyFile, output] = positional;
 assert.ok(plugin && keyFile && output);
-const legacy = rawArgs.includes("--legacy");
 const endpointFlag = rawArgs.find(a => a.startsWith("--endpoint="))?.slice("--endpoint=".length);
 const modelFlag = rawArgs.find(a => a.startsWith("--model="))?.slice("--model=".length);
 const { resolveConfig } = await import(pathToFileURL(`${plugin}/dist/src/config.js`));
-const { LEGACY_SYSTEMONE_ENDPOINT, resolveTypeSafeApiKey } = await import(pathToFileURL(`${plugin}/dist/src/typesafe-client.js`));
+const { resolveDecisionCredential } = await import(pathToFileURL(`${plugin}/dist/src/decision-client.js`));
 const { judgeResponse, responseRubricVersion } = await import(pathToFileURL(`${plugin}/dist/src/response-judge.js`));
-const endpointOverride = endpointFlag ?? (legacy ? LEGACY_SYSTEMONE_ENDPOINT : undefined);
-const { decisionModel: typesafe } = resolveConfig({
+const { decisionModel } = resolveConfig({
   decisionModel: {
     enabled: true,
-    ...(endpointOverride ? { endpoint: endpointOverride } : {}),
+    ...(endpointFlag ? { endpoint: endpointFlag } : {}),
     ...(modelFlag ? { model: modelFlag } : {}),
     apiKeyFile: keyFile,
     timeoutMs: 10000,
   },
 });
-const { endpoint, model } = typesafe;
-const apiKey = await resolveTypeSafeApiKey(typesafe);
+const { endpoint, model } = decisionModel;
+const apiKey = await resolveDecisionCredential(decisionModel);
 assert.ok(apiKey, "Decision model key unavailable");
 const cases = [
   { id: "neutral_correction", feedback: "The total is 42, not 43. Please update it.", annoyed: false, frustrated: false, polarity: "neutral" },

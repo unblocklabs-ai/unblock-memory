@@ -24,7 +24,7 @@ function tools(config: ReturnType<typeof resolveConfig>, runtime: QmdMemoryRunti
 test("review tools gate missing keys and disabled features before accessing memory", async () => {
   const runtime = { getMemorySearchManager() { assert.fail("must not access memory"); } } as unknown as QmdMemoryRuntime;
   for (const enabled of [false, true]) {
-    const call = tools(resolveConfig({ typesafe: { apiKeyFile: "/nonexistent/unblock-review-key.env" },
+    const call = tools(resolveConfig({ decisionModel: { apiKeyFile: "/nonexistent/unblock-review-key.env" },
       qualityAudit: { enabled, corpora: ["memory"] }, evidenceReview: { enabled, corpora: ["memory"] } }), runtime);
     const claim = await call("memory_review_claim", { claim: "Fact", citations: [{ path: "qmd://memory/note.md", from: 1, lines: 1 }] });
     const cluster = await call("memory_review_cluster", { clusterId: "0123456789" });
@@ -42,7 +42,7 @@ test("review tools propagate approved scope and cancellation and sanitize errors
     },
     async reviewCluster(params: { corpora: string[] }) { calls++; assert.deepEqual(params.corpora, ["memory"]); return { status: "ok", members: [] }; },
   } }; } } as unknown as QmdMemoryRuntime;
-  const call = tools(resolveConfig({ typesafe: { apiKey: "fake-secret" },
+  const call = tools(resolveConfig({ decisionModel: { apiKey: "fake-secret" },
     qualityAudit: { enabled: true, corpora: ["memory"] }, evidenceReview: { enabled: true, corpora: ["memory"] } }), runtime);
   const result = await call("memory_review_claim", { claim: "Fact", citations: [{ path: "qmd://memory/note.md", from: 1, lines: 1 }] });
   assert.equal(result.status, "unavailable");
@@ -93,7 +93,7 @@ for (const review of reviews) {
           if (stage === "initialization") started.resolve();
           return initialization.promise;
         } } as unknown as QmdMemoryRuntime;
-        const config = resolveConfig({ typesafe: stage === "credentials" ? { apiKeyFile: "/fake/review.env" } : { apiKey: "fake-secret" },
+        const config = resolveConfig({ decisionModel: stage === "credentials" ? { apiKeyFile: "/fake/review.env" } : { apiKey: "fake-secret" },
           qualityAudit: { enabled: true, corpora: ["memory"] }, evidenceReview: { enabled: true, corpora: ["memory"] } });
         const call = tools(config, runtime);
         const cancelled = call(review.name, review.params, cancellation === "caller" ? controller.signal : undefined);
@@ -127,7 +127,7 @@ for (const review of reviews) {
     const started = deferred<void>(), initialization = deferred<never>();
     const controller = new AbortController();
     const runtime = { getMemorySearchManager() { started.resolve(); return initialization.promise; } } as unknown as QmdMemoryRuntime;
-    const call = tools(resolveConfig({ typesafe: { apiKey: "fake-secret" },
+    const call = tools(resolveConfig({ decisionModel: { apiKey: "fake-secret" },
       qualityAudit: { enabled: true, corpora: ["memory"] }, evidenceReview: { enabled: true, corpora: ["memory"] } }), runtime);
     const result = call(review.name, review.params, controller.signal);
     await started.promise;
@@ -140,14 +140,14 @@ for (const review of reviews) {
 }
 
 test("diagnostics reports disabled features, safe credential state and per-agent counts without inference", async t => {
-  t.mock.method(globalThis, "fetch", () => { assert.fail("diagnostics must not call TypeSafe"); });
+  t.mock.method(globalThis, "fetch", () => { assert.fail("diagnostics must not call decision model"); });
   const diagnostics = new WhispererDiagnostics();
   diagnostics.record("bill", "skill", "emitted");
   diagnostics.record("pearl", "memory", "failed");
   const runtime = { async getMemorySearchManager() { return { manager: { async diagnostics() {
     return { projectorVersion: 6, semanticChunkingVersion: 7, needsEmbedding: 3, embeddingReady: false };
   } } }; } } as unknown as QmdMemoryRuntime;
-  const call = tools(resolveConfig({ typesafe: { apiKey: "fake-secret" } }), runtime, diagnostics);
+  const call = tools(resolveConfig({ decisionModel: { apiKey: "fake-secret" } }), runtime, diagnostics);
   const result = await call("memory_diagnostics");
   assert.equal(result.credential, "available");
   assert.equal(JSON.stringify(result).includes("fake-secret"), false);

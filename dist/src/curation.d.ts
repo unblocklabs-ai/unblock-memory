@@ -1,4 +1,4 @@
-import type { QualityJudgment } from "./typesafe.js";
+import type { QualityJudgment } from "./decision-ranking.js";
 declare const TEMPORAL_BASES: readonly ["path", "frontmatter", "session", "agent_verified"];
 export type TemporalBasis = typeof TEMPORAL_BASES[number];
 declare const MAINTENANCE_TASK_TYPES: readonly ["ambiguous_event_time", "exact_duplicate", "quality_review"];

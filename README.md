@@ -10,9 +10,9 @@ keyword or vector similarity.
 
 **Requirements:** Node.js 22+ and OpenClaw 2026.8.1-beta.3 or later.
 Use the Node version required by your OpenClaw release.
-A decision-model API key (defaulting to `https://codex.unblocklabs.ai/v1/decisions`
-with `liquid/d1.2-ultra`, or `https://api.typesafe.ai/v1/systemone` via `typesafe.endpoint`)
-enables usefulness ranking; without it, explicit search returns labeled local search leads.
+A decision-model API key enables usefulness ranking. The default endpoint is
+`https://codex.unblocklabs.ai/v1/decisions` (Codex LB → OpenRouter `liquid/d1.2-ultra`).
+Without a key, search returns labeled local leads.
 
 1. Install once per OpenClaw host, not once per agent:
 
@@ -38,15 +38,13 @@ enables usefulness ranking; without it, explicit search returns labeled local se
          "unblock-memory": {
            "enabled": true,
            "config": {
-             "typesafe": { "apiKeyFile": "/home/you/.openclaw/secrets/unblock-memory-decisions.env" }
+             "decisionModel": { "apiKeyFile": "/home/you/.openclaw/secrets/unblock-memory-decisions.env" }
            }
          }
        }
      }
    }
    ```
-
-   To use legacy TypeSafe (`jev-1.13.0`) instead, store `TYPESAFE_API_KEY="your-key"` in a private file and also set `"endpoint": "https://api.typesafe.ai/v1/systemone"` under `typesafe`.
 
 4. Restart the Gateway, then ask an agent to run `memory_diagnostics`:
 
@@ -55,7 +53,7 @@ enables usefulness ranking; without it, explicit search returns labeled local se
    ```
 
    `"credential": "available"` means the key was found. It does not check that
-   TypeSafe accepts the key; a test search does.
+   the endpoint accepts the key; a test search does.
 
 By default each agent indexes `MEMORY.md`, `USER.md` and `memory/**/*.md` in its
 workspace. The index is built on first use and refreshes in the background when
@@ -68,7 +66,7 @@ To install from source instead:
 ## How it works
 
 The agent writes two queries: keywords for BM25 search and a plain-language
-question for vector search. Each returns up to ten candidate passages. TypeSafe
+question for vector search. Each returns up to ten candidate passages. The decision model
 scores how useful each complete passage is for the question, and the best ones
 come back with their source location.
 
@@ -93,16 +91,16 @@ come back with their source location.
 
 The agent then calls `memory_get` with that `path` to read the surrounding
 context, attribution and dates. Search defaults to 5 results with a usefulness
-score of at least 0.7 when TypeSafe is available. If ranking is unavailable,
+score of at least 0.7 when judging is available. If ranking is unavailable,
 search returns unjudged local leads with a warning; the usefulness threshold
-is not applied. Automatic Memory Whisperer hints still require TypeSafe.
+is not applied. Automatic Memory Whisperer hints still require a decision model.
 See [search and read](docs/retrieval.md#search-and-read) for every parameter.
 
 **What leaves your machine:** indexing, embeddings, storage and `memory_get` run
 locally. `memory_search` sends the search question and candidate passages, with
-their paths and dates, to TypeSafe for scoring when available. Optional TypeSafe
+their paths and dates, to the configured decision endpoint for scoring. Optional decision-model
 features send only what their own settings approve; see
-[TypeSafe data scope](docs/configuration.md#typesafe-data-scope).
+[decision model data scope](docs/configuration.md#decision-model-data-scope).
 
 **On by default:** search and read over the `memory` corpus, and a
 [compaction memory flush](docs/configuration.md#compaction-memory-writes): before
@@ -118,7 +116,7 @@ Everything below is off until you configure it.
 | --- | --- |
 | [Session indexing](docs/retrieval.md#sessions) | Makes past conversations searchable. Group and channel chats by default; DMs only if you add them. |
 | [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Suggests one relevant skill for a user message. Never runs it. Turns on when you add a `skills` corpus; works without a remote decision model. |
-| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to three relevant past excerpts before the agent replies. Needs a configured decision endpoint (`typesafe`); optionally uses a self-hosted query-generation API with local fallback. |
+| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to three relevant past excerpts before the agent replies. Needs a configured decision endpoint (`decisionModel`); optionally uses a self-hosted query-generation API with local fallback. |
 | [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if the decision endpoint is unavailable. |
 | [My Turn](docs/configuration.md#my-turn) | Asks the configured decision model (default `liquid/d1.2-ultra` via Codex LB) whether a group/channel conversation needs this agent's response. Advises `NO_REPLY` only when silence is clearly favored; the agent keeps the final say. Opt-in; failures leave the turn unchanged. |
 | [People dossiers](docs/peoplesql.md) | Lets the agent keep a short, evidence-backed note about each person it works with. |
@@ -208,8 +206,8 @@ npm run preflight   # full pre-release check
 
 Releases publish to npm from GitHub Releases; see
 [RELEASE.md](https://github.com/unblocklabs-ai/unblock-memory/blob/main/docs/RELEASE.md).
-Fleet TypeSafe key tooling for source checkouts is described in
-[TYPESAFE-FLEET.md](https://github.com/unblocklabs-ai/unblock-memory/blob/main/scripts/TYPESAFE-FLEET.md);
+Fleet decision model key tooling for source checkouts is described in
+[DECISION-FLEET.md](https://github.com/unblocklabs-ai/unblock-memory/blob/main/scripts/DECISION-FLEET.md);
 keep populated key files private.
 
 ## License

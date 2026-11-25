@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createRequire } from "node:module";
 const [plugin, stateRoot, output, senderId, mode = "dry-run", days = "30", batches = "1"] = process.argv.slice(2);
 assert.ok(plugin && stateRoot && output && senderId && ["dry-run", "live", "cached"].includes(mode));
-if (mode === "cached") globalThis.fetch = async () => { throw new Error("Cached verification must never call TypeSafe"); };
+if (mode === "cached") globalThis.fetch = async () => { throw new Error("Cached verification must never call decision model"); };
 const lookbackDays = Number(days), maxBatches = Number(batches);
 assert.ok(Number.isInteger(lookbackDays) && lookbackDays >= 1 && lookbackDays <= 90);
 assert.ok(Number.isInteger(maxBatches) && maxBatches >= 1 && maxBatches <= 3);
@@ -19,9 +19,9 @@ const { ResponseAuditStore } = await imp("response-store");
 const { ResponseTranscriptReader } = await imp("response-episodes");
 const raw = await readFile(`${stateRoot}/openclaw.json`, "utf8");
 const host = JSON.parse(raw);
-const { typesafe: hostTypeSafe, decisionModel: hostDecisionModel, ...restHostConfig } = host.plugins.entries["unblock-memory"].config ?? {};
-const config = resolveConfig({ ...restHostConfig,
-  decisionModel: { ...(hostDecisionModel ?? hostTypeSafe), timeoutMs: 10000 },
+const hostConfig = host.plugins.entries["unblock-memory"].config ?? {};
+const config = resolveConfig({ ...hostConfig,
+  decisionModel: { ...hostConfig.decisionModel, timeoutMs: 10000 },
   responseAudit: { enabled: true, senderIds: [senderId], chatTypes: ["direct", "channel"], lookbackDays,
     historyMessages: 6, maxEpisodes: 100, intervalMinutes: 0, memoryCorpora: ["memory", "knowledge"] } });
 const options = { agentId: "main", config, databasePath: `${stateRoot}/agents/main/agent/openclaw-agent.sqlite`,
@@ -57,7 +57,7 @@ if (mode !== "dry-run" && first.status === "ok") {
   assert.equal(cacheVerified, original.length, "Successful pilot judgments were unexpectedly repeated");
   const store = new ResponseAuditStore(options.storePath);
   try {
-    const cohort = responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
+    const cohort = responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
     report = store.report(cohort, Date.now() - lookbackDays * 86400_000);
     assert.ok(report.groups.every(g => g.human?.senderId === senderId), "Human attribution missing or mixed");
     assert.equal(repeated.coverage.extractedSessions, 0, "Repeat extracted unchanged sessions");

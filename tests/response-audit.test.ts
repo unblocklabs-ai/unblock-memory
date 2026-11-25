@@ -30,7 +30,7 @@ import { compressAgentTranscripts, createAgentDatabase, insertSession } from "./
 import { ResponsePeople } from "../src/response-identity.js";
 
 const session = { sessionId: "s", accountId: "workspace", conversationId: "conversation-s", chatType: "direct" };
-const config = resolveConfig({ typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+const config = resolveConfig({ decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
   responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0 } });
 const user = (text: string, extra: Record<string, unknown> = {}) => ({ role: "user", content: text,
   __openclaw: { senderId: "owner", senderIdentity: { senderKind: "human" }, transport: { channel: "slack", conversationRef: "conversation-s", threadId: "thread" } }, ...extra });
@@ -283,9 +283,9 @@ test("audit persists deduplicated results, skips retired active branches and rep
 
 test("disabled, missing key and already-running gates prevent API work", async t => {
   const { db, options } = await fixture(); t.after(() => db.close());
-  t.mock.method(globalThis, "fetch", async () => { assert.fail("must not call TypeSafe"); });
+  t.mock.method(globalThis, "fetch", async () => { assert.fail("must not call decision model"); });
   assert.equal((await auditResponses({ ...options, config: resolveConfig({}) })).status, "disabled");
-  assert.equal((await auditResponses({ ...options, config: { ...config, typesafe: { ...config.typesafe, apiKey: undefined, apiKeyFile: "/not-found-response-key" } } })).status, "unavailable");
+  assert.equal((await auditResponses({ ...options, config: { ...config, decisionModel: { ...config.decisionModel, apiKey: undefined, apiKeyFile: "/not-found-response-key" } } })).status, "unavailable");
   const store = new ResponseAuditStore(options.storePath); t.after(() => store.close());
   const lease = store.acquire(Date.now())!;
   assert.equal((await auditResponses(options)).status, "already_running");
@@ -749,7 +749,7 @@ test("trend rates retain unknowns and score deltas abstain when scored coverage 
 
 test("sentiment opt-out removes every emotion question and stored field without disabling quality", async t => {
   const { db, options } = await fixture(); t.after(() => db.close());
-  options.config = resolveConfig({ typesafe: { apiKey: "fake" }, responseAudit: {
+  options.config = resolveConfig({ decisionModel: { apiKey: "fake" }, responseAudit: {
     enabled: true, senderIds: ["owner"], sentimentEnabled: false, intervalMinutes: 0 } });
   let calls = 0;
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
@@ -1098,7 +1098,7 @@ test("ok episodes with unavailable memory automatically retry only memory after 
     indexDb.prepare("INSERT INTO documents_fts(rowid,body) VALUES(?,?)").run(id, doc);
   }
   const memConfig = resolveConfig({
-    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
     responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
   });
   const memOptions = { ...options, config: memConfig, sources: [source] };
@@ -1168,7 +1168,7 @@ test("memory failures before stage-key creation respect retry bounds and retryFa
   const root = join(options.storePath, "..");
   const source = resolveSource(root, "memory/**/*.md");
   const memConfig = resolveConfig({
-    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
     responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
   });
   const memOptions = { ...options, config: memConfig, sources: [source] };
@@ -1376,7 +1376,7 @@ test("corrupted persisted ok stage rows are invalidated and recomputed across al
   indexDb.prepare("INSERT INTO documents_fts(rowid,body) VALUES(1,?)").run("Brief explanation guidelines for Atlas.");
 
   const memConfig = resolveConfig({
-    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
     responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
   });
   const memOptions = { ...options, config: memConfig, sources: [source] };
@@ -1717,7 +1717,7 @@ test("cached retrospective complete-with-null-judgment and mismatched memory can
   indexDb.prepare("INSERT INTO documents_fts(rowid,body) VALUES(1,?)").run("Brief explanation guidelines for Atlas.");
 
   const memConfig = resolveConfig({
-    typesafe: { apiKey: "fake-secret", timeoutMs: 1000 },
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
     responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0, memoryCorpora: [source.corpus] },
   });
   const memOptions = { ...options, config: memConfig, sources: [source] };
@@ -2121,7 +2121,7 @@ test("memory-responses review CLI requires --evidence-hash and rejects stale evi
   );
 
   const storePath = join(root, "agents/main/unblock-memory/unblock-memory.sqlite");
-  const cohort = responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
+  const cohort = responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
   const store = new ResponseAuditStore(storePath);
   t.after(() => store.close());
   assert.equal(store.reviews.list(cohort, oldTask.id)[0]!.status, "pending");

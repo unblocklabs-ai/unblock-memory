@@ -122,7 +122,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   let diagnosticsFactory: typeof factory;
   let getFactory: typeof factory;
   const api = {
-    pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
+    pluginConfig: { decisionModel: { enabled: true, apiKey: "test-key" } },
     registerCli() {}, registerService() {}, on() {}, registerGatewayMethod() {},
     registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
       Object.defineProperty(runtime, "getMemorySearchManager", { value: async () => ({ manager }) });
@@ -210,7 +210,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   await assert.rejects(tool.execute("legacy", { query: "Exactneedle" }));
   await assert.rejects(tool.execute("too-large", { ...input, vectorQuery: "x".repeat(24_001) }), /context budget/);
   await assert.rejects(tool.execute("cancelled", input, AbortSignal.abort()), { name: "AbortError" });
-  assert.equal(judged.length, calls, "invalid input never reaches TypeSafe");
+  assert.equal(judged.length, calls, "invalid input never reaches decision model");
   const finalSnapshot = await diagnostics.execute("diagnostics", {}) as typeof snapshot;
   const finalOperations = finalSnapshot.details.whisperers.telemetry.operations;
   assert.equal(finalOperations.memorySearch!.calls, 5, "one observation per tool invocation, even on early failures");
@@ -251,7 +251,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
     rankingMode: string; minUsefulnessApplied: boolean; warning?: string; fallbackReason?: string;
     results: { path: string; score: number }[];
   } };
-  assert.equal(recovered.details.rankingMode, "typesafe_usefulness");
+  assert.equal(recovered.details.rankingMode, "decision");
   assert.equal(recovered.details.minUsefulnessApplied, true);
   assert.equal(recovered.details.warning, undefined);
   assert.equal(recovered.details.fallbackReason, undefined);

@@ -2,7 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { Value } from "typebox/value";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { SafetyChannel, SafetyRequestor, SafetyScenario } from "./safety-config.js";
-import { estimateJevTokens, isTypeSafeTimeout, requestTypeSafe, resolveTypeSafeApiKey, TYPESAFE_NOUL_SCHEMA, TypeSafeRequestError } from "./typesafe-client.js";
+import { estimateDecisionTokens, isDecisionTimeout, requestDecision, resolveDecisionCredential, NOUL_SCHEMA, DecisionRequestError } from "./decision-client.js";
 import { MAX_STATE_TOKENS, messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { CONVERSATION_INFO, conversationEnvelope, conversationUserText } from "./response-text.js";
 import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
@@ -13,7 +13,7 @@ import { nonBlank, record } from "./guards.js";
 const MAX_SESSIONS = 1000;
 const RUNS_PER_SESSION = 4;
 
-type SafetyPluginConfig = Pick<UnblockMemoryConfig, "safetyWhisperer" | "typesafe" | "memoryWhisperer" | "skillWhisperer">;
+type SafetyPluginConfig = Pick<UnblockMemoryConfig, "safetyWhisperer" | "decisionModel" | "memoryWhisperer" | "skillWhisperer">;
 type Turn = { provider?: string; accountId?: string; senderId?: string; channelId?: string };
 type SafetyContext = { appendContext: string };
 
@@ -68,12 +68,12 @@ export function safetyConversation(prompt: string, messages: readonly unknown[],
   const envelope = conversationEnvelope(prompt, senderId);
   // An unrecognized wrapper is judged whole, minus the identity header: over-flagging beats missing a request.
   const currentRequest = envelope?.text ?? prompt.trim().replace(CONVERSATION_INFO, "").trim();
-  const baseTokens = estimateJevTokens({ currentRequest, history: [] });
+  const baseTokens = estimateDecisionTokens({ currentRequest, history: [] });
   if (baseTokens > MAX_STATE_TOKENS) throw new SafetyInputError("Current request exceeds the safety check budget");
   // Thread starter, reply target and chat history since the last reply resolve "answer the question above".
   const lines = envelope?.context?.split("\n") ?? [];
   const contextBudget = takeRecentWithinTokens(lines, {
-    maxTokens: MAX_STATE_TOKENS, usedTokens: baseTokens, estimateTokens: estimateJevTokens,
+    maxTokens: MAX_STATE_TOKENS, usedTokens: baseTokens, estimateTokens: estimateDecisionTokens,
   });
   const channelContext = contextBudget.items.join("\n").trim();
   let last = messages.length - 1;
@@ -82,7 +82,7 @@ export function safetyConversation(prompt: string, messages: readonly unknown[],
   if (newest?.role === "user" && newest.content === currentRequest) last--;
   const { items: history } = takeRecentWithinTokens(messages, {
     endIndex: last, maxItems: historyMessages, maxTokens: MAX_STATE_TOKENS, usedTokens: contextBudget.usedTokens,
-    estimateTokens: estimateJevTokens, transform: historyMessage,
+    estimateTokens: estimateDecisionTokens, transform: historyMessage,
   });
   return { currentRequest, ...(channelContext ? { channelContext } : {}), history };
 }
@@ -118,11 +118,11 @@ async function judgeSafetyScenarios(apiKey: string, signal: AbortSignal,
   options?: { endpoint?: string; model?: string }): Promise<(number | undefined)[]> {
   const key = (index: number) => `scenario_${index}`;
   const questions = Object.fromEntries(scenarios.map((scenario, index) => [key(index), scenarioQuestion(scenario.instructions)]));
-  const result = await requestTypeSafe({ apiKey, endpoint: options?.endpoint, model: options?.model, signal }, state, questions);
+  const result = await requestDecision({ apiKey, endpoint: options?.endpoint, model: options?.model, signal }, state, questions);
   const answers = record(record(result)?.answers) ?? {};
   return scenarios.map((_scenario, index) => {
     const answer = answers[key(index)];
-    return Value.Check(TYPESAFE_NOUL_SCHEMA, answer) && Number.isFinite(answer.noul) ? answer.noul : undefined;
+    return Value.Check(NOUL_SCHEMA, answer) && Number.isFinite(answer.noul) ? answer.noul : undefined;
   });
 }
 
@@ -140,7 +140,7 @@ function queueMode(value: unknown): "steer" | "other" | undefined {
 }
 
 function disabledReason(hooks: Record<string, unknown>, config: SafetyPluginConfig) {
-  if (!config.typesafe.enabled) return "typesafe_disabled" as const;
+  if (!config.decisionModel.enabled) return "decision_disabled" as const;
   if (hooks.allowConversationAccess !== true) return "conversation_access_not_allowed" as const;
   if (hooks.allowPromptInjection === false) return "prompt_injection_not_allowed" as const;
   if (!config.safetyWhisperer.scenarios.some(scenario => scenario.enabled)) return "no_enabled_scenarios" as const;
@@ -178,7 +178,7 @@ export function registerSafetyWhisperer(
   plugin: SafetyPluginConfig,
   diagnostics?: WhispererDiagnostics,
 ): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
-  const config = plugin.safetyWhisperer, typesafe = plugin.typesafe;
+  const config = plugin.safetyWhisperer, decisionModel = plugin.decisionModel;
   if (!config.enabled) return;
   const status = safetyStatus(api.config, plugin);
   if (!status.active || "warnings" in status) {
@@ -218,22 +218,22 @@ export function registerSafetyWhisperer(
       if (!scenarios.length) { recordOutcome("no_scenarios"); return; }
       const state = safetyConversation(event.prompt, event.messages, config.historyMessages, turn.senderId);
       if (!state.currentRequest) { recordOutcome("empty_request"); return; }
-      const apiKey = await abortable(resolveTypeSafeApiKey(typesafe), signal);
+      const apiKey = await abortable(resolveDecisionCredential(decisionModel), signal);
       if (!apiKey) {
-        recordOutcome(typesafe.enabled ? "missing_key" : "typesafe_disabled");
+        recordOutcome(decisionModel.enabled ? "missing_key" : "decision_disabled");
         if (!warnedMissingKey) {
-          api.logger.warn(`unblock-memory safety whisperer could not check: ${typesafe.enabled ? "TypeSafe key unavailable" : "TypeSafe disabled"}`);
+          api.logger.warn(`unblock-memory safety whisperer could not check: ${decisionModel.enabled ? "decision model key unavailable" : "decision model disabled"}`);
         }
         warnedMissingKey = true;
         return;
       }
       warnedMissingKey = false;
       const probabilities = await abortable(judgeSafetyScenarios(apiKey, signal, state, scenarios,
-        { endpoint: typesafe.endpoint, model: typesafe.model }), signal);
+        { endpoint: decisionModel.endpoint, model: decisionModel.model }), signal);
       const unanswered = probabilities.filter(probability => probability === undefined).length;
       const matched = scenarios.filter((scenario, index) => (probabilities[index] ?? -1) >= scenario.minProbability);
       if (!matched.length) {
-        if (unanswered) throw new TypeSafeRequestError("Invalid safety response", "invalid_response");
+        if (unanswered) throw new DecisionRequestError("Invalid safety response", "invalid_response");
         recordOutcome("no_match");
         return;
       }
@@ -247,12 +247,12 @@ export function registerSafetyWhisperer(
       return safetyContext(matched.map(scenario => scenario.flaggedPrompt));
     } catch (error) {
       // Fail open by design, but never silently: "could not check" is recorded separately from "no match".
-      const outcome = error instanceof SafetyInputError ? "input_too_large" : isTypeSafeTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed";
+      const outcome = error instanceof SafetyInputError ? "input_too_large" : isDecisionTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed";
       recordOutcome(outcome);
       if (outcome !== "cancelled") {
         warn({ event: "check_failed", agentId, runId: context.runId, outcome, eligibleScenarios: scenarios.length,
-          errorCode: error instanceof TypeSafeRequestError ? error.code : undefined,
-          httpStatus: error instanceof TypeSafeRequestError ? error.status : undefined });
+          errorCode: error instanceof DecisionRequestError ? error.code : undefined,
+          httpStatus: error instanceof DecisionRequestError ? error.status : undefined });
       }
       // The requestor controls message size, so an oversized message gets every eligible prompt rather than none.
       if (outcome === "input_too_large") return safetyContext(scenarios.map(scenario => scenario.flaggedPrompt));

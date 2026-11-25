@@ -191,7 +191,7 @@ test("tool gates disabled and missing credentials before accessing stores or ret
   for (const enabled of [false, true]) {
     let tool: { execute(id: string, args: unknown): Promise<unknown> } | undefined;
     const cfg = resolveConfig({ people: { enabled: true }, peoplePrimer: { enabled, corpora: ["memory"] },
-      typesafe: { apiKeyFile: "/nonexistent/primer-key.env" } });
+      decisionModel: { apiKeyFile: "/nonexistent/primer-key.env" } });
     registerPeoplePrimerTool({ registerTool(factory: (ctx: OpenClawPluginToolContext) => typeof tool) {
       tool = factory({ agentId: "bill", config: {} } as OpenClawPluginToolContext);
     } } as unknown as OpenClawPluginApi,
@@ -205,7 +205,7 @@ test("tool gates disabled and missing credentials before accessing stores or ret
 test("draft mode reviews indexed evidence with primer approval, skips search and sanitizes failures", async t => {
   const f = await fixture(t);
   const cfg = resolveConfig({ people: { enabled: true }, peoplePrimer: { enabled: true, corpora: ["memory"] },
-    typesafe: { apiKey: "fake-secret" } });
+    decisionModel: { apiKey: "fake-secret" } });
   let calls = 0, fail = false;
   let tool: { execute(id: string, args: unknown): Promise<{ content: { text: string }[] }> } | undefined;
   registerPeoplePrimerTool({ registerTool(factory: (ctx: OpenClawPluginToolContext) => typeof tool) {

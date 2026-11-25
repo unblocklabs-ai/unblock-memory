@@ -45,7 +45,7 @@ test("quality audit is inert when disabled or an explicit key file is absent", a
     const api = {
       pluginConfig: {
         qualityAudit: { enabled, corpora: ["memory"] },
-        typesafe: { apiKeyFile: join(root, "missing.env") },
+        decisionModel: { apiKeyFile: join(root, "missing.env") },
       },
       registerCli() {},
       registerService() {},
@@ -64,7 +64,7 @@ test("quality audit is inert when disabled or an explicit key file is absent", a
     const tool = auditFactory!({ agentId: "bill", config: {} } as OpenClawPluginToolContext)!;
     const result = parseJsonResult(await tool.execute("gate", {}));
     assert.equal(result.status, enabled ? "unavailable" : "disabled");
-    if (enabled) assert.equal(result.reason, "TypeSafe API key not configured");
+    if (enabled) assert.equal(result.reason, "Decision model API key not configured");
   }
 });
 
@@ -229,7 +229,7 @@ test("memory search compacts judged results without changing evidence or request
   let searchFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   let getFactory: ((ctx: OpenClawPluginToolContext) => Tool | null) | undefined;
   const api = {
-    pluginConfig: { typesafe: { enabled: true, apiKey: "test-key" } },
+    pluginConfig: { decisionModel: { enabled: true, apiKey: "test-key" } },
     on() {},
     registerCli() {},
     registerService() {},
@@ -334,7 +334,7 @@ test("memory search compacts judged results without changing evidence or request
   const result = parseJsonResult(response);
   await getFactory(context)!.execute("get", { path: "qmd://memory/missing.md" });
   assert.deepEqual(result, {
-    rankingMode: "typesafe_usefulness",
+    rankingMode: "decision",
     scoreMeaning: "usefulness_probability",
     minUsefulnessApplied: true,
     results: [

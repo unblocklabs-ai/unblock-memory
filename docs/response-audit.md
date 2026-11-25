@@ -10,8 +10,8 @@ deliverable fit, clear underdelivery and its observable reason. Memory gaps are 
 an optional diagnostic lead, not a proxy for performance.
 
 This reads the host transcript database directly: it does not require a `sessions`
-corpus, People Primer, whisperers or clustering. Configure [shared TypeSafe
-credentials](configuration.md#shared-typesafe-credentials) separately. Begin with
+corpus, People Primer, whisperers or clustering. Configure [shared decision model
+credentials](configuration.md#shared-decision-model-credentials) separately. Begin with
 the dry-run command below before requesting inference.
 Only approved Slack sender IDs with trusted `senderKind: human` or owner metadata
 qualify (older Slack records use unknown senderKind even for known owners).
@@ -46,15 +46,15 @@ investigation while still tracking response quality and sentiment.
 
 This is explicit approval to send those exchanges to the configured decision-model
 endpoint (defaulting to `https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter
-`liquid/d1.2-ultra`, or `https://api.typesafe.ai/v1/systemone` when overridden). Sender IDs apply
+`liquid/d1.2-ultra`). Sender IDs apply
 across the agent's Slack accounts; use only identities approved in all such accounts.
 `memoryCorpora` is optional and separately approves configured **file** corpora for
 memory-gap investigation. Leave it empty to send no indexed memory evidence.
-`typesafe.enabled: false` or missing credentials prevents evaluation. An interval
+`decisionModel.enabled: false` or missing credentials prevents evaluation. An interval
 of zero means manual-only. Defaults are disabled, no approved senders, direct chats,
 6 preceding visible messages, 30 days, 20 episodes per run and a 60-minute interval.
 `sentimentEnabled` defaults to **true within that opt-in audit**; it does not bypass
-approved senders or TypeSafe credentials. Set it false to omit polarity, annoyance,
+approved senders or decision model credentials. Set it false to omit polarity, annoyance,
 frustration and intensity questions while retaining quality/repair judgments.
 `intervalMinutes` controls their shared cadence; no second sentiment timer is needed.
 For example, `720` means every 12 hours; `0` means manual-only. `maxEpisodes`
@@ -128,7 +128,7 @@ fulfillment/deliverable-fit grade. The feedback pass distinguishes acceptance,
 correction, continuation, unrelated replies, expressed sentiment, repeated constraints
 and avoidable rework. Current-index memory investigation runs only for a strong
 memory-gap signal: lexical retrieval selects up to three whole short documents from
-approved collections. Each document is graded in its own concurrent TypeSafe request
+approved collections. Each document is graded in its own concurrent decision model request
 against the same request/answer/feedback; no candidate sees the other documents.
 The isolated memory-stage cache version does not reuse old multi-candidate scores.
 This is an investigation lead, **not proof of historical

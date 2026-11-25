@@ -55,10 +55,10 @@ function isLearningAuthorized(cfg, config, job) {
     return listAgentIds(cfg).includes(job.agentId) && isLearningEnabled(config, job.agentId, job.kind);
 }
 function isAnalysisApproved(config) {
-    return config.responseAudit.enabled && config.typesafe.enabled && config.responseAudit.intervalMinutes > 0;
+    return config.responseAudit.enabled && config.decisionModel.enabled && config.responseAudit.intervalMinutes > 0;
 }
 function auditCohort(config) {
-    return responseCohort(config.responseAudit, config.typesafe.model, config.typesafe.endpoint);
+    return responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
 }
 function publishManifest(root, manifest) {
     return privateJson(root, `${manifestRevision(manifest)}.manifest.json`, manifest);

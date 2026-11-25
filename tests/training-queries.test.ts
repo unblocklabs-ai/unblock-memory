@@ -6,20 +6,21 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { createStore } from "@unblocklabs/qmd";
+import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, type QueryFeedback } from "../src/training-models.js";
 import { TrainingStore, type QueryEvaluation } from "../src/training-store.js";
 import { currentTrainingCorpusHashes, generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, selectTrainingQueries, trainingQueryScore } from "../src/training-queries.js";
 import { historicalTrainingSearch, HistoricalCorpusUnavailableError, type TrainingHit } from "../src/training-retrieval.js";
 import { resolveConfig } from "../src/config.js";
 import { collectTraining } from "../src/training.js";
-import { memoryJudgeVersion } from "../src/typesafe.js";
+import { memoryJudgeVersion } from "../src/decision-ranking.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 import type { QueryLane } from "../src/query-contract.js";
 
 const input = { history: [{ role: "user" as const, content: "Atlas is our project." }], currentRequest: "What did we decide?" };
 const usage = { input_tokens: 42, output_tokens: 8 };
 const options = { maxInputBytes: 3_000_000 };
-const config = resolveConfig({ typesafe: { apiKey: "test-key" }, corpora: [
+const config = resolveConfig({ decisionModel: { apiKey: "test-key" }, corpora: [
   { name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "sessions", kind: "sessions", chatTypes: ["direct"] },
 ] });
 const candidates = (lane: QueryLane, round: number) => Array.from({ length: 5 }, (_, i) => `${lane} round ${round} query ${i}`);
@@ -196,7 +197,7 @@ test("low-scoring and empty lanes retain targets independently of the live usefu
 
 test("all-empty retrieval exports stable winners and recovers old usefulness-only exclusions without calls", async t => {
   const f = fixture(t), host = runtime();
-  t.mock.method(globalThis, "fetch", async () => { throw new Error("Empty retrieval must not call TypeSafe"); });
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("Empty retrieval must not call decision model"); });
   const search = searchFixture(async () => []);
   const db = new DatabaseSync(f.storePath);
   t.after(() => db.close());
@@ -381,14 +382,14 @@ test("a failed legacy Jev evaluation review does not block Liquid, and Liquid su
     search: async () => [{ ...hit(), text: `Atlas fact from ${corpusHash}` }], close: async () => {},
   });
   const legacyConfig = resolveConfig({
-    typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone", apiKey: "legacy-key" },
+    decisionModel: { endpoint: LEGACY_SYSTEMONE_ENDPOINT, model: "jev-1.13.0", apiKey: "legacy-key" },
     corpora: [
       { name: "memory", kind: "files", paths: ["MEMORY.md"] },
       { name: "sessions", kind: "sessions", chatTypes: ["direct"] },
     ],
   });
-  const jevJudge = memoryJudgeVersion(legacyConfig.typesafe.model, legacyConfig.typesafe.endpoint);
-  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  const jevJudge = memoryJudgeVersion(legacyConfig.decisionModel.model, legacyConfig.decisionModel.endpoint);
+  const liquidJudge = memoryJudgeVersion(config.decisionModel.model, config.decisionModel.endpoint);
   const legacyStore = new TrainingStore(f.storePath, "main", "jev-1.13.0");
   t.after(() => legacyStore.close());
   const fetch = t.mock.method(globalThis, "fetch", async () =>
@@ -454,7 +455,7 @@ test("missing session manifest flags unavailable and never exports zero-score ta
   const f = fixture(t), host = runtime();
   const qmd = await createStore({ dbPath: join(f.source.stateDir, "index.sqlite"), config: { collections: {} } });
   await qmd.close();
-  t.mock.method(globalThis, "fetch", async () => { assert.fail("Unavailable manifest must not call TypeSafe"); });
+  t.mock.method(globalThis, "fetch", async () => { assert.fail("Unavailable manifest must not call decision model"); });
   await f.store.locked(async () => {
     f.initialize();
     await generateTrainingQueries(f.source, f.store, host, options);
@@ -473,7 +474,7 @@ test("missing session manifest flags unavailable and never exports zero-score ta
 
 test("repaired corpus is not blocked by a stale corpus-hash retrieval failure, while unchanged broken corpus still blocks", async t => {
   const f = fixture(t), host = runtime();
-  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  const liquidJudge = memoryJudgeVersion(config.decisionModel.model, config.decisionModel.endpoint);
   t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(gradeResponse(0.85))));
   await f.store.locked(async () => {
     f.initialize();
@@ -525,7 +526,7 @@ test("repaired corpus is not blocked by a stale corpus-hash retrieval failure, w
 
 test("export requires matching current-corpus proof and refuses stale or unproven corpora", async t => {
   const f = fixture(t), host = runtime();
-  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  const liquidJudge = memoryJudgeVersion(config.decisionModel.model, config.decisionModel.endpoint);
   t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(gradeResponse(0.9))));
   await f.store.locked(async () => {
     f.initialize();
@@ -564,14 +565,14 @@ test("export requires matching current-corpus proof and refuses stale or unprove
 test("provider switchback retains Jev retrieval hold after Liquid recovers on a repaired corpus", async t => {
   const f = fixture(t), host = runtime();
   const legacyConfig = resolveConfig({
-    typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone", apiKey: "legacy-key" },
+    decisionModel: { endpoint: LEGACY_SYSTEMONE_ENDPOINT, model: "jev-1.13.0", apiKey: "legacy-key" },
     corpora: [
       { name: "memory", kind: "files", paths: ["MEMORY.md"] },
       { name: "sessions", kind: "sessions", chatTypes: ["direct"] },
     ],
   });
-  const jevJudge = memoryJudgeVersion(legacyConfig.typesafe.model, legacyConfig.typesafe.endpoint);
-  const liquidJudge = memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint);
+  const jevJudge = memoryJudgeVersion(legacyConfig.decisionModel.model, legacyConfig.decisionModel.endpoint);
+  const liquidJudge = memoryJudgeVersion(config.decisionModel.model, config.decisionModel.endpoint);
   const legacyStore = new TrainingStore(f.storePath, "main", "jev-1.13.0");
   t.after(() => legacyStore.close());
   t.mock.method(globalThis, "fetch", async (url: unknown) => {

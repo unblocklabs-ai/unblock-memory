@@ -127,7 +127,7 @@ function markdownReport(indexMs: number, arms: readonly ArmReport[]): string {
   }
   lines.push("", "## Interpretation", "",
     "- vector@5 and vector@20 use the production manager with the normal 0.3 cutoff; lexical directly uses QMD's whole-document BM25 API.",
-    "- hybrid@20 calls QMD search with rerank:false, limit:20, candidateLimit:20 and minScore:0. QMD owns discovery, deduplication and local rank fusion; no TypeSafe call.",
+    "- hybrid@20 calls QMD search with rerank:false, limit:20, candidateLimit:20 and minScore:0. QMD owns discovery, deduplication and local rank fusion; no decision model call.",
     "- Hybrid's rank-fusion scores are not vector similarities: compare evidence at equal context budgets, not numeric score thresholds. Internal retrieval breadth is SDK-owned, not an equal-compute ablation.",
     "- All repeat trials include result construction. First trials determine quality; successful repeats measure query latency, not independent quality observations.",
     "- Citation integrity checks source spans, not generated answers. Nonempty no-answer retrieval is not automatically a false answer.");

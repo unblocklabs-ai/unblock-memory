@@ -6,10 +6,10 @@ import { registerSkillWhisperer } from "../src/skill-whisperer.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 import { resolveConfig, type UnblockMemoryConfig } from "../src/config.js";
 
-const disabledTypeSafe = resolveConfig({ typesafe: { enabled: false, timeoutMs: 1500 } }).typesafe;
-const activeTypeSafe = resolveConfig({ typesafe: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).typesafe;
+const disabledDecisionModel = resolveConfig({ decisionModel: { enabled: false, timeoutMs: 1500 } }).decisionModel;
+const activeDecisionModel = resolveConfig({ decisionModel: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).decisionModel;
 
-function typeSafeResponse(choice: string) {
+function decisionResponse(choice: string) {
   return Response.json({ answers: { useful: { type: "noul", noul: choice === "none" ? 0.1 : 0.9 } } });
 }
 
@@ -45,7 +45,7 @@ const enabled = {
 
 function harness(
   candidates: Array<{ name: string; path: string; score: number }>,
-  typesafe: UnblockMemoryConfig["typesafe"] = disabledTypeSafe,
+  decisionModel: UnblockMemoryConfig["decisionModel"] = disabledDecisionModel,
   controls: UnblockMemoryConfig["skillWhisperer"] = enabled,
 ) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
@@ -71,7 +71,7 @@ function harness(
     },
     resolveSkillPath(_params: unknown, path: string) { return path.startsWith("/skills/") ? path : undefined; },
   };
-  const before = registerSkillWhisperer(api, runtime, controls, typesafe, diagnostics);
+  const before = registerSkillWhisperer(api, runtime, controls, decisionModel, diagnostics);
   return {
     api,
     runtime,
@@ -87,11 +87,11 @@ function harness(
   };
 }
 
-test("skill query and Jev use only bounded visible history without reading discarded messages", async t => {
+test("skill query and the decision model use only bounded visible history without reading discarded messages", async t => {
   let expectedHistory = [{ role: "assistant", content: "recent answer" }, { role: "user", content: "recent question" }];
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     assert.deepEqual(JSON.parse(String(init?.body)).state[0].history, expectedHistory);
-    return typeSafeResponse("skill_0");
+    return decisionResponse("skill_0");
   });
   let discardedReads = 0;
   const ignored = { role: "user", get content(): string { discardedReads++; return "old excluded request"; } };
@@ -105,12 +105,12 @@ test("skill query and Jev use only bounded visible history without reading disca
   ];
   const candidates = [{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }];
   const context = { trigger: "user", runId: "run", agentId: "bill", sessionId: "session" };
-  const h = harness(candidates, activeTypeSafe);
+  const h = harness(candidates, activeDecisionModel);
   assert.match((await h.before({ prompt: "current request", messages }, context))?.appendContext ?? "", /alpha/);
   assert.deepEqual(h.queries, ["assistant: recent answer\n\nuser: recent question\n\nuser: current request"]);
   assert.equal(discardedReads, 0, "discarded history must not be read");
   expectedHistory = [];
-  const noHistory = harness(candidates, activeTypeSafe, { ...enabled, historyMessages: 0 });
+  const noHistory = harness(candidates, activeDecisionModel, { ...enabled, historyMessages: 0 });
   assert.match((await noHistory.before({ prompt: "current request", messages: [ignored] }, context))?.appendContext ?? "", /alpha/);
   assert.deepEqual(noHistory.queries, ["user: current request"]);
   assert.equal(discardedReads, 0, "zero-history turns must not read any history");
@@ -209,7 +209,7 @@ test("symlinked suggestions and canonical reads share cooldown state", async () 
     resolveSkillPath(_params, path) {
       return path === lexicalPath || path === canonicalPath ? canonicalPath : undefined;
     },
-  }, enabled, disabledTypeSafe) as BeforePromptBuild;
+  }, enabled, disabledDecisionModel) as BeforePromptBuild;
   const after = hooks.get("after_tool_call") as unknown as AfterToolCall;
   const context: HookContext = { trigger: "user", runId: "run-0", agentId: "bill", sessionId: "session" };
 
@@ -229,7 +229,7 @@ test("disabled whispering registers no hooks", () => {
   registerSkillWhisperer(api, {
     async searchSkills() { return []; },
     resolveSkillPath() { return undefined; },
-  }, { ...enabled, enabled: false }, disabledTypeSafe);
+  }, { ...enabled, enabled: false }, disabledDecisionModel);
   assert.equal(registrations, 0);
 });
 
@@ -242,7 +242,7 @@ test("retrieval failures do not block the agent turn", async () => {
   const before = registerSkillWhisperer(api, {
     async searchSkills() { throw new Error("index unavailable"); },
     resolveSkillPath() { return undefined; },
-  }, enabled, disabledTypeSafe);
+  }, enabled, disabledDecisionModel);
   assert.ok(before);
   assert.equal(await before(
     { prompt: "task", messages: [] },
@@ -250,7 +250,7 @@ test("retrieval failures do not block the agent turn", async () => {
   ), undefined);
 });
 
-test("TypeSafe reranks below-threshold candidates and preserves selected-skill cooldown", async (t) => {
+test("decision model reranks below-threshold candidates and preserves selected-skill cooldown", async (t) => {
   const judged: string[] = [];
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
@@ -260,7 +260,7 @@ test("TypeSafe reranks below-threshold candidates and preserves selected-skill c
     assert.equal(JSON.stringify(request).includes("/skills/"), false);
     assert.equal(state.currentRequest, "new task");
     assert.deepEqual(state.history, [{ role: "user", content: "previous task" }]);
-    return typeSafeResponse(state.candidate.name === "beta" ? "skill_1" : "none");
+    return decisionResponse(state.candidate.name === "beta" ? "skill_1" : "none");
   });
   const h = harness([
     { name: "invalid", path: "/not-allowed/SKILL.md", score: 0.95 },
@@ -268,7 +268,7 @@ test("TypeSafe reranks below-threshold candidates and preserves selected-skill c
     { name: "beta", path: "/skills/beta/SKILL.md", score: 0.3 },
     { name: "gamma", path: "/skills/gamma/SKILL.md", score: 0.2 },
     { name: "delta", path: "/skills/delta/SKILL.md", score: 0.1 },
-  ], activeTypeSafe);
+  ], activeDecisionModel);
   const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "run-1" };
   const event = { prompt: "new task", messages: [{ role: "system", content: "do not send" },
     { role: "toolResult", content: "do not send" }, { role: "user", content: "previous task" }] };
@@ -279,17 +279,17 @@ test("TypeSafe reranks below-threshold candidates and preserves selected-skill c
   assert.equal(await h.before(event, context), result);
   assert.equal(fetch.mock.callCount(), 3);
   judged.length = 0;
-  // Cooling beta is excluded before shortlisting, so beta is not re-sent to Jev.
+  // Cooling beta is excluded before shortlisting, so beta is not re-sent to the decision model.
   assert.equal(await h.before(event, { ...context, runId: "run-2" }), undefined);
   assert.deepEqual(judged, ["alpha", "gamma", "delta"]);
   assert.equal(h.warnings.length, 0);
 });
 
-test("missing key keeps original selection and does not call TypeSafe", async (t) => {
+test("missing key keeps original selection and does not call decision model", async (t) => {
   t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected API call"); });
   const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], resolveConfig({
-    typesafe: { enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-unblock-typesafe-fixture/key" },
-  }).typesafe);
+    decisionModel: { enabled: true, timeoutMs: 100, apiKeyFile: "/nonexistent-unblock-decisionModel-fixture/key" },
+  }).decisionModel);
   assert.match((await h.before({ prompt: "task", messages: [] }, {
     trigger: "user", agentId: "main", sessionId: "session", runId: "run",
   }))?.appendContext ?? "", /alpha/);
@@ -299,8 +299,8 @@ test("missing key keeps original selection and does not call TypeSafe", async (t
 });
 
 test("none and provider failures do not fall back to a strong vector match or consume cooldown", async (t) => {
-  const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("none"));
-  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.99 }], activeTypeSafe);
+  const fetch = t.mock.method(globalThis, "fetch", async () => decisionResponse("none"));
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.99 }], activeDecisionModel);
   const event = { prompt: "task", messages: [] };
   const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "none" };
   assert.equal(await h.before(event, context), undefined);
@@ -308,12 +308,12 @@ test("none and provider failures do not fall back to a strong vector match or co
   assert.equal(await h.before(event, { ...context, runId: "failed" }), undefined);
   assert.equal(h.warnings.length, 2);
   assert.equal(h.warnings[0].includes("fake-secret"), false);
-  fetch.mock.mockImplementation(async () => typeSafeResponse("skill_0"));
+  fetch.mock.mockImplementation(async () => decisionResponse("skill_0"));
   assert.match((await h.before(event, { ...context, runId: "succeeded" }))?.appendContext ?? "", /alpha/);
   assert.deepEqual(h.diagnostics.snapshot("main").skill, { rejected: 1, judge_candidate_failed: 1, failed: 1, emitted: 1 });
 });
 
-test("TypeSafe conversation is bounded and pending selections do not survive session end", async (t) => {
+test("decision model conversation is bounded and pending selections do not survive session end", async (t) => {
   let resolveRequest!: (value: Response) => void;
   let requestStarted!: () => void;
   const started = new Promise<void>(resolve => { requestStarted = resolve; });
@@ -326,24 +326,24 @@ test("TypeSafe conversation is bounded and pending selections do not survive ses
     requestStarted();
     return new Promise<Response>(resolve => { resolveRequest = resolve; });
   });
-  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], activeTypeSafe);
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], activeDecisionModel);
   const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "pending" };
   const pending = h.before({ prompt: "x".repeat(13_000), messages: [{ role: "user", content: "older" }] }, context);
   await started;
   await h.end({ sessionId: "session" }, context);
   assert.equal(requestSignal?.aborted, true);
-  resolveRequest(typeSafeResponse("skill_0"));
+  resolveRequest(decisionResponse("skill_0"));
   assert.equal(await pending, undefined);
 });
 
-test("cooling top candidate skips to next eligible skill and an entirely cooling list avoids Jev", async t => {
+test("cooling top candidate skips to next eligible skill and an entirely cooling list avoids the decision model", async t => {
   const judged: string[] = [];
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     judged.push(request.state[0].candidate.name);
-    return typeSafeResponse("skill_0");
+    return decisionResponse("skill_0");
   });
-  const h = harness(["alpha", "beta"].map(name => ({ name, path: `/skills/${name}/SKILL.md`, score: 0.9 })), activeTypeSafe);
+  const h = harness(["alpha", "beta"].map(name => ({ name, path: `/skills/${name}/SKILL.md`, score: 0.9 })), activeDecisionModel);
   const context = { trigger: "user", agentId: "main", sessionId: "session", runId: "run-1" };
   const event = { prompt: "task", messages: [] };
   // Run 1 emits alpha.
@@ -353,7 +353,7 @@ test("cooling top candidate skips to next eligible skill and an entirely cooling
   judged.length = 0;
   assert.match((await h.before(event, { ...context, runId: "run-2" }))?.appendContext ?? "", /beta/);
   assert.deepEqual(judged, ["beta"]);
-  // Run 3 has every candidate cooling, so Jev is skipped entirely.
+  // Run 3 has every candidate cooling, so the decision model is skipped entirely.
   const callsBeforeCooldown = fetch.mock.callCount();
   assert.equal(await h.before(event, { ...context, runId: "run-3" }), undefined);
   assert.equal(fetch.mock.callCount(), callsBeforeCooldown);
@@ -368,10 +368,10 @@ test("cooling top candidate skips to next eligible skill and an entirely cooling
   assert.equal(fetch.mock.callCount(), callsAfterRead);
 });
 
-test("late skill retrieval cannot send Jev requests after teardown, shutdown or supersession", async t => {
+test("late skill retrieval cannot send the decision model requests after teardown, shutdown or supersession", async t => {
   for (const action of ["end", "stop", "supersede"]) await t.test(action, async t => {
-    const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("skill_0"));
-    const h = harness([], activeTypeSafe);
+    const fetch = t.mock.method(globalThis, "fetch", async () => decisionResponse("skill_0"));
+    const h = harness([], activeDecisionModel);
     let finish!: (hits: Awaited<ReturnType<typeof h.runtime.searchSkills>>) => void;
     let started!: () => void;
     const ready = new Promise<void>(resolve => { started = resolve; });
@@ -394,8 +394,8 @@ test("late skill retrieval cannot send Jev requests after teardown, shutdown or 
 
 test("the total skill deadline releases ready memory and people without late egress", async t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const fetch = t.mock.method(globalThis, "fetch", async () => typeSafeResponse("skill_0"));
-  const h = harness([], activeTypeSafe);
+  const fetch = t.mock.method(globalThis, "fetch", async () => decisionResponse("skill_0"));
+  const h = harness([], activeDecisionModel);
   let finish!: (hits: Awaited<ReturnType<typeof h.runtime.searchSkills>>) => void;
   let started!: () => void;
   const ready = new Promise<void>(resolve => { started = resolve; });
@@ -433,9 +433,9 @@ test("session cap evicts least-recently-used session and aborts its in-flight co
       slowStarted();
       return new Promise<Response>(resolve => { resolveSlow = resolve; });
     }
-    return typeSafeResponse("none");
+    return decisionResponse("none");
   });
-  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], activeTypeSafe);
+  const h = harness([{ name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 }], activeDecisionModel);
   t.after(() => h.stop());
 
   const pending0 = h.before({ prompt: "session-0", messages: [] }, {
@@ -448,7 +448,7 @@ test("session cap evicts least-recently-used session and aborts its in-flight co
     });
   }
   assert.equal(signals.get("session-0")?.aborted, true);
-  resolveSlow(typeSafeResponse("skill_0"));
+  resolveSlow(decisionResponse("skill_0"));
   assert.equal(await pending0, undefined);
 });
 
@@ -467,13 +467,13 @@ test("delayed rebuild of a superseded run does not abort the active run, search 
       bStarted();
       return new Promise<Response>(resolve => { resolveB = resolve; });
     }
-    return typeSafeResponse(candidateName === "alpha" ? "skill_0" : "none");
+    return decisionResponse(candidateName === "alpha" ? "skill_0" : "none");
   });
 
   const h = harness([
     { name: "alpha", path: "/skills/alpha/SKILL.md", score: 0.9 },
     { name: "beta", path: "/skills/beta/SKILL.md", score: 0.8 },
-  ], activeTypeSafe);
+  ], activeDecisionModel);
   t.after(() => h.stop());
 
   const context = (runId: string): HookContext => ({ trigger: "user", runId, agentId: "bill", sessionId: "session" });
@@ -483,7 +483,7 @@ test("delayed rebuild of a superseded run does not abort the active run, search 
   assert.deepEqual(resultA, { appendContext: '<skill>This skill may be relevant: "/skills/alpha/SKILL.md"</skill>' });
   assert.equal(h.queries.length, 1);
 
-  // Run B (turn 2) starts and stays in-flight while awaiting TypeSafe for beta.
+  // Run B (turn 2) starts and stays in-flight while awaiting decision model for beta.
   const pendingB = h.before({ prompt: "run B", messages: [] }, context("run-B"));
   await bReady;
   assert.equal(h.queries.length, 2);
@@ -495,7 +495,7 @@ test("delayed rebuild of a superseded run does not abort the active run, search 
   assert.equal(bSignal?.aborted, false);
 
   // Run B finishes normally and emits beta; same-run replay of B returns B's cached hint.
-  resolveB(typeSafeResponse("skill_0"));
+  resolveB(decisionResponse("skill_0"));
   const resultB = await pendingB;
   assert.deepEqual(resultB, { appendContext: '<skill>This skill may be relevant: "/skills/beta/SKILL.md"</skill>' });
   assert.equal(await h.before({ prompt: "run B rebuild", messages: [] }, context("run-B")), resultB);

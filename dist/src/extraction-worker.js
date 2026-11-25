@@ -3,7 +3,7 @@ import { extractWithLuna, validateExtractedMemory, EXTRACTION_VERSION, } from ".
 import { buildCompleteRevision, ExtractionLeaseLostError, extractionPolicyFingerprint, ExtractionStore, } from "./extraction-store.js";
 import { readExtractionPage } from "./extraction-source.js";
 import { extractionHistory, readExtractionChunk } from "./extraction-chunk.js";
-import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { resolveDecisionCredential } from "./decision-client.js";
 function handleResetOrMissing(store, sessionId, page, owner, policyFingerprint) {
     if (page.kind !== "reset" && page.kind !== "missing")
         return false;
@@ -42,8 +42,8 @@ async function validateProposals(params) {
                 newIds,
                 existing,
                 apiKey,
-                endpoint: config.typesafe.endpoint,
-                model: config.typesafe.model,
+                endpoint: config.decisionModel.endpoint,
+                model: config.decisionModel.model,
                 signal,
                 thresholds: config.extraction,
             }),
@@ -211,10 +211,10 @@ export async function runExtraction(params) {
     if (!config.enabled)
         return { status: "disabled" };
     params.signal.throwIfAborted();
-    const apiKey = await abortable(resolveTypeSafeApiKey(params.config.typesafe), params.signal);
+    const apiKey = await abortable(resolveDecisionCredential(params.config.decisionModel), params.signal);
     params.signal.throwIfAborted();
     if (!apiKey)
-        return { status: "unavailable", reason: "TypeSafe API key not configured" };
+        return { status: "unavailable", reason: "Decision model API key not configured" };
     const store = new ExtractionStore(params.storePath);
     const owner = store.claim(params.scheduled ?? false, config.intervalMinutes * 60_000);
     if (!owner) {
@@ -241,7 +241,7 @@ export async function runExtraction(params) {
         minSupport: config.minSupport,
         minRetention: config.minRetention,
         minReplacement: config.minReplacement,
-        validatorModel: params.config.typesafe.model,
+        validatorModel: params.config.decisionModel.model,
     });
     try {
         const sessions = params.sessions();

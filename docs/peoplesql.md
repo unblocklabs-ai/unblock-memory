@@ -42,14 +42,14 @@ it does **not** generate claims, update dossiers, or inject context. With
 ```
 
 This is a plugin config fragment. List only configured, approved non-skill corpora. The feature is **off by
-default** and requires shared TypeSafe credentials. Disabled TypeSafe or missing/
+default** and requires shared decision model credentials. Disabled decision model or missing/
 unreadable credentials safely skip the primer; agents can still research normally.
 Enabling it approves sending the person's identity, retrieved excerpts and optional
-draft snippet to TypeSafe. Existing dossiers are not sent as grading evidence.
+draft snippet to the decision endpoint. Existing dossiers are not sent as grading evidence.
 Sessions includes all indexed conversations;
 results are available to the agent's tool callers, so scope approval accordingly.
 Primer and dossier-save requests use `peoplePrimer.timeoutMs`, not
-`typesafe.timeoutMs`; the total tool deadline is two minutes.
+`decisionModel.timeoutMs`; the total tool deadline is two minutes.
 
 Three default questions cover explicit role/organization, enduring organizational
 background, and the person's relationship to the agent (not its business mission).
@@ -88,9 +88,9 @@ edit/deletion returns `conflict` instead of overwriting the newer change.
 After independently verifying every assertion and background eligibility, an agent
 can supply a source-specific `manualVerification` explanation (up to 400 characters)
 for direct human corrections, non-indexed evidence or disabled/unavailable/incorrect
-reviews. This explicit path skips TypeSafe, records manual provenance in change
+reviews. This explicit path skips decision model, records manual provenance in change
 history and keeps all structural limits. It is not a provider pass. Normal success
-returns `status: "ok"`, `saved: true` and `verification: "typesafe" | "manual"`.
+returns `status: "ok"`, `saved: true` and `verification: "decision" | "manual"`.
 The skill documents when to use each path. Sources outside approved corpora are
 rejected before egress; no separate `evidenceReview` toggle is needed.
 
@@ -153,7 +153,7 @@ before replacement. No automatic destructive migration or blanket deletion occur
 
 Every `replace_dossier` and `delete_dossier` action requires a concise `reason`
 (up to 500 characters for replacements, 1,000 for deletions). Replacement history
-also records whether TypeSafe checks passed or a manual attestation was used.
+also records whether decision model checks passed or a manual attestation was used.
 The plugin transactionally records that reason with its authoritative before and
 after dossier snapshots. List small newest-first summaries with
 `memory_people_inspect({ view: "dossier_changes", personId, limit?, offset? })`,

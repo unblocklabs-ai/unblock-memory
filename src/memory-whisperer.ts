@@ -1,8 +1,8 @@
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { CorpusMemorySearchResult } from "./contracts.js";
-import { resolveTypeSafeApiKey, TypeSafeRequestError } from "./typesafe-client.js";
-import { complementaryIndices, reviewMemoryRedundancy } from "./typesafe-review.js";
+import { resolveDecisionCredential, DecisionRequestError } from "./decision-client.js";
+import { complementaryIndices, reviewMemoryRedundancy } from "./decision-review.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { ApiQueryGenerator, compactJudgeConversation, fallbackQueries, QueryApiError, queryConversation } from "./query-generator.js";
 import { QueryInputBudgetError, type QueryPair } from "./query-contract.js";
@@ -21,7 +21,7 @@ function encodeHints(items: { source: string; lines: string; body: string }[]): 
 }
 
 function failureFields(error: unknown) {
-  return error instanceof TypeSafeRequestError || error instanceof QueryApiError
+  return error instanceof DecisionRequestError || error instanceof QueryApiError
     ? { errorCode: error.code, httpStatus: error.status }
     : { errorCode: "unexpected" };
 }
@@ -97,7 +97,7 @@ async function generateQueriesWithFallback(params: {
 async function selectComplementaryHints(params: {
   ranked: readonly RankedHint[];
   config: UnblockMemoryConfig["memoryWhisperer"];
-  typesafe: UnblockMemoryConfig["typesafe"];
+  decisionModel: UnblockMemoryConfig["decisionModel"];
   apiKey: string;
   signal: AbortSignal;
   turn: TurnTelemetry;
@@ -105,13 +105,13 @@ async function selectComplementaryHints(params: {
   diagnostics?: WhispererDiagnostics;
   log: TurnLogger;
 }): Promise<RankedHint[]> {
-  const { ranked, config, typesafe, apiKey, signal, turn, agentId, diagnostics, log } = params;
+  const { ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log } = params;
   let selected = ranked.slice(0, config.maxHints);
   if (!config.complementaryHints || config.maxHints <= 1 || ranked.length <= 1) return selected;
   turn.stage = "redundancy";
   try {
     const pairs = await reviewMemoryRedundancy({
-      apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, signal,
+      apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, signal,
       excerpts: ranked.map(candidate => candidate.excerpt),
     });
     selected = complementaryIndices(ranked.length, pairs, config.maxHints).map(index => ranked[index]!);
@@ -149,10 +149,10 @@ export function registerMemoryWhisperer(
   api: OpenClawPluginApi,
   runtime: MemoryWhispererRuntime,
   config: UnblockMemoryConfig["memoryWhisperer"],
-  typesafe: UnblockMemoryConfig["typesafe"],
+  decisionModel: UnblockMemoryConfig["decisionModel"],
   diagnostics?: WhispererDiagnostics,
 ): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
-  if (!config.enabled || !typesafe.enabled) return;
+  if (!config.enabled || !decisionModel.enabled) return;
   const sessions = new Map<string, SessionState>();
   const generator = new ApiQueryGenerator(config.api);
   const touchSession = (key: string, state: SessionState) => {
@@ -211,7 +211,7 @@ export function registerMemoryWhisperer(
     const run = async () => {
       const conversation = queryConversation(event.prompt, event.messages, currentUserMessage);
       turn.stage = "credentials";
-      const apiKey = await timeStage("setupMs", turn.measurement, signal, () => resolveTypeSafeApiKey(typesafe));
+      const apiKey = await timeStage("setupMs", turn.measurement, signal, () => resolveDecisionCredential(decisionModel));
       if (signal.aborted) return;
       if (!apiKey) { turn.reason = "missing_key"; diagnostics?.record(agentId, "memory", "missing_key"); return; }
       const queries = await generateQueriesWithFallback({
@@ -225,7 +225,7 @@ export function registerMemoryWhisperer(
       if (signal.aborted) return;
       if (!manager) { turn.reason = "unavailable"; diagnostics?.record(agentId, "memory", "unavailable"); return; }
       const search = await searchMemory(manager, queries, {
-        corpora, signal, apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, conversation: compactJudgeConversation(conversation),
+        corpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: compactJudgeConversation(conversation),
         asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: 4,
         maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
         onCandidates: observation => {
@@ -236,7 +236,7 @@ export function registerMemoryWhisperer(
           turn.stage = "judgment";
         },
         onJudgment: ({ candidateIndex, elapsedMs, error }) => {
-          const fields = { stage: "judgment", candidateIndex, elapsedMs, timeoutMs: typesafe.timeoutMs };
+          const fields = { stage: "judgment", candidateIndex, elapsedMs, timeoutMs: decisionModel.timeoutMs };
           if (error !== undefined) {
             turn.requestsFailed++;
             diagnostics?.record(agentId, "memory", "judge_candidate_failed");
@@ -258,7 +258,7 @@ export function registerMemoryWhisperer(
       const ranked: RankedHint[] = search.results.map(hit => ({ hit, excerpt: hit.snippet, id: memoryPassageId(hit.snippet) }));
       if (!ranked.length) { turn.reason = "rejected"; diagnostics?.record(agentId, "memory", "rejected"); return; }
       const selected = await selectComplementaryHints({
-        ranked, config, typesafe, apiKey, signal, turn, agentId, diagnostics, log,
+        ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log,
       });
       if (signal.aborted || sessions.get(key) !== state) return;
       turn.stage = "render";
@@ -308,7 +308,7 @@ export function registerMemoryWhisperer(
           judgedCandidates: turn.requestsSucceeded,
           partial: turn.requestsSucceeded > 0 && turn.requestsFailed > 0,
           timeoutMs: config.timeoutMs,
-          requestTimeoutMs: typesafe.timeoutMs,
+          requestTimeoutMs: decisionModel.timeoutMs,
         });
         if (signal.aborted) diagnostics?.record(agentId, "memory", timedOut ? "timed_out" : "cancelled");
         clearTimeout(timer);

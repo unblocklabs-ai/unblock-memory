@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import { resolveConfig } from "../../src/config.js";
 import { resolveSources, resolveSessionSource } from "../../src/sources.js";
-import { judgeMemoryPassage, memoryUsefulnessRequest } from "../../src/typesafe.js";
-import { resolveTypeSafeApiKey, TypeSafeRequestError } from "../../src/typesafe-client.js";
+import { judgeMemoryPassage, memoryUsefulnessRequest } from "../../src/decision-ranking.js";
+import { resolveDecisionCredential, DecisionRequestError } from "../../src/decision-client.js";
 import { collectSearches, hash, record, searchQueries, type SearchCase } from "./cases.js";
 import type { SessionManifest } from "../../src/session-sync.js";
 import { blindCase, retrieve, type Judgment, type Retrieval } from "./ranking.js";
@@ -55,22 +55,22 @@ if (sessions?.kind === "sessions") sources.push(resolveSessionSource(join(stateD
 const approved = sources.filter(s => config.memoryWhisperer.corpora.includes(s.corpus));
 if (!approved.length) throw new Error("No Memory Whisperer approved corpora; explicitly configure the evaluation scope");
 const collections = new Map(approved.map(s => [s.collection, s.corpus]));
-const recipe = { version: "memory-ranking-v1", endpoint: config.typesafe.endpoint, model: config.typesafe.model, limitPerMethod: 10,
+const recipe = { version: "memory-ranking-v1", endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, limitPerMethod: 10,
   ...(frozenCases ? { frozenCasesHash: hash(frozenCases) } : {}),
   limitScope: "across_selected_collections", inputWindow: "lfm-8192-tokens-24000-bytes",
-  timeoutMs: config.typesafe.timeoutMs, minUsefulness: config.memoryWhisperer.minUsefulness,
+  timeoutMs: config.decisionModel.timeoutMs, minUsefulness: config.memoryWhisperer.minUsefulness,
   collections: [...collections], rrf: { implementation: "QMD reciprocalRankFusion", k: 60, weights: [1, 1],
     identity: "source plus trimmed passage", topRankBonus: { first: 0.05, secondAndThird: 0.02 } },
   queryMode: "actual_agent_query_no_generation", contextMode: "visible_history_before_latest_user_turn",
   extractorVersion: "canonical-user-content-v3-dual-query-transcript-reader",
   chronologyVersion: "hash-matched-projection-spans-v2",
   corpusMode: "current_index_snapshot_not_historical_reconstruction",
-  policyHash: hash(readFileSync(new URL(existsSync(new URL("../../src/typesafe.js", import.meta.url)) ?
-    "../../src/typesafe.js" : "../../src/typesafe.ts", import.meta.url), "utf8")) };
+  policyHash: hash(readFileSync(new URL(existsSync(new URL("../../src/decision-ranking.js", import.meta.url)) ?
+    "../../src/decision-ranking.js" : "../../src/decision-ranking.ts", import.meta.url), "utf8")) };
 
 async function main() {
-  const key = await resolveTypeSafeApiKey(config.typesafe);
-  if (!key) throw new Error("TypeSafe credential unavailable; no request sent");
+  const key = await resolveDecisionCredential(config.decisionModel);
+  if (!key) throw new Error("decision model credential unavailable; no request sent");
   const snapshot = join(out, "index.sqlite");
   let cases: SearchCase[];
   if (values.resume) {
@@ -102,7 +102,7 @@ async function main() {
   const reusable = new Map<string, Judgment>();
   if (values["reuse-judgments"]) for (const line of readFileSync(values["reuse-judgments"], "utf8").split("\n").filter(Boolean)) {
     const row = JSON.parse(line) as Judgment;
-    if (row.status === "complete" && Number.isFinite(row.typesafe_score)) reusable.set(row.inputHash, row);
+    if (row.status === "complete" && Number.isFinite(row.decision_score)) reusable.set(row.inputHash, row);
   }
   let qmd: QMDStore | undefined;
   try {
@@ -138,13 +138,13 @@ async function main() {
           let terminal: Judgment;
           try {
             const { probability: score } = await judgeMemoryPassage(
-              memoryUsefulnessRequest(params.conversation, params.candidates[0]!, params.asOf, config.typesafe.model),
-              { apiKey: key, endpoint: config.typesafe.endpoint, model: config.typesafe.model, timeoutMs: recipe.timeoutMs, signal: new AbortController().signal });
-            terminal = { ...attempt, status: "complete", typesafe_score: score, elapsedMs: performance.now() - started };
+              memoryUsefulnessRequest(params.conversation, params.candidates[0]!, params.asOf, config.decisionModel.model),
+              { apiKey: key, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, timeoutMs: recipe.timeoutMs, signal: new AbortController().signal });
+            terminal = { ...attempt, status: "complete", decision_score: score, elapsedMs: performance.now() - started };
           } catch (error) {
             terminal = { ...attempt, status: "failed", elapsedMs: performance.now() - started,
-              error: error instanceof TypeSafeRequestError ? error.code : "unexpected",
-              ...(error instanceof TypeSafeRequestError && error.status ? { httpStatus: error.status } : {}) };
+              error: error instanceof DecisionRequestError ? error.code : "unexpected",
+              ...(error instanceof DecisionRequestError && error.status ? { httpStatus: error.status } : {}) };
           }
           append("judgments.jsonl", terminal); judgments.set(identity, terminal);
         }));
@@ -158,9 +158,9 @@ async function main() {
   const suffix = values.resume ? `-${Date.now()}` : "";
   const output = cases.map(item => ({ ...item, ...existingRetrieval.get(item.id), hits: (existingRetrieval.get(item.id)?.hits ?? []).map(hit => {
     const judgment = judgments.get(`${item.id}:${hit.id}`);
-    return { ...hit, typesafe_score: judgment?.typesafe_score ?? null,
-      typesafe_status: judgment?.status ?? "not_attempted", typesafe_error: judgment?.error,
-      typesafe_latency_ms: judgment?.elapsedMs };
+    return { ...hit, decision_score: judgment?.decision_score ?? null,
+      decision_status: judgment?.status ?? "not_attempted", decision_error: judgment?.error,
+      decision_latency_ms: judgment?.elapsedMs };
   }) }));
   for (const row of output) append(`results${suffix}.jsonl`, row);
   const blindDir = join(out, `blind${suffix}`); mkdirSync(blindDir, { mode: 0o700 });
@@ -176,6 +176,6 @@ Do not skip passages. Do not use order, IDs, source popularity, or mention frequ
 No scores, retrieval-method labels, original search queries, or rankings are provided.
 `, { flag: "wx", mode: 0o600 });
   console.log(JSON.stringify({ output: out, searches: output.length, hits: output.reduce((n, c) => n + c.hits.length, 0),
-    scored: output.reduce((n, c) => n + c.hits.filter(h => h.typesafe_status === "complete").length, 0), blindDir }));
+    scored: output.reduce((n, c) => n + c.hits.filter(h => h.decision_status === "complete").length, 0), blindDir }));
 }
 await main();

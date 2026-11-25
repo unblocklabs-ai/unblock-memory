@@ -5,12 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
+import chokidar from "chokidar";
 import {
   buildReadResult,
   cleanupRemovedDocuments,
   enableSecureDelete,
   expandSessionSearchHit,
-  pruneStaleCollections,
   QmdMemoryManager,
   type ManagerStore,
 } from "../src/manager.js";
@@ -265,7 +265,7 @@ test("fails sync when QMD reports embedding errors", async () => {
   await manager.close();
 });
 
-test("watches modified and new Markdown, serializes refreshes, and stops on close", async () => {
+test("watches modified and new Markdown, retries failed refreshes, and stops on close", async t => {
   const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-watch-"));
   const memoryDir = join(workspace, "memory");
   const existing = join(memoryDir, "today.md");
@@ -280,12 +280,19 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
   let activeSyncs = 0;
   let maxActiveSyncs = 0;
   let syncRuns = 0;
+  let failNext = false;
   const store = {
     async update(options?: Parameters<ManagerStore["update"]>[0]) {
       updatedCollections.push(options?.collections ?? []);
-      activeSyncs += options?.collections?.length ?? 1;
-      syncRuns += 1;
+      const activeCollections = options?.collections?.length ?? 1;
+      activeSyncs += activeCollections;
       maxActiveSyncs = Math.max(maxActiveSyncs, activeSyncs);
+      syncRuns += 1;
+      if (failNext) {
+        failNext = false;
+        activeSyncs -= activeCollections;
+        throw new Error("transient update failure");
+      }
       await delay(250);
       return { collections: 1, indexed: 0, updated: 0, unchanged: 1, removed: 0, skipped: 0, needsEmbedding: 0 };
     },
@@ -309,6 +316,7 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
     sources: [memorySource, knowledgeSource],
     storeFactory: async () => store,
   });
+  t.after(() => manager.close());
 
   await manager.start();
   syncRuns = 0;
@@ -317,15 +325,62 @@ test("watches modified and new Markdown, serializes refreshes, and stops on clos
 
   await writeFile(existing, "modified\n");
   await waitFor(() => syncRuns === 1, "modified-file refresh");
+  failNext = true;
   await writeFile(join(memoryDir, "new.md"), "new\n");
-  await waitFor(() => updatedCollections.length >= 2 && activeSyncs === 0, "new-file refresh");
-  assert.deepEqual(updatedCollections, [[memorySource.collection], [memorySource.collection]]);
+  await waitFor(() => !failNext, "failed watch refresh");
+  assert.equal(manager.status().dirty, true);
+  await waitFor(() => !manager.status().dirty, "automatic watch retry");
+  assert.deepEqual(updatedCollections, [[memorySource.collection], [memorySource.collection], [memorySource.collection]]);
   assert.equal(maxActiveSyncs, 1);
 
   await manager.close();
   await writeFile(existing, "after close\n");
   await delay(500);
-  assert.equal(syncRuns, 2);
+  assert.equal(syncRuns, 3);
+});
+
+test("reports dirty and vector unavailable when a watch event arrives during status refresh", async t => {
+  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-watch-status-"));
+  const path = join(workspace, "MEMORY.md");
+  await writeFile(path, "initial\n");
+  const watch = chokidar.watch;
+  let changeObserved = false;
+  t.mock.method(chokidar, "watch", (...args: Parameters<typeof watch>) => watch(...args).on("change", () => {
+    changeObserved = true;
+  }));
+  const refreshStarted = deferred<void>();
+  const finishRefresh = deferred<void>();
+  let pauseRefresh = false;
+  const manager = new QmdMemoryManager({
+    dbPath: join(workspace, "index.sqlite"),
+    workspaceDir: workspace,
+    sources: [resolveSource(workspace, "MEMORY.md")],
+    storeFactory: async () => createManagerStore({
+      async listCollections() {
+        if (pauseRefresh) {
+          pauseRefresh = false;
+          refreshStarted.resolve();
+          await finishRefresh.promise;
+        }
+        return [];
+      },
+    }),
+  });
+  t.after(async () => { finishRefresh.resolve(); await manager.close(); });
+
+  await manager.start();
+  pauseRefresh = true;
+  const sync = manager.sync();
+  await refreshStarted.promise;
+  await writeFile(path, "changed during refresh\n");
+  await waitFor(() => changeObserved, "watch event during refresh");
+  finishRefresh.resolve();
+  await sync;
+
+  assert.equal(manager.status().dirty, true);
+  assert.equal(manager.status().vector?.available, false);
+  await waitFor(() => !manager.status().dirty, "queued watch refresh");
+  assert.equal(manager.status().vector?.available, true);
 });
 
 test("purges documents and plaintext from collections removed from configuration", async () => {
@@ -343,9 +398,16 @@ test("purges documents and plaintext from collections removed from configuration
   await original.update();
   await original.close();
 
+  const manager = new QmdMemoryManager({ dbPath, workspaceDir: root, sources: [] });
+  try {
+    await manager.diagnostics();
+    await assertMarkerAbsent(dbPath, marker);
+  } finally {
+    await manager.close();
+  }
+
   const reopened = await createStore({ dbPath, config: { collections: {} } });
   try {
-    await pruneStaleCollections(reopened, new Set());
     assert.equal((await reopened.getStatus()).totalDocuments, 0);
     const contentCount = reopened.internal.db
       .prepare("SELECT COUNT(*) AS count FROM content")

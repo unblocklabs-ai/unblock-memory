@@ -55,7 +55,8 @@ function resolveQualityAudit(value, corpora) {
     }
     return { enabled, corpora: [...new Set(selected)], minNoise };
 }
-function resolveDecisionModel(value, label) {
+function resolveDecisionModel(value) {
+    const label = "decisionModel";
     if (value === undefined)
         return { ...DEFAULT_DECISION_MODEL_CONFIG };
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -71,7 +72,7 @@ function resolveDecisionModel(value, label) {
     try {
         resolved = resolveDecisionConfig({
             endpoint: config.endpoint,
-            model: config.model,
+            model: config.model === undefined ? DEFAULT_DECISIONS_MODEL : config.model,
             apiKey: config.apiKey,
             apiKeyFile: config.apiKeyFile,
             timeoutMs,
@@ -311,10 +312,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "typesafe", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"], "config");
-    if (config.decisionModel !== undefined && config.typesafe !== undefined) {
-        throw new Error("unblock-memory accepts decisionModel or typesafe, not both");
-    }
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -391,9 +389,6 @@ export function resolveConfig(value) {
     if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
         skillWhisperer = { ...skillWhisperer, enabled: false };
     }
-    const decisionModel = config.decisionModel !== undefined
-        ? resolveDecisionModel(config.decisionModel, "decisionModel")
-        : resolveDecisionModel(config.typesafe, "typesafe");
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
         myTurn: resolveMyTurn(config.myTurn),
         extraction: resolveExtraction(config.extraction, corpora),
@@ -403,6 +398,5 @@ export function resolveConfig(value) {
         insideOut: resolveInsideOut(config.insideOut),
         memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
         safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
-        decisionModel,
-        typesafe: decisionModel };
+        decisionModel: resolveDecisionModel(config.decisionModel) };
 }

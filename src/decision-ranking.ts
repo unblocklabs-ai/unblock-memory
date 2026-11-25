@@ -3,9 +3,8 @@ import type { QueryConversation } from "./query-contract.js";
 import {
   decideWithModel,
   decisionModelScope,
-  defaultDecisionModel,
-  TYPESAFE_MODEL,
-} from "./typesafe-client.js";
+  DEFAULT_DECISION_MODEL,
+} from "./decision-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 
 const SKILL_MIN_USEFULNESS = 0.7;
@@ -75,7 +74,7 @@ const QUALITY_QUESTIONS = {
 } as const;
 
 /** Select from trusted candidates; never accept a provider-generated path or skill name. */
-export async function selectTypeSafeSkill(params: {
+export async function selectSkill(params: {
   apiKey: string;
   endpoint?: string;
   model?: string;
@@ -87,7 +86,7 @@ export async function selectTypeSafeSkill(params: {
   onCandidateFailure?: (index: number, error: unknown) => void;
 }): Promise<number | undefined> {
   if (!params.candidates.length) return undefined;
-  const results = await Promise.allSettled(params.candidates.map(candidate => judgeTypeSafeSkill({ ...params, candidate })));
+  const results = await Promise.allSettled(params.candidates.map(candidate => judgeSkill({ ...params, candidate })));
   let selected: number | undefined;
   for (const [index, result] of results.entries()) {
     if (result.status === "rejected") { params.onCandidateFailure?.(index, result.reason); continue; }
@@ -100,7 +99,7 @@ export async function selectTypeSafeSkill(params: {
 }
 
 /** One skill per request; rank the comparable usefulness probabilities in code. */
-async function judgeTypeSafeSkill(params: {
+async function judgeSkill(params: {
   apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal?: AbortSignal; currentRequest: string;
   history: readonly { role: "user" | "assistant"; content: string }[];
   candidate: { name: string; description: string };
@@ -118,13 +117,13 @@ async function judgeTypeSafeSkill(params: {
   return result.answers.useful.noul;
 }
 
-export function qualityJudgeVersion(model = TYPESAFE_MODEL, endpoint?: string): string {
+export function qualityJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint?: string): string {
   return `${decisionModelScope(model, endpoint)}:quality-v3-isolated`;
 }
 export type QualityJudgment = { noise: number; evidence: number };
 
 /** These are indicators for review, never authorization to delete or rewrite. */
-export async function judgeTypeSafeQuality(params: {
+export async function judgeQuality(params: {
   apiKey: string;
   endpoint?: string;
   model?: string;
@@ -147,7 +146,7 @@ export async function judgeTypeSafeQuality(params: {
   }));
 }
 
-export function memoryJudgeVersion(model = TYPESAFE_MODEL, endpoint?: string): string {
+export function memoryJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint?: string): string {
   return `${decisionModelScope(model, endpoint)}:memory-usefulness-v2`;
 }
 export const MEMORY_JUDGE_VERSION = memoryJudgeVersion();
@@ -171,7 +170,7 @@ const MEMORY_QUESTIONS = {
 } as const;
 
 /** The sole versioned passage prompt/state builder for both training and runtime. */
-export function memoryUsefulnessRequest(conversation: QueryConversation, candidate: MemoryPassage, asOf: string, model = TYPESAFE_MODEL) {
+export function memoryUsefulnessRequest(conversation: QueryConversation, candidate: MemoryPassage, asOf: string, model = DEFAULT_DECISION_MODEL) {
   if (!Number.isFinite(Date.parse(asOf))) throw new Error("Invalid judgment time");
   if (!candidate.excerpt.trim() || candidate.excerpt.length > MEMORY_PASSAGE_CHARS) throw new Error("Invalid judgment passage");
   // Deliberate allowlist: no generated query, rank, backend, score, or other candidates.
@@ -189,7 +188,7 @@ export function memoryUsefulnessRequest(conversation: QueryConversation, candida
 export async function judgeMemoryPassage(request: ReturnType<typeof memoryUsefulnessRequest>, params: {
   apiKey: string; endpoint?: string; model?: string; timeoutMs: number; signal?: AbortSignal;
 }) {
-  const model = params.model ?? (params.endpoint && request.model === TYPESAFE_MODEL ? defaultDecisionModel(params.endpoint) : request.model);
+  const model = params.model ?? request.model;
   let result;
   try {
     result = await decideWithModel({ ...params, model }, request.state, request.questions, { validateModel: true });

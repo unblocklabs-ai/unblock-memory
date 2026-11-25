@@ -23,8 +23,8 @@ test("response audit registers operator CLI even in metadata mode but schedules 
   }
 });
 
-test("TypeSafe opt-out and zero interval prevent response scheduling", () => {
-  for (const overrides of [{ typesafe: { enabled: false } }, { responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0 } }]) {
+test("decision model opt-out and zero interval prevent response scheduling", () => {
+  for (const overrides of [{ decisionModel: { enabled: false } }, { responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 0 } }]) {
     const api = { registerCli() {}, on() { assert.fail("must not schedule"); } } as unknown as OpenClawPluginApi;
     registerResponseAudit(api, resolveConfig({ responseAudit: { enabled: true, senderIds: ["owner"] }, ...overrides }));
   }
@@ -53,7 +53,7 @@ test("scheduler waits for its interval, prevents overlap, and cancels in-flight 
   const ready = new Promise<void>(resolve => { started = resolve; });
   t.mock.method(globalThis, "fetch", () => { calls++; started(); return new Promise<Response>(() => {}); });
   t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
-  registerResponseAudit(api, resolveConfig({ typesafe: { apiKey: "fake" },
+  registerResponseAudit(api, resolveConfig({ decisionModel: { apiKey: "fake" },
     responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 1 } }));
   await hooks.get("gateway_start")!();
   await new Promise<void>(resolve => setImmediate(resolve));
@@ -90,12 +90,13 @@ test("durable schedule survives reopen, claims once, catches up once and applies
 
 test("Gateway restart catches up safely without credentials; absent, empty and unreadable keys never fetch", { timeout: 5000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), "response-no-key-"));
-  const previous = process.env.OPENCLAW_STATE_DIR, previousKey = process.env.TYPESAFE_API_KEY;
+  const previous = process.env.OPENCLAW_STATE_DIR;
+  const previousKey = process.env.CODEX_LB_API_KEY;
   process.env.OPENCLAW_STATE_DIR = root;
-  delete process.env.TYPESAFE_API_KEY;
+  delete process.env.CODEX_LB_API_KEY;
   t.after(() => {
     if (previous === undefined) delete process.env.OPENCLAW_STATE_DIR; else process.env.OPENCLAW_STATE_DIR = previous;
-    if (previousKey === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = previousKey;
+    if (previousKey === undefined) delete process.env.CODEX_LB_API_KEY; else process.env.CODEX_LB_API_KEY = previousKey;
   });
   const empty = join(root, "empty.env"); await writeFile(empty, "# no credentials\n");
   let calls = 0;
@@ -112,7 +113,7 @@ test("Gateway restart catches up safely without credentials; absent, empty and u
     const api = { config: { agents: { entries: { [id]: { workspace: root } } } }, registerCli() {},
       on(name: string, fn: () => void | Promise<void>) { hooks.set(name, fn); },
       logger: { warn() { warnings++; warned(); } } } as unknown as OpenClawPluginApi;
-    registerResponseAudit(api, resolveConfig({ typesafe: { apiKeyFile },
+    registerResponseAudit(api, resolveConfig({ decisionModel: { apiKeyFile },
       responseAudit: { enabled: true, senderIds: ["owner"], intervalMinutes: 720 } }));
     await hooks.get("gateway_start")!();
     await hooks.get("gateway_stop")!();

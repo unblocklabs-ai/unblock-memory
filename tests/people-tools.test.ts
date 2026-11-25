@@ -143,7 +143,7 @@ test("reviews every preference and stored role assertion, even when the identity
 async function writeHarness(t: test.TestContext) {
   const f = await reviewFixture(); t.after(f.close);
   const note = await f.insert("# Mira\nMira is the founder of ExampleCo.");
-  const config = resolveConfig({ people: peopleConfig, typesafe: { apiKey: "test-key" },
+  const config = resolveConfig({ people: peopleConfig, decisionModel: { apiKey: "test-key" },
     peoplePrimer: { enabled: true, corpora: ["memory"] } });
   const calls: Array<Parameters<typeof reviewIndexedClaim>[0]> = [];
   const runtime = { async getMemorySearchManager() { return { manager: {
@@ -182,12 +182,12 @@ test("dossier update reviews indexed blurb and saves once only on a passing judg
   });
   const result = await h.write();
   assert.equal(result.status, "ok");
-  assert.equal(result.verification, "typesafe");
+  assert.equal(result.verification, "decision");
   assert.equal(requests.length, 1);
   assert.deepEqual(h.calls[0]?.personBackground, { name: "Mira", agentName: "Bill" });
   assert.deepEqual(h.calls[0]?.citations, [{ path: h.calls[0]!.citations[0]!.path, from: 2, lines: 1 }]);
   assert.equal(h.store.listDossierChanges(h.person.id).length, 2);
-  assert.match(h.store.listDossierChanges(h.person.id)[0]!.reason, /TypeSafe review passed for every dossier assertion/);
+  assert.match(h.store.listDossierChanges(h.person.id)[0]!.reason, /Decision model review passed for every dossier assertion/);
 });
 
 test("rejected, failed and unapproved reviews preserve dossier and history", async t => {
@@ -220,11 +220,11 @@ test("disabled or missing-key review requires explicit manual verification witho
   h.config.peoplePrimer.enabled = false;
   assert.equal((await h.write()).status, "review_unavailable");
   h.config.peoplePrimer.enabled = true;
-  h.config.typesafe.enabled = false;
+  h.config.decisionModel.enabled = false;
   assert.equal((await h.write()).status, "review_unavailable");
-  h.config.typesafe.enabled = true;
-  h.config.typesafe.apiKey = undefined;
-  h.config.typesafe.apiKeyFile = "/nonexistent/people-review-key";
+  h.config.decisionModel.enabled = true;
+  h.config.decisionModel.apiKey = undefined;
+  h.config.decisionModel.apiKeyFile = "/nonexistent/people-review-key";
   assert.equal((await h.write()).status, "review_unavailable");
   assert.equal(h.calls.length, 0);
   assert.equal(h.store.listDossierChanges(h.person.id).length, 1);

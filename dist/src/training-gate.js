@@ -1,7 +1,7 @@
 import { DecisionError, noul } from "@unblocklabs/decisions";
-import { decideWithModel, defaultDecisionModel, TYPESAFE_MODEL } from "./typesafe-client.js";
+import { decideWithModel, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 export const TRAINING_GATE_VERSION = "historical-recall-v2";
-export const TRAINING_GATE_MODEL = TYPESAFE_MODEL;
+export const TRAINING_GATE_MODEL = DEFAULT_DECISION_MODEL;
 export const TRAINING_GATE_THRESHOLD = 0.7;
 export const TRAINING_GATE_QUESTIONS = {
     recall_needed: noul({
@@ -23,7 +23,7 @@ export const TRAINING_GATE_QUESTIONS = {
     }),
 };
 export async function judgeTrainingInput(input, apiKey, signal, options) {
-    const expectedModel = options?.model ?? defaultDecisionModel(options?.endpoint);
+    const expectedModel = options?.model ?? DEFAULT_DECISION_MODEL;
     const result = await decideWithModel({ apiKey, endpoint: options?.endpoint, model: expectedModel, signal }, input, TRAINING_GATE_QUESTIONS, { validateModel: true });
     if (!result.usage) {
         throw new DecisionError("Invalid training gate response", "invalid_response");

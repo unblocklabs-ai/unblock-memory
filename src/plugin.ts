@@ -27,7 +27,7 @@ import { resolveTimezone } from "./session-projector.js";
 import { searchMemory } from "./memory-search.js";
 import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
 import type { RetrievalObservation } from "./retrieval-telemetry.js";
-import { resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { resolveDecisionCredential } from "./decision-client.js";
 import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
 import { registerPeopleLearning, registerPeopleLearningCli } from "./people-learning-runtime.js";
@@ -71,7 +71,7 @@ const searchParameters = Type.Object(
       ),
     ),
     maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum hits; default 5." })),
-    minUsefulness: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Minimum TypeSafe usefulness probability; default 0.7. Not confidence in factual truth. Not applied to unjudged retrieval fallback." })),
+    minUsefulness: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Minimum decision model usefulness probability; default 0.7. Not confidence in factual truth. Not applied to unjudged retrieval fallback." })),
   },
   { additionalProperties: false },
 );
@@ -94,14 +94,14 @@ const syncSessionsParameters = Type.Object(
 
 const syncStatusParameters = Type.Object({}, { additionalProperties: false });
 
-function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext, typesafe: UnblockMemoryConfig["typesafe"], diagnostics: WhispererDiagnostics) {
+function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext, decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics: WhispererDiagnostics) {
   const active = getContext(ctx);
   if (!active) return null;
   return {
     name: "memory_search",
     label: "Memory Search",
     description:
-      "Search this agent's configured memory corpora with BM25 and vector queries, then TypeSafe usefulness ranking. If TypeSafe is unavailable, returns retrieval-ranked leads with a warning; retrieval scores are not usefulness probabilities and minUsefulness is not applied. Supply keywords in bm25Query and the information needed in vectorQuery; no query generation or recall gate runs. Queries and candidate passages are sent to TypeSafe when available. Skills are excluded. Session snippets are message arrays; file snippets are strings. Inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
+      "Search this agent's memory corpora with BM25 and vector queries. The configured decision endpoint (Codex LB by default) receives the semantic query and candidate passages to rank usefulness. If judging is unavailable, returns unjudged retrieval leads without applying minUsefulness. Supply keywords in bm25Query and the information needed in vectorQuery. Skills are excluded. Inspect source context with memory_get. Empty results or errors do not prove absence of a fact.",
     parameters: searchParameters,
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
       const started = performance.now();
@@ -121,7 +121,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
         prepareQueryConversation([], queries.lex);
         const { conversation } = prepareQueryConversation([], queries.vec);
         let apiKey: string | undefined;
-        try { apiKey = await resolveTypeSafeApiKey(typesafe); }
+        try { apiKey = await resolveDecisionCredential(decisionModel); }
         catch { /* Explicit search can still return local evidence; never expose credential errors. */ }
         signal?.throwIfAborted();
         const { manager, error } = await runtime.getMemorySearchManager(active);
@@ -132,7 +132,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
           sessionFilter,
           maxResults,
           minUsefulness,
-          apiKey, endpoint: typesafe.endpoint, model: typesafe.model, timeoutMs: typesafe.timeoutMs, conversation, allowRetrievalFallback: true,
+          apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation, allowRetrievalFallback: true,
           signal, timings: measurement,
           requestContext: active.requestContext,
           onCandidates: ({ retrievalMs, candidates, eligible }) => {
@@ -153,7 +153,7 @@ function createSearchTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolCont
           scoreMeaning: search.rankingMode === "retrieval" ? "retrieval_rank" : "usefulness_probability",
           minUsefulnessApplied: search.rankingMode !== "retrieval",
           ...(search.fallbackReason ? { fallbackReason: search.fallbackReason,
-            warning: "TypeSafe usefulness ranking unavailable; returning unjudged retrieval-ranked leads. Scores are retrieval ranks, not usefulness probabilities; minUsefulness was not applied. Verify evidence with memory_get." }
+            warning: "decision model usefulness ranking unavailable; returning unjudged retrieval-ranked leads. Scores are retrieval ranks, not usefulness probabilities; minUsefulness was not applied. Verify evidence with memory_get." }
             : search.requestsFailed ? { warning: `${search.requestsFailed} candidate usefulness judgments failed; results are partial` } : {}),
           results: search.results.map(({ source: _source, citation: _citation, vectorScore: _vectorScore,
             textScore: _textScore, session, sessionMessages, ...result }) => ({
@@ -376,13 +376,13 @@ function createAuditQualityTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginTo
   if (!active) return null;
   return {
     name: "memory_audit_quality", label: "Audit Memory Quality",
-    description: "Audit a bounded page of approved indexed chunks using TypeSafe. Records review indicators in the maintenance inbox; never edits, deletes or suppresses source data. Continue with the returned next cursor; restart without after for a cached rescan.",
+    description: "Audit a bounded page of approved indexed chunks using decision model. Records review indicators in the maintenance inbox; never edits, deletes or suppresses source data. Continue with the returned next cursor; restart without after for a cached rescan.",
     parameters: auditQualityParameters,
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
       const options = Value.Parse(auditQualityParameters, params);
-      if (!config.qualityAudit.enabled || !config.typesafe.enabled) return jsonResult({ status: "disabled" });
+      if (!config.qualityAudit.enabled || !config.decisionModel.enabled) return jsonResult({ status: "disabled" });
       try {
-        const context = await reviewRequestContext(runtime, active, config.typesafe, signal);
+        const context = await reviewRequestContext(runtime, active, config.decisionModel, signal);
         if (context.status !== "ready") return jsonResult(context);
         return jsonResult(await context.manager.auditQuality({
           ...options, corpora: config.qualityAudit.corpora, minNoise: config.qualityAudit.minNoise,
@@ -594,13 +594,13 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     api.logger.warn('unblock-memory skillWhisperer.enabled is true but no corpus has kind "skills"; Skill Whisperer is inactive');
   }
   registerWhispererPrompt(api, {
-    memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.typesafe, diagnostics),
-    skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.typesafe, diagnostics),
+    memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics),
+    skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics),
     people: peopleWhisperer,
-    myTurn: registerMyTurn(api, config.myTurn, config.typesafe, diagnostics),
+    myTurn: registerMyTurn(api, config.myTurn, config.decisionModel, diagnostics),
     safety: registerSafetyWhisperer(api, config, diagnostics),
   });
-  api.registerTool((ctx) => createSearchTool(runtime, ctx, config.typesafe, diagnostics), { names: ["memory_search"] });
+  api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics), { names: ["memory_search"] });
   api.registerTool((ctx) => createGetTool(runtime, ctx), { names: ["memory_get"] });
   api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
     names: ["memory_sync_sessions"],

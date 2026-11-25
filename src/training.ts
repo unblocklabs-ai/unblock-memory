@@ -1,4 +1,4 @@
-import { classifyDecisionFailure, resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { classifyDecisionFailure, resolveDecisionCredential } from "./decision-client.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import { TrainingTranscriptReader, type TrainingInput } from "./training-input.js";
 import { judgeTrainingInput, TRAINING_GATE_QUESTIONS } from "./training-gate.js";
@@ -57,8 +57,8 @@ export async function runTraining(source: Source, store: TrainingStore, config: 
   const result = { refreshed, pendingSelected: jobs.length, calls: 0, completed: 0, failed: 0, ambiguous: 0,
     inputBytes: 0, inputTokens: 0, outputTokens: 0, budgetLimited: false };
   // Resolve only when there is work. Reruns with no pending inputs need no credentials.
-  const key = jobs.length && !options.dryRun ? await resolveTypeSafeApiKey(config.typesafe) : undefined;
-  if (jobs.length && !options.dryRun && !key) throw new Error("TypeSafe is disabled or its credential is unavailable");
+  const key = jobs.length && !options.dryRun ? await resolveDecisionCredential(config.decisionModel) : undefined;
+  if (jobs.length && !options.dryRun && !key) throw new Error("Decision model is disabled or its credential is unavailable");
   let next = 0, stopped = false;
   const workers = await Promise.allSettled(Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
     while (!stopped && !result.budgetLimited) {
@@ -77,7 +77,7 @@ export async function runTraining(source: Source, store: TrainingStore, config: 
         try {
           // Offline labeling has its own deadline, not Whisperer's latency-sensitive timeout.
           judgment = await judgeTrainingInput(input, key!, AbortSignal.timeout(30_000),
-            { endpoint: config.typesafe.endpoint, model: config.typesafe.model });
+            { endpoint: config.decisionModel.endpoint, model: config.decisionModel.model });
         } catch (error) {
           const classified = classifyDecisionFailure(error);
           store.finish(job.id, attempt, { status: classified.status, error: classified.error });

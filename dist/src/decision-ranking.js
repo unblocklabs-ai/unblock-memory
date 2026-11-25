@@ -1,5 +1,5 @@
 import { DecisionError, noul } from "@unblocklabs/decisions";
-import { decideWithModel, decisionModelScope, defaultDecisionModel, TYPESAFE_MODEL, } from "./typesafe-client.js";
+import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, } from "./decision-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 const SKILL_MIN_USEFULNESS = 0.7;
 const SKILL_USEFUL_QUESTIONS = {
@@ -55,10 +55,10 @@ const QUALITY_QUESTIONS = {
     }),
 };
 /** Select from trusted candidates; never accept a provider-generated path or skill name. */
-export async function selectTypeSafeSkill(params) {
+export async function selectSkill(params) {
     if (!params.candidates.length)
         return undefined;
-    const results = await Promise.allSettled(params.candidates.map(candidate => judgeTypeSafeSkill({ ...params, candidate })));
+    const results = await Promise.allSettled(params.candidates.map(candidate => judgeSkill({ ...params, candidate })));
     let selected;
     for (const [index, result] of results.entries()) {
         if (result.status === "rejected") {
@@ -75,7 +75,7 @@ export async function selectTypeSafeSkill(params) {
     return selected;
 }
 /** One skill per request; rank the comparable usefulness probabilities in code. */
-async function judgeTypeSafeSkill(params) {
+async function judgeSkill(params) {
     const result = await decideWithModel(params, {
         currentRequest: params.currentRequest,
         history: params.history,
@@ -83,11 +83,11 @@ async function judgeTypeSafeSkill(params) {
     }, SKILL_USEFUL_QUESTIONS, { validateModel: false });
     return result.answers.useful.noul;
 }
-export function qualityJudgeVersion(model = TYPESAFE_MODEL, endpoint) {
+export function qualityJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint) {
     return `${decisionModelScope(model, endpoint)}:quality-v3-isolated`;
 }
 /** These are indicators for review, never authorization to delete or rewrite. */
-export async function judgeTypeSafeQuality(params) {
+export async function judgeQuality(params) {
     if (!params.chunks.length)
         return [];
     return Promise.all(params.chunks.map(async (chunk) => {
@@ -98,7 +98,7 @@ export async function judgeTypeSafeQuality(params) {
         };
     }));
 }
-export function memoryJudgeVersion(model = TYPESAFE_MODEL, endpoint) {
+export function memoryJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint) {
     return `${decisionModelScope(model, endpoint)}:memory-usefulness-v2`;
 }
 export const MEMORY_JUDGE_VERSION = memoryJudgeVersion();
@@ -116,7 +116,7 @@ const MEMORY_QUESTIONS = {
     }),
 };
 /** The sole versioned passage prompt/state builder for both training and runtime. */
-export function memoryUsefulnessRequest(conversation, candidate, asOf, model = TYPESAFE_MODEL) {
+export function memoryUsefulnessRequest(conversation, candidate, asOf, model = DEFAULT_DECISION_MODEL) {
     if (!Number.isFinite(Date.parse(asOf)))
         throw new Error("Invalid judgment time");
     if (!candidate.excerpt.trim() || candidate.excerpt.length > MEMORY_PASSAGE_CHARS)
@@ -133,7 +133,7 @@ export function memoryUsefulnessRequest(conversation, candidate, asOf, model = T
     };
 }
 export async function judgeMemoryPassage(request, params) {
-    const model = params.model ?? (params.endpoint && request.model === TYPESAFE_MODEL ? defaultDecisionModel(params.endpoint) : request.model);
+    const model = params.model ?? request.model;
     let result;
     try {
         result = await decideWithModel({ ...params, model }, request.state, request.questions, { validateModel: true });

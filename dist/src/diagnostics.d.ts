@@ -1,6 +1,6 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 type Whisperer = "skill" | "memory" | "safety" | "myTurn";
-type Outcome = "missing_key" | "typesafe_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" | "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
+type Outcome = "missing_key" | "decision_disabled" | "no_candidates" | "rejected" | "cooldown" | "emitted" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" | "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export declare class WhispererDiagnostics {
     #private;
@@ -16,7 +16,7 @@ export declare class WhispererDiagnostics {
             failed?: number | undefined;
             timed_out?: number | undefined;
             missing_key?: number | undefined;
-            typesafe_disabled?: number | undefined;
+            decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
             rejected?: number | undefined;
             cooldown?: number | undefined;
@@ -41,7 +41,7 @@ export declare class WhispererDiagnostics {
             failed?: number | undefined;
             timed_out?: number | undefined;
             missing_key?: number | undefined;
-            typesafe_disabled?: number | undefined;
+            decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
             rejected?: number | undefined;
             cooldown?: number | undefined;
@@ -66,7 +66,7 @@ export declare class WhispererDiagnostics {
             failed?: number | undefined;
             timed_out?: number | undefined;
             missing_key?: number | undefined;
-            typesafe_disabled?: number | undefined;
+            decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
             rejected?: number | undefined;
             cooldown?: number | undefined;
@@ -94,7 +94,7 @@ export declare class WhispererDiagnostics {
             failed?: number | undefined;
             timed_out?: number | undefined;
             missing_key?: number | undefined;
-            typesafe_disabled?: number | undefined;
+            decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
             rejected?: number | undefined;
             cooldown?: number | undefined;

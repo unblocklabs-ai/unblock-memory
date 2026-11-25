@@ -69,6 +69,7 @@ export { expandSessionSearchHit } from "./memory-passage.js";
 const DEFAULT_READ_LINES = 120;
 const MAX_READ_CHARS = 12_000;
 const WATCH_DEBOUNCE_MS = 250;
+const WATCH_RETRY_MS = 1_000;
 const MANAGER_CLOSED_ERROR = "QmdMemoryManager is closed";
 
 export type ManagerStore = Pick<
@@ -230,16 +231,10 @@ export function cleanupRemovedDocuments(store: QMDStore, changedDocuments = 0): 
   return cleaned;
 }
 
-export async function pruneStaleCollections(
+function pruneStaleCollections(
   store: QMDStore,
-  configuredCollections: ReadonlySet<string>,
-): Promise<number> {
-  const staleCollections = (await store.getStatus()).collections
-    .map((collection) => collection.name)
-    .filter((name) => !configuredCollections.has(name));
-  if (staleCollections.length === 0) return 0;
-
-  enableSecureDelete(store);
+  staleCollections: readonly string[],
+): number {
   const deleteDocuments = store.internal.db.prepare(
     "DELETE FROM documents WHERE collection = ?",
   );
@@ -264,17 +259,21 @@ export function buildReadResult(params: {
   const requestedLines = Math.max(1, Math.floor(params.lines ?? DEFAULT_READ_LINES));
   const selected = fileLines.slice(from - 1, from - 1 + requestedLines);
 
-  let includedLines = selected.length;
-  let text = selected.join("\n");
-  while (includedLines > 1 && text.length > MAX_READ_CHARS) {
-    includedLines -= 1;
-    text = selected.slice(0, includedLines).join("\n");
+  let includedLines = 0;
+  let length = 0;
+  for (const line of selected) {
+    const nextLength = length + line.length + (includedLines > 0 ? 1 : 0);
+    if (includedLines > 0 && nextLength > MAX_READ_CHARS) break;
+    length = nextLength;
+    includedLines += 1;
   }
-  const hardTruncated = text.length > MAX_READ_CHARS;
-  if (hardTruncated) text = text.slice(0, MAX_READ_CHARS);
+  const hardTruncated = length > MAX_READ_CHARS;
   const moreLinesRemain = from - 1 + includedLines < fileLines.length;
   const truncated = hardTruncated || moreLinesRemain || includedLines < selected.length;
   const nextFrom = hardTruncated ? undefined : truncated ? from + includedLines : undefined;
+  selected.length = includedLines;
+  let text = selected.join("\n");
+  if (hardTruncated) text = text.slice(0, MAX_READ_CHARS);
   if (truncated) {
     text += `\n\n[More content available.${nextFrom ? ` Use from=${nextFrom} to continue.` : ""}]`;
   }
@@ -490,15 +489,19 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       if (!matchingSources.some((source) => source.kind !== "skills")) return;
       for (const source of matchingSources) if (source.kind !== "skills") this.#watchCollections.add(source.collection);
       this.#dirty = true;
-      if (this.#watchTimer) clearTimeout(this.#watchTimer);
-      this.#watchTimer = setTimeout(() => {
-        this.#watchTimer = undefined;
-        if (this.#closed) return;
-        const collections = [...this.#watchCollections];
-        this.#watchCollections.clear();
-        void this.#sync({ reason: "watch" }, collections).catch(() => undefined);
-      }, WATCH_DEBOUNCE_MS);
+      this.#scheduleWatchSync();
     });
+  }
+
+  #scheduleWatchSync(retry = false): void {
+    if (this.#watchTimer) clearTimeout(this.#watchTimer);
+    this.#watchTimer = setTimeout(() => {
+      this.#watchTimer = undefined;
+      if (this.#closed) return;
+      void this.#sync({ watchOnly: true }).catch(() => {
+        if (!retry && !this.#closed && !this.#watchTimer) this.#scheduleWatchSync(true);
+      });
+    }, retry ? WATCH_RETRY_MS : WATCH_DEBOUNCE_MS);
   }
 
   #assertOpen(): void {
@@ -578,18 +581,22 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       const staleCollections = (await store.getStatus()).collections
         .map((collection) => collection.name)
         .filter((collection) => !configuredCollections.has(collection));
-      const latestRunId = latestAnalysisRunId(store.internal.db);
-      const appearsInAnalysis = store.internal.db.prepare(`
-        SELECT 1
-        FROM memory_analysis_memberships membership
-        JOIN documents document ON document.hash = membership.hash
-        WHERE membership.run_id = ? AND document.collection = ?
-        LIMIT 1
-      `);
-      const prunedAnalysisInput = latestRunId !== undefined &&
-        staleCollections.some((collection) => appearsInAnalysis.get(latestRunId, collection));
-      const prunedDocuments = await pruneStaleCollections(store, configuredCollections);
-      if (prunedDocuments > 0 && prunedAnalysisInput) markMemoryAnalysisStale(store.internal.db);
+      if (staleCollections.length > 0) {
+        const latestRunId = latestAnalysisRunId(store.internal.db);
+        let prunedAnalysisInput = false;
+        if (latestRunId !== undefined) {
+          const appearsInAnalysis = store.internal.db.prepare(`
+            SELECT 1
+            FROM memory_analysis_memberships membership
+            JOIN documents document ON document.hash = membership.hash
+            WHERE membership.run_id = ? AND document.collection = ?
+            LIMIT 1
+          `);
+          prunedAnalysisInput = staleCollections.some((collection) => appearsInAnalysis.get(latestRunId, collection));
+        }
+        const prunedDocuments = pruneStaleCollections(store, staleCollections);
+        if (prunedDocuments > 0 && prunedAnalysisInput) markMemoryAnalysisStale(store.internal.db);
+      }
       await ensureSemanticChunking(store);
       this.#assertOpen();
     } catch (error) {
@@ -685,22 +692,29 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const status = await store.getStatus();
     const collections = await store.listCollections();
     this.#files = collections.reduce((total, collection) => total + collection.active_count, 0);
-    this.#dirty = status.needsEmbedding > 0;
+    this.#dirty = status.needsEmbedding > 0 || this.#watchCollections.size > 0;
   }
 
   sync(params?: MemorySyncParams): Promise<void> {
-    return this.#sync(params);
+    return this.#sync({ force: params?.force });
   }
 
-  #sync(params?: MemorySyncParams, affectedCollections?: readonly string[]): Promise<void> {
-    const run = async () => {
-      const store = await this.#getStore();
+  #sync({ force, watchOnly }: { force?: boolean; watchOnly?: boolean }): Promise<void> {
+    return this.#enqueue(async () => {
+      const watched = [...this.#watchCollections];
+      if (watchOnly && watched.length === 0) return;
+      this.#watchCollections.clear();
       this.#dirty = true;
-      const collections = affectedCollections ?? this.#indexSources.filter((source) => source.kind !== "sessions").map(source => source.collection);
-      await this.#updateAndEmbed(store, collections.length ? collections : undefined, params?.force);
-      await this.#refreshIndexStatus(store);
-    };
-    return this.#enqueue(run);
+      try {
+        const store = await this.#getStore();
+        const collections = watchOnly ? watched : this.#indexSources.filter((source) => source.kind !== "sessions").map(source => source.collection);
+        await this.#updateAndEmbed(store, collections.length ? collections : undefined, force);
+        await this.#refreshIndexStatus(store);
+      } catch (error) {
+        if (!this.#closed) for (const collection of watched) this.#watchCollections.add(collection);
+        throw error;
+      }
+    });
   }
 
   syncSessions(

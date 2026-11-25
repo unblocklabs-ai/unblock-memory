@@ -7,7 +7,7 @@ import {
   type ResponseJudgeParams,
   type ResponseStages,
 } from "./response-judge.js";
-import { decisionModelScope, defaultDecisionModel } from "./typesafe-client.js";
+import { decisionModelScope, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import type { ResponseAuditStore } from "./response-store.js";
 import { jsonHash } from "./json-hash.js";
 
@@ -16,7 +16,7 @@ type CoreResponseStage = "quality" | "feedback" | "sentiment" | "retrospective";
 export async function assessResponseStages(store: ResponseAuditStore, cohort: string, e: ResponseEpisode,
   params: ResponseJudgeParams, sentimentEnabled: boolean,
   usage: { stageAttempts: number; stageCacheHits: number }) {
-  const scope = decisionModelScope(params.model ?? defaultDecisionModel(params.endpoint), params.endpoint);
+  const scope = decisionModelScope(params.model ?? DEFAULT_DECISION_MODEL, params.endpoint);
   const original = { before: e.before, request: e.request, answer: e.answer, contextLimited: e.contextLimited };
   const feedback = { ...original, feedback: e.feedback };
   const evidence: Record<CoreResponseStage, unknown> = {

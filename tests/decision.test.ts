@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { judgeMemoryPassage, judgeTypeSafeQuality, selectTypeSafeSkill, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/typesafe.js";
+import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
+import { judgeMemoryPassage, judgeQuality, selectSkill, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/decision-ranking.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "../src/training-judge.js";
-import { decisionModelScope, matchesDecisionModel, requestTypeSafe, resolveTypeSafeApiKey } from "../src/typesafe-client.js";
+import { decisionModelScope, matchesDecisionModel, requestDecision, resolveDecisionCredential } from "../src/decision-client.js";
 
 const config = { enabled: true, timeoutMs: 100 };
 
@@ -22,12 +23,12 @@ test("quality judgments keep evidence and noise independent and validate exact a
     assert.deepEqual(Object.keys(request.state[0]), ["chunks"]);
     return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { noise_0: { type: "noul", noul: 0.96 }, evidence_0: { type: "noul", noul: 0.97 } } });
   });
-  assert.deepEqual(await judgeTypeSafeQuality(params), [{ noise: 0.96, evidence: 0.97 }]);
+  assert.deepEqual(await judgeQuality(params), [{ noise: 0.96, evidence: 0.97 }]);
   for (const answers of [{}, { noise_0: { type: "noul", noul: 0.95 } },
     { noise_0: { type: "noul", noul: 2 }, evidence_0: { type: "noul", noul: 0.97 } },
     { noise_0: { type: "noul", noul: 0.95 }, evidence_0: { type: "score", noul: 0.97 } }]) {
     fetch.mock.mockImplementation(async () => Response.json({ answers }));
-    await assert.rejects(judgeTypeSafeQuality(params), { code: "invalid_response" });
+    await assert.rejects(judgeQuality(params), { code: "invalid_response" });
   }
 });
 const selection = {
@@ -37,59 +38,58 @@ const selection = {
 };
 const response = (noul: number) => Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { useful: { type: "noul", noul } } });
 
-test("credentials strictly isolate Codex LB, legacy TypeSafe, and custom endpoints without cross-provider fallback", async (t) => {
-  const previousTypeSafe = process.env.TYPESAFE_API_KEY;
+test("credentials ignore obsolete keys and do not send ambient Codex credentials to custom endpoints", async (t) => {
+  const previousLegacy = process.env.TYPESAFE_API_KEY;
   const previousCodex = process.env.CODEX_LB_API_KEY;
-  process.env.TYPESAFE_API_KEY = "typesafe-env-key";
+  process.env.TYPESAFE_API_KEY = "obsolete-env-key";
   delete process.env.CODEX_LB_API_KEY;
   t.after(() => {
-    if (previousTypeSafe === undefined) delete process.env.TYPESAFE_API_KEY;
-    else process.env.TYPESAFE_API_KEY = previousTypeSafe;
+    if (previousLegacy === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = previousLegacy;
     if (previousCodex === undefined) delete process.env.CODEX_LB_API_KEY;
     else process.env.CODEX_LB_API_KEY = previousCodex;
   });
-  const dir = await mkdtemp(join(tmpdir(), "unblock-typesafe-key-"));
+  const dir = await mkdtemp(join(tmpdir(), "unblock-decision-key-"));
+  t.after(() => rm(dir, { recursive: true }));
   const apiKeyFile = join(dir, "key");
-  const legacy = { ...config, endpoint: "https://api.typesafe.ai/v1/systemone" };
+  const legacy = { ...config, endpoint: LEGACY_SYSTEMONE_ENDPOINT };
   const custom = { ...config, endpoint: "https://other.example/v1/decisions" };
   const loopback = { ...config, endpoint: "http://127.0.0.1:8787/v1/decisions" };
 
-  assert.equal(await resolveTypeSafeApiKey({ ...config, enabled: false, apiKeyFile: dir }), undefined);
-  // Default Codex LB endpoint never inherits TYPESAFE_API_KEY.
-  assert.equal(await resolveTypeSafeApiKey(config), undefined);
-  assert.equal(await resolveTypeSafeApiKey(legacy), "typesafe-env-key");
+  assert.equal(await resolveDecisionCredential({ ...config, enabled: false, apiKeyFile: dir }), undefined);
+  assert.equal(await resolveDecisionCredential(config), undefined);
+  assert.equal(await resolveDecisionCredential(legacy), undefined);
   process.env.CODEX_LB_API_KEY = "codex-env-key";
-  assert.equal(await resolveTypeSafeApiKey(config), "codex-env-key");
-  assert.equal(await resolveTypeSafeApiKey(legacy), "typesafe-env-key");
+  assert.equal(await resolveDecisionCredential(config), "codex-env-key");
+  assert.equal(await resolveDecisionCredential(legacy), undefined);
   // Custom origins and loopback HTTP never inherit ambient env keys.
-  assert.equal(await resolveTypeSafeApiKey(custom), undefined);
-  assert.equal(await resolveTypeSafeApiKey(loopback), undefined);
-  assert.equal(await resolveTypeSafeApiKey({ ...config, endpoint: "http://api.typesafe.ai/v1/systemone" }), undefined);
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKey: " explicit-key " }), "explicit-key");
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKeyFile }), undefined);
+  assert.equal(await resolveDecisionCredential(custom), undefined);
+  assert.equal(await resolveDecisionCredential(loopback), undefined);
+  await assert.rejects(resolveDecisionCredential({ ...config, endpoint: "http://other.example/v1/decisions" }),
+    { code: "invalid_config" });
+  assert.equal(await resolveDecisionCredential({ ...config, apiKey: " explicit-key " }), "explicit-key");
+  assert.equal(await resolveDecisionCredential({ ...config, apiKeyFile }), undefined);
   await writeFile(apiKeyFile, "plain-key\n", { mode: 0o600 });
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKeyFile }), "plain-key");
-  assert.equal(await resolveTypeSafeApiKey({ ...custom, apiKeyFile }), "plain-key");
-  // Dotenv files are strictly isolated by provider.
+  assert.equal(await resolveDecisionCredential({ ...config, apiKeyFile }), "plain-key");
+  assert.equal(await resolveDecisionCredential({ ...custom, apiKeyFile }), "plain-key");
   await writeFile(apiKeyFile, '# legacy key\nexport TYPESAFE_API_KEY="dotenv-key"\nOTHER=value\n');
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKeyFile }), undefined);
-  assert.equal(await resolveTypeSafeApiKey({ ...legacy, apiKeyFile }), "dotenv-key");
-  await writeFile(apiKeyFile, 'CODEX_LB_API_KEY="codex-dotenv-key"\nTYPESAFE_API_KEY="dotenv-key"\n');
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKeyFile }), "codex-dotenv-key");
-  assert.equal(await resolveTypeSafeApiKey({ ...legacy, apiKeyFile }), "dotenv-key");
-  assert.equal(await resolveTypeSafeApiKey({ ...custom, apiKeyFile }), "codex-dotenv-key");
-  assert.equal(process.env.TYPESAFE_API_KEY, "typesafe-env-key");
+  assert.equal(await resolveDecisionCredential({ ...config, apiKeyFile }), undefined);
+  assert.equal(await resolveDecisionCredential({ ...legacy, apiKeyFile }), undefined);
+  await writeFile(apiKeyFile, 'CODEX_LB_API_KEY="codex-dotenv-key"\n');
+  assert.equal(await resolveDecisionCredential({ ...config, apiKeyFile }), "codex-dotenv-key");
+  assert.equal(await resolveDecisionCredential({ ...custom, apiKeyFile }), "codex-dotenv-key");
+  await writeFile(apiKeyFile, "DECISION_MODEL_API_KEY=custom-dotenv-key\n");
+  assert.equal(await resolveDecisionCredential({ ...custom, apiKeyFile }), "custom-dotenv-key");
   await writeFile(apiKeyFile, "OTHER=value\n");
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKeyFile }), undefined);
-  await writeFile(apiKeyFile, "CODEX_LB_API_KEY=\nTYPESAFE_API_KEY=\n");
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKeyFile }), undefined);
+  assert.equal(await resolveDecisionCredential({ ...config, apiKeyFile }), undefined);
+  await writeFile(apiKeyFile, "CODEX_LB_API_KEY=\n");
+  assert.equal(await resolveDecisionCredential({ ...config, apiKeyFile }), undefined);
   await writeFile(apiKeyFile, "  \n");
-  assert.equal(await resolveTypeSafeApiKey({ ...config, apiKeyFile }), undefined);
-  await assert.rejects(resolveTypeSafeApiKey({ ...config, apiKeyFile: dir }), /credential file could not be read/);
+  assert.equal(await resolveDecisionCredential({ ...config, apiKeyFile }), undefined);
+  await assert.rejects(resolveDecisionCredential({ ...config, apiKeyFile: dir }), /credential file could not be read/);
   delete process.env.CODEX_LB_API_KEY;
-  delete process.env.TYPESAFE_API_KEY;
-  assert.equal(await resolveTypeSafeApiKey(config), undefined);
-  assert.equal(await resolveTypeSafeApiKey(legacy), undefined);
+  assert.equal(await resolveDecisionCredential(config), undefined);
+  assert.equal(await resolveDecisionCredential(legacy), undefined);
 });
 
 test("selection scores one skill, uses default codex decisions endpoint/model with array state, and abstains below threshold", async (t) => {
@@ -110,28 +110,28 @@ test("selection scores one skill, uses default codex decisions endpoint/model wi
     assert.equal(request.questions.useful.type, "noul");
     return response(calls === 1 ? 0.9 : 0.1);
   });
-  assert.equal(await selectTypeSafeSkill(selection), 0);
-  assert.equal(await selectTypeSafeSkill(selection), undefined);
-  assert.equal(await selectTypeSafeSkill({ ...selection, candidates: [] }), undefined);
+  assert.equal(await selectSkill(selection), 0);
+  assert.equal(await selectSkill(selection), undefined);
+  assert.equal(await selectSkill({ ...selection, candidates: [] }), undefined);
   assert.equal(calls, 2);
 });
 
-test("legacy TypeSafe systemone endpoint override infers jev-1.13.0, sends bare object state, and validates requested model", async (t) => {
+test("the original route no longer implicitly requests its historical model", async (t) => {
   t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof globalThis.fetch>) => {
-    assert.equal(url, "https://api.typesafe.ai/v1/systemone");
+    assert.equal(url, LEGACY_SYSTEMONE_ENDPOINT);
     const request = JSON.parse(String(init?.body));
-    assert.equal(request.model, "jev-1.13.0");
+    assert.equal(request.model, "liquid/d1.2-ultra");
     assert.equal(Array.isArray(request.state), false);
     assert.equal(request.state.candidates[0].excerpt, "Alpha requires approval");
-    return Response.json({ model: "jev-1.13.0", answers: { memory_0: { type: "noul", noul: 0.91 } } });
+    return Response.json({ model: "liquid/d1.2-ultra", answers: { memory_0: { type: "noul", noul: 0.91 } } });
   });
   const req = memoryUsefulnessRequest(memoryJudgment.conversation, memoryJudgment.candidates[0]!, memoryJudgment.asOf);
   const res = await judgeMemoryPassage(req, {
     ...memoryJudgment,
-    endpoint: "https://api.typesafe.ai/v1/systemone",
+    endpoint: LEGACY_SYSTEMONE_ENDPOINT,
   });
   assert.equal(res.probability, 0.91);
-  assert.equal(res.model, "jev-1.13.0");
+  assert.equal(res.model, "liquid/d1.2-ultra");
 });
 
 test("model matching restricts suffixes to dated snapshots or jev-latest, scope isolates custom endpoints, and 503 Retry-After is flagged", async (t) => {
@@ -143,30 +143,28 @@ test("model matching restricts suffixes to dated snapshots or jev-latest, scope 
     assert.equal(matchesDecisionModel(bad, "liquid/d1.2-ultra"), false, String(bad));
   }
   assert.equal(decisionModelScope("liquid/d1.2-ultra", "https://codex.unblocklabs.ai/v1/decisions"), "liquid/d1.2-ultra");
-  assert.equal(decisionModelScope("jev-1.13.0", "https://api.typesafe.ai/v1/systemone"), "jev-1.13.0");
+  assert.equal(decisionModelScope("jev-1.13.0", LEGACY_SYSTEMONE_ENDPOINT), "jev-1.13.0");
   assert.equal(decisionModelScope("liquid/d1.2-ultra", "https://openrouter.ai/api/alpha/decisions"),
     "liquid/d1.2-ultra@https://openrouter.ai/api/alpha/decisions");
   const fetch = t.mock.method(globalThis, "fetch", async () =>
     new Response("busy", { status: 503, headers: { "Retry-After": "2" } }));
-  await assert.rejects(requestTypeSafe({ apiKey: "fake" }, {}, {}), { code: "http_error", status: 503, retryAfter: true });
-  await assert.rejects(requestTypeSafe({ apiKey: "fake", endpoint: "https://api.typesafe.ai/v1/systemone" }, {}, {}),
-    { code: "http_error", status: 503, retryAfter: false });
-  await assert.rejects(requestTypeSafe({ apiKey: "fake", endpoint: "https://custom.example/v1/decisions" }, {}, {}),
+  await assert.rejects(requestDecision({ apiKey: "fake" }, {}, {}), { code: "http_error", status: 503, retryAfter: true });
+  await assert.rejects(requestDecision({ apiKey: "fake", endpoint: "https://custom.example/v1/decisions" }, {}, {}),
     { code: "http_error", status: 503, retryAfter: false });
   fetch.mock.mockImplementation(async () => new Response("busy", { status: 503 }));
-  await assert.rejects(requestTypeSafe({ apiKey: "fake" }, {}, {}), { code: "http_error", status: 503, retryAfter: false });
+  await assert.rejects(requestDecision({ apiKey: "fake" }, {}, {}), { code: "http_error", status: 503, retryAfter: false });
 });
 
 test("HTTP and schema errors never expose provider content or retry", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => new Response("test-secret", { status: 529 }));
-  await assert.rejects(selectTypeSafeSkill(selection), { message: "Decision model HTTP 529", code: "http_error", status: 529 });
+  await assert.rejects(selectSkill(selection), { message: "Decision model HTTP 529", code: "http_error", status: 529 });
   assert.equal(fetch.mock.callCount(), 1);
   fetch.mock.mockImplementation(async () => response(2));
-  await assert.rejects(selectTypeSafeSkill(selection), { code: "invalid_response" });
+  await assert.rejects(selectSkill(selection), { code: "invalid_response" });
   fetch.mock.mockImplementation(async () => Response.json({ secret: "test-secret" }));
-  await assert.rejects(selectTypeSafeSkill(selection), { code: "invalid_response" });
+  await assert.rejects(selectSkill(selection), { code: "invalid_response" });
   fetch.mock.mockImplementation(async () => { throw new Error("test-secret network detail"); });
-  await assert.rejects(selectTypeSafeSkill(selection), { message: "Decision model request failed", code: "network_error" });
+  await assert.rejects(selectSkill(selection), { message: "Decision model request failed", code: "network_error" });
 });
 
 test("the request deadline aborts slow fetches", async (t) => {
@@ -177,7 +175,7 @@ test("the request deadline aborts slow fetches", async (t) => {
       reject(new Error("secret-bearing transport error"));
     }, { once: true });
   }));
-  await assert.rejects(selectTypeSafeSkill({ ...selection, timeoutMs: 20 }), { message: "Decision model request timed out", code: "timeout" });
+  await assert.rejects(selectSkill({ ...selection, timeoutMs: 20 }), { message: "Decision model request timed out", code: "timeout" });
 });
 
 const memoryJudgment = {
@@ -239,11 +237,11 @@ test("memory requests sanitize failures, do not retry, and honor the provider de
 test("shared transport preserves caller errors for HTTP, cancellation and invalid JSON failures", async t => {
   const params = { apiKey: "test-secret", timeoutMs: 100, signal: new AbortController().signal };
   const callers = [
-    { request: () => selectTypeSafeSkill(selection), error: "Decision model HTTP 529", status: true },
+    { request: () => selectSkill(selection), error: "Decision model HTTP 529", status: true },
     { request: () => judgeMemory(), error: "Decision model HTTP 529", status: true },
-    { request: () => judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
+    { request: () => judgeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
       error: "Decision model HTTP 529", status: true },
-    { request: () => requestTypeSafe(params, {}, {}), error: "Decision model HTTP 529", status: true },
+    { request: () => requestDecision(params, {}, {}), error: "Decision model HTTP 529", status: true },
   ];
   const fetch = t.mock.method(globalThis, "fetch");
   for (const caller of callers) {
@@ -270,12 +268,12 @@ test("caller cancellation preserves quality, memory and review abort errors", as
     init?.signal?.throwIfAborted();
     throw new Error("caller signal was not propagated");
   });
-  await assert.rejects(judgeTypeSafeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
+  await assert.rejects(judgeQuality({ ...params, chunks: [{ text: "fact", sourceKind: "files" }] }),
     { message: "Decision model request cancelled", code: "cancelled" });
   await assert.rejects(judgeMemory({ ...memoryJudgment, signal: params.signal }),
     { message: "Decision model request cancelled", code: "cancelled" });
   assert.equal(fetch.mock.callCount(), 0, "already-aborted requests never reach fetch");
-  await assert.rejects(requestTypeSafe(params, {}, {}), { message: "Decision model request cancelled", code: "cancelled" });
+  await assert.rejects(requestDecision(params, {}, {}), { message: "Decision model request cancelled", code: "cancelled" });
   assert.equal(fetch.mock.callCount(), 0, "review must abort before fetch");
 });
 
@@ -285,10 +283,10 @@ test("client distinguishes timeout, first caller cancellation, and body-read fai
       const keepAlive = setTimeout(() => reject(new Error("abort not delivered")), 1000);
       init?.signal?.addEventListener("abort", () => { clearTimeout(keepAlive); reject(new Error("private")); }, { once: true });
     }));
-  await assert.rejects(requestTypeSafe({ apiKey: "private", signal: AbortSignal.timeout(10) }, {}, {}),
+  await assert.rejects(requestDecision({ apiKey: "private", signal: AbortSignal.timeout(10) }, {}, {}),
     { code: "timeout", message: "Decision model request timed out" });
   const controller = new AbortController();
-  const cancelled = requestTypeSafe({ apiKey: "private", signal: controller.signal, timeoutMs: 20 }, {}, {});
+  const cancelled = requestDecision({ apiKey: "private", signal: controller.signal, timeoutMs: 20 }, {}, {});
   await new Promise(resolve => setImmediate(resolve));
   controller.abort("private reason");
   await assert.rejects(cancelled, { code: "cancelled", message: "Decision model request cancelled" });
@@ -296,7 +294,7 @@ test("client distinguishes timeout, first caller cancellation, and body-read fai
   fetch.mock.mockImplementation(async () => new Response(new ReadableStream({
     start(controller) { controller.error(new Error("private body detail")); },
   })));
-  await assert.rejects(requestTypeSafe({ apiKey: "private" }, {}, {}),
+  await assert.rejects(requestDecision({ apiKey: "private" }, {}, {}),
     { code: "network_error", message: "Decision model request failed" });
 });
 
@@ -306,7 +304,7 @@ test("quality helper isolates requests and keeps scores aligned despite reversed
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => new Promise<Response>(resolve => {
     pending.push({ body: JSON.parse(String(init?.body)), resolve });
   }));
-  const quality = judgeTypeSafeQuality({ apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal,
+  const quality = judgeQuality({ apiKey: "fake", timeoutMs: 1000, signal: new AbortController().signal,
     chunks: [{ text: "first", sourceKind: "files" }, { text: "second", sourceKind: "sessions" }] });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(pending.length, 2, "both requests start before either completes");
@@ -329,12 +327,12 @@ test("skill reranking isolates candidates, preserves successes, and breaks ties 
   });
   const params = { ...selection, candidates: ["bad", "good", "tie"].map(name => ({ name, description: "test" })),
     onCandidateFailure: (i: number) => { failures.push(i); } };
-  assert.equal(await selectTypeSafeSkill(params), 1);
+  assert.equal(await selectSkill(params), 1);
   assert.deepEqual(failures, [0]);
   mode = "ties";
-  assert.equal(await selectTypeSafeSkill(params), 0);
+  assert.equal(await selectSkill(params), 0);
   mode = "none";
-  assert.equal(await selectTypeSafeSkill(params), undefined);
+  assert.equal(await selectSkill(params), undefined);
   assert.equal(fetch.mock.callCount(), 9);
 });
 

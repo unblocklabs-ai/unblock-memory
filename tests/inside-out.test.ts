@@ -18,7 +18,7 @@ import { PeopleStore } from "../src/people-store.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 const emotions = ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
-const cfg = (insideOut = {}) => resolveConfig({ typesafe: { apiKey: "fake", timeoutMs: 1000 },
+const cfg = (insideOut = {}) => resolveConfig({ decisionModel: { apiKey: "fake", timeoutMs: 1000 },
   insideOut: { enabled: true, intervalMinutes: 0, ...insideOut } });
 const user = (content: string, senderId = "bek", timestamp?: number) => ({ role: "user", content, timestamp,
   __openclaw: { senderId, senderIdentity: { senderKind: "human" } } });
@@ -63,7 +63,7 @@ test("Inside Out judges visible replies, not replay metadata, and leaves unsafe 
   const storePath = join(root, "unblock-memory.sqlite");
   await runInsideOut({ agentId: "main", databasePath, storePath, config: cfg() });
   assert.deepEqual(requests.map(r => r.target.text).sort(), ["Short reply", "Legacy thanks", "Safe follow-up", literal].sort());
-  assert.ok(!JSON.stringify(requests).includes("PRIVATE_"), "replay metadata and transport context never reach Jev");
+  assert.ok(!JSON.stringify(requests).includes("PRIVATE_"), "replay metadata and transport context never reach the decision model");
   assert.deepEqual(requests.find(r => r.target.text === "Short reply")?.history.map(m => m.text),
     ["Original question", "Visible answer"]);
   assert.deepEqual(requests.find(r => r.target.text === "Safe follow-up")?.history.map(m => m.text),
@@ -75,7 +75,7 @@ test("Inside Out judges visible replies, not replay metadata, and leaves unsafe 
   assert.ok(emotions.every(e => oversized?.[e] === null), "oversized inputs receive no fabricated emotion scores");
 });
 
-test("People links are stored on new reviews and backfilled on legacy rows without repeating Jev", async t => {
+test("People links are stored on new reviews and backfilled on legacy rows without repeating the decision model", async t => {
   const root = await mkdtemp(join(tmpdir(), "inside-out-people-")), sessionsDir = join(root, "sessions");
   await mkdir(sessionsDir);
   const storePath = join(root, "unblock-memory.sqlite");
@@ -164,7 +164,7 @@ test("legacy sender metadata links only unambiguous People identities without gu
     .run(JSON.stringify(["local", "session:old", "owner"]));
   const immutable = () => reportInsideOut(storePath).map(({ channel: _channel, sender_id: _sender, human_key: _human, person_id: _person, ...row }) => row);
   const before = immutable(), checkpoints = db.prepare("SELECT * FROM inside_out_checkpoints").all();
-  fetch.mock.mockImplementation(async () => { throw new Error("Identity repair must not call Jev"); });
+  fetch.mock.mockImplementation(async () => { throw new Error("Identity repair must not call the decision model"); });
   assert.deepEqual(await repairInsideOutIdentities(options), { repaired: 1, errors: [] });
   assert.deepEqual(linkInsideOutPeople(storePath), { updated: 1, linked: 2, unlinked: 4 });
   assert.deepEqual(reportInsideOut(storePath).find(r => r.message_id === "unique"), rows.find(r => r.message_id === "unique"));
@@ -359,7 +359,7 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
     const program = new Command(), output = [], hooks = {};
     console.log = text => output.push(JSON.parse(text));
     registerInsideOut({config:{},registerCli:fn=>fn({program,config:{}}),on:(name,fn)=>hooks[name]=fn,
-      logger:{warn:text=>{throw new Error(text)}}}, resolveConfig({insideOut:{enabled:true},typesafe:{apiKey:"fake"}}));
+      logger:{warn:text=>{throw new Error(text)}}}, resolveConfig({insideOut:{enabled:true},decisionModel:{apiKey:"fake"}}));
     await program.parseAsync(["node","openclaw","memory-emotions","run","--session","archived"]);
     await program.parseAsync(["node","openclaw","memory-emotions","report","--session","archived","--sender","bek"]);
     await program.parseAsync(["node","openclaw","memory-emotions","export","--session","archived","--emotion","joy","--min","0.5"]);
@@ -385,11 +385,11 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
       insert.run(...Object.values(row));
     }
     db.exec("COMMIT");
-    // Manual inference and disabled TypeSafe still publish local statistics on
+    // Manual inference and disabled decision model still publish local statistics on
     // startup. Advancing one UTC week must produce a new empty-week snapshot.
     Date.now = () => ${time + 21 * 86400_000};
     registerInsideOut({config:{},registerCli:()=>{},on:(name,fn)=>hooks[name]=fn,
-      logger:{warn:text=>{throw new Error(text)}}}, resolveConfig({insideOut:{enabled:true,intervalMinutes:0},typesafe:{enabled:false}}));
+      logger:{warn:text=>{throw new Error(text)}}}, resolveConfig({insideOut:{enabled:true,intervalMinutes:0},decisionModel:{enabled:false}}));
     hooks.gateway_start();
     await new Promise(setImmediate);
     if (db.prepare("SELECT count(*) n FROM inside_out_deviations WHERE interaction_id LIKE 'bulk-%'").get().n !== 0)
@@ -521,7 +521,7 @@ test("opt-in, tool/automation filtering and failed-request retries through the p
   const options = { agentId: "main", databasePath, storePath: join(root, "unblock-memory.sqlite"), config: cfg() };
   const mock = t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
     const { state: [state] } = JSON.parse(String(init.body));
-    assert.ok(!JSON.stringify(state).includes("INTERNAL_"), "tool payloads, system text and hidden reasoning never reach Jev");
+    assert.ok(!JSON.stringify(state).includes("INTERNAL_"), "tool payloads, system text and hidden reasoning never reach the decision model");
     if (state.target.text === "Fast reply") assert.ok(state.history.some((m: { text: string }) => m.text === "Progress"));
     return Response.json({ answers: {} });
   });
@@ -687,7 +687,7 @@ test("Inside Out validates payload.model without aborting and stores the request
   const alt = await runInsideOut({
     agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath,
     config: resolveConfig({
-      typesafe: { endpoint: "https://alt.example/v1/decisions", model: "liquid/d1.2-ultra", apiKey: "alt-key", timeoutMs: 1000 },
+      decisionModel: { endpoint: "https://alt.example/v1/decisions", model: "liquid/d1.2-ultra", apiKey: "alt-key", timeoutMs: 1000 },
       insideOut: { enabled: true, intervalMinutes: 0, maxInteractions: 100 },
     }),
   });
@@ -740,7 +740,7 @@ test("purging a person during in-flight retry grading cannot resurrect grades or
   });
 
   const retried = await runInsideOut({ ...options, retry: true });
-  assert.equal(retryFetches, 1, "rechecking retry eligibility skips remaining purged rows before calling Jev");
+  assert.equal(retryFetches, 1, "rechecking retry eligibility skips remaining purged rows before calling the decision model");
   assert.equal("reviewed" in retried && retried.reviewed, 0, "fenced tombstone write does not report a revived grade");
   assert.equal("failed" in retried && retried.failed, 0);
 
@@ -789,7 +789,7 @@ test("repeated gateway_start clears prior timers and guards tick/refresh after g
 
   registerInsideOut(api, resolveConfig({
     insideOut: { enabled: true, intervalMinutes: 5 },
-    typesafe: { enabled: true, apiKey: "fake" },
+    decisionModel: { enabled: true, apiKey: "fake" },
   }));
 
   hooks.gateway_start!();

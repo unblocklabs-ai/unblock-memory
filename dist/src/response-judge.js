@@ -2,8 +2,8 @@ import { choice, noul, score } from "@unblocklabs/decisions";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
-import { decideWithModel, decisionModelScope, TYPESAFE_MODEL, TYPESAFE_NOUL_SCHEMA as noulSchema, } from "./typesafe-client.js";
-export function responseRubricVersion(model = TYPESAFE_MODEL, endpoint) {
+import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, NOUL_SCHEMA as noulSchema, } from "./decision-client.js";
+export function responseRubricVersion(model = DEFAULT_DECISION_MODEL, endpoint) {
     return `${decisionModelScope(model, endpoint)}:response-v10`;
 }
 export const RESPONSE_STAGE_VERSIONS = {

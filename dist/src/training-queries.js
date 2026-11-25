@@ -1,10 +1,10 @@
 import { collectTraining } from "./training.js";
 import { TRAINING_GATE_THRESHOLD } from "./training-gate.js";
-import { classifyDecisionFailure, resolveTypeSafeApiKey } from "./typesafe-client.js";
+import { classifyDecisionFailure, resolveDecisionCredential } from "./decision-client.js";
 import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_MODEL, TRAINING_TEACHER_VERSION } from "./training-models.js";
 import { historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
-import { memoryJudgeVersion } from "./typesafe.js";
+import { memoryJudgeVersion } from "./decision-ranking.js";
 import { jsonHash } from "./json-hash.js";
 const LANES = ["lex", "vec"];
 const SELECTION_VERSION = "independent-lanes-top3-mean-v2";
@@ -222,9 +222,9 @@ function hasCallRoom(ctx) {
     return true;
 }
 function resolveApiKey(ctx) {
-    return ctx.key ??= resolveTypeSafeApiKey(ctx.config.typesafe).then(value => {
+    return ctx.key ??= resolveDecisionCredential(ctx.config.decisionModel).then(value => {
         if (!value)
-            throw new Error("TypeSafe is disabled or its credential is unavailable");
+            throw new Error("Decision model is disabled or its credential is unavailable");
         return value;
     });
 }
@@ -239,7 +239,7 @@ async function openSnapshot(ctx, timestamp) {
     return sourceForCutoff(timestamp);
 }
 function judgePassageOnce(ctx, input, maxDate, hit) {
-    const request = contextJudgeRequest(input, maxDate, hit, ctx.config.typesafe.model);
+    const request = contextJudgeRequest(input, maxDate, hit, ctx.config.decisionModel.model);
     const identity = jsonHash([ctx.judgeVersion, request]);
     let pending = ctx.judgments.get(identity);
     if (!pending) {
@@ -456,8 +456,8 @@ export async function evaluateTrainingQueries(source, store, config, runtime, op
     }
     const ctx = {
         source, store, config, runtime, options, chatTypes: corpus.chatTypes,
-        judgeVersion: memoryJudgeVersion(config.typesafe.model, config.typesafe.endpoint),
-        evaluationOptions: { endpoint: config.typesafe.endpoint, model: config.typesafe.model },
+        judgeVersion: memoryJudgeVersion(config.decisionModel.model, config.decisionModel.endpoint),
+        evaluationOptions: { endpoint: config.decisionModel.endpoint, model: config.decisionModel.model },
         result: { ...summary(), retrievals: 0, evaluated: 0, awaitingTeacher: 0 },
         reviewsBySource, judgments: new Map(), revisions: new Map(), createSearch, stopped: false,
     };

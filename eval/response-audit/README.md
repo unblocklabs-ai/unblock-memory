@@ -12,7 +12,7 @@ are private sandbox files, never repository fixtures or memory inputs.
 - `holdout.mjs prepare PLUGIN STATE OUTPUT BASELINE SENDER`: freeze up to 12
   eligible exchanges from distinct sessions absent from BASELINE/evidence.json.
   Looks back 90 days, inspects at most 200 new eligible sessions from a bounded
-  500-session metadata selection. No TypeSafe request is made during preparation.
+  500-session metadata selection. No decision model request is made during preparation.
 - Read the frozen evidence BEFORE any predictions. Create `holdout-labels.json`
   with `reviewerType` (`human` or `agent`), `evidenceSha256`, and `rows` containing
   each `id`, `inputHash`, `expected` (`reported_shortfall`, `acknowledged_success`,

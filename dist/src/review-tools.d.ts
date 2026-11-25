@@ -4,9 +4,9 @@ import type { QmdMemoryRuntime } from "./runtime.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { getContext } from "./tool-context.js";
 /** Bound initialization as well as inference, without cancelling shared managers. */
-export declare function reviewRequestContext(runtime: QmdMemoryRuntime, active: NonNullable<ReturnType<typeof getContext>>, typesafe: UnblockMemoryConfig["typesafe"], signal?: AbortSignal): Promise<{
+export declare function reviewRequestContext(runtime: QmdMemoryRuntime, active: NonNullable<ReturnType<typeof getContext>>, decisionModel: UnblockMemoryConfig["decisionModel"], signal?: AbortSignal): Promise<{
     readonly status: "unavailable";
-    readonly reason: "TypeSafe API key not configured";
+    readonly reason: "Decision model API key not configured";
     readonly manager?: undefined;
     readonly apiKey?: undefined;
     readonly endpoint?: undefined;

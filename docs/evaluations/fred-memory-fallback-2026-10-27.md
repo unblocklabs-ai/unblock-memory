@@ -2,7 +2,7 @@
 
 Owner: Bill. Requested by Rico on 2026-10-27. Scope: Fred (CLFWD), public
 `memory_search` falling back to existing local candidate retrieval when the
-TypeSafe key is unavailable or all candidate judgments fail. Automatic Memory
+decision model key is unavailable or all candidate judgments fail. Automatic Memory
 Whisperer injection remains strict; this change does not make its unjudged
 passages eligible for automatic injection.
 
@@ -56,13 +56,13 @@ comparative quality/latency unavailable; do not reconstruct it from memory.
 Exercise failures using a deterministic local stub/test harness, never by
 deleting production credentials or deliberately exhausting credits. Existing
 `eval/memory-ranking` replay tools use a different candidate depth and paid
-TypeSafe judgments: do not present their output as a public-tool fallback test.
+decision model judgments: do not present their output as a public-tool fallback test.
 
 Required arms and acceptance gates:
 
-1. Healthy provider: normal TypeSafe ranking, existing usefulness threshold and
+1. Healthy provider: normal decision model ranking, existing usefulness threshold and
    maxResults honored. No unnecessary fallback.
-2. Missing key/disabled TypeSafe/key-resolution failure: valid retrieval succeeds,
+2. Missing key/disabled decision model/key-resolution failure: valid retrieval succeeds,
    returns local leads with a degradation warning, `rankingMode: retrieval`,
    `scoreMeaning: retrieval_rank`, and `minUsefulnessApplied: false`. Zero provider
    requests for the missing-key arm.
@@ -80,7 +80,7 @@ Required arms and acceptance gates:
    bounded snippets/results, duplicates suppressed, and no raw credential or
    provider-error disclosure. Automatic injection still fails closed.
 7. Recovery: after a failure arm, a healthy stub on the next call restores
-   TypeSafe ranking automatically without restart or configuration changes. On
+   decision model ranking automatically without restart or configuration changes. On
    Fred, verify this again with the real provider only when existing access is
    working; otherwise report real-provider recovery as unverified.
 
@@ -100,7 +100,7 @@ Blind the reviewer to ranking mode, scores, and result order before assigning
 passage relevance: 0 irrelevant, 1 marginal, 2 useful, 3 direct/high-value. Store
 short reasons privately. A second reviewer adjudicates disputed relevant labels
 and every potentially consequential false positive; do not use the unavailable
-TypeSafe service as the sole reference grader.
+decision model service as the sole reference grader.
 
 - Primary metric: precision@5 = useful hits (grade ≥2) / 5 per answerable query;
   missing slots count as non-useful. Report macro average and numerator/denominator,

@@ -32,7 +32,6 @@ export type SkillSearchCandidate = {
 };
 export declare function enableSecureDelete(store: QMDStore): void;
 export declare function cleanupRemovedDocuments(store: QMDStore, changedDocuments?: number): number;
-export declare function pruneStaleCollections(store: QMDStore, configuredCollections: ReadonlySet<string>): Promise<number>;
 export declare function buildReadResult(params: {
     content: string;
     path: string;

@@ -101,7 +101,7 @@ function windowMetadata(window: WindowRow): SessionMetadata {
   };
 }
 
-type EventRow = { sessionId: string; eventJson: string; createdAt: number };
+type EventRows = SessionProjectionInput["events"];
 
 type ProjectionOptions = {
   databasePath: string;
@@ -177,7 +177,7 @@ function readSnapshot(params: {
 }): {
   windows: WindowRow[];
   fingerprints: Map<string, string>;
-  events: Map<string, EventRow[]>;
+  events: Map<string, EventRows>;
   changed: Set<string>;
   unavailable: Set<string>;
 } {
@@ -213,7 +213,7 @@ function readSnapshot(params: {
       ORDER BY window.created_at, window.session_id
     `).all(...params.chatTypes) as WindowRow[];
     const fingerprints = new Map<string, string>();
-    const events = new Map<string, EventRow[]>();
+    const events = new Map<string, EventRows>();
     const changed = new Set<string>();
     const unavailable = new Set<string>();
     for (const window of windows) {
@@ -238,8 +238,7 @@ function readSnapshot(params: {
         if (!params.metadataOnly) {
           try {
             const snapshot = transcripts.read(window.sessionId);
-            if (snapshot.kind === "ready") events.set(window.sessionId,
-              snapshot.rows.map(row => ({ ...row, sessionId: window.sessionId })));
+            if (snapshot.kind === "ready") events.set(window.sessionId, snapshot.rows);
             else unavailable.add(window.sessionId);
           } catch { unavailable.add(window.sessionId); }
         }
@@ -379,7 +378,7 @@ async function syncWindow(params: {
   window: WindowRow;
   sourceFingerprint: string;
   previous?: IndexedSession;
-  events?: EventRow[];
+  events?: EventRows;
   unavailable: boolean;
   force: boolean;
   outputDir: string;

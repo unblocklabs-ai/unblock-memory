@@ -14,7 +14,7 @@ export type MemorySearchObservation = RetrievalTimings & {
     requestsFailed: number;
 };
 export type MemoryRanking = {
-    rankingMode: "typesafe_usefulness" | "retrieval";
+    rankingMode: "decision" | "retrieval";
     fallbackReason?: "key_unavailable" | "all_judgments_failed";
 };
 /** Both entry points use the same complete passages and independent usefulness judgments. */
@@ -27,7 +27,7 @@ export declare function searchMemory(manager: MemoryCandidateManager, queries: Q
     asOf?: string;
     /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
     allowRetrievalFallback?: boolean;
-    /** Cap top retrieval-ranked candidates sent to TypeSafe (after dedup and cooldown filtering). */
+    /** Cap top retrieval-ranked candidates sent to the decision endpoint (after dedup and cooldown filtering). */
     maxJudgeCandidates?: number;
     minUsefulness?: number;
     excludedPassages?: ReadonlyMap<string, number>;
