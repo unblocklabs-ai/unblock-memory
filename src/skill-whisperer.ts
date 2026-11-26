@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
@@ -8,6 +9,7 @@ import { scoreSkillCatalog } from "./decision-ranking.js";
 import { isDecisionTimeout, resolveDecisionCredential, DecisionRequestError } from "./decision-client.js";
 import { buildSkillWhispererQuery, MAX_SKILL_QUERY_CHARS, recentSkillMessages } from "./whisperer-context.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
+import type { RecallLedgerEvent, RecallLedgerWriter, SkillRoutingRecord } from "./recall-ledger.js";
 import { SkillSessionStore, type ActiveSkillEntry } from "./skill-session-store.js";
 import { abortable } from "./abortable.js";
 import { isRecord } from "./guards.js";
@@ -110,7 +112,7 @@ function inActivationOrder(entries: readonly ActiveSkillEntry[]): ActiveSkillEnt
     (a.canonicalPath < b.canonicalPath ? -1 : a.canonicalPath > b.canonicalPath ? 1 : 0));
 }
 
-function renderSkills(entries: readonly ActiveSkillEntry[]): string | undefined {
+function renderSkills(entries: readonly ActiveSkillEntry[], emitted?: string[]): string | undefined {
   const header = "<skills>\nRelevant skills for this conversation (load SKILL.md via skills_read or read before following a skill's instructions):\n";
   const footer = "</skills>";
   let block = header;
@@ -123,6 +125,7 @@ function renderSkills(entries: readonly ActiveSkillEntry[]): string | undefined 
     const text = descriptionWithin(description, block === header ? remaining : Infinity);
     if (text.length > remaining) break;
     block += open + text + close;
+    emitted?.push(entry.canonicalPath);
   }
   return block === header ? undefined : block + footer;
 }
@@ -133,6 +136,7 @@ export function registerSkillWhisperer(
   config: UnblockMemoryConfig["skillWhisperer"],
   decisionModel: UnblockMemoryConfig["decisionModel"],
   diagnostics?: WhispererDiagnostics,
+  recallLedger?: { writer: RecallLedgerWriter; dbPathForAgent: (agentId: string) => string },
 ): WhispererPrompt | undefined {
   if (!config.enabled) return;
   const sessions = new Map<string, SessionState>();
@@ -140,6 +144,14 @@ export function registerSkillWhisperer(
   const stores = new Map<string, { store: SkillSessionStore; prunedAt: number }>();
   let stopped = false;
   const paramsFor = (agentId: string) => ({ cfg: api.config, agentId });
+  const recordSkillEvent = (event: Extract<RecallLedgerEvent, { kind: "skill_routing" | "skill_open" }>) => {
+    if (!recallLedger) return;
+    try {
+      recallLedger.writer.enqueue(recallLedger.dbPathForAgent(event.record.agentId), event);
+    } catch {
+      api.logger.warn("unblock-memory could not enqueue skill telemetry");
+    }
+  };
 
   const storeFor = (agentId: string, existingOnly = false) => {
     const path = runtime.memoryDatabasePath?.(agentId);
@@ -254,11 +266,20 @@ export function registerSkillWhisperer(
     let catalog: Map<string, SkillCatalogEntry> | undefined;
     let store: SkillSessionStore | undefined;
     const diagnose = (outcome: Parameters<WhispererDiagnostics["record"]>[2]) => diagnostics?.record(agentId, "skill", outcome);
+    const started = performance.now();
+    const emitted: string[] = [];
+    const route: SkillRoutingRecord | undefined = recallLedger && {
+      agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
+      eventKey: JSON.stringify([agentId, scope, runId]), createdAtMs: Date.now(),
+      surface: surface ?? whispererSurface(context), mode: "fallback", candidateCount: 0, scores: [], emitted, outcome: "no_candidates",
+    };
 
     const emit = (entries: readonly ActiveSkillEntry[], added = false) => {
-      const block = renderSkills(entries);
+      const block = renderSkills(entries, route && emitted);
       if (!block) return;
-      diagnose(added ? "emitted" : "active_reused");
+      const outcome = added ? "emitted" : "active_reused";
+      diagnose(outcome);
+      if (route && (route.outcome === "no_candidates" || route.outcome === "rejected")) route.outcome = outcome;
       return { appendContext: block };
     };
     const finish = (entries: readonly ActiveSkillEntry[], additions: readonly ActiveSkillEntry[] = []) => {
@@ -275,6 +296,11 @@ export function registerSkillWhisperer(
         const live = runtime.listSkills && await abortable(runtime.listSkills(params), signal);
         signal.throwIfAborted();
         if (live) catalog = catalogFor(params, live);
+        if (route && catalog) {
+          const hash = createHash("sha256");
+          for (const path of [...catalog.keys()].sort()) hash.update(JSON.stringify([path, catalog.get(path)!.description]));
+          route.catalogRevision = hash.digest("hex").slice(0, 16);
+        }
         const entries = activeSkills(state, params, catalog);
         prune(state, entries, store);
         if (skills.size >= settings.maxActiveSkillsPerSession) return finish(entries);
@@ -284,6 +310,7 @@ export function registerSkillWhisperer(
         if (!apiKey) diagnose(decisionModel.enabled ? "missing_key" : "decision_disabled");
         const recent = recentSkillMessages(event.messages, config.historyMessages);
         const direct = apiKey && live && live.length <= settings.maxDirectCatalogSkills;
+        if (route) route.mode = direct ? "direct" : apiKey ? "search" : "fallback";
         const candidates: ReadonlyMap<string, SkillCatalogEntry & { score?: number }> = direct && catalog
           ? catalog
           : catalogFor(params, (await abortable(runtime.searchSkills(params,
@@ -291,18 +318,33 @@ export function registerSkillWhisperer(
           ), signal)).filter(candidate => apiKey || candidate.score >= config.minScore));
         signal.throwIfAborted();
         const eligible = [...candidates].filter(([path]) => !skills.has(path));
+        const recordScores = (scores: readonly { index: number; score: number }[]) => {
+          if (!route) return;
+          route.scores = scores.slice(0, Math.max(settings.maxDirectCatalogSkills, settings.maxCandidates)).map(({ index, score }) => {
+            const [path, { name }] = eligible[index]!;
+            return { path, name, score };
+          });
+        };
+        if (route) {
+          route.candidateCount = eligible.length;
+          if (eligible.length) route.outcome = "rejected";
+          if (!apiKey) recordScores(eligible.flatMap(([, { score }], index) => score === undefined ? [] : [{ index, score }]));
+        }
         if (!eligible.length) diagnose("no_candidates");
-        const matches = !eligible.length ? [] : apiKey ? await abortable(scoreSkillCatalog({
+        const matches = !eligible.length ? [] : apiKey ? await scoreSkillCatalog({
           apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: SKILL_WHISPERER_TIMEOUT_MS, signal,
           ...decisionConversation(event.prompt, recent), candidates: eligible.map(([, candidate]) => candidate),
+          onAllScores: route && recordScores,
+          onUsage: route && (usage => Object.assign(route, usage)),
           onBatchFailure: (batchIndex, error) => {
             if (signal.aborted) return;
+            if (route) route.outcome = "partial";
             diagnose("judge_candidate_failed");
             api.logger.warn("unblock-memory skill_whisperer " + JSON.stringify({ event: "batch_failed", agentId, runId, batchIndex,
               errorCode: error instanceof DecisionRequestError ? error.code : "unexpected",
               httpStatus: error instanceof DecisionRequestError ? error.status : undefined }));
           },
-        }), signal) : eligible.slice(0, settings.maxMatchesPerTurn).map(([, candidate], index) => ({ index, score: candidate.score }));
+        }) : eligible.slice(0, settings.maxMatchesPerTurn).map(([, candidate], index) => ({ index, score: candidate.score }));
         if (eligible.length && !matches.length) diagnose("rejected");
         signal.throwIfAborted();
 
@@ -321,9 +363,14 @@ export function registerSkillWhisperer(
         }
         return finish(current, additions);
       } catch (error) {
-        if (!ownsRun()) { diagnose("cancelled"); return; }
+        if (!ownsRun()) {
+          if (route) route.outcome = "cancelled";
+          diagnose("cancelled"); return;
+        }
         const timedOut = isDecisionTimeout(error, signal);
-        diagnose(timedOut ? "timed_out" : "failed");
+        const outcome = timedOut ? "timed_out" : "failed";
+        if (route) route.outcome = outcome;
+        diagnose(outcome);
         if (!timedOut) api.logger.warn("unblock-memory skill whisperer could not route new skills");
         let entries: ActiveSkillEntry[] | undefined;
         try {
@@ -334,7 +381,13 @@ export function registerSkillWhisperer(
           api.logger.warn("unblock-memory skill whisperer could not refresh active skills");
           return entries && emit(entries);
         }
-      } finally { clearTimeout(timer); }
+      } finally {
+        clearTimeout(timer);
+        if (route) {
+          route.elapsedMs = performance.now() - started;
+          recordSkillEvent({ kind: "skill_routing", record: route });
+        }
+      }
     };
     state.result = run();
     return state.result;
@@ -350,19 +403,22 @@ export function registerSkillWhisperer(
     const path = isRead ? readPath(event.params) : undefined;
     const skillName = isSkillsRead ? readSkillName(event.params) : undefined;
     if (!scope || (isRead ? !path : !skillName || !runtime.listSkills)) return;
-    const key = sessionKey(agentId, scope);
     const runId = context.runId ?? event.runId;
     const ephemeral = sessions.get(sessionKey(agentId, scope, true));
     // Older tool-hook payloads may omit the trigger; a known ephemeral run still must not pin skills.
-    if (isEphemeral(whispererSurface(context)) ||
-        (ephemeral && (!runId || ephemeral.lastRunId === runId || ephemeral.seenRuns.has(runId)))) return;
+    const runLocal = isEphemeral(whispererSurface(context)) ||
+      !!(ephemeral && (!runId || ephemeral.lastRunId === runId || ephemeral.seenRuns.has(runId)));
+    if (runLocal && !recallLedger) return;
+    const key = sessionKey(agentId, scope, runLocal);
     if (ended.has(key) || (runId && sessions.get(key)?.seenRuns.has(runId))) return;
     try {
       const params = paramsFor(agentId);
       let canonicalPath = path ? runtime.resolveSkillPath(params, path) : undefined;
       if (isRead && !canonicalPath) return;
-      const state = stateFor(key, agentId, scope);
-      const store = storeFor(agentId);
+      // Observing an unpinned cron read must not create a session (or evict a live user session).
+      const state = runLocal ? ephemeral : stateFor(key, agentId, scope);
+      if (!state) return;
+      const store = runLocal ? undefined : storeFor(agentId);
       const skills = hydrate(state, store);
       let catalog: Map<string, SkillCatalogEntry> | undefined;
       if (runtime.listSkills) {
@@ -384,14 +440,19 @@ export function registerSkillWhisperer(
       const verifyPath = isRead ? path! : matchedByName?.[1].path;
       if (!canonicalPath || !verifyPath || sessions.get(key) !== state || context.abortSignal?.aborted ||
         (runId && state.seenRuns.has(runId)) || runtime.resolveSkillPath(params, verifyPath) !== canonicalPath) return;
-      if (catalog || !runtime.listSkills) prune(state, activeSkills(state, params, catalog), store);
+      if (!runLocal && (catalog || !runtime.listSkills)) prune(state, activeSkills(state, params, catalog), store);
       const prior = skills.get(canonicalPath);
-      if (!prior && skills.size >= settings.maxActiveSkillsPerSession) return;
-      const entry = matchedByName?.[1] ?? catalog?.get(canonicalPath) ?? readSkillCatalogEntry(canonicalPath);
       const now = Date.now();
+      if (recallLedger) recordSkillEvent({ kind: "skill_open", record: {
+        createdAtMs: now, agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
+        skillPath: canonicalPath, toolName: isRead ? "read" : "skills_read", wasWhispered: prior?.source === "whisperer",
+        wasPinned: !!prior,
+      } });
+      if (runLocal || (!prior && skills.size >= settings.maxActiveSkillsPerSession)) return;
+      const entry = matchedByName?.[1] ?? catalog?.get(canonicalPath) ?? readSkillCatalogEntry(canonicalPath);
       save(state, [{ canonicalPath, name: entry.name, description: entry.description,
         source: prior?.source ?? "read", score: prior?.score, addedTurn: prior?.addedTurn ?? state.turn,
-        addedAtMs: prior?.addedAtMs ?? nextAddedAt(state, now), lastUsedAtMs: now }], store);
+        addedAtMs: prior?.addedAtMs ?? nextAddedAt(state, now), lastUsedAtMs: now, openedAtMs: now }], store);
     } catch {
       api.logger.warn("unblock-memory skill whisperer could not pin a read skill");
     }

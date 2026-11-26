@@ -9,6 +9,8 @@ import { resolveConfig, type UnblockMemoryConfig } from "../src/config.js";
 import { DEFAULTS } from "../src/defaults.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
 import { QmdMemoryRuntime } from "../src/runtime.js";
+import { openRecallLedger, RecallLedgerWriter } from "../src/recall-ledger.js";
+import { openMemoryDatabase } from "../src/memory-database.js";
 import { SkillSessionStore } from "../src/skill-session-store.js";
 import { registerSkillWhisperer } from "../src/skill-whisperer.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
@@ -32,7 +34,7 @@ const hit = (name: string, score = 0.9, description = `Use ${name} for its workf
 const read = (path: string) => ({ toolName: "read", params: { file_path: path } });
 
 function harness(runtime: Runtime, decision = active, cfg: OpenClawPluginApi["config"] = {}, config = enabled,
-  triggers = resolveConfig({}).whispererTriggers) {
+  triggers = resolveConfig({}).whispererTriggers, ledger?: Parameters<typeof registerSkillWhisperer>[5]) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
   const warnings: string[] = [];
   const diagnostics = new WhispererDiagnostics();
@@ -41,7 +43,7 @@ function harness(runtime: Runtime, decision = active, cfg: OpenClawPluginApi["co
     logger: { warn(message: string) { warnings.push(message); } },
     on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, handler); },
   } as unknown as OpenClawPluginApi;
-  const skill = registerSkillWhisperer(api, runtime, config, decision, diagnostics);
+  const skill = registerSkillWhisperer(api, runtime, config, decision, diagnostics, ledger);
   registerWhispererPrompt(api, { skill }, triggers);
   return { hooks, warnings, diagnostics, before: skill as Prompt,
     after: hooks.get("after_tool_call") as Read, end: hooks.get("session_end") as End,
@@ -95,8 +97,8 @@ type DecisionState = { currentRequest: string; history: { role: string; content:
 function decisionState(init?: RequestInit): DecisionState {
   return JSON.parse(String(init?.body)).state[0];
 }
-function scores(state: DecisionState, score: (name: string) => number = () => 0.9) {
-  return Response.json({ answers: Object.fromEntries(state.skills.map(({ id, name }) => [id, { type: "noul", noul: score(name) }])) });
+function scores(state: DecisionState, score: (name: string) => number = () => 0.9, usage?: { input_tokens: number; output_tokens: number }) {
+  return Response.json({ usage, answers: Object.fromEntries(state.skills.map(({ id, name }) => [id, { type: "noul", noul: score(name) }])) });
 }
 
 test("direct routing sends bounded visible history and up to 79 skills once per run, then excludes pinned skills", async t => {
@@ -138,9 +140,12 @@ test("direct routing sends bounded visible history and up to 79 skills once per 
 });
 
 test("400 skills route directly in five parallel batches with a 3-second request timeout", async t => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-ledger-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const writer = new RecallLedgerWriter();
   const candidates = Array.from({ length: 400 }, (_, index) => hit(`skill-${index}`));
   const search = t.mock.fn<Runtime["searchSkills"]>(async () => []);
-  const h = harness(catalogRuntime(candidates, search));
+  const h = harness(catalogRuntime(candidates, search), active, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
   const requests: DecisionState[] = [];
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -149,7 +154,8 @@ test("400 skills route directly in five parallel batches with a 3-second request
     const state = decisionState(init);
     requests.push(state);
     await gate;
-    return scores(state, name => name === "skill-399" ? 0.9 : 0.1);
+    return scores(state, name => name === "skill-399" ? 0.9 : 0.1,
+      state.skills[0].name === "skill-0" ? undefined : { input_tokens: 13, output_tokens: 2 });
   });
   const result = h.prompt(prompt(), ctx("large-catalog"));
   try {
@@ -164,6 +170,93 @@ test("400 skills route directly in five parallel batches with a 3-second request
     await result;
   }
   assert.match((await result)?.appendContext ?? "", /name="skill-399"/);
+  await writer.close();
+  const db = openRecallLedger(dbPath);
+  try {
+    const [route] = db.prepare("SELECT * FROM skill_routing_events").all();
+    assert.equal(route.mode, "direct");
+    assert.equal(route.surface, "user");
+    assert.equal(route.outcome, "emitted");
+    assert.ok(Number(route.elapsed_ms) >= 0);
+    assert.match(String(route.catalog_revision), /^[0-9a-f]{16}$/);
+    assert.equal(route.candidate_count, 400);
+    assert.deepEqual(JSON.parse(String(route.scores_json)), candidates.map(({ path, name }, i) =>
+      ({ path, name, score: i === 399 ? 0.9 : 0.1 })));
+    assert.deepEqual(JSON.parse(String(route.emitted_json)), [candidates[399].path]);
+    assert.deepEqual([route.input_tokens, route.output_tokens], [52, 8]);
+  } finally { db.close(); h.stop(); }
+});
+
+test("opening a legacy whispered skill preserves its provenance; an independent read is not attributed to routing", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-open-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const db = openMemoryDatabase(dbPath);
+  const entries = [hit("routed"), hit("discovered")];
+  const now = Date.now();
+  try {
+    db.exec(`CREATE TABLE skill_whisper_sessions (
+      session_scope TEXT NOT NULL, canonical_path TEXT NOT NULL, skill_name TEXT NOT NULL, skill_description TEXT NOT NULL,
+      source TEXT NOT NULL, score REAL, added_turn INTEGER NOT NULL, added_at_ms INTEGER NOT NULL,
+      last_used_at_ms INTEGER NOT NULL, PRIMARY KEY(session_scope, canonical_path))`);
+    db.prepare("INSERT INTO skill_whisper_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      "thread", entries[0].path, "routed", "original", "whisperer", 0.9, 1, now, now);
+    const writer = new RecallLedgerWriter();
+    const runtime = { ...catalogRuntime(entries, async () => []), memoryDatabasePath: () => dbPath };
+    const h = harness(runtime, local, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+    try {
+      const context = ctx("one");
+      await h.prompt(prompt(), context);
+      assert.equal(db.prepare("SELECT opened_at_ms FROM skill_whisper_sessions").get()?.opened_at_ms, null);
+      await h.after({ toolName: "skills_read", params: { name: "routed" } }, context);
+      await h.after(read(entries[1].path), context);
+      await h.after(read(entries[1].path), context);
+    } finally { h.stop(); await writer.close(); }
+    const store = new SkillSessionStore(dbPath);
+    try {
+      const rows = store.list("thread");
+      assert.deepEqual(rows.map(row => [row.name, row.source]), [["routed", "whisperer"], ["discovered", "read"]]);
+      assert.ok(rows.every(row => row.openedAtMs !== undefined && row.openedAtMs >= now));
+    } finally { store.close(); }
+    const opens = db.prepare("SELECT skill_path, tool_name, was_whispered, was_pinned FROM skill_open_events ORDER BY id").all();
+    assert.deepEqual(opens.map(row => [row.skill_path, row.tool_name, row.was_whispered, row.was_pinned]), [
+      [entries[0].path, "skills_read", 1, 1], [entries[1].path, "read", 0, 0], [entries[1].path, "read", 0, 1],
+    ]);
+    const route = db.prepare("SELECT mode, input_tokens, output_tokens FROM skill_routing_events").get();
+    assert.deepEqual({ ...route }, { mode: "fallback", input_tokens: null, output_tokens: null });
+  } finally { db.close(); }
+});
+
+test("a routing deadline records completed batches without emitting late suggestions", async t => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-deadline-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const writer = new RecallLedgerWriter();
+  const entries = Array.from({ length: DEFAULTS.skillWhisperer.catalogBatchSize + 1 }, (_, i) => hit(String(i)));
+  const h = harness(catalogRuntime(entries), active, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+  let release!: (response: Response) => void;
+  const stalled = new Promise<Response>(resolve => { release = resolve; });
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const state = decisionState(init);
+    return state.skills.length === 1 ? stalled : scores(state, () => 0.8, { input_tokens: 120, output_tokens: 32 });
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const pending = h.prompt(prompt(), ctx("deadline"));
+    await new Promise(resolve => setImmediate(resolve));
+    t.mock.timers.tick(DEFAULTS.skillWhisperer.timeoutMs);
+    assert.equal(await pending, undefined);
+  } finally {
+    release(new Response(null, { status: 503 }));
+    t.mock.timers.reset();
+    h.stop(); await writer.close();
+  }
+  const db = openRecallLedger(dbPath);
+  try {
+    const route = db.prepare("SELECT * FROM skill_routing_events").get()!;
+    assert.equal(route.outcome, "timed_out");
+    assert.deepEqual(JSON.parse(String(route.emitted_json)), []);
+    assert.equal(JSON.parse(String(route.scores_json)).length, entries.length - 1);
+    assert.deepEqual([route.input_tokens, route.output_tokens], [120, 32]);
+  } finally { db.close(); }
 });
 
 test("oversized and no-key catalogs use the right QMD fallback and filter pinned, invalid and weak hits", async t => {

@@ -104,16 +104,28 @@ test("resolveConfig and openclaw.plugin.json manifest declare recallLedger with 
   assert.ok("retentionDays" in manifest.configSchema.properties.recallLedger.properties);
 });
 
-test("openRecallLedger initializes recall_ledger:1 cleanly with openMemoryDatabase and rejects unknown versions", async () => {
+test("openRecallLedger migrates a populated v1 database without losing hits and rejects unknown versions", async () => {
   const root = await tempDir();
   try {
     const dbPath = join(root, MEMORY_DATABASE);
+    writeRecallBatch(dbPath, [{ kind: "query", record: sampleQuery({ eventKey: "legacy" }) }]);
+    const legacy = new DatabaseSync(dbPath);
+    try {
+      legacy.exec(`ALTER TABLE recall_queries DROP COLUMN input_tokens;
+        ALTER TABLE recall_queries DROP COLUMN output_tokens;
+        DROP TABLE skill_routing_events; DROP TABLE skill_open_events;
+        UPDATE memory_schema SET version = 1 WHERE component = 'recall_ledger'`);
+    } finally { legacy.close(); }
+    writeRecallBatch(dbPath, [{ kind: "query", record: sampleQuery({ eventKey: "new", inputTokens: 80, outputTokens: 0 }) }]);
     const db = openRecallLedger(dbPath);
     try {
       const storage = db.prepare("SELECT version FROM memory_schema WHERE component = 'storage'").get();
       const ledger = db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'").get();
       assert.equal(storage?.version, 1);
       assert.equal(ledger?.version, RECALL_LEDGER_SCHEMA_VERSION);
+      assert.deepEqual(db.prepare(`SELECT event_key, input_tokens, output_tokens FROM recall_queries q
+        JOIN recall_hits h ON h.query_id = q.id ORDER BY q.id`).all().map(row => [row.event_key, row.input_tokens, row.output_tokens]),
+        [["legacy", null, null], ["new", 80, 0]]);
       db.prepare("UPDATE memory_schema SET version = 99 WHERE component = 'recall_ledger'").run();
     } finally {
       db.close();
@@ -130,6 +142,12 @@ test("writeRecallBatch is idempotent on event_key, surfaces CHECK violations, an
     const dbPath = join(root, MEMORY_DATABASE);
     const freshMs = Date.now();
     const oldMs = freshMs - 120 * 86_400_000;
+    const skillEvents = (createdAtMs: number) => [
+      { kind: "skill_routing", record: { eventKey: String(createdAtMs), createdAtMs, agentId: "bill", mode: "direct",
+        candidateCount: 0, emitted: [], scores: [], outcome: "no_candidates" } },
+      { kind: "skill_open", record: { createdAtMs, agentId: "bill", skillPath: "/skills/a/SKILL.md", toolName: "read",
+        wasWhispered: false, wasPinned: false } },
+    ] as const;
 
     const first = writeRecallBatch(dbPath, [
       { kind: "query", record: sampleQuery({ eventKey: "whisperer:s1:m1", createdAtMs: oldMs }) },
@@ -155,6 +173,7 @@ test("writeRecallBatch is idempotent on event_key, surfaces CHECK violations, an
     const second = writeRecallBatch(
       dbPath,
       [
+        ...skillEvents(oldMs), ...skillEvents(freshMs),
         {
           kind: "query",
           record: sampleQuery({
@@ -189,8 +208,8 @@ test("writeRecallBatch is idempotent on event_key, surfaces CHECK violations, an
       ],
       { retentionDays: 90, nowMs: freshMs, prune: true },
     );
-    assert.equal(second.written, 3);
-    assert.equal(second.pruned, 2);
+    assert.equal(second.written, 7);
+    assert.equal(second.pruned, 4);
 
     const verify = openRecallLedger(dbPath);
     try {
@@ -201,6 +220,9 @@ test("writeRecallBatch is idempotent on event_key, surfaces CHECK violations, an
       const reads = verify.prepare("SELECT event_key, status FROM recall_reads").all();
       assert.equal(reads.length, 1);
       assert.equal(reads[0]?.event_key, "get:tc-fresh");
+      for (const table of ["skill_routing_events", "skill_open_events"]) {
+        assert.deepEqual(verify.prepare(`SELECT created_at_ms FROM ${table}`).all().map(row => row.created_at_ms), [freshMs]);
+      }
     } finally {
       verify.close();
     }
