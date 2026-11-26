@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { Type } from "typebox";
+import { Type, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { abortable, abortedByTimeout } from "./abortable.js";
 import { isRecord, record } from "./guards.js";
@@ -8,19 +8,22 @@ import { o200kTokenCount } from "./o200k.js";
 import type { StewardConfig } from "./steward-config.js";
 
 type JsonObject = Record<string, unknown>;
+/** Plain JSON Schema or a TypeBox schema (TypeBox interfaces lack an index signature). */
+type Schema = JsonObject | TSchema;
+const json = (schema: Schema) => schema as JsonObject;
 export type StewardUsage = { requests: number; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number;
   reasoningTokens?: number; costUsd?: number };
-export type StewardToolDef<TParams = JsonObject> = { name: string; description: string; parameters: JsonObject;
+export type StewardToolDef<TParams = JsonObject> = { name: string; description: string; parameters: Schema;
   execute: (params: TParams, signal: AbortSignal) => Promise<unknown> };
 type Prompt = { purpose: string; systemPrompt: string; userPrompt: string; model?: string;
   reasoning?: StewardConfig["reasoning"]; signal?: AbortSignal };
-export type StewardCompleteRequest<T> = Prompt & { schema: JsonObject; timeoutMs?: number; maxRetries?: number };
-export type StewardErrorCode = "aborted" | "timeout" | "lifecycle_reload" | "missing_credentials" | "context_overflow" |
+export type StewardCompleteRequest<T> = Prompt & { schema: Schema; timeoutMs?: number; maxRetries?: number };
+type StewardErrorCode = "aborted" | "timeout" | "lifecycle_reload" | "missing_credentials" | "context_overflow" |
   "transient_provider" | "invalid_output" | "budget_exhausted" | "provider_error";
 type Failure = { ok: false; code: StewardErrorCode; error: string; retryable: boolean; usage: StewardUsage };
 export type StewardCompleteResult<T> = Failure | { ok: true; data: T; usage: StewardUsage; model?: string;
   backend: "host_llm" | "responses_api" };
-export type StewardRunRequest<T> = Prompt & { tools: readonly StewardToolDef[]; submitSchema: JsonObject; submitDescription?: string;
+export type StewardRunRequest<T> = Prompt & { tools: readonly StewardToolDef[]; submitSchema: Schema; submitDescription?: string;
   maxTurns: number; maxToolCalls: number; maxInputTokens?: number; maxToolResultChars?: number; wallTimeoutMs: number;
   onToolCall?: (event: { name: string; ok: boolean; elapsedMs: number }) => void };
 type Status = "complete" | "incomplete" | "needs_decision";
@@ -42,8 +45,8 @@ function parse(text: unknown): unknown {
   if (typeof text !== "string") return undefined;
   try { return JSON.parse(text); } catch { return undefined; }
 }
-function conforms<T>(schema: JsonObject, value: unknown): value is T {
-  return value !== undefined && Value.Check(Type.Unsafe<T>(schema), value);
+function conforms<T>(schema: Schema, value: unknown): value is T {
+  return value !== undefined && Value.Check(Type.Unsafe<T>(json(schema)), value);
 }
 
 /** One deadline and accounting ledger across retries, tools and correction turns. */
@@ -195,7 +198,7 @@ export function createStewardRunner(deps: Deps): StewardRunner {
             let reply;
             try {
               reply = await abortable(host({ model: req.model ?? deps.config.model, systemPrompt: req.systemPrompt,
-                messages: [{ role: "user", content: prompt }], responseFormat: req.schema, reasoning: req.reasoning ?? deps.config.reasoning,
+                messages: [{ role: "user", content: prompt }], responseFormat: json(req.schema), reasoning: req.reasoning ?? deps.config.reasoning,
                 purpose: req.purpose, signal: a.signal }), a.signal);
             } catch (error) {
               if (record(error)?.code === "LLM_RUNTIME_LIFECYCLE") throw new Fault("lifecycle_reload", "Host runtime reloading");
@@ -231,7 +234,8 @@ export function createStewardRunner(deps: Deps): StewardRunner {
 }
 
 const SUBMIT = "submit_result";
-function submissionSchema(schema: JsonObject) {
+function submissionSchema(input: Schema) {
+  const schema = json(input);
   const properties = schema.properties ?? {};
   if ((schema.type !== undefined && schema.type !== "object") || !isRecord(properties) ||
     Object.hasOwn(properties, "status") || (schema.required !== undefined && !Array.isArray(schema.required))) {

@@ -29,7 +29,8 @@
       "memory_people_update",
       "memory_people_prime",
       "memory_people_sync",
-      "memory_people_learning"
+      "memory_people_learning",
+      "deep_thought"
     ]
   },
   "toolMetadata": {
@@ -211,6 +212,30 @@
     "analysis.executable": {
       "label": "Memory Analysis Worker",
       "help": "Optional absolute path to the locally installed unblock-memory-analysis executable."
+    },
+    "steward.enabled": {
+      "label": "Steward",
+      "help": "Master switch for the Steward sub-agent. Also enable steward.deepThought and/or steward.peopleShadow."
+    },
+    "steward.deepThought.enabled": {
+      "label": "Deep Thought Curator",
+      "help": "Registers the read-only deep_thought tool: a multi-hop memory investigation with verified citations."
+    },
+    "steward.peopleShadow.enabled": {
+      "label": "People Shadow",
+      "help": "Background, proposal-only review of People Learning manifests. Never publishes; compare with `openclaw memory-steward shadow-report`."
+    },
+    "steward.endpoint": {
+      "label": "Steward Endpoint",
+      "help": "HTTPS (or loopback HTTP) Responses API endpoint. Defaults to https://codex.unblocklabs.ai/v1/responses, which reuses the decision credential on the same origin."
+    },
+    "steward.apiKey": {
+      "label": "Steward API Key",
+      "sensitive": true
+    },
+    "steward.apiKeyFile": {
+      "label": "Steward API Key File",
+      "help": "Absolute path to a plaintext API key or dotenv file for the Steward endpoint. When unset, the decision credential is used only for the same origin."
     }
   },
   "configSchema": {
@@ -1147,6 +1172,116 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 3650
+          }
+        },
+        "default": {
+          "enabled": false
+        }
+      },
+      "steward": {
+        "type": "object",
+        "description": "Opt-in Steward sub-agent: the deep_thought memory curator tool and proposal-only People shadow adjudication. Off by default.",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "model": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "reasoning": {
+            "type": "string",
+            "enum": [
+              "off",
+              "minimal",
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ]
+          },
+          "endpoint": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^[Hh][Tt][Tt][Pp](?:[Ss]://(?:\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\\.?)|://(?:[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127\\.0\\.0\\.1|\\[::1\\]))(?::\\d+)?(?:/[^\\s?#]*)?$"
+          },
+          "apiKey": {
+            "type": "string",
+            "pattern": "^\\s*\\S+\\s*$"
+          },
+          "apiKeyFile": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "maxActiveBackground": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4
+          },
+          "deepThought": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "maxTurns": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 12
+              },
+              "maxToolCalls": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32
+              },
+              "maxConcurrent": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 5000,
+                "maximum": 180000
+              },
+              "maxToolResultChars": {
+                "type": "integer",
+                "minimum": 500,
+                "maximum": 32000
+              },
+              "maxInputTokens": {
+                "type": "integer",
+                "minimum": 2000,
+                "maximum": 128000
+              }
+            }
+          },
+          "peopleShadow": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "intervalMinutes": {
+                "type": "integer",
+                "minimum": 5,
+                "maximum": 1440
+              },
+              "maxItemsPerRun": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 5000,
+                "maximum": 180000
+              }
+            }
           }
         },
         "default": {

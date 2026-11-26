@@ -1,5 +1,6 @@
 import { DEFAULTS } from "./defaults.js";
 import { LEGACY_SYSTEMONE_ENDPOINT, noul } from "@unblocklabs/decisions";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { stripReasoningTagsFromText } from "openclaw/plugin-sdk/text-chunking";
@@ -11,8 +12,14 @@ import { INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, emotionBaselineHist
 import { PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 import { jsonHash } from "./json-hash.js";
 import { tableExists } from "./memory-database.js";
+import { WorkFenceLostError, WorkStore, startWorkHeartbeat } from "./work-store.js";
 export { linkInsideOutPeople, purgeInsideOutPerson, refreshInsideOutBaselines, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 const RUBRIC = "emotion-presence-v2";
+/** One fenced `mode='run'` singleton per agent store replaces the old process-local lock. */
+export const INSIDE_OUT_WORK_KIND = "inside_out_grade";
+export const INSIDE_OUT_WORK_SCOPE = "agent";
+const LEASE_MS = 120_000;
+const HEARTBEAT_MS = 20_000;
 const CONTEXT_ERROR = "Target reply and preceding assistant exceed context budget";
 function insideOutRubric(endpoint) {
     const canonical = endpoint.replace(/\/+$/u, "");
@@ -138,7 +145,19 @@ function* interactions(source, budget, cached, after) {
         history.push(message);
     }
 }
-const running = new Set();
+/** In-flight passes by owner, so `gateway_stop` can release leases synchronously on the same connection. */
+const activeWork = new Map();
+/** Synchronous graceful release for `gateway_stop`: call before aborting so the pass adds no strikes. */
+export function interruptInsideOut(owner, now) {
+    let released = 0;
+    for (const work of activeWork.get(owner) ?? []) {
+        try {
+            released += work.interruptOwner(owner, now);
+        }
+        catch { /* A busy store keeps its lease; it expires and the abort below still stops the pass. */ }
+    }
+    return released;
+}
 /** Explicit legacy repair: only read sources owning unlinked reviews; never rejudge their text. */
 export async function repairInsideOutIdentities(options) {
     const db = openInsideOutStore(options.storePath), errors = [];
@@ -231,7 +250,7 @@ function loadRetryTargets(store, rubric, options) {
     return pending;
 }
 async function reviewSource(reader, context, retryPass) {
-    const { apiKey, config, rubric, signal, retry, sessionId: scopedSessionId, result, statements } = context;
+    const { apiKey, config, rubric, signal, retry, sessionId: scopedSessionId, result, statements, work, claim } = context;
     const budgetExhausted = () => result.reviewed + result.failed >= config.insideOut.maxInteractions;
     signal?.throwIfAborted();
     const prior = statements.checkpoint.get(reader.source, rubric);
@@ -271,7 +290,8 @@ async function reviewSource(reader, context, retryPass) {
             continue;
         }
         const { probabilities, error, model } = await gradeInteraction(interaction, { apiKey, config, signal });
-        const saved = statements.save.run(interaction.id, rubric, source.sessionId, interaction.messageId, interaction.assistantId, interaction.human, interaction.sender, interaction.channel, source.source, interaction.targetAt, Date.now(), model, Number(interaction.trimmed), ...probabilities, error, statements.person?.get(interaction.channel, interaction.human, interaction.sender)?.person_id ?? null, PURGED_GRADE);
+        // Fenced on the lease attempt: a pass that lost its lease (hot replacement, expiry) can never publish late.
+        const saved = work.withFence(claim, () => statements.save.run(interaction.id, rubric, source.sessionId, interaction.messageId, interaction.assistantId, interaction.human, interaction.sender, interaction.channel, source.source, interaction.targetAt, Date.now(), model, Number(interaction.trimmed), ...probabilities, error, statements.person?.get(interaction.channel, interaction.human, interaction.sender)?.person_id ?? null, PURGED_GRADE));
         if (Number(saved.changes) > 0) {
             if (error)
                 result.failed++;
@@ -281,9 +301,14 @@ async function reviewSource(reader, context, retryPass) {
     }
     // Only exhausted snapshots advance: partial passes resume using the existing per-interaction cache.
     if (!retryPass) {
-        statements.finish.run(source.source, rubric, source.sessionId, reader.signature, reader.revision, source.events.reduce((last, event) => Math.max(last, event.seq), 0));
+        work.withFence(claim, () => statements.finish.run(source.source, rubric, source.sessionId, reader.signature, reader.revision, source.events.reduce((last, event) => Math.max(last, event.seq), 0)));
     }
 }
+/**
+ * Scheduled passes run only when the agent's `inside_out_grade` row is due, so repeated `gateway_start`
+ * calls and hot-replaced instances cannot re-run inside `intervalMinutes`. Manual passes start at once but
+ * never overlap a live lease held by another process.
+ */
 export async function runInsideOut(options) {
     const { config, storePath } = options;
     if (!config.insideOut.enabled)
@@ -291,19 +316,40 @@ export async function runInsideOut(options) {
     const apiKey = await resolveDecisionCredential(config.decisionModel);
     if (!apiKey)
         throw new Error("Inside Out requires a configured decision model API key");
-    if (running.has(storePath))
-        throw new Error("Inside Out is already running for this agent");
-    running.add(storePath);
-    let store;
+    options.signal?.throwIfAborted();
+    const owner = options.owner ?? `inside-out:${process.pid}:${randomUUID()}`;
+    const leaseMs = options.leaseMs ?? LEASE_MS, intervalMs = config.insideOut.intervalMinutes * 60_000;
+    const store = openInsideOutStore(storePath);
+    let work, claim, heartbeat, scheduledDue = 0;
+    const owned = activeWork.get(owner) ?? new Set();
+    const fence = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, fence.signal]) : fence.signal;
     const result = { reviewed: 0, cached: 0, failed: 0, sources: 0, skippedSources: 0, errors: [] };
     try {
+        work = new WorkStore(store);
+        work.enqueue({ kind: INSIDE_OUT_WORK_KIND, scope: INSIDE_OUT_WORK_SCOPE, mode: "run", dueAt: 0 });
+        scheduledDue = work.get(INSIDE_OUT_WORK_KIND, INSIDE_OUT_WORK_SCOPE)?.dueAt ?? 0;
+        claim = work.claim({ kind: INSIDE_OUT_WORK_KIND, scope: INSIDE_OUT_WORK_SCOPE, mode: "run", owner, leaseMs,
+            ignoreDueAt: options.manual === true });
+        if (!claim) {
+            if (options.manual)
+                throw new Error("Inside Out is already running for this agent");
+            const row = work.get(INSIDE_OUT_WORK_KIND, INSIDE_OUT_WORK_SCOPE);
+            return { status: "skipped", reason: row?.status === "running" ? "already_running" : "not_due" };
+        }
+        const held = claim;
+        owned.add(work);
+        activeWork.set(owner, owned);
+        heartbeat = startWorkHeartbeat(work, held, { intervalMs: options.heartbeatMs ?? HEARTBEAT_MS, leaseMs,
+            onFenceLost: error => fence.abort(error) });
         const rubric = insideOutRubric(config.decisionModel.endpoint);
-        store = openInsideOutStore(storePath);
         const context = {
             apiKey,
             config,
             rubric,
-            signal: options.signal,
+            work,
+            claim: held,
+            signal,
             retry: options.retry,
             sessionId: options.sessionId,
             result,
@@ -315,6 +361,7 @@ export async function runInsideOut(options) {
                 retryable: store.prepare(`SELECT 1 FROM inside_out
           WHERE interaction_id=? AND rubric=? AND error IS NOT NULL AND error<>?
           AND (? OR (error<>? AND reviewed_at<=?))`),
+                // Never let a late errored write replace a successful grade, and never revive a purge tombstone.
                 save: store.prepare(`INSERT INTO inside_out (
           interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,channel,source,
           target_at,reviewed_at,model,context_trimmed,joy,sadness,fear,anger,disgust,surprise,error,person_id
@@ -339,7 +386,7 @@ export async function runInsideOut(options) {
           surprise=excluded.surprise,
           error=excluded.error,
           person_id=excluded.person_id
-        WHERE inside_out.error IS NOT ?`),
+        WHERE inside_out.error IS NOT ? AND (excluded.error IS NULL OR inside_out.error IS NOT NULL)`),
                 checkpoint: store.prepare("SELECT * FROM inside_out_checkpoints WHERE source=? AND rubric=?"),
                 finish: store.prepare(`INSERT OR REPLACE INTO inside_out_checkpoints
           (source,rubric,session_id,signature,revision,last_seq) VALUES(?,?,?,?,?,?)`),
@@ -357,7 +404,7 @@ export async function runInsideOut(options) {
             const pending = loadRetryTargets(store, rubric, { retry: options.retry, sessionId: options.sessionId, retryCutoff });
             if (pending.size) {
                 for await (const reader of readInsideOutSources(options, result.errors)) {
-                    options.signal?.throwIfAborted();
+                    signal.throwIfAborted();
                     const retryIds = pending.get(reader.source);
                     if (!retryIds)
                         continue;
@@ -367,24 +414,47 @@ export async function runInsideOut(options) {
                 }
             }
         }
-        store.close();
-        store = undefined;
-        // Grades are already saved; derived statistics never turn a completed run into a failure.
-        if (result.reviewed + result.failed) {
+        signal.throwIfAborted();
+        heartbeat.stop();
+        // Manual passes keep the gateway's schedule; scheduled passes re-arm one interval out.
+        work.commitWithDomain(held, { nextDueAt: options.manual ? scheduledDue : Date.now() + intervalMs }, () => undefined);
+        claim = undefined;
+    }
+    catch (error) {
+        heartbeat?.stop();
+        if (claim && work) {
+            // Shutdown, credentials, transient provider and source errors are not strikes; retry on the next schedule.
             try {
-                await refreshInsideOutBaselinesAsync(storePath, { minInteractions: config.insideOut.baselineMinInteractions }, options.signal);
+                work.fail(claim, { error: error instanceof Error ? error.message : String(error),
+                    retryAt: options.manual ? scheduledDue : Date.now() + intervalMs });
             }
-            catch (error) {
-                options.signal?.throwIfAborted();
-                result.baselineError = error instanceof Error ? error.message : String(error);
+            catch (release) {
+                if (!(release instanceof WorkFenceLostError))
+                    throw release;
             }
         }
-        return result;
+        throw fence.signal.aborted && !options.signal?.aborted ? fence.signal.reason : error;
     }
     finally {
-        store?.close();
-        running.delete(storePath);
+        heartbeat?.stop();
+        if (work) {
+            owned.delete(work);
+            if (!owned.size)
+                activeWork.delete(owner);
+        }
+        store.close();
     }
+    // Grades are already saved; derived statistics never turn a completed run into a failure.
+    if (result.reviewed + result.failed) {
+        try {
+            await refreshInsideOutBaselinesAsync(storePath, { minInteractions: config.insideOut.baselineMinInteractions }, options.signal);
+        }
+        catch (error) {
+            options.signal?.throwIfAborted();
+            result.baselineError = error instanceof Error ? error.message : String(error);
+        }
+    }
+    return result;
 }
 export function reportInsideOutBaselines(path, options = {}) {
     if (!existsSync(path))

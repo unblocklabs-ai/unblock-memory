@@ -11,6 +11,7 @@ import { resolveInsideOut, type InsideOutConfig } from "./inside-out.js";
 import { resolveSafetyWhisperer, type SafetyWhispererConfig } from "./safety-config.js";
 import { resolveMyTurn, type MyTurnConfig } from "./my-turn.js";
 import { resolveRecallLedger, type RecallLedgerConfig } from "./recall-ledger.js";
+import { resolveStewardConfig, type StewardConfig } from "./steward-config.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -110,6 +111,8 @@ export type UnblockMemoryConfig = {
   safetyWhisperer: SafetyWhispererConfig;
   whispererTriggers: WhispererTriggersConfig;
   recallLedger: RecallLedgerConfig;
+  /** Off unless configured: `deep_thought` curator and People shadow adjudication. */
+  steward: StewardConfig;
 };
 
 export const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"] = {
@@ -481,7 +484,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "whispererTriggers"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -584,5 +587,6 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
     whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),
     recallLedger: resolveRecallLedger(config.recallLedger),
+    steward: resolveStewardConfig(config.steward),
     decisionModel: resolveDecisionModel(config.decisionModel) };
 }

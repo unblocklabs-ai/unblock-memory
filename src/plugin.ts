@@ -34,6 +34,10 @@ import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
 import { registerPeopleLearning, registerPeopleLearningCli } from "./people-learning-runtime.js";
 import { nonBlank } from "./guards.js";
+import { createDeepThoughtTool, type DeepThoughtDeps } from "./deep-thought.js";
+import { resolveStewardCredential } from "./steward-config.js";
+import { createStewardRunner, type StewardRunner } from "./steward-runner.js";
+import { registerStewardRuntime } from "./steward-runtime.js";
 import { RecallLedgerWriter, type RecallHitRecord, type RecallQueryOutcome } from "./recall-ledger.js";
 
 function managerUnavailable(error?: string) {
@@ -737,11 +741,36 @@ export function resolveFlushPlan(params: { cfg?: OpenClawConfig; nowMs?: number 
   };
 }
 
+/**
+ * One shared, stateless Steward runner. Credentials resolve per call (steward overrides, else the same-origin
+ * decision key); structured `complete` prefers the host LLM runtime when the gateway provides one.
+ */
+function stewardRunnerFactory(api: OpenClawPluginApi, config: UnblockMemoryConfig): () => StewardRunner {
+  let runner: StewardRunner | undefined;
+  return () => {
+    if (runner) return runner;
+    const llm = (api.runtime as Partial<OpenClawPluginApi["runtime"]> | undefined)?.llm;
+    const hostLlmComplete = typeof llm?.complete === "function" ? llm.complete.bind(llm) : undefined;
+    runner = createStewardRunner({
+      config: config.steward,
+      resolveApiKey: () => resolveStewardCredential(config.steward, config.decisionModel),
+      ...(hostLlmComplete ? { hostLlmComplete } : {}),
+    });
+    return runner;
+  };
+}
+
 export function registerUnblockMemory(api: OpenClawPluginApi): void {
   const config = resolveConfig(api.pluginConfig);
   registerPeopleLearningCli(api, config);
   registerResponseAudit(api, config);
   registerInsideOut(api, config);
+  const stewardRunner = stewardRunnerFactory(api, config);
+  // Registers `memory-steward` CLI always; the People shadow loop only when steward + peopleShadow are enabled.
+  registerStewardRuntime(api, {
+    config: config.steward,
+    createRunner: () => config.steward.enabled ? stewardRunner() : undefined,
+  });
   if (api.registrationMode === "cli-metadata") { registerExtraction(api, config); return; }
   const runtime = new QmdMemoryRuntime(config.corpora, {
     analysisExecutable: config.analysis.executable,
@@ -802,7 +831,7 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   }
   registerWhispererPrompt(api, {
     memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics, recallLedger),
-    skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics),
+    skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics, recallLedger),
     people: peopleWhisperer,
     myTurn: registerMyTurn(api, config.myTurn, config.decisionModel, diagnostics),
     safety: registerSafetyWhisperer(api, config, diagnostics),
@@ -829,4 +858,14 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     names: ["memory_update_maintenance_task"],
   });
   registerReviewTools(api, runtime, config, diagnostics);
+  if (config.steward.enabled && config.steward.deepThought.enabled) {
+    const deepThought: DeepThoughtDeps = {
+      runtime,
+      runner: stewardRunner(),
+      config: config.steward.deepThought,
+      decisionModel: config.decisionModel,
+      ...(config.people.enabled ? { people: { enabled: true, stores: peopleStores } } : {}),
+    };
+    api.registerTool((ctx) => createDeepThoughtTool(ctx, deepThought), { names: ["deep_thought"] });
+  }
 }

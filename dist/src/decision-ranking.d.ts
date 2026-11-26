@@ -21,6 +21,14 @@ export declare function scoreSkillCatalog(params: {
     maxMatches?: number;
     batchSize?: number;
     onBatchFailure?: (batchIndex: number, error: unknown) => void;
+    onAllScores?: (scores: readonly {
+        index: number;
+        score: number;
+    }[]) => void;
+    onUsage?: (usage: {
+        inputTokens?: number;
+        outputTokens?: number;
+    }) => void;
 }): Promise<Array<{
     index: number;
     score: number;

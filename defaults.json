@@ -203,5 +203,9 @@
     "maxQueueSize": 256,
     "pruneIntervalMs": 3600000,
     "shutdownTimeoutMs": 3500
+  },
+  "steward": {
+    "leaseMs": 300000,
+    "shutdownGraceMs": 5000
   }
 }

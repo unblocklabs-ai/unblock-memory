@@ -1,0 +1,26 @@
+import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import type { StewardConfig } from "./steward-config.js";
+import { type PeopleShadowPassResult } from "./steward-people-shadow.js";
+import type { StewardRunner } from "./steward-runner.js";
+import { WorkStore } from "./work-store.js";
+/** Process-wide (all agents, all plugin instances) background Steward slot; returns a one-shot release or undefined at capacity. */
+export declare function tryAcquireBackgroundSlot(maxActive: number): (() => void) | undefined;
+export declare function activeBackgroundStewards(): number;
+type StewardRuntimeOptions = {
+    config: StewardConfig;
+    /** Lazily built on the first background tick; undefined skips background work without error. */
+    createRunner(): Pick<StewardRunner, "complete"> | undefined;
+    /** Test seam; defaults to a dedicated `WorkStore` connection on the agent's memory database. */
+    openWorkStore?(dbPath: string): WorkStore;
+    dbPathForAgent?(agentId: string): string;
+    listAgents?(cfg: OpenClawConfig): string[];
+    shutdownGraceMs?: number;
+};
+export declare function registerStewardRuntime(api: OpenClawPluginApi, options: StewardRuntimeOptions): {
+    owner: string;
+    tick: () => Promise<void>;
+    stop: () => Promise<void>;
+    lastResults: () => Map<string, PeopleShadowPassResult>;
+    enabled: boolean;
+};
+export {};

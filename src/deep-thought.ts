@@ -11,11 +11,8 @@ import { searchMemory, type MemoryCandidateManager } from "./memory-search.js";
 import { prepareQueryConversation } from "./query-contract.js";
 import { selectJudgeConversation } from "./judge-context.js";
 import { getContext } from "./tool-context.js";
-import type {
-  StewardRunnerLike,
-  StewardToolLike,
-  StewardUsage,
-} from "./steward-runtime.js";
+import type { StewardConfig } from "./steward-config.js";
+import type { StewardRunner, StewardToolDef, StewardUsage } from "./steward-runner.js";
 
 /* ───────────────────────────── Contracts ───────────────────────────── */
 
@@ -86,7 +83,7 @@ const lookupPersonArgs = Type.Object({
 
 /* ───────────────────────────── Dependencies ───────────────────────────── */
 
-export type DeepThoughtManager = MemoryCandidateManager & {
+type DeepThoughtManager = MemoryCandidateManager & {
   readFile(params: {
     relPath: string; from?: number; lines?: number; cursor?: MemoryReadCursor; requestContext?: MemoryRequestContext;
   }): Promise<MemoryReadResult>;
@@ -111,7 +108,7 @@ type ClaimLike = {
 type DossierLike = { blurb: string; sections: { category: string; claims: ClaimLike[] }[] };
 
 /** Read-only structural subset of `PeopleStores`; `lookup_person` never writes. */
-export type DeepThoughtPeopleSource = {
+type DeepThoughtPeopleSource = {
   get(agentId: string): {
     listActivePeople(limit?: number, offset?: number, includeInactive?: boolean): PersonLike[];
     listIdentities(personId: string): IdentityLike[];
@@ -125,13 +122,15 @@ export type DeepThoughtConfig = {
   maxToolCalls: number;
   timeoutMs: number;
   maxConcurrent?: number;
+  maxInputTokens?: number;
+  maxToolResultChars?: number;
   model?: string;
-  reasoning?: string;
+  reasoning?: StewardConfig["reasoning"];
 };
 
 export type DeepThoughtDeps = {
   runtime: DeepThoughtRuntime;
-  runner: StewardRunnerLike;
+  runner: Pick<StewardRunner, "run">;
   config: DeepThoughtConfig;
   decisionModel: Pick<UnblockMemoryConfig["decisionModel"], "enabled" | "apiKey" | "apiKeyFile" | "endpoint" | "model" | "timeoutMs">;
   people?: { enabled: boolean; stores: DeepThoughtPeopleSource };
@@ -252,7 +251,7 @@ const CURATOR_SYSTEM_PROMPT = [
  * Runs one caller-scoped multi-hop investigation. Every tool is bound to the caller's exact context:
  * identical `requestContext`, `agentId`, approved corpora and account. Never writes, never escalates.
  */
-export async function runDeepThought(
+async function runDeepThought(
   active: ActiveContext,
   params: DeepThoughtParams,
   deps: DeepThoughtDeps,
@@ -291,12 +290,12 @@ export async function runDeepThought(
       apiKey = await (deps.resolveCredential ?? (() => resolveDecisionCredential(deps.decisionModel)))();
     } catch { /* Judging is optional; retrieval fallback still returns local evidence. */ }
 
-    const tools: StewardToolLike[] = [];
+    const tools: StewardToolDef[] = [];
     tools.push({
       name: "search_memory",
       description: `Search approved memory corpora (${approvedCorpora.join(", ") || "none"}) with BM25 + vector queries. Returns qmd:// paths and snippets.`,
       parameters: searchMemoryArgs,
-      async execute(raw, context) {
+      async execute(raw, toolSignal) {
         toolCallsUsed += 1;
         const args = Value.Parse(searchMemoryArgs, raw);
         const requested = resolveCorpora(args.corpora, approvedCorpora);
@@ -314,7 +313,7 @@ export async function runDeepThought(
           timeoutMs: deps.decisionModel.timeoutMs,
           conversation: selectJudgeConversation(conversation),
           allowRetrievalFallback: true,
-          signal: context?.signal ?? runSignal,
+          signal: toolSignal,
           requestContext: active.requestContext,
         });
         const results = search.results.map(hit => {
@@ -419,31 +418,38 @@ export async function runDeepThought(
     const run = await deps.runner.run<DeepThoughtResult>({
       purpose: "deep_thought",
       systemPrompt: CURATOR_SYSTEM_PROMPT,
-      input,
+      userPrompt: input,
       tools,
       submitSchema: DEEP_THOUGHT_RESULT_SCHEMA,
       maxTurns,
       maxToolCalls: Math.max(1, deps.config.maxToolCalls),
       wallTimeoutMs: deps.config.timeoutMs,
       signal: runSignal,
+      ...(deps.config.maxInputTokens ? { maxInputTokens: deps.config.maxInputTokens } : {}),
+      ...(deps.config.maxToolResultChars ? { maxToolResultChars: deps.config.maxToolResultChars } : {}),
       ...(deps.config.model ? { model: deps.config.model } : {}),
       ...(deps.config.reasoning ? { reasoning: deps.config.reasoning } : {}),
     });
     const elapsedMs = Math.max(0, now() - started);
-    const result = run.result && Value.Check(DEEP_THOUGHT_RESULT_SCHEMA, run.result) ? run.result : undefined;
+    const counts = { hopsUsed: run.turns, toolCallsUsed, elapsedMs, usage: run.usage, corpora: approvedCorpora };
+    if (!run.ok) {
+      const status: DeepThoughtOutcome["status"] = signal?.aborted ? "cancelled"
+        : run.code === "timeout" ? "timed_out"
+        : run.code === "aborted" ? (timeoutSignal.aborted ? "timed_out" : "cancelled")
+        : run.code === "budget_exhausted" ? "incomplete"
+        : run.code === "missing_credentials" ? "unavailable"
+        : "failed";
+      return { status, citations: [], openQuestions: [], ...counts, error: clip(run.error, 300) };
+    }
+    const result = Value.Check(DEEP_THOUGHT_RESULT_SCHEMA, run.data) ? run.data : undefined;
     const { kept, dropped } = verifyCitations(result?.citations ?? [], visitedPaths);
     return {
       status: result ? run.status : "incomplete",
       ...(result ? { answer: result.answer, confidence: kept.length || !result.citations.length ? result.confidence : "low" } : {}),
       citations: kept,
       openQuestions: result?.openQuestions ?? [],
-      hopsUsed: run.turns,
-      toolCallsUsed,
-      elapsedMs,
-      usage: run.usage,
+      ...counts,
       ...(dropped ? { unverifiedCitationsDropped: dropped } : {}),
-      corpora: approvedCorpora,
-      ...(run.stopReason && run.status !== "complete" ? { error: clip(run.stopReason, 300) } : {}),
     };
   } catch (error) {
     const outcome = { ...base(), toolCallsUsed, corpora: approvedCorpora };

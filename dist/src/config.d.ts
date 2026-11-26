@@ -6,6 +6,7 @@ import { type InsideOutConfig } from "./inside-out.js";
 import { type SafetyWhispererConfig } from "./safety-config.js";
 import { type MyTurnConfig } from "./my-turn.js";
 import { type RecallLedgerConfig } from "./recall-ledger.js";
+import { type StewardConfig } from "./steward-config.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -103,6 +104,8 @@ export type UnblockMemoryConfig = {
     safetyWhisperer: SafetyWhispererConfig;
     whispererTriggers: WhispererTriggersConfig;
     recallLedger: RecallLedgerConfig;
+    /** Off unless configured: `deep_thought` curator and People shadow adjudication. */
+    steward: StewardConfig;
 };
 export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];
 export type MemoryWhispererMode = "v2" | "legacy";

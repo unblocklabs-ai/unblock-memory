@@ -1,10 +1,11 @@
 import { DEFAULTS } from "./defaults.js";
+import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { resolveAgentDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { dateOption } from "./date-option.js";
-import { linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
+import { interruptInsideOut, linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 export function registerInsideOut(api, config) {
     const paths = (cfg, agentId) => {
@@ -30,7 +31,8 @@ export function registerInsideOut(api, config) {
         root.command("run").option("--agent <id>", "Agent id", "main").option("--retry", "Retry failed judgments immediately")
             .option("--session <id>", "Review only this session")
             .action(async (opts) => {
-            const result = await runInsideOut({ ...paths(cfg, opts.agent), config, retry: opts.retry, sessionId: opts.session });
+            // Explicit operator pass: run now unless another process holds the live lease.
+            const result = await runInsideOut({ ...paths(cfg, opts.agent), config, retry: opts.retry, sessionId: opts.session, manual: true });
             console.log(JSON.stringify(result, null, 2));
             if ("failed" in result && (result.failed || result.errors.length || result.baselineError))
                 process.exitCode = 1;
@@ -72,6 +74,8 @@ export function registerInsideOut(api, config) {
     let timer, baselineTimer, running;
     let refreshing;
     let lifetime = new AbortController();
+    // One lease owner per registration: hot-replaced instances contend through the shared work row.
+    const owner = `inside-out:${process.pid}:${randomUUID()}`;
     const clearTimers = () => {
         if (timer) {
             clearInterval(timer);
@@ -91,7 +95,8 @@ export function registerInsideOut(api, config) {
                 if (signal.aborted)
                     break;
                 try {
-                    const result = await runInsideOut({ ...paths(api.config, agentId), config, signal });
+                    // Scheduled passes respect the persisted due time, so restarts inside the interval do not re-run.
+                    const result = await runInsideOut({ ...paths(api.config, agentId), config, signal, owner });
                     if ("failed" in result && (result.failed || result.errors.length))
                         api.logger.warn("Inside Out: some reviews or sources failed; inspect memory-emotions export");
                     if ("baselineError" in result && result.baselineError)
@@ -136,6 +141,12 @@ export function registerInsideOut(api, config) {
             tick();
         }
     });
-    // Aborting cancels active baseline workers rather than waiting for a full historical pass.
-    api.on("gateway_stop", async () => { clearTimers(); lifetime.abort(); await Promise.all([running, refreshing]); });
+    // Release leases synchronously first (graceful stop adds no strikes), then abort active passes and
+    // baseline workers rather than waiting for a full historical pass.
+    api.on("gateway_stop", async () => {
+        clearTimers();
+        interruptInsideOut(owner);
+        lifetime.abort();
+        await Promise.all([running, refreshing]);
+    });
 }

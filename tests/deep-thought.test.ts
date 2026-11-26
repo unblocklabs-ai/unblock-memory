@@ -16,7 +16,8 @@ import {
   type DeepThoughtResult,
   type DeepThoughtRuntime,
 } from "../src/deep-thought.js";
-import type { StewardRunRequest, StewardRunResult, StewardRunnerLike } from "../src/steward-runtime.js";
+import { resolveStewardConfig } from "../src/steward-config.js";
+import { createStewardRunner, type StewardRunner, type StewardRunRequest, type StewardRunResult, type StewardUsage } from "../src/steward-runner.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { PeopleStores, type PersonDossier } from "../src/people-store.js";
 
@@ -61,25 +62,28 @@ function fakeRuntime(hits: CorpusMemorySearchResult[] = [hit("launch"), hit("ret
   return { runtime, recorded };
 }
 
+type RunRunner = Pick<StewardRunner, "run">;
 type ScriptStep =
-  | { call: string; args: unknown }[]
-  | { submit: (outputs: unknown[]) => DeepThoughtResult; status?: StewardRunResult<DeepThoughtResult>["status"] };
+  | { call: string; args: Record<string, unknown> }[]
+  | { submit: (outputs: unknown[]) => DeepThoughtResult; status?: "complete" | "incomplete" | "needs_decision" };
+
+const budgetExhausted = <T>(turns: number, toolCalls: number, usage: StewardUsage): StewardRunResult<T> =>
+  ({ ok: false, code: "budget_exhausted", error: "Exceeded maxTurns", retryable: false, usage, turns, toolCalls });
 
 /** Mimics StewardRunner.run: validates args against each tool schema, enforces turn budget, honors abort. */
 function scriptedRunner(script: ScriptStep[]) {
-  const requests: StewardRunRequest[] = [];
+  const requests: StewardRunRequest<DeepThoughtResult>[] = [];
   const toolNames: string[][] = [];
-  const runner: StewardRunnerLike = {
-    async complete() { throw new Error("complete not used by deep_thought"); },
-    async run<T>(request: StewardRunRequest): Promise<StewardRunResult<T>> {
-      requests.push(request);
+  const runner: RunRunner = {
+    async run<T>(request: StewardRunRequest<T>): Promise<StewardRunResult<T>> {
+      requests.push(request as StewardRunRequest<never>);
       toolNames.push(request.tools.map(tool => tool.name));
       const outputs: unknown[] = [];
       let turns = 0, toolCalls = 0;
       for (const step of script) {
         request.signal?.throwIfAborted();
         if (turns >= request.maxTurns) {
-          return { status: "incomplete", turns, toolCalls, usage: { requests: turns, inputTokens: 10 * turns, outputTokens: 5 * turns }, stopReason: "max_turns" };
+          return budgetExhausted(turns, toolCalls, { requests: turns, inputTokens: 10 * turns, outputTokens: 5 * turns });
         }
         turns += 1;
         if (Array.isArray(step)) {
@@ -88,16 +92,16 @@ function scriptedRunner(script: ScriptStep[]) {
             if (!tool) { outputs.push({ error: `unknown tool ${call}` }); continue; }
             assert.ok(Value.Check(tool.parameters, args), `runner validates ${call} args`);
             toolCalls += 1;
-            outputs.push(await tool.execute(args, { signal: request.signal! }));
+            outputs.push(await tool.execute(args, request.signal!));
           }
           continue;
         }
         const result = step.submit(outputs);
         assert.ok(Value.Check(request.submitSchema, result), "submit matches caller schema");
-        return { status: step.status ?? "complete", result: result as T, turns, toolCalls,
+        return { ok: true, status: step.status ?? "complete", data: result as T, summary: result.answer, turns, toolCalls,
           usage: { requests: turns, inputTokens: 100 * turns, outputTokens: 20 * turns } };
       }
-      return { status: "incomplete", turns, toolCalls, usage: { requests: turns } };
+      return budgetExhausted(turns, toolCalls, { requests: turns });
     },
   };
   return { runner, requests, toolNames };
@@ -116,7 +120,7 @@ function toolContext(overrides: Partial<OpenClawPluginToolContext> = {}): OpenCl
   } as OpenClawPluginToolContext;
 }
 
-function deps(runtime: DeepThoughtRuntime, runner: StewardRunnerLike, extra: Partial<DeepThoughtDeps> = {}): DeepThoughtDeps {
+function deps(runtime: DeepThoughtRuntime, runner: RunRunner, extra: Partial<DeepThoughtDeps> = {}): DeepThoughtDeps {
   return { runtime, runner, config: CONFIG, decisionModel: DECISION, resolveCredential: async () => undefined, ...extra };
 }
 
@@ -187,7 +191,7 @@ test("multi-hop investigation: search_memory → read_memory → lookup_person �
   assert.equal(requests[0]!.maxTurns, CONFIG.maxTurns, "maxHops is clamped by config.maxTurns");
   assert.equal(requests[0]!.maxToolCalls, CONFIG.maxToolCalls);
   assert.equal(requests[0]!.submitSchema, DEEP_THOUGHT_RESULT_SCHEMA);
-  assert.match(requests[0]!.input, /Focus: dates/u);
+  assert.match(requests[0]!.userPrompt, /Focus: dates/u);
 
   // Caller scope forwarded verbatim to every memory call.
   const managerActive = recorded.managerParams[0] as { agentId: string; requestContext: unknown };
@@ -232,8 +236,7 @@ test("hallucinated and unvisited citation paths are stripped and counted", async
 test("caller corpus ACL: unknown/skill corpora are refused, narrowed corpora bound search and reads", async () => {
   const { runtime, recorded } = fakeRuntime([hit("launch"), hit("dm", "sessions")]);
   let ran = false;
-  const refusing: StewardRunnerLike = { complete: async () => { throw new Error("unused"); },
-    run: async () => { ran = true; throw new Error("must not run"); } };
+  const refusing: RunRunner = { run: async () => { ran = true; throw new Error("must not run"); } };
   for (const corpora of [["skills"], ["secret-corpus"], ["all", "memory"]]) {
     const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, refusing)), { question: "q", corpora });
     assert.equal(outcome.status, "invalid_request", `refuses ${corpora.join(",")}`);
@@ -309,12 +312,12 @@ test("concurrency cap returns busy without stampeding; slots are released", asyn
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   let started = 0;
-  const blocking: StewardRunnerLike = {
-    complete: async () => { throw new Error("unused"); },
+  const blocking: RunRunner = {
     async run<T>(): Promise<StewardRunResult<T>> {
       started += 1;
       await gate;
-      return { status: "complete", result: { answer: "done", confidence: "low", citations: [] } as T, turns: 1, toolCalls: 0, usage: { requests: 1 } };
+      return { ok: true, status: "complete", data: { answer: "done", confidence: "low", citations: [] } as T, summary: "done",
+        turns: 1, toolCalls: 0, usage: { requests: 1 } };
     },
   };
   const make = () => createDeepThoughtTool(toolContext(), deps(runtime, blocking));
@@ -333,10 +336,11 @@ test("concurrency cap returns busy without stampeding; slots are released", asyn
 
 test("wall timeout, caller abort, runner failure and turn budget all terminate cleanly", async () => {
   const { runtime } = fakeRuntime();
-  const hanging: StewardRunnerLike = {
-    complete: async () => { throw new Error("unused"); },
-    run: request => new Promise((_resolve, reject) => {
-      request.signal!.addEventListener("abort", () => reject(request.signal!.reason), { once: true });
+  // Like the real runner, an aborted run resolves with a failure (never rejects).
+  const hanging: RunRunner = {
+    run: request => new Promise(resolve => {
+      request.signal!.addEventListener("abort", () => resolve({ ok: false, code: "aborted", error: "Steward aborted", retryable: false,
+        usage: { requests: 1 }, turns: 1, toolCalls: 0 }), { once: true });
     }),
   };
   const timedOut = await execute(createDeepThoughtTool(toolContext(),
@@ -350,12 +354,17 @@ test("wall timeout, caller abort, runner failure and turn budget all terminate c
   assert.equal((await pending).status, "cancelled");
   assert.equal(activeDeepThoughts(), 0);
 
-  const failing: StewardRunnerLike = { complete: async () => { throw new Error("unused"); },
-    run: async () => { throw Object.assign(new Error("upstream 503"), { usage: { requests: 2, inputTokens: 50 } }); } };
-  const failed = await execute(createDeepThoughtTool(toolContext(), deps(runtime, failing)), { question: "q" });
+  const failWith = (code: "transient_provider" | "missing_credentials"): RunRunner => ({
+    run: async () => ({ ok: false, code, error: code === "transient_provider" ? "Temporary provider failure" : "No usable Steward credential",
+      retryable: code === "transient_provider", usage: { requests: 2, inputTokens: 50 }, turns: 2, toolCalls: 0 }),
+  });
+  const failed = await execute(createDeepThoughtTool(toolContext(), deps(runtime, failWith("transient_provider"))), { question: "q" });
   assert.equal(failed.status, "failed");
-  assert.match(failed.error ?? "", /503/u);
+  assert.match(failed.error ?? "", /Temporary provider failure/u);
+  assert.equal(failed.hopsUsed, 2);
   assert.deepEqual(failed.usage, { requests: 2, inputTokens: 50 }, "failed attempts still report honest usage");
+  const unavailable = await execute(createDeepThoughtTool(toolContext(), deps(runtime, failWith("missing_credentials"))), { question: "q" });
+  assert.equal(unavailable.status, "unavailable", "no Steward credential is reported as unavailable, not a crash");
 
   const { runner, requests } = scriptedRunner([
     [{ call: "search_memory", args: { bm25Query: "a", vectorQuery: "a" } }],
@@ -366,7 +375,7 @@ test("wall timeout, caller abort, runner failure and turn budget all terminate c
   assert.equal(requests[0]!.maxTurns, 1, "maxHops narrows the turn budget");
   assert.equal(budget.status, "incomplete");
   assert.equal(budget.answer, undefined);
-  assert.equal(budget.error, "max_turns");
+  assert.equal(budget.error, "Exceeded maxTurns");
   assert.equal(budget.toolCallsUsed, 1);
 });
 
@@ -384,4 +393,35 @@ test("disabled config or missing agent context registers no tool; parameters are
     assert.equal(Value.Check(tool.parameters, bad), false, JSON.stringify(bad).slice(0, 60));
   }
   assert.equal(Value.Check(tool.parameters, { question: "q", focus: "f", corpora: ["all"], maxHops: 8 }), true);
+});
+
+test("end-to-end through the real StewardRunner: tool calls, submit_result and usage cross the B2/B3 seam", async t => {
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("no network in tests"); });
+  const { runtime, recorded } = fakeRuntime();
+  const call = (name: string, id: string, args: unknown) => ({ type: "function_call", status: "completed", call_id: id, name,
+    arguments: JSON.stringify(args) });
+  const replies = [
+    { status: "completed", output: [call("search_memory", "c1", { bm25Query: "launch", vectorQuery: "When is the launch?" })],
+      usage: { input_tokens: 100, output_tokens: 10 } },
+    { status: "completed", output: [call("submit_result", "c2", { status: "complete", answer: "Friday.", confidence: "high",
+      citations: [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }] })],
+      usage: { input_tokens: 200, output_tokens: 20 } },
+  ];
+  const sent: { tools: { name: string }[]; input: { type?: string; call_id?: string; output?: string }[] }[] = [];
+  const runner = createStewardRunner({
+    config: resolveStewardConfig({ enabled: true, deepThought: { enabled: true } }),
+    resolveApiKey: async () => "test-token",
+    fetch: async (_url, init) => { sent.push(JSON.parse(String(init?.body))); return Response.json(replies.shift()); },
+  });
+  const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, runner)), { question: "When is the launch?" });
+  assert.equal(outcome.status, "complete");
+  assert.equal(outcome.answer, "Friday.");
+  assert.deepEqual(outcome.citations.map(c => c.source), ["qmd://memory/launch.md"]);
+  assert.equal(outcome.hopsUsed, 2);
+  assert.equal(outcome.toolCallsUsed, 1);
+  assert.deepEqual(outcome.usage, { requests: 2, inputTokens: 300, outputTokens: 30 });
+  assert.deepEqual(sent[0]!.tools.map(tool => tool.name), ["search_memory", "read_memory", "submit_result"]);
+  const toolOutput = sent[1]!.input.find(item => item.type === "function_call_output" && item.call_id === "c1");
+  assert.match(toolOutput?.output ?? "", /qmd:\/\/memory\/launch\.md/u, "search results reached the model");
+  assert.equal(recorded.searches.length, 1);
 });

@@ -80,6 +80,8 @@ const ranges = {
     "recallLedger.defaultRetentionDays": [1, 3650],
     "recallLedger.maxQueueSize": [1, 10000],
     "recallLedger.shutdownTimeoutMs": [100, 10000],
+    "steward.leaseMs": [30_000, 3_600_000],
+    "steward.shutdownGraceMs": [100, 30_000],
 };
 function record(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);

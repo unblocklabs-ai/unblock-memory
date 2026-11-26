@@ -433,3 +433,45 @@ test("memoryWhisperer.mode defaults to v2, accepts legacy, and keeps old fleet a
     assert.throws(() => resolveConfig({ memoryWhisperer: { mode } }), /memoryWhisperer\.mode/u);
   }
 });
+
+test("steward is optional and off by default; host manifest and runtime resolver agree on its shape", async () => {
+  const validate = await manifestValidator("unblock-memory:test:steward");
+  // Existing fleet configs carry no steward section: both host defaults and the runtime keep it off.
+  for (const fleet of [{}, { decisionModel: { enabled: true } }]) {
+    const host = validate(fleet);
+    assert.equal(host.ok, true);
+    assert.deepEqual(host.value?.steward, { enabled: false });
+    const steward = resolveConfig(host.value).steward;
+    assert.equal(steward.enabled, false);
+    assert.equal(steward.deepThought.enabled, false);
+    assert.equal(steward.peopleShadow.enabled, false);
+    assert.deepEqual(resolveConfig(fleet).steward, steward);
+  }
+  const enabled = {
+    steward: {
+      enabled: true, model: "gpt-6.2-sol", reasoning: "low", endpoint: "http://127.0.0.1:8787/v1/responses",
+      apiKeyFile: "/run/secrets/steward", maxActiveBackground: 2,
+      deepThought: { enabled: true, maxTurns: 8, maxToolCalls: 20, maxConcurrent: 1, timeoutMs: 90_000, maxToolResultChars: 4000, maxInputTokens: 64_000 },
+      peopleShadow: { enabled: true, intervalMinutes: 120, maxItemsPerRun: 5, timeoutMs: 30_000 },
+    },
+  };
+  const host = validate(enabled);
+  assert.equal(host.ok, true, JSON.stringify(host.errors));
+  const steward = resolveConfig(host.value).steward;
+  assert.equal(steward.endpoint, "http://127.0.0.1:8787/v1/responses");
+  assert.deepEqual(steward.deepThought, enabled.steward.deepThought);
+  assert.deepEqual(steward.peopleShadow, enabled.steward.peopleShadow);
+  for (const invalid of [
+    { steward: { extra: true } },
+    { steward: { deepThought: { extra: 1 } } },
+    { steward: { peopleShadow: { intervalMinutes: 1 } } },
+    { steward: { reasoning: "adaptive" } },
+    { steward: { endpoint: "http://remote.example/v1/responses" } },
+    { steward: { endpoint: "https://user:pass@remote.example/v1/responses" } },
+    { steward: { apiKey: "two words" } },
+    { steward: { maxActiveBackground: 5 } },
+  ]) {
+    assert.equal(validate(invalid).ok, false, JSON.stringify(invalid));
+    assert.throws(() => resolveConfig(invalid), /steward/, JSON.stringify(invalid));
+  }
+});

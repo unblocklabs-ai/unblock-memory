@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { immediateTransaction, openMemoryDatabase } from "../src/memory-database.js";
 import { dossierAssertions, privateJson, type ReviewAssertion, type ReviewManifest } from "../src/people-learning-inventory.js";
 import { PeopleLearningStore, type LearningReceipt } from "../src/people-learning-store.js";
 import { reviewWindow } from "../src/people-learning-time.js";
@@ -19,118 +18,22 @@ import {
   type PeopleShadowArtifact,
   type PeopleShadowProposal,
 } from "../src/steward-people-shadow.js";
-import {
-  activeBackgroundStewards,
-  registerStewardRuntime,
-  tryAcquireBackgroundSlot,
-  type StewardCompleteRequest,
-  type StewardCompleteResult,
-  type StewardRunnerLike,
-  type WorkItemLike,
-  type WorkRef,
-  type WorkStatus,
-  type WorkStoreLike,
-} from "../src/steward-runtime.js";
+import { resolveStewardConfig } from "../src/steward-config.js";
+import type { StewardCompleteRequest, StewardCompleteResult, StewardRunner } from "../src/steward-runner.js";
+import { activeBackgroundStewards, registerStewardRuntime, tryAcquireBackgroundSlot } from "../src/steward-runtime.js";
+import { WorkStore } from "../src/work-store.js";
 
-/* ───────────── Plan-schema WorkStore double (B1 lands the real one) ───────────── */
+type CompleteRunner = Pick<StewardRunner, "complete">;
 
-class WorkFenceLostError extends Error {}
-
-class TestWorkStore implements WorkStoreLike {
-  readonly db: DatabaseSync;
+/** The real fenced WorkStore, recording graceful interrupts so tests can assert their ordering. */
+class RecordingWorkStore extends WorkStore {
   readonly interrupts: string[] = [];
-  constructor(path: string, readonly maxStrikes = 3, readonly onInterrupt?: () => void) {
-    this.db = openMemoryDatabase(path);
-    this.db.exec(`CREATE TABLE IF NOT EXISTS work_items (
-      kind TEXT NOT NULL, scope TEXT NOT NULL,
-      mode TEXT NOT NULL CHECK(mode IN ('run','item')),
-      status TEXT NOT NULL CHECK(status IN ('pending','running','staged','completed','quarantined')),
-      attempt INTEGER NOT NULL DEFAULT 0, owner TEXT, lease_until INTEGER NOT NULL DEFAULT 0, due_at INTEGER NOT NULL DEFAULT 0,
-      input_revision TEXT, recipe_hash TEXT, stage TEXT,
-      artifact_json TEXT CHECK(artifact_json IS NULL OR json_valid(artifact_json)),
-      usage_json TEXT CHECK(usage_json IS NULL OR json_valid(usage_json)),
-      strikes INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at INTEGER NOT NULL,
-      PRIMARY KEY (kind, scope)) STRICT`);
-  }
-  close() { this.db.close(); }
-  enqueue(input: { kind: string; scope: string; mode: "run" | "item"; inputRevision?: string; recipeHash?: string; requeue?: boolean }) {
-    const existing = this.get(input.kind, input.scope);
-    const now = Date.now();
-    if (!existing) {
-      this.db.prepare(`INSERT INTO work_items (kind,scope,mode,status,input_revision,recipe_hash,updated_at) VALUES (?,?,?,'pending',?,?,?)`)
-        .run(input.kind, input.scope, input.mode, input.inputRevision ?? null, input.recipeHash ?? null, now);
-    } else if (input.requeue || existing.inputRevision !== (input.inputRevision ?? null) || existing.recipeHash !== (input.recipeHash ?? null)) {
-      this.db.prepare(`UPDATE work_items SET status='pending',stage=NULL,artifact_json=NULL,usage_json=NULL,strikes=0,owner=NULL,
-        input_revision=?,recipe_hash=?,updated_at=? WHERE kind=? AND scope=?`)
-        .run(input.inputRevision ?? null, input.recipeHash ?? null, now, input.kind, input.scope);
-    }
-    return this.get(input.kind, input.scope);
-  }
-  claim(input: { kind: string; scope?: string; owner: string; leaseMs: number; now?: number }): WorkRef | undefined {
-    const now = input.now ?? Date.now();
-    return immediateTransaction(this.db, () => {
-      const row = this.db.prepare(`SELECT attempt FROM work_items WHERE kind=? AND scope=? AND
-        (status IN ('pending','staged') OR (status='running' AND lease_until<?))`).get(input.kind, input.scope!, now);
-      if (!row) return undefined;
-      const attempt = Number(row.attempt) + 1;
-      this.db.prepare(`UPDATE work_items SET attempt=?,owner=?,lease_until=?,status='running',updated_at=? WHERE kind=? AND scope=?`)
-        .run(attempt, input.owner, now + input.leaseMs, now, input.kind, input.scope!);
-      return { kind: input.kind, scope: input.scope!, attempt, owner: input.owner };
-    });
-  }
-  renew(ref: WorkRef, leaseMs: number) {
-    return this.db.prepare("UPDATE work_items SET lease_until=? WHERE kind=? AND scope=? AND attempt=? AND status='running'")
-      .run(Date.now() + leaseMs, ref.kind, ref.scope, ref.attempt).changes > 0;
-  }
-  stageArtifact(ref: WorkRef, stage: string, artifactJson: string, usageJson?: string) {
-    const changes = this.db.prepare(`UPDATE work_items SET status='staged',stage=?,artifact_json=?,usage_json=?,strikes=0,updated_at=?
-      WHERE kind=? AND scope=? AND attempt=? AND status='running'`)
-      .run(stage, artifactJson, usageJson ?? null, Date.now(), ref.kind, ref.scope, ref.attempt).changes;
-    if (!changes) throw new WorkFenceLostError("fence lost");
-  }
-  commitWithDomain<T>(db: DatabaseSync, ref: WorkRef, fn: () => T): T {
-    assert.equal(db, this.db, "domain commit must share the WorkStore connection");
-    return immediateTransaction(db, () => {
-      const result = fn();
-      const changes = db.prepare(`UPDATE work_items SET status='completed',owner=NULL,lease_until=0,updated_at=?
-        WHERE kind=? AND scope=? AND attempt=? AND status IN ('running','staged')`).run(Date.now(), ref.kind, ref.scope, ref.attempt).changes;
-      if (!changes) throw new WorkFenceLostError("fence lost");
-      return result;
-    });
-  }
-  fail(ref: WorkRef, error: string, options?: { strike?: boolean }) {
-    const row = this.get(ref.kind, ref.scope);
-    if (!row || row.attempt !== ref.attempt || row.status !== "running") throw new WorkFenceLostError("fence lost");
-    const strikes = row.strikes + (options?.strike ? 1 : 0);
-    const status: WorkStatus = row.mode === "item" && strikes >= this.maxStrikes ? "quarantined" : "pending";
-    this.db.prepare("UPDATE work_items SET status=?,strikes=?,last_error=?,owner=NULL,lease_until=0,updated_at=? WHERE kind=? AND scope=?")
-      .run(status, strikes, error, Date.now(), ref.kind, ref.scope);
-  }
-  interruptOwner(owner: string) {
+  constructor(path: string, readonly onInterrupt?: () => void) { super(path); }
+  override interruptOwner(owner: string, now?: number): number {
     this.interrupts.push(owner);
     this.onInterrupt?.();
-    return Number(this.db.prepare(`UPDATE work_items SET status=CASE WHEN stage IS NULL THEN 'pending' ELSE 'staged' END,
-      owner=NULL,lease_until=0 WHERE owner=? AND status='running'`).run(owner).changes);
+    return super.interruptOwner(owner, now);
   }
-  list(filter?: { kind?: string }) {
-    return this.db.prepare("SELECT * FROM work_items WHERE (? IS NULL OR kind=?) ORDER BY kind, scope")
-      .all(filter?.kind ?? null, filter?.kind ?? null).map(toItem);
-  }
-  get(kind: string, scope: string) {
-    const row = this.db.prepare("SELECT * FROM work_items WHERE kind=? AND scope=?").get(kind, scope);
-    return row ? toItem(row) : undefined;
-  }
-}
-
-function toItem(row: Record<string, unknown>): WorkItemLike {
-  const text = (value: unknown) => typeof value === "string" ? value : null;
-  return {
-    kind: String(row.kind), scope: String(row.scope), mode: row.mode as "item", status: row.status as WorkStatus,
-    attempt: Number(row.attempt), owner: text(row.owner), leaseUntil: Number(row.lease_until), dueAt: Number(row.due_at),
-    inputRevision: text(row.input_revision), recipeHash: text(row.recipe_hash), stage: text(row.stage),
-    artifactJson: text(row.artifact_json), usageJson: text(row.usage_json), strikes: Number(row.strikes),
-    lastError: text(row.last_error), updatedAt: Number(row.updated_at),
-  };
 }
 
 /* ───────────── Fixture: real People + People Learning state ───────────── */
@@ -240,15 +143,15 @@ type Decide = (prompt: string, handles: string[]) => PeopleShadowProposal;
 
 function scriptedRunner(decide: Decide) {
   const prompts: string[] = [];
-  const runner: StewardRunnerLike = {
-    async complete<T>(request: StewardCompleteRequest): Promise<StewardCompleteResult<T>> {
+  const runner: CompleteRunner = {
+    async complete<T>(request: StewardCompleteRequest<T>): Promise<StewardCompleteResult<T>> {
       assert.equal(request.schema, PEOPLE_SHADOW_PROPOSAL_SCHEMA);
-      const prompt = request.messages.map(m => m.content).join("\n");
+      const prompt = request.userPrompt;
       prompts.push(prompt);
       const handles = [...prompt.matchAll(/\[(ev_\d+)\]/gu)].map(match => match[1]!);
-      return { value: decide(prompt, handles) as T, usage: { requests: 1, inputTokens: 200, outputTokens: 40 } };
+      return { ok: true, data: decide(prompt, handles) as T, backend: "responses_api",
+        usage: { requests: 1, inputTokens: 200, outputTokens: 40 } };
     },
-    async run() { throw new Error("people shadow uses complete only"); },
   };
   return { runner, prompts };
 }
@@ -280,10 +183,10 @@ test("shadow pass: opaque handles, rejected hallucinations, work_items-only writ
       citedHandles: [handles[0]!, handles[0]!], confidence: "low" };
     return { disposition: "revalidated", reason: "trust me", citedHandles: ["ev_99", "/etc/passwd"], confidence: "high" };
   });
-  const store = new TestWorkStore(f.dbPath, 1);
+  const store = new WorkStore(f.dbPath);
   t.after(() => store.close());
   const result = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "steward:test",
-    skipCronResolved: true });
+    skipCronResolved: true, maxStrikes: 1 });
 
   // Manifest read and enqueue: blurb skipped (cron-resolved), four item rows keyed by (manifest, person, assertion).
   assert.deepEqual(result.manifests, [{ manifestId: f.manifest.id, manifestRevision: f.revision, assertions: 4 }]);
@@ -293,7 +196,7 @@ test("shadow pass: opaque handles, rejected hallucinations, work_items-only writ
   assert.equal(result.rejected, 1);
   assert.equal(result.usage.requests, 4);
   assert.equal(result.usage.inputTokens, 800);
-  const items = store.list({ kind: PEOPLE_SHADOW_KIND });
+  const items = store.list(PEOPLE_SHADOW_KIND);
   assert.deepEqual(items.map(i => i.scope).sort(), [recFirst, asyncUpdates, fridayDigest, workingStyle]
     .map(a => `${f.manifest.id}:${f.mira.id}:${a!.id}`).sort());
   for (const item of items) {
@@ -336,7 +239,7 @@ test("shadow pass: opaque handles, rejected hallucinations, work_items-only writ
 
   // Re-running is idempotent: completed/quarantined rows are not re-adjudicated.
   const again = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "steward:test",
-    skipCronResolved: true });
+    skipCronResolved: true, maxStrikes: 1 });
   assert.equal(again.attempted, 0);
   assert.equal(prompts.length, 4);
 
@@ -366,9 +269,8 @@ test("no approved evidence: host stages unresolved without a model call; cross-a
   const tampered = f.manifest.sessions[0]!;
   writeFileSync(tampered.file, JSON.stringify({ sessionId: "s1", accountId: "acct-a", provider: "slack", messages: [] }));
   let calls = 0;
-  const runner: StewardRunnerLike = { complete: async () => { calls += 1; throw new Error("must not be called"); },
-    run: async () => { throw new Error("unused"); } };
-  const store = new TestWorkStore(f.dbPath);
+  const runner: CompleteRunner = { complete: async () => { calls += 1; throw new Error("must not be called"); } };
+  const store = new WorkStore(f.dbPath);
   t.after(() => store.close());
   const result = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
   assert.equal(calls, 0);
@@ -386,33 +288,100 @@ test("no approved evidence: host stages unresolved without a model call; cross-a
 test("provider failure adds no strike; staged proposal resumes at publication without re-running the model", async t => {
   const f = await fixture();
   t.after(f.cleanup);
-  const store = new TestWorkStore(f.dbPath, 1);
+  const store = new WorkStore(f.dbPath);
   t.after(() => store.close());
-  const failing: StewardRunnerLike = {
-    complete: async () => { throw Object.assign(new Error("429 rate limited"), { usage: { requests: 1 } }); },
-    run: async () => { throw new Error("unused"); },
+  const failing: CompleteRunner = {
+    complete: async () => ({ ok: false, code: "transient_provider", error: "Temporary provider failure", retryable: true,
+      usage: { requests: 1 } }),
   };
-  const failed = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failing, owner: "o", maxItems: 1 });
+  const failed = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failing, owner: "o",
+    maxItems: 1, maxStrikes: 1 });
   assert.equal(failed.failed, 1);
   const first = store.list().find(item => item.lastError)!;
   assert.equal(first.status, "pending", "rate limits never quarantine");
   assert.equal(first.strikes, 0);
 
   // Simulate a crash after staging: claim + stage, never commit.
-  const ref = store.claim({ kind: PEOPLE_SHADOW_KIND, scope: first.scope, owner: "crashed", leaseMs: 1, now: 0 })!;
+  const ref = store.claim({ kind: PEOPLE_SHADOW_KIND, scope: first.scope, owner: "crashed", leaseMs: 1, now: 0, ignoreDueAt: true })!;
   const staged: PeopleShadowArtifact = { schemaVersion: 1, manifestId: f.manifest.id, manifestRevision: f.revision,
     personId: f.mira.id, assertionId: first.scope.split(":").at(-1)!, source: "model", evidence: [], proposedAt: new Date().toISOString(),
     proposal: { disposition: "unresolved", reason: "staged before crash", citedHandles: [], confidence: "low" } };
-  store.stageArtifact(ref, "proposal", JSON.stringify(staged), JSON.stringify({ requests: 1 }));
+  store.stageArtifact(ref, { stage: "proposal", artifactJson: JSON.stringify(staged), usageJson: JSON.stringify({ requests: 1 }), now: 0 });
   let calls = 0;
   const { runner } = scriptedRunner((_prompt, handles) => { calls += 1; return { disposition: "revalidated", reason: "ok",
     citedHandles: [handles[0]!], confidence: "medium" }; });
-  const counted: StewardRunnerLike = runner;
-  const resumed = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: counted, owner: "o2" });
+  const resumed = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o2" });
   assert.equal(resumed.items.find(i => i.scope === first.scope)?.outcome, "resumed");
   assert.equal(calls, 4, "the staged item did not spend another model call");
   assert.equal(JSON.parse(store.get(PEOPLE_SHADOW_KIND, first.scope)!.artifactJson!).proposal.reason, "staged before crash");
   assert.equal(store.get(PEOPLE_SHADOW_KIND, first.scope)!.status, "completed");
+});
+
+test("heartbeat keeps a slow model call's lease alive; a lost fence aborts the call instead of publishing", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const store = new WorkStore(f.dbPath);
+  const rival = new WorkStore(f.dbPath);
+  t.after(() => { store.close(); rival.close(); });
+  const running = () => store.list(PEOPLE_SHADOW_KIND).find(item => item.status === "running")!;
+
+  // Slow call outlives the 60ms lease several times over; renewals keep a rival owner out.
+  const slow: CompleteRunner = {
+    async complete<T>(request: StewardCompleteRequest<T>): Promise<StewardCompleteResult<T>> {
+      const handle = /\[(ev_\d+)\]/u.exec(request.userPrompt)![1]!;
+      const scope = running().scope;
+      for (let i = 0; i < 4; i += 1) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        assert.equal(rival.claim({ kind: PEOPLE_SHADOW_KIND, scope, owner: "rival", leaseMs: 60_000 }), undefined, "lease still live");
+      }
+      return { ok: true, backend: "host_llm", usage: { requests: 1 },
+        data: { disposition: "revalidated", reason: "ok", citedHandles: [handle], confidence: "medium" } as T };
+    },
+  };
+  const kept = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: slow, owner: "o",
+    maxItems: 1, leaseMs: 60, heartbeatMs: 10 });
+  assert.equal(kept.completed, 1);
+  assert.equal(kept.items.find(item => item.outcome === "completed")?.outcome, "completed");
+
+  // A newer input revision resets the row mid-call: the heartbeat loses its fence and aborts the model call.
+  let aborted = false;
+  const reset: CompleteRunner = {
+    complete: request => new Promise((_resolve, reject) => {
+      request.signal!.addEventListener("abort", () => { aborted = true; reject(request.signal!.reason); }, { once: true });
+      const item = running();
+      rival.enqueue({ kind: item.kind, scope: item.scope, mode: "item", inputRevision: "newer", recipeHash: item.recipeHash });
+    }),
+  };
+  const lost = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: reset, owner: "o",
+    maxItems: 1, leaseMs: 60_000, heartbeatMs: 5 });
+  assert.equal(aborted, true);
+  assert.equal(lost.failed, 1);
+  assert.ok(lost.items.some(item => item.outcome === "failed" && item.detail === "fence_lost"));
+  assert.equal(store.list(PEOPLE_SHADOW_KIND).filter(item => item.inputRevision === "newer" && item.status === "pending").length, 1,
+    "the fenced-out attempt published nothing over the reset row");
+});
+
+test("runner failures: invalid output strikes toward quarantine, missing credentials stop the pass without strikes", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  let calls = 0;
+  const failWith = (code: "invalid_output" | "missing_credentials"): CompleteRunner => ({
+    complete: async () => { calls += 1; return { ok: false, code, error: code, retryable: false, usage: { requests: code === "invalid_output" ? 1 : 0 } }; },
+  });
+  const invalid = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failWith("invalid_output"),
+    owner: "o", maxStrikes: 1 });
+  assert.equal(invalid.failed, 5);
+  assert.ok(store.list(PEOPLE_SHADOW_KIND).every(item => item.status === "quarantined" && item.strikes === 1));
+
+  for (const item of store.list(PEOPLE_SHADOW_KIND)) assert.equal(store.requeue(item.kind, item.scope), true);
+  calls = 0;
+  const missing = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failWith("missing_credentials"),
+    owner: "o", maxStrikes: 1 });
+  assert.equal(calls, 1, "a systemic failure stops the pass after the first item");
+  assert.equal(missing.failed, 1);
+  assert.ok(store.list(PEOPLE_SHADOW_KIND).every(item => item.status === "pending" && item.strikes === 0));
 });
 
 test("background slots are process-wide and single-use releases", () => {
@@ -442,18 +411,17 @@ test("gateway_stop interrupts the owner synchronously before aborting: 0 strikes
   } as unknown as OpenClawPluginApi;
   let entered!: () => void;
   const inFlight = new Promise<void>(resolve => { entered = resolve; });
-  const blocking: StewardRunnerLike = {
+  const blocking: CompleteRunner = {
     complete: request => new Promise((_resolve, reject) => {
       request.signal!.addEventListener("abort", () => { order.push("abort"); reject(request.signal!.reason); }, { once: true });
       entered();
     }),
-    run: async () => { throw new Error("unused"); },
   };
-  const stores: TestWorkStore[] = [];
+  const stores: RecordingWorkStore[] = [];
   const runtime = registerStewardRuntime(api, {
-    config: { enabled: true, peopleShadow: { enabled: true }, intervalMinutes: 60 },
+    config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: true } }),
     createRunner: () => blocking,
-    openWorkStore: path => { const store = new TestWorkStore(path, 1, () => order.push("interrupt")); stores.push(store); return store; },
+    openWorkStore: path => { const store = new RecordingWorkStore(path, () => order.push("interrupt")); stores.push(store); return store; },
     dbPathForAgent: () => f.dbPath,
     listAgents: () => ["main"],
     shutdownGraceMs: 1_000,
@@ -470,9 +438,9 @@ test("gateway_stop interrupts the owner synchronously before aborting: 0 strikes
   const result = runtime.lastResults().get("main")!;
   assert.equal(result.interrupted, true);
   // Inspect persisted rows through a fresh connection: graceful stop added zero strikes and nothing quarantined.
-  const check = new TestWorkStore(f.dbPath);
+  const check = new WorkStore(f.dbPath);
   t.after(() => check.close());
-  const rows = check.list({ kind: PEOPLE_SHADOW_KIND });
+  const rows = check.list(PEOPLE_SHADOW_KIND);
   assert.equal(rows.length, 5);
   assert.ok(rows.every(row => row.strikes === 0 && row.status === "pending" && row.owner === null));
   assert.ok(!order.some(entry => entry.startsWith("warn:")), "graceful stop is not logged as a failure");
@@ -482,7 +450,7 @@ test("disabled runtime registers only the CLI", () => {
   const events: string[] = [];
   const api = { registrationMode: "full", config: {}, logger: { warn() {} },
     on: (event: string) => events.push(event), registerCli: () => {} } as unknown as OpenClawPluginApi;
-  const runtime = registerStewardRuntime(api, { config: { enabled: true, peopleShadow: { enabled: false } },
+  const runtime = registerStewardRuntime(api, { config: resolveStewardConfig({ enabled: true }),
     createRunner: () => undefined, openWorkStore: () => { throw new Error("unused"); } });
   assert.equal(runtime.enabled, false);
   assert.deepEqual(events, []);

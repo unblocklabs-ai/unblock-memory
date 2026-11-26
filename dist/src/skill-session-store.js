@@ -16,10 +16,18 @@ export class SkillSessionStore {
         added_turn INTEGER NOT NULL,
         added_at_ms INTEGER NOT NULL,
         last_used_at_ms INTEGER NOT NULL,
+        opened_at_ms INTEGER,
         PRIMARY KEY (session_scope, canonical_path)
       );
       CREATE INDEX IF NOT EXISTS idx_skill_whisper_sessions_scope
         ON skill_whisper_sessions(session_scope, added_at_ms ASC);`);
+            const hasOpenedAt = () => this.#db.prepare("PRAGMA table_info(skill_whisper_sessions)").all()
+                .some(row => row.name === "opened_at_ms");
+            if (!hasOpenedAt())
+                immediateTransaction(this.#db, () => {
+                    if (!hasOpenedAt())
+                        this.#db.exec("ALTER TABLE skill_whisper_sessions ADD COLUMN opened_at_ms INTEGER");
+                });
         }
         catch (error) {
             this.#db.close();
@@ -28,7 +36,7 @@ export class SkillSessionStore {
     }
     list(scope) {
         return this.#db.prepare(`SELECT canonical_path, skill_name, skill_description, source, score,
-        added_turn, added_at_ms, last_used_at_ms
+        added_turn, added_at_ms, last_used_at_ms, opened_at_ms
       FROM skill_whisper_sessions WHERE session_scope = ?
       ORDER BY added_at_ms ASC, canonical_path ASC`).all(scope).map(row => ({
             canonicalPath: String(row.canonical_path),
@@ -39,6 +47,7 @@ export class SkillSessionStore {
             addedTurn: Number(row.added_turn),
             addedAtMs: Number(row.added_at_ms),
             lastUsedAtMs: Number(row.last_used_at_ms),
+            openedAtMs: row.opened_at_ms === null ? undefined : Number(row.opened_at_ms),
         }));
     }
     upsert(scope, entries) {
@@ -49,15 +58,16 @@ export class SkillSessionStore {
     #write(scope, entries) {
         const statement = this.#db.prepare(`INSERT INTO skill_whisper_sessions (
       session_scope, canonical_path, skill_name, skill_description, source, score,
-      added_turn, added_at_ms, last_used_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      added_turn, added_at_ms, last_used_at_ms, opened_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (session_scope, canonical_path) DO UPDATE SET
       skill_name = excluded.skill_name,
       skill_description = excluded.skill_description,
       last_used_at_ms = excluded.last_used_at_ms,
+      opened_at_ms = coalesce(excluded.opened_at_ms, skill_whisper_sessions.opened_at_ms),
       score = coalesce(excluded.score, skill_whisper_sessions.score)`);
         for (const entry of entries) {
-            statement.run(scope, entry.canonicalPath, entry.name, entry.description, entry.source, entry.score ?? null, entry.addedTurn, entry.addedAtMs, entry.lastUsedAtMs);
+            statement.run(scope, entry.canonicalPath, entry.name, entry.description, entry.source, entry.score ?? null, entry.addedTurn, entry.addedAtMs, entry.lastUsedAtMs, entry.openedAtMs ?? null);
         }
     }
     rebindSession(scopes, successor, entries) {

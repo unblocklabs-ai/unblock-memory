@@ -19,11 +19,11 @@ export declare class RetrievalTelemetry {
                 outcomes: {
                     cancelled?: number | undefined;
                     ok?: number | undefined;
+                    skipped?: number | undefined;
                     partial?: number | undefined;
                     empty?: number | undefined;
                     failed?: number | undefined;
                     timed_out?: number | undefined;
-                    skipped?: number | undefined;
                     degraded?: number | undefined;
                 };
                 slowestRecent: {

@@ -3,11 +3,13 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative, isAbsolute } from "node:path";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
+import { DEFAULTS } from "./defaults.js";
 import { jsonHash } from "./json-hash.js";
 import { record, nonBlank } from "./guards.js";
 import type { ReviewAssertion, ReviewManifest } from "./people-learning-inventory.js";
 import { manifestRevision, LEARNING_RECEIPT_SCHEMA, type LearningReceipt } from "./people-learning-store.js";
-import type { StewardRunnerLike, StewardUsage, WorkItemLike, WorkRef, WorkStoreLike } from "./steward-runtime.js";
+import type { StewardRunner, StewardUsage } from "./steward-runner.js";
+import { startWorkHeartbeat, type WorkClaim, type WorkItem, type WorkStore } from "./work-store.js";
 
 // Proposal-only shadow of the People Learning cron. The cron stays the sole production
 // publisher: this module reads immutable manifests, never calls inventory/inspect/signals,
@@ -19,7 +21,7 @@ const PROPOSAL_STAGE = "proposal";
 const PROMPT_VERSION = 1;
 const DEFAULT_MAX_HANDLES = 16;
 const DEFAULT_EXCERPT_CHARS = 800;
-const DEFAULT_LEASE_MS = 5 * 60_000;
+const DEFAULT_LEASE_MS = DEFAULTS.steward.leaseMs;
 const MAX_EXPORT_BYTES = 4 * 1024 * 1024;
 
 const DISPOSITIONS = ["revalidated", "corrected", "retired", "unresolved"] as const;
@@ -72,14 +74,21 @@ export type PeopleShadowPassOptions = {
   /** Agent state `unblock-memory.sqlite`; opened read-only here. */
   dbPath: string;
   agentId: string;
-  workStore: WorkStoreLike;
-  runner: StewardRunnerLike;
+  /** Must be a connection on `dbPath`; proposals are staged and completed through its fence only. */
+  workStore: WorkStore;
+  runner: Pick<StewardRunner, "complete">;
   owner: string;
   /** Explicit run ids; default is the latest non-pending nightly and weekly manifests. */
   manifestIds?: string[];
   /** Approved private export root; default `<state>/people-learning/exports`. */
   exportRoot?: string;
   leaseMs?: number;
+  /** Lease renewal cadence during a model call; default one third of `leaseMs`. */
+  heartbeatMs?: number;
+  /** Strikes before a rejected or schema-invalid item quarantines (WorkStore default when omitted). */
+  maxStrikes?: number;
+  /** Per-proposal model deadline (`steward.peopleShadow.timeoutMs`). */
+  timeoutMs?: number;
   /** Maximum model calls this pass. */
   maxItems?: number;
   maxHandles?: number;
@@ -320,26 +329,29 @@ function addUsage(totals: UsageTotals, usage: Partial<StewardUsage> | undefined)
 
 /* ───────────────────────────── Pass ───────────────────────────── */
 
-class ProposalSchemaError extends Error {
-  override name = "ProposalSchemaError";
-}
-
 function safeError(error: unknown): string {
   const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
   return clip(text.replace(/\s+/gu, " "), 300);
 }
 
-function tryFail(store: WorkStoreLike, ref: WorkRef, reason: string, strike: boolean): void {
-  try { store.fail(ref, reason, { strike }); } catch { /* Fence lost: another owner (or interruptOwner) already released it. */ }
+function tryFail(store: WorkStore, claim: WorkClaim, reason: string, strike: boolean, maxStrikes: number | undefined): void {
+  try { store.fail(claim, { error: reason, addStrike: strike, maxStrikes }); }
+  catch { /* Fence lost: another owner (or interruptOwner) already released it. */ }
 }
 
-function commit(store: WorkStoreLike, ref: WorkRef): boolean {
+function commit(store: WorkStore, claim: WorkClaim): boolean {
   try {
-    // Proposal-only: the domain callback deliberately performs no domain writes.
-    store.commitWithDomain(store.db, ref, () => undefined);
+    // Proposal-only: the domain callback deliberately performs no domain writes. Keep the staged artifact:
+    // the completed row's artifact_json IS the shadow proposal the report compares against the cron.
+    store.commitWithDomain(claim, { keepArtifact: true }, () => undefined);
     return true;
   } catch { return false; }
 }
+
+/** Codes that say nothing about this item: stop the pass instead of burning through every assertion. */
+const SYSTEMIC_FAILURES = new Set(["missing_credentials", "lifecycle_reload"]);
+/** Codes that are this item's fault (bad output, oversized packet): strike toward quarantine. */
+const ITEM_FAILURES = new Set(["invalid_output", "context_overflow"]);
 
 /**
  * One shadow pass: enqueue one `item` row per manifest assertion, then adjudicate up to `maxItems`
@@ -377,6 +389,8 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
 
   const exportRoot = options.exportRoot ?? join(dirname(options.dbPath), "people-learning", "exports");
   const maxItems = options.maxItems ?? Number.POSITIVE_INFINITY;
+  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
+  const maxStrikes = options.maxStrikes;
   for (const task of tasks) {
     if (options.signal?.aborted) { result.interrupted = true; break; }
     const existing = options.workStore.get(PEOPLE_SHADOW_KIND, task.scope);
@@ -388,12 +402,11 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
     // Resume a staged proposal at publication without re-running the model.
     const resumable = existing.status === "staged" && existing.stage === PROPOSAL_STAGE && existing.artifactJson;
     if (!resumable && result.attempted >= maxItems) break;
-    const ref = options.workStore.claim({ kind: PEOPLE_SHADOW_KIND, scope: task.scope, owner: options.owner,
-      leaseMs: options.leaseMs ?? DEFAULT_LEASE_MS, now: now() });
-    if (!ref) { result.items.push({ scope: task.scope, outcome: "busy" }); continue; }
-    const claimed = options.workStore.get(PEOPLE_SHADOW_KIND, task.scope);
-    if (claimed?.stage === PROPOSAL_STAGE && claimed.artifactJson) {
-      if (commit(options.workStore, ref)) {
+    const claim = options.workStore.claim({ kind: PEOPLE_SHADOW_KIND, scope: task.scope, mode: "item", owner: options.owner,
+      leaseMs, maxStrikes, now: now() });
+    if (!claim) { result.items.push({ scope: task.scope, outcome: "busy" }); continue; }
+    if (claim.stage === PROPOSAL_STAGE && claim.artifactJson) {
+      if (commit(options.workStore, claim)) {
         result.completed += 1;
         result.items.push({ scope: task.scope, outcome: "resumed" });
       } else result.items.push({ scope: task.scope, outcome: "failed", detail: "commit_fenced" });
@@ -414,47 +427,71 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
       const artifact: PeopleShadowArtifact = { ...artifactBase, source: "host", evidence: [], proposedAt: new Date(now()).toISOString(),
         proposal: { disposition: "unresolved", reason: "No approved in-account evidence excerpts for this person", citedHandles: [], confidence: "low" } };
       try {
-        options.workStore.stageArtifact(ref, PROPOSAL_STAGE, JSON.stringify(artifact), JSON.stringify({ requests: 0 }));
-        if (commit(options.workStore, ref)) { result.completed += 1; result.items.push({ scope: task.scope, outcome: "host_unresolved" }); }
+        const staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
+          usageJson: JSON.stringify({ requests: 0 }), now: now() });
+        if (commit(options.workStore, staged)) { result.completed += 1; result.items.push({ scope: task.scope, outcome: "host_unresolved" }); }
         else result.items.push({ scope: task.scope, outcome: "failed", detail: "commit_fenced" });
       } catch (error) { result.items.push({ scope: task.scope, outcome: "failed", detail: safeError(error) }); }
       continue;
     }
 
     result.attempted += 1;
-    let proposal: PeopleShadowProposal;
-    let usage: StewardUsage | undefined;
+    // Renew the lease while the model thinks; a lost fence aborts the call instead of publishing late.
+    const fence = new AbortController();
+    const heartbeat = startWorkHeartbeat(options.workStore, claim, {
+      intervalMs: Math.max(1, options.heartbeatMs ?? Math.floor(leaseMs / 3)), leaseMs,
+      onFenceLost: error => fence.abort(error),
+    });
+    const signal = options.signal ? AbortSignal.any([options.signal, fence.signal]) : fence.signal;
+    let completion: Awaited<ReturnType<PeopleShadowPassOptions["runner"]["complete"]>> | undefined;
+    let thrown: unknown;
     try {
-      const completion = await options.runner.complete<PeopleShadowProposal>({
+      completion = await options.runner.complete<PeopleShadowProposal>({
         purpose: "people_shadow",
         systemPrompt: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: buildPrompt(task.manifest, task.assertion, evidence) }],
+        userPrompt: buildPrompt(task.manifest, task.assertion, evidence),
         schema: PEOPLE_SHADOW_PROPOSAL_SCHEMA,
-        ...(options.signal ? { signal: options.signal } : {}),
+        ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+        signal,
       });
-      usage = completion.usage;
-      addUsage(result.usage, usage);
-      if (!Value.Check(PEOPLE_SHADOW_PROPOSAL_SCHEMA, completion.value)) throw new ProposalSchemaError("proposal failed schema validation");
-      proposal = completion.value;
-    } catch (error) {
-      addUsage(result.usage, (error as { usage?: StewardUsage } | undefined)?.usage);
-      if (options.signal?.aborted) {
-        // Graceful stop: interruptOwner already released the lease; never add a strike.
-        tryFail(options.workStore, ref, "interrupted", false);
-        result.interrupted = true;
-        result.items.push({ scope: task.scope, outcome: "interrupted" });
-        break;
-      }
-      // Provider/credential/rate-limit failures are not the item's fault: no strike.
-      tryFail(options.workStore, ref, safeError(error), error instanceof ProposalSchemaError);
+    } catch (error) { thrown = error; }
+    finally { heartbeat.stop(); }
+    const usage: StewardUsage | undefined = completion?.usage ?? (thrown as { usage?: StewardUsage } | undefined)?.usage;
+    addUsage(result.usage, usage);
+    if (options.signal?.aborted) {
+      // Graceful stop: interruptOwner already released the lease; never add a strike.
+      tryFail(options.workStore, claim, "interrupted", false, maxStrikes);
+      result.interrupted = true;
+      result.items.push({ scope: task.scope, outcome: "interrupted" });
+      break;
+    }
+    if (fence.signal.aborted) {
+      // Reclaimed, reset or interrupted elsewhere: this attempt can no longer write.
       result.failed += 1;
-      result.items.push({ scope: task.scope, outcome: "failed", detail: safeError(error) });
+      result.items.push({ scope: task.scope, outcome: "failed", detail: "fence_lost" });
       continue;
     }
+    if (!completion?.ok) {
+      const code = completion?.code ?? "provider_error";
+      const detail = completion ? `${completion.code}: ${completion.error}` : safeError(thrown);
+      // Provider/credential/rate-limit failures are not the item's fault: no strike.
+      tryFail(options.workStore, claim, detail, ITEM_FAILURES.has(code), maxStrikes);
+      result.failed += 1;
+      result.items.push({ scope: task.scope, outcome: "failed", detail });
+      if (SYSTEMIC_FAILURES.has(code)) break;
+      continue;
+    }
+    if (!Value.Check(PEOPLE_SHADOW_PROPOSAL_SCHEMA, completion.data)) {
+      tryFail(options.workStore, claim, "proposal failed schema validation", true, maxStrikes);
+      result.rejected += 1;
+      result.items.push({ scope: task.scope, outcome: "rejected", detail: "schema_invalid" });
+      continue;
+    }
+    const proposal = completion.data;
 
     const verified = verifyProposal(proposal, minted);
     if (!verified.ok) {
-      tryFail(options.workStore, ref, verified.reason, true);
+      tryFail(options.workStore, claim, verified.reason, true, maxStrikes);
       result.rejected += 1;
       result.items.push({ scope: task.scope, outcome: "rejected", detail: verified.reason });
       continue;
@@ -466,14 +503,16 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
       ...(usage ? { usage } : {}),
       proposedAt: new Date(now()).toISOString(),
     };
+    let staged: WorkClaim;
     try {
-      options.workStore.stageArtifact(ref, PROPOSAL_STAGE, JSON.stringify(artifact), JSON.stringify(usage ?? { requests: 1 }));
+      staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
+        usageJson: JSON.stringify(usage ?? { requests: 1 }), now: now() });
     } catch (error) {
       result.failed += 1;
       result.items.push({ scope: task.scope, outcome: "failed", detail: safeError(error) });
       continue;
     }
-    if (commit(options.workStore, ref)) {
+    if (commit(options.workStore, staged)) {
       result.completed += 1;
       result.items.push({ scope: task.scope, outcome: "completed" });
     } else result.items.push({ scope: task.scope, outcome: "staged", detail: "commit_fenced" });
@@ -519,7 +558,7 @@ function parseScope(scope: string): { manifestId: string; personId: string; asse
   return { manifestId: scope.slice(0, middle), personId: scope.slice(middle + 1, last), assertionId: scope.slice(last + 1) };
 }
 
-type WorkRow = Pick<WorkItemLike, "scope" | "status" | "inputRevision" | "artifactJson" | "usageJson" | "strikes" | "lastError">;
+type WorkRow = Pick<WorkItem, "scope" | "status" | "inputRevision" | "artifactJson" | "usageJson" | "strikes" | "lastError">;
 
 /** Read-only side-by-side of shadow proposals vs the cron's receipt for the same manifest revision. */
 export function buildPeopleShadowReport(dbPath: string, manifestId?: string): PeopleShadowReport {
@@ -534,7 +573,7 @@ export function buildPeopleShadowReport(dbPath: string, manifestId?: string): Pe
     const rows: WorkRow[] = db.prepare(`SELECT scope, status, input_revision inputRevision, artifact_json artifactJson,
       usage_json usageJson, strikes, last_error lastError FROM work_items WHERE kind=? ORDER BY scope`).all(PEOPLE_SHADOW_KIND)
       .map(row => ({
-        scope: String(row.scope), status: String(row.status) as WorkItemLike["status"],
+        scope: String(row.scope), status: String(row.status) as WorkItem["status"],
         inputRevision: typeof row.inputRevision === "string" ? row.inputRevision : null,
         artifactJson: typeof row.artifactJson === "string" ? row.artifactJson : null,
         usageJson: typeof row.usageJson === "string" ? row.usageJson : null,

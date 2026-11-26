@@ -4,7 +4,7 @@ import { DEFAULTS } from "./defaults.js";
 import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
 // Loaded by the background writer worker with plain Node resolution:
 // this module and its imports must stay free of `openclaw`.
-export const RECALL_LEDGER_SCHEMA_VERSION = 1;
+export const RECALL_LEDGER_SCHEMA_VERSION = 2;
 const MAX_RETENTION_DAYS = 3650;
 /** Parses YYYY-MM-DD.md filenames (both `2026-11-20.md` under a rooted `memory/` source and `memory/2026-11-20.md`). */
 export function parseDailyFilenameDateMs(path) {
@@ -134,25 +134,61 @@ CREATE INDEX IF NOT EXISTS idx_recall_hits_session_time ON recall_hits (target_s
 CREATE INDEX IF NOT EXISTS idx_recall_hits_disp_time ON recall_hits (disposition, hit_at_ms);
 CREATE INDEX IF NOT EXISTS idx_recall_reads_time ON recall_reads (read_at_ms);
 CREATE INDEX IF NOT EXISTS idx_recall_reads_path_time ON recall_reads (source_path, read_at_ms);
+
+CREATE TABLE IF NOT EXISTS skill_routing_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_key TEXT NOT NULL UNIQUE,
+  created_at_ms INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  session_id TEXT,
+  session_key TEXT,
+  run_id TEXT,
+  surface TEXT,
+  catalog_revision TEXT,
+  mode TEXT NOT NULL CHECK(mode IN ('direct','search','fallback')),
+  candidate_count INTEGER NOT NULL,
+  emitted_json TEXT NOT NULL CHECK(json_valid(emitted_json)),
+  scores_json TEXT NOT NULL CHECK(json_valid(scores_json)),
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  elapsed_ms REAL,
+  outcome TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_skill_routing_agent_time ON skill_routing_events (agent_id, created_at_ms);
+
+CREATE TABLE IF NOT EXISTS skill_open_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_ms INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  session_id TEXT,
+  session_key TEXT,
+  run_id TEXT,
+  skill_path TEXT NOT NULL,
+  tool_name TEXT NOT NULL CHECK(tool_name IN ('read','skills_read')),
+  was_whispered INTEGER NOT NULL CHECK(was_whispered IN (0,1)),
+  was_pinned INTEGER NOT NULL CHECK(was_pinned IN (0,1))
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_skill_open_agent_time ON skill_open_events (agent_id, created_at_ms);
 `;
 function ensureRecallLedgerSchema(db) {
-    const row = db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'").get();
-    if (row !== undefined) {
-        if (Number(row.version) !== RECALL_LEDGER_SCHEMA_VERSION) {
-            throw new Error(`Unsupported recall_ledger schema version: ${String(row.version)}`);
-        }
+    const version = db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'");
+    if (version.get()?.version === RECALL_LEDGER_SCHEMA_VERSION)
         return;
-    }
     immediateTransaction(db, () => {
-        const inside = db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'").get();
-        if (inside !== undefined) {
-            if (Number(inside.version) !== RECALL_LEDGER_SCHEMA_VERSION) {
-                throw new Error(`Unsupported recall_ledger schema version: ${String(inside.version)}`);
-            }
+        const current = version.get()?.version;
+        if (current === RECALL_LEDGER_SCHEMA_VERSION)
             return;
+        if (current !== undefined && current !== 1) {
+            throw new Error(`Unsupported recall_ledger schema version: ${String(current)}`);
         }
         db.exec(SCHEMA_SQL);
-        db.prepare("INSERT INTO memory_schema (component, version) VALUES ('recall_ledger', ?)").run(RECALL_LEDGER_SCHEMA_VERSION);
+        const columns = db.prepare("PRAGMA table_info(recall_queries)").all();
+        for (const column of ["input_tokens", "output_tokens"]) {
+            if (!columns.some(row => row.name === column))
+                db.exec(`ALTER TABLE recall_queries ADD COLUMN ${column} INTEGER`);
+        }
+        db.prepare(`INSERT INTO memory_schema (component, version) VALUES ('recall_ledger', ?)
+      ON CONFLICT(component) DO UPDATE SET version = excluded.version`).run(RECALL_LEDGER_SCHEMA_VERSION);
     });
 }
 export function openRecallLedger(path) {
@@ -200,14 +236,14 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
       provider, account_id, sender_id, channel_id, thread_id, chat_type,
       lex_query, vec_query, query_fallback,
       corpora_json, session_filter_json, ranking_mode, fallback_reason, decision_model, min_usefulness,
-      outcome, parent_query_id
+      outcome, parent_query_id, input_tokens, output_tokens
     ) VALUES (
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
-      ?, ?
+      ?, ?, ?, ?
     )
     ON CONFLICT(event_key) DO NOTHING
   `);
@@ -235,6 +271,13 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_key) DO NOTHING
   `);
+    const insertRouting = db.prepare(`INSERT INTO skill_routing_events (
+    event_key, created_at_ms, agent_id, session_id, session_key, run_id, surface, catalog_revision,
+    mode, candidate_count, emitted_json, scores_json, input_tokens, output_tokens, elapsed_ms, outcome
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING`);
+    const insertOpen = db.prepare(`INSERT INTO skill_open_events (
+    created_at_ms, agent_id, session_id, session_key, run_id, skill_path, tool_name, was_whispered, was_pinned
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     let written = 0;
     let pruned = 0;
     const fallbackNow = Math.trunc(options.nowMs ?? Date.now());
@@ -243,7 +286,7 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
             if (event.kind === "query") {
                 const r = event.record;
                 const createdAtMs = requiredInt(r.createdAtMs, fallbackNow);
-                const result = insertQuery.run(r.eventKey, createdAtMs, r.agentId, r.source, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.provider ?? null, r.accountId ?? null, r.senderId ?? null, r.channelId ?? null, r.threadId ?? null, r.chatType ?? null, r.lexQuery ?? null, r.vecQuery ?? null, r.queryFallback ? 1 : 0, JSON.stringify(r.corpora), r.sessionFilterJson ?? null, r.rankingMode, r.fallbackReason ?? null, r.decisionModel ?? null, finiteOrNull(r.minUsefulness), r.outcome, positiveIntOrNull(r.parentQueryId));
+                const result = insertQuery.run(r.eventKey, createdAtMs, r.agentId, r.source, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.provider ?? null, r.accountId ?? null, r.senderId ?? null, r.channelId ?? null, r.threadId ?? null, r.chatType ?? null, r.lexQuery ?? null, r.vecQuery ?? null, r.queryFallback ? 1 : 0, JSON.stringify(r.corpora), r.sessionFilterJson ?? null, r.rankingMode, r.fallbackReason ?? null, r.decisionModel ?? null, finiteOrNull(r.minUsefulness), r.outcome, positiveIntOrNull(r.parentQueryId), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens));
                 if (Number(result.changes) > 0) {
                     written++;
                     const queryId = Number(result.lastInsertRowid);
@@ -254,17 +297,27 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
                     }
                 }
             }
-            else {
+            else if (event.kind === "read") {
                 const r = event.record;
                 const result = insertRead.run(r.eventKey, requiredInt(r.readAtMs, fallbackNow), r.agentId, r.sessionId ?? null, r.runId ?? null, r.sourcePath, truncIntOrNull(r.startLine), truncIntOrNull(r.lineCount), r.status);
                 if (Number(result.changes) > 0)
                     written++;
+            }
+            else if (event.kind === "skill_routing") {
+                const r = event.record;
+                written += Number(insertRouting.run(r.eventKey, r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.surface ?? null, r.catalogRevision ?? null, r.mode, r.candidateCount, JSON.stringify(r.emitted), JSON.stringify(r.scores), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), finiteOrNull(r.elapsedMs), r.outcome).changes);
+            }
+            else {
+                const r = event.record;
+                written += Number(insertOpen.run(r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.skillPath, r.toolName, Number(r.wasWhispered), Number(r.wasPinned)).changes);
             }
         }
         if (options.prune && options.retentionDays && options.retentionDays > 0) {
             const cutoff = Math.trunc((options.nowMs ?? Date.now()) - options.retentionDays * 86_400_000);
             pruned += Number(db.prepare("DELETE FROM recall_queries WHERE created_at_ms < ?").run(cutoff).changes);
             pruned += Number(db.prepare("DELETE FROM recall_reads WHERE read_at_ms < ?").run(cutoff).changes);
+            pruned += Number(db.prepare("DELETE FROM skill_routing_events WHERE created_at_ms < ?").run(cutoff).changes);
+            pruned += Number(db.prepare("DELETE FROM skill_open_events WHERE created_at_ms < ?").run(cutoff).changes);
         }
     });
     return { written, pruned };

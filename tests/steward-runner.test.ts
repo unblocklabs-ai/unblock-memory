@@ -52,7 +52,8 @@ test("config defaults, nested overrides and strict boundaries", () => {
     { peopleShadow: { intervalMinutes: 1441 } }, { peopleShadow: { maxItemsPerRun: 0 } }, { peopleShadow: { timeoutMs: 180001 } }]) {
     assert.throws(() => resolveStewardConfig(bad));
   }
-  for (const endpoint of ["not a URL", "file:///private", "https://u:p@x.test", "https://x.test/?", "https://x.test/#fragment"]) {
+  for (const endpoint of ["not a URL", "file:///private", "https://u:p@x.test", "https://x.test/?", "https://x.test/#fragment",
+    "http://remote.example/v1/responses"]) {
     assert.throws(() => resolveStewardConfig({ endpoint }), /endpoint/);
   }
 });

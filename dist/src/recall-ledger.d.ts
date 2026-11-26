@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-export declare const RECALL_LEDGER_SCHEMA_VERSION = 1;
+export declare const RECALL_LEDGER_SCHEMA_VERSION = 2;
 export type RecallLedgerConfig = {
     enabled: boolean;
     retentionDays: number;
@@ -66,6 +66,8 @@ export type RecallQueryRecord = {
     minUsefulness?: number;
     outcome: RecallQueryOutcome;
     parentQueryId?: number;
+    inputTokens?: number;
+    outputTokens?: number;
     hits: readonly RecallHitRecord[];
 };
 type RecallReadRecord = {
@@ -79,12 +81,48 @@ type RecallReadRecord = {
     lineCount?: number;
     status: "ok" | "not_found" | "unavailable";
 };
+type SkillEventContext = {
+    createdAtMs: number;
+    agentId: string;
+    sessionId?: string;
+    sessionKey?: string;
+    runId?: string;
+};
+export type SkillRoutingRecord = SkillEventContext & {
+    eventKey: string;
+    surface?: string;
+    catalogRevision?: string;
+    mode: "direct" | "search" | "fallback";
+    candidateCount: number;
+    emitted: readonly string[];
+    scores: readonly {
+        path: string;
+        name: string;
+        score: number;
+    }[];
+    inputTokens?: number;
+    outputTokens?: number;
+    elapsedMs?: number;
+    outcome: string;
+};
+type SkillOpenRecord = SkillEventContext & {
+    skillPath: string;
+    toolName: "read" | "skills_read";
+    wasWhispered: boolean;
+    wasPinned: boolean;
+};
 export type RecallLedgerEvent = {
     kind: "query";
     record: RecallQueryRecord;
 } | {
     kind: "read";
     record: RecallReadRecord;
+} | {
+    kind: "skill_routing";
+    record: SkillRoutingRecord;
+} | {
+    kind: "skill_open";
+    record: SkillOpenRecord;
 };
 export type RecallPersonIdentity = {
     provider: string;

@@ -478,3 +478,35 @@ test("an explicit Skill Whisperer enable without a skills corpus warns instead o
     assert.equal(hooks.includes("before_prompt_build"), false);
   }
 });
+
+test("steward: memory-steward CLI always registers; deep_thought and the shadow loop only when explicitly enabled", () => {
+  const register = (pluginConfig: Record<string, unknown>, registrationMode = "full") => {
+    const tools: string[] = [], cli: string[] = [], hooks: string[] = [];
+    registerUnblockMemory({
+      pluginConfig, registrationMode, config: {},
+      on(name: string) { hooks.push(name); },
+      registerCli(_register: unknown, options?: { descriptors?: { name: string }[] }) {
+        cli.push(...(options?.descriptors ?? []).map(descriptor => descriptor.name));
+      },
+      registerService() {}, registerGatewayMethod() {}, registerMemoryCapability() {},
+      registerTool(_factory: unknown, options: { names: string[] }) { tools.push(...options.names); },
+      logger: { warn() {}, info() {}, debug() {}, error() {} },
+    } as unknown as OpenClawPluginApi);
+    return { tools, cli, hooks };
+  };
+  const off = register({});
+  assert.ok(off.cli.includes("memory-steward"));
+  assert.equal(off.tools.includes("deep_thought"), false);
+  // Section enabled without a sub-feature, or a sub-feature without the master switch, stays inert.
+  assert.equal(register({ steward: { enabled: true } }).tools.includes("deep_thought"), false);
+  assert.equal(register({ steward: { deepThought: { enabled: true } } }).tools.includes("deep_thought"), false);
+  const on = register({ steward: { enabled: true, deepThought: { enabled: true } } });
+  assert.deepEqual(on.tools.filter(name => name === "deep_thought"), ["deep_thought"]);
+  const metadata = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }, "cli-metadata");
+  assert.ok(metadata.cli.includes("memory-steward"), "CLI descriptors are available to cli-metadata loads");
+  assert.equal(metadata.hooks.length, 0, "cli-metadata never starts background work");
+  const shadowHooks = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }).hooks;
+  const quietHooks = register({ steward: { enabled: true } }).hooks;
+  assert.equal(shadowHooks.filter(name => name === "gateway_start").length, quietHooks.filter(name => name === "gateway_start").length + 1,
+    "the People shadow loop adds exactly one gateway_start hook");
+});

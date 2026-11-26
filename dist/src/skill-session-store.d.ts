@@ -7,6 +7,7 @@ export type ActiveSkillEntry = {
     addedTurn: number;
     addedAtMs: number;
     lastUsedAtMs: number;
+    openedAtMs?: number;
 };
 export declare class SkillSessionStore {
     #private;

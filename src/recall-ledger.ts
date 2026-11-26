@@ -142,7 +142,7 @@ export type SkillRoutingRecord = SkillEventContext & {
   outcome: string;
 };
 
-export type SkillOpenRecord = SkillEventContext & {
+type SkillOpenRecord = SkillEventContext & {
   skillPath: string;
   toolName: "read" | "skills_read";
   wasWhispered: boolean;

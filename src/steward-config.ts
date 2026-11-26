@@ -2,11 +2,11 @@ import type { DecisionModelPluginConfig } from "./config.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 import { isRecord } from "./guards.js";
 
-export type StewardDeepThoughtConfig = {
+type StewardDeepThoughtConfig = {
   enabled: boolean; maxTurns: number; maxToolCalls: number; maxConcurrent: number;
   timeoutMs: number; maxToolResultChars: number; maxInputTokens: number;
 };
-export type StewardPeopleShadowConfig = {
+type StewardPeopleShadowConfig = {
   enabled: boolean; intervalMinutes: number; maxItemsPerRun: number; timeoutMs: number;
 };
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -16,7 +16,7 @@ export type StewardConfig = {
   deepThought: StewardDeepThoughtConfig; peopleShadow: StewardPeopleShadowConfig;
 };
 
-export const DEFAULT_STEWARD_CONFIG: StewardConfig = {
+const DEFAULT_STEWARD_CONFIG: StewardConfig = {
   enabled: false, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
   maxActiveBackground: 1,
   deepThought: { enabled: false, maxTurns: 6, maxToolCalls: 16, maxConcurrent: 2, timeoutMs: 60_000,
@@ -49,7 +49,11 @@ function text(value: unknown, key: string) {
 function endpoint(value: unknown) {
   const url = typeof value === "string" && /^https?:\/\//iu.test(value) && !/[\s?#\\]/u.test(value) &&
     !value.split("/")[2]?.includes("@") && URL.canParse(value) ? new URL(value) : undefined;
-  if (!url || url.username || url.password) throw new Error("steward.endpoint must be an HTTP(S) URL without credentials, query or fragment");
+  // Plain HTTP would expose the bearer credential: allow it for loopback only, matching decisionModel.endpoint.
+  const loopback = url && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (!url || url.username || url.password || (url.protocol === "http:" && !loopback)) {
+    throw new Error("steward.endpoint must be an HTTPS (or loopback HTTP) URL without credentials, query or fragment");
+  }
   return url.href.replace(/\/+$/u, "");
 }
 

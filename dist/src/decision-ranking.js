@@ -1,4 +1,5 @@
 import { DEFAULTS } from "./defaults.js";
+import { abortable } from "./abortable.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
 import { selectJudgeConversation } from "./judge-context.js";
 import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, } from "./decision-client.js";
@@ -42,8 +43,10 @@ function qualityQuestions(index) {
 /** Rank independent applicability judgments; only code maps answers to catalog entries. */
 export async function scoreSkillCatalog(params) {
     const { candidates, currentRequest, history, minUsefulness = DEFAULTS.skillWhisperer.minDecisionUsefulness, maxMatches = DEFAULTS.skillWhisperer.maxMatchesPerTurn, batchSize = DEFAULTS.skillWhisperer.catalogBatchSize } = params;
-    if (!candidates.length)
+    if (!candidates.length) {
+        params.onAllScores?.([]);
         return [];
+    }
     if (!Number.isSafeInteger(batchSize) || batchSize < 1)
         throw new RangeError("Invalid skill catalog batch size");
     const batches = Array.from({ length: Math.ceil(candidates.length / batchSize) }, async (_, batchIndex) => {
@@ -54,19 +57,32 @@ export async function scoreSkillCatalog(params) {
                 true: "The described workflow applies to the requested task and materially helps with it.",
                 false: "Only the topic matches, the description excludes the task, or the workflow adds no value.",
             })]));
-        const { answers } = await decideWithModel(params, { currentRequest, history, skills }, questions, { validateModel: false });
-        return skills.map(({ id }, i) => ({ index: offset + i, score: answers[id].noul }));
+        // Settle each batch on cancellation so a stalled sibling cannot hide already completed judgments.
+        const { answers, usage } = await abortable(decideWithModel(params, { currentRequest, history, skills }, questions, { validateModel: false }), params.signal);
+        return { scores: skills.map(({ id }, i) => ({ index: offset + i, score: answers[id].noul })), usage };
     });
     const results = await Promise.allSettled(batches);
     if (results.every(result => result.status === "rejected"))
         throw results[0].reason;
-    const matches = results.flatMap((result, i) => {
-        if (result.status === "fulfilled")
-            return result.value.filter(({ score }) => score >= minUsefulness);
-        params.onBatchFailure?.(i, result.reason);
-        return [];
+    let usage;
+    const scores = results.flatMap((result, i) => {
+        if (result.status === "rejected") {
+            params.onBatchFailure?.(i, result.reason);
+            return [];
+        }
+        const reported = result.value.usage;
+        if (reported) {
+            usage ??= { inputTokens: 0, outputTokens: 0 };
+            usage.inputTokens += reported.input_tokens;
+            usage.outputTokens += reported.output_tokens;
+        }
+        return result.value.scores;
     });
-    return matches.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, maxMatches);
+    params.onAllScores?.(scores);
+    if (usage)
+        params.onUsage?.(usage);
+    return scores.filter(({ score }) => score >= minUsefulness)
+        .sort((a, b) => b.score - a.score || a.index - b.index).slice(0, maxMatches);
 }
 export function qualityJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint) {
     return `${decisionModelScope(model, endpoint)}:quality-v3-isolated`;

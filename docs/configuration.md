@@ -26,6 +26,8 @@ settings; a rotated credential file is reread without a restart.
 | Response quality/sentiment | `responseAudit.enabled`, approved humans/chat types | No inference | Unavailable; successful assessment stages stay cached |
 | Inside Out | `insideOut.enabled`; opts in all retained channels | No inference | Failed reviews are recorded and retried; successes stay cached |
 | Clustering | Configured local `analysis.executable` | Unchanged | Unchanged; worker failures do not disable ordinary search |
+| `deep_thought` | `steward.enabled` + `steward.deepThought.enabled`; a Steward credential | Tool returns `unavailable`; inner searches use local retrieval ranking | `failed`/`timed_out` with partial usage; no answer is invented |
+| People shadow | `steward.enabled` + `steward.peopleShadow.enabled`; People Learning manifests | Pass stops early; no strikes, nothing published | Item retried next pass without a strike; rejected proposals strike toward quarantine |
 
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
 one it registers no hook and reports inactive.
@@ -899,6 +901,59 @@ so it cannot restore the purged data.
 Purging removes existing data only. While Inside Out stays enabled and the person's
 identity remains in PeopleSQL, their new replies are graded and start a new
 baseline. Soft-deleting a person in PeopleSQL does not remove Inside Out data.
+
+## Steward
+
+The Steward is an opt-in sub-agent with two independent features, both off by
+default. Fleet configs without a `steward` section load unchanged.
+
+```json
+{
+  "steward": {
+    "enabled": true,
+    "deepThought": { "enabled": true },
+    "peopleShadow": { "enabled": true, "intervalMinutes": 60, "maxItemsPerRun": 10 }
+  }
+}
+```
+
+- **`deep_thought` tool**: a read-only, multi-hop memory curator. It searches and
+  reads with exactly the calling agent's corpora, request context and account
+  (plus `lookup_person` when People is enabled), then returns one synthesis whose
+  citations are kept only if the curator actually opened them. It never writes.
+- **People shadow**: a background, proposal-only reviewer of People Learning
+  manifests. Verified proposals are stored only in `work_items`; dossiers, learning
+  runs and cron jobs are never touched. Compare with the cron using
+  `openclaw memory-steward shadow-report --agent main`; `memory-steward status`
+  lists backlog and quarantined items, and `memory-steward requeue --scope <scope>`
+  re-drives one item. Leases are renewed during model calls; a Gateway stop
+  releases them without strikes.
+
+| Setting | Default | Meaning / supported range |
+| --- | --- | --- |
+| `steward.enabled` | `false` | Master switch; each feature below also needs its own `enabled` |
+| `steward.model` | `gpt-6.2-sol` | Responses model id |
+| `steward.reasoning` | `medium` | `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` |
+| `steward.endpoint` | `https://codex.unblocklabs.ai/v1/responses` | HTTPS (or loopback HTTP) Responses endpoint without credentials, query or fragment |
+| `steward.apiKey` / `steward.apiKeyFile` | Unset | Explicit Steward credential. When unset, the `decisionModel` credential is reused **only** when both endpoints share an origin |
+| `steward.maxActiveBackground` | `1` | 1–4 concurrent background Steward passes per Gateway process |
+| `steward.deepThought.enabled` | `false` | Registers `deep_thought` |
+| `steward.deepThought.maxTurns` | `6` | 1–12 model turns; a call's `maxHops` can only narrow it |
+| `steward.deepThought.maxToolCalls` | `16` | 1–32 tool calls per investigation |
+| `steward.deepThought.maxConcurrent` | `2` | 1–4 in-flight investigations per process; extra calls return `busy` |
+| `steward.deepThought.timeoutMs` | `60000` | 5,000–180,000 ms wall clock per investigation |
+| `steward.deepThought.maxToolResultChars` | `8000` | 500–32,000 characters per tool result returned to the model |
+| `steward.deepThought.maxInputTokens` | `48000` | 2,000–128,000 cumulative input tokens per investigation |
+| `steward.peopleShadow.enabled` | `false` | Starts the background shadow loop on Gateway start |
+| `steward.peopleShadow.intervalMinutes` | `60` | 5–1,440 minutes between passes |
+| `steward.peopleShadow.maxItemsPerRun` | `10` | 1–50 model calls per agent per pass |
+| `steward.peopleShadow.timeoutMs` | `45000` | 5,000–180,000 ms per proposal |
+
+**Enabling `deep_thought` approves sending the question plus the memory excerpts it
+opens to the Steward endpoint. Enabling the People shadow approves sending one
+dossier assertion and up to 16 approved, account-fenced excerpts per item.** When
+the Gateway exposes a host LLM runtime, the shadow's structured calls use it;
+`deep_thought` always uses the Responses endpoint.
 
 ## Storage, upgrades and recovery
 

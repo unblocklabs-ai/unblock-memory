@@ -9,6 +9,7 @@ import { resolveInsideOut } from "./inside-out.js";
 import { resolveSafetyWhisperer } from "./safety-config.js";
 import { resolveMyTurn } from "./my-turn.js";
 import { resolveRecallLedger } from "./recall-ledger.js";
+import { resolveStewardConfig } from "./steward-config.js";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
@@ -350,7 +351,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "whispererTriggers"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -438,5 +439,6 @@ export function resolveConfig(value) {
         safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
         whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),
         recallLedger: resolveRecallLedger(config.recallLedger),
+        steward: resolveStewardConfig(config.steward),
         decisionModel: resolveDecisionModel(config.decisionModel) };
 }
