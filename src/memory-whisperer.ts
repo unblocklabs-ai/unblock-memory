@@ -356,6 +356,7 @@ export function registerMemoryWhisperer(
     let generatedQueries: readonly QueryPair[] | undefined;
     let searchedCorpora: readonly string[] = corpora;
     let traces: RecallCandidateTrace[] = [];
+    let judgeUsage: { inputTokens?: number; outputTokens?: number } = {};
     let ledgerRecorded = false;
     const recordLedger = (
       outcome: RecallQueryOutcome,
@@ -385,6 +386,7 @@ export function registerMemoryWhisperer(
           decisionModel: decisionModel.model,
           minUsefulness: config.minUsefulness,
           outcome,
+          ...judgeUsage,
           hits: buildRecallHits(traces, emittedRanks, selectedIds, redundantIds),
         },
       });
@@ -470,6 +472,10 @@ export function registerMemoryWhisperer(
       });
       if (signal.aborted || !sessions.isCurrent(state)) return;
       turn.measurement.judgeMs = search.judgeMs;
+      judgeUsage = {
+        ...(search.inputTokens !== undefined ? { inputTokens: search.inputTokens } : {}),
+        ...(search.outputTokens !== undefined ? { outputTokens: search.outputTokens } : {}),
+      };
       if (search.topicsFailed) {
         diagnostics?.record(agentId, "memory", "topic_search_failed");
         log("warn", "topic_search_failed", { topicsFailed: search.topicsFailed, topicCount: turn.topicCount });

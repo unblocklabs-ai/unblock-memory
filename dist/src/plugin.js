@@ -145,7 +145,7 @@ function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger
             let sessionFilterJson;
             let requestedMinUsefulness;
             let ledgerRecorded = false;
-            const enqueueToolQuery = (outcome, rankingMode, hits = [], fallbackReason) => {
+            const enqueueToolQuery = (outcome, rankingMode, hits = [], fallbackReason, usage = {}) => {
                 if (!recallLedger || ledgerRecorded)
                     return;
                 ledgerRecorded = true;
@@ -170,6 +170,7 @@ function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger
                         decisionModel: decisionModel.model,
                         minUsefulness: requestedMinUsefulness ?? 0.7,
                         outcome,
+                        ...usage,
                         hits,
                     },
                 });
@@ -228,7 +229,8 @@ function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger
                         : measurement.outcome === "empty" && search.eligible > 0 && search.rankingMode === "decision"
                             ? "rejected"
                             : measurement.outcome;
-                    enqueueToolQuery(ledgerOutcome, search.rankingMode, toolTraceToHits(traces), search.fallbackReason === "input_too_large" ? undefined : search.fallbackReason);
+                    enqueueToolQuery(ledgerOutcome, search.rankingMode, toolTraceToHits(traces), search.fallbackReason === "input_too_large" ? undefined : search.fallbackReason, { ...(search.inputTokens !== undefined ? { inputTokens: search.inputTokens } : {}),
+                        ...(search.outputTokens !== undefined ? { outputTokens: search.outputTokens } : {}) });
                 }
                 // Compact only the public tool response; internal ranking and consumers keep
                 // full-precision scores and the host's source/citation compatibility fields.
@@ -647,19 +649,15 @@ export function resolveFlushPlan(params = {}) {
 }
 /**
  * One shared, stateless Steward runner. Credentials resolve per call (steward overrides, else the same-origin
- * decision key); structured `complete` prefers the host LLM runtime when the gateway provides one.
+ * decision key). Structured `complete` goes direct to `steward.endpoint`: the host LLM runtime denies plugin
+ * model overrides by default (`LLM_COMPLETION_NOT_AUTHORIZED`) and would ignore the steward endpoint and key.
  */
-function stewardRunnerFactory(api, config) {
+function stewardRunnerFactory(config) {
     let runner;
     return () => {
-        if (runner)
-            return runner;
-        const llm = api.runtime?.llm;
-        const hostLlmComplete = typeof llm?.complete === "function" ? llm.complete.bind(llm) : undefined;
-        runner = createStewardRunner({
+        runner ??= createStewardRunner({
             config: config.steward,
             resolveApiKey: () => resolveStewardCredential(config.steward, config.decisionModel),
-            ...(hostLlmComplete ? { hostLlmComplete } : {}),
         });
         return runner;
     };
@@ -669,7 +667,7 @@ export function registerUnblockMemory(api) {
     registerPeopleLearningCli(api, config);
     registerResponseAudit(api, config);
     registerInsideOut(api, config);
-    const stewardRunner = stewardRunnerFactory(api, config);
+    const stewardRunner = stewardRunnerFactory(config);
     // Registers `memory-steward` CLI always; the People shadow loop only when steward + peopleShadow are enabled.
     registerStewardRuntime(api, {
         config: config.steward,

@@ -135,6 +135,18 @@ export class ResponseAuditStore {
       AND (status='failed' OR (status='ok' AND json_extract(result,'$.memory.status')='unavailable'))`)
       .run(cohort, e.id, e.inputHash);
   }
+  /**
+   * Cancellation is not a provider failure: refund the episode attempt and the stage attempts still in flight
+   * when it fired, in one transaction on this connection. Stages that already settled keep their attempt.
+   */
+  refundCancelled(cohort: string, e: ResponseEpisode, inFlightStageKeys: readonly string[]) {
+    immediateTransaction(this.#db, () => {
+      this.stale(cohort, e);
+      const refund = this.#db.prepare(`UPDATE response_stages SET attempts=MAX(0,attempts-1),attempted_at=NULL,status='pending'
+        WHERE key=? AND status='failed'`);
+      for (const key of inFlightStageKeys) refund.run(key);
+    });
+  }
   save(cohort: string, e: ResponseEpisode, result: ResponseResult, now: number) {
     result = { ...result, human: result.human ?? new ResponsePeople().resolve(e) };
     const memoryUnavailable = result.memory.status === "unavailable" ? 1 : 0;
@@ -223,6 +235,8 @@ export class ResponseAuditStore {
       }
     });
   }
+  /** Hook: these begun stage attempts finished with their own failure (subclasses track in-flight work). */
+  stageSettled(_keys: readonly string[]): void {}
   stageSave<K extends keyof ResponseStages>(key: string, result: ResponseStages[K], now: number) {
     this.#db.prepare("UPDATE response_stages SET status='ok',result=?,assessed_at=? WHERE key=?").run(JSON.stringify(result), now, key);
   }

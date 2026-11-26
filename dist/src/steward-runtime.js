@@ -55,10 +55,19 @@ export function registerStewardRuntime(api, options) {
         if (!release)
             return Promise.resolve(); // Another agent/instance holds the gateway's background slot.
         running = (async () => {
-            const runner = options.createRunner();
-            if (!runner)
+            let agents;
+            let runner;
+            try {
+                runner = options.createRunner();
+                agents = runner ? listAgents(api.config) : [];
+            }
+            catch (error) {
+                // `void tick()` must never surface an unhandled rejection.
+                if (!signal.aborted)
+                    api.logger.warn(`unblock-memory steward: ${String(error)}`);
                 return;
-            for (const agentId of listAgents(api.config)) {
+            }
+            for (const agentId of agents) {
                 if (signal.aborted)
                     break;
                 let store;
@@ -66,7 +75,7 @@ export function registerStewardRuntime(api, options) {
                     const dbPath = dbPathForAgent(agentId);
                     store = openWorkStore(dbPath);
                     openStores.add(store);
-                    if (options.config.peopleShadow.enabled) {
+                    if (options.config.peopleShadow.enabled && runner) {
                         lastResults.set(agentId, await runPeopleShadowPass({
                             dbPath, agentId, workStore: store, runner, owner, signal,
                             maxItems: options.config.peopleShadow.maxItemsPerRun, timeoutMs: options.config.peopleShadow.timeoutMs,
@@ -95,14 +104,15 @@ export function registerStewardRuntime(api, options) {
             clearInterval(timer);
             timer = undefined;
         }
-        // Release leases synchronously FIRST so a graceful stop adds 0 strikes even if the process exits mid-await.
+        // Abort in-flight work and release leases in one synchronous step, so a graceful stop adds 0 strikes even if
+        // the process exits mid-await. interruptOwner waits at most 200ms on a held lock (the lease then expires).
+        lifetime.abort(new StewardShutdownError());
         for (const store of openStores) {
             try {
                 store.interruptOwner(owner);
             }
             catch { }
         }
-        lifetime.abort(new StewardShutdownError());
         const pending = running;
         if (!pending)
             return;

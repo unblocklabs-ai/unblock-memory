@@ -6,11 +6,14 @@ import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 /**
  * Fenced background work: one row per `(kind, scope)`, guarded by a single monotonic integer `attempt`.
  *
- * - `claim()` increments `attempt`; every later write by that worker is fenced on `attempt` alone, never on
- *   wall-clock time, so a clock jump cannot abort a healthy worker. Only a reclaim (which bumps `attempt`)
- *   or an explicit release/reset fences a worker out.
- * - Strikes count leases that expired with no saved stage progress. Graceful stops (`interruptOwner`) and
- *   transient failures add none. Only `mode='item'` rows quarantine; `mode='run'` singletons never do.
+ * - `claim()` increments `attempt`; every later write by that worker is fenced on `status='running'` plus
+ *   `attempt`, never on wall-clock time, so a clock jump cannot abort a healthy worker. A reclaim, an
+ *   `interruptOwner()` and a `requeue()` all bump `attempt`, so a released worker can never write again,
+ *   even before anyone reclaims the row.
+ * - Strikes count leases that expired without that attempt saving progress (`progressed_attempt < attempt`),
+ *   so a staged row whose resumed attempts keep crashing still quarantines. Graceful stops
+ *   (`interruptOwner`) and transient failures add none. Only `mode='item'` rows quarantine; `mode='run'`
+ *   singletons never do.
  * - `commitWithDomain()` runs the caller's domain write and the work completion in ONE `BEGIN IMMEDIATE`
  *   on ONE connection, so a fenced-out worker can never publish.
  */
@@ -32,6 +35,7 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS work_items (
   strikes INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   updated_at INTEGER NOT NULL,
+  progressed_attempt INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (kind, scope)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS work_items_due ON work_items(kind, status, due_at);`;
@@ -39,6 +43,8 @@ CREATE INDEX IF NOT EXISTS work_items_due ON work_items(kind, status, due_at);`;
 const SCHEMA_VERSION = 1;
 const DEFAULT_MAX_STRIKES = 3;
 const HEARTBEAT_BUSY_TIMEOUT_MS = 100;
+/** `gateway_stop` must never stall on a held write lock: a busy release lets the lease expire instead. */
+const INTERRUPT_BUSY_TIMEOUT_MS = 200;
 const SQLITE_BUSY = 5;
 const SQLITE_LOCKED = 6;
 
@@ -62,6 +68,8 @@ export type WorkItem = {
   kind: string; scope: string; mode: WorkMode; status: WorkStatus; attempt: number; owner: string | null;
   leaseUntil: number; dueAt: number; inputRevision: string | null; recipeHash: string | null; stage: string | null;
   artifactJson: string | null; usageJson: string | null; strikes: number; lastError: string | null; updatedAt: number;
+  /** The last attempt that saved stage progress (0 = never). */
+  progressedAttempt: number;
 };
 
 export class WorkFenceLostError extends Error {
@@ -91,7 +99,7 @@ function item(row: Record<string, unknown>): WorkItem {
     attempt: Number(row.attempt), owner: text(row.owner), leaseUntil: Number(row.lease_until), dueAt: Number(row.due_at),
     inputRevision: text(row.input_revision), recipeHash: text(row.recipe_hash), stage: text(row.stage),
     artifactJson: text(row.artifact_json), usageJson: text(row.usage_json), strikes: Number(row.strikes),
-    lastError: text(row.last_error), updatedAt: Number(row.updated_at),
+    lastError: text(row.last_error), updatedAt: Number(row.updated_at), progressedAttempt: Number(row.progressed_attempt ?? 0),
   };
 }
 
@@ -106,15 +114,19 @@ function requireDuration(value: number, field: string): void {
 
 function ensureWorkSchema(db: DatabaseSync): void {
   const read = () => db.prepare("SELECT version FROM memory_schema WHERE component='work'").get()?.version;
+  // Additive columns keep schema v1 so a rollback still opens the store.
+  const hasProgress = () => db.prepare("PRAGMA table_info(work_items)").all().some(row => row.name === "progressed_attempt");
   const ready = (version: unknown) => {
     if (version !== undefined && version !== SCHEMA_VERSION) throw new Error("Unsupported work store schema version");
-    return version === SCHEMA_VERSION && Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='work_items'").get());
+    return version === SCHEMA_VERSION && Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='work_items'").get()) &&
+      hasProgress();
   };
   // Fast path avoids taking the write lock on every open.
   if (ready(read())) return;
   immediateTransaction(db, () => {
     if (ready(read())) return;
     db.exec(SCHEMA);
+    if (!hasProgress()) db.exec("ALTER TABLE work_items ADD COLUMN progressed_attempt INTEGER NOT NULL DEFAULT 0");
     db.prepare("INSERT OR IGNORE INTO memory_schema VALUES ('work',?)").run(SCHEMA_VERSION);
   });
 }
@@ -159,27 +171,31 @@ export class WorkStore {
   /**
    * Reclaim expired leases, then claim the earliest due `pending`/`staged` row (or the given `scope`).
    * `ignoreDueAt` lets an explicit operator run start before the schedule; it never steals a live lease.
+   * `expectedInputRevision`/`expectedRecipeHash` refuse a row whose inputs advanced since the caller read them.
    */
   claim(options: { kind: string; scope?: string; mode?: WorkMode; owner: string; leaseMs: number; now?: number;
-    maxStrikes?: number; ignoreDueAt?: boolean }): WorkClaim | undefined {
+    maxStrikes?: number; ignoreDueAt?: boolean; expectedInputRevision?: string; expectedRecipeHash?: string }): WorkClaim | undefined {
     requireDuration(options.leaseMs, "leaseMs");
     if (!options.owner) throw new Error("WorkStore owner is required");
     const now = options.now ?? Date.now(), maxStrikes = options.maxStrikes ?? DEFAULT_MAX_STRIKES;
     const scope = options.scope ?? null, mode = options.mode ?? null;
     return immediateTransaction(this.db, () => {
-      // A strike means the lease ran out with no saved stage. Released artifacts stay resumable as 'staged'.
+      // A strike means the expired attempt saved no progress of its own (a resumed crash counts too).
+      // Released artifacts stay resumable as 'staged'.
       this.db.prepare(`UPDATE work_items SET
-          strikes=strikes + (stage IS NULL),
-          status=CASE WHEN mode='item' AND strikes + (stage IS NULL) >= ? THEN 'quarantined'
+          strikes=strikes + (progressed_attempt < attempt),
+          status=CASE WHEN mode='item' AND strikes + (progressed_attempt < attempt) >= ? THEN 'quarantined'
             WHEN artifact_json IS NOT NULL THEN 'staged' ELSE 'pending' END,
           owner=NULL, lease_until=0, last_error='lease expired', updated_at=?
         WHERE kind=? AND status='running' AND lease_until<=? AND (? IS NULL OR scope=?)`)
         .run(maxStrikes, now, options.kind, now, scope, scope);
+      const revision = options.expectedInputRevision ?? null, recipe = options.expectedRecipeHash ?? null;
       const row = this.db.prepare(`SELECT * FROM work_items
         WHERE kind=? AND status IN ('pending','staged') AND (? OR due_at<=?)
           AND (? IS NULL OR scope=?) AND (? IS NULL OR mode=?)
+          AND (? IS NULL OR input_revision=?) AND (? IS NULL OR recipe_hash=?)
         ORDER BY due_at, scope LIMIT 1`)
-        .get(options.kind, Number(options.ignoreDueAt ?? false), now, scope, scope, mode, mode);
+        .get(options.kind, Number(options.ignoreDueAt ?? false), now, scope, scope, mode, mode, revision, revision, recipe, recipe);
       if (!row) return undefined;
       const current = item(row);
       const changed = this.db.prepare(`UPDATE work_items SET attempt=attempt+1, owner=?, lease_until=?, status='running',
@@ -210,7 +226,7 @@ export class WorkStore {
     requireJson(options.usageJson, "usageJson");
     const now = options.now ?? Date.now();
     const changed = this.db.prepare(`UPDATE work_items SET stage=?, artifact_json=?, usage_json=COALESCE(?, usage_json),
-        strikes=0, updated_at=? WHERE kind=? AND scope=? AND status='running' AND attempt=?`)
+        strikes=0, progressed_attempt=attempt, updated_at=? WHERE kind=? AND scope=? AND status='running' AND attempt=?`)
       .run(options.stage, options.artifactJson, options.usageJson ?? null, now, claim.kind, claim.scope, claim.attempt).changes;
     if (!Number(changed)) throw new WorkFenceLostError(claim, "stageArtifact");
     return { ...claim, stage: options.stage, artifactJson: options.artifactJson };
@@ -228,18 +244,20 @@ export class WorkStore {
    * Verify the fence, run the caller's synchronous domain write, and complete (or re-arm) the work row,
    * all inside one `BEGIN IMMEDIATE` on this connection. A lost fence throws before `domainFn` runs.
    */
-  commitWithDomain<T>(claim: WorkClaim, options: { nextDueAt?: number; usageJson?: string | null; keepArtifact?: boolean; now?: number },
-    domainFn: (db: DatabaseSync) => T): T {
+  commitWithDomain<T>(claim: WorkClaim, options: { nextDueAt?: number; preserveDueAt?: boolean; usageJson?: string | null;
+    keepArtifact?: boolean; now?: number }, domainFn: (db: DatabaseSync) => T): T {
     requireJson(options.usageJson, "usageJson");
     const now = options.now ?? Date.now(), keep = Number(options.keepArtifact ?? false);
+    // `preserveDueAt` re-arms at the row's due time as read inside this transaction (manual runs keep the schedule).
+    const preserve = Number(options.preserveDueAt ?? false);
     return immediateTransaction(this.db, () => {
       this.#requireFence(claim, "commit");
       const result = domainFn(this.db);
-      const changed = this.db.prepare(`UPDATE work_items SET status=?, due_at=?, owner=NULL, lease_until=0, strikes=0,
-          last_error=NULL, usage_json=COALESCE(?, usage_json),
+      const changed = this.db.prepare(`UPDATE work_items SET status=?, due_at=CASE WHEN ? THEN due_at ELSE ? END, owner=NULL,
+          lease_until=0, strikes=0, last_error=NULL, usage_json=COALESCE(?, usage_json),
           stage=CASE WHEN ? THEN stage ELSE NULL END, artifact_json=CASE WHEN ? THEN artifact_json ELSE NULL END,
-          updated_at=? WHERE kind=? AND scope=? AND attempt=? AND status IN ('running','staged')`)
-        .run(options.nextDueAt !== undefined ? "pending" : "completed", options.nextDueAt ?? 0, options.usageJson ?? null,
+          updated_at=? WHERE kind=? AND scope=? AND attempt=? AND status='running'`)
+        .run(options.nextDueAt !== undefined || preserve ? "pending" : "completed", preserve, options.nextDueAt ?? 0, options.usageJson ?? null,
           keep, keep, now, claim.kind, claim.scope, claim.attempt).changes;
       if (!Number(changed)) throw new WorkFenceLostError(claim, "commit");
       return result;
@@ -250,18 +268,18 @@ export class WorkStore {
    * Release a failed attempt. `addStrike: false` (default) is graceful/transient: requeue with 0 strikes.
    * `addStrike: true` marks a deterministic bad item; `mode='item'` rows quarantine at `maxStrikes`.
    */
-  fail(claim: WorkClaim, options: { error: string; retryAt?: number; addStrike?: boolean; maxStrikes?: number;
+  fail(claim: WorkClaim, options: { error: string; retryAt?: number; preserveDueAt?: boolean; addStrike?: boolean; maxStrikes?: number;
     usageJson?: string | null; now?: number }): WorkStatus {
     requireJson(options.usageJson, "usageJson");
-    const now = options.now ?? Date.now(), strike = Number(options.addStrike ?? false);
+    const now = options.now ?? Date.now(), strike = Number(options.addStrike ?? false), preserve = Number(options.preserveDueAt ?? false);
     return immediateTransaction(this.db, () => {
       const changed = this.db.prepare(`UPDATE work_items SET
           strikes=CASE WHEN ? THEN strikes+1 ELSE 0 END,
           status=CASE WHEN ? AND mode='item' AND strikes+1 >= ? THEN 'quarantined'
             WHEN artifact_json IS NOT NULL THEN 'staged' ELSE 'pending' END,
-          due_at=?, owner=NULL, lease_until=0, last_error=?, usage_json=COALESCE(?, usage_json), updated_at=?
-        WHERE kind=? AND scope=? AND attempt=? AND status IN ('running','staged')`)
-        .run(strike, strike, options.maxStrikes ?? DEFAULT_MAX_STRIKES, options.retryAt ?? now, options.error.slice(0, 2000),
+          due_at=CASE WHEN ? THEN due_at ELSE ? END, owner=NULL, lease_until=0, last_error=?, usage_json=COALESCE(?, usage_json), updated_at=?
+        WHERE kind=? AND scope=? AND attempt=? AND status='running'`)
+        .run(strike, strike, options.maxStrikes ?? DEFAULT_MAX_STRIKES, preserve, options.retryAt ?? now, options.error.slice(0, 2000),
           options.usageJson ?? null, now, claim.kind, claim.scope, claim.attempt).changes;
       if (!Number(changed)) throw new WorkFenceLostError(claim, "fail");
       return this.get(claim.kind, claim.scope)!.status;
@@ -269,14 +287,15 @@ export class WorkStore {
   }
 
   /**
-   * Synchronous graceful release for `gateway_stop`: call BEFORE aborting so no strikes are added.
-   * Rows with a saved artifact become `staged` (resumable), others `pending`. Fences out the live attempt.
+   * Synchronous graceful release for `gateway_stop` (no strikes). Rows with a saved artifact become `staged`
+   * (resumable), others `pending`. Bumps `attempt`, so the released worker is fenced out at once. Waits at most
+   * 200ms for a held write lock, then throws `SQLITE_BUSY` (the lease simply expires instead).
    */
   interruptOwner(owner: string, now?: number): number {
-    return Number(this.db.prepare(`UPDATE work_items SET
+    return this.#withBusyTimeout(INTERRUPT_BUSY_TIMEOUT_MS, () => Number(this.db.prepare(`UPDATE work_items SET
         status=CASE WHEN artifact_json IS NOT NULL THEN 'staged' ELSE 'pending' END,
-        owner=NULL, lease_until=0, updated_at=? WHERE owner=? AND status='running'`)
-      .run(now ?? Date.now(), owner).changes);
+        attempt=attempt+1, owner=NULL, lease_until=0, updated_at=? WHERE owner=? AND status='running'`)
+      .run(now ?? Date.now(), owner).changes));
   }
 
   /** Operator re-drive (including quarantined rows). Never steals a live lease. */
@@ -284,7 +303,7 @@ export class WorkStore {
     const at = now ?? Date.now();
     return Number(this.db.prepare(`UPDATE work_items SET
         status=CASE WHEN artifact_json IS NOT NULL THEN 'staged' ELSE 'pending' END,
-        due_at=?, strikes=0, owner=NULL, lease_until=0, last_error=NULL, updated_at=?
+        attempt=attempt+1, due_at=?, strikes=0, owner=NULL, lease_until=0, last_error=NULL, updated_at=?
       WHERE kind=? AND scope=? AND NOT (status='running' AND lease_until>?)`)
       .run(dueAt ?? at, at, kind, scope, at).changes) > 0;
   }
@@ -300,7 +319,7 @@ export class WorkStore {
   }
 
   #requireFence(claim: WorkClaim, action: string): void {
-    const live = this.db.prepare(`SELECT 1 FROM work_items WHERE kind=? AND scope=? AND attempt=? AND status IN ('running','staged')`)
+    const live = this.db.prepare(`SELECT 1 FROM work_items WHERE kind=? AND scope=? AND attempt=? AND status='running'`)
       .get(claim.kind, claim.scope, claim.attempt);
     if (!live) throw new WorkFenceLostError(claim, action);
   }

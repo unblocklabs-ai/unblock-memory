@@ -275,11 +275,41 @@ function safeError(error) {
     const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     return clip(text.replace(/\s+/gu, " "), 300);
 }
-function tryFail(store, claim, reason, strike, maxStrikes) {
+/** Usage recorded on the row so far plus this attempt's: failed, rejected and timed-out attempts still cost tokens. */
+function cumulativeUsage(priorJson, usage) {
+    if (!usage)
+        return undefined;
+    let prior;
     try {
-        store.fail(claim, { error: reason, addStrike: strike, maxStrikes });
+        prior = priorJson ? record(JSON.parse(priorJson)) : undefined;
+    }
+    catch { }
+    const total = {};
+    for (const key of ["requests", "inputTokens", "outputTokens", "cachedInputTokens", "reasoningTokens", "costUsd"]) {
+        const values = [prior?.[key], usage[key]].filter((n) => typeof n === "number" && Number.isFinite(n) && n >= 0);
+        if (values.length)
+            total[key] = values.reduce((sum, n) => sum + n, 0);
+    }
+    total.requests ??= 0;
+    return JSON.stringify(total);
+}
+function tryFail(store, claim, reason, strike, maxStrikes, usageJson) {
+    try {
+        store.fail(claim, { error: reason, addStrike: strike, maxStrikes, ...(usageJson ? { usageJson } : {}) });
     }
     catch { /* Fence lost: another owner (or interruptOwner) already released it. */ }
+}
+/** A staged artifact is only resumable for the exact manifest revision it was proposed against. */
+function artifactRevision(artifactJson) {
+    if (!artifactJson)
+        return undefined;
+    try {
+        const revision = record(JSON.parse(artifactJson))?.manifestRevision;
+        return typeof revision === "string" ? revision : undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 function commit(store, claim) {
     try {
@@ -292,10 +322,13 @@ function commit(store, claim) {
         return false;
     }
 }
-/** Codes that say nothing about this item: stop the pass instead of burning through every assertion. */
-const SYSTEMIC_FAILURES = new Set(["missing_credentials", "lifecycle_reload"]);
-/** Codes that are this item's fault (bad output, oversized packet): strike toward quarantine. */
-const ITEM_FAILURES = new Set(["invalid_output", "context_overflow"]);
+/**
+ * Codes that say nothing about this item: stop the pass instead of burning `maxItems` on every assertion.
+ * `transient_provider` (429/5xx) arrives only after the runner's own bounded retries were exhausted.
+ */
+const SYSTEMIC_FAILURES = new Set(["missing_credentials", "auth_denied", "lifecycle_reload", "transient_provider"]);
+/** Codes that are this item's fault (bad output, oversized packet, a packet too slow to adjudicate): strike toward quarantine. */
+const ITEM_FAILURES = new Set(["invalid_output", "context_overflow", "timeout"]);
 /**
  * One shadow pass: enqueue one `item` row per manifest assertion, then adjudicate up to `maxItems`
  * of them through `runner.complete`, staging ONLY host-verified proposals into `work_items`.
@@ -346,17 +379,20 @@ export async function runPeopleShadowPass(options) {
             result.items.push({ scope: task.scope, outcome: "skipped", detail: existing?.status });
             continue;
         }
-        // Resume a staged proposal at publication without re-running the model.
-        const resumable = existing.status === "staged" && existing.stage === PROPOSAL_STAGE && existing.artifactJson;
+        // Resume a staged proposal at publication without re-running the model, only for this exact manifest revision.
+        const resumable = existing.status === "staged" && existing.stage === PROPOSAL_STAGE &&
+            artifactRevision(existing.artifactJson) === task.revision;
         if (!resumable && result.attempted >= maxItems)
             break;
+        // Bind the claim to the revision this task was built from: a manifest that advanced since is not ours to adjudicate.
         const claim = options.workStore.claim({ kind: PEOPLE_SHADOW_KIND, scope: task.scope, mode: "item", owner: options.owner,
-            leaseMs, maxStrikes, now: now() });
+            leaseMs, maxStrikes, now: now(), expectedInputRevision: task.revision, expectedRecipeHash: PEOPLE_SHADOW_RECIPE_HASH });
         if (!claim) {
             result.items.push({ scope: task.scope, outcome: "busy" });
             continue;
         }
-        if (claim.stage === PROPOSAL_STAGE && claim.artifactJson) {
+        const priorUsage = options.workStore.get(PEOPLE_SHADOW_KIND, task.scope)?.usageJson ?? null;
+        if (claim.stage === PROPOSAL_STAGE && artifactRevision(claim.artifactJson) === task.revision) {
             if (commit(options.workStore, claim)) {
                 result.completed += 1;
                 result.items.push({ scope: task.scope, outcome: "resumed" });
@@ -380,7 +416,7 @@ export async function runPeopleShadowPass(options) {
                 proposal: { disposition: "unresolved", reason: "No approved in-account evidence excerpts for this person", citedHandles: [], confidence: "low" } };
             try {
                 const staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
-                    usageJson: JSON.stringify({ requests: 0 }), now: now() });
+                    usageJson: cumulativeUsage(priorUsage, { requests: 0 }) ?? null, now: now() });
                 if (commit(options.workStore, staged)) {
                     result.completed += 1;
                     result.items.push({ scope: task.scope, outcome: "host_unresolved" });
@@ -421,9 +457,10 @@ export async function runPeopleShadowPass(options) {
         }
         const usage = completion?.usage ?? thrown?.usage;
         addUsage(result.usage, usage);
+        const usageJson = cumulativeUsage(priorUsage, usage);
         if (options.signal?.aborted) {
             // Graceful stop: interruptOwner already released the lease; never add a strike.
-            tryFail(options.workStore, claim, "interrupted", false, maxStrikes);
+            tryFail(options.workStore, claim, "interrupted", false, maxStrikes, usageJson);
             result.interrupted = true;
             result.items.push({ scope: task.scope, outcome: "interrupted" });
             break;
@@ -437,8 +474,8 @@ export async function runPeopleShadowPass(options) {
         if (!completion?.ok) {
             const code = completion?.code ?? "provider_error";
             const detail = completion ? `${completion.code}: ${completion.error}` : safeError(thrown);
-            // Provider/credential/rate-limit failures are not the item's fault: no strike.
-            tryFail(options.workStore, claim, detail, ITEM_FAILURES.has(code), maxStrikes);
+            // Provider/credential/rate-limit failures are not the item's fault: no strike, and the pass stops.
+            tryFail(options.workStore, claim, detail, ITEM_FAILURES.has(code), maxStrikes, usageJson);
             result.failed += 1;
             result.items.push({ scope: task.scope, outcome: "failed", detail });
             if (SYSTEMIC_FAILURES.has(code))
@@ -446,7 +483,7 @@ export async function runPeopleShadowPass(options) {
             continue;
         }
         if (!Value.Check(PEOPLE_SHADOW_PROPOSAL_SCHEMA, completion.data)) {
-            tryFail(options.workStore, claim, "proposal failed schema validation", true, maxStrikes);
+            tryFail(options.workStore, claim, "proposal failed schema validation", true, maxStrikes, usageJson);
             result.rejected += 1;
             result.items.push({ scope: task.scope, outcome: "rejected", detail: "schema_invalid" });
             continue;
@@ -454,7 +491,7 @@ export async function runPeopleShadowPass(options) {
         const proposal = completion.data;
         const verified = verifyProposal(proposal, minted);
         if (!verified.ok) {
-            tryFail(options.workStore, claim, verified.reason, true, maxStrikes);
+            tryFail(options.workStore, claim, verified.reason, true, maxStrikes, usageJson);
             result.rejected += 1;
             result.items.push({ scope: task.scope, outcome: "rejected", detail: verified.reason });
             continue;
@@ -469,7 +506,7 @@ export async function runPeopleShadowPass(options) {
         let staged;
         try {
             staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
-                usageJson: JSON.stringify(usage ?? { requests: 1 }), now: now() });
+                usageJson: cumulativeUsage(priorUsage, usage ?? { requests: 1 }) ?? null, now: now() });
         }
         catch (error) {
             result.failed += 1;
@@ -548,7 +585,8 @@ export function buildPeopleShadowReport(dbPath, manifestId) {
                 }
                 catch { }
             }
-            if (!artifact || !Value.Check(PEOPLE_SHADOW_PROPOSAL_SCHEMA, artifact.proposal)) {
+            // An artifact proposed against another manifest revision is never compared with this revision's receipt.
+            if (!artifact || artifact.manifestRevision !== row.inputRevision || !Value.Check(PEOPLE_SHADOW_PROPOSAL_SCHEMA, artifact.proposal)) {
                 report.pending += 1;
                 group.shadow.set(parsed.assertionId, comparison);
                 continue;

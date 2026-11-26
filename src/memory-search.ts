@@ -26,6 +26,9 @@ export type MemorySearchObservation = RetrievalTimings & {
   requestsSucceeded: number; requestsFailed: number;
   /** Multi-topic searches only: topic searches that failed while at least one other topic succeeded. */
   topicsFailed?: number;
+  /** Decision-model tokens summed across every judged candidate that reported usage. */
+  inputTokens?: number;
+  outputTokens?: number;
 };
 
 export type MemoryRanking = {
@@ -331,7 +334,7 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
       const requestStarted = performance.now();
       const trace = trackTrace ? traceByCandidate.get(hit) : undefined;
       try {
-        const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
+        const { probability, usage } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
           excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
           // Observation dates let the judge order contradictory dated observations (e.g. 2025 vs 2026).
           dates: [...new Set([
@@ -340,6 +343,10 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
               ?? (hit.messageTimestamp ? [hit.messageTimestamp] : [])),
           ])],
         }, asOf, options.model), { ...options, apiKey });
+        if (usage) {
+          observation.inputTokens = (observation.inputTokens ?? 0) + usage.input_tokens;
+          observation.outputTokens = (observation.outputTokens ?? 0) + usage.output_tokens;
+        }
         signal?.throwIfAborted();
         observation.requestsSucceeded++;
         options.onJudgment?.({ candidateIndex, elapsedMs: performance.now() - requestStarted });

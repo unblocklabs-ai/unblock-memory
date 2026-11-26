@@ -14,7 +14,6 @@ import {
   type ResponseStages,
 } from "./response-judge.js";
 import { ResponseAuditStore, type ResponseResult } from "./response-store.js";
-import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
 import { ResponsePeople } from "./response-identity.js";
@@ -29,7 +28,10 @@ export function responseCohort(config: UnblockMemoryConfig["responseAudit"], mod
   }).slice(0, 16);
 }
 
-/** Tracks stage attempts this run started but never saved, so cancellation can refund them. */
+/**
+ * Tracks stage attempts this run started that are still genuinely in flight: saved stages and stages that
+ * settled with their own provider failure leave the set, so cancellation refunds only interrupted work.
+ */
 class CancellableAuditStore extends ResponseAuditStore {
   readonly inFlight = new Set<string>();
   override stageBegin(keys: string[], now: number) {
@@ -40,27 +42,19 @@ class CancellableAuditStore extends ResponseAuditStore {
     super.stageSave(key, result, now);
     this.inFlight.delete(key);
   }
+  override stageSettled(keys: readonly string[]) {
+    for (const key of keys) this.inFlight.delete(key);
+  }
 }
 
 /**
  * Cancellation (gateway stop, deadline) is not a provider failure: like a stale snapshot, it must not burn
- * the episode's or its stages' bounded retry budget, or a few restarts would exhaust them permanently.
+ * the episode's or its in-flight stages' bounded retry budget, or a few restarts would exhaust them permanently.
  */
-function refundCancelledAttempt(store: CancellableAuditStore, storePath: string, cohort: string, e: ResponseEpisode) {
-  try { store.stale(cohort, e); } catch { /* Best effort: a busy store keeps the attempt, as before. */ }
-  if (!store.inFlight.size) return;
+function refundCancelledAttempt(store: CancellableAuditStore, cohort: string, e: ResponseEpisode) {
   const keys = [...store.inFlight];
   store.inFlight.clear();
-  try {
-    const db = openMemoryDatabase(storePath);
-    try {
-      immediateTransaction(db, () => {
-        const refund = db.prepare(`UPDATE response_stages SET attempts=MAX(0,attempts-1),attempted_at=NULL,status='pending'
-          WHERE key=? AND status='failed'`);
-        for (const key of keys) refund.run(key);
-      });
-    } finally { db.close(); }
-  } catch { /* Best effort, see above. */ }
+  try { store.refundCancelled(cohort, e, keys); } catch { /* Best effort: a busy store keeps the attempt, as before. */ }
 }
 
 export type ResponseAuditOptions = {
@@ -184,7 +178,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
           else coverage.evaluated++;
         } catch {
           if (signal.aborted) {
-            refundCancelledAttempt(store!, options.storePath, cohort, e);
+            refundCancelledAttempt(store!, cohort, e);
             throw new Error("Audit cancelled");
           }
           coverage.failed++;
@@ -244,7 +238,12 @@ async function assessMemoryOpportunity(
     else {
       store.stageBegin([memoryKey], Date.now());
       usage.stageAttempts++;
-      judged = await abortable(judgeMemoryOpportunity(e, candidates, params), params.signal);
+      try {
+        judged = await abortable(judgeMemoryOpportunity(e, candidates, params), params.signal);
+      } catch (error) {
+        if (!params.signal.aborted) store.stageSettled([memoryKey]);
+        throw error;
+      }
       store.stageSave(memoryKey, judged, Date.now());
     }
     return { status: "checked", candidates: judged };

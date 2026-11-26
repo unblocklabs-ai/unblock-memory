@@ -31,7 +31,7 @@ export type StewardCompleteRequest<T> = Prompt & {
     timeoutMs?: number;
     maxRetries?: number;
 };
-type StewardErrorCode = "aborted" | "timeout" | "lifecycle_reload" | "missing_credentials" | "context_overflow" | "transient_provider" | "invalid_output" | "budget_exhausted" | "provider_error";
+type StewardErrorCode = "aborted" | "timeout" | "lifecycle_reload" | "missing_credentials" | "auth_denied" | "context_overflow" | "transient_provider" | "invalid_output" | "budget_exhausted" | "provider_error";
 type Failure = {
     ok: false;
     code: StewardErrorCode;
@@ -81,8 +81,22 @@ export interface StewardRunner {
 type Deps = {
     config: StewardConfig;
     resolveApiKey: () => Promise<string | undefined>;
+    /**
+     * Opt-in only (`useHostLlm: true`): OpenClaw denies plugin model overrides by default
+     * (`LLM_COMPLETION_NOT_AUTHORIZED`) and ignores `steward.endpoint`/credentials, so `complete()` defaults to
+     * the direct `/v1/responses` path.
+     */
     hostLlmComplete?: OpenClawPluginApi["runtime"]["llm"]["complete"];
+    useHostLlm?: boolean;
     fetch?: typeof fetch;
 };
+/**
+ * Wire form of `schema` for OpenAI/codex-lb `strict: true`: every object closes `additionalProperties`, lists
+ * every property in `required` (originally optional ones become nullable) and drops unsupported validation
+ * keywords. Decode replies with `stripOptionalNulls` and validate them against the ORIGINAL schema.
+ */
+export declare function toStrictJsonSchema(schema: Schema): JsonObject;
+/** Remove the `null`s strict mode forces onto originally optional keys (unless the original accepts null). */
+export declare function stripOptionalNulls(value: unknown, schema: Schema): unknown;
 export declare function createStewardRunner(deps: Deps): StewardRunner;
 export {};

@@ -3,7 +3,9 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
 import { resolveStewardConfig, resolveStewardCredential } from "../src/steward-config.js";
-import { createStewardRunner, type StewardRunRequest } from "../src/steward-runner.js";
+import { createStewardRunner, stripOptionalNulls, toStrictJsonSchema, type StewardRunRequest } from "../src/steward-runner.js";
+import { DEEP_THOUGHT_RESULT_SCHEMA } from "../src/deep-thought.js";
+import { PEOPLE_SHADOW_PROPOSAL_SCHEMA } from "../src/steward-people-shadow.js";
 
 const config = resolveStewardConfig(undefined);
 const token = "private-test-credential";
@@ -46,7 +48,7 @@ test("config defaults, nested overrides and strict boundaries", () => {
   assert.equal(overridden.deepThought.maxConcurrent, 2);
   for (const bad of [null, [], { extra: false }, { deepThought: { extra: 0 } }, { peopleShadow: { other: true } },
     { enabled: null }, { peopleShadow: { enabled: 1 } }, { deepThought: [] }, { model: " " }, { reasoning: "adaptive" },
-    { apiKey: "bad key" }, { apiKeyFile: 2 }, { maxActiveBackground: 5 }, { deepThought: { maxTurns: 0 } },
+    { apiKey: "bad key" }, { apiKeyFile: 2 }, { apiKeyFile: "relative/secret.env" }, { apiKeyFile: "./secret.env" }, { maxActiveBackground: 5 }, { deepThought: { maxTurns: 0 } },
     { deepThought: { maxToolCalls: 33 } }, { deepThought: { maxConcurrent: 1.5 } }, { deepThought: { timeoutMs: 4999 } },
     { deepThought: { maxToolResultChars: 32001 } }, { deepThought: { maxInputTokens: 1999 } },
     { peopleShadow: { intervalMinutes: 1441 } }, { peopleShadow: { maxItemsPerRun: 0 } }, { peopleShadow: { timeoutMs: 180001 } }]) {
@@ -69,7 +71,7 @@ test("credential overrides never inherit a decision key across origins or after 
 
 test("host complete corrects invalid JSON once and accounts for both SDK completions", async () => {
   const calls: Parameters<Host>[0][] = [];
-  const runner = createStewardRunner({ ...deps, resolveApiKey: () => { throw new Error("direct auth not allowed"); },
+  const runner = createStewardRunner({ ...deps, useHostLlm: true, resolveApiKey: () => { throw new Error("direct auth not allowed"); },
     hostLlmComplete: async input => { calls.push(input); return { ...hostReply(calls.length === 1 ? '{"answer":7}' : '{"answer":"ok"}'),
       usage: { inputTokens: 8, outputTokens: 2, cacheReadTokens: 3 } }; } });
   const result = await runner.complete(complete);
@@ -90,7 +92,7 @@ test("host lifecycle, stopReason error, and persistent schema errors never escap
     [async () => hostReply("null"), "invalid_output", false, 2],
   ];
   for (const [hostLlmComplete, code, retryable, requests] of cases) {
-    const result = await createStewardRunner({ ...deps, hostLlmComplete }).complete({ ...complete, maxRetries: 9 });
+    const result = await createStewardRunner({ ...deps, useHostLlm: true, hostLlmComplete }).complete({ ...complete, maxRetries: 9 });
     assert.ok(!result.ok);
     assert.equal(result.code, code);
     assert.equal(result.retryable, retryable);
@@ -98,7 +100,7 @@ test("host lifecycle, stopReason error, and persistent schema errors never escap
     assert.equal("costUsd" in result.usage, false);
     if (code === "provider_error") assert.equal(result.usage.outputTokens, 2);
   }
-  const result = await createStewardRunner({ ...deps, hostLlmComplete: async () => ({
+  const result = await createStewardRunner({ ...deps, useHostLlm: true, hostLlmComplete: async () => ({
     ...hostReply('{"answer":"yes"}'), usage: { costUsd: 0.03 },
   }) }).complete(complete);
   assert.ok(result.ok);
@@ -143,7 +145,8 @@ test("three-turn HTTP run replays ordered reasoning, pairs exact call IDs and sa
   const result = await runner.run({ ...req, maxToolResultChars: 100, tools: [{ name: "read", description: "Read", parameters: schema,
     execute: async args => { invoked.push(args.answer); return "Bearer ab.cd sk-test-123 xoxb-test ghp_test AKIA1234567890123456 " + token + "😀".repeat(100); } }],
     onToolCall: event => events.push(event.ok) });
-  assert.deepEqual(result, { ok: true, status: "complete", summary: "found", data: { answer: "found" }, model: "served", turns: 3, toolCalls: 6,
+  // submit_result is not a budgeted tool call: five research calls.
+  assert.deepEqual(result, { ok: true, status: "complete", summary: "found", data: { answer: "found" }, model: "served", turns: 3, toolCalls: 5,
     usage: { requests: 3, inputTokens: 30, outputTokens: 15, cachedInputTokens: 6, reasoningTokens: 3 } });
   assert.deepEqual(invoked, ["first", "second"]);
   assert.deepEqual(events, [true, false, false, false, true, true]);
@@ -235,7 +238,7 @@ test("a connection reset after a tool call resends its output without re-executi
 
 test("provider limits, permanent HTTP failures and Retry-After beyond the deadline are not retried", async () => {
   for (const [status, code, expected] of [[503, "context_length_exceeded", "context_overflow"], [400, "stream_incomplete", "provider_error"],
-    [401, "unauthorized", "provider_error"], [403, "forbidden", "provider_error"], [429, "rate_limit", "transient_provider"]] as const) {
+    [401, "unauthorized", "auth_denied"], [403, "forbidden", "auth_denied"], [429, "rate_limit", "transient_provider"]] as const) {
     const { runner, sent } = scripted(Response.json({ error: { code, message: token } }, { status, headers: { "Retry-After": "300" } }));
     const result = await runner.run(req);
     assert.ok(!result.ok);
@@ -252,13 +255,14 @@ test("hard budgets stop before the next dispatch or a partial batch of tool exec
   const tools = [{ name: "read", description: "read", parameters: schema, execute: async () => {
     executions++; return "long tool output ".repeat(1000);
   } }];
-  for (const [overrides, response, requests, count] of [
-    [{ maxTurns: 1 }, collected(read), 1, 1],
-    [{ maxToolCalls: 1 }, collected(read, { ...read, call_id: "read2" }), 1, 0],
-    [{ maxInputTokens: 5 }, collected(read), 0, 0],
-    [{ maxInputTokens: 1000 }, collected(read), 1, 1],
+  // Exhausting maxTurns/maxToolCalls buys exactly one submit-only wrap-up turn (here the model still does not submit).
+  for (const [overrides, responses, requests, count] of [
+    [{ maxTurns: 1 }, [collected(read), collected(message("still thinking"))], 2, 1],
+    [{ maxToolCalls: 1 }, [collected(read, { ...read, call_id: "read2" }), collected(message("no"))], 2, 0],
+    [{ maxInputTokens: 5 }, [collected(read)], 0, 0],
+    [{ maxInputTokens: 1000 }, [collected(read)], 1, 1],
   ] as const) {
-    const { runner, sent } = scripted(response);
+    const { runner, sent } = scripted(...responses);
     executions = 0;
     const result = await runner.run({ ...req, ...overrides, tools });
     assert.ok(!result.ok && result.code === "budget_exhausted");
@@ -266,6 +270,58 @@ test("hard budgets stop before the next dispatch or a partial batch of tool exec
     assert.equal(sent.length, requests);
     assert.equal(executions, count);
   }
+  // An overrunning batch is answered (never executed) so the wrap-up input stays a valid call/output transcript.
+  const { runner, sent } = scripted(collected(read, { ...read, call_id: "read2" }), collected(message("no")));
+  await runner.run({ ...req, maxToolCalls: 1, tools });
+  assert.deepEqual(sent[1]!.input.filter(i => i.type === "function_call_output").map(i => [i.call_id, i.output]),
+    [["read1", "Error: tool call budget exhausted; not executed."], ["read2", "Error: tool call budget exhausted; not executed."]]);
+});
+
+test("budget exhaustion runs one forced submit-only wrap-up turn that keeps the research", async () => {
+  const tools = [{ name: "read", description: "read", parameters: schema, execute: async () => "evidence" }];
+  for (const overrides of [{ maxTurns: 2 }, { maxToolCalls: 2 }]) {
+    const { runner, sent } = scripted(collected(call("read", "r1", { answer: "a" })), collected(call("read", "r2", { answer: "b" })),
+      collected(call("submit_result", "wrap", { answer: "best effort", status: "incomplete" })));
+    const result = await runner.run({ ...req, ...overrides, tools });
+    assert.ok(result.ok, JSON.stringify(overrides));
+    assert.equal(result.status, "incomplete");
+    assert.deepEqual(result.data, { answer: "best effort" });
+    assert.equal(result.turns, 3);
+    assert.equal(result.toolCalls, 2);
+    const wrap = sent[2]!;
+    assert.deepEqual(wrap.tools.map(t => t.name), ["submit_result"], "only submit_result is offered");
+    assert.deepEqual(wrap.tool_choice, { type: "function", name: "submit_result" });
+    assert.match(String(wrap.input.at(-1)?.content), /budget is exhausted/u);
+    assert.equal(wrap.input.filter(i => i.type === "function_call_output").length, 2, "gathered evidence is replayed");
+  }
+});
+
+test("submit_result never counts against maxToolCalls", async () => {
+  const { runner, sent } = scripted(collected(call("submit_result", "bad", { answer: 1, status: "complete" })),
+    collected(call("submit_result", "good", { answer: "fixed", status: "complete" })));
+  const result = await runner.run({ ...req, maxToolCalls: 1 });
+  assert.ok(result.ok);
+  assert.equal(result.toolCalls, 0);
+  assert.equal(sent.length, 2);
+});
+
+test("maxInputTokens bounds each request, not the cumulative sum, and retries are never double-charged", async () => {
+  const tools = [{ name: "read", description: "read", parameters: schema, execute: async () => "short" }];
+  const turns = Array.from({ length: 5 }, (_, i) => collected(call("read", `r${i}`, { answer: "x" })));
+  const { runner, sent } = scripted(...turns, collected(submit));
+  const perRequest = 2_000;
+  const result = await runner.run({ ...req, maxTurns: 8, maxInputTokens: perRequest, tools });
+  assert.ok(result.ok, "six requests whose sum exceeds the per-request budget still succeed");
+  assert.equal(sent.length, 6);
+  // A body just under the limit survives two transient retries of the same request.
+  const body = JSON.stringify({ model: config.model, instructions: prompt.systemPrompt, stream: false, store: false,
+    reasoning: { effort: "medium" }, input: [{ role: "user", content: prompt.userPrompt }] });
+  assert.ok(body.length < perRequest);
+  const retried = scripted(Response.json({}, { status: 503, headers: { "Retry-After": "0" } }),
+    Response.json({}, { status: 429, headers: { "Retry-After": "0" } }), collected(submit));
+  const ok = await retried.runner.run({ ...req, maxInputTokens: 400 });
+  assert.ok(ok.ok, "retries resend the same body without spending a second budget");
+  assert.equal(ok.usage.requests, 3);
 });
 
 test("wall timeout bounds stalled credentials; caller abort interrupts an uncooperative tool", async () => {
@@ -298,4 +354,121 @@ test("a chunked oversized response is cancelled, not parsed or retried", async (
   assert.ok(!result.ok && result.code === "invalid_output");
   assert.equal(cancelled, true);
   assert.equal(sent.length, 1);
+});
+
+test("strict wire schemas: closed objects, every key required, optional keys nullable, validation keywords stripped", () => {
+  const isStrict = (node: unknown, path = "$"): void => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return;
+    const n = node as Record<string, unknown>;
+    for (const key of ["maxLength", "minLength", "pattern", "minimum", "maximum", "minItems", "maxItems", "format",
+      "exclusiveMinimum", "exclusiveMaximum"]) assert.equal(key in n, false, `${path} keeps ${key}`);
+    assert.ok("type" in n || Array.isArray(n.anyOf), `${path} has a type`);
+    if (n.type === "object" || n.properties) {
+      assert.equal(n.additionalProperties, false, `${path} is closed`);
+      assert.deepEqual([...(n.required as string[])].sort(), Object.keys(n.properties as object).sort(), `${path} requires every key`);
+      for (const [k, v] of Object.entries(n.properties as object)) isStrict(v, `${path}.${k}`);
+    }
+    if (n.items) isStrict(n.items, `${path}[]`);
+    for (const branch of (n.anyOf as unknown[] | undefined) ?? []) isStrict(branch, `${path}|`);
+  };
+  const deep = toStrictJsonSchema(DEEP_THOUGHT_RESULT_SCHEMA);
+  const shadow = toStrictJsonSchema(PEOPLE_SHADOW_PROPOSAL_SCHEMA);
+  isStrict(deep); isStrict(shadow);
+  const citation = (deep.properties as any).citations.items;
+  assert.deepEqual(citation.properties.lines, { type: ["string", "null"] }, "optional primitive becomes nullable");
+  assert.deepEqual(citation.properties.source, { type: "string" }, "required keys stay non-null; pattern/maxLength stripped");
+  assert.deepEqual((deep.properties as any).openQuestions.anyOf[1], { type: "null" }, "optional array becomes anyOf null");
+  assert.deepEqual((shadow.properties as any).disposition, { type: "string", enum: ["revalidated", "corrected", "retired", "unresolved"] },
+    "bare enums gain a type");
+  // The original schemas keep their local validation keywords.
+  assert.equal((DEEP_THOUGHT_RESULT_SCHEMA.properties.answer as { maxLength?: number }).maxLength, 8_000);
+  // Decoding drops the forced nulls on optional keys only.
+  const decoded = stripOptionalNulls({ answer: "a", confidence: "low", openQuestions: null,
+    citations: [{ source: "s", quote: "q", lines: null, date: "2026" }] }, DEEP_THOUGHT_RESULT_SCHEMA);
+  assert.deepEqual(decoded, { answer: "a", confidence: "low", citations: [{ source: "s", quote: "q", date: "2026" }] });
+  assert.deepEqual(stripOptionalNulls({ answer: null }, schema), { answer: null }, "a required null is kept (and fails validation)");
+  const nullable = { type: "object", properties: { note: { anyOf: [{ type: "string" }, { type: "null" }] } } };
+  assert.deepEqual(stripOptionalNulls({ note: null }, nullable), { note: null }, "an original that accepts null keeps it");
+});
+
+test("strict schemas reach the wire for complete(), submit_result and tools; nulls on optional keys decode and validate", async () => {
+  const optional = { type: "object", properties: { answer: { type: "string", maxLength: 50 }, note: { type: "string" } },
+    required: ["answer"], additionalProperties: false };
+  const { runner, sent } = scripted(collected(message('{"answer":"yes","note":null}')),
+    collected(call("read", "r", { answer: "q", note: null })), collected(call("submit_result", "s", { answer: "done", note: null, status: "complete" })));
+  const completed = await runner.complete({ ...prompt, schema: optional });
+  assert.ok(completed.ok);
+  assert.deepEqual(completed.data, { answer: "yes" });
+  assert.deepEqual((sent[0]!.text as any).format.schema, { type: "object", additionalProperties: false, required: ["answer", "note"],
+    properties: { answer: { type: "string" }, note: { type: ["string", "null"] } } });
+  const received: unknown[] = [];
+  const result = await runner.run({ ...req, submitSchema: optional, tools: [{ name: "read", description: "read", parameters: optional,
+    execute: async args => { received.push(args); return "ok"; } }] });
+  assert.ok(result.ok);
+  assert.deepEqual(result.data, { answer: "done" });
+  assert.deepEqual(received, [{ answer: "q" }], "tools receive decoded arguments");
+  for (const tool of sent[1]!.tools as unknown as Array<{ name: string; strict: boolean; parameters: { required: string[]; additionalProperties: boolean } }>) {
+    assert.equal(tool.strict, true, tool.name);
+    assert.equal(tool.parameters.additionalProperties, false);
+    assert.ok(tool.parameters.required.includes("note"));
+  }
+});
+
+test("complete() defaults to the direct Responses path even when a host runtime exists; host denial is auth_denied", async () => {
+  let hostCalls = 0;
+  const host: Host = async () => { hostCalls++; return hostReply('{"answer":"host"}'); };
+  const sent: unknown[] = [];
+  const direct = await createStewardRunner({ ...deps, hostLlmComplete: host, fetch: async (_url, init) => {
+    sent.push(JSON.parse(String(init?.body))); return collected(message('{"answer":"direct"}'));
+  } }).complete(complete);
+  assert.ok(direct.ok);
+  assert.equal(direct.backend, "responses_api");
+  assert.equal(hostCalls, 0);
+  assert.equal(sent.length, 1);
+  for (const denial of [Object.assign(new Error("denied"), { code: "LLM_COMPLETION_NOT_AUTHORIZED" }),
+    new Error("LLM_COMPLETION_NOT_AUTHORIZED: plugin model override not allowed")]) {
+    const denied = await createStewardRunner({ ...deps, useHostLlm: true, hostLlmComplete: async () => { throw denial; } }).complete(complete);
+    assert.ok(!denied.ok);
+    assert.equal(denied.code, "auth_denied");
+    assert.equal(denied.retryable, false);
+  }
+});
+
+test("complete() retries transient 408/429/5xx and connection resets, never 400/401/403 or context overflow", async () => {
+  for (const status of [408, 429, 500, 502, 503, 504]) {
+    const { runner, sent } = scripted(Response.json({}, { status, headers: { "Retry-After": "0" } }), collected(message('{"answer":"ok"}')));
+    const result = await runner.complete(complete);
+    assert.ok(result.ok, `HTTP ${status} retried`);
+    assert.equal(result.usage.requests, 2);
+    assert.equal(sent.length, 2);
+  }
+  let resets = 0;
+  const reset = await createStewardRunner({ ...deps, fetch: async () => {
+    if (resets++ < 2) throw new TypeError("ECONNRESET");
+    return collected(message('{"answer":"ok"}'));
+  } }).complete(complete);
+  assert.ok(reset.ok);
+  assert.equal(reset.usage.requests, 3);
+  const exhausted = scripted(...Array.from({ length: 3 }, () => Response.json({}, { status: 502, headers: { "Retry-After": "0" } })));
+  const gaveUp = await exhausted.runner.complete(complete);
+  assert.ok(!gaveUp.ok && gaveUp.code === "transient_provider" && gaveUp.retryable);
+  assert.equal(exhausted.sent.length, 3, "retries are bounded");
+  for (const [status, code] of [[400, "bad"], [401, "x"], [403, "x"], [500, "context_length_exceeded"]] as const) {
+    const { runner, sent } = scripted(Response.json({ error: { code } }, { status }));
+    const result = await runner.complete(complete);
+    assert.ok(!result.ok);
+    assert.equal(sent.length, 1, `HTTP ${status} ${code} is not retried`);
+  }
+});
+
+test("outbound user prompts are redacted for complete() and run()", async () => {
+  const secretPrompt = { ...prompt, userPrompt: `Use ${token} or Bearer abc.def and sk-live-123 xoxb-1-2 please` };
+  const { runner, sent } = scripted(collected(message('{"answer":"ok"}')), collected(submit));
+  await runner.complete({ ...secretPrompt, schema });
+  await runner.run({ ...req, ...secretPrompt });
+  for (const wire of sent) {
+    const text = JSON.stringify(wire.input[0]);
+    assert.doesNotMatch(text, /private-test-credential|abc\.def|sk-live|xoxb-/u);
+    assert.match(text, /\[redacted\]/u);
+  }
 });

@@ -208,6 +208,8 @@ type JudgeStage = "quality" | "feedback" | "sentiment";
 type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
     begin: (stages: JudgeStage[]) => void;
     save: <K extends JudgeStage>(stage: K, result: ResponseStages[K]) => void;
+    /** These begun stages failed on their own (not by cancellation): their attempt is spent, never refunded. */
+    settle?: (stages: JudgeStage[]) => void;
 };
 export declare function validateCachedStage<K extends keyof ResponseStages>(stage: K, value: unknown, contract?: ResponseStageContracts[K]): ResponseStages[K];
 /** Separate requests are deliberate: later feedback must not leak into the original quality grade. */

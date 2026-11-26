@@ -257,8 +257,8 @@ test("shadow pass: opaque handles, rejected hallucinations, work_items-only writ
   assert.equal(report.agreementRate, 0.5);
   assert.deepEqual(report.divergences.map(d => [d.assertionId, d.shadow, d.cron]), [[asyncUpdates!.id, "corrected", "revalidated"]]);
   assert.deepEqual(report.cronOnlyItems.map(i => [i.assertionId, i.personId, i.cron]), [[blurb!.id, f.mira.id, "revalidated"]]);
-  assert.equal(report.usageTotals.requests, 3, "usage of staged/completed proposals (rejected attempts store none)");
-  assert.equal(report.usageTotals.outputTokens, 120);
+  assert.equal(report.usageTotals.requests, 4, "usage of every attempt, including the rejected one");
+  assert.equal(report.usageTotals.outputTokens, 160);
   assert.deepEqual(buildPeopleShadowReport(f.dbPath, "weekly:none").manifests, [], "manifest filter is exact");
 });
 
@@ -367,7 +367,7 @@ test("runner failures: invalid output strikes toward quarantine, missing credent
   const store = new WorkStore(f.dbPath);
   t.after(() => store.close());
   let calls = 0;
-  const failWith = (code: "invalid_output" | "missing_credentials"): CompleteRunner => ({
+  const failWith = (code: "invalid_output" | "missing_credentials" | "auth_denied" | "transient_provider" | "lifecycle_reload" | "timeout"): CompleteRunner => ({
     complete: async () => { calls += 1; return { ok: false, code, error: code, retryable: false, usage: { requests: code === "invalid_output" ? 1 : 0 } }; },
   });
   const invalid = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failWith("invalid_output"),
@@ -382,6 +382,99 @@ test("runner failures: invalid output strikes toward quarantine, missing credent
   assert.equal(calls, 1, "a systemic failure stops the pass after the first item");
   assert.equal(missing.failed, 1);
   assert.ok(store.list(PEOPLE_SHADOW_KIND).every(item => item.status === "pending" && item.strikes === 0));
+
+  // Auth denial, rate limits/outages (after the runner's own retries) and host reloads stop the pass too.
+  for (const code of ["auth_denied", "transient_provider", "lifecycle_reload"] as const) {
+    calls = 0;
+    const stopped = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failWith(code),
+      owner: "o", maxStrikes: 1, maxItems: 10 });
+    assert.equal(calls, 1, `${code} stops the pass instead of burning maxItems`);
+    assert.equal(stopped.failed, 1);
+    assert.ok(store.list(PEOPLE_SHADOW_KIND).every(item => item.strikes === 0), `${code} adds no strike`);
+  }
+
+  // A packet that keeps timing out is the item's problem: it strikes toward quarantine instead of looping forever.
+  calls = 0;
+  const slow = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failWith("timeout"),
+    owner: "o", maxStrikes: 1 });
+  assert.equal(calls, 5);
+  assert.equal(slow.failed, 5);
+  assert.ok(store.list(PEOPLE_SHADOW_KIND).every(item => item.status === "quarantined" && item.strikes === 1));
+});
+
+test("usage accumulates on the row across failed and successful attempts", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const failing: CompleteRunner = { complete: async () => ({ ok: false, code: "context_overflow", error: "too big", retryable: false,
+    usage: { requests: 1, inputTokens: 50, outputTokens: 5 } }) };
+  await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner: failing, owner: "o", maxItems: 1 });
+  const scope = store.list(PEOPLE_SHADOW_KIND).find(item => item.lastError)!.scope;
+  assert.deepEqual(JSON.parse(store.get(PEOPLE_SHADOW_KIND, scope)!.usageJson!), { requests: 1, inputTokens: 50, outputTokens: 5 },
+    "a failed attempt's tokens are recorded");
+  const { runner } = scriptedRunner((_prompt, handles) => ({ disposition: "revalidated", reason: "ok", citedHandles: [handles[0]!],
+    confidence: "medium" }));
+  await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o", maxItems: 1 });
+  const row = store.get(PEOPLE_SHADOW_KIND, scope)!;
+  assert.equal(row.status, "completed");
+  assert.deepEqual(JSON.parse(row.usageJson!), { requests: 2, inputTokens: 250, outputTokens: 45 }, "both attempts are billed");
+  const report = buildPeopleShadowReport(f.dbPath, f.manifest.id);
+  assert.equal(report.usageTotals.requests, 2);
+});
+
+test("revision binding: claims, resumes and the report only use artifacts for the exact manifest revision", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  // The row's inputs advance between the pass reading it and claiming it: the bound claim refuses it.
+  class RacingStore extends WorkStore {
+    target?: string;
+    override get(kind: string, scope: string) {
+      const row = super.get(kind, scope);
+      if (row && !this.target && row.status === "pending") {
+        this.target = scope;
+        this.enqueue({ kind, scope, mode: "item", inputRevision: "advanced", recipeHash: row.recipeHash });
+      }
+      return row;
+    }
+  }
+  const racing = new RacingStore(f.dbPath);
+  t.after(() => racing.close());
+  const seen: string[] = [];
+  const { runner } = scriptedRunner((prompt, handles) => { seen.push(prompt); return { disposition: "revalidated", reason: "ok",
+    citedHandles: [handles[0]!], confidence: "medium" }; });
+  const raced = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: racing, runner, owner: "o", maxItems: 1 });
+  assert.equal(raced.items[0]?.scope, racing.target);
+  assert.equal(raced.items[0]?.outcome, "busy", "a row whose revision advanced after it was read is never claimed");
+  assert.equal(racing.get(PEOPLE_SHADOW_KIND, racing.target!)?.status, "pending");
+  assert.equal(racing.get(PEOPLE_SHADOW_KIND, racing.target!)?.inputRevision, "advanced");
+
+  // A staged artifact proposed against another revision is not resumed: the model re-adjudicates this revision.
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const scope = store.list(PEOPLE_SHADOW_KIND).find(item => item.inputRevision === f.revision && item.status === "completed")!.scope;
+  assert.equal(store.requeue(PEOPLE_SHADOW_KIND, scope), true);
+  const ref = store.claim({ kind: PEOPLE_SHADOW_KIND, scope, owner: "crashed", leaseMs: 1, now: 0, ignoreDueAt: true })!;
+  const foreign: PeopleShadowArtifact = { schemaVersion: 1, manifestId: f.manifest.id, manifestRevision: "some-other-revision",
+    personId: f.mira.id, assertionId: scope.split(":").at(-1)!, source: "model", evidence: [], proposedAt: new Date().toISOString(),
+    proposal: { disposition: "retired", reason: "foreign revision", citedHandles: [], confidence: "low" } };
+  store.stageArtifact(ref, { stage: "proposal", artifactJson: JSON.stringify(foreign), now: 0 });
+  store.interruptOwner("crashed");
+  const calls = seen.length;
+  const resumed = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o2" });
+  assert.notEqual(resumed.items.find(i => i.scope === scope)?.outcome, "resumed");
+  assert.ok(seen.length > calls);
+  const artifact = JSON.parse(store.get(PEOPLE_SHADOW_KIND, scope)!.artifactJson!) as PeopleShadowArtifact;
+  assert.equal(artifact.manifestRevision, f.revision);
+  assert.equal(artifact.proposal.disposition, "revalidated");
+
+  // The report never compares an artifact whose embedded revision differs from the row's.
+  const before = buildPeopleShadowReport(f.dbPath, f.manifest.id);
+  store.db.prepare("UPDATE work_items SET artifact_json=json_set(artifact_json,'$.manifestRevision','tampered') WHERE kind=? AND scope=?")
+    .run(PEOPLE_SHADOW_KIND, scope);
+  const after = buildPeopleShadowReport(f.dbPath, f.manifest.id);
+  assert.equal(after.pending, before.pending + 1);
+  assert.equal(after.shadowOnly + after.matched + after.diverged, before.shadowOnly + before.matched + before.diverged - 1);
 });
 
 test("background slots are process-wide and single-use releases", () => {
@@ -432,7 +525,9 @@ test("gateway_stop interrupts the owner synchronously before aborting: 0 strikes
   await inFlight;
   assert.equal(activeBackgroundStewards(), 1);
   await handlers.get("gateway_stop")!();
-  assert.deepEqual(order.slice(0, 2), ["interrupt", "abort"], "interruptOwner runs before in-flight calls are aborted");
+  // Abort and interruptOwner happen in one synchronous step: the pass only observes the abort afterwards, so its
+  // late fail() is fenced out and adds no strike, and shutdown never waits on the release.
+  assert.deepEqual(order.slice(0, 2), ["abort", "interrupt"], "in-flight calls are aborted alongside interruptOwner");
   assert.equal(stores[0]!.interrupts[0], runtime.owner);
   assert.equal(activeBackgroundStewards(), 0);
   const result = runtime.lastResults().get("main")!;

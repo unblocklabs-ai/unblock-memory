@@ -320,7 +320,9 @@ export async function runInsideOut(options) {
     const owner = options.owner ?? `inside-out:${process.pid}:${randomUUID()}`;
     const leaseMs = options.leaseMs ?? LEASE_MS, intervalMs = config.insideOut.intervalMinutes * 60_000;
     const store = openInsideOutStore(storePath);
-    let work, claim, heartbeat, scheduledDue = 0;
+    let work, claim, heartbeat;
+    // Cadence is measured from pass start, so a pass of non-zero duration still runs once per interval.
+    const startedAt = Date.now();
     const owned = activeWork.get(owner) ?? new Set();
     const fence = new AbortController();
     const signal = options.signal ? AbortSignal.any([options.signal, fence.signal]) : fence.signal;
@@ -328,7 +330,6 @@ export async function runInsideOut(options) {
     try {
         work = new WorkStore(store);
         work.enqueue({ kind: INSIDE_OUT_WORK_KIND, scope: INSIDE_OUT_WORK_SCOPE, mode: "run", dueAt: 0 });
-        scheduledDue = work.get(INSIDE_OUT_WORK_KIND, INSIDE_OUT_WORK_SCOPE)?.dueAt ?? 0;
         claim = work.claim({ kind: INSIDE_OUT_WORK_KIND, scope: INSIDE_OUT_WORK_SCOPE, mode: "run", owner, leaseMs,
             ignoreDueAt: options.manual === true });
         if (!claim) {
@@ -416,8 +417,9 @@ export async function runInsideOut(options) {
         }
         signal.throwIfAborted();
         heartbeat.stop();
-        // Manual passes keep the gateway's schedule; scheduled passes re-arm one interval out.
-        work.commitWithDomain(held, { nextDueAt: options.manual ? scheduledDue : Date.now() + intervalMs }, () => undefined);
+        // Manual passes keep the gateway's schedule (the row's due time as of commit); scheduled passes re-arm one
+        // interval after they started.
+        work.commitWithDomain(held, options.manual ? { preserveDueAt: true } : { nextDueAt: startedAt + intervalMs }, () => undefined);
         claim = undefined;
     }
     catch (error) {
@@ -426,7 +428,7 @@ export async function runInsideOut(options) {
             // Shutdown, credentials, transient provider and source errors are not strikes; retry on the next schedule.
             try {
                 work.fail(claim, { error: error instanceof Error ? error.message : String(error),
-                    retryAt: options.manual ? scheduledDue : Date.now() + intervalMs });
+                    ...(options.manual ? { preserveDueAt: true } : { retryAt: startedAt + intervalMs }) });
             }
             catch (release) {
                 if (!(release instanceof WorkFenceLostError))

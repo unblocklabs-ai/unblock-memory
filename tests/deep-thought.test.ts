@@ -213,7 +213,8 @@ test("hallucinated and unvisited citation paths are stripped and counted", async
       answer: "Launch moved to Friday.",
       confidence: "high",
       citations: [
-        { source: "qmd://memory/retro.md", quote: "surfaced by search" },
+        { source: "qmd://memory/retro.md", quote: "The launch moved to   FRIDAY" },
+        { source: "qmd://memory/launch.md", quote: "The board cancelled the launch indefinitely." },
         { source: "qmd://memory/never-seen.md", quote: "invented" },
         { source: "/Users/someone/secret.md", quote: "raw path" },
         { source: "person:not-looked-up", quote: "invented person" },
@@ -222,8 +223,9 @@ test("hallucinated and unvisited citation paths are stripped and counted", async
   ]);
   const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, runner)), { question: "launch date?" });
   assert.equal(outcome.status, "complete");
-  assert.deepEqual(outcome.citations.map(c => c.source), ["qmd://memory/retro.md"]);
-  assert.equal(outcome.unverifiedCitationsDropped, 3);
+  assert.deepEqual(outcome.citations.map(c => c.source), ["qmd://memory/retro.md"],
+    "a quote is kept only when grounded (case/whitespace-insensitive) in the text its visited source returned");
+  assert.equal(outcome.unverifiedCitationsDropped, 4, "a fabricated quote on a visited source is dropped too");
 
   const { runner: allBad } = scriptedRunner([{ submit: () => ({ answer: "Guess.", confidence: "high",
     citations: [{ source: "qmd://memory/never-seen.md", quote: "x" }] }) }]);
@@ -424,4 +426,69 @@ test("end-to-end through the real StewardRunner: tool calls, submit_result and u
   const toolOutput = sent[1]!.input.find(item => item.type === "function_call_output" && item.call_id === "c1");
   assert.match(toolOutput?.output ?? "", /qmd:\/\/memory\/launch\.md/u, "search results reached the model");
   assert.equal(recorded.searches.length, 1);
+});
+
+test("quote grounding: verbatim or high token overlap with the cited source's own returned text; never another source's", async () => {
+  const { runtime } = fakeRuntime([hit("launch"), { ...hit("budget"), snippet: "Budget review: Q3 spend is frozen until December." }]);
+  const { runner } = scriptedRunner([
+    [{ call: "search_memory", args: { bm25Query: "launch", vectorQuery: "launch" } },
+      { call: "read_memory", args: { path: "qmd://memory/launch.md" } }],
+    { submit: () => ({ answer: "Friday; spend frozen.", confidence: "high", citations: [
+      { source: "qmd://memory/launch.md#L2", quote: "Launch moved to Friday (2026-11-20)." },
+      { source: "qmd://memory/budget.md", quote: "Q3 spend is frozen until December" },
+      { source: "qmd://memory/budget.md", quote: "spend frozen until December for Q3" },
+      { source: "qmd://memory/budget.md", quote: "the launch moved to Friday" },
+      { source: "qmd://memory/launch.md", quote: "" },
+    ] }) },
+  ]);
+  const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, runner)), { question: "q" });
+  assert.deepEqual(outcome.citations.map(c => c.quote), ["Launch moved to Friday (2026-11-20).", "Q3 spend is frozen until December",
+    "spend frozen until December for Q3"], "read_memory content and reordered-but-overlapping quotes are grounded");
+  assert.equal(outcome.unverifiedCitationsDropped, 2, "another source's text and empty quotes do not ground a citation");
+});
+
+test("lookup_person skips people excluded from injection (injectionEnabled === false)", async t => {
+  const people = peopleFixture();
+  t.after(people.cleanup);
+  people.stores.get("main").setInjection(people.mira.id, false);
+  const { runtime } = fakeRuntime();
+  const { runner } = scriptedRunner([
+    [{ call: "lookup_person", args: { query: "Mira" } }, { call: "lookup_person", args: { query: people.mira.id } }],
+    { submit: outputs => {
+      for (const output of outputs) assert.equal((output as { status: string }).status, "not_found");
+      return { answer: "Unknown.", confidence: "low", citations: [{ source: `person:${people.mira.id}`, quote: "Mira leads launch planning at ExampleCo." }] };
+    } },
+  ]);
+  const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, runner, { people: { enabled: true, stores: people.stores } })),
+    { question: "Who is Mira?" });
+  assert.deepEqual(outcome.citations, []);
+  assert.equal(outcome.unverifiedCitationsDropped, 1);
+});
+
+test("through the real runner, an exhausted tool budget still returns the forced wrap-up's grounded answer", async t => {
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("no network in tests"); });
+  const { runtime } = fakeRuntime();
+  const call = (name: string, id: string, args: unknown) => ({ type: "function_call", status: "completed", call_id: id, name,
+    arguments: JSON.stringify(args) });
+  const replies = [
+    { status: "completed", output: [call("search_memory", "c1", { bm25Query: "launch", vectorQuery: "launch", corpora: null,
+      sessionFilter: null, maxResults: null })] },
+    { status: "completed", output: [call("submit_result", "c2", { status: "incomplete", answer: "Probably Friday.", confidence: "medium",
+      openQuestions: null, citations: [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday", lines: null, date: null }] })] },
+  ];
+  const sent: { tools: { name: string }[]; tool_choice?: unknown }[] = [];
+  const runner = createStewardRunner({
+    config: resolveStewardConfig({ enabled: true, deepThought: { enabled: true } }),
+    resolveApiKey: async () => "test-token",
+    fetch: async (_url, init) => { sent.push(JSON.parse(String(init?.body))); return Response.json(replies.shift()); },
+  });
+  const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, runner, { config: { ...CONFIG, maxToolCalls: 1 } })),
+    { question: "When is the launch?" });
+  assert.equal(outcome.status, "incomplete");
+  assert.equal(outcome.answer, "Probably Friday.");
+  assert.deepEqual(outcome.citations, [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }],
+    "strict-mode nulls are decoded away before validation");
+  assert.deepEqual(outcome.openQuestions, []);
+  assert.deepEqual(sent[1]!.tools.map(tool => tool.name), ["submit_result"]);
+  assert.deepEqual(sent[1]!.tool_choice, { type: "function", name: "submit_result" });
 });

@@ -4,7 +4,11 @@ import { DEFAULTS } from "./defaults.js";
 import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
 // Loaded by the background writer worker with plain Node resolution:
 // this module and its imports must stay free of `openclaw`.
-export const RECALL_LEDGER_SCHEMA_VERSION = 2;
+/**
+ * Stays 1: skill event tables and nullable token columns are purely additive, so a rollback to v0.16.0
+ * (which rejects any other version) still opens the ledger. Opens self-heal missing additive objects.
+ */
+export const RECALL_LEDGER_SCHEMA_VERSION = 1;
 const MAX_RETENTION_DAYS = 3650;
 /** Parses YYYY-MM-DD.md filenames (both `2026-11-20.md` under a rooted `memory/` source and `memory/2026-11-20.md`). */
 export function parseDailyFilenameDateMs(path) {
@@ -170,20 +174,27 @@ CREATE TABLE IF NOT EXISTS skill_open_events (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_skill_open_agent_time ON skill_open_events (agent_id, created_at_ms);
 `;
+const ADDITIVE_TABLES = ["recall_queries", "recall_hits", "recall_reads", "skill_routing_events", "skill_open_events"];
+const ADDITIVE_QUERY_COLUMNS = ["input_tokens", "output_tokens"];
+/** Pre-release Phase B builds stamped 2 for the same additive layout; heal those back to 1 for rollback safety. */
+const PRE_RELEASE_VERSION = 2;
 function ensureRecallLedgerSchema(db) {
     const version = db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'");
-    if (version.get()?.version === RECALL_LEDGER_SCHEMA_VERSION)
+    const complete = () => ADDITIVE_TABLES.every(table => tableExists(db, table)) &&
+        ADDITIVE_QUERY_COLUMNS.every(column => db.prepare("PRAGMA table_info(recall_queries)").all().some(row => row.name === column));
+    // Fast path avoids the write lock on every open.
+    if (version.get()?.version === RECALL_LEDGER_SCHEMA_VERSION && complete())
         return;
     immediateTransaction(db, () => {
         const current = version.get()?.version;
-        if (current === RECALL_LEDGER_SCHEMA_VERSION)
-            return;
-        if (current !== undefined && current !== 1) {
+        if (current !== undefined && current !== RECALL_LEDGER_SCHEMA_VERSION && current !== PRE_RELEASE_VERSION) {
             throw new Error(`Unsupported recall_ledger schema version: ${String(current)}`);
         }
+        if (current === RECALL_LEDGER_SCHEMA_VERSION && complete())
+            return;
         db.exec(SCHEMA_SQL);
         const columns = db.prepare("PRAGMA table_info(recall_queries)").all();
-        for (const column of ["input_tokens", "output_tokens"]) {
+        for (const column of ADDITIVE_QUERY_COLUMNS) {
             if (!columns.some(row => row.name === column))
                 db.exec(`ALTER TABLE recall_queries ADD COLUMN ${column} INTEGER`);
         }
@@ -341,28 +352,36 @@ function purgeRecallPersonInDb(db, identity) {
     if (!provider || !senderId)
         throw new Error("provider and senderId are required");
     if (!tableExists(db, "recall_queries"))
-        return { queries: 0 };
-    let queries = 0;
+        return { queries: 0, skillEvents: 0 };
+    let queries = 0, skillEvents = 0;
     immediateTransaction(db, () => {
-        if (accountId) {
-            queries = Number(db.prepare("DELETE FROM recall_queries WHERE provider = ? AND account_id = ? AND sender_id = ?")
-                .run(provider, accountId, senderId).changes);
+        const match = accountId ? "provider = ? AND account_id = ? AND sender_id = ?" : "provider = ? AND sender_id = ?";
+        const args = accountId ? [provider, accountId, senderId] : [provider, senderId];
+        // Skill routing/open events carry no sender: erase every event bound to one of the person's sessions or runs.
+        const scopes = db.prepare(`SELECT DISTINCT agent_id, session_id, session_key, run_id FROM recall_queries WHERE ${match}`).all(...args);
+        for (const table of ["skill_routing_events", "skill_open_events"]) {
+            if (!tableExists(db, table))
+                continue;
+            const remove = db.prepare(`DELETE FROM ${table} WHERE agent_id = :agent AND (
+        (:session IS NOT NULL AND session_id = :session) OR (:sessionKey IS NOT NULL AND session_key = :sessionKey) OR
+        (:run IS NOT NULL AND run_id = :run))`);
+            for (const scope of scopes) {
+                skillEvents += Number(remove.run({ agent: scope.agent_id, session: scope.session_id ?? null,
+                    sessionKey: scope.session_key ?? null, run: scope.run_id ?? null }).changes);
+            }
         }
-        else {
-            queries = Number(db.prepare("DELETE FROM recall_queries WHERE provider = ? AND sender_id = ?")
-                .run(provider, senderId).changes);
-        }
+        queries = Number(db.prepare(`DELETE FROM recall_queries WHERE ${match}`).run(...args).changes);
     });
-    return { queries };
+    return { queries, skillEvents };
 }
-/** Operator erasure for one person's recall query history; never creates tables in an uninitialized DB. */
+/** Operator erasure for one person's recall history (queries, hits and linked skill events); never creates tables. */
 export function purgeRecallPerson(path, identity) {
     const provider = identity.provider.trim().toLowerCase();
     const senderId = identity.senderId.trim();
     if (!provider || !senderId)
         throw new Error("provider and senderId are required");
     if (!existsSync(path))
-        return { queries: 0 };
+        return { queries: 0, skillEvents: 0 };
     const db = openMemoryDatabase(path);
     try {
         return purgeRecallPersonInDb(db, identity);
@@ -635,7 +654,7 @@ export class RecallLedgerWriter {
                     });
                     if (!response.ok)
                         throw new Error(response.error);
-                    task.resolve(response.result ?? { queries: 0 });
+                    task.resolve(response.result ?? { queries: 0, skillEvents: 0 });
                 }
                 catch (error) {
                     this.#errors++;

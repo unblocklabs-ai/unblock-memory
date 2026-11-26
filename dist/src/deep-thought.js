@@ -86,12 +86,32 @@ function citationKey(source) {
     const hash = trimmed.indexOf("#");
     return hash > 0 ? trimmed.slice(0, hash) : trimmed;
 }
+/** Case-, punctuation- and whitespace-insensitive form used to ground quotes in returned evidence. */
+function normalizeEvidence(text) {
+    return text.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+/** Minimum share of a quote's words that must appear in the cited source's returned text when it is not verbatim. */
+const QUOTE_TOKEN_OVERLAP = 0.8;
+/** A quote is grounded when its normalized text occurs in, or overwhelmingly overlaps, what the source returned. */
+function quoteGrounded(quote, evidence) {
+    const needle = normalizeEvidence(quote);
+    if (!needle)
+        return false;
+    const haystacks = evidence.map(normalizeEvidence);
+    if (haystacks.some(text => text.includes(needle)))
+        return true;
+    const tokens = needle.split(" ");
+    const vocabulary = new Set(haystacks.flatMap(text => text.split(" ")));
+    return tokens.filter(token => vocabulary.has(token)).length / tokens.length >= QUOTE_TOKEN_OVERLAP;
+}
+/** Keep citations whose source a tool actually returned AND whose quote is grounded in that source's returned text. */
 function verifyCitations(citations, visited) {
     const kept = [];
     let dropped = 0;
     for (const citation of citations) {
         const source = citation.source.trim();
-        if (visited.has(source) || visited.has(citationKey(source))) {
+        const evidence = visited.get(source) ?? visited.get(citationKey(source));
+        if (evidence && quoteGrounded(citation.quote, evidence)) {
             kept.push({ ...citation, source, quote: clip(citation.quote, MAX_QUOTE_CHARS) });
         }
         else
@@ -161,7 +181,14 @@ async function runDeepThought(active, params, deps, signal) {
         return { ...base(), status: "busy", error: `deep_thought is at capacity (${maxConcurrent} concurrent); retry shortly or use memory_search` };
     }
     counter.active += 1;
-    const visitedPaths = new Set();
+    /** Text each visited path/handle actually returned to the model: citation quotes must be grounded in it. */
+    const visitedEvidence = new Map();
+    const remember = (source, text) => {
+        const texts = visitedEvidence.get(source) ?? [];
+        if (text)
+            texts.push(text);
+        visitedEvidence.set(source, texts);
+    };
     /** Paths surfaced by search; when corpora are narrowed, reads are confined to these. */
     const surfacedPaths = new Set();
     let toolCallsUsed = 0;
@@ -189,7 +216,6 @@ async function runDeepThought(active, params, deps, signal) {
                 if ("error" in requested)
                     return { status: "invalid_request", error: requested.error };
                 const queries = { lex: args.bm25Query.trim(), vec: args.vectorQuery.trim() };
-                prepareQueryConversation([], queries.lex);
                 const { conversation } = prepareQueryConversation([], queries.vec);
                 const search = await searchMemory(manager, queries, {
                     corpora: requested.corpora,
@@ -205,7 +231,8 @@ async function runDeepThought(active, params, deps, signal) {
                     requestContext: active.requestContext,
                 });
                 const results = search.results.map(hit => {
-                    visitedPaths.add(hit.path);
+                    const snippet = clip(hit.snippet, MAX_SNIPPET_CHARS);
+                    remember(hit.path, snippet);
                     surfacedPaths.add(hit.path);
                     return {
                         path: hit.path,
@@ -216,7 +243,7 @@ async function runDeepThought(active, params, deps, signal) {
                         ...(hit.session ? { sessionStartedAt: new Date(hit.session.startedAt).toISOString() } : {}),
                         ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
                         ...(hit.extracted ? { observedAt: hit.extracted.observedAt } : {}),
-                        snippet: clip(hit.snippet, MAX_SNIPPET_CHARS),
+                        snippet,
                     };
                 });
                 return { rankingMode: search.rankingMode, results };
@@ -241,9 +268,9 @@ async function runDeepThought(active, params, deps, signal) {
                     requestContext: active.requestContext,
                 });
                 if (result.status === "ok") {
-                    visitedPaths.add(path);
-                    if (result.path)
-                        visitedPaths.add(result.path);
+                    remember(path, result.text);
+                    if (result.path && result.path !== path)
+                        remember(result.path, result.text);
                 }
                 return result;
             },
@@ -263,6 +290,9 @@ async function runDeepThought(active, params, deps, signal) {
                     for (let offset = 0; offset < PEOPLE_SCAN_LIMIT && matches.length < MAX_PEOPLE_MATCHES; offset += PEOPLE_PAGE) {
                         const page = store.listActivePeople(PEOPLE_PAGE, offset, false);
                         for (const person of page) {
+                            // People excluded from injection stay invisible here too (matches the People prompt hooks).
+                            if (person.injectionEnabled === false)
+                                continue;
                             // Strict account fence: only identities in the caller's exact provider + account are visible.
                             const scoped = store.listIdentities(person.id).filter(identity => !identity.isDeactivated && identity.isBot !== true &&
                                 identity.provider.toLowerCase() === origin.provider && identity.accountScope.toLowerCase() === origin.accountId);
@@ -270,21 +300,22 @@ async function runDeepThought(active, params, deps, signal) {
                                 continue;
                             const verified = store.getVerifiedDossier(person.id);
                             const handle = `person:${person.id}`;
-                            visitedPaths.add(handle);
+                            const name = person.preferredName ?? person.displayName;
+                            const identities = scoped.map(identity => ({ provider: identity.provider, externalId: identity.externalId,
+                                handle: identity.handle, title: identity.title }));
+                            const sections = verified?.dossier.sections.map(section => ({
+                                category: section.category,
+                                claims: section.claims.map(({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt }) => ({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt })),
+                            }));
+                            remember(handle, [name, person.displayName, ...identities.flatMap(i => [i.handle, i.title, i.externalId]),
+                                verified?.dossier.blurb, ...(sections ?? []).flatMap(section => section.claims.flatMap(c => [c.statement, c.scope]))]
+                                .filter((text) => typeof text === "string" && text.length > 0).join("\n"));
                             matches.push({
                                 source: handle,
-                                name: person.preferredName ?? person.displayName,
+                                name,
                                 status: person.status,
-                                identities: scoped.map(identity => ({ provider: identity.provider, externalId: identity.externalId,
-                                    handle: identity.handle, title: identity.title })),
-                                dossier: verified ? {
-                                    reviewedAt: verified.reviewedAt,
-                                    blurb: verified.dossier.blurb,
-                                    sections: verified.dossier.sections.map(section => ({
-                                        category: section.category,
-                                        claims: section.claims.map(({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt }) => ({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt })),
-                                    })),
-                                } : null,
+                                identities,
+                                dossier: verified ? { reviewedAt: verified.reviewedAt, blurb: verified.dossier.blurb, sections } : null,
                                 dossierStatus: verified ? "verified" : "unverified_or_missing",
                             });
                             if (matches.length >= MAX_PEOPLE_MATCHES)
@@ -331,7 +362,7 @@ async function runDeepThought(active, params, deps, signal) {
             return { status, citations: [], openQuestions: [], ...counts, error: clip(run.error, 300) };
         }
         const result = Value.Check(DEEP_THOUGHT_RESULT_SCHEMA, run.data) ? run.data : undefined;
-        const { kept, dropped } = verifyCitations(result?.citations ?? [], visitedPaths);
+        const { kept, dropped } = verifyCitations(result?.citations ?? [], visitedEvidence);
         return {
             status: result ? run.status : "incomplete",
             ...(result ? { answer: result.answer, confidence: kept.length || !result.citations.length ? result.confidence : "low" } : {}),

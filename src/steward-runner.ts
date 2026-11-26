@@ -18,7 +18,7 @@ export type StewardToolDef<TParams = JsonObject> = { name: string; description: 
 type Prompt = { purpose: string; systemPrompt: string; userPrompt: string; model?: string;
   reasoning?: StewardConfig["reasoning"]; signal?: AbortSignal };
 export type StewardCompleteRequest<T> = Prompt & { schema: Schema; timeoutMs?: number; maxRetries?: number };
-type StewardErrorCode = "aborted" | "timeout" | "lifecycle_reload" | "missing_credentials" | "context_overflow" |
+type StewardErrorCode = "aborted" | "timeout" | "lifecycle_reload" | "missing_credentials" | "auth_denied" | "context_overflow" |
   "transient_provider" | "invalid_output" | "budget_exhausted" | "provider_error";
 type Failure = { ok: false; code: StewardErrorCode; error: string; retryable: boolean; usage: StewardUsage };
 export type StewardCompleteResult<T> = Failure | { ok: true; data: T; usage: StewardUsage; model?: string;
@@ -34,7 +34,14 @@ export interface StewardRunner {
   run<T>(req: StewardRunRequest<T>): Promise<StewardRunResult<T>>;
 }
 type Deps = { config: StewardConfig; resolveApiKey: () => Promise<string | undefined>;
-  hostLlmComplete?: OpenClawPluginApi["runtime"]["llm"]["complete"]; fetch?: typeof fetch };
+  /**
+   * Opt-in only (`useHostLlm: true`): OpenClaw denies plugin model overrides by default
+   * (`LLM_COMPLETION_NOT_AUTHORIZED`) and ignores `steward.endpoint`/credentials, so `complete()` defaults to
+   * the direct `/v1/responses` path.
+   */
+  hostLlmComplete?: OpenClawPluginApi["runtime"]["llm"]["complete"]; useHostLlm?: boolean; fetch?: typeof fetch };
+/** Bounded transient retries per request (408/429/5xx, interrupted streams, connection resets). */
+const TRANSIENT_RETRIES = 2;
 
 class Fault extends Error {
   constructor(readonly code: StewardErrorCode, message: string, readonly retryAfterMs = 0) { super(message); }
@@ -47,6 +54,81 @@ function parse(text: unknown): unknown {
 }
 function conforms<T>(schema: Schema, value: unknown): value is T {
   return value !== undefined && Value.Check(Type.Unsafe<T>(json(schema)), value);
+}
+
+/** Validation keywords OpenAI strict mode rejects; stripped from the wire schema only (local checks keep them). */
+const STRICT_UNSUPPORTED = new Set(["maxLength", "minLength", "pattern", "minimum", "maximum", "minItems", "maxItems", "format",
+  "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "uniqueItems", "minProperties", "maxProperties", "not", "default"]);
+const COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
+const jsonType = (value: unknown) => value === null ? "null" : Array.isArray(value) ? "array"
+  : typeof value === "number" ? (Number.isInteger(value) ? "integer" : "number") : typeof value;
+const nullable = (node: JsonObject): JsonObject => {
+  if (Array.isArray(node.type) && node.type.includes("null")) return node;
+  if (typeof node.type === "string" && !["object", "array", "null"].includes(node.type) && node.enum === undefined &&
+    node.const === undefined) return { ...node, type: [node.type, "null"] };
+  return { anyOf: [node, { type: "null" }] };
+};
+function strictNode(input: unknown, root = false): unknown {
+  if (!isRecord(input)) return input;
+  const node: JsonObject = {};
+  for (const [key, value] of Object.entries(input)) if (!STRICT_UNSUPPORTED.has(key)) node[key] = value;
+  if (node.type === undefined && !COMBINATORS.some(c => Array.isArray(node[c])) && typeof node.$ref !== "string") {
+    const values = Array.isArray(node.enum) ? node.enum : Object.hasOwn(node, "const") ? [node.const] : undefined;
+    const types = values && [...new Set(values.map(jsonType))];
+    if (types?.length) node.type = types.length === 1 ? types[0] : types;
+    else if (root || isRecord(node.properties)) node.type = "object";
+  }
+  if (node.type === "object" || isRecord(node.properties)) {
+    const properties = isRecord(node.properties) ? node.properties : {};
+    const required = new Set(Array.isArray(input.required) ? input.required.filter(k => typeof k === "string") : []);
+    node.properties = Object.fromEntries(Object.entries(properties).map(([key, value]) => {
+      const strict = strictNode(value);
+      return [key, required.has(key) || !isRecord(strict) ? strict : nullable(strict)];
+    }));
+    node.required = Object.keys(properties);
+    node.additionalProperties = false;
+  }
+  if (Array.isArray(node.items)) node.items = node.items.map(item => strictNode(item));
+  else if (node.items !== undefined) node.items = strictNode(node.items);
+  for (const c of COMBINATORS) if (Array.isArray(node[c])) node[c] = node[c].map(branch => strictNode(branch));
+  for (const d of ["$defs", "definitions"]) {
+    const defs = node[d];
+    if (isRecord(defs)) node[d] = Object.fromEntries(Object.entries(defs).map(([k, v]) => [k, strictNode(v)]));
+  }
+  return node;
+}
+/**
+ * Wire form of `schema` for OpenAI/codex-lb `strict: true`: every object closes `additionalProperties`, lists
+ * every property in `required` (originally optional ones become nullable) and drops unsupported validation
+ * keywords. Decode replies with `stripOptionalNulls` and validate them against the ORIGINAL schema.
+ */
+export function toStrictJsonSchema(schema: Schema): JsonObject {
+  return strictNode(json(schema), true) as JsonObject;
+}
+/** Remove the `null`s strict mode forces onto originally optional keys (unless the original accepts null). */
+export function stripOptionalNulls(value: unknown, schema: Schema): unknown {
+  const node = json(schema);
+  if (value === null || typeof value !== "object") return value;
+  for (const c of COMBINATORS) {
+    const branches = node[c];
+    if (!Array.isArray(branches)) continue;
+    for (const branch of branches) {
+      if (!isRecord(branch)) continue;
+      const stripped = stripOptionalNulls(value, branch);
+      if (conforms(branch, stripped)) return stripped;
+    }
+  }
+  if (Array.isArray(value)) return isRecord(node.items) ? value.map(item => stripOptionalNulls(item, node.items as JsonObject)) : value;
+  if (!isRecord(node.properties) || !isRecord(value)) return value;
+  const properties = node.properties;
+  const required = new Set(Array.isArray(node.required) ? node.required : []);
+  const out: JsonObject = {};
+  for (const [key, item] of Object.entries(value)) {
+    const property = properties[key];
+    if (item === null && !required.has(key) && isRecord(property) && !conforms(property, null)) continue;
+    out[key] = isRecord(property) ? stripOptionalNulls(item, property) : item;
+  }
+  return out;
 }
 
 /** One deadline and accounting ledger across retries, tools and correction turns. */
@@ -126,7 +208,8 @@ function providerFault(response: Response, body?: JsonObject) {
   if (/context[_ -](?:length[_ -]exceeded|overflow|window)|exceeds? (?:the )?(?:maximum )?context/i.test(detail)) {
     return new Fault("context_overflow", "Provider context window exceeded");
   }
-  if (![400, 401, 403].includes(response.status) && ([429, 502, 503, 504].includes(response.status) ||
+  if ([401, 403].includes(response.status)) return new Fault("auth_denied", `Provider denied the credential (HTTP ${response.status})`);
+  if (response.status !== 400 && ([408, 429, 500, 502, 503, 504].includes(response.status) ||
     /stream_incomplete|upstream.*clos(?:ed|ing)|stream.*closed/i.test(detail))) {
     return new Fault("transient_provider", "Temporary provider failure", retryAfter(response.headers.get("retry-after")));
   }
@@ -173,8 +256,8 @@ function baseRequest(req: Prompt, config: StewardConfig) {
   return { model: req.model ?? config.model, instructions: req.systemPrompt, stream: false, store: false,
     ...(effort === "off" ? {} : { reasoning: { effort } }) };
 }
-function redactSecrets(text: string, token: string) {
-  return text.replaceAll(token, "[redacted]").replace(/\bBearer\s+[^\s"',;\]}]+|\b(?:sk-|xox[baprs]-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}/gi, "[redacted]");
+function redactSecrets(text: string, token?: string) {
+  return (token ? text.replaceAll(token, "[redacted]") : text).replace(/\bBearer\s+[^\s"',;\]}]+|\b(?:sk-|xox[baprs]-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}/gi, "[redacted]");
 }
 function toolText(value: unknown, token: string, max: number) {
   const text = redactSecrets(typeof value === "string" ? value : JSON.stringify(value) ?? "null", token);
@@ -187,9 +270,10 @@ export function createStewardRunner(deps: Deps): StewardRunner {
       const a = attempt(req.timeoutMs ?? deps.config.deepThought.timeoutMs, req.signal);
       try {
         a.check();
-        const host = deps.hostLlmComplete;
+        const host = deps.useHostLlm ? deps.hostLlmComplete : undefined;
         const token = host ? undefined : await credential(deps, a);
-        let prompt = req.userPrompt;
+        const wireSchema = toStrictJsonSchema(req.schema);
+        let prompt = redactSecrets(req.userPrompt, token);
         for (let pass = 0; ; pass++) {
           a.check();
           let model, text;
@@ -201,7 +285,11 @@ export function createStewardRunner(deps: Deps): StewardRunner {
                 messages: [{ role: "user", content: prompt }], responseFormat: json(req.schema), reasoning: req.reasoning ?? deps.config.reasoning,
                 purpose: req.purpose, signal: a.signal }), a.signal);
             } catch (error) {
-              if (record(error)?.code === "LLM_RUNTIME_LIFECYCLE") throw new Fault("lifecycle_reload", "Host runtime reloading");
+              const code = record(error)?.code;
+              if (code === "LLM_RUNTIME_LIFECYCLE") throw new Fault("lifecycle_reload", "Host runtime reloading");
+              if (code === "LLM_COMPLETION_NOT_AUTHORIZED" || (error instanceof Error && /LLM_COMPLETION_NOT_AUTHORIZED/u.test(error.message))) {
+                throw new Fault("auth_denied", "Host denied the plugin completion");
+              }
               throw error;
             }
             a.account({ ...reply.usage, cachedInputTokens: reply.usage?.cacheReadTokens });
@@ -213,12 +301,12 @@ export function createStewardRunner(deps: Deps): StewardRunner {
           } else {
             const reply = await post(deps, a, token!, JSON.stringify({ ...baseRequest(req, deps.config),
               input: [{ role: "user", content: prompt }], text: { format: { type: "json_schema", name: "steward_output",
-                schema: req.schema, strict: true } } }), 0);
+                schema: wireSchema, strict: true } } }), TRANSIENT_RETRIES);
             text = reply.output.filter(i => i.type === "message" && Array.isArray(i.content))
               .flatMap(i => i.content).map(record).filter(i => i?.type === "output_text" && typeof i.text === "string").map(i => i!.text).join("");
             model = reply.model;
           }
-          const data = parse(text);
+          const data = stripOptionalNulls(parse(text), req.schema);
           if (conforms<T>(req.schema, data)) {
             a.check();
             return { ok: true, data, usage: a.receipt(), model, backend: host ? "host_llm" : "responses_api" };
@@ -234,6 +322,9 @@ export function createStewardRunner(deps: Deps): StewardRunner {
 }
 
 const SUBMIT = "submit_result";
+const WRAP_UP = "The investigation budget is exhausted: no further tools are available. Call submit_result now with your best " +
+  "answer synthesized ONLY from the evidence already gathered in this conversation, citing only sources you actually " +
+  "searched or read. Use status \"incomplete\" if that evidence is insufficient.";
 function submissionSchema(input: Schema) {
   const schema = json(input);
   const properties = schema.properties ?? {};
@@ -260,63 +351,80 @@ async function run<T>(deps: Deps, req: StewardRunRequest<T>): Promise<StewardRun
     const submit = submissionSchema(req.submitSchema);
     const byName = new Map(req.tools.map(tool => [tool.name, tool]));
     if (byName.size !== req.tools.length || byName.has(SUBMIT)) throw invalid("Tool names must be unique and may not shadow submit_result");
-    const tools = [...req.tools.map(({ name, description, parameters }) => ({ type: "function", name, description, parameters })),
-      { type: "function", name: SUBMIT, description: req.submitDescription ?? "Submit the final structured result.",
-        parameters: submit, strict: true }];
+    const submitTool = { type: "function", name: SUBMIT, description: req.submitDescription ?? "Submit the final structured result.",
+      parameters: toStrictJsonSchema(submit), strict: true };
+    const tools = [...req.tools.map(({ name, description, parameters }) =>
+      ({ type: "function", name, description, parameters: toStrictJsonSchema(parameters), strict: true })), submitTool];
     const token = await credential(deps, a);
-    const input: JsonObject[] = [{ role: "user", content: req.userPrompt }];
+    const input: JsonObject[] = [{ role: "user", content: redactSecrets(req.userPrompt, token) }];
     const seen = new Set<string>();
-    let tokensRemaining = maxInput, correcting = false;
-    while (turns < req.maxTurns) {
+    let model: string | undefined;
+
+    /** One model turn. `maxInputTokens` bounds each request body; transient retries resend it uncharged. */
+    const send = async (options: { forced: boolean; only?: JsonObject[] }) => {
       a.check();
-      const body = JSON.stringify({ ...baseRequest(req, deps.config), tools, input, include: ["reasoning.encrypted_content"],
-        ...(correcting ? { tool_choice: { type: "function", name: SUBMIT } } : {}) });
-      const tokens = o200kTokenCount(body);
+      const body = JSON.stringify({ ...baseRequest(req, deps.config), tools: options.only ?? tools, input,
+        include: ["reasoning.encrypted_content"], ...(options.forced ? { tool_choice: { type: "function", name: SUBMIT } } : {}) });
+      if (o200kTokenCount(body) > maxInput) throw budget("maxInputTokens");
       let dispatched = false;
-      const reply = await post(deps, a, token, body, 2, () => {
-        if (tokens > tokensRemaining) throw budget("maxInputTokens");
-        tokensRemaining -= tokens;
-        if (!dispatched) { dispatched = true; turns++; }
-      });
+      const reply = await post(deps, a, token, body, TRANSIENT_RETRIES, () => { if (!dispatched) { dispatched = true; turns++; } });
+      model = reply.model ?? model;
       // Replay whole output first, including encrypted reasoning; then append one output per call.
       for (const item of reply.output) input.push(item);
-      const calls = reply.output.filter(item => item.type === "function_call").map(item => {
+      return reply.output.filter(item => item.type === "function_call").map(item => {
         if (typeof item.name !== "string" || typeof item.call_id !== "string" || !item.call_id.trim() || seen.has(item.call_id)) {
           throw invalid("Malformed or duplicate function call ID");
         }
         seen.add(item.call_id);
         return { name: item.name, id: item.call_id, args: parse(item.arguments) };
       });
+    };
+    const report = (name: string, ok: boolean, start: number) =>
+      req.onToolCall?.({ name: redactSecrets(name, token).slice(0, 128), ok, elapsedMs: performance.now() - start });
+    /** Decode a strict-mode submission (optional keys arrive as null) and validate it against the caller's schema. */
+    const accept = (args: unknown) => {
+      const decoded = stripOptionalNulls(args, submit);
+      if (!isRecord(decoded) || !conforms<JsonObject & { status: Status }>(submit, decoded)) return undefined;
+      const { status, ...data } = decoded;
+      if (!conforms<T>(req.submitSchema, data)) return undefined;
+      a.check();
+      const summary = typeof data.summary === "string" ? data.summary : typeof data.answer === "string" ? data.answer : status;
+      return { ok: true as const, status, data, summary, turns, toolCalls, model, usage: a.receipt() };
+    };
+
+    let correcting = false, exhausted: "maxTurns" | "maxToolCalls" | undefined;
+    for (;;) {
+      if (turns >= req.maxTurns) { exhausted = "maxTurns"; break; }
+      const calls = await send({ forced: correcting });
       if (calls.some(c => c.name === SUBMIT) && calls.length !== 1) throw invalid("Ambiguous final submission");
       if (correcting && (calls.length !== 1 || calls[0]?.name !== SUBMIT)) throw invalid("Missing corrected submit_result");
-      if (calls.length > req.maxToolCalls - toolCalls) throw budget("maxToolCalls");
+      // submit_result never counts against maxToolCalls. A batch that would overrun the budget executes nothing.
+      if (calls.filter(c => c.name !== SUBMIT).length > req.maxToolCalls - toolCalls) {
+        for (const { id } of calls) input.push({ type: "function_call_output", call_id: id, output: "Error: tool call budget exhausted; not executed." });
+        exhausted = "maxToolCalls";
+        break;
+      }
       let needsCorrection = calls.length === 0;
       for (const { name, id, args } of calls) {
         a.check();
-        toolCalls++;
         const start = performance.now();
         let ok = false;
         try {
           let output: string;
           if (name === SUBMIT) {
-            if (isRecord(args) && conforms<JsonObject & { status: Status }>(submit, args)) {
-              const { status, ...data } = args;
-              if (conforms<T>(req.submitSchema, data)) {
-                a.check();
-                ok = true;
-                const summary = typeof data.summary === "string" ? data.summary : typeof data.answer === "string" ? data.answer : status;
-                return { ok: true, status, data, summary, turns, toolCalls, model: reply.model, usage: a.receipt() };
-              }
-            }
+            const accepted = accept(args);
+            if (accepted) { ok = true; return accepted; }
             output = "Error: final submission did not match the schema.";
             needsCorrection = true;
           } else {
+            toolCalls++;
             const tool = byName.get(name);
+            const decoded = tool && stripOptionalNulls(args, tool.parameters);
             if (!tool) output = "Error: unknown tool.";
-            else if (!isRecord(args) || !conforms(tool.parameters, args)) output = "Error: invalid tool arguments.";
+            else if (!isRecord(decoded) || !conforms(tool.parameters, decoded)) output = "Error: invalid tool arguments.";
             else {
               try {
-                const result = await abortable(tool.execute(args, a.signal), a.signal);
+                const result = await abortable(tool.execute(decoded, a.signal), a.signal);
                 output = toolText(result, token, maxChars);
                 ok = true;
               } catch {
@@ -326,18 +434,24 @@ async function run<T>(deps: Deps, req: StewardRunRequest<T>): Promise<StewardRun
             }
           }
           input.push({ type: "function_call_output", call_id: id, output: output.slice(0, maxChars) });
-        } finally {
-          req.onToolCall?.({ name: redactSecrets(name, token).slice(0, 128), ok, elapsedMs: performance.now() - start });
-        }
+        } finally { report(name, ok, start); }
       }
       if (needsCorrection) {
         if (correcting) throw invalid("Invalid corrected submit_result");
         correcting = true;
         input.push({ role: "user", content: "Call submit_result once with a result matching its schema." });
       }
-      if (toolCalls === req.maxToolCalls) throw budget("maxToolCalls");
+      if (toolCalls >= req.maxToolCalls) { exhausted = "maxToolCalls"; break; }
     }
-    throw budget("maxTurns");
+    // Budget reached without a submission: one forced, submit-only wrap-up turn keeps the research instead of discarding it.
+    input.push({ role: "user", content: WRAP_UP });
+    const calls = await send({ forced: true, only: [submitTool] });
+    const final = calls.length === 1 && calls[0]!.name === SUBMIT ? calls[0]! : undefined;
+    const start = performance.now();
+    const accepted = final && accept(final.args);
+    if (final) report(final.name, !!accepted, start);
+    if (accepted) return accepted;
+    throw budget(exhausted);
   } catch (error) { return { ...a.failure(error), turns, toolCalls }; }
   finally { a.close(); }
 }

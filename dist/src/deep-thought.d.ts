@@ -49,6 +49,7 @@ type PersonLike = {
     displayName: string;
     preferredName: string | null;
     status: string;
+    injectionEnabled?: boolean;
 };
 type IdentityLike = {
     personId: string;

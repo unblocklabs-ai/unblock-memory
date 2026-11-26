@@ -21,6 +21,9 @@ export type MemorySearchObservation = RetrievalTimings & {
     requestsFailed: number;
     /** Multi-topic searches only: topic searches that failed while at least one other topic succeeded. */
     topicsFailed?: number;
+    /** Decision-model tokens summed across every judged candidate that reported usage. */
+    inputTokens?: number;
+    outputTokens?: number;
 };
 export type MemoryRanking = {
     rankingMode: "decision" | "retrieval";

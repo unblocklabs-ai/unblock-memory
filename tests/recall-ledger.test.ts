@@ -122,7 +122,11 @@ test("openRecallLedger migrates a populated v1 database without losing hits and 
       const storage = db.prepare("SELECT version FROM memory_schema WHERE component = 'storage'").get();
       const ledger = db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'").get();
       assert.equal(storage?.version, 1);
-      assert.equal(ledger?.version, RECALL_LEDGER_SCHEMA_VERSION);
+      assert.equal(RECALL_LEDGER_SCHEMA_VERSION, 1, "additive-only changes keep v1 so a v0.16.0 rollback still opens the ledger");
+      assert.equal(ledger?.version, 1);
+      for (const table of ["skill_routing_events", "skill_open_events"]) {
+        assert.ok(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(table), `${table} healed on open`);
+      }
       assert.deepEqual(db.prepare(`SELECT event_key, input_tokens, output_tokens FROM recall_queries q
         JOIN recall_hits h ON h.query_id = q.id ORDER BY q.id`).all().map(row => [row.event_key, row.input_tokens, row.output_tokens]),
         [["legacy", null, null], ["new", 80, 0]]);
@@ -291,7 +295,7 @@ test("purgeRecallPerson never creates tables in an uninitialized DB", async () =
     const emptyDb = join(root, "empty.sqlite");
     const dbInit = openMemoryDatabase(emptyDb);
     dbInit.close();
-    assert.deepEqual(purgeRecallPerson(emptyDb, { provider: "slack", senderId: "U123" }), { queries: 0 });
+    assert.deepEqual(purgeRecallPerson(emptyDb, { provider: "slack", senderId: "U123" }), { queries: 0, skillEvents: 0 });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -318,7 +322,8 @@ test("searchMemory onTrace distinguishes rank_limit, below_threshold, judge_fail
       }
       const prob = body.includes("Hit A") ? 0.95 : body.includes("Hit B") ? 0.88 : 0.25;
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ model: "liquid/d1.2-ultra", answers: { memory_0: { type: "noul", noul: prob } } }));
+      res.end(JSON.stringify({ model: "liquid/d1.2-ultra", answers: { memory_0: { type: "noul", noul: prob } },
+        usage: { input_tokens: body.includes("Hit A") ? 100 : 10, output_tokens: 3 } }));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -347,6 +352,9 @@ test("searchMemory onTrace distinguishes rank_limit, below_threshold, judge_fail
     );
     assert.equal(res.rankingMode, "decision");
     assert.equal(res.results.length, 1);
+    // Judged A, B, C report usage; E failed and D was cooled down (never judged).
+    assert.equal(res.inputTokens, 120, "decision input tokens are summed across judged candidates");
+    assert.equal(res.outputTokens, 9);
 
     assert.equal(traced.length, 5);
     assert.equal(traced[0]?.disposition, "passed");
@@ -447,7 +455,8 @@ test("registerMemoryWhisperer writes emitted, rank_limit (when complementaryHint
     req.on("end", () => {
       const prob = body.includes("First memory") ? 0.96 : 0.89;
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ model: "liquid/d1.2-ultra", answers: { memory_0: { type: "noul", noul: prob } } }));
+      res.end(JSON.stringify({ model: "liquid/d1.2-ultra", answers: { memory_0: { type: "noul", noul: prob } },
+        ...(body.includes("memory excerpt") ? { usage: { input_tokens: 40, output_tokens: 2 } } : {}) }));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -511,6 +520,8 @@ test("registerMemoryWhisperer writes emitted, rank_limit (when complementaryHint
     try {
       const q = db.prepare("SELECT * FROM recall_queries").get() as Record<string, unknown>;
       assert.equal(q.outcome, "emitted");
+      assert.equal(q.input_tokens, 80, "both judged passages' decision tokens reach recall_queries");
+      assert.equal(q.output_tokens, 4);
       assert.equal(q.provider, "slack");
       assert.equal(q.channel_id, "c123");
       assert.equal(q.thread_id, "1700.01");
@@ -726,4 +737,116 @@ test("compiled dist/src/recall-ledger.js worker commits in plain Node even under
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("a pre-release v2 ledger heals back to v1 and a v1 ledger missing additive objects self-heals on open", async () => {
+  const root = await tempDir();
+  try {
+    const dbPath = join(root, MEMORY_DATABASE);
+    writeRecallBatch(dbPath, [{ kind: "query", record: sampleQuery({ eventKey: "pre" }) }]);
+    const raw = new DatabaseSync(dbPath);
+    try { raw.exec("UPDATE memory_schema SET version = 2 WHERE component = 'recall_ledger'"); } finally { raw.close(); }
+    let db = openRecallLedger(dbPath);
+    try {
+      assert.equal(db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'").get()?.version, 1);
+      assert.equal(Number(db.prepare("SELECT count(*) n FROM recall_queries").get()?.n), 1, "healing keeps rows");
+      // A v1 stamp whose additive table vanished (rollback, then roll forward) is not trusted by the fast path.
+      db.exec("DROP TABLE skill_open_events");
+    } finally { db.close(); }
+    db = openRecallLedger(dbPath);
+    try {
+      assert.ok(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='skill_open_events'").get());
+      assert.equal(db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'").get()?.version, 1);
+    } finally { db.close(); }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("purging a person also erases skill routing and open events bound to their sessions and runs", async () => {
+  const root = await tempDir();
+  try {
+    const dbPath = join(root, MEMORY_DATABASE);
+    const now = Date.now();
+    const routing = (eventKey: string, ctx: { agentId?: string; sessionId?: string; sessionKey?: string; runId?: string }) => ({
+      kind: "skill_routing" as const, record: { eventKey, createdAtMs: now, agentId: ctx.agentId ?? "bill", sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey, runId: ctx.runId, mode: "direct" as const, candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } });
+    const open = (ctx: { agentId?: string; sessionId?: string; sessionKey?: string; runId?: string }) => ({
+      kind: "skill_open" as const, record: { createdAtMs: now, agentId: ctx.agentId ?? "bill", sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey, runId: ctx.runId, skillPath: "/skills/a/SKILL.md", toolName: "read" as const,
+        wasWhispered: true, wasPinned: true } });
+    writeRecallBatch(dbPath, [
+      { kind: "query", record: sampleQuery({ eventKey: "purged-1", sessionId: "s-purge", sessionKey: "k-purge", runId: "r-purge" }) },
+      { kind: "query", record: sampleQuery({ eventKey: "kept-1", senderId: "U-OTHER", sessionId: "s-keep", sessionKey: "k-keep", runId: "r-keep" }) },
+      routing("route-by-session", { sessionId: "s-purge" }),
+      routing("route-by-key", { sessionKey: "k-purge" }),
+      routing("route-by-run", { runId: "r-purge" }),
+      routing("route-other-agent", { agentId: "other", sessionId: "s-purge" }),
+      routing("route-kept", { sessionId: "s-keep", sessionKey: "k-keep", runId: "r-keep" }),
+      open({ sessionId: "s-purge" }),
+      open({ runId: "r-purge" }),
+      open({ sessionId: "s-keep" }),
+    ]);
+    assert.deepEqual(purgeRecallPerson(dbPath, { provider: "slack", accountId: "default", senderId: "U123" }), { queries: 1, skillEvents: 5 });
+    const db = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(db.prepare("SELECT event_key FROM recall_queries").all().map(r => r.event_key), ["kept-1"]);
+      assert.deepEqual(db.prepare("SELECT event_key FROM skill_routing_events ORDER BY event_key").all().map(r => r.event_key),
+        ["route-kept", "route-other-agent"], "other sessions and other agents keep their routing events");
+      assert.deepEqual(db.prepare("SELECT session_id FROM skill_open_events").all().map(r => r.session_id), ["s-keep"]);
+    } finally { db.close(); }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_search writes summed decision-judge token usage into recall_queries", async t => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "recall-ledger-usage-"));
+  const dbPath = join(directory.path, MEMORY_DATABASE);
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => { body += String(chunk); });
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ model: "liquid/d1.2-ultra", answers: { memory_0: { type: "noul", noul: 0.9 } },
+        usage: { input_tokens: body.includes("Alpha") ? 70 : 30, output_tokens: 5 } }));
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const hits: CorpusMemorySearchResult[] = [
+    { path: "qmd://s/2026-11-20.md", startLine: 1, endLine: 2, score: 0.09, snippet: "Alpha memory", corpus: "memory", source: "memory" },
+    { path: "qmd://s/2026-11-19.md", startLine: 1, endLine: 2, score: 0.08, snippet: "Beta memory", corpus: "memory", source: "memory" },
+  ];
+  type ToolFactory = (ctx: OpenClawPluginToolContext) => { execute(id: string, params: unknown): Promise<unknown> };
+  let createSearch: ToolFactory | undefined;
+  const stop: (() => unknown)[] = [];
+  registerUnblockMemory({
+    pluginConfig: { recallLedger: { enabled: true },
+      decisionModel: { endpoint: `http://127.0.0.1:${address.port}/v1/decisions`, apiKey: "k", timeoutMs: 2000 } },
+    logger: { warn() {}, info() {}, error() {}, debug() {} },
+    registerCli() {}, registerService() {}, registerGatewayMethod() {},
+    on(event: string, handler: () => unknown) { if (event === "gateway_stop") stop.push(handler); },
+    registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
+      t.mock.method(runtime, "getMemorySearchManager", async () => ({ manager: { async searchCandidates() { return hits; } } }));
+      t.mock.method(runtime, "memoryDatabasePath", () => dbPath);
+    },
+    registerTool(factory: ToolFactory, { names }: { names: string[] }) {
+      if (names.includes("memory_search")) createSearch = factory;
+    },
+  } as unknown as OpenClawPluginApi);
+  try {
+    assert.ok(createSearch);
+    await createSearch({ agentId: "bill", config: {} }).execute("usage", { bm25Query: "memory", vectorQuery: "Which memory?" });
+  } finally {
+    await Promise.all(stop.map(handler => handler()));
+  }
+  const db = openRecallLedger(dbPath);
+  try {
+    const row = db.prepare("SELECT source, ranking_mode, input_tokens, output_tokens FROM recall_queries").get();
+    assert.deepEqual({ ...row }, { source: "tool", ranking_mode: "decision", input_tokens: 100, output_tokens: 10 });
+  } finally { db.close(); }
 });

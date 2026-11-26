@@ -1161,7 +1161,7 @@
       },
       "recallLedger": {
         "type": "object",
-        "description": "Opt-in local ledger of retrieval queries, candidate hits, and memory_get reads in unblock-memory.sqlite. Off by default.",
+        "description": "Opt-in local ledger of retrieval queries (with decision-model token usage), candidate hits, memory_get reads, skill routing events and skill open events in unblock-memory.sqlite. Off by default.",
         "additionalProperties": false,
         "properties": {
           "enabled": {

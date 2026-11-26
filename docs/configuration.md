@@ -735,9 +735,12 @@ cached; new interactions take priority over retries. Request failures retry afte
 an hour when the pass has remaining capacity, or immediately with `--retry`.
 Oversized context failures require explicit `--retry`, for example after increasing
 the context budget. Source read failures appear in the run's `errors` list.
-Run one writer per agent: pause the
-background cadence during concurrent operator backfills. There is no cross-process
-lease or persistent scheduling infrastructure.
+Each agent's pass is guarded by a cross-process `WorkStore` lease (the
+`inside_out_grade` row in `work_items`): a scheduled pass, a hot-replaced Gateway
+instance and a manual `run` never overlap, and a lost lease fences out late writes.
+Scheduled passes re-arm one interval after they **start**, so the configured cadence
+holds even for long passes; a manual `run` keeps the existing schedule. A Gateway
+stop aborts the pass and releases the lease without a strike.
 
 `--session` limits `run`, `report`, and `export` to one exact session ID. For a
 manual canary, keep `intervalMinutes: 0` and run/export that session; this still
@@ -920,7 +923,10 @@ default. Fleet configs without a `steward` section load unchanged.
 - **`deep_thought` tool**: a read-only, multi-hop memory curator. It searches and
   reads with exactly the calling agent's corpora, request context and account
   (plus `lookup_person` when People is enabled), then returns one synthesis whose
-  citations are kept only if the curator actually opened them. It never writes.
+  citations are kept only if the curator actually opened the cited source and the
+  quote is grounded in the text that source returned. If the turn or tool budget
+  runs out first, one final submit-only turn asks for the best cited answer from
+  the evidence already gathered. It never writes.
 - **People shadow**: a background, proposal-only reviewer of People Learning
   manifests. Verified proposals are stored only in `work_items`; dossiers, learning
   runs and cron jobs are never touched. Compare with the cron using
@@ -935,7 +941,7 @@ default. Fleet configs without a `steward` section load unchanged.
 | `steward.model` | `gpt-6.2-sol` | Responses model id |
 | `steward.reasoning` | `medium` | `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` |
 | `steward.endpoint` | `https://codex.unblocklabs.ai/v1/responses` | HTTPS (or loopback HTTP) Responses endpoint without credentials, query or fragment |
-| `steward.apiKey` / `steward.apiKeyFile` | Unset | Explicit Steward credential. When unset, the `decisionModel` credential is reused **only** when both endpoints share an origin |
+| `steward.apiKey` / `steward.apiKeyFile` | Unset | Explicit Steward credential (`apiKeyFile` must be an absolute path). When unset, the `decisionModel` credential is reused **only** when both endpoints share an origin |
 | `steward.maxActiveBackground` | `1` | 1–4 concurrent background Steward passes per Gateway process |
 | `steward.deepThought.enabled` | `false` | Registers `deep_thought` |
 | `steward.deepThought.maxTurns` | `6` | 1–12 model turns; a call's `maxHops` can only narrow it |
@@ -943,7 +949,7 @@ default. Fleet configs without a `steward` section load unchanged.
 | `steward.deepThought.maxConcurrent` | `2` | 1–4 in-flight investigations per process; extra calls return `busy` |
 | `steward.deepThought.timeoutMs` | `60000` | 5,000–180,000 ms wall clock per investigation |
 | `steward.deepThought.maxToolResultChars` | `8000` | 500–32,000 characters per tool result returned to the model |
-| `steward.deepThought.maxInputTokens` | `48000` | 2,000–128,000 cumulative input tokens per investigation |
+| `steward.deepThought.maxInputTokens` | `48000` | 2,000–128,000 input tokens per model request (retries are not double-charged) |
 | `steward.peopleShadow.enabled` | `false` | Starts the background shadow loop on Gateway start |
 | `steward.peopleShadow.intervalMinutes` | `60` | 5–1,440 minutes between passes |
 | `steward.peopleShadow.maxItemsPerRun` | `10` | 1–50 model calls per agent per pass |
@@ -951,9 +957,15 @@ default. Fleet configs without a `steward` section load unchanged.
 
 **Enabling `deep_thought` approves sending the question plus the memory excerpts it
 opens to the Steward endpoint. Enabling the People shadow approves sending one
-dossier assertion and up to 16 approved, account-fenced excerpts per item.** When
-the Gateway exposes a host LLM runtime, the shadow's structured calls use it;
-`deep_thought` always uses the Responses endpoint.
+dossier assertion and up to 16 approved, account-fenced excerpts per item.** Both
+features call `steward.endpoint` directly (`stream: false`, `store: false`) with
+OpenAI strict JSON schemas; the host LLM runtime is not used, because it denies
+plugin model overrides by default and would ignore the Steward endpoint and key.
+Transient failures (HTTP 408/429/5xx, interrupted streams, connection resets) are
+retried a bounded number of times; context overflow and HTTP 400/401/403 are not.
+Outbound prompts and tool results are scanned for bearer tokens and common API key
+formats before they are sent. A People shadow pass stops early on credential,
+rate-limit or provider outages; an item that keeps timing out strikes toward quarantine.
 
 ## Storage, upgrades and recovery
 

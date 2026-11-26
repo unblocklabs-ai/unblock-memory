@@ -5,7 +5,6 @@ import { decisionModelScope, resolveDecisionCredential, DEFAULT_DECISION_MODEL }
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader } from "./response-episodes.js";
 import { responseRubricVersion, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity, } from "./response-judge.js";
 import { ResponseAuditStore } from "./response-store.js";
-import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
 import { ResponsePeople } from "./response-identity.js";
@@ -18,7 +17,10 @@ export function responseCohort(config, model = DEFAULT_DECISION_MODEL, endpoint)
         senderIds: [...config.senderIds].sort(), chatTypes: [...config.chatTypes].sort(), memoryCorpora: [...config.memoryCorpora].sort(),
     }).slice(0, 16);
 }
-/** Tracks stage attempts this run started but never saved, so cancellation can refund them. */
+/**
+ * Tracks stage attempts this run started that are still genuinely in flight: saved stages and stages that
+ * settled with their own provider failure leave the set, so cancellation refunds only interrupted work.
+ */
 class CancellableAuditStore extends ResponseAuditStore {
     inFlight = new Set();
     stageBegin(keys, now) {
@@ -30,35 +32,22 @@ class CancellableAuditStore extends ResponseAuditStore {
         super.stageSave(key, result, now);
         this.inFlight.delete(key);
     }
+    stageSettled(keys) {
+        for (const key of keys)
+            this.inFlight.delete(key);
+    }
 }
 /**
  * Cancellation (gateway stop, deadline) is not a provider failure: like a stale snapshot, it must not burn
- * the episode's or its stages' bounded retry budget, or a few restarts would exhaust them permanently.
+ * the episode's or its in-flight stages' bounded retry budget, or a few restarts would exhaust them permanently.
  */
-function refundCancelledAttempt(store, storePath, cohort, e) {
-    try {
-        store.stale(cohort, e);
-    }
-    catch { /* Best effort: a busy store keeps the attempt, as before. */ }
-    if (!store.inFlight.size)
-        return;
+function refundCancelledAttempt(store, cohort, e) {
     const keys = [...store.inFlight];
     store.inFlight.clear();
     try {
-        const db = openMemoryDatabase(storePath);
-        try {
-            immediateTransaction(db, () => {
-                const refund = db.prepare(`UPDATE response_stages SET attempts=MAX(0,attempts-1),attempted_at=NULL,status='pending'
-          WHERE key=? AND status='failed'`);
-                for (const key of keys)
-                    refund.run(key);
-            });
-        }
-        finally {
-            db.close();
-        }
+        store.refundCancelled(cohort, e, keys);
     }
-    catch { /* Best effort, see above. */ }
+    catch { /* Best effort: a busy store keeps the attempt, as before. */ }
 }
 /** All inference is outside memory's mutation queue and outside transcript DB transactions. */
 export async function auditResponses(options) {
@@ -201,7 +190,7 @@ export async function auditResponses(options) {
                 }
                 catch {
                     if (signal.aborted) {
-                        refundCancelledAttempt(store, options.storePath, cohort, e);
+                        refundCancelledAttempt(store, cohort, e);
                         throw new Error("Audit cancelled");
                     }
                     coverage.failed++;
@@ -257,7 +246,14 @@ async function assessMemoryOpportunity(store, cohort, e, feedback, options, para
         else {
             store.stageBegin([memoryKey], Date.now());
             usage.stageAttempts++;
-            judged = await abortable(judgeMemoryOpportunity(e, candidates, params), params.signal);
+            try {
+                judged = await abortable(judgeMemoryOpportunity(e, candidates, params), params.signal);
+            }
+            catch (error) {
+                if (!params.signal.aborted)
+                    store.stageSettled([memoryKey]);
+                throw error;
+            }
             store.stageSave(memoryKey, judged, Date.now());
         }
         return { status: "checked", candidates: judged };

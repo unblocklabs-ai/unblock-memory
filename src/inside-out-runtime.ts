@@ -116,12 +116,13 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
       timer = setInterval(tick, config.insideOut.intervalMinutes * 60_000); timer.unref(); tick();
     }
   });
-  // Release leases synchronously first (graceful stop adds no strikes), then abort active passes and
-  // baseline workers rather than waiting for a full historical pass.
+  // Abort active passes and baseline workers, and release leases in the same synchronous step (graceful stop
+  // adds no strikes; the bumped attempt fences out any late write). A held lock costs at most 200ms: the
+  // release is skipped and the lease expires instead of stalling shutdown.
   api.on("gateway_stop", async () => {
     clearTimers();
-    interruptInsideOut(owner);
     lifetime.abort();
+    interruptInsideOut(owner);
     await Promise.all([running, refreshing]);
   });
 }

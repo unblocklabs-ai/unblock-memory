@@ -46,6 +46,11 @@ export declare class ResponseAuditStore {
     memoryRetryResult(cohort: string, e: ResponseEpisode): ResponseResult | undefined;
     attempted(cohort: string, e: ResponseEpisode, now: number): void;
     stale(cohort: string, e: ResponseEpisode): void;
+    /**
+     * Cancellation is not a provider failure: refund the episode attempt and the stage attempts still in flight
+     * when it fired, in one transaction on this connection. Stages that already settled keep their attempt.
+     */
+    refundCancelled(cohort: string, e: ResponseEpisode, inFlightStageKeys: readonly string[]): void;
     save(cohort: string, e: ResponseEpisode, result: ResponseResult, now: number): void;
     cursor(cohort: string): string;
     advance(cohort: string, cursor: string): void;
@@ -64,6 +69,8 @@ export declare class ResponseAuditStore {
     unresolvedWork(cohort: string, since: number, until: number): number;
     stage<K extends keyof ResponseStages>(cohort: string, e: ResponseEpisode, stage: K, key: string, contract?: ResponseStageContracts[K]): ResponseStages[K] | undefined;
     stageBegin(keys: string[], now: number): void;
+    /** Hook: these begun stage attempts finished with their own failure (subclasses track in-flight work). */
+    stageSettled(_keys: readonly string[]): void;
     stageSave<K extends keyof ResponseStages>(key: string, result: ResponseStages[K], now: number): void;
     retryFailed(cohort: string): {
         stages: number;

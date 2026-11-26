@@ -1,5 +1,6 @@
 import type { DecisionModelPluginConfig } from "./config.js";
 import { resolveDecisionCredential } from "./decision-client.js";
+import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
 
 type StewardDeepThoughtConfig = {
@@ -46,6 +47,11 @@ function text(value: unknown, key: string) {
   if (typeof value !== "string" || !value.trim()) throw new Error(`steward.${key} must be a non-empty string`);
   return value.trim();
 }
+function absolutePath(value: unknown) {
+  const path = text(value, "apiKeyFile");
+  if (!isAbsolute(path)) throw new Error("steward.apiKeyFile must be an absolute path");
+  return path;
+}
 function endpoint(value: unknown) {
   const url = typeof value === "string" && /^https?:\/\//iu.test(value) && !/[\s?#\\]/u.test(value) &&
     !value.split("/")[2]?.includes("@") && URL.canParse(value) ? new URL(value) : undefined;
@@ -67,7 +73,7 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
   const apiKey = c.apiKey === undefined ? undefined : text(c.apiKey, "apiKey");
   if (apiKey && /\s/u.test(apiKey)) throw new Error("steward.apiKey must not contain whitespace");
   return { enabled: enabled(c.enabled, "steward"), model: text(c.model, "model"), reasoning, endpoint: endpoint(c.endpoint),
-    ...(apiKey ? { apiKey } : {}), ...(c.apiKeyFile === undefined ? {} : { apiKeyFile: text(c.apiKeyFile, "apiKeyFile") }),
+    ...(apiKey ? { apiKey } : {}), ...(c.apiKeyFile === undefined ? {} : { apiKeyFile: absolutePath(c.apiKeyFile) }),
     maxActiveBackground: integer(c.maxActiveBackground, 1, 4, "maxActiveBackground"),
     deepThought: { enabled: enabled(d.enabled, "steward.deepThought"), maxTurns: integer(d.maxTurns, 1, 12, "deepThought.maxTurns"),
       maxToolCalls: integer(d.maxToolCalls, 1, 32, "deepThought.maxToolCalls"), maxConcurrent: integer(d.maxConcurrent, 1, 4, "deepThought.maxConcurrent"),

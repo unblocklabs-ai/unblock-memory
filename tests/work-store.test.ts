@@ -163,7 +163,7 @@ test("strikes: graceful stops add none, expired no-progress leases quarantine it
   }
   let row = store.get(KIND, "graceful")!;
   assert.equal(row.strikes, 0); assert.equal(row.status, "pending"); assert.equal(row.owner, null); assert.equal(row.leaseUntil, 0);
-  assert.equal(row.attempt, 3);
+  assert.equal(row.attempt, 6, "each claim and each interrupt bumps the attempt");
 
   // Three expired leases with no progress (crash, OOM, kill -9).
   store.enqueue({ kind: KIND, scope: "poison", mode: "item", now: 0 });
@@ -220,7 +220,7 @@ test("stage progress resets strikes and the next attempt resumes from the saved 
   assert.equal(store.get(KIND, "s")?.status, "staged");
   const again = store.claim({ kind: KIND, owner: "c5", leaseMs: 10, now: 102 })!;
   assert.equal(again.artifactJson, "{\"answer\":42}");
-  assert.equal(again.attempt, 5);
+  assert.equal(again.attempt, 6, "five claims plus one interrupt");
   assert.throws(() => store.stageArtifact(again, { stage: "proposal", artifactJson: "{bad" }), /valid JSON/);
 });
 
@@ -350,4 +350,135 @@ test("heartbeat renews, skips SQLITE_BUSY beats without losing the fence, and re
   assert.equal(lost.length, 1, "fence loss is reported once and the heartbeat stops");
   assert.ok((lost as unknown[])[0] instanceof WorkFenceLostError, "deepEqual narrowed the array type above");
   assert.deepEqual(errors, []);
+});
+
+test("interruptOwner and requeue bump attempt: a released worker can never write, even before anyone reclaims", async t => {
+  const store = new WorkStore(await storePath());
+  t.after(() => store.close());
+  store.db.exec("CREATE TABLE destination (id TEXT PRIMARY KEY) STRICT");
+  store.enqueue({ kind: KIND, scope: "s", mode: "item", now: 0 });
+  const claim = store.claim({ kind: KIND, owner: "gw", leaseMs: 1000, now: 0 })!;
+  const staged = store.stageArtifact(claim, { stage: "proposal", artifactJson: "{}", now: 1 });
+  assert.equal(store.interruptOwner("gw", 2), 1);
+  const row = store.get(KIND, "s")!;
+  assert.equal(row.status, "staged"); assert.equal(row.attempt, claim.attempt + 1);
+  // Nobody has reclaimed the row yet, and its attempt is no longer the stopped worker's.
+  let ran = false;
+  assert.throws(() => store.commitWithDomain(staged, { now: 3 }, () => { ran = true; }), WorkFenceLostError);
+  assert.throws(() => store.withFence(staged, () => { ran = true; }), WorkFenceLostError);
+  assert.throws(() => store.stageArtifact(staged, { stage: "proposal", artifactJson: "{}", now: 3 }), WorkFenceLostError);
+  assert.throws(() => store.fail(staged, { error: "late", now: 3 }), WorkFenceLostError);
+  assert.throws(() => store.renew(staged, 1000, 3), WorkFenceLostError);
+  assert.equal(ran, false);
+  assert.equal(store.get(KIND, "s")?.status, "staged", "late writes leave the released row untouched");
+
+  // An expired lease re-driven by an operator fences the stale worker out the same way.
+  store.enqueue({ kind: KIND, scope: "r", mode: "item", now: 0 });
+  const stale = store.claim({ kind: KIND, scope: "r", owner: "old", leaseMs: 10, now: 0 })!;
+  assert.equal(store.requeue(KIND, "r", 0, 100), true);
+  assert.equal(store.get(KIND, "r")?.attempt, stale.attempt + 1);
+  assert.throws(() => store.commitWithDomain(stale, { now: 101 }, () => undefined), WorkFenceLostError);
+  assert.throws(() => store.fail(stale, { error: "late", now: 101 }), WorkFenceLostError);
+});
+
+test("fenced writes require status='running': a 'staged' row at the same attempt is never accepted", async t => {
+  const store = new WorkStore(await storePath());
+  t.after(() => store.close());
+  store.enqueue({ kind: KIND, scope: "s", mode: "item", now: 0 });
+  const claim = store.claim({ kind: KIND, owner: "w", leaseMs: 1000, now: 0 })!;
+  store.stageArtifact(claim, { stage: "proposal", artifactJson: "{}", now: 1 });
+  // Force the pre-fix hole: same attempt, but released to 'staged'.
+  store.db.prepare("UPDATE work_items SET status='staged' WHERE kind=? AND scope=?").run(KIND, "s");
+  for (const write of [
+    () => store.commitWithDomain(claim, { now: 2 }, () => undefined),
+    () => store.withFence(claim, () => undefined),
+    () => store.stageArtifact(claim, { stage: "proposal", artifactJson: "{}", now: 2 }),
+    () => store.fail(claim, { error: "x", now: 2 }),
+  ]) assert.throws(write, WorkFenceLostError);
+  assert.equal(store.get(KIND, "s")?.status, "staged");
+});
+
+test("progressed_attempt: a staged row whose resumed attempts keep crashing still strikes and quarantines", async t => {
+  const store = new WorkStore(await storePath());
+  t.after(() => store.close());
+  store.enqueue({ kind: KIND, scope: "s", mode: "item", now: 0 });
+  const first = store.claim({ kind: KIND, owner: "c1", leaseMs: 10, now: 0 })!;
+  store.stageArtifact(first, { stage: "proposal", artifactJson: "{\"p\":1}", now: 1 });
+  assert.equal(store.get(KIND, "s")?.progressedAttempt, first.attempt);
+  // c1 crashes after staging: its own progress means no strike, and the artifact stays resumable.
+  const resumed = store.claim({ kind: KIND, owner: "c2", leaseMs: 10, now: 50 })!;
+  assert.equal(resumed.stage, "proposal");
+  assert.equal(store.get(KIND, "s")?.strikes, 0);
+  // Every resumed attempt now crashes without saving anything new: each expiry is a strike.
+  let now = 100;
+  for (let i = 0; i < 2; i++) { assert.ok(store.claim({ kind: KIND, owner: `crash-${i}`, leaseMs: 10, now }), `resume ${i}`); now += 50; }
+  assert.equal(store.claim({ kind: KIND, owner: "next", leaseMs: 10, now }), undefined, "the third resumed crash quarantines");
+  const row = store.get(KIND, "s")!;
+  assert.equal(row.status, "quarantined"); assert.equal(row.strikes, 3); assert.equal(row.artifactJson, "{\"p\":1}");
+});
+
+test("claim honors expectedInputRevision / expectedRecipeHash so a worker never claims inputs that advanced", async t => {
+  const store = new WorkStore(await storePath());
+  t.after(() => store.close());
+  store.enqueue({ kind: KIND, scope: "s", mode: "item", inputRevision: "r1", recipeHash: "h1", now: 0 });
+  store.enqueue({ kind: KIND, scope: "s", mode: "item", inputRevision: "r2", recipeHash: "h1", now: 1 });
+  assert.equal(store.claim({ kind: KIND, scope: "s", owner: "w", leaseMs: 100, now: 2, expectedInputRevision: "r1" }), undefined);
+  assert.equal(store.claim({ kind: KIND, scope: "s", owner: "w", leaseMs: 100, now: 2, expectedInputRevision: "r2", expectedRecipeHash: "h0" }),
+    undefined);
+  assert.equal(store.get(KIND, "s")?.status, "pending", "a refused claim changes nothing");
+  const claim = store.claim({ kind: KIND, scope: "s", owner: "w", leaseMs: 100, now: 2, expectedInputRevision: "r2", expectedRecipeHash: "h1" });
+  assert.equal(claim?.inputRevision, "r2");
+});
+
+test("an existing v1 work_items table without progressed_attempt gains the column additively (schema stays v1)", async t => {
+  const path = await storePath();
+  const db = openMemoryDatabase(path);
+  t.after(() => { if (db.isOpen) db.close(); });
+  db.exec(`CREATE TABLE work_items (kind TEXT NOT NULL, scope TEXT NOT NULL, mode TEXT NOT NULL CHECK(mode IN ('run','item')),
+    status TEXT NOT NULL CHECK(status IN ('pending','running','staged','completed','quarantined')), attempt INTEGER NOT NULL DEFAULT 0,
+    owner TEXT, lease_until INTEGER NOT NULL DEFAULT 0, due_at INTEGER NOT NULL DEFAULT 0, input_revision TEXT, recipe_hash TEXT,
+    stage TEXT, artifact_json TEXT, usage_json TEXT, strikes INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+    updated_at INTEGER NOT NULL, PRIMARY KEY (kind, scope)) STRICT;
+    INSERT INTO memory_schema VALUES ('work', 1);
+    INSERT INTO work_items(kind,scope,mode,status,attempt,updated_at) VALUES ('${KIND}','old','item','pending',4,0);`);
+  db.close();
+  const store = new WorkStore(path);
+  t.after(() => store.close());
+  assert.equal(store.get(KIND, "old")?.progressedAttempt, 0);
+  assert.equal(store.db.prepare("SELECT version FROM memory_schema WHERE component='work'").get()?.version, 1);
+  assert.equal(store.claim({ kind: KIND, owner: "w", leaseMs: 10, now: 0 })?.attempt, 5);
+});
+
+test("interruptOwner waits at most ~200ms on a held write lock and restores the connection's busy timeout", async t => {
+  const path = await storePath();
+  const store = new WorkStore(path);
+  t.after(() => store.close());
+  store.enqueue({ kind: KIND, scope: "s", mode: "item" });
+  store.claim({ kind: KIND, owner: "gw", leaseMs: 60_000 });
+  const before = Number(store.db.prepare("PRAGMA busy_timeout").get()?.timeout);
+  const blocker = new DatabaseSync(path);
+  t.after(() => { if (blocker.isOpen) blocker.close(); });
+  blocker.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE");
+  const started = performance.now();
+  let busy: unknown;
+  try { store.interruptOwner("gw"); } catch (error) { busy = error; }
+  const waited = performance.now() - started;
+  assert.ok(isSqliteBusy(busy), "a held lock surfaces SQLITE_BUSY instead of stalling shutdown");
+  assert.ok(waited >= 150 && waited < 2000, `waited ${waited}ms`);
+  assert.equal(Number(store.db.prepare("PRAGMA busy_timeout").get()?.timeout), before);
+  blocker.exec("ROLLBACK"); blocker.close();
+  assert.equal(store.interruptOwner("gw"), 1);
+});
+
+test("commitWithDomain/fail preserveDueAt keep the row's due time as read inside the transaction", async t => {
+  const store = new WorkStore(await storePath());
+  t.after(() => store.close());
+  store.enqueue({ kind: "inside_out_grade", scope: "agent", mode: "run", dueAt: 500, now: 0 });
+  let claim = store.claim({ kind: "inside_out_grade", owner: "cli", leaseMs: 1000, now: 0, ignoreDueAt: true })!;
+  store.db.prepare("UPDATE work_items SET due_at=777 WHERE kind='inside_out_grade'").run(); // rescheduled mid-pass
+  store.commitWithDomain(claim, { preserveDueAt: true, now: 1 }, () => undefined);
+  assert.deepEqual([store.get("inside_out_grade", "agent")?.status, store.get("inside_out_grade", "agent")?.dueAt], ["pending", 777]);
+  claim = store.claim({ kind: "inside_out_grade", owner: "cli", leaseMs: 1000, now: 2, ignoreDueAt: true })!;
+  store.fail(claim, { error: "x", preserveDueAt: true, now: 3 });
+  assert.equal(store.get("inside_out_grade", "agent")?.dueAt, 777);
 });

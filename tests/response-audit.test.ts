@@ -2228,6 +2228,43 @@ test("cancellation refunds the episode and in-flight stage attempts so gateway r
   assert.equal(result.coverage?.failed, 0);
 });
 
+test("cancellation never refunds a stage that already settled with its own provider failure", { timeout: 10_000 }, async t => {
+  const { db, options } = await fixture(); t.after(() => db.close());
+  const controller = new AbortController();
+  let feedbackFailed!: () => void;
+  const settled = new Promise<void>(resolve => { feedbackFailed = resolve; });
+  const hanging = new Set<string>();
+  t.mock.method(globalThis, "fetch", (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const stage = body.questions.fulfillment ? "quality" : body.questions.feedbackType ? "feedback" : "retrospective";
+    if (stage === "feedback") {
+      // Settles with its own provider failure well before cancellation.
+      return nextTurn().then(() => { feedbackFailed(); throw new Error("synthetic provider failure"); });
+    }
+    hanging.add(stage);
+    return new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    });
+  });
+  const run = auditResponses({ ...options, signal: controller.signal });
+  await settled;
+  for (let i = 0; i < 5; i++) await nextTurn(); // Let the failure reach the stage's own catch.
+  assert.deepEqual([...hanging].sort(), ["quality", "retrospective"], "the sibling stages are still in flight");
+  controller.abort();
+  const result = await run;
+  assert.equal(result.status, "unavailable");
+  const state = new DatabaseSync(options.storePath, { readOnly: true }); t.after(() => state.close());
+  const stages = Object.fromEntries(state.prepare("SELECT stage,status,attempts,attempted_at FROM response_stages").all()
+    .map(row => [String(row.stage), { status: row.status, attempts: row.attempts, attemptedAt: row.attempted_at === null ? null : "set" }]));
+  assert.deepEqual(stages.feedback, { status: "failed", attempts: 1, attemptedAt: "set" }, "a settled provider failure keeps its attempt");
+  assert.deepEqual(stages.sentiment, { status: "failed", attempts: 1, attemptedAt: "set" }, "its paired stage keeps its attempt too");
+  assert.deepEqual(stages.quality, { status: "pending", attempts: 0, attemptedAt: null }, "the in-flight stage is refunded");
+  assert.deepEqual(stages.retrospective, { status: "pending", attempts: 0, attemptedAt: null }, "the in-flight stage is refunded");
+  assert.deepEqual(state.prepare("SELECT attempts,attempted_at,status FROM response_results").all()
+    .map(row => ({ attempts: row.attempts, attemptedAt: row.attempted_at, status: row.status })),
+  [{ attempts: 0, attemptedAt: null, status: "pending" }], "the cancelled episode is refunded");
+});
+
 test("genuine provider failures still consume the bounded retry budget", async t => {
   const { db, options } = await fixture(); t.after(() => db.close());
   t.mock.method(globalThis, "fetch", async () => new Response("upstream down", { status: 503 }));

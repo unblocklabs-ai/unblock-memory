@@ -30,6 +30,9 @@ export async function assessResponseStages(store, cohort, e, params, sentimentEn
             params.signal.throwIfAborted();
             store.stageSave(keys[stage], result, Date.now());
         },
+        settle(stages) {
+            store.stageSettled(stages.map(stage => keys[stage]));
+        },
     };
     usage.stageCacheHits += Number(!!cache.quality) + Number(!!cache.feedback) + Number(!!cache.sentiment);
     const assessRetrospective = async () => {
@@ -40,9 +43,16 @@ export async function assessResponseStages(store, cohort, e, params, sentimentEn
             return cached;
         }
         cache.begin(["retrospective"]);
-        const retrospective = await judgeResponseFollowup(e, params);
-        cache.save("retrospective", retrospective);
-        return retrospective;
+        try {
+            const retrospective = await judgeResponseFollowup(e, params);
+            cache.save("retrospective", retrospective);
+            return retrospective;
+        }
+        catch (error) {
+            if (!params.signal.aborted)
+                cache.settle(["retrospective"]);
+            throw error;
+        }
     };
     const [judgment, retrospective] = await Promise.allSettled([
         judgeResponse(e, params, sentimentEnabled, cache), assessRetrospective(),

@@ -455,46 +455,57 @@ export async function judgeResponse(episode, params, sentimentEnabled = true, ca
         contextLimited: episode.contextLimited,
         evidenceLimit: "Visible conversation only. Artifacts, tool results and external facts are not provided.",
     };
+    const attempt = async (stages, run) => {
+        cache?.begin(stages);
+        try {
+            return await run();
+        }
+        catch (error) {
+            if (!params.signal?.aborted)
+                cache?.settle?.(stages);
+            throw error;
+        }
+    };
     const assessQuality = async () => {
         if (cache?.quality)
             return validateCachedQuality(cache.quality);
-        cache?.begin(["quality"]);
-        const { answers } = await decideWithModel(params, state, QUALITY_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-        const quality = qualityFields({
-            ...answers,
-            fulfillment: toFourLevelScore(answers.fulfillment),
-            deliverableFit: toFourLevelScore(answers.deliverableFit),
+        return attempt(["quality"], async () => {
+            const { answers } = await decideWithModel(params, state, QUALITY_QUESTIONS, PROJECTED_DECISION_OPTIONS);
+            const quality = qualityFields({
+                ...answers,
+                fulfillment: toFourLevelScore(answers.fulfillment),
+                deliverableFit: toFourLevelScore(answers.deliverableFit),
+            });
+            cache?.save("quality", quality);
+            return quality;
         });
-        cache?.save("quality", quality);
-        return quality;
     };
     const assessFeedback = async () => {
         const cachedFeedback = cache?.feedback ? validateCachedFeedback(cache.feedback) : undefined;
         const cachedSentiment = sentimentEnabled && cache?.sentiment ? validateCachedSentiment(cache.sentiment) : undefined;
         const feedbackState = { ...state, feedback: episode.feedback };
         if (!cachedFeedback && sentimentEnabled && !cachedSentiment) {
-            cache?.begin(["feedback", "sentiment"]);
-            const { answers } = await decideWithModel(params, feedbackState, FEEDBACK_WITH_SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-            const feedback = feedbackBaseFields(answers);
-            const sentiment = sentimentFields({ ...answers, dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity) });
-            cache?.save("feedback", feedback);
-            cache?.save("sentiment", sentiment);
-            return { ...feedback, ...sentiment };
+            return attempt(["feedback", "sentiment"], async () => {
+                const { answers } = await decideWithModel(params, feedbackState, FEEDBACK_WITH_SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
+                const feedback = feedbackBaseFields(answers);
+                const sentiment = sentimentFields({ ...answers, dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity) });
+                cache?.save("feedback", feedback);
+                cache?.save("sentiment", sentiment);
+                return { ...feedback, ...sentiment };
+            });
         }
-        let feedback = cachedFeedback;
-        if (!feedback) {
-            cache?.begin(["feedback"]);
+        const feedback = cachedFeedback ?? await attempt(["feedback"], async () => {
             const { answers } = await decideWithModel(params, feedbackState, FEEDBACK_BASE_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-            feedback = feedbackBaseFields(answers);
-            cache?.save("feedback", feedback);
-        }
-        let sentiment = cachedSentiment;
-        if (sentimentEnabled && !sentiment) {
-            cache?.begin(["sentiment"]);
+            const judged = feedbackBaseFields(answers);
+            cache?.save("feedback", judged);
+            return judged;
+        });
+        const sentiment = cachedSentiment ?? (!sentimentEnabled ? undefined : await attempt(["sentiment"], async () => {
             const { answers } = await decideWithModel(params, feedbackState, SENTIMENT_QUESTIONS, PROJECTED_DECISION_OPTIONS);
-            sentiment = sentimentFields({ ...answers, dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity) });
-            cache?.save("sentiment", sentiment);
-        }
+            const judged = sentimentFields({ ...answers, dissatisfactionIntensity: toFourLevelScore(answers.dissatisfactionIntensity) });
+            cache?.save("sentiment", judged);
+            return judged;
+        }));
         return { ...feedback, ...sentiment };
     };
     // Each request saves its own result before we propagate a sibling's failure.

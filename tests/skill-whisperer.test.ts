@@ -472,3 +472,47 @@ test("skills_read pins skills by exact name (case-insensitive) and ignores unkno
 test("disabled Skill Whisperer registers no hooks", () => {
   assert.equal(harness(catalogRuntime([]), local, {}, { ...enabled, enabled: false }).hooks.size, 0);
 });
+
+test("opened_at_ms is monotonic: an earlier or missing open time never rewinds the recorded first-open watermark", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-opened-"));
+  const store = new SkillSessionStore(join(directory.path, "memory.sqlite"));
+  try {
+    const entry = { canonicalPath: "/skills/a/SKILL.md", name: "a", description: "A", source: "read" as const,
+      addedTurn: 1, addedAtMs: 100, lastUsedAtMs: 100 };
+    store.upsert("s", [{ ...entry, openedAtMs: 500 }]);
+    store.upsert("s", [{ ...entry, lastUsedAtMs: 600, openedAtMs: 300 }]);
+    assert.equal(store.list("s")[0]?.openedAtMs, 500, "a late-arriving earlier open does not rewind");
+    store.upsert("s", [{ ...entry, lastUsedAtMs: 700 }]);
+    assert.equal(store.list("s")[0]?.openedAtMs, 500, "an upsert without an open keeps the existing value");
+    store.upsert("s", [{ ...entry, lastUsedAtMs: 800, openedAtMs: 900 }]);
+    assert.equal(store.list("s")[0]?.openedAtMs, 900);
+  } finally { store.close(); }
+});
+
+test("wasWhispered is recorded only for whispered skills that were actually rendered, not overflow admissions", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-overflow-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  // Five admissions whose escaped descriptions (~1,200 chars each) cannot all fit maxInjectedChars.
+  const entries = Array.from({ length: 5 }, (_, i) => hit(`s${i}`, 0.9, "&".repeat(300)));
+  const writer = new RecallLedgerWriter();
+  const runtime = { ...catalogRuntime(entries, async () => entries), memoryDatabasePath: () => dbPath };
+  const h = harness(runtime, local, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+  let rendered: string[] = [];
+  try {
+    const context = ctx("one");
+    const block = (await h.prompt(prompt(), context))?.appendContext ?? "";
+    rendered = [...block.matchAll(/path="([^"]+)"/g)].map(match => match[1]!);
+    assert.ok(rendered.length > 0 && rendered.length < entries.length, `some admissions overflow (${rendered.length} rendered)`);
+    for (const entry of entries) await h.after(read(entry.path), context);
+  } finally { h.stop(); await writer.close(); }
+  const store = new SkillSessionStore(dbPath);
+  try {
+    assert.equal(store.list("thread").filter(row => row.source === "whisperer").length, entries.length, "all five were admitted");
+  } finally { store.close(); }
+  const db = openRecallLedger(dbPath);
+  try {
+    const opens = db.prepare("SELECT skill_path, was_whispered, was_pinned FROM skill_open_events ORDER BY id").all();
+    assert.deepEqual(opens.map(row => [row.skill_path, row.was_whispered, row.was_pinned]),
+      entries.map(entry => [entry.path, rendered.includes(entry.path) ? 1 : 0, 1]));
+  } finally { db.close(); }
+});

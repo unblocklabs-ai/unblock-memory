@@ -999,11 +999,62 @@ test("gateway_stop releases the lease synchronously: graceful stops add no strik
     assert.equal(row.status, "pending", `stop ${i} released the lease`);
     assert.equal(row.owner, null); assert.equal(row.lease_until, 0);
     assert.equal(row.strikes, 0, `graceful stop ${i} adds no strikes`);
-    assert.equal(row.attempt, i);
+    assert.equal(row.attempt, 2 * i, "claim and interruptOwner each bump attempt, fencing out the stopped worker");
     assert.equal(row.due_at, 0, "an interrupted pass stays due so the next start resumes it");
   }
   assert.deepEqual(reportInsideOut(harness.storePath), [], "aborted inference never writes a grade");
   assert.deepEqual(gateway.warnings, []);
+});
+
+test("scheduled cadence is measured from pass start, so a slow pass still runs once per interval", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-cadence-")), sessionsDir = join(root, "sessions");
+  await oneReplySessions(sessionsDir);
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir,
+    storePath: join(root, "unblock-memory.sqlite"), config: cfg({ intervalMinutes: 5 }) };
+  const delayMs = 250;
+  let firstFetchAt = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    firstFetchAt ||= Date.now();
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    return graded(0.6);
+  });
+  const before = Date.now();
+  const result = await runInsideOut({ ...options, owner: "gateway" });
+  const finished = Date.now();
+  assert.equal("reviewed" in result && result.reviewed, 1);
+  const row = workRow(options.storePath)!;
+  assert.equal(row.status, "pending");
+  const startedAt = Number(row.due_at) - 5 * 60_000;
+  assert.ok(startedAt >= before && startedAt <= firstFetchAt,
+    `due_at re-arms from pass start (${startedAt}), not after the ${delayMs}ms pass finished (${finished})`);
+  assert.ok(finished - startedAt >= delayMs, "the pass itself took non-zero time");
+});
+
+test("a manual pass keeps the row's due_at as of commit, even if the schedule moved mid-pass", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-manual-due-")), sessionsDir = join(root, "sessions");
+  await oneReplySessions(sessionsDir);
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir,
+    storePath: join(root, "unblock-memory.sqlite"), config: cfg({ intervalMinutes: 5 }) };
+  const sentinel = 4_102_444_800_000; // 2100-01-01: clearly distinct from any pre-claim value.
+  let release!: (response: Response) => void, started!: () => void;
+  const inflight = new Promise<Response>(resolve => { release = resolve; });
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  t.mock.method(globalThis, "fetch", () => { started(); return inflight; });
+  const pass = runInsideOut({ ...options, owner: "cli", manual: true });
+  await ready;
+  assert.equal(workRow(options.storePath)?.status, "running");
+  // Another writer (e.g. the gateway's schedule) moves the due time while the manual pass is in flight.
+  const other = new DatabaseSync(options.storePath);
+  try {
+    other.exec("PRAGMA busy_timeout=2000");
+    other.prepare("UPDATE work_items SET due_at=? WHERE kind=? AND scope=?").run(sentinel, INSIDE_OUT_WORK_KIND, INSIDE_OUT_WORK_SCOPE);
+  } finally { other.close(); }
+  release(graded(0.6));
+  const result = await pass;
+  assert.equal("reviewed" in result && result.reviewed, 1);
+  const row = workRow(options.storePath)!;
+  assert.equal(row.status, "pending", "a manual commit re-arms the schedule rather than completing it");
+  assert.equal(Number(row.due_at), sentinel, "the due time is read inside the commit transaction, not before claim");
 });
 
 test("interruptInsideOut is a synchronous no-op for owners without an active pass", () => {

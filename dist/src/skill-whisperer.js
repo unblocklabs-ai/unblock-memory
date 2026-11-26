@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { DEFAULTS } from "./defaults.js";
@@ -8,7 +8,7 @@ import { isDecisionTimeout, resolveDecisionCredential, DecisionRequestError } fr
 import { buildSkillWhispererQuery, MAX_SKILL_QUERY_CHARS, recentSkillMessages } from "./whisperer-context.js";
 import { SkillSessionStore } from "./skill-session-store.js";
 import { abortable } from "./abortable.js";
-import { isRecord } from "./guards.js";
+import { isRecord, nonBlank } from "./guards.js";
 import { whispererSurface } from "./whisperer-prompt.js";
 const settings = DEFAULTS.skillWhisperer;
 const MAX_SESSIONS = 1_000;
@@ -244,13 +244,20 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         const emitted = [];
         const route = recallLedger && {
             agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
-            eventKey: JSON.stringify([agentId, scope, runId]), createdAtMs: Date.now(),
+            // A missing run id must never collapse distinct routing events onto one key.
+            eventKey: JSON.stringify([agentId, scope, nonBlank(runId) ?? randomUUID()]), createdAtMs: Date.now(),
             surface: surface ?? whispererSurface(context), mode: "fallback", candidateCount: 0, scores: [], emitted, outcome: "no_candidates",
         };
         const emit = (entries, added = false) => {
-            const block = renderSkills(entries, route && emitted);
+            const rendered = [];
+            const block = renderSkills(entries, rendered);
+            if (route)
+                emitted.push(...rendered);
             if (!block)
                 return;
+            state.rendered ??= new Set();
+            for (const path of rendered)
+                state.rendered.add(path);
             const outcome = added ? "emitted" : "active_reused";
             diagnose(outcome);
             if (route && (route.outcome === "no_candidates" || route.outcome === "rejected"))
@@ -447,7 +454,9 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
             if (recallLedger)
                 recordSkillEvent({ kind: "skill_open", record: {
                         createdAtMs: now, agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
-                        skillPath: canonicalPath, toolName: isRead ? "read" : "skills_read", wasWhispered: prior?.source === "whisperer",
+                        // Whispered means the model was actually shown the skill, not merely that routing admitted it.
+                        skillPath: canonicalPath, toolName: isRead ? "read" : "skills_read",
+                        wasWhispered: prior?.source === "whisperer" && !!state.rendered?.has(canonicalPath),
                         wasPinned: !!prior,
                     } });
             if (runLocal || (!prior && skills.size >= settings.maxActiveSkillsPerSession))

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
@@ -12,7 +12,7 @@ import type { WhispererDiagnostics } from "./diagnostics.js";
 import type { RecallLedgerEvent, RecallLedgerWriter, SkillRoutingRecord } from "./recall-ledger.js";
 import { SkillSessionStore, type ActiveSkillEntry } from "./skill-session-store.js";
 import { abortable } from "./abortable.js";
-import { isRecord } from "./guards.js";
+import { isRecord, nonBlank } from "./guards.js";
 import { whispererSurface, type WhispererPrompt, type WhispererSurface } from "./whisperer-prompt.js";
 
 const settings = DEFAULTS.skillWhisperer;
@@ -40,6 +40,8 @@ type SessionState = {
   result?: Promise<{ appendContext: string } | undefined>;
   controller?: AbortController;
   skills?: Map<string, ActiveSkillEntry>;
+  /** Canonical paths actually rendered into a `<skills>` block this session (overflow entries are not). */
+  rendered?: Set<string>;
 };
 
 function decisionConversation(prompt: string, messages: ReturnType<typeof recentSkillMessages>) {
@@ -270,13 +272,18 @@ export function registerSkillWhisperer(
     const emitted: string[] = [];
     const route: SkillRoutingRecord | undefined = recallLedger && {
       agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
-      eventKey: JSON.stringify([agentId, scope, runId]), createdAtMs: Date.now(),
+      // A missing run id must never collapse distinct routing events onto one key.
+      eventKey: JSON.stringify([agentId, scope, nonBlank(runId) ?? randomUUID()]), createdAtMs: Date.now(),
       surface: surface ?? whispererSurface(context), mode: "fallback", candidateCount: 0, scores: [], emitted, outcome: "no_candidates",
     };
 
     const emit = (entries: readonly ActiveSkillEntry[], added = false) => {
-      const block = renderSkills(entries, route && emitted);
+      const rendered: string[] = [];
+      const block = renderSkills(entries, rendered);
+      if (route) emitted.push(...rendered);
       if (!block) return;
+      state.rendered ??= new Set();
+      for (const path of rendered) state.rendered.add(path);
       const outcome = added ? "emitted" : "active_reused";
       diagnose(outcome);
       if (route && (route.outcome === "no_candidates" || route.outcome === "rejected")) route.outcome = outcome;
@@ -445,7 +452,9 @@ export function registerSkillWhisperer(
       const now = Date.now();
       if (recallLedger) recordSkillEvent({ kind: "skill_open", record: {
         createdAtMs: now, agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
-        skillPath: canonicalPath, toolName: isRead ? "read" : "skills_read", wasWhispered: prior?.source === "whisperer",
+        // Whispered means the model was actually shown the skill, not merely that routing admitted it.
+        skillPath: canonicalPath, toolName: isRead ? "read" : "skills_read",
+        wasWhispered: prior?.source === "whisperer" && !!state.rendered?.has(canonicalPath),
         wasPinned: !!prior,
       } });
       if (runLocal || (!prior && skills.size >= settings.maxActiveSkillsPerSession)) return;

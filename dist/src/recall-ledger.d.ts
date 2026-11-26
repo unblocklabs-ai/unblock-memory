@@ -1,5 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
-export declare const RECALL_LEDGER_SCHEMA_VERSION = 2;
+/**
+ * Stays 1: skill event tables and nullable token columns are purely additive, so a rollback to v0.16.0
+ * (which rejects any other version) still opens the ledger. Opens self-heal missing additive objects.
+ */
+export declare const RECALL_LEDGER_SCHEMA_VERSION = 1;
 export type RecallLedgerConfig = {
     enabled: boolean;
     retentionDays: number;
@@ -142,10 +146,12 @@ export declare function writeRecallBatch(path: string, events: readonly RecallLe
     written: number;
     pruned: number;
 };
-/** Operator erasure for one person's recall query history; never creates tables in an uninitialized DB. */
-export declare function purgeRecallPerson(path: string, identity: RecallPersonIdentity): {
+export type RecallPurgeResult = {
     queries: number;
+    skillEvents: number;
 };
+/** Operator erasure for one person's recall history (queries, hits and linked skill events); never creates tables. */
+export declare function purgeRecallPerson(path: string, identity: RecallPersonIdentity): RecallPurgeResult;
 type WorkerRequestPayload = {
     kind: "batch";
     path: string;
@@ -171,9 +177,7 @@ type WorkerResponse = {
     result: {
         written: number;
         pruned: number;
-    } | {
-        queries: number;
-    } | null;
+    } | RecallPurgeResult | null;
 } | {
     id: number;
     ok: false;
@@ -204,9 +208,7 @@ export declare class RecallLedgerWriter {
     });
     enqueue(dbPath: string, event: RecallLedgerEvent): boolean;
     /** Orders person erasure behind any previously accepted writes so queued events cannot resurrect deleted rows. */
-    purgePerson(dbPath: string, identity: RecallPersonIdentity): Promise<{
-        queries: number;
-    }>;
+    purgePerson(dbPath: string, identity: RecallPersonIdentity): Promise<RecallPurgeResult>;
     flush(): Promise<void>;
     close(timeoutMs?: number): Promise<void>;
     stats(): {

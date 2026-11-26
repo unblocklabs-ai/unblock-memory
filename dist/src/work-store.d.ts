@@ -30,6 +30,8 @@ export type WorkItem = {
     strikes: number;
     lastError: string | null;
     updatedAt: number;
+    /** The last attempt that saved stage progress (0 = never). */
+    progressedAttempt: number;
 };
 export declare class WorkFenceLostError extends Error {
     readonly kind: string;
@@ -66,6 +68,7 @@ export declare class WorkStore {
     /**
      * Reclaim expired leases, then claim the earliest due `pending`/`staged` row (or the given `scope`).
      * `ignoreDueAt` lets an explicit operator run start before the schedule; it never steals a live lease.
+     * `expectedInputRevision`/`expectedRecipeHash` refuse a row whose inputs advanced since the caller read them.
      */
     claim(options: {
         kind: string;
@@ -76,6 +79,8 @@ export declare class WorkStore {
         now?: number;
         maxStrikes?: number;
         ignoreDueAt?: boolean;
+        expectedInputRevision?: string;
+        expectedRecipeHash?: string;
     }): WorkClaim | undefined;
     /** Extend a live lease. Fenced by `attempt` only: a clock jump past `lease_until` never fails a healthy renew. */
     renew(claim: WorkClaim, leaseMs: number, now?: number, options?: {
@@ -96,6 +101,7 @@ export declare class WorkStore {
      */
     commitWithDomain<T>(claim: WorkClaim, options: {
         nextDueAt?: number;
+        preserveDueAt?: boolean;
         usageJson?: string | null;
         keepArtifact?: boolean;
         now?: number;
@@ -107,14 +113,16 @@ export declare class WorkStore {
     fail(claim: WorkClaim, options: {
         error: string;
         retryAt?: number;
+        preserveDueAt?: boolean;
         addStrike?: boolean;
         maxStrikes?: number;
         usageJson?: string | null;
         now?: number;
     }): WorkStatus;
     /**
-     * Synchronous graceful release for `gateway_stop`: call BEFORE aborting so no strikes are added.
-     * Rows with a saved artifact become `staged` (resumable), others `pending`. Fences out the live attempt.
+     * Synchronous graceful release for `gateway_stop` (no strikes). Rows with a saved artifact become `staged`
+     * (resumable), others `pending`. Bumps `attempt`, so the released worker is fenced out at once. Waits at most
+     * 200ms for a held write lock, then throws `SQLITE_BUSY` (the lease simply expires instead).
      */
     interruptOwner(owner: string, now?: number): number;
     /** Operator re-drive (including quarantined rows). Never steals a live lease. */

@@ -64,7 +64,8 @@ export class SkillSessionStore {
       skill_name = excluded.skill_name,
       skill_description = excluded.skill_description,
       last_used_at_ms = excluded.last_used_at_ms,
-      opened_at_ms = coalesce(excluded.opened_at_ms, skill_whisper_sessions.opened_at_ms),
+      opened_at_ms = CASE WHEN excluded.opened_at_ms IS NULL THEN skill_whisper_sessions.opened_at_ms
+        ELSE MAX(coalesce(skill_whisper_sessions.opened_at_ms, 0), excluded.opened_at_ms) END,
       score = coalesce(excluded.score, skill_whisper_sessions.score)`);
         for (const entry of entries) {
             statement.run(scope, entry.canonicalPath, entry.name, entry.description, entry.source, entry.score ?? null, entry.addedTurn, entry.addedAtMs, entry.lastUsedAtMs, entry.openedAtMs ?? null);
