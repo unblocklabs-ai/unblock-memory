@@ -6,7 +6,7 @@ export const JUDGE_CONTEXT_VERSION = `whole-messages-v1:${QUERY_CONTRACT.revisio
 export type SelectedJudgeConversation = { status: "ok"; conversation: QueryConversation };
 type JudgeConversationSelection = SelectedJudgeConversation | { status: "input_too_large" };
 
-/** Budget the actual judge JSON, using the bundled tokenizer as a provider-independent proxy. */
+/** Budget the actual judge JSON, using o200k_base as a provider-independent proxy. */
 export function selectJudgeConversation({ history, currentRequest }: QueryConversation): JudgeConversationSelection {
   const current = { history: [], currentRequest };
   let bytes = Buffer.byteLength(JSON.stringify(current));

@@ -13,7 +13,7 @@ test("judge context admits the intact request and the newest whole-message suffi
     { role: "assistant", content: "Here is the revised detail." },
   ];
   // Each older message exceeds a different cap even though the other cap would admit it.
-  const tokenHeavy = "🚀".repeat(1500);
+  const tokenHeavy = "🚀 ".repeat(2200);
   const byteHeavy = (" ".repeat(128) + "word").repeat(180);
   for (const [limit, content] of [["tokens", tokenHeavy], ["bytes", byteHeavy]] as const) {
     const tooLarge = { history: [{ role: "user" as const, content }, ...recent], currentRequest };
@@ -27,7 +27,7 @@ test("judge context admits the intact request and the newest whole-message suffi
 });
 
 test("judge context reports overflow rather than clipping a current request", () => {
-  for (const currentRequest of ["🚀".repeat(1500), `before${" ".repeat(24_000)}after`]) {
+  for (const currentRequest of ["🚀 ".repeat(2200), `before${" ".repeat(24_000)}after`]) {
     assert.deepEqual(selectJudgeConversation({ history: [], currentRequest }), { status: "input_too_large" });
   }
 });

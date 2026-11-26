@@ -1,6 +1,5 @@
 import {
   abortedByTimeout,
-  classifyDecisionFailure,
   createDecisionClient,
   DEFAULT_DECISIONS_ENDPOINT,
   DecisionError,
@@ -19,7 +18,6 @@ import type { UnblockMemoryConfig } from "./config.js";
 import { DEFAULTS } from "./defaults.js";
 
 export {
-  classifyDecisionFailure,
   matchesDecisionModel,
   DecisionError as DecisionRequestError,
 };

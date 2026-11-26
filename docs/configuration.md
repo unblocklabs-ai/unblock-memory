@@ -248,7 +248,7 @@ contract; these tables explain their effects.
 | `corpora[].kind` | Required for explicit entries | `files`, `sessions`, or `skills` |
 | `corpora[].paths` | Required for files/skills | Nonempty exact-file/directory/glob list; workspace-relative, absolute or `~/`; directory means recursive Markdown; does not grant host write trust |
 | `corpora[sessions].chatTypes` | `['channel','group']` | Nonempty subset of channel/group/direct; DMs require `direct` |
-| `corpora[sessions].maxExpandedTokens` | `500` | 1–10,000; internal host vector retrieval expands a full turn/message when it fits. Public search and Whisperer share the fixed 1,200-character complete-passage renderer with training. |
+| `corpora[sessions].maxExpandedTokens` | `500` | 1–10,000; internal host vector retrieval expands a full turn/message when it fits. Public search and Whisperer share the 1,200-character complete-passage renderer. |
 | `corpora[sessions].syncIntervalMinutes` | `5` | 0–1,440; zero manual-only; first scheduled sync after one interval; requires running Gateway |
 | `keepEmbeddingModelWarm` | `true` | Retain embedding model/context after first use; false allows five-minute idle disposal |
 | `analysis.executable` | Unset | Optional absolute local worker path; enables ability to recluster, not automatic scheduling |
@@ -417,7 +417,7 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Feature | Evidence sent when explicitly enabled/approved |
 | --- | --- |
 | Skill selection | Bounded visible current/recent conversation + shortlisted skill names/descriptions; not skill procedures or source-path fields |
-| Memory hints | Same 8,192-token/24,000-byte visible conversation as training goes to the configured query API (when available); decision model passage judging receives the compacted conversation (current request plus at most two prior visible messages, bounded to 1,500 characters) plus one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per candidate, capped at the top 6 RRF-fused eligible passages from at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
+| Memory hints | The visible conversation (up to 8,192 `o200k_base` tokens and 24,000 bytes) goes to the configured query API (when available); decision model passage judging receives the whole current request and recent whole messages (up to 4,096 tokens and 24,000 bytes by default) plus one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per candidate, capped at the top 6 RRF-fused eligible passages from at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
 | Complementarity | Up to 4 already-qualified excerpts, shared by up to 6 directional redundancy checks per request |
 | People primer | Person identity, agent name, and up to 4 approved retrieved excerpts with their source/session metadata per request (16,000 serialized state bytes); all indexed sessions eligible if approved, not just the current chat |
 | Dossier save/draft review | Proposed blurb, person/agent names and 1–3 exact approved indexed evidence ranges, at most 6,000 characters total; existing dossier is not evidence |

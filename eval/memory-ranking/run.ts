@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import { resolveConfig } from "../../src/config.js";
+import { QUERY_CONTRACT } from "../../src/query-contract.js";
+import { JUDGE_CONTEXT_VERSION } from "../../src/judge-context.js";
 import { resolveSources, resolveSessionSource } from "../../src/sources.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "../../src/decision-ranking.js";
 import { resolveDecisionCredential, DecisionRequestError } from "../../src/decision-client.js";
@@ -57,7 +59,7 @@ if (!approved.length) throw new Error("No Memory Whisperer approved corpora; exp
 const collections = new Map(approved.map(s => [s.collection, s.corpus]));
 const recipe = { version: "memory-ranking-v1", endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, limitPerMethod: 10,
   ...(frozenCases ? { frozenCasesHash: hash(frozenCases) } : {}),
-  limitScope: "across_selected_collections", inputWindow: "lfm-8192-tokens-24000-bytes",
+  limitScope: "across_selected_collections", inputWindow: QUERY_CONTRACT, judgeContextVersion: JUDGE_CONTEXT_VERSION,
   timeoutMs: config.decisionModel.timeoutMs, minUsefulness: config.memoryWhisperer.minUsefulness,
   collections: [...collections], rrf: { implementation: "QMD reciprocalRankFusion", k: 60, weights: [1, 1],
     identity: "source plus trimmed passage", topRankBonus: { first: 0.05, secondAndThird: 0.02 } },
@@ -121,7 +123,7 @@ async function main() {
           const params = { conversation: item.conversation!, asOf: item.userTimestamp ?? item.searchedAt,
             candidates: [{ excerpt: hit.body.trim(), corpus: hit.corpus, sourcePath: hit.source,
               dates: hit.messageTimestamp ? [hit.messageTimestamp] : [] }] };
-          const inputHash = hash([recipe.policyHash, recipe.model, params]);
+          const inputHash = hash([recipe.policyHash, recipe.judgeContextVersion, recipe.model, params]);
           const previous = judgments.get(identity);
           if (previous) {
             if (previous.inputHash !== inputHash) throw new Error("Saved judgment input changed");

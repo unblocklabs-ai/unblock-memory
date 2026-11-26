@@ -96,7 +96,7 @@ test("caller cancellation while judging never becomes degraded success", async t
 for (const scenario of ["missing credential", "disabled credential", "unreadable credential", "oversized judge input"] as const) {
   test(`public tool returns explicitly labeled retrieval evidence with ${scenario}`, async t => {
     const overflow = scenario === "oversized judge input";
-    const vectorQuery = overflow ? `Find evidence about ${"🚀".repeat(1500)}` : queries.vec;
+    const vectorQuery = overflow ? `Find evidence about ${"🚀 ".repeat(2200)}` : queries.vec;
     let providerCalls = 0;
     t.mock.method(globalThis, "fetch", async () => { providerCalls++; throw new Error("must not call provider"); });
     const previousCodex = process.env.CODEX_LB_API_KEY;

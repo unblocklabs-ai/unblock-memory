@@ -42,15 +42,13 @@ export declare function judgeQuality(params: {
         sourceKind: "files" | "sessions";
     }[];
 }): Promise<QualityJudgment[]>;
-export declare function memoryJudgeVersion(model?: string, endpoint?: string): string;
-export declare const MEMORY_JUDGE_VERSION: string;
 export type MemoryPassage = {
     excerpt: string;
     corpus: string;
     sourcePath: string;
     dates: readonly string[];
 };
-/** The sole versioned passage prompt/state builder for both training and runtime. */
+/** Build a blind request for one candidate passage. */
 export declare function memoryUsefulnessRequest(input: QueryConversation | SelectedJudgeConversation, candidate: MemoryPassage, asOf: string, model?: string): {
     model: string;
     state: {

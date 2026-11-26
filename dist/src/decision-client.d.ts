@@ -1,7 +1,7 @@
-import { classifyDecisionFailure, DecisionError, matchesDecisionModel, type DecisionResult, type ExtractionResult, type FieldMap, type QuestionMap } from "@unblocklabs/decisions";
+import { DecisionError, matchesDecisionModel, type DecisionResult, type ExtractionResult, type FieldMap, type QuestionMap } from "@unblocklabs/decisions";
 import { Type } from "typebox";
 import type { UnblockMemoryConfig } from "./config.js";
-export { classifyDecisionFailure, matchesDecisionModel, DecisionError as DecisionRequestError, };
+export { matchesDecisionModel, DecisionError as DecisionRequestError, };
 export declare const NOUL_SCHEMA: Type.TObject<{
     type: Type.TLiteral<"noul">;
     noul: Type.TNumber;

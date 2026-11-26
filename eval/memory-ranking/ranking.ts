@@ -1,6 +1,6 @@
 import { createHash, randomInt } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
-import { trainingCandidates } from "../../src/training-candidates.js";
+import { discoverLaneCandidates } from "../../src/memory-candidates.js";
 import type { SessionManifest } from "../../src/session-sync.js";
 import { hash, type SearchCase } from "./cases.js";
 
@@ -18,7 +18,7 @@ export type Judgment = { caseId: string; hitId: string; inputHash: string; statu
   decision_score?: number; elapsedMs?: number; error?: string; httpStatus?: number };
 type Projection = Pick<SessionManifest["sessions"][string], "projectionHash" | "messages">;
 
-export function fusePassages(candidates: Awaited<ReturnType<typeof trainingCandidates>>, rrf: Rrf) {
+export function fusePassages(candidates: Awaited<ReturnType<typeof discoverLaneCandidates>>, rrf: Rrf) {
   const lists: Ranked[][] = [[], []];
   for (const candidate of candidates) {
     const id = hash([candidate.file, candidate.bestChunk.trim()]);
@@ -39,7 +39,7 @@ export async function retrieve(qmd: QMDStore, item: SearchCase, collections: Map
   const scope = [...collections].filter(([, corpus]) => !requested || requested.includes(corpus));
   if (!scope.length) return { caseId: item.id, elapsedMs: 0, hits: [], error: "no_approved_collections" };
   const laneHits = (await Promise.all((["lex", "vec"] as const).map(lane =>
-    trainingCandidates(qmd, lane === "lex" ? item.bm25Query : item.vectorQuery,
+    discoverLaneCandidates(qmd, lane === "lex" ? item.bm25Query : item.vectorQuery,
       scope.map(([collection]) => collection), lane)))).flat();
   const merged = new Map<string, typeof laneHits[number]>();
   for (const candidate of laneHits) {

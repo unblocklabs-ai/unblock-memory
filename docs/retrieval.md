@@ -335,8 +335,7 @@ The example is a plugin config fragment; `knowledge` must already be configured.
 For a complete corpus example, use the [configuration profiles](configuration.md#example-profiles).
 
 Memory Whisperer runs directly on user turns without a pre-retrieval recall-gate
-classifier (the `historical-recall-v2` gate remains offline-training-only in
-`memory-training`). Using the configured V2 query API — or deterministic local
+classifier. Using the configured V2 query API — or deterministic local
 `lex`/`vec` query extraction if the query API fails, times out, or has no
 credentials — QMD searches its independent `lex` and `vec` queries through BM25
 and vectors respectively, retrieving ten candidates per backend across the
@@ -344,28 +343,26 @@ complete approved collection scope (not ten per collection) and fusing them via
 passage-level RRF (`k = 60`, with QMD top-rank bonuses). The lexical adapter
 uses literal OR keywords; quotation marks do not enable exact-phrase matching.
 After deduplication and cooldown filtering, Whisperer sends at most the top **six**
-fused candidates to the decision endpoint, paired with a compact conversation context (the
-current request plus at most the last two visible messages, bounded to 1,500
-characters). decision model evaluates one independent Noul question per candidate in
+fused candidates to the decision endpoint, paired with the current request and
+recent whole messages. The decision model evaluates one independent Noul question per candidate in
 its own concurrent HTTP request: would a careful assistant use a specific factual
 detail from the excerpt when answering the current request? Partial answers and
 concrete leads count; repeated facts, topic/name matches without answer content,
 unrelated details, and unsupported speculation do not.
-This is the sole versioned Memory Whisperer usefulness prompt, shared by runtime
-and offline training. Generated queries, ranks, retrieval scores, and other candidates
+Generated queries, ranks, retrieval scores, and other candidates
 are never included in the passage judge's state.
 `minUsefulness` defaults to `0.5` and
 thresholds the probability of yes, not a calibrated guarantee of accuracy.
 Explicit configured thresholds are preserved. Evaluate it on your own conversations.
 
 **Privacy and budgets:** query generation prepares the visible conversation up to
-8,192 pinned-LFM tokens and 24,000 UTF-8 bytes after serialization. The whole
+8,192 `o200k_base` tokens and 24,000 UTF-8 bytes after serialization. The whole
 current request and most recent whole messages are retained; an oversized current
 request skips automatic memory before query generation or retrieval.
 Diagnostics count `input_too_large`; completed logs report `outcome: "skipped"` and
 `reason: "input_too_large"`, without recording the input. Each decision model usefulness
-request receives the compacted conversation (at most 1,500 characters across the
-current request and up to two prior visible messages) plus one complete
+request receives the whole current request and newest whole messages that fit
+its separate budget (4,096 tokens and 24,000 bytes by default), plus one complete
 1,200-character excerpt, its corpus/source path, all represented message timestamps,
 and the request's evaluation time, capped at six candidate requests per turn.
 Dates record when source messages were said, without inferring event dates.
@@ -431,12 +428,6 @@ The plugin does not launch or manage the server. Use plain HTTP only on trusted 
 Visible conversation text is sent to this endpoint, never tool outputs/thinking.
 Approve only corpora suitable for every audience of the agent.
 
-The packaged `src/mlx-query-worker.py` is a standalone JSON-lines worker for
-separately managed model-serving integrations, not a Gateway subprocess or HTTP
-server. It is retained with `query_contract.py` and the pinned tokenizer assets;
-the latter also define the training-data contract. A host service owns any adapter
-between that private worker protocol and the HTTP API below.
-
 `POST /generate` accepts `{id, conversation: {history, currentRequest}}` and returns
 `{response: {id, text}}`, where `text` is JSON with exactly two nonempty strings,
 `lex` and `vec`. The request ID must match. Redirects, malformed/oversized responses,
@@ -448,20 +439,12 @@ Turn cancellation aborts HTTP and prevents late hints; already-running server-si
 generation may finish independently. Gateway shutdown does not stop the shared API.
 Old `mlx` config is accepted but ignored; remove it after migrating.
 
-Query generation requests one `{"lex":"keywords","vec":"semantic query"}` object
-using visible user/assistant text, the exact model prompt/template, greedy decoding,
-and a 256-token output ceiling. It keeps the whole current request, drops oldest
-whole history messages to fit the shared 8,192-token and 24,000-byte input budgets,
-and excludes oversized/ambiguous inputs. The old fixed `historyMessages` limit is
-not used by memory input preparation.
-
 The `lex` query retrieves ten BM25 matches and `vec` retrieves ten vector matches
 across the approved scope, then fuses them with passage-level RRF (`k = 60` plus
 QMD top-rank bonuses). After deduplication and cooldown filtering, up to the top
 **six** fused passages proceed to the shared usefulness judge, with one HTTP request
-per passage launched concurrently. Each request contains the compacted conversation
-(up to 1,500 characters across the current request and at most two prior visible
-messages) and only its own passage. Successful judgments remain eligible if another
+per passage launched concurrently. Each request contains the budgeted judge
+conversation and only its own passage. Successful judgments remain eligible if another
 request times out, fails HTTP/network delivery, or returns invalid answers. Scores
 stay paired with their original passages; failed candidates are excluded, not scored
 as zero. If all requests fail, nothing is injected. The total deadline and session

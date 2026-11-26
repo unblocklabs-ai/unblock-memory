@@ -24,7 +24,6 @@ import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools, reviewRequestContext } from "./review-tools.js";
 import { registerResponseAudit } from "./response-runtime.js";
 import { registerInsideOut } from "./inside-out-runtime.js";
-import { registerMemoryTraining } from "./training-runtime.js";
 import { resolveTimezone } from "./session-projector.js";
 import { searchMemory, type RecallCandidateTrace } from "./memory-search.js";
 import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
@@ -743,7 +742,6 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   registerPeopleLearningCli(api, config);
   registerResponseAudit(api, config);
   registerInsideOut(api, config);
-  registerMemoryTraining(api, config);
   if (api.registrationMode === "cli-metadata") { registerExtraction(api, config); return; }
   const runtime = new QmdMemoryRuntime(config.corpora, {
     analysisExecutable: config.analysis.executable,

@@ -1,7 +1,6 @@
 import type { VectorSearchResult } from "@unblocklabs/qmd";
 import { type SessionMessageSpan } from "./session-projector.js";
 export declare const MEMORY_PASSAGE_CHARS: number;
-export declare const MEMORY_PASSAGE_VERSION: string;
 type Passage = Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">;
 type LocatedPassage = {
     path: string;
@@ -9,7 +8,7 @@ type LocatedPassage = {
     startLine: number;
     endLine: number;
 };
-/** Same passage eligibility in target scoring and runtime hint selection. */
+/** Deduplicate matching excerpts and overlapping lines from the same source. */
 export declare function duplicateMemoryPassage(passage: LocatedPassage, previous: readonly LocatedPassage[]): boolean;
 /** Preserve a complete match and, when it fits, its whole turn/message context. */
 export declare function expandSessionSearchHit(result: Passage, maxTokens: number, countTokens: (text: string) => Promise<number>, maxChars?: number, messages?: SessionMessageSpan[]): Promise<{
@@ -17,7 +16,7 @@ export declare function expandSessionSearchHit(result: Passage, maxTokens: numbe
     position: number;
     sourceText?: string;
 }>;
-/** One fixed, model-independent renderer for offline and deployed Whisperer. */
+/** Render a complete passage within the shared search and Whisperer excerpt limit. */
 export declare function renderMemoryPassage(result: Passage, messages?: SessionMessageSpan[]): Promise<{
     sourceText: string;
     text: string;

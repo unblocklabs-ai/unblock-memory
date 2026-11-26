@@ -18,7 +18,7 @@ import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
 import { abortable } from "./abortable.js";
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
-import { trainingCandidates } from "./training-candidates.js";
+import { discoverLaneCandidates } from "./memory-candidates.js";
 import { expandSessionSearchHit, renderMemoryPassage } from "./memory-passage.js";
 import { startTiming, timeStage, vectorTrace, vectorParts, unaccounted } from "./retrieval-timing.js";
 import { parseDailyFilenameDateMs } from "./recall-ledger.js";
@@ -994,7 +994,7 @@ export class QmdMemoryManager {
                     opts.signal?.throwIfAborted();
                     let candidates;
                     try {
-                        candidates = await timeStage(lane === "lex" ? "bm25Ms" : "vectorMs", timings, signal, () => trainingCandidates(store, queries[lane], collections, lane, opts.signal, allowedPaths, lane === "vec" ? vectorTrace(timings, signal) : undefined));
+                        candidates = await timeStage(lane === "lex" ? "bm25Ms" : "vectorMs", timings, signal, () => discoverLaneCandidates(store, queries[lane], collections, lane, opts.signal, allowedPaths, lane === "vec" ? vectorTrace(timings, signal) : undefined));
                     }
                     finally {
                         if (lane === "vec" && timings?.vectorMs !== undefined) {

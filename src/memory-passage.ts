@@ -4,11 +4,10 @@ import { meetingRevisionAnnotation, meetingSpeakerSpans } from "./loggie-project
 import { sessionContextSpans, type SessionMessageSpan } from "./session-projector.js";
 
 export const MEMORY_PASSAGE_CHARS = DEFAULTS.memoryWhisperer.judgmentExcerptChars;
-export const MEMORY_PASSAGE_VERSION = `complete-excerpt-${MEMORY_PASSAGE_CHARS}-v1`;
 type Passage = Pick<VectorSearchResult, "body" | "bestChunk" | "chunkPos" | "chunkLen">;
 type LocatedPassage = { path: string; text: string; startLine: number; endLine: number };
 
-/** Same passage eligibility in target scoring and runtime hint selection. */
+/** Deduplicate matching excerpts and overlapping lines from the same source. */
 export function duplicateMemoryPassage(passage: LocatedPassage, previous: readonly LocatedPassage[]) {
   const normalized = (text: string) => text.replace(/\s+/gu, " ").trim();
   return previous.some(other => normalized(other.text) === normalized(passage.text) ||
@@ -46,7 +45,7 @@ export async function expandSessionSearchHit(
   return leaf;
 }
 
-/** One fixed, model-independent renderer for offline and deployed Whisperer. */
+/** Render a complete passage within the shared search and Whisperer excerpt limit. */
 export async function renderMemoryPassage(result: Passage, messages?: SessionMessageSpan[]) {
   if (!result.bestChunk.trim() || result.bestChunk.length > MEMORY_PASSAGE_CHARS) return;
   const selected = messages ? await expandSessionSearchHit(result, Infinity, async () => 0, MEMORY_PASSAGE_CHARS, messages)
