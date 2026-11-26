@@ -33,13 +33,13 @@ function prefixThatFits(message, offset, tokens, bytes) {
         throw new Error("No room for extraction message");
     return end;
 }
-export function extractionHistory(messages, count, existing = []) {
+export function extractionHistory(messages, count) {
     if (!count)
         return [];
     const kept = [];
     let remaining = DEFAULTS.extraction.historyTokenBudget;
     // Give history the same share of the validation byte budget as of the input token budget.
-    let remainingBytes = Math.floor(extractionValidationTranscriptBudget(existing) * remaining / EXTRACTION_INPUT_LIMIT);
+    let remainingBytes = Math.floor(extractionValidationTranscriptBudget() * remaining / EXTRACTION_INPUT_LIMIT);
     for (const message of messages.slice(-count).reverse()) {
         const tokens = extractionMessageTokens(message);
         const bytes = extractionMessageBytes(message);
@@ -98,9 +98,9 @@ export async function readExtractionChunk(params) {
     const startingFence = resume?.fence;
     let cursor = resume ? resume.before : params.cursor;
     const messages = [...params.context];
-    let tokens = extractionOverhead(params.existing) + messages.reduce((n, m) => n + extractionMessageTokens(m), 0);
+    let tokens = extractionOverhead() + messages.reduce((n, m) => n + extractionMessageTokens(m), 0);
     let bytes = messages.reduce((n, m) => n + extractionMessageBytes(m), 0);
-    const byteLimit = extractionValidationTranscriptBudget(params.existing);
+    const byteLimit = extractionValidationTranscriptBudget();
     let entryCount = 0;
     const newIds = [];
     for (;;) {

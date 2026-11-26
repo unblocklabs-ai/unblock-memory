@@ -30,7 +30,7 @@ export declare function extractionPolicyFingerprint(params: {
     historyMessages: number;
     minSupport: number;
     minRetention: number;
-    minReplacement: number;
+    minReplacement?: number;
     extractorModel?: string;
     validatorModel?: string;
 }): string;

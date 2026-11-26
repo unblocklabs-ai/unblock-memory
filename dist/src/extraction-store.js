@@ -14,7 +14,7 @@ export function extractionPolicyFingerprint(params) {
         historyMessages: params.historyMessages,
         minSupport: params.minSupport,
         minRetention: params.minRetention,
-        minReplacement: params.minReplacement,
+        immutableObservations: true,
         extractorModel: params.extractorModel ?? null,
         validatorModel: params.validatorModel ?? null,
     });
@@ -39,8 +39,12 @@ function parseCompleteRevision(value) {
     catch { /* Legacy plain-string complete_revision without policy binding. */ }
     return { sourceRevision: value, policy: null };
 }
-function memoryDigest(text) {
-    return createHash("sha256").update(text.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]+$/, "")).digest("hex");
+function normalize(text) {
+    return text.trim().toLowerCase().replace(/\s+/gu, " ");
+}
+function memoryDigest(normalizedText, evidence) {
+    const citations = evidence.map(({ messageId, quote }) => JSON.stringify([messageId, normalize(quote)])).sort();
+    return jsonHash([normalizedText, citations]);
 }
 export class ExtractionStore {
     db;
@@ -124,8 +128,7 @@ export class ExtractionStore {
             const storedCompleteRevision = row.complete_revision;
             const storedPolicy = row.policy_fingerprint;
             if (since !== undefined && since < Number(row.extract_since)) {
-                // A broader explicitly approved backfill replays this session. Existing facts are
-                // supplied to Luna and exact duplicates are ignored; history is never deleted.
+                // A broader approved backfill replays the session; commit deduplicates source occurrences.
                 const nextPolicy = policyFingerprint ?? storedPolicy;
                 this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=?,policy_fingerprint=? WHERE session_id=?")
                     .run(since, nextPolicy, session.sessionId);
@@ -210,32 +213,22 @@ export class ExtractionStore {
     commit(params) {
         return immediateTransaction(this.db, () => {
             let written = 0;
-            const replaced = new Set();
             this.renew(params.owner);
             const current = this.db.prepare("SELECT cursor,policy_fingerprint FROM extraction_sessions WHERE session_id=?").get(params.session.sessionId);
             const nextPolicy = this.assertCheckpointFenced(current, params.expected, params.policyFingerprint, params.completeRevision);
             for (const { proposal, observedAt, judgment } of params.accepted) {
-                const digest = memoryDigest(proposal.text);
-                const duplicate = this.db.prepare("SELECT id FROM extracted_memories WHERE session_id=? AND digest=? AND status='active'")
-                    .get(params.session.sessionId, digest);
-                if (duplicate)
+                const normalizedText = normalize(proposal.text).replace(/[.!]+$/, "");
+                const digest = memoryDigest(normalizedText, proposal.evidence);
+                // Old active rows have text-only digests. An indexed lookup avoids migrating
+                // the table or duplicating the original occurrence on the first policy replay.
+                const legacy = this.db.prepare("SELECT evidence FROM extracted_memories WHERE session_id=? AND digest=? AND status='active'")
+                    .get(params.session.sessionId, createHash("sha256").update(normalizedText).digest("hex"));
+                if (legacy && memoryDigest(normalizedText, JSON.parse(String(legacy.evidence))) === digest)
                     continue;
-                let id = randomUUID(), revision = 1;
-                if (proposal.replaces) {
-                    if (replaced.has(proposal.replaces))
-                        throw new Error("Conflicting memory replacement in batch");
-                    const previous = this.db.prepare("SELECT revision,observed_at FROM extracted_memories WHERE id=? AND session_id=? AND status='active'")
-                        .get(proposal.replaces, params.session.sessionId);
-                    if (!previous || Number(previous.observed_at) > observedAt)
-                        throw new Error("Invalid or stale memory replacement");
-                    replaced.add(proposal.replaces);
-                    id = proposal.replaces;
-                    revision = Number(previous.revision) + 1;
-                    this.db.prepare("UPDATE extracted_memories SET status='superseded' WHERE id=? AND status='active'").run(id);
-                }
-                this.db.prepare(`INSERT INTO extracted_memories VALUES(?,?,?,?,?,?,?,'active',?,?,?)`)
-                    .run(id, revision, params.session.sessionId, proposal.text.trim(), digest, JSON.stringify(proposal.evidence), observedAt, JSON.stringify(judgment), params.version, Date.now());
-                written++;
+                const result = this.db.prepare(`INSERT INTO extracted_memories VALUES(?,1,?,?,?,?,?,'active',?,?,?)
+          ON CONFLICT(session_id,digest) WHERE status='active' DO NOTHING`)
+                    .run(randomUUID(), params.session.sessionId, proposal.text.trim(), digest, JSON.stringify(proposal.evidence), observedAt, JSON.stringify(judgment), params.version, Date.now());
+                written += Number(result.changes);
             }
             this.db.prepare("UPDATE extraction_sessions SET cursor=?,context=?,updated_at=?,complete_revision=?,policy_fingerprint=?,error=NULL WHERE session_id=?")
                 .run(params.cursor, JSON.stringify(params.context), Date.now(), params.completeRevision ?? null, nextPolicy, params.session.sessionId);
