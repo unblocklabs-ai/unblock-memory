@@ -1,4 +1,5 @@
 import { DEFAULTS } from "./defaults.js";
+import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveAgentDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
@@ -6,7 +7,7 @@ import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import type { UnblockMemoryConfig } from "./config.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { dateOption } from "./date-option.js";
-import { linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
+import { interruptInsideOut, linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
 export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryConfig) {
@@ -31,7 +32,8 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
     root.command("run").option("--agent <id>", "Agent id", "main").option("--retry", "Retry failed judgments immediately")
       .option("--session <id>", "Review only this session")
       .action(async (opts: { agent: string; retry?: boolean; session?: string }) => {
-        const result = await runInsideOut({ ...paths(cfg, opts.agent), config, retry: opts.retry, sessionId: opts.session });
+        // Explicit operator pass: run now unless another process holds the live lease.
+        const result = await runInsideOut({ ...paths(cfg, opts.agent), config, retry: opts.retry, sessionId: opts.session, manual: true });
         console.log(JSON.stringify(result, null, 2));
         if ("failed" in result && (result.failed || result.errors.length || result.baselineError)) process.exitCode = 1;
       });
@@ -73,6 +75,8 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
   let timer: NodeJS.Timeout | undefined, baselineTimer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
   let refreshing: Promise<void> | undefined;
   let lifetime = new AbortController();
+  // One lease owner per registration: hot-replaced instances contend through the shared work row.
+  const owner = `inside-out:${process.pid}:${randomUUID()}`;
   const clearTimers = () => {
     if (timer) { clearInterval(timer); timer = undefined; }
     if (baselineTimer) { clearInterval(baselineTimer); baselineTimer = undefined; }
@@ -84,7 +88,8 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
       for (const agentId of listAgentIds(api.config)) {
         if (signal.aborted) break;
         try {
-          const result = await runInsideOut({ ...paths(api.config, agentId), config, signal });
+          // Scheduled passes respect the persisted due time, so restarts inside the interval do not re-run.
+          const result = await runInsideOut({ ...paths(api.config, agentId), config, signal, owner });
           if ("failed" in result && (result.failed || result.errors.length)) api.logger.warn("Inside Out: some reviews or sources failed; inspect memory-emotions export");
           if ("baselineError" in result && result.baselineError) api.logger.warn(`Inside Out baselines: ${result.baselineError}`);
         } catch (error) { if (!signal.aborted) api.logger.warn(`Inside Out: ${String(error)}`); }
@@ -111,6 +116,12 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
       timer = setInterval(tick, config.insideOut.intervalMinutes * 60_000); timer.unref(); tick();
     }
   });
-  // Aborting cancels active baseline workers rather than waiting for a full historical pass.
-  api.on("gateway_stop", async () => { clearTimers(); lifetime.abort(); await Promise.all([running, refreshing]); });
+  // Release leases synchronously first (graceful stop adds no strikes), then abort active passes and
+  // baseline workers rather than waiting for a full historical pass.
+  api.on("gateway_stop", async () => {
+    clearTimers();
+    interruptInsideOut(owner);
+    lifetime.abort();
+    await Promise.all([running, refreshing]);
+  });
 }

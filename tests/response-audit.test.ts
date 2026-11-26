@@ -2183,3 +2183,57 @@ test("memory-responses review CLI requires --evidence-hash and rejects stale evi
   assert.equal(decisions[0]!.inputHash, newTask.inputHash);
   assert.equal(decisions[0]!.evidenceHash, newTask.evidenceHash);
 });
+
+test("cancellation refunds the episode and in-flight stage attempts so gateway restarts cannot exhaust retries", { timeout: 10_000 }, async t => {
+  const { db, options } = await fixture(); t.after(() => db.close());
+  const attempts = () => {
+    const store = new DatabaseSync(options.storePath, { readOnly: true });
+    try {
+      return {
+        episodes: store.prepare("SELECT attempts,attempted_at,status FROM response_results").all()
+          .map(row => ({ attempts: row.attempts, attemptedAt: row.attempted_at, status: row.status })),
+        stages: store.prepare("SELECT attempts,attempted_at FROM response_stages WHERE status!='ok'").all()
+          .map(row => ({ attempts: row.attempts, attemptedAt: row.attempted_at })),
+        begun: Number(store.prepare("SELECT count(*) n FROM response_stages").get()?.n),
+      };
+    } finally { store.close(); }
+  };
+  // More cancellations than the retry budget allows: uncooperative and cooperative providers alike.
+  for (let restart = 0; restart < DEFAULTS.responseAudit.maxRetries + 1; restart++) {
+    const controller = new AbortController();
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const fetchMock = t.mock.method(globalThis, "fetch", (_url: string, init: RequestInit) => {
+      started();
+      return new Promise<Response>((_resolve, reject) => {
+        if (restart % 2) init.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+      });
+    });
+    const run = auditResponses({ ...options, signal: controller.signal });
+    await ready; await nextTurn(); controller.abort();
+    const result = await run;
+    fetchMock.mock.restore();
+    assert.equal(result.status, "unavailable");
+    assert.equal(result.coverage?.failed, 0, "a cancelled episode is not counted as a provider failure");
+    const state = attempts();
+    assert.ok(state.begun > 0, "stage attempts had started before cancellation");
+    assert.deepEqual(state.episodes, [{ attempts: 0, attemptedAt: null, status: "pending" }], `restart ${restart} refunded the episode`);
+    assert.ok(state.stages.every(stage => stage.attempts === 0 && stage.attemptedAt === null), `restart ${restart} refunded begun stages`);
+  }
+  // With no backoff or exhausted budget left behind, the next uninterrupted run judges immediately.
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => Response.json(payload(JSON.parse(String(init.body)))));
+  const result = await auditResponses(options);
+  assert.equal(result.status, "ok");
+  assert.equal(result.coverage?.evaluated, 1);
+  assert.equal(result.coverage?.failed, 0);
+});
+
+test("genuine provider failures still consume the bounded retry budget", async t => {
+  const { db, options } = await fixture(); t.after(() => db.close());
+  t.mock.method(globalThis, "fetch", async () => new Response("upstream down", { status: 503 }));
+  const result = await auditResponses(options);
+  assert.equal(result.coverage?.failed, 1);
+  const store = new DatabaseSync(options.storePath, { readOnly: true }); t.after(() => store.close());
+  assert.equal(store.prepare("SELECT attempts FROM response_results").get()?.attempts, 1);
+  assert.ok(Number(store.prepare("SELECT max(attempts) n FROM response_stages").get()?.n) >= 1);
+});
