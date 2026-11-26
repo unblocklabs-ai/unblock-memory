@@ -32,7 +32,7 @@ const signal = () => new AbortController().signal;
 const thresholds = config().extraction;
 type ValidationParams = Parameters<typeof validateExtractedMemories>[0];
 const acceptAll = async ({ proposals, thresholds }: ValidationParams) => proposals.map(() => ({
-  accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds,
+  accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1 }, thresholds,
 }));
 const validateOne = async ({ proposal, ...params }: Omit<ValidationParams, "proposals"> & { proposal: MemoryProposal }) =>
   (await validateExtractedMemories({ ...params, proposals: [proposal] }))[0]!;
@@ -96,7 +96,7 @@ test("the worker validates four verbatim d1.2 proposals with one dated transcrip
   assert.deepEqual(state, [{
     messages: source.map(message => ({ ...message, sourceDate: new Date(message.timestamp).toISOString() })),
     newMessageIds: source.map(message => message.id),
-    proposals: quotes.map((quote, i) => ({ text: `Bek: ${quote}`, replaces: null, evidence: [{ messageId: source[i]!.id, quote }], prior: null })),
+    proposals: quotes.map((quote, i) => ({ text: `Bek: ${quote}`, evidence: [{ messageId: source[i]!.id, quote }] })),
   }]);
   for (const i of quotes.keys()) {
     for (const rubric of ["support", "retain"]) {
@@ -137,66 +137,36 @@ test("no-span responses match exact new-message text; empty and null responses y
     Response.json({ model: JSON.parse(String(init.body)).model, answers: { memories: answer } }));
   const params = { messages: [{ ...messages[0]!, id: "old" }, ...messages], newIds: ["m1"], existing: [], apiKey: "test", signal: signal() };
   assert.deepEqual(await extractWithDecisionModel(params), [{ ...proposal, text: `Bek: ${messages[0]!.text}` }]);
+  const later = { ...messages[0]!, id: "later" };
+  answer = { value: [later.text, later.text] };
+  assert.deepEqual((await extractWithDecisionModel({ ...params, messages: [...params.messages, later], newIds: ["m1", "later"] }))
+    .map(p => p.evidence[0]!.messageId), ["m1", "later"]);
   for (answer of [{ value: [] }, { value: null, p_null: 0.97 }, { value: [messages[0]!.text], p_null: 1 }]) {
     assert.deepEqual(await extractWithDecisionModel(params), []);
   }
 });
 
-test("replacement selection sends five independently normalized choice blocks once per proposal", async t => {
-  const existing = Array.from({ length: 100 }, (_, i) => ({ id: i === 81 ? "none" : `id-${i}`, text: `prior fact ${i}` }));
-  let choices = 0;
-  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
-    const body = JSON.parse(String(init.body));
-    if (url.endsWith("/extractions")) {
-      return Response.json({ model: body.model, answers: { memories: { value: [messages[0]!.text] } } });
-    }
-    choices++;
-    assert.ok(Buffer.byteLength(String(init.body)) <= DEFAULTS.extraction.replacementBatchMaxPayloadBytes);
-    return Response.json({ answers: Object.fromEntries(Object.entries(body.questions).map(([key, question]) => {
-      const { criteria } = question as { criteria: Record<string, { text: string } | string> };
-      assert.ok(criteria.none);
-      const keys = Object.keys(criteria);
-      assert.equal(keys.length, 21);
-      const winner = "prior_1", prior = criteria[winner];
-      const probability = typeof prior === "object" && /^prior fact 81\b/u.test(prior.text) ? 0.96 : 0.91;
-      return [key, { type: "choice", choice: winner, confidence: probability,
-        probabilities: Object.fromEntries(keys.map(option => [option, option === winner ? probability : option === "none" ? 1 - probability : 0])),
-      }];
-    })) });
-  });
-  const params = { messages, newIds: ["m1"], existing, apiKey: "test", signal: signal() };
-  assert.equal((await extractWithDecisionModel(params))[0]?.replaces, "none");
-  assert.equal(choices, 1);
-  assert.equal((await extractWithDecisionModel({ ...params, minReplacement: 0.97 }))[0]?.replaces, null);
-  assert.equal(choices, 2);
-  const widePriors = existing.map(prior => ({ ...prior, text: `${prior.text} ${"世界".repeat(125)}` }));
-  assert.equal((await extractWithDecisionModel({ ...params, existing: widePriors }))[0]?.replaces, "none");
-  assert.equal(choices, 4, "the same five blocks require two requests only when their serialized bytes exceed the cap");
-});
-
-test("missing quotes, unknown replacement ids and context-only citations never reach decision model", async t => {
+test("missing quotes and context-only citations never reach decision model", async t => {
   t.mock.method(globalThis, "fetch", () => { assert.fail("invalid evidence must not be sent"); });
-  for (const p of [{ ...proposal, evidence: [{ messageId: "m1", quote: "blue" }] }, { ...proposal, replaces: "unknown" }, proposal]) {
+  for (const p of [{ ...proposal, evidence: [{ messageId: "m1", quote: "blue" }] }, proposal]) {
     const result = await validateOne({ proposal: p, messages, newIds: p === proposal ? [] : ["m1"], existing: [], apiKey: "test", signal: signal(), thresholds });
     assert.equal(result.accepted, false); assert.equal(result.reason, "invalid_evidence");
   }
 });
 
-test("all three validation dimensions must meet the gate; malformed responses fail closed", async t => {
-  let support = 0.98, useful = 0.98, replacement = 0.98;
+test("support and retention must both meet the gate; malformed responses fail closed", async t => {
+  let support = 0.98, useful = 0.98;
   t.mock.method(globalThis, "fetch", async () => Response.json({ answers: { support_0: { type: "choice", choice: "supported", confidence: support, probabilities: { supported: support, unsupported: 1-support, contradicted: 0 } },
-    retain_0: { type: "noul", noul: useful }, replace_0: { type: "noul", noul: replacement } } }));
-  const params = { proposal: { ...proposal, replaces: "prior" }, messages, newIds: ["m1"], existing: [{ id: "prior", text: "Bek likes blue." }], apiKey: "test", signal: signal(), thresholds };
+    retain_0: { type: "noul", noul: useful } } }));
+  const params = { proposal, messages, newIds: ["m1"], apiKey: "test", signal: signal(), thresholds };
   assert.equal((await validateOne(params)).accepted, true);
   useful = 0.89; assert.equal((await validateOne(params)).accepted, false);
   assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minRetention: 0.85 } })).accepted, true);
   useful = 0.98; support = 0.89; assert.equal((await validateOne(params)).accepted, false);
-  support = 0.98; replacement = 0.5; assert.equal((await validateOne(params)).accepted, false);
-  assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minReplacement: 0.5 } })).accepted, true);
   support = 0.8;
-  assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minSupport: 0.8, minReplacement: 0.5 } })).accepted, true);
+  assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minSupport: 0.8 } })).accepted, true);
   assert.equal((await validateOne({ ...params, thresholds: { ...thresholds, minRetention: 0.1 } })).accepted, false);
-  replacement = NaN; await assert.rejects(validateOne(params), /invalid noul answer/i);
+  useful = NaN; await assert.rejects(validateOne(params), /invalid noul answer/i);
 });
 
 test("citations preserve source formatting; separated spans must be separate quotes", async t => {
@@ -222,24 +192,40 @@ test("citations preserve source formatting; separated spans must be separate quo
   assert.equal(calls, 1);
 });
 
-test("commit is atomic, deduplicated, versioned and fenced by checkpoint and lease", async () => {
+test("commit deduplicates retries and is fenced by checkpoint and lease", async () => {
   const f = await fixture(), store = new ExtractionStore(f.storePath);
   try {
     const owner = store.claim(false, 0)!; assert.ok(owner); assert.equal(store.claim(false, 0), undefined);
     store.checkpoint(session, owner);
     const commit = { session, expected: null, cursor: "c1", context: messages, accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" };
-    store.commit(commit); const original = store.records()[0]!;
+    assert.equal(store.commit(commit), 1);
     assert.throws(() => store.commit(commit), /checkpoint/);
-    store.commit({ ...commit, expected: "c1", cursor: "c2" }); assert.equal(store.records().length, 1);
-    const replacement = { ...proposal, text: "Bek's favorite color is green.", replaces: original.id };
-    assert.throws(() => store.commit({ ...commit, expected: "c2", cursor: "c3", accepted: [{ proposal: replacement, observedAt: 900, judgment: {} }] }), /stale/);
-    assert.equal(store.checkpoint(session, owner).cursor, "c2");
-    store.commit({ ...commit, expected: "c2", cursor: "c3", accepted: [{ proposal: replacement, observedAt: 2000, judgment: {} }] });
-    assert.equal(store.records()[0]!.revision, 2);
-    assert.equal(store.db.prepare("SELECT count(*) AS n FROM extracted_memories").get()!.n, 2);
+    assert.equal(store.commit({ ...commit, expected: "c1", cursor: "c2" }), 0);
     store.reset(session.sessionId, "reset", owner); assert.deepEqual(store.records(), []);
     store.release(owner); assert.throws(() => store.renew(owner), /lease/);
     assert.equal(store.db.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
+  } finally { store.close(); }
+});
+
+test("legacy and new digests deduplicate the same evidence, not the same text", async () => {
+  await using root = await mkdtempDisposable(join(tmpdir(), "extraction-legacy-digest-"));
+  const store = new ExtractionStore(join(root.path, "memory.sqlite"));
+  try {
+    const owner = store.claim(false, 0)!;
+    store.checkpoint(session, owner);
+    const evidence = [{ messageId: "question", quote: "Coffee?" }, { messageId: "reply", quote: "Dark roast." }];
+    const text = "Bek drinks dark roast";
+    const legacyDigest = createHash("sha256").update(text.toLowerCase()).digest("hex");
+    store.db.prepare("INSERT INTO extracted_memories VALUES('legacy',2,?,?,?,?,1000,'active','{}','v1',1000)")
+      .run(session.sessionId, text, legacyDigest, JSON.stringify(evidence));
+    const commit = (expected: string | null, cursor: string, cites: MemoryProposal["evidence"]) =>
+      store.commit({ session, owner, version: "test", context: [], expected, cursor,
+        accepted: [{ proposal: { text, replaces: null, evidence: cites }, observedAt: 2000, judgment: {} }] });
+    assert.equal(commit(null, "1", [...evidence].reverse()), 0, "upgrade replay preserves the legacy occurrence");
+    const other = [evidence[0]!, { messageId: "reply", quote: "I prefer dark roast." }];
+    assert.equal(commit("1", "2", other), 1, "a distinct quote on the same message is a new occurrence");
+    assert.equal(commit("2", "3", [{ ...other[1]!, quote: " I prefer   dark roast. " }, other[0]!]), 0);
+    assert.deepEqual(store.records().map(r => [r.revision, r.evidence]), [[2, evidence], [1, other]]);
   } finally { store.close(); }
 });
 
@@ -536,7 +522,7 @@ test("policy and prompt version changes invalidate complete_revision and re-scan
     validate: async ({ proposals, thresholds: t }: ValidationParams) => proposals.map(prop => ({
       accepted: prop.text === proposal.text || t.minSupport <= 0.85,
       reason: "judged" as const,
-      scores: { supported: prop.text === proposal.text ? 0.99 : 0.85, useful: 0.99, replacement: 1 },
+      scores: { supported: prop.text === proposal.text ? 0.99 : 0.85, useful: 0.99 },
       thresholds: config(extraCfg).extraction,
     })),
   });
@@ -548,7 +534,7 @@ test("policy and prompt version changes invalidate complete_revision and re-scan
   const readsAfter1 = reads;
 
   // Same policy & prompt version skips cleanly without reading delta.
-  const r2 = await runExtraction(makeOpts({}, "lasting-facts-v11"));
+  const r2 = await runExtraction(makeOpts({ extraction: { ...thresholds, minReplacement: 0 } }, "lasting-facts-v11"));
   assert.equal(r2.unchanged, 1);
   assert.equal(reads, readsAfter1);
 
@@ -580,61 +566,40 @@ test("policy and prompt version changes invalidate complete_revision and re-scan
   assert.equal(extractions, 4);
 });
 
-test("multiple accepted proposals targeting the same predecessor pick one deterministic winner and reject store-level conflicts", async () => {
+test("later corrections and restatements append dated observations without replacement calls", async t => {
   const f = await fixture();
-  // Seed initial memory revision 1.
-  const store = new ExtractionStore(f.storePath);
-  let priorId = "";
-  try {
-    const owner = store.claim(false, 0)!;
-    store.checkpoint(session, owner, 0);
-    store.commit({
-      session, expected: null, cursor: "c1", context: messages,
-      accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test",
-    });
-    priorId = store.records(session.sessionId)[0]!.id;
-
-    // Direct store.commit must refuse two conflicting replacements for the same predecessor in one batch.
-    const dupA: MemoryProposal = { text: "Bek's favorite color is green.", replaces: priorId, evidence: [{ messageId: "m2", quote: "green" }] };
-    const dupB: MemoryProposal = { text: "Bek's favorite color is blue.", replaces: priorId, evidence: [{ messageId: "m3", quote: "blue" }] };
-    assert.throws(() => store.commit({
-      session, expected: "c1", cursor: "c2", context: messages,
-      accepted: [
-        { proposal: dupA, observedAt: 2000, judgment: {} },
-        { proposal: dupB, observedAt: 3000, judgment: {} },
-      ],
-      owner, version: "test",
-    }), /Conflicting memory replacement/);
-    assert.equal(store.records(session.sessionId)[0]!.revision, 1);
-    store.release(owner);
-  } finally { store.close(); }
-
-  // Worker batch with 2 accepted replacements targeting priorId picks the latest observedAt deterministically,
-  // creating a single revision 2 (no intermediate revision 2 -> 3) and rejecting the competing proposal.
-  const m2: ExtractionMessage = { id: "m2", speaker: "Bek", role: "user", text: "Actually I like green now.", timestamp: 2000 };
-  const m3: ExtractionMessage = { id: "m3", speaker: "Bek", role: "user", text: "Wait no, make it yellow.", timestamp: 3000 };
-  const repEarly: MemoryProposal = { text: "Bek's favorite color is green.", replaces: priorId, evidence: [{ messageId: "m2", quote: m2.text }] };
-  const repLate: MemoryProposal = { text: "Bek's favorite color is yellow.", replaces: priorId, evidence: [{ messageId: "m3", quote: m3.text }] };
-  const result = await runExtraction({
-    config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
-    sessions: () => [session], since: 0, signal: signal(),
-    readPage: async (_id, _name, _s, cursor) => cursor === "c2" ? page("c2", []) : page("c2", [m2, m3]),
-    extract: async () => [repEarly, repLate],
-    validate: acceptAll,
+  const quotes = ["I love Adidas.", "I only wear Yeezys now.", "I love Adidas."];
+  let turn = 0;
+  const calls: string[][] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    const { model, state, questions } = JSON.parse(String(init.body));
+    if (url.endsWith("/extractions")) {
+      calls.push(["extract"]);
+      const quote = quotes[turn]!, start = state.lastIndexOf(quote);
+      return Response.json({ model, answers: { memories: { value: [quote], spans: [[start, start + quote.length]] } } });
+    }
+    calls.push(Object.keys(questions).sort());
+    return Response.json({ answers: {
+      support_0: { type: "choice", choice: "supported", confidence: 1, probabilities: { supported: 1, unsupported: 0, contradicted: 0 } },
+      retain_0: { type: "noul", noul: 1 },
+    } });
   });
-  assert.equal(result.status, "completed");
-  assert.equal(result.accepted, 1);
-  assert.equal(result.rejected, 1);
-
-  const check = new ExtractionStore(f.storePath);
+  const opts = { config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill", sessions: () => [session], since: 0, signal: signal() };
+  for (; turn < quotes.length; turn++) {
+    const id = String(turn + 1);
+    const result = await runExtraction({ ...opts, readPage: async (_a, _n, _s, cursor) =>
+      page(id, cursor === id ? [] : [{ ...messages[0]!, id, text: quotes[turn]!, timestamp: (turn + 1) * 1000 }]) });
+    assert.equal(result.accepted, 1, `observation ${id} must be stored`);
+  }
+  assert.deepEqual(calls, quotes.flatMap(() => [["extract"], ["retain_0", "support_0"]]));
+  const store = new ExtractionStore(f.storePath);
   try {
-    const active = check.records(session.sessionId);
-    assert.equal(active.length, 1);
-    assert.equal(active[0]!.id, priorId);
-    assert.equal(active[0]!.revision, 2);
-    assert.equal(active[0]!.text, "Bek's favorite color is yellow.");
-    assert.equal(check.db.prepare("SELECT count(*) AS n FROM extracted_memories WHERE id=?").get(priorId)!.n, 2);
-  } finally { check.close(); }
+    const active = store.records(session.sessionId);
+    assert.deepEqual(active.map(r => [r.text, r.observedAt, r.evidence]), quotes.map((quote, i) =>
+      [`Bek: ${quote}`, (i + 1) * 1000, [{ messageId: String(i + 1), quote }]]));
+    assert.equal(new Set(active.map(r => r.id)).size, 3);
+    assert.ok(active.every(r => r.revision === 1));
+  } finally { store.close(); }
 });
 
 test("extraction-runtime gateway_stop aborts and drains in-flight RPC runs before resolving", async () => {
@@ -745,7 +710,7 @@ test("policy change and unversioned legacy partial cursors rewind before process
     validate: async ({ proposals, thresholds: t }: ValidationParams) => proposals.map(prop => ({
       accepted: prop.text === p2.text || t.minSupport <= 0.85,
       reason: "judged" as const,
-      scores: { supported: prop.text === p2.text ? 0.99 : 0.85, useful: 0.99, replacement: 1 },
+      scores: { supported: prop.text === p2.text ? 0.99 : 0.85, useful: 0.99 },
       thresholds: config(extraCfg).extraction,
     })),
   });

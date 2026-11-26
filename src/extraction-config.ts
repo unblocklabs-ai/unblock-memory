@@ -3,7 +3,9 @@ import type { ChatType, CorpusConfig } from "./config.js";
 
 export type ExtractionConfig = { enabled: boolean; publish: boolean; intervalMinutes: number;
   chatTypes: ChatType[]; historyMessages: number; maxBatches: number;
-  minSupport: number; minRetention: number; minReplacement: number };
+  minSupport: number; minRetention: number;
+  /** @deprecated Accepted for existing configs. Observations never replace prior facts. */
+  minReplacement: number };
 export function resolveExtraction(value: unknown, corpora: readonly CorpusConfig[]): ExtractionConfig {
   const defaults: ExtractionConfig = { enabled: false, publish: false, intervalMinutes: DEFAULTS.extraction.intervalMinutes,
     chatTypes: [], historyMessages: DEFAULTS.extraction.historyMessages, maxBatches: DEFAULTS.extraction.maxBatches,

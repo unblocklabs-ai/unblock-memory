@@ -13,7 +13,6 @@ import {
   ExtractionLeaseLostError,
   extractionPolicyFingerprint,
   ExtractionStore,
-  type ExtractedRecord,
   type ExtractionSession,
 } from "./extraction-store.js";
 import { readExtractionPage } from "./extraction-source.js";
@@ -25,7 +24,6 @@ type AcceptedCandidate = {
   proposal: MemoryProposal;
   observedAt: number;
   judgment: ValidationJudgment;
-  order: number;
 };
 type SessionOutcome = {
   processed: number;
@@ -47,40 +45,25 @@ function handleResetOrMissing(
   return true;
 }
 
-function scoreField(judgment: ValidationJudgment, key: "replacement" | "supported" | "useful"): number {
-  return "scores" in judgment && judgment.scores ? judgment.scores[key] : 0;
-}
-
-function isBetterReplacement(candidate: AcceptedCandidate, incumbent: AcceptedCandidate): boolean {
-  if (candidate.observedAt !== incumbent.observedAt) return candidate.observedAt > incumbent.observedAt;
-  for (const key of ["replacement", "supported", "useful"] as const) {
-    const diff = scoreField(candidate.judgment, key) - scoreField(incumbent.judgment, key);
-    if (diff !== 0) return diff > 0;
-  }
-  return candidate.order < incumbent.order;
-}
-
 async function validateProposals(params: {
   proposals: MemoryProposal[];
   messages: ExtractionMessage[];
   newIds: string[];
-  existing: ExtractedRecord[];
   apiKey: string;
   config: UnblockMemoryConfig;
   signal: AbortSignal;
   validate: typeof validateExtractedMemories;
 }) {
-  const { proposals, messages, newIds, existing, apiKey, config, signal, validate } = params;
+  const { proposals, messages, newIds, apiKey, config, signal, validate } = params;
   const messageById = new Map(messages.map(m => [m.id, m]));
-  const existingById = new Map(existing.map(m => [m.id, m]));
-  const standalone: AcceptedCandidate[] = [];
-  const winnerByPredecessor = new Map<string, AcceptedCandidate>();
+  const accepted: AcceptedCandidate[] = [];
   let rejected = 0;
 
   signal.throwIfAborted();
   const judgments = proposals.length ? await validate({
-    proposals, messages, newIds, existing: existing.map(({ id, text, observedAt }) => ({ id, text, observedAt })),
-    apiKey, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, signal, thresholds: config.extraction,
+    proposals, messages, newIds,
+    apiKey, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, signal,
+    thresholds: { minSupport: config.extraction.minSupport, minRetention: config.extraction.minRetention },
   }) : [];
   for (const [order, proposal] of proposals.entries()) {
     const judgment = judgments[order]!;
@@ -104,35 +87,8 @@ async function validateProposals(params: {
       rejected++;
       continue;
     }
-    const prior = proposal.replaces ? existingById.get(proposal.replaces) : undefined;
-    if (proposal.replaces && (!prior || prior.observedAt > observedAt)) {
-      rejected++;
-      continue;
-    }
-    const candidate: AcceptedCandidate = {
-      proposal: { ...proposal, evidence: mappedEvidence },
-      judgment,
-      observedAt,
-      order,
-    };
-    if (proposal.replaces) {
-      const incumbent = winnerByPredecessor.get(proposal.replaces);
-      if (!incumbent) {
-        winnerByPredecessor.set(proposal.replaces, candidate);
-      } else {
-        if (isBetterReplacement(candidate, incumbent)) {
-          winnerByPredecessor.set(proposal.replaces, candidate);
-        }
-        rejected++;
-      }
-    } else {
-      standalone.push(candidate);
-    }
+    accepted.push({ proposal: { ...proposal, evidence: mappedEvidence }, judgment, observedAt });
   }
-
-  const accepted = [...standalone, ...winnerByPredecessor.values()]
-    .sort((a, b) => a.order - b.order)
-    .map(({ proposal, observedAt, judgment }) => ({ proposal, observedAt, judgment }));
   return { accepted, rejected };
 }
 
@@ -168,18 +124,12 @@ async function processSession(params: {
 
   let stage = "read";
   try {
-    const existing = store.records(session.sessionId);
-    if (existing.length > DEFAULTS.extraction.maxExistingFacts || JSON.stringify(existing.map(m => ({ id: m.id, text: m.text }))).length > DEFAULTS.extraction.maxExistingChars) {
-      throw new Error("Existing memories exceed review budget");
-    }
-    const existingFacts = existing.map(m => ({ id: m.id, text: m.text, observedAt: m.observedAt }));
     const page = await readExtractionChunk({
       agentId,
       agentName,
       session,
       cursor: checkpoint.cursor,
-      context: extractionHistory(checkpoint.context, extractionConfig.historyMessages, existingFacts),
-      existing: existingFacts,
+      context: extractionHistory(checkpoint.context, extractionConfig.historyMessages),
       signal,
       readPage,
     });
@@ -206,15 +156,14 @@ async function processSession(params: {
     const messages = page.messages;
     const newIds = messages.filter(m => freshIds.has(m.id) && m.timestamp >= checkpoint.since).map(m => m.id);
     stage = "propose";
-    const proposals = newIds.length ? await extract({ messages, newIds, existing: existingFacts, apiKey, signal,
-      endpoint: config.decisionModel.endpoint, model: config.decisionModel.model, minReplacement: extractionConfig.minReplacement }) : [];
+    const proposals = newIds.length ? await extract({ messages, newIds, apiKey, signal,
+      endpoint: config.decisionModel.endpoint, model: config.decisionModel.model }) : [];
 
     stage = "validate";
     const { accepted, rejected } = await validateProposals({
       proposals,
       messages,
       newIds,
-      existing,
       apiKey,
       config,
       signal,
@@ -232,7 +181,7 @@ async function processSession(params: {
     }
     if (check.kind === "unavailable") throw new Error("Source changed during extraction");
 
-    const context = extractionHistory(messages, extractionConfig.historyMessages, existingFacts);
+    const context = extractionHistory(messages, extractionConfig.historyMessages);
     stage = "commit";
     const written = store.commit({
       session,
@@ -284,7 +233,6 @@ export async function runExtraction(params: { config: UnblockMemoryConfig; store
     historyMessages: config.historyMessages,
     minSupport: config.minSupport,
     minRetention: config.minRetention,
-    minReplacement: config.minReplacement,
     extractorModel: params.config.decisionModel.model,
     validatorModel: params.config.decisionModel.model,
   });

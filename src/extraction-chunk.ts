@@ -3,7 +3,7 @@ import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
 import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageBytes, extractionMessageTokens, extractionOverhead,
-  extractionValidationTranscriptBudget, type ExtractionMessage, type PriorMemory } from "./extraction-model.js";
+  extractionValidationTranscriptBudget, type ExtractionMessage } from "./extraction-model.js";
 import { readExtractionPage } from "./extraction-source.js";
 import type { ExtractionSession } from "./extraction-store.js";
 import { jsonHash } from "./json-hash.js";
@@ -34,12 +34,12 @@ function prefixThatFits(message: ExtractionMessage, offset: number, tokens: numb
   return end;
 }
 
-export function extractionHistory(messages: ExtractionMessage[], count: number, existing: PriorMemory[] = []): ExtractionMessage[] {
+export function extractionHistory(messages: ExtractionMessage[], count: number): ExtractionMessage[] {
   if (!count) return [];
   const kept: ExtractionMessage[] = [];
   let remaining = DEFAULTS.extraction.historyTokenBudget;
   // Give history the same share of the validation byte budget as of the input token budget.
-  let remainingBytes = Math.floor(extractionValidationTranscriptBudget(existing) * remaining / EXTRACTION_INPUT_LIMIT);
+  let remainingBytes = Math.floor(extractionValidationTranscriptBudget() * remaining / EXTRACTION_INPUT_LIMIT);
   for (const message of messages.slice(-count).reverse()) {
     const tokens = extractionMessageTokens(message);
     const bytes = extractionMessageBytes(message);
@@ -65,7 +65,7 @@ export function extractionHistory(messages: ExtractionMessage[], count: number, 
 
 /** SDK pages are transport only. A chunk always belongs to exactly one session. */
 export async function readExtractionChunk(params: { agentId: string; agentName: string; session: ExtractionSession;
-  cursor: string | null; context: ExtractionMessage[]; existing: PriorMemory[]; signal: AbortSignal;
+  cursor: string | null; context: ExtractionMessage[]; signal: AbortSignal;
   readPage?: typeof readExtractionPage }) {
   const read = params.readPage ?? readExtractionPage;
   const fetchPage = async (cursor: string | null) => {
@@ -92,9 +92,9 @@ export async function readExtractionChunk(params: { agentId: string; agentName: 
   const startingFence = resume?.fence;
   let cursor = resume ? resume.before : params.cursor;
   const messages = [...params.context];
-  let tokens = extractionOverhead(params.existing) + messages.reduce((n, m) => n + extractionMessageTokens(m), 0);
+  let tokens = extractionOverhead() + messages.reduce((n, m) => n + extractionMessageTokens(m), 0);
   let bytes = messages.reduce((n, m) => n + extractionMessageBytes(m), 0);
-  const byteLimit = extractionValidationTranscriptBudget(params.existing);
+  const byteLimit = extractionValidationTranscriptBudget();
   let entryCount = 0;
   const newIds: string[] = [];
   for (;;) {

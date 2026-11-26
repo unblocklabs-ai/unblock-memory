@@ -1,7 +1,7 @@
 # Session memory extraction
 
-Opt-in lasting-fact extraction: **d1.2 selects transcript spans → code maps them to exact quotes →
-d1.2 checks support, retention, and corrections → SQLite stores accepted facts → optional QMD search.**
+Opt-in observation extraction: **d1.2 selects transcript spans → code maps them to exact quotes →
+d1.2 checks support and retention → SQLite appends timestamped observations → optional QMD search.**
 It is independent of Inside Out: emotion scores do not select or strengthen memories.
 It never writes `MEMORY.md`, daily Markdown, or people dossiers.
 
@@ -25,8 +25,7 @@ and be a subset of the configured sessions corpus. This is channel agnostic.
     "historyMessages": 6,
     "maxBatches": 5,
     "minSupport": 0.90,
-    "minRetention": 0.90,
-    "minReplacement": 0.90
+    "minRetention": 0.90
   }
 }
 ```
@@ -72,13 +71,12 @@ question to make sense, the proposal can quote both turns. At least one quote mu
 come from a new message. List items below 0.50 confidence are skipped when the
 provider supplies per-item confidence.
 
-If prior facts exist, separate choice questions share a request and look for an
-explicit correction or update. Validation shares the dated transcript across up
-to four proposals per request, checking support, retention, and any proposed
-replacement against that proposal's own evidence. All applicable thresholds must
-pass, and support must select `supported`, even if its threshold is lowered.
+Validation shares the dated transcript across up to four proposals per request.
+Each proposal must pass support and retention using its own citations. Support must
+select `supported`, even if its threshold is lowered. Prior observations are not
+sent to the model. `minReplacement` is accepted for older configurations but has no effect.
 
-The three thresholds accept 0–1 and default to 0.90. Lowering retention changes
+The two thresholds accept 0–1 and default to 0.90. Lowering retention changes
 certainty about category membership, not the categories themselves. Agents can
 edit configuration when instructed, then reload/restart the Gateway; they must
 not silently lower thresholds. Decisions store their probabilities and thresholds
@@ -88,12 +86,18 @@ rejected proposals are not kept for automatic regrading.
 ## Storage, search, and limits
 
 Three tables in the existing agent `unblock-memory.sqlite` store worker state,
-session checkpoints, and versioned facts/evidence/judgments. Facts and checkpoints
-commit together. Deduplication/corrections are per session, not cross-session;
-older evidence cannot overwrite a newer observation. Source resets/deletions
-withdraw affected facts when the worker next checks them. Reports include accepted
-facts, judgments, checkpoints, and source/proposal/validation/commit failure stages
-without leaking provider errors or source text into error messages.
+session checkpoints, and observations. An observation and its checkpoint commit
+together. Its timestamp is the latest message it cites, not the time extraction ran.
+A later correction or restatement is a new active observation; it never overwrites
+the earlier one. For example, “I love Adidas” and a later “I only wear Yeezys”
+remain independently readable at their respective dates.
+
+Within a session, replaying the same normalized claim with the same message IDs and
+normalized quotes is a no-op, regardless of citation order. The same claim from a
+different message or a different quote is a new occurrence. Existing historical
+revisions are preserved. Source resets or deletions withdraw the session's active
+observations when the worker next checks them. Reports include active observations,
+judgments, checkpoints, and source/proposal/validation/commit failure stages without leaking provider errors or source text into error messages.
 
 `publish: false` stores accepted facts for evaluation only. `publish: true` indexes
 them in the existing QMD `index.sqlite`; `memory_search` includes them by default,
@@ -109,8 +113,8 @@ no approved chat types, hourly, six overlap messages, and five chunks per run.
 Chunks target 24k input tokens and cap at 28k using an `o200k_base` estimate.
 Quotes are limited to 512 characters, and overlap is capped at 8k tokens by default.
 Oversized messages split with resumable offsets and original message-ID citations.
-A session above 100 retained facts or 40k characters of prior facts pauses rather
-than silently dropping comparison context. Model errors leave the chunk uncommitted.
+The number of previously stored observations does not limit extraction. Model errors
+leave the chunk uncommitted.
 
 This is a conservative v1, not a calibrated guarantee of memory recall or truth.
 Start with a single-session shadow run and inspect the retained facts before publishing.

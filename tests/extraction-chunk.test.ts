@@ -15,7 +15,7 @@ import { DEFAULTS } from "../src/defaults.js";
 const session: ExtractionSession = { sessionId: "s1", sessionKey: "agent:main:slack:channel:test", chatType: "channel", startedAt: 1 };
 type ValidationParams = Parameters<typeof validateExtractedMemories>[0];
 const acceptAll = async ({ proposals, thresholds }: ValidationParams) => proposals.map(() => ({
-  accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1, replacement: 1 }, thresholds,
+  accepted: true, reason: "judged" as const, scores: { supported: 1, useful: 1 }, thresholds,
 }));
 const message = (id: string, text = id): ExtractionMessage => ({ id, text, speaker: "Bek", role: "user", timestamp: 1000 });
 function fixture(pages: ExtractionMessage[][], toolPages = new Set<number>()): typeof readExtractionPage {
@@ -26,7 +26,7 @@ function fixture(pages: ExtractionMessage[][], toolPages = new Set<number>()): t
   };
 }
 function params(readPage: typeof readExtractionPage, cursor: string | null = null, context: ExtractionMessage[] = []) {
-  return { agentId: "main", agentName: "Bill", session, cursor, context, existing: [], signal: AbortSignal.timeout(30_000), readPage };
+  return { agentId: "main", agentName: "Bill", session, cursor, context, signal: AbortSignal.timeout(30_000), readPage };
 }
 
 test("reader uses maxMessages and expands oversized SDK entries before filtering tools", async () => {
@@ -67,7 +67,7 @@ test("large conversations resume inside SDK pages, preserving all messages with 
   for (;;) {
     const result = await readExtractionChunk(params(readPage, cursor, context));
     assert.equal(result.kind, "page"); if (result.kind !== "page" || !result.newIds.length) break;
-    assert.ok(extractionOverhead([]) + result.messages.reduce((n,m) => n + extractionMessageTokens(m), 0) <= EXTRACTION_INPUT_LIMIT);
+    assert.ok(extractionOverhead() + result.messages.reduce((n,m) => n + extractionMessageTokens(m), 0) <= EXTRACTION_INPUT_LIMIT);
     if (chunks) { assert.ok(result.messages[0]!.sourceMessageId); assert.ok(!result.newIds.includes(result.messages[0]!.id)); }
     seen.push(...result.newIds); cursor = result.cursor; context = extractionHistory(result.messages, 6); chunks++;
   }
@@ -83,7 +83,7 @@ test("single oversized Unicode message splits losslessly and resumes through ser
     const result = await readExtractionChunk(params(readPage, cursor, context));
     assert.equal(result.kind, "page"); if (result.kind !== "page" || !result.newIds.length) break;
     pieces.push(...result.messages.filter(m => result.newIds.includes(m.id)));
-    assert.ok(extractionOverhead([]) + result.messages.reduce((n,m) => n + extractionMessageTokens(m), 0) <= EXTRACTION_INPUT_LIMIT);
+    assert.ok(extractionOverhead() + result.messages.reduce((n,m) => n + extractionMessageTokens(m), 0) <= EXTRACTION_INPUT_LIMIT);
     cursor = JSON.parse(JSON.stringify(result.cursor)); context = extractionHistory(result.messages, 6);
   }
   assert.ok(pieces.length > 1); assert.equal(pieces.map(m => m.text).join(""), original.text);
@@ -252,7 +252,10 @@ test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on re
     store.checkpoint(session, owner, 0, currentPolicy);
     store.commit({
       session, expected: null, cursor: "unblock-extraction:v1:{poisoned", context: [],
-      accepted: [{ proposal: { text: "Stale fact.", replaces: null, evidence: [{ messageId: "one", quote: "project" }] }, observedAt: 1000, judgment: {} }],
+      // Even a session above the old prior-fact cap must reach the source reset.
+      accepted: Array.from({ length: DEFAULTS.extraction.maxExistingFacts + 1 }, (_, i) => ({
+        proposal: { text: "Stale fact.", replaces: null, evidence: [{ messageId: String(i), quote: "project" }] }, observedAt: 1000, judgment: {},
+      })),
       owner, version: EXTRACTION_VERSION, policyFingerprint: currentPolicy,
     });
     store.release(owner);
@@ -275,6 +278,8 @@ test("poisoned or mismatched fragment bookmarks rewind cleanly and recover on re
   try {
     assert.equal(verify.readCheckpoint(session.sessionId)?.cursor, null);
     assert.deepEqual(verify.records(session.sessionId), []);
+    assert.equal(verify.db.prepare("SELECT count(*) AS n FROM extracted_memories WHERE status='withdrawn'").get()!.n,
+      DEFAULTS.extraction.maxExistingFacts + 1);
   } finally { verify.close(); }
 
   // Run 2: cleanly extracts from cursor=null instead of looping on the poisoned bookmark.
