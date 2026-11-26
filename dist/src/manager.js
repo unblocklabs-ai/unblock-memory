@@ -1,4 +1,5 @@
 import { DEFAULTS } from "./defaults.js";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
@@ -20,7 +21,7 @@ import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 import { trainingCandidates } from "./training-candidates.js";
 import { expandSessionSearchHit, renderMemoryPassage } from "./memory-passage.js";
 import { startTiming, timeStage, vectorTrace, vectorParts, unaccounted } from "./retrieval-timing.js";
-import { attachHitLocator, parseDailyFilenameDateMs, sha256Text } from "./recall-ledger.js";
+import { parseDailyFilenameDateMs } from "./recall-ledger.js";
 import { memoryPassageId } from "./memory-search.js";
 export { expandSessionSearchHit } from "./memory-passage.js";
 const WATCH_DEBOUNCE_MS = DEFAULTS.sqlite.watchDebounceMs;
@@ -174,6 +175,7 @@ export function buildReadResult({ content, path, from: start, lines, cursor }) {
     if (fileLines.at(-1) === "")
         fileLines.pop();
     const from = cursor?.line ?? Math.max(1, Math.floor(start ?? 1));
+    const sha256Text = (text) => createHash("sha256").update(text).digest("hex");
     const offset = cursor?.offset ?? 0;
     const revision = () => sha256Text(JSON.stringify([path, sha256Text(content)]));
     if (cursor) {
@@ -1002,16 +1004,21 @@ export class QmdMemoryManager {
                     for (const [index, hit] of candidates.entries()) {
                         const rank = hit.bm25?.rank ?? hit.vector?.rank ?? index + 1;
                         const contribution = 1 / (RRF_K + rank);
-                        const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk.trim()]);
+                        const { ref } = hit;
+                        const key = JSON.stringify(ref
+                            ? [hit.file, ref.docHash, ref.chunkPos, ref.chunkLen]
+                            : [hit.file, hit.bestChunkPos, hit.bestChunk.trim()]);
                         const existing = hits.get(key);
                         if (existing) {
                             existing.rrfScore += contribution;
                             existing.topRank = Math.min(existing.topRank, rank);
+                            if (ref && ref.seq !== null && existing.hit.ref?.seq === null)
+                                existing.hit.ref = ref;
                         }
                         else {
                             hits.set(key, {
                                 hit: { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
-                                    chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: 0 },
+                                    chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: 0, ref },
                                 rrfScore: contribution,
                                 topRank: rank,
                             });
@@ -1034,27 +1041,6 @@ export class QmdMemoryManager {
     }
     async #renderSearchHits(hits, store, opts, whisperer = false) {
         const tokenizer = store.internal?.llm;
-        const vectorDb = this.#trackRecallLocators ? store.internal?.db : undefined;
-        let seqStmt;
-        if (vectorDb) {
-            try {
-                seqStmt = vectorDb.prepare("SELECT seq FROM content_vectors WHERE hash = ? AND pos = ? AND chunk_len = ? LIMIT 1");
-            }
-            catch {
-                seqStmt = undefined;
-            }
-        }
-        const lookupQmdSeq = (docHash, pos, len) => {
-            if (!seqStmt)
-                return undefined;
-            try {
-                const row = seqStmt.get(docHash, pos, len);
-                return typeof row?.seq === "number" && Number.isInteger(row.seq) ? row.seq : undefined;
-            }
-            catch {
-                return undefined;
-            }
-        };
         const results = [];
         const current = new Map(this.#currentExtracted(hits.map(hit => hit.file), opts?.sessionFilter).map(r => [extractedUri(r), r]));
         for (const hit of hits) {
@@ -1063,22 +1049,25 @@ export class QmdMemoryManager {
             // turn/message context exceeds their budget. Ordinary search is unchanged.
             if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity))
                 continue;
+            const { ref } = hit;
+            const locator = this.#trackRecallLocators ? {
+                docHash: ref?.docHash,
+                qmdSeq: ref?.seq ?? undefined,
+                chunkPos: ref?.chunkPos ?? hit.chunkPos,
+                chunkLen: ref?.chunkLen ?? hit.chunkLen,
+            } : undefined;
             const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
             if (collection === EXTRACTED_COLLECTION) {
                 const record = current.get(hit.file);
                 if (record && record.text.length <= (opts?.maxSnippetChars ?? Infinity)) {
                     const item = extractedHit(record, hit.score);
-                    if (this.#trackRecallLocators) {
-                        const docHash = sha256Text(record.text);
-                        attachHitLocator(item, {
+                    if (locator) {
+                        item.locator = {
+                            ...locator,
                             rawLeafId: memoryPassageId(hit.bestChunk || record.text),
-                            docHash,
-                            qmdSeq: lookupQmdSeq(docHash, hit.chunkPos, hit.chunkLen),
-                            chunkPos: hit.chunkPos,
-                            chunkLen: hit.chunkLen,
                             observedAtMs: Number.isFinite(record.observedAt) ? record.observedAt : undefined,
                             observedAtBasis: Number.isFinite(record.observedAt) ? "extracted" : "unknown",
-                        });
+                        };
                     }
                     results.push(item);
                 }
@@ -1098,7 +1087,7 @@ export class QmdMemoryManager {
             // Never apply offsets from a newer projection to an older indexed snapshot.
             const messages = corpus === "sessions"
                 ? projection?.messages && projection.documentPath === relativePath &&
-                    projection.projectionHash === projectionHash(hit.body)
+                    projection.projectionHash === (ref?.docHash ?? projectionHash(hit.body))
                     ? projection.messages : parseSessionMessageSpans(hit.body)
                 : undefined;
             const contextSpan = messages ? sessionContextSpans(hit.body, hit.chunkPos, messages) : undefined;
@@ -1124,23 +1113,19 @@ export class QmdMemoryManager {
                 ...(messageTimestamp ? { messageTimestamp } : {}),
                 citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
             };
-            if (this.#trackRecallLocators) {
-                const docHash = sha256Text(hit.body);
+            if (locator) {
                 const isMemoryDateSource = corpus !== "sessions" && relativePath !== undefined && (corpus === "memory" || basename(source.root) === "memory" || /(?:^|\/)memory\//u.test(relativePath));
                 const fileDateMs = isMemoryDateSource && relativePath ? parseDailyFilenameDateMs(relativePath) : undefined;
-                attachHitLocator(item, {
+                item.locator = {
+                    ...locator,
                     rawLeafId: memoryPassageId(hit.bestChunk),
-                    docHash,
-                    qmdSeq: lookupQmdSeq(docHash, hit.chunkPos, hit.chunkLen),
-                    chunkPos: hit.chunkPos,
-                    chunkLen: hit.chunkLen,
                     observedAtMs: messageTimestampMs ?? fileDateMs,
                     observedAtBasis: messageTimestampMs !== undefined
                         ? "session_message"
                         : fileDateMs !== undefined
                             ? "filename_date"
                             : "unknown",
-                });
+                };
             }
             results.push(item);
         }

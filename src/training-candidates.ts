@@ -6,11 +6,11 @@ export async function trainingCandidates(qmd: QMDStore, query: string, collectio
   const hits = await qmd.discoverCandidates({ query, lane, collection, limit: 10, signal,
     // Preserve keyword chunk tie-breaking against this lane's own query.
     intent: query, allowedPaths, trace });
-  return hits.map(({ method, rank, score, file, body, bestChunk, bestChunkPos }) => {
+  return hits.map(({ method, rank, score, file, body, bestChunk, bestChunkPos, ref }) => {
     const retrieval: Partial<Record<typeof method, { score: number; rank: number }>> = {
       [method]: { score, rank: rank + 1 },
     };
-    return { file, body, bestChunk, bestChunkPos, score: 1 / (rank + 1),
+    return { file, body, bestChunk, bestChunkPos, ...(ref ? { ref } : {}), score: 1 / (rank + 1),
       explain: { methods: [method] }, ...retrieval };
   });
 }

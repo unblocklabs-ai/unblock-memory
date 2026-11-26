@@ -625,7 +625,8 @@ test("scopes vector search to named corpora and labels results", async () => {
 });
 
 test("v2 Whisperer routes each query only to its lane across the approved corpus scope", async t => {
-  const workspace = await mkdtemp(join(tmpdir(), "unblock-memory-whisperer-lanes-"));
+  await using directory = await mkdtempDisposable(join(tmpdir(), "unblock-memory-whisperer-lanes-"));
+  const workspace = directory.path;
   const memory = resolveSource(workspace, "MEMORY.md", "memory");
   const projects = resolveSource(workspace, "projects/**/*.md", "projects");
   const store = await createStore({ dbPath: ":memory:", config: { collections: Object.fromEntries(
@@ -635,21 +636,35 @@ test("v2 Whisperer routes each query only to its lane across the approved corpus
     store.internal.insertContent(`lex${index}`, `Exactneedle lexical evidence ${index}`, "2026-01-01");
     store.internal.insertDocument(source.collection, "lex.md", "Evidence", `lex${index}`, "2026-01-01", "2026-01-01");
   }
+  const sharedBody = "Exactneedle lexical evidence 0";
+  const sharedPath = `qmd://${memory.collection}/lex.md`;
+  store.internal.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, chunk_len, model, embedded_at)
+    VALUES ('lex0', 7, 0, ?, 'test', '2026-01-01')`).run(sharedBody.length);
   store.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
   const vector = t.mock.method(store.internal, "searchVec", async (query: string, _model: string, limit: number, collection: string[]) => {
     assert.equal(query, "semantic intent only");
     assert.equal(limit, 10);
     assert.deepEqual(collection, [memory.collection, projects.collection]);
-    return [{ filepath: `qmd://${memory.collection}/vec.md`, body: "semantic evidence", chunkPos: 0, chunkLen: 17, score: 0.9 }];
+    return [
+      { filepath: sharedPath, body: sharedBody, chunkPos: 0, chunkLen: sharedBody.length, score: 0.9,
+        ref: { collection: memory.collection, path: "lex.md", docHash: "lex0", chunkPos: 0, chunkLen: sharedBody.length,
+          seq: 0, embedFingerprint: "vector-fingerprint" } },
+      { filepath: `qmd://${memory.collection}/vec.md`, body: "semantic evidence", chunkPos: 0, chunkLen: 17, score: 0.8 },
+    ];
   });
   const manager = new QmdMemoryManager({ dbPath: join(workspace, "unused.sqlite"), workspaceDir: workspace,
-    sources: [memory, projects], storeFactory: async () => store });
+    sources: [memory, projects], storeFactory: async () => store, trackRecallLocators: true });
   try {
     const results = await manager.searchCandidates({ lex: "Exactneedle", vec: "semantic intent only" },
       { corpora: ["memory", "projects"], maxSnippetChars: 1200 });
     assert.equal(vector.mock.callCount(), 1);
     assert.deepEqual(new Set(results.map(result => result.snippet)),
       new Set(["Exactneedle lexical evidence 0", "Exactneedle lexical evidence 1", "semantic evidence"]));
+    const shared = results.filter(result => result.path === sharedPath);
+    assert.equal(shared.length, 1, "matching occurrences fuse into a single hit");
+    assert.equal(shared[0]?.locator?.docHash, "lex0");
+    assert.equal(shared[0]?.locator?.qmdSeq, 0, "preserve the vector ref, including sequence zero");
+    assert.equal(results.find(result => result.corpus === "projects")?.locator?.qmdSeq, undefined);
   } finally { await manager.close(); }
 });
 

@@ -5,7 +5,7 @@ import { selectJudgeConversation } from "./judge-context.js";
 import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "./decision-ranking.js";
 import { startTiming, retrievalParts, unaccounted, type RetrievalTimings } from "./retrieval-timing.js";
-import { copyHitLocator, getHitLocator, parseDailyFilenameDateMs, type RecallHitDisposition, type RecallHitLocator } from "./recall-ledger.js";
+import { parseDailyFilenameDateMs, type RecallHitDisposition, type RecallHitLocator } from "./recall-ledger.js";
 
 export type MemoryCandidateManager = {
   searchCandidates(queries: QueryPair, options: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
@@ -37,8 +37,7 @@ export type RecallCandidateTrace = {
 };
 
 function resolveLocator(hit: CorpusMemorySearchResult, passageId: string): RecallHitLocator {
-  const existing = getHitLocator(hit);
-  if (existing) return existing;
+  if (hit.locator) return hit.locator;
   const extractedMs = hit.extracted?.observedAt ? Date.parse(hit.extracted.observedAt) : Number.NaN;
   if (Number.isFinite(extractedMs)) {
     return { rawLeafId: passageId, observedAtMs: extractedMs, observedAtBasis: "extracted" };
@@ -110,7 +109,6 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
       }
       if (duplicateMemoryPassage({ ...hit, text: excerpt }, candidates.map(candidate => ({ ...candidate, text: candidate.snippet })))) continue;
       const candidate: CorpusMemorySearchResult = { ...hit, snippet: excerpt };
-      if (trackTrace) copyHitLocator(hit, candidate);
       candidates.push(candidate);
       if (trackTrace) {
         retrievalRank++;
@@ -188,7 +186,6 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
         // Discovery reciprocal ranks are not vector similarity or usefulness.
         const { vectorScore: _vectorScore, textScore: _textScore, ...result } = hit;
         const scored: CorpusMemorySearchResult = { ...result, score: probability };
-        if (trackTrace) copyHitLocator(hit, scored);
         return [{ result: scored, trace }];
       } catch (error) {
         if (signal?.aborted) return [];

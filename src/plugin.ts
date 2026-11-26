@@ -294,7 +294,7 @@ function createSearchTool(
             warning: "decision model usefulness ranking unavailable; returning unjudged retrieval-ranked leads. Scores are retrieval ranks, not usefulness probabilities; minUsefulness was not applied. Verify evidence with memory_get." }
             : search.requestsFailed ? { warning: `${search.requestsFailed} candidate usefulness judgments failed; results are partial` } : {}),
           results: search.results.map(({ source: _source, citation: _citation, vectorScore: _vectorScore,
-            textScore: _textScore, session, sessionMessages, ...result }) => ({
+            textScore: _textScore, locator: _locator, session, sessionMessages, ...result }) => ({
             ...result,
             snippet: result.corpus === "sessions" ? sessionMessages ?? [{ body: result.snippet, partial: true }] : result.snippet,
             score: search.rankingMode === "retrieval" ? result.score : Number(result.score.toFixed(2)),

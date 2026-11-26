@@ -3,6 +3,7 @@ import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry
 import type { SessionMetadata, SessionSnippetMessage } from "./session-projector.js";
 import type { ChatType } from "./config.js";
 import type { RetrievalTimings } from "./retrieval-timing.js";
+import type { RecallHitLocator } from "./recall-ledger.js";
 
 export type MemoryPluginRuntimeContract = NonNullable<MemoryPluginCapability["runtime"]>;
 
@@ -23,6 +24,8 @@ export type CorpusMemorySearchResult = MemorySearchResult & {
   /** Structured tool output; snippet stays a string for the host and internal consumers. */
   sessionMessages?: SessionSnippetMessage[];
   extracted?: { id: string; revision: number; observedAt: string };
+  /** Internal recall-ledger metadata; omitted from memory_search output. */
+  locator?: RecallHitLocator;
 };
 export type SessionSearchFilter = {
   startedFrom?: string;

@@ -3,6 +3,7 @@ import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry
 import type { SessionMetadata, SessionSnippetMessage } from "./session-projector.js";
 import type { ChatType } from "./config.js";
 import type { RetrievalTimings } from "./retrieval-timing.js";
+import type { RecallHitLocator } from "./recall-ledger.js";
 export type MemoryPluginRuntimeContract = NonNullable<MemoryPluginCapability["runtime"]>;
 type ManagerLookup = Awaited<ReturnType<MemoryPluginRuntimeContract["getMemorySearchManager"]>>;
 export type MemorySearchManagerContract = NonNullable<ManagerLookup["manager"]>;
@@ -20,6 +21,8 @@ export type CorpusMemorySearchResult = MemorySearchResult & {
         revision: number;
         observedAt: string;
     };
+    /** Internal recall-ledger metadata; omitted from memory_search output. */
+    locator?: RecallHitLocator;
 };
 export type SessionSearchFilter = {
     startedFrom?: string;

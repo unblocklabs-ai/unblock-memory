@@ -1,30 +1,32 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, mkdtempDisposable, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import type { DiscoveryCandidate, QMDStore } from "@unblocklabs/qmd";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "../src/config.js";
 import { DEFAULTS } from "../src/defaults.js";
 import { MEMORY_DATABASE, openMemoryDatabase } from "../src/memory-database.js";
 import { QmdMemoryManager } from "../src/manager.js";
 import { memoryPassageId, searchMemory, type RecallCandidateTrace } from "../src/memory-search.js";
 import { registerMemoryWhisperer } from "../src/memory-whisperer.js";
+import { registerUnblockMemory } from "../src/plugin.js";
 import {
-  attachHitLocator,
-  getHitLocator,
   openRecallLedger,
   parseDailyFilenameDateMs,
   purgeRecallPerson,
   RECALL_LEDGER_SCHEMA_VERSION,
   RecallLedgerWriter,
-  sha256Text,
   writeRecallBatch,
   type RecallQueryRecord,
 } from "../src/recall-ledger.js";
 import { projectSessionDocument, sessionContextSpans } from "../src/session-projector.js";
+import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { resolveSources } from "../src/sources.js";
 import type { CorpusMemorySearchResult } from "../src/contracts.js";
 
@@ -59,7 +61,7 @@ function sampleQuery(overrides: Partial<RecallQueryRecord> = {}): RecallQueryRec
       {
         rawLeafId: memoryPassageId(leaf),
         passageId: memoryPassageId(leaf),
-        docHash: sha256Text(`# Daily\n${leaf}`),
+        docHash: createHash("sha256").update(`# Daily\n${leaf}`).digest("hex"),
         qmdSeq: 2,
         chunkPos: 8,
         chunkLen: leaf.length,
@@ -275,17 +277,14 @@ test("purgeRecallPerson never creates tables in an uninitialized DB", async () =
 
 test("searchMemory onTrace distinguishes rank_limit, below_threshold, judge_failed, and cooldown", async () => {
   const hits: CorpusMemorySearchResult[] = [
-    { path: "qmd://s/2026-11-20.md", startLine: 1, endLine: 2, score: 0.09, snippet: "Hit A high score", corpus: "memory", source: "memory" },
+    { path: "qmd://s/2026-11-20.md", startLine: 1, endLine: 2, score: 0.09, snippet: "Hit A high score", corpus: "memory", source: "memory",
+      locator: { rawLeafId: "leaf-a", docHash: "hash-a", qmdSeq: 4, chunkPos: 0, chunkLen: 16,
+        observedAtMs: Date.UTC(2026, 10, 20), observedAtBasis: "filename_date" } },
     { path: "qmd://s/2026-11-19.md", startLine: 1, endLine: 2, score: 0.08, snippet: "Hit B also high score", corpus: "memory", source: "memory" },
     { path: "qmd://s/2026-11-18.md", startLine: 1, endLine: 2, score: 0.07, snippet: "Hit C low score", corpus: "memory", source: "memory" },
     { path: "qmd://s/2026-11-17.md", startLine: 1, endLine: 2, score: 0.065, snippet: "Hit E fails judge", corpus: "memory", source: "memory" },
     { path: "qmd://s/2026-11-16.md", startLine: 1, endLine: 2, score: 0.06, snippet: "Hit D cooled down", corpus: "memory", source: "memory" },
   ];
-  attachHitLocator(hits[0]!, {
-    rawLeafId: "leaf-a", docHash: "hash-a", qmdSeq: 4, chunkPos: 0, chunkLen: 16,
-    observedAtMs: Date.UTC(2026, 10, 20), observedAtBasis: "filename_date",
-  });
-
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => { body += String(chunk); });
@@ -326,7 +325,6 @@ test("searchMemory onTrace distinguishes rank_limit, below_threshold, judge_fail
     );
     assert.equal(res.rankingMode, "decision");
     assert.equal(res.results.length, 1);
-    assert.equal("rawLeafId" in res.results[0]!, false);
 
     assert.equal(traced.length, 5);
     assert.equal(traced[0]?.disposition, "passed");
@@ -343,57 +341,80 @@ test("searchMemory onTrace distinguishes rank_limit, below_threshold, judge_fail
   }
 });
 
-test("QmdMemoryManager resolves content_vectors (docHash, qmdSeq) and rooted memory/**/*.md daily dates when trackRecallLocators is enabled", async () => {
-  const root = await tempDir();
-  try {
-    const workspace = join(root, "ws");
-    const memDir = join(workspace, "memory");
-    await mkdir(memDir, { recursive: true });
-    const body = "# Daily\n\nBek only wears Yeezys now.\n";
-    const chunk = "Bek only wears Yeezys now.";
-    const chunkPos = body.indexOf(chunk);
-    await writeFile(join(memDir, "2026-11-20.md"), body, "utf8");
-
-    const sources = resolveSources(workspace, [{ name: "memory", kind: "files", paths: ["memory/**/*.md"] }]);
-    const dailySource = sources[0]!;
-    const fileUri = `qmd://${dailySource.collection}/2026-11-20.md`;
-    const docHash = sha256Text(body);
-
-    const vecDb = new DatabaseSync(":memory:");
-    vecDb.exec("CREATE TABLE content_vectors (hash TEXT NOT NULL, seq INTEGER NOT NULL, pos INTEGER NOT NULL, chunk_len INTEGER NOT NULL)");
-    vecDb.prepare("INSERT INTO content_vectors VALUES (?, ?, ?, ?)").run(docHash, 7, chunkPos, chunk.length);
-
-    const mockStore = {
-      dbPath: join(root, "index.sqlite"),
-      internal: { db: vecDb },
-      async discoverCandidates({ lane }: { lane: string }) {
-        return lane === "vec"
-          ? [{ method: "vector", rank: 0, score: 0.91, file: fileUri, body, bestChunk: chunk, bestChunkPos: chunkPos }]
-          : [];
-      },
-      async close() { vecDb.close(); },
+test("memory_search records canonical vector and lexical locators without exposing them or querying QMD's database", async t => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "recall-ledger-tool-"));
+  const workspace = directory.path;
+  await mkdir(join(workspace, "memory"));
+  const sources = resolveSources(workspace, [{ name: "memory", kind: "files", paths: ["memory/**/*.md"] }]);
+  const { collection } = sources[0]!;
+  const dbPath = join(workspace, MEMORY_DATABASE);
+  const candidate = (path: string, bestChunk: string, docHash: string, seq: number | null): DiscoveryCandidate => {
+    const heading = "# Daily\n\n";
+    return {
+      file: `qmd://${collection}/${path}`, displayPath: `${collection}/${path}`, title: "Daily", context: null,
+      docid: docHash.slice(0, 6), body: `${heading}${bestChunk}\n`, bestChunk, bestChunkPos: heading.length,
+      method: seq === null ? "bm25" : "vector", rank: 0, score: 0.91,
+      ref: { collection, path, docHash, chunkPos: heading.length, chunkLen: bestChunk.length,
+        seq, embedFingerprint: seq === null ? null : "test-fingerprint" },
     };
-
-    const manager = new QmdMemoryManager({
-      dbPath: join(root, "index.sqlite"),
-      workspaceDir: workspace,
-      sources,
-      storeFactory: async () => mockStore as never,
-      trackRecallLocators: true,
-    });
-    const hits = await manager.searchCandidates({ lex: "Yeezys", vec: "What shoes?" }, { corpora: ["memory"] });
-    assert.equal(hits.length, 1);
-    const locator = getHitLocator(hits[0]!);
-    assert.ok(locator);
-    assert.equal(locator.docHash, docHash);
-    assert.equal(locator.qmdSeq, 7);
-    assert.equal(locator.rawLeafId, memoryPassageId(chunk));
-    assert.equal(locator.observedAtBasis, "filename_date");
-    assert.equal(locator.observedAtMs, Date.UTC(2026, 10, 20));
-    await manager.close();
+  };
+  const lexical = candidate("2026-11-19.md", "Shoes are stored by the door.", "canonical-lexical-hash", null);
+  const vector = candidate("2026-11-20.md", "Bek only wears Yeezys now.", "canonical-vector-hash", 7);
+  const qmdDb = new DatabaseSync(":memory:");
+  const prepare = t.mock.method(qmdDb, "prepare");
+  const mockStore = {
+    dbPath: join(workspace, "index.sqlite"),
+    internal: { db: qmdDb },
+    async discoverCandidates({ lane }) { return [lane === "lex" ? lexical : vector]; },
+    async close() { qmdDb.close(); },
+  } satisfies Pick<QMDStore, "dbPath" | "discoverCandidates" | "close"> & { internal: object };
+  const manager = new QmdMemoryManager({
+    dbPath: mockStore.dbPath, workspaceDir: workspace, sources,
+    storeFactory: async () => mockStore as unknown as QMDStore, trackRecallLocators: true,
+  });
+  type Payload = { details: { results: unknown[] }; content: { text: string }[] };
+  type ToolFactory = (ctx: OpenClawPluginToolContext) => { execute(id: string, params: unknown): Promise<Payload> };
+  let createSearch: ToolFactory | undefined;
+  const stop: (() => unknown)[] = [];
+  const warnings: string[] = [];
+  registerUnblockMemory({
+    pluginConfig: { recallLedger: { enabled: true }, decisionModel: { enabled: false } },
+    logger: { warn(message: string) { warnings.push(message); } },
+    registerCli() {}, registerService() {}, registerGatewayMethod() {},
+    on(event: string, handler: () => unknown) { if (event === "gateway_stop") stop.push(handler); },
+    registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
+      t.mock.method(runtime, "getMemorySearchManager", async () => ({ manager }));
+      t.mock.method(runtime, "memoryDatabasePath", () => dbPath);
+    },
+    registerTool(factory: ToolFactory, { names }: { names: string[] }) {
+      if (names.includes("memory_search")) createSearch = factory;
+    },
+  } as unknown as OpenClawPluginApi);
+  let response: Payload;
+  try {
+    assert.ok(createSearch);
+    response = await createSearch({ agentId: "bill", config: {} })
+      .execute("search", { bm25Query: "Shoes", vectorQuery: "What shoes?" });
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await Promise.all([...stop.map(handler => handler()), manager.close()]);
   }
+  assert.deepEqual(prepare.mock.calls.filter(({ arguments: [sql] }) => /\bcontent_vectors\b/i.test(sql)), []);
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(JSON.parse(response.content[0]!.text), response.details);
+  assert.deepEqual(response.details.results, [lexical, vector].map(hit => ({
+    path: hit.file, startLine: 3, endLine: 3, score: 1 / 61 + 0.05, snippet: hit.bestChunk, corpus: "memory",
+  })));
+
+  const db = openRecallLedger(dbPath);
+  try {
+    const rows = db.prepare(`SELECT doc_hash, qmd_seq, chunk_pos, chunk_len, raw_leaf_id, observed_at_ms, observed_at_basis
+      FROM recall_hits ORDER BY retrieval_rank`).all();
+    assert.deepEqual(rows.map(row => ({ ...row })), [lexical, vector].map(hit => ({
+      doc_hash: hit.ref!.docHash, qmd_seq: hit.ref!.seq, chunk_pos: hit.bestChunkPos, chunk_len: hit.bestChunk.length,
+      raw_leaf_id: memoryPassageId(hit.bestChunk), observed_at_ms: Date.parse(hit.ref!.path.replace(".md", "")),
+      observed_at_basis: "filename_date",
+    })));
+  } finally { db.close(); }
 });
 
 test("registerMemoryWhisperer writes emitted, rank_limit (when complementaryHints=false), and thread origin to RecallLedgerWriter", async () => {

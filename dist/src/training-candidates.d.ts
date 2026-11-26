@@ -10,12 +10,13 @@ export declare function trainingCandidates(qmd: QMDStore, query: string, collect
         score: number;
         rank: number;
     } | undefined;
-    file: string;
-    body: string;
-    bestChunk: string;
-    bestChunkPos: number;
     score: number;
     explain: {
         methods: ("vector" | "bm25")[];
     };
+    ref?: import("@unblocklabs/qmd").PassageRef | undefined;
+    file: string;
+    body: string;
+    bestChunk: string;
+    bestChunkPos: number;
 }[]>;

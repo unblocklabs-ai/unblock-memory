@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { DEFAULTS } from "./defaults.js";
@@ -7,21 +6,6 @@ import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-
 // this module and its imports must stay free of `openclaw`.
 export const RECALL_LEDGER_SCHEMA_VERSION = 1;
 const MAX_RETENTION_DAYS = 3650;
-const hitLocators = new WeakMap();
-export function attachHitLocator(hit, locator) {
-    hitLocators.set(hit, locator);
-}
-export function getHitLocator(hit) {
-    return hitLocators.get(hit);
-}
-export function copyHitLocator(from, to) {
-    const locator = hitLocators.get(from);
-    if (locator)
-        hitLocators.set(to, locator);
-}
-export function sha256Text(text) {
-    return createHash("sha256").update(text).digest("hex");
-}
 /** Parses YYYY-MM-DD.md filenames (both `2026-11-20.md` under a rooted `memory/` source and `memory/2026-11-20.md`). */
 export function parseDailyFilenameDateMs(path) {
     const match = /(?:^|\/)(\d{4})-(\d{2})-(\d{2})\.md$/u.exec(path);

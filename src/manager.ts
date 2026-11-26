@@ -1,4 +1,5 @@
 import { DEFAULTS } from "./defaults.js";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
@@ -67,7 +68,7 @@ import { trainingCandidates } from "./training-candidates.js";
 import { expandSessionSearchHit, renderMemoryPassage } from "./memory-passage.js";
 import type { QueryPair } from "./query-contract.js";
 import { startTiming, timeStage, vectorTrace, vectorParts, unaccounted } from "./retrieval-timing.js";
-import { attachHitLocator, parseDailyFilenameDateMs, sha256Text } from "./recall-ledger.js";
+import { parseDailyFilenameDateMs } from "./recall-ledger.js";
 import { memoryPassageId } from "./memory-search.js";
 export { expandSessionSearchHit } from "./memory-passage.js";
 
@@ -115,6 +116,7 @@ export type SkillCatalogEntry = {
 export type SkillSearchCandidate = SkillCatalogEntry & { score: number };
 
 type AnalysisStore = ManagerStore & Pick<QMDStore, "internal">;
+type PassageHit = Pick<VectorSearchResult, "file" | "body" | "bestChunk" | "chunkPos" | "chunkLen" | "displayPath" | "score" | "ref">;
 
 type SkillIndexEntry = SkillSearchCandidate & {
   embedding: number[];
@@ -292,6 +294,7 @@ export function buildReadResult({ content, path, from: start, lines, cursor }: {
   const fileLines = content.split("\n");
   if (fileLines.at(-1) === "") fileLines.pop();
   const from = cursor?.line ?? Math.max(1, Math.floor(start ?? 1));
+  const sha256Text = (text: string) => createHash("sha256").update(text).digest("hex");
   const offset = cursor?.offset ?? 0;
   const revision = () => sha256Text(JSON.stringify([path, sha256Text(content)]));
   if (cursor) {
@@ -1179,8 +1182,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
         });
         const store = await timeStage("storeSetupMs", timings, signal, () => this.#getAnalysisStore()) as QMDStore;
         const RRF_K = 60;
-        type CandidateHit = Pick<VectorSearchResult, "file" | "body" | "bestChunk" | "chunkPos" | "chunkLen" | "displayPath" | "score">;
-        const hits = new Map<string, { hit: CandidateHit; rrfScore: number; topRank: number }>();
+        const hits = new Map<string, { hit: PassageHit; rrfScore: number; topRank: number }>();
         // Serialize native QMD work. Cancellation prevents further queries/collections.
         for (const lane of ["lex", "vec"] as const) {
           opts.signal?.throwIfAborted();
@@ -1197,15 +1199,19 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
           for (const [index, hit] of candidates.entries()) {
             const rank = hit.bm25?.rank ?? hit.vector?.rank ?? index + 1;
             const contribution = 1 / (RRF_K + rank);
-            const key = JSON.stringify([hit.file, hit.bestChunkPos, hit.bestChunk.trim()]);
+            const { ref } = hit;
+            const key = JSON.stringify(ref
+              ? [hit.file, ref.docHash, ref.chunkPos, ref.chunkLen]
+              : [hit.file, hit.bestChunkPos, hit.bestChunk.trim()]);
             const existing = hits.get(key);
             if (existing) {
               existing.rrfScore += contribution;
               existing.topRank = Math.min(existing.topRank, rank);
+              if (ref && ref.seq !== null && existing.hit.ref?.seq === null) existing.hit.ref = ref;
             } else {
               hits.set(key, {
                 hit: { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
-                  chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: 0 },
+                  chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: 0, ref },
                 rrfScore: contribution,
                 topRank: rank,
               });
@@ -1225,28 +1231,10 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   }
 
   async #renderSearchHits(
-    hits: readonly Pick<VectorSearchResult, "file" | "body" | "bestChunk" | "chunkPos" | "chunkLen" | "displayPath" | "score">[],
+    hits: readonly PassageHit[],
     store: ManagerStore, opts?: Pick<CorpusSearchOptions, "maxSnippetChars" | "signal" | "sessionFilter">, whisperer = false,
   ): Promise<CorpusMemorySearchResult[]> {
     const tokenizer = (store as Partial<AnalysisStore>).internal?.llm;
-    const vectorDb = this.#trackRecallLocators ? (store as Partial<AnalysisStore>).internal?.db : undefined;
-    let seqStmt: ReturnType<NonNullable<typeof vectorDb>["prepare"]> | undefined;
-    if (vectorDb) {
-      try {
-        seqStmt = vectorDb.prepare("SELECT seq FROM content_vectors WHERE hash = ? AND pos = ? AND chunk_len = ? LIMIT 1");
-      } catch {
-        seqStmt = undefined;
-      }
-    }
-    const lookupQmdSeq = (docHash: string, pos: number, len: number): number | undefined => {
-      if (!seqStmt) return undefined;
-      try {
-        const row = seqStmt.get(docHash, pos, len) as { seq?: unknown } | undefined;
-        return typeof row?.seq === "number" && Number.isInteger(row.seq) ? row.seq : undefined;
-      } catch {
-        return undefined;
-      }
-    };
     const results: CorpusMemorySearchResult[] = [];
     const current = new Map(this.#currentExtracted(hits.map(hit => hit.file), opts?.sessionFilter).map(r => [extractedUri(r), r]));
     for (const hit of hits) {
@@ -1254,22 +1242,25 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       // Proactive hints must retain the entire matched chunk, even when expanded
       // turn/message context exceeds their budget. Ordinary search is unchanged.
       if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity)) continue;
+      const { ref } = hit;
+      const locator = this.#trackRecallLocators ? {
+        docHash: ref?.docHash,
+        qmdSeq: ref?.seq ?? undefined,
+        chunkPos: ref?.chunkPos ?? hit.chunkPos,
+        chunkLen: ref?.chunkLen ?? hit.chunkLen,
+      } : undefined;
       const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
       if (collection === EXTRACTED_COLLECTION) {
         const record = current.get(hit.file);
         if (record && record.text.length <= (opts?.maxSnippetChars ?? Infinity)) {
           const item = extractedHit(record, hit.score);
-          if (this.#trackRecallLocators) {
-            const docHash = sha256Text(record.text);
-            attachHitLocator(item, {
+          if (locator) {
+            item.locator = {
+              ...locator,
               rawLeafId: memoryPassageId(hit.bestChunk || record.text),
-              docHash,
-              qmdSeq: lookupQmdSeq(docHash, hit.chunkPos, hit.chunkLen),
-              chunkPos: hit.chunkPos,
-              chunkLen: hit.chunkLen,
               observedAtMs: Number.isFinite(record.observedAt) ? record.observedAt : undefined,
               observedAtBasis: Number.isFinite(record.observedAt) ? "extracted" : "unknown",
-            });
+            };
           }
           results.push(item);
         }
@@ -1288,7 +1279,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       // Never apply offsets from a newer projection to an older indexed snapshot.
       const messages = corpus === "sessions"
         ? projection?.messages && projection.documentPath === relativePath &&
-          projection.projectionHash === projectionHash(hit.body)
+          projection.projectionHash === (ref?.docHash ?? projectionHash(hit.body))
           ? projection.messages : parseSessionMessageSpans(hit.body)
         : undefined;
       const contextSpan = messages ? sessionContextSpans(hit.body, hit.chunkPos, messages) : undefined;
@@ -1319,25 +1310,21 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
         ...(messageTimestamp ? { messageTimestamp } : {}),
         citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
       };
-      if (this.#trackRecallLocators) {
-        const docHash = sha256Text(hit.body);
+      if (locator) {
         const isMemoryDateSource = corpus !== "sessions" && relativePath !== undefined && (
           corpus === "memory" || basename(source.root) === "memory" || /(?:^|\/)memory\//u.test(relativePath)
         );
         const fileDateMs = isMemoryDateSource && relativePath ? parseDailyFilenameDateMs(relativePath) : undefined;
-        attachHitLocator(item, {
+        item.locator = {
+          ...locator,
           rawLeafId: memoryPassageId(hit.bestChunk),
-          docHash,
-          qmdSeq: lookupQmdSeq(docHash, hit.chunkPos, hit.chunkLen),
-          chunkPos: hit.chunkPos,
-          chunkLen: hit.chunkLen,
           observedAtMs: messageTimestampMs ?? fileDateMs,
           observedAtBasis: messageTimestampMs !== undefined
             ? "session_message"
             : fileDateMs !== undefined
             ? "filename_date"
             : "unknown",
-        });
+        };
       }
       results.push(item);
     }

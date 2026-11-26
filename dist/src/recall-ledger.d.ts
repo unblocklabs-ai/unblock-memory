@@ -91,10 +91,6 @@ export type RecallPersonIdentity = {
     senderId: string;
     accountId?: string;
 };
-export declare function attachHitLocator(hit: object, locator: RecallHitLocator): void;
-export declare function getHitLocator(hit: object): RecallHitLocator | undefined;
-export declare function copyHitLocator(from: object, to: object): void;
-export declare function sha256Text(text: string): string;
 /** Parses YYYY-MM-DD.md filenames (both `2026-11-20.md` under a rooted `memory/` source and `memory/2026-11-20.md`). */
 export declare function parseDailyFilenameDateMs(path: string): number | undefined;
 export declare function resolveRecallLedger(value: unknown): RecallLedgerConfig;

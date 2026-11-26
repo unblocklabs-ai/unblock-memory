@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
@@ -128,25 +127,6 @@ export type RecallPersonIdentity = {
   senderId: string;
   accountId?: string;
 };
-
-const hitLocators = new WeakMap<object, RecallHitLocator>();
-
-export function attachHitLocator(hit: object, locator: RecallHitLocator): void {
-  hitLocators.set(hit, locator);
-}
-
-export function getHitLocator(hit: object): RecallHitLocator | undefined {
-  return hitLocators.get(hit);
-}
-
-export function copyHitLocator(from: object, to: object): void {
-  const locator = hitLocators.get(from);
-  if (locator) hitLocators.set(to, locator);
-}
-
-export function sha256Text(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
-}
 
 /** Parses YYYY-MM-DD.md filenames (both `2026-11-20.md` under a rooted `memory/` source and `memory/2026-11-20.md`). */
 export function parseDailyFilenameDateMs(path: string): number | undefined {
