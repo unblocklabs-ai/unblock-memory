@@ -55,7 +55,11 @@ Without `--since`, the first enabled run establishes a live start time; historic
 messages require an explicit backfill. Runs process at most `maxBatches` session
 chunks; repeat the same command to continue. The approved backfill boundary and
 cursors persist across restarts and scheduled runs. An earlier `--since` replays
-history without deleting retained facts. Unchanged reruns make no model calls;
+history without deleting retained facts. Before such a rewind (or one caused by a policy or
+model change) discards a session's cursor, the worker first checks that cursor against the
+source: if the session was rewritten or deleted, its active observations are withdrawn before
+the replay. Upgrading from v0.15.x keeps the same prompt version and policy fingerprint, so
+existing cursors resume forward-only; immutable observations apply to new messages. Unchanged reruns make no model calls;
 new messages resume from each session's cursor. Failed chunks do not advance it.
 
 ## Retention and thresholds
@@ -74,7 +78,9 @@ provider supplies per-item confidence.
 Validation shares the dated transcript across up to four proposals per request.
 Each proposal must pass support and retention using its own citations. Support must
 select `supported`, even if its threshold is lowered. Prior observations are not
-sent to the model. `minReplacement` is accepted for older configurations but has no effect.
+sent to the model. `minReplacement` is accepted for older configurations but no longer
+gates anything; it remains part of the checkpoint policy fingerprint, so changing it rewinds
+sessions like any other policy change.
 
 The two thresholds accept 0–1 and default to 0.90. Lowering retention changes
 certainty about category membership, not the categories themselves. Agents can

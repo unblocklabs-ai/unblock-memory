@@ -22,16 +22,18 @@ export function extractionPolicyFingerprint(params: {
   historyMessages: number;
   minSupport: number;
   minRetention: number;
-  minReplacement?: number;
+  /** Deprecated for immutable observations, but still hashed: the v0.15.x fingerprint shape must not change. */
+  minReplacement: number;
   extractorModel?: string;
   validatorModel?: string;
 }): string {
+  // Byte-for-byte the v0.15.x shape. Any change rewinds every live checkpoint and replays full histories.
   return jsonHash({
     version: params.version,
     historyMessages: params.historyMessages,
     minSupport: params.minSupport,
     minRetention: params.minRetention,
-    immutableObservations: true,
+    minReplacement: params.minReplacement,
     extractorModel: params.extractorModel ?? null,
     validatorModel: params.validatorModel ?? null,
   });
@@ -131,6 +133,23 @@ export class ExtractionStore {
       policyFingerprint: row.policy_fingerprint as string | null,
       error: row.error as string | null,
     };
+  }
+  /**
+   * The stored cursor that `checkpoint()` would discard by rewinding (a broader backfill or a policy change), or
+   * null when it would resume. The caller must verify this cursor against the source first: once discarded, a
+   * rewritten or deleted session reads as a fresh page and its stale observations would stay active.
+   */
+  rewindCursor(session: ExtractionSession, since?: number, policyFingerprint?: string): string | null {
+    const row = this.db.prepare("SELECT cursor,extract_since,complete_revision,policy_fingerprint FROM extraction_sessions WHERE session_id=?")
+      .get(session.sessionId);
+    const storedCursor = (row?.cursor ?? null) as string | null;
+    if (!row || storedCursor === null) return null;
+    if (since !== undefined && since < Number(row.extract_since)) return storedCursor;
+    if (policyFingerprint === undefined) return null;
+    const storedCompleteRevision = row.complete_revision as string | null;
+    const completeRevisionPolicyMismatch =
+      storedCompleteRevision !== null && parseCompleteRevision(storedCompleteRevision)?.policy !== policyFingerprint;
+    return row.policy_fingerprint !== policyFingerprint || completeRevisionPolicyMismatch ? storedCursor : null;
   }
   checkpoint(session: ExtractionSession, owner: string, since?: number, policyFingerprint?: string): Checkpoint {
     return immediateTransaction(this.db, () => {

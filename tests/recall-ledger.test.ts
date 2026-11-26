@@ -549,7 +549,11 @@ test("registerMemoryWhisperer with complementaryHints=true labels redundant hits
     req.on("data", (chunk) => { body += String(chunk); });
     req.on("end", () => {
       res.setHeader("content-type", "application/json");
-      const { questions } = JSON.parse(body) as { questions: Record<string, unknown> };
+      const { questions = {} } = JSON.parse(body) as { questions?: Record<string, unknown> };
+      if (req.url?.endsWith("/v1/extractions")) {
+        res.end(JSON.stringify({ model: "liquid/d1.2-ultra", answers: { topics: { type: "list", value: [] } } }));
+        return;
+      }
       if (questions.pair_0_1) {
         // Only Hit 2 is redundant with Hit 1; Hit 3 and Hit 4 are distinct.
         const answers = Object.fromEntries(Object.keys(questions).map(key =>

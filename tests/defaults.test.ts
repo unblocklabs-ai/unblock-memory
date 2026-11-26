@@ -59,6 +59,19 @@ test("operational override files reject malformed JSON, unknown keys and invalid
   }
 });
 
+test("a retired top-level training section in an override file is ignored, not rejected", t => {
+  const { file, write } = overrideFixture(t);
+  write(JSON.stringify({ training: { queryModel: "old", epochs: 3 }, memoryWhisperer: { planningTimeoutMs: 1200 } }));
+  const loaded = loadOperationalDefaults(file);
+  assert.equal(loaded.memoryWhisperer.planningTimeoutMs, 1200, "the rest of the file still applies");
+  assert.equal(Object.hasOwn(loaded, "training"), false);
+  write('{"extraction":{"training":1}}');
+  assert.throws(() => loadOperationalDefaults(file), /Unknown operational default extraction.training/u,
+    "only the retired top-level section is ignored");
+  write('{"memoryWhisperer":{"planningTimeoutMs":0}}');
+  assert.throws(() => loadOperationalDefaults(file), /memoryWhisperer.planningTimeoutMs/u);
+});
+
 test("decision pack limits are bounded startup overrides", t => {
   const { file, write } = overrideFixture(t);
   const limits = {

@@ -26,6 +26,10 @@ const deprecatedKeys: Record<string, Record<string, string>> = {
   quality: { judgeBatchMaxChars: "judgeBatchMaxStateBytes" },
   people: { primerBatchMaxChars: "primerBatchMaxStateBytes" },
 };
+/** Removed sections still accepted (and ignored) so older override files keep loading. */
+const retiredKeys: Record<string, readonly string[]> = {
+  "": ["training"],
+};
 const ranges: Record<string, readonly [number, number]> = {
   "decisionModel.timeoutMs": [1, 10_000],
   "decisionModel.unboundedTimeoutMs": [1, 60_000],
@@ -48,6 +52,7 @@ const ranges: Record<string, readonly [number, number]> = {
   "memoryWhisperer.maxTopics": [1, 3],
   "memoryWhisperer.gateTimeoutMs": [1, 10_000],
   "memoryWhisperer.extractTimeoutMs": [1, 10_000],
+  "memoryWhisperer.planningTimeoutMs": [1, 10_000],
   "skillWhisperer.defaultHistoryMessages": [0, Number.MAX_SAFE_INTEGER],
   "skillWhisperer.defaultCooldownTurns": [0, Number.MAX_SAFE_INTEGER],
   "skillWhisperer.maxDirectCatalogSkills": [1, 1000],
@@ -121,6 +126,7 @@ function validLeaf(base: unknown, value: unknown, path: string, key: string): bo
 function merge(base: RecordValue, patch: unknown, parent = ""): RecordValue {
   if (!record(patch)) throw new Error(`Invalid operational default ${parent || "(root)"}: expected an object`);
   const normalized = { ...patch };
+  for (const key of retiredKeys[parent] ?? []) delete normalized[key];
   for (const [oldKey, newKey] of Object.entries(deprecatedKeys[parent] ?? {})) {
     if (!Object.hasOwn(normalized, oldKey)) continue;
     if (Object.hasOwn(normalized, newKey) && normalized[newKey] !== normalized[oldKey]) {

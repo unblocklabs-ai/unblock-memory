@@ -969,6 +969,19 @@ export class QmdMemoryManager {
     }
     /** Shared discovery: exact trained recipe, scoped before either retrieval lane. */
     async searchCandidates(queries, opts) {
+        const [result] = await this.#searchCandidateJob([queries], opts, true);
+        if (result.status === "rejected")
+            throw result.reason;
+        return result.value;
+    }
+    /**
+     * Multi-topic discovery in ONE serialized job: one queue slot behind background indexing, one metadata refresh
+     * and store setup, then each topic's lanes in order. A failed topic settles alone; cancellation fails the job.
+     */
+    async searchCandidateTopics(topics, opts) {
+        return this.#searchCandidateJob(topics, opts, false);
+    }
+    async #searchCandidateJob(topics, opts, rethrow) {
         const { timings, signal } = opts;
         const endQueueWait = startTiming("queueWaitMs", timings, signal);
         try {
@@ -977,7 +990,7 @@ export class QmdMemoryManager {
                 opts.signal?.throwIfAborted();
                 const collections = this.#collectionNames(opts.corpora);
                 if (!collections.length)
-                    return [];
+                    return topics.map(() => ({ status: "fulfilled", value: [] }));
                 const allowedPaths = await timeStage("metadataMs", timings, signal, async () => {
                     if (this.#sessions && collections.includes(this.#sessions.collection)) {
                         const reloaded = await this.#refreshSessionMetadata();
@@ -987,57 +1000,73 @@ export class QmdMemoryManager {
                     return this.#allowedPaths(collections, opts.sessionFilter);
                 });
                 const store = await timeStage("storeSetupMs", timings, signal, () => this.#getAnalysisStore());
-                const RRF_K = 60;
-                const hits = new Map();
-                // Serialize native QMD work. Cancellation prevents further queries/collections.
-                for (const lane of ["lex", "vec"]) {
+                const settled = [];
+                for (const queries of topics) {
                     opts.signal?.throwIfAborted();
-                    let candidates;
                     try {
-                        candidates = await timeStage(lane === "lex" ? "bm25Ms" : "vectorMs", timings, signal, () => discoverLaneCandidates(store, queries[lane], collections, lane, opts.signal, allowedPaths, lane === "vec" ? vectorTrace(timings, signal) : undefined));
+                        settled.push({ status: "fulfilled", value: await this.#discoverCandidates(store, queries, collections, allowedPaths, opts) });
                     }
-                    finally {
-                        if (lane === "vec" && timings?.vectorMs !== undefined) {
-                            timings.vectorOtherMs = unaccounted(timings.vectorMs, timings, vectorParts);
-                        }
-                    }
-                    for (const [index, hit] of candidates.entries()) {
-                        const rank = hit.bm25?.rank ?? hit.vector?.rank ?? index + 1;
-                        const contribution = 1 / (RRF_K + rank);
-                        const { ref } = hit;
-                        const key = JSON.stringify(ref
-                            ? [hit.file, ref.docHash, ref.chunkPos, ref.chunkLen]
-                            : [hit.file, hit.bestChunkPos, hit.bestChunk.trim()]);
-                        const existing = hits.get(key);
-                        if (existing) {
-                            existing.rrfScore += contribution;
-                            existing.topRank = Math.min(existing.topRank, rank);
-                            if (ref && ref.seq !== null && existing.hit.ref?.seq === null)
-                                existing.hit.ref = ref;
-                        }
-                        else {
-                            hits.set(key, {
-                                hit: { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
-                                    chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: 0, ref },
-                                rrfScore: contribution,
-                                topRank: rank,
-                            });
-                        }
+                    catch (reason) {
+                        if (rethrow || opts.signal?.aborted)
+                            throw reason;
+                        settled.push({ status: "rejected", reason });
                     }
                 }
-                // Passage-level RRF (k=60) with QMD's top-rank bonuses so rank-1 single-lane
-                // hits compete cleanly alongside dual-lane matches before any candidate cap.
-                const fused = [...hits.values()].map(entry => ({
-                    ...entry.hit,
-                    score: entry.rrfScore + (entry.topRank === 1 ? 0.05 : entry.topRank <= 3 ? 0.02 : 0),
-                })).sort((a, b) => b.score - a.score);
-                opts.signal?.throwIfAborted();
-                return timeStage("passageMs", timings, signal, () => this.#renderSearchHits(fused, store, opts, true));
+                return settled;
             });
         }
         finally {
             endQueueWait();
         }
+    }
+    async #discoverCandidates(store, queries, collections, allowedPaths, opts) {
+        const { timings, signal } = opts;
+        const RRF_K = 60;
+        const hits = new Map();
+        // Serialize native QMD work. Cancellation prevents further queries/collections.
+        for (const lane of ["lex", "vec"]) {
+            opts.signal?.throwIfAborted();
+            let candidates;
+            try {
+                candidates = await timeStage(lane === "lex" ? "bm25Ms" : "vectorMs", timings, signal, () => discoverLaneCandidates(store, queries[lane], collections, lane, opts.signal, allowedPaths, lane === "vec" ? vectorTrace(timings, signal) : undefined));
+            }
+            finally {
+                if (lane === "vec" && timings?.vectorMs !== undefined) {
+                    timings.vectorOtherMs = unaccounted(timings.vectorMs, timings, vectorParts);
+                }
+            }
+            for (const [index, hit] of candidates.entries()) {
+                const rank = hit.bm25?.rank ?? hit.vector?.rank ?? index + 1;
+                const contribution = 1 / (RRF_K + rank);
+                const { ref } = hit;
+                const key = JSON.stringify(ref
+                    ? [hit.file, ref.docHash, ref.chunkPos, ref.chunkLen]
+                    : [hit.file, hit.bestChunkPos, hit.bestChunk.trim()]);
+                const existing = hits.get(key);
+                if (existing) {
+                    existing.rrfScore += contribution;
+                    existing.topRank = Math.min(existing.topRank, rank);
+                    if (ref && ref.seq !== null && existing.hit.ref?.seq === null)
+                        existing.hit.ref = ref;
+                }
+                else {
+                    hits.set(key, {
+                        hit: { file: hit.file, body: hit.body, bestChunk: hit.bestChunk,
+                            chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length, displayPath: hit.file, score: 0, ref },
+                        rrfScore: contribution,
+                        topRank: rank,
+                    });
+                }
+            }
+        }
+        // Passage-level RRF (k=60) with QMD's top-rank bonuses so rank-1 single-lane
+        // hits compete cleanly alongside dual-lane matches before any candidate cap.
+        const fused = [...hits.values()].map(entry => ({
+            ...entry.hit,
+            score: entry.rrfScore + (entry.topRank === 1 ? 0.05 : entry.topRank <= 3 ? 0.02 : 0),
+        })).sort((a, b) => b.score - a.score);
+        opts.signal?.throwIfAborted();
+        return timeStage("passageMs", timings, signal, () => this.#renderSearchHits(fused, store, opts, true));
     }
     async #renderSearchHits(hits, store, opts, whisperer = false) {
         const tokenizer = store.internal?.llm;

@@ -16,7 +16,7 @@ import {
   type ExtractionSession,
 } from "./extraction-store.js";
 import { readExtractionPage } from "./extraction-source.js";
-import { extractionHistory, readExtractionChunk } from "./extraction-chunk.js";
+import { checkpointFence, extractionHistory, readExtractionChunk } from "./extraction-chunk.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 
 type ValidationJudgment = Awaited<ReturnType<typeof validateExtractedMemories>>[number];
@@ -114,6 +114,32 @@ async function processSession(params: {
     version, policyFingerprint, apiKey, signal, leaseAbort, readPage, extract, validate,
   } = params;
   const extractionConfig = config.extraction;
+  // Verify a cursor against the source before an intentional rewind discards it, so a rewritten or deleted
+  // session still withdraws its stale observations instead of replaying as a fresh source.
+  const rewindFrom = store.rewindCursor(session, since, policyFingerprint);
+  if (rewindFrom !== null) {
+    const fence = checkpointFence(rewindFrom);
+    let kind: Awaited<ReturnType<typeof readPage>>["kind"] = "reset"; // A malformed bookmark is a reset.
+    if (fence !== undefined) {
+      try {
+        signal.throwIfAborted();
+        const pending = readPage(agentId, agentName, session, fence, undefined, signal);
+        void pending.catch(() => {});
+        kind = (await abortable(pending, signal)).kind;
+      } catch {
+        signal.throwIfAborted();
+        kind = "unavailable";
+      }
+      signal.throwIfAborted();
+    }
+    if (kind === "unavailable") {
+      // Keep the stored cursor so the next run verifies it again before rewinding.
+      store.error(session.sessionId, "source_unavailable", owner);
+      return { processed: 1, accepted: 0, rejected: 0, unchanged: 0, failed: 1 };
+    }
+    // Withdraw first; the rewind below then replays the rewritten source from its start.
+    if (kind !== "page") store.reset(session.sessionId, null, owner, policyFingerprint);
+  }
   const checkpoint = store.checkpoint(session, owner, since, policyFingerprint);
   const expectedCompleteRevision = session.sourceRevision === undefined
     ? undefined
@@ -233,6 +259,7 @@ export async function runExtraction(params: { config: UnblockMemoryConfig; store
     historyMessages: config.historyMessages,
     minSupport: config.minSupport,
     minRetention: config.minRetention,
+    minReplacement: config.minReplacement,
     extractorModel: params.config.decisionModel.model,
     validatorModel: params.config.decisionModel.model,
   });

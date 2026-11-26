@@ -330,6 +330,86 @@ test("multi-topic reservation still caps at maxJudgeCandidates and tolerates one
   assert.equal(judged.length, 3);
   assert.ok(judged.includes("a hit 0") && judged.includes("c hit 0"));
   assert.equal(search.eligible, 8);
+  assert.equal(search.topicsFailed, 1, "a partial topic failure is reported, not hidden");
   const failing = { searchCandidates: async () => { throw new Error("all down"); } };
   await assert.rejects(searchMemory(failing, topics, judgeOptions), /all down/u);
+});
+
+function judgeBy(t: test.TestContext, score: (excerpt: string) => number, bodies: string[] = []) {
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
+    bodies.push(String(init?.body));
+    const excerpt = JSON.parse(String(init?.body)).state[0].candidates[0].excerpt;
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul: score(excerpt) } } });
+  });
+  return bodies;
+}
+
+test("multi-topic finalists reserve each topic's best qualifying hit before filling by usefulness", async t => {
+  const topics = [{ lex: "a", vec: "a" }, { lex: "b", vec: "b" }];
+  const manager = { searchCandidates: async (queries: { lex: string }) => queries.lex === "a"
+    ? Array.from({ length: 5 }, (_, i) => topicHit(`Topic A hit ${i}`, 0.9))
+    : [topicHit("Topic B hit", 0.1)] };
+  judgeBy(t, excerpt => excerpt.startsWith("Topic B") ? 0.75 : 0.95 - Number(excerpt.at(-1)) / 100);
+  const search = await searchMemory(manager, topics, { ...judgeOptions, maxJudgeCandidates: 6, maxResults: 4, minUsefulness: 0.7 });
+  assert.equal(search.results.length, 4);
+  assert.ok(search.results.some(hit => hit.snippet === "Topic B hit"), "topic B's qualifying hit survives four stronger topic A hits");
+  assert.deepEqual(search.results.map(hit => hit.score), [...search.results.map(hit => hit.score)].sort((a, b) => b - a),
+    "finalists stay in usefulness order");
+  // Reservation never admits a hit below the usefulness threshold.
+  judgeBy(t, excerpt => excerpt.startsWith("Topic B") ? 0.5 : 0.95);
+  const strict = await searchMemory(manager, topics, { ...judgeOptions, maxJudgeCandidates: 6, maxResults: 4, minUsefulness: 0.7 });
+  assert.ok(!strict.results.some(hit => hit.snippet === "Topic B hit"));
+  assert.equal(strict.results.length, 4);
+});
+
+test("usefulness judging sees an extracted observation's own date", async t => {
+  const observedAt = "2025-03-14T09:30:00.000Z";
+  const extracted = { ...topicHit("Bek lives in Brooklyn.", 0.9, "extracted"),
+    extracted: { id: "x1", revision: 1, observedAt, sessionId: "s1", evidence: [] } };
+  const bodies = judgeBy(t, () => 0.9);
+  await searchMemory({ searchCandidates: async () => [extracted] as never }, { lex: "Bek", vec: "where does Bek live" },
+    { ...judgeOptions, maxJudgeCandidates: 6 });
+  assert.equal(bodies.length, 1);
+  assert.ok(bodies[0]!.includes(observedAt), "the observation date is passed as a candidate date");
+});
+
+test("parallel topic searches record into separate timing buckets and merge without overwriting", async t => {
+  const topics = [{ lex: "slow", vec: "slow" }, { lex: "fast", vec: "fast" }];
+  const sinks: object[] = [];
+  const manager = { searchCandidates: async (queries: { lex: string }, options: { timings?: Record<string, number> }) => {
+    sinks.push(options.timings!);
+    // Mimic startTiming: read the previous value, await, then write previous + elapsed.
+    const previous = options.timings!.bm25Ms ?? 0;
+    await new Promise(resolve => setTimeout(resolve, queries.lex === "slow" ? 30 : 1));
+    options.timings!.bm25Ms = previous + (queries.lex === "slow" ? 30 : 1);
+    options.timings!.vectorScanAttempts = (options.timings!.vectorScanAttempts ?? 0) + 1;
+    return [topicHit(`${queries.lex} hit`, 0.5)];
+  } };
+  judgeAll(t);
+  const timings: Record<string, number> = { bm25Ms: 5 };
+  await searchMemory(manager, topics, { ...judgeOptions, timings, maxJudgeCandidates: 6 });
+  assert.notEqual(sinks[0], sinks[1], "each topic gets its own sink");
+  assert.notEqual(sinks[0], timings);
+  assert.equal(timings.bm25Ms, 5 + 30, "overlapping durations add their maximum to the outer sink");
+  assert.equal(timings.vectorScanAttempts, 2, "counters add up");
+});
+
+test("managers with searchCandidateTopics run every topic in one call", async t => {
+  const calls: unknown[][] = [];
+  const manager = {
+    searchCandidates: async () => assert.fail("one-job managers must not be queued once per topic"),
+    searchCandidateTopics: async (topics: readonly { lex: string }[]) => {
+      calls.push([...topics]);
+      return topics.map(topic => topic.lex === "b"
+        ? { status: "rejected" as const, reason: new Error("lane failed") }
+        : { status: "fulfilled" as const, value: [topicHit(`${topic.lex} hit`, 0.5)] });
+    },
+  };
+  judgeAll(t);
+  const topics = [{ lex: "a", vec: "a" }, { lex: "b", vec: "b" }, { lex: "c", vec: "c" }];
+  const search = await searchMemory(manager, topics, { ...judgeOptions, maxJudgeCandidates: 6 });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], topics);
+  assert.equal(search.topicsFailed, 1);
+  assert.deepEqual(search.results.map(hit => hit.snippet).sort(), ["a hit", "c hit"]);
 });

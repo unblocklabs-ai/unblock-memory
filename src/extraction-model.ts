@@ -1,13 +1,15 @@
 import { choice, listField, noul, type ChoiceQuestion, type NoulQuestion } from "@unblocklabs/decisions";
-import { Tiktoken } from "js-tiktoken/lite";
-import o200kBase from "js-tiktoken/ranks/o200k_base";
 import { decideWithModel, extractWithModel } from "./decision-client.js";
 import { decisionStateBytes, packDecisionState } from "./decision-packs.js";
 import { DEFAULTS } from "./defaults.js";
 import type { ExtractionConfig } from "./extraction-config.js";
+import { o200kTokenCount } from "./o200k.js";
+import { codePointSpanToUtf16 } from "./text-span.js";
 
 const limits = DEFAULTS.extraction;
-export const EXTRACTION_VERSION = `${limits.version}-observations`;
+// Keep the v0.15.x prompt version: changing it (or the policy fingerprint) would rewind every live checkpoint and
+// replay full histories. Immutable occurrence-scoped observations apply to new messages going forward.
+export const EXTRACTION_VERSION = limits.version;
 export const EXTRACTION_INPUT_TARGET = limits.inputTargetTokens;
 export const EXTRACTION_INPUT_LIMIT = limits.inputLimitTokens;
 
@@ -32,11 +34,10 @@ Each excerpt must cite a message marked "new". Include the preceding question or
 Leave the list empty when no lasting facts qualify. Do not fill a quota.`;
 const EXTRACTION_FIELDS = { memories: listField({ instructions: EXTRACTION_PROMPT, items: "text" }) };
 
-let tokenizer: Tiktoken | undefined;
 let overheadTokens: number | undefined;
-// o200k_base is a budgeting proxy, not the provider's tokenizer.
+// o200k_base is a budgeting proxy, not the provider's tokenizer; long unbroken runs are counted in bounded chunks.
 function extractionTokens(text: string): number {
-  return (tokenizer ??= new Tiktoken(o200kBase)).encode(text, [], []).length;
+  return o200kTokenCount(text);
 }
 function datedMessage(message: ExtractionMessage) {
   return { ...message, sourceDate: new Date(message.timestamp).toISOString() };
@@ -106,20 +107,6 @@ function attributedText(quotes: QuotedMessage[]): string {
   return (lastSpace > prefix.length / 2 ? prefix.slice(0, lastSpace) : prefix) + "…";
 }
 
-function codePointSpanToUtf16(text: string, [cpStart, cpEnd]: [number, number]): [number, number] | undefined {
-  if (!Number.isSafeInteger(cpStart) || !Number.isSafeInteger(cpEnd) || cpStart < 0 || cpStart >= cpEnd) return undefined;
-  let cp = 0;
-  let start = -1;
-  for (let i = 0; i < text.length; ) {
-    if (cp === cpStart) start = i;
-    const code = text.codePointAt(i)!;
-    i += code > 0xffff ? 2 : 1;
-    cp++;
-    if (cp === cpEnd) return start >= 0 ? [start, i] : undefined;
-  }
-  return undefined;
-}
-
 function resolveUtf16Span(state: string, span: [number, number], value: string): [number, number] | undefined {
   const [start, end] = span;
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start >= end) return undefined;
@@ -144,7 +131,9 @@ export async function extractWithDecisionModel(params: ProposeParams): Promise<M
   const seen = new Set<string>();
   const normalize = (text: string) => text.trim().replace(/\s+/gu, " ").toLowerCase();
   const candidates: MemoryProposal[] = [];
-  const matchedWithoutSpan = new Set<string>();
+  // Without spans a repeated quote is ambiguous. Bind it to the first fresh message containing it; a repeat may
+  // only claim another fresh occurrence by the same speaker and role, never an unrelated speaker's message.
+  const matchedWithoutSpan = new Map<string, ExtractionMessage[]>();
   for (const [index, value] of (answers.memories.value ?? []).entries()) {
     const confidence = confidences?.[index];
     if (typeof value !== "string" || !value.trim() ||
@@ -156,10 +145,11 @@ export async function extractWithDecisionModel(params: ProposeParams): Promise<M
       quotes = resolved ? spanQuotes(bodies, resolved) : [];
     } else {
       const quote = value.trim();
-      // A provider can return the same excerpt for two different fresh messages.
-      const message = params.messages.find(m => fresh.has(m.id) && m.text.includes(quote) &&
-        !matchedWithoutSpan.has(JSON.stringify([m.id, quote])));
-      if (message) matchedWithoutSpan.add(JSON.stringify([message.id, quote]));
+      const matched = matchedWithoutSpan.get(quote);
+      const first = matched?.[0];
+      const message = params.messages.find(m => fresh.has(m.id) && m.text.includes(quote) && !matched?.includes(m) &&
+        (!first || (m.speaker === first.speaker && m.role === first.role)));
+      if (message) matchedWithoutSpan.set(quote, [...(matched ?? []), message]);
       quotes = message ? [{ message, quote }] : [];
     }
     if (quotes.length > limits.maxEvidencePerProposal ||

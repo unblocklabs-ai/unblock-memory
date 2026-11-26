@@ -668,6 +668,49 @@ test("v2 Whisperer routes each query only to its lane across the approved corpus
   } finally { await manager.close(); }
 });
 
+test("searchCandidateTopics runs all topics in one queued job and settles a failed topic alone", async t => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "unblock-memory-topic-job-"));
+  const workspace = directory.path;
+  const memory = resolveSource(workspace, "MEMORY.md", "memory");
+  const store = await createStore({ dbPath: ":memory:", config: { collections: {
+    [memory.collection]: { path: memory.root, pattern: memory.pattern } } } });
+  for (const [index, word] of ["Alphaneedle", "Betaneedle"].entries()) {
+    store.internal.insertContent(`h${index}`, `${word} evidence ${index}`, "2026-01-01");
+    store.internal.insertDocument(memory.collection, `${word}.md`, "Evidence", `h${index}`, "2026-01-01", "2026-01-01");
+  }
+  store.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+  const order: string[] = [];
+  t.mock.method(store.internal, "searchVec", async (query: string) => {
+    order.push(query);
+    if (query === "boom") throw new Error("vector lane failed");
+    return [];
+  });
+  let factoryCalls = 0;
+  const manager = new QmdMemoryManager({ dbPath: join(workspace, "unused.sqlite"), workspaceDir: workspace,
+    sources: [memory], storeFactory: async () => { factoryCalls++; return store; } });
+  try {
+    const timings: Record<string, number> = {};
+    const pending = manager.searchCandidateTopics([
+      { lex: "Alphaneedle", vec: "alpha" }, { lex: "Gammaneedle", vec: "boom" }, { lex: "Betaneedle", vec: "beta" },
+    ], { corpora: ["memory"], maxSnippetChars: 1200, timings });
+    // Queued after the topic job: it must not interleave between its topics.
+    const later = manager.searchCandidates({ lex: "Betaneedle", vec: "later" }, { corpora: ["memory"], maxSnippetChars: 1200 });
+    const [alpha, failed, beta] = await pending;
+    await later;
+    assert.deepEqual(order, ["alpha", "boom", "beta", "later"]);
+    assert.equal(alpha?.status === "fulfilled" && alpha.value.map(hit => hit.snippet).join(), "Alphaneedle evidence 0");
+    assert.equal(failed?.status === "rejected" && (failed.reason as Error).message, "vector lane failed");
+    assert.equal(beta?.status === "fulfilled" && beta.value.map(hit => hit.snippet).join(), "Betaneedle evidence 1");
+    assert.equal(factoryCalls, 1);
+    for (const field of ["queueWaitMs", "metadataMs", "storeSetupMs", "bm25Ms", "vectorMs"]) {
+      assert.equal(typeof timings[field], "number", `${field} recorded`);
+    }
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(manager.searchCandidateTopics([{ lex: "a", vec: "a" }], { corpora: ["memory"], signal: controller.signal }));
+  } finally { await manager.close(); }
+});
+
 test("lists YAML skill metadata in source order and refreshes it without opening QMD", async () => {
   await using directory = await mkdtempDisposable(join(tmpdir(), "unblock-memory-catalog-"));
   const workspace = directory.path;

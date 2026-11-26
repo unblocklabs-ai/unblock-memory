@@ -5,6 +5,11 @@ import { type RetrievalTimings } from "./retrieval-timing.js";
 import { type RecallHitDisposition, type RecallHitLocator } from "./recall-ledger.js";
 export type MemoryCandidateManager = {
     searchCandidates(queries: QueryPair, options: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
+    /**
+     * Optional: run every topic inside one serialized job (one queue slot, one metadata/store setup) instead of
+     * queueing each topic separately behind background indexing. Settles per topic, in topic order.
+     */
+    searchCandidateTopics?(topics: readonly QueryPair[], options: CorpusSearchOptions): Promise<PromiseSettledResult<CorpusMemorySearchResult[]>[]>;
 };
 export declare function memoryPassageId(text: string): string;
 export type MemorySearchObservation = RetrievalTimings & {
@@ -14,6 +19,8 @@ export type MemorySearchObservation = RetrievalTimings & {
     eligible: number;
     requestsSucceeded: number;
     requestsFailed: number;
+    /** Multi-topic searches only: topic searches that failed while at least one other topic succeeded. */
+    topicsFailed?: number;
 };
 export type MemoryRanking = {
     rankingMode: "decision" | "retrieval";
@@ -31,8 +38,8 @@ export type RecallCandidateTrace = {
 };
 /**
  * Both entry points use the same complete passages and independent usefulness judgments.
- * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search in parallel and
- * fuse with passage-level RRF, reserving at least one judge slot per topic.
+ * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search together (one
+ * manager job when supported) and fuse with passage-level RRF, reserving a judge slot and a finalist slot per topic.
  */
 export declare function searchMemory(manager: MemoryCandidateManager, queries: QueryPair | readonly QueryPair[], options: CorpusSearchOptions & {
     apiKey?: string;

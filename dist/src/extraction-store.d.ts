@@ -30,7 +30,8 @@ export declare function extractionPolicyFingerprint(params: {
     historyMessages: number;
     minSupport: number;
     minRetention: number;
-    minReplacement?: number;
+    /** Deprecated for immutable observations, but still hashed: the v0.15.x fingerprint shape must not change. */
+    minReplacement: number;
     extractorModel?: string;
     validatorModel?: string;
 }): string;
@@ -46,6 +47,12 @@ export declare class ExtractionStore {
     readCheckpoint(sessionId: string): (Checkpoint & {
         error: string | null;
     }) | undefined;
+    /**
+     * The stored cursor that `checkpoint()` would discard by rewinding (a broader backfill or a policy change), or
+     * null when it would resume. The caller must verify this cursor against the source first: once discarded, a
+     * rewritten or deleted session reads as a fresh page and its stale observations would stay active.
+     */
+    rewindCursor(session: ExtractionSession, since?: number, policyFingerprint?: string): string | null;
     checkpoint(session: ExtractionSession, owner: string, since?: number, policyFingerprint?: string): Checkpoint;
     records(sessionId?: string, paths?: readonly string[]): ExtractedRecord[];
     reset(sessionId: string, cursor: string | null, owner: string, policyFingerprint?: string): void;

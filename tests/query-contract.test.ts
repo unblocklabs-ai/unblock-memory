@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { Tiktoken } from "js-tiktoken/lite";
+import o200kBase from "js-tiktoken/ranks/o200k_base";
 import test from "node:test";
+import { o200kTokenCount } from "../src/o200k.js";
 import { queryConversation } from "../src/query-generator.js";
 import { prepareQueryConversation, queryTokenIds, serializeQueryConversation, QUERY_CONTRACT } from "../src/query-contract.js";
 
@@ -8,6 +10,39 @@ test("query budgets use o200k_base and encode special-token spellings as ordinar
   // o200k_base token IDs from the OpenAI cookbook's encoding comparison.
   assert.deepEqual(queryTokenIds("お誕生日おめでとう"), [8930, 9697, 243, 128225, 8930, 17693, 4344, 48669]);
   assert.deepEqual(queryTokenIds("<|endoftext|>"), [27, 91, 419, 1440, 919, 91, 29]);
+});
+
+test("bounded o200k encoding matches the reference on ordinary text and stays linear on long unbroken runs", () => {
+  const reference = new Tiktoken(o200kBase);
+  for (const text of [
+    "お誕生日おめでとう", "<|endoftext|>", "",
+    "The quick brown fox jumps over the lazy dog. Sarah's invoice INV-2207 is due 2026-11-30.\n\n  Indented  text\t😀",
+    "Prose with https://example.com/a/b?c=d and snake_case_identifiers, plus 1234567890 digits. ".repeat(200),
+  ]) {
+    assert.deepEqual(queryTokenIds(text), reference.encode(text, [], []), JSON.stringify(text.slice(0, 40)));
+  }
+  const random = Buffer.from(Array.from({ length: 18_000 }, (_, i) => (i * 7919 + 13) % 256)).toString("base64");
+  const adversarial = {
+    "8 KiB letters": "a".repeat(8 * 1024),
+    "20 KiB letters": "Zq".repeat(10 * 1024),
+    "24 KiB base64": random.slice(0, 24 * 1024),
+    "8 KiB spaces": " ".repeat(8 * 1024),
+    "8 KiB CJK": "日本語".repeat(900),
+    "20 KiB astral": "😀".repeat(5 * 1024),
+    "embedded run": `Before ${"x".repeat(20 * 1024)} after.`,
+  };
+  for (const [name, text] of Object.entries(adversarial)) {
+    const started = performance.now();
+    const ids = queryTokenIds(text);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 200, `${name} encoded in ${elapsed.toFixed(1)} ms`);
+    assert.ok(ids.length > 0 && ids.length <= Buffer.byteLength(text), `${name} produced ${ids.length} tokens`);
+    assert.equal(o200kTokenCount(text), ids.length);
+    assert.equal(reference.decode(ids), text, `${name} chunks never split a scalar`);
+  }
+  // A long run is counted conservatively: never fewer tokens than the exact reference.
+  const run = "a".repeat(1000);
+  assert.ok(queryTokenIds(run).length >= reference.encode(run, [], []).length);
 });
 
 test("shared window preserves more than 32 short messages and drops only whole oldest messages", () => {

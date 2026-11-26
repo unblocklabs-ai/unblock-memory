@@ -9,6 +9,12 @@ import { parseDailyFilenameDateMs, type RecallHitDisposition, type RecallHitLoca
 
 export type MemoryCandidateManager = {
   searchCandidates(queries: QueryPair, options: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
+  /**
+   * Optional: run every topic inside one serialized job (one queue slot, one metadata/store setup) instead of
+   * queueing each topic separately behind background indexing. Settles per topic, in topic order.
+   */
+  searchCandidateTopics?(topics: readonly QueryPair[], options: CorpusSearchOptions):
+    Promise<PromiseSettledResult<CorpusMemorySearchResult[]>[]>;
 };
 
 export function memoryPassageId(text: string): string {
@@ -18,6 +24,8 @@ export function memoryPassageId(text: string): string {
 export type MemorySearchObservation = RetrievalTimings & {
   retrievalMs: number; judgeMs: number; candidates: number; eligible: number;
   requestsSucceeded: number; requestsFailed: number;
+  /** Multi-topic searches only: topic searches that failed while at least one other topic succeeded. */
+  topicsFailed?: number;
 };
 
 export type MemoryRanking = {
@@ -98,6 +106,39 @@ function fuseTopicHits(lists: readonly CorpusMemorySearchResult[][]): TopicFusio
   return { hits, topicRanks, topicCount: lists.length };
 }
 
+const timingCounters = new Set(["metadataReloads", "vectorScanAttempts"]);
+
+/**
+ * Parallel topic searches must not share one mutable timing sink: `startTiming` writes `previous + elapsed`, so
+ * overlapping stages overwrite each other. Each topic records into its own bucket; overlapping durations add
+ * their maximum (wall-clock lower bound) to the outer sink and counters add their sum.
+ */
+function mergeTopicTimings(target: RetrievalTimings | undefined, buckets: readonly RetrievalTimings[]): void {
+  if (!target) return;
+  const fields = new Set(buckets.flatMap(bucket => Object.keys(bucket))) as Set<keyof RetrievalTimings>;
+  for (const field of fields) {
+    const values = buckets.map(bucket => bucket[field] ?? 0);
+    const merged = timingCounters.has(field) ? values.reduce((sum, value) => sum + value, 0) : Math.max(...values);
+    target[field] = (target[field] ?? 0) + merged;
+  }
+}
+
+async function searchTopics(
+  manager: MemoryCandidateManager,
+  topics: readonly QueryPair[],
+  options: CorpusSearchOptions,
+): Promise<PromiseSettledResult<CorpusMemorySearchResult[]>[]> {
+  // One serialized job records its stages sequentially, so it can share the outer timing sink.
+  if (manager.searchCandidateTopics) return manager.searchCandidateTopics(topics, options);
+  const buckets = topics.map((): RetrievalTimings => ({}));
+  try {
+    return await Promise.allSettled(topics.map((topic, index) =>
+      manager.searchCandidates(topic, { ...options, ...(options.timings ? { timings: buckets[index] } : {}) })));
+  } finally {
+    mergeTopicTimings(options.timings, buckets);
+  }
+}
+
 /** Reserve the best eligible candidate of each topic first, then fill by fused score up to `limit`. */
 function reserveTopicCandidates(
   candidates: readonly CorpusMemorySearchResult[],
@@ -125,9 +166,31 @@ function reserveTopicCandidates(
 }
 
 /**
+ * Finalists after usefulness filtering: reserve the most useful qualifying passage of each topic first, then fill
+ * by usefulness, so one topic's many strong hits cannot push another topic's qualifying hit out of the results.
+ */
+function reserveTopicFinalists<T extends { result: CorpusMemorySearchResult }>(
+  passed: readonly T[],
+  fusion: TopicFusion,
+  limit: number,
+): T[] {
+  const ranked = [...passed].sort((a, b) => b.result.score - a.result.score);
+  const picked = new Set<T>();
+  for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
+    const best = ranked.find(entry => fusion.topicRanks.get(memoryPassageId(entry.result.snippet))?.[topic] !== undefined);
+    if (best) picked.add(best);
+  }
+  for (const entry of ranked) {
+    if (picked.size >= limit) break;
+    picked.add(entry);
+  }
+  return ranked.filter(entry => picked.has(entry));
+}
+
+/**
  * Both entry points use the same complete passages and independent usefulness judgments.
- * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search in parallel and
- * fuse with passage-level RRF, reserving at least one judge slot per topic.
+ * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search together (one
+ * manager job when supported) and fuse with passage-level RRF, reserving a judge slot and a finalist slot per topic.
  */
 export async function searchMemory(manager: MemoryCandidateManager, queries: QueryPair | readonly QueryPair[], options: CorpusSearchOptions & {
   apiKey?: string; endpoint?: string; model?: string; timeoutMs: number;
@@ -154,14 +217,16 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   };
   let hits: CorpusMemorySearchResult[];
   let fusion: TopicFusion | undefined;
+  let topicsFailed: number | undefined;
   try {
     if (topics.length === 1) {
       hits = await manager.searchCandidates(topics[0]!, searchOptions);
     } else {
-      const settled = await Promise.allSettled(topics.map(topic => manager.searchCandidates(topic, searchOptions)));
+      const settled = await searchTopics(manager, topics, searchOptions);
       signal?.throwIfAborted();
       // One failed topic must not hide the others; fail only when every topic search failed.
       if (settled.every(result => result.status === "rejected")) throw (settled[0] as PromiseRejectedResult).reason;
+      topicsFailed = settled.filter(result => result.status === "rejected").length;
       fusion = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
       hits = fusion.hits;
     }
@@ -171,7 +236,8 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   }
   signal?.throwIfAborted();
   const observation: MemorySearchObservation = { retrievalMs: timings.retrievalMs ?? 0, judgeMs: 0,
-    candidates: hits.length, eligible: 0, requestsSucceeded: 0, requestsFailed: 0 };
+    candidates: hits.length, eligible: 0, requestsSucceeded: 0, requestsFailed: 0,
+    ...(topicsFailed !== undefined ? { topicsFailed } : {}) };
   const trackTrace = Boolean(options.onTrace);
   const candidates: CorpusMemorySearchResult[] = [];
   const traces: RecallCandidateTrace[] = [];
@@ -267,8 +333,12 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
       try {
         const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
           excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
-          dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
-            ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
+          // Observation dates let the judge order contradictory dated observations (e.g. 2025 vs 2026).
+          dates: [...new Set([
+            ...(hit.extracted?.observedAt ? [hit.extracted.observedAt] : []),
+            ...(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
+              ?? (hit.messageTimestamp ? [hit.messageTimestamp] : [])),
+          ])],
         }, asOf, options.model), { ...options, apiKey });
         signal?.throwIfAborted();
         observation.requestsSucceeded++;
@@ -294,10 +364,11 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   observation.judgeMs = timings.judgeMs ?? 0;
   if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
     return fallback("all_judgments_failed");
-  const passed = judged
-    .filter(({ result }) => result.score >= minUsefulness)
-    .sort((a, b) => b.result.score - a.result.score)
-    .slice(0, options.maxResults ?? 5);
+  const qualifying = judged.filter(({ result }) => result.score >= minUsefulness);
+  const maxResults = options.maxResults ?? 5;
+  const passed = fusion
+    ? reserveTopicFinalists(qualifying, fusion, maxResults)
+    : qualifying.sort((a, b) => b.result.score - a.result.score).slice(0, maxResults);
   if (trackTrace) {
     for (const [index, entry] of passed.entries()) {
       if (entry.trace) {

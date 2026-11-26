@@ -282,6 +282,11 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     search(query: string, opts?: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
     /** Shared discovery: exact trained recipe, scoped before either retrieval lane. */
     searchCandidates(queries: QueryPair, opts: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]>;
+    /**
+     * Multi-topic discovery in ONE serialized job: one queue slot behind background indexing, one metadata refresh
+     * and store setup, then each topic's lanes in order. A failed topic settles alone; cancellation fails the job.
+     */
+    searchCandidateTopics(topics: readonly QueryPair[], opts: CorpusSearchOptions): Promise<PromiseSettledResult<CorpusMemorySearchResult[]>[]>;
     listSkills(): Promise<SkillCatalogEntry[]>;
     skillAliases(canonicalPath: string): readonly string[];
     searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;

@@ -63,6 +63,20 @@ export function extractionHistory(messages: ExtractionMessage[], count: number):
   return kept;
 }
 
+/**
+ * The host cursor that fences a stored checkpoint cursor: the bookmark's page fence, or the cursor itself.
+ * Undefined for a malformed bookmark, which callers must treat as a source reset.
+ */
+export function checkpointFence(cursor: string): string | undefined {
+  if (!cursor.startsWith(PREFIX)) return cursor;
+  try {
+    const parsed: unknown = JSON.parse(cursor.slice(PREFIX.length));
+    return Value.Check(bookmarkSchema, parsed) ? parsed.fence : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** SDK pages are transport only. A chunk always belongs to exactly one session. */
 export async function readExtractionChunk(params: { agentId: string; agentName: string; session: ExtractionSession;
   cursor: string | null; context: ExtractionMessage[]; signal: AbortSignal;

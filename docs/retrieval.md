@@ -315,7 +315,8 @@ or `memory_get`. Enable it in the plugin config with an explicit corpus allowlis
     "minUsefulness": 0.5,
     "maxHints": 3,
     "cooldownTurns": 10,
-    "timeoutMs": 3000
+    "timeoutMs": 5000,
+    "mode": "v2"
   }
 }
 ```
@@ -334,16 +335,47 @@ indexing/sync schedule.
 The example is a plugin config fragment; `knowledge` must already be configured.
 For a complete corpus example, use the [configuration profiles](configuration.md#example-profiles).
 
-Memory Whisperer runs directly on user turns without a pre-retrieval recall-gate
-classifier. Using the configured V2 query API — or deterministic local
-`lex`/`vec` query extraction if the query API fails, times out, or has no
-credentials — QMD searches its independent `lex` and `vec` queries through BM25
+`memoryWhisperer.mode` selects how queries are planned. The default, `"v2"`, uses only the
+decision model (`liquid/d1.2-ultra` by default) and never calls a query-model API;
+`"legacy"` is the opt-in rollback to the [query-model API path](#legacy-mode-api-query-generation).
+In v2 each user turn plans recall with two decision-model calls that run **in parallel**
+under one planning deadline:
+
+1. **Recall gate and corpus router** (`/v1/decisions`): one batched call asks whether the
+   current request needs historical memory beyond the visible thread (`need_recall`) and,
+   when more than one corpus is approved, whether each corpus could hold it. Below the gate
+   threshold (0.45) the turn is skipped (`gate_skipped`): no QMD search, no judging, and the
+   in-flight extraction is aborted immediately. Corpora scoring at least 0.35 are searched;
+   when none clear that bar, every approved corpus is searched.
+2. **Grounded topic extraction** (`/v1/extractions`): one call returns up to three anchor
+   phrases (people, handles, project names, IDs, antecedents of "it"/"that"). Each anchor must
+   occur verbatim in a conversation message, never only in a role label: a returned span is
+   checked against the message it points into (UTF-16 or code-point offsets) and the message's
+   own text is used, and without a span only a substring of a message is accepted.
+   Single-character anchors and anchors made only of stopwords ("it", "the", "this") are
+   rejected. Each anchor becomes one `{lex, vec}` pair (`lex` = anchor, `vec` = anchor plus
+   the current request); pairs are deduplicated after length bounding and then capped at three.
+
+Planning never takes more than half of `memoryWhisperer.timeoutMs`
+(`min(2 s, timeoutMs / 2)`), so at least half of the turn budget remains for retrieval and
+judging; each call is also bounded by its own 1.5-second stage deadline and the shared
+`decisionModel.timeoutMs`. A failed, timed-out or malformed gate fails open: every approved
+corpus is searched, using the extraction's grounded topics when it succeeded. A failed
+extraction, or one with no grounded anchors, falls back to deterministic local `lex`/`vec`
+queries. Turn cancellation is never treated as a fallback.
+
+QMD searches each topic's independent `lex` and `vec` queries through BM25
 and vectors respectively, retrieving ten candidates per backend across the
 complete approved collection scope (not ten per collection) and fusing them via
-passage-level RRF (`k = 60`, with QMD top-rank bonuses). The lexical adapter
+passage-level RRF (`k = 60`, with QMD top-rank bonuses). With several topics, all of them run
+in one queued QMD job (one wait behind background indexing, one metadata refresh) and their
+lists are fused again with passage-level RRF. One topic's failure does not hide the others;
+`topic_search_failed` is logged, and when nothing else was found the turn is recorded as
+`failed` rather than as a clean empty result. The lexical adapter
 uses literal OR keywords; quotation marks do not enable exact-phrase matching.
 After deduplication and cooldown filtering, Whisperer sends at most the top **six**
-fused candidates to the decision endpoint, paired with the current request and
+fused candidates to the decision endpoint (with several topics, each topic's best candidate
+is reserved a slot first), paired with the current request and
 recent whole messages. The decision model evaluates one independent Noul question per candidate in
 its own concurrent HTTP request: would a careful assistant use a specific factual
 detail from the excerpt when answering the current request? Partial answers and
@@ -354,17 +386,26 @@ are never included in the passage judge's state.
 `minUsefulness` defaults to `0.5` and
 thresholds the probability of yes, not a calibrated guarantee of accuracy.
 Explicit configured thresholds are preserved. Evaluate it on your own conversations.
+With several topics, the finalists reserve the most useful qualifying passage of each topic
+before filling the remaining slots by usefulness, so one topic's strong hits cannot crowd out
+another topic's qualifying hit.
 
-**Privacy and budgets:** query generation prepares the visible conversation up to
-8,192 `o200k_base` tokens and 24,000 UTF-8 bytes after serialization. The whole
-current request and most recent whole messages are retained; an oversized current
-request skips automatic memory before query generation or retrieval.
+**Privacy and budgets:** in v2 the recall gate and topic extraction receive the same
+budgeted conversation as the usefulness judge (the whole current request and newest whole
+messages, up to 4,096 `o200k_base` tokens and 24,000 bytes by default), the evaluation time
+and, for routing, the approved corpus names. Legacy query generation prepares the visible
+conversation up to 8,192 `o200k_base` tokens and 24,000 UTF-8 bytes after serialization for
+the query-model API. The whole current request and most recent whole messages are retained;
+an oversized current request skips automatic memory before planning or retrieval.
+Token budgets are computed locally; unusually long unbroken runs (base64, minified code) are
+counted conservatively in bounded chunks so tokenizing them cannot stall the Gateway.
 Diagnostics count `input_too_large`; completed logs report `outcome: "skipped"` and
 `reason: "input_too_large"`, without recording the input. Each decision model usefulness
 request receives the whole current request and newest whole messages that fit
 its separate budget (4,096 tokens and 24,000 bytes by default), plus one complete
-1,200-character excerpt, its corpus/source path, all represented message timestamps,
-and the request's evaluation time, capped at six candidate requests per turn.
+1,200-character excerpt, its corpus/source path, all represented message timestamps
+(and, for an extracted observation, its observation date), and the request's evaluation
+time, capped at six candidate requests per turn.
 Dates record when source messages were said, without inferring event dates.
 Session excerpts retain a complete turn or message when it fits,
 otherwise the complete matched chunk. Chunks exceeding the excerpt budget are
@@ -400,20 +441,27 @@ run concurrently, and a failed contribution does not discard successful siblings
 Unlike Skill Whisperer, **disabled decision model, a missing key, or no qualifying successful
 judgments means no memory hint**—there is no vector-only fallback. A failed candidate
 does not discard successful siblings. The overall process
-has a 3-second deadline, with the shared 1.5-second decision model request deadline inside it;
+has a 5-second deadline (`memoryWhisperer.timeoutMs`), with the shared 4-second
+`decisionModel.timeoutMs` request deadline and the planning budget above inside it;
 neither performs retries. Timed-out or superseded runs cannot inject late hints.
 Already-running local QMD work may finish in the background, but does not keep the
 agent waiting beyond the deadline. No new indexing, clustering, or summarization runs
 are triggered by this feature beyond the memory manager's normal initialization.
 
-### API query generation (Memory Whisperer remains off by default)
+### Legacy mode: API query generation
 
-Memory Whisperer uses deterministic queries by default. To use a resident V2 query-model API, explicitly configure its endpoint and credential file:
+`mode: "legacy"` restores the pre-v2 path: no recall gate, no corpus routing and no topic
+extraction; one `{lex, vec}` pair per turn from a resident query-model API, or deterministic
+local queries when no endpoint is configured. In v2 (the default) `api.endpoint` is still
+accepted so existing configs keep loading, but it is ignored; the Gateway logs one
+`query_api_ignored` note at startup when it is set. To keep using the query-model API, set
+the mode explicitly along with its endpoint and credential file:
 
 ```json
 {
   "memoryWhisperer": {
     "enabled": false,
+    "mode": "legacy",
     "corpora": ["memory", "knowledge", "sessions"],
     "timeoutMs": 8000,
     "api": {
@@ -460,19 +508,20 @@ surrounding whitespace is trimmed. Old query arrays are not accepted. Unparseabl
 timed-out, or unavailable v2 output falls back to deterministic local `lex`/`vec`
 queries for that turn and still requires decision model passage judgments.
 Nothing changes in manual `memory_search` beyond passage-level RRF scoring in
-shared candidate discovery. The default total deadline remains three seconds;
+shared candidate discovery. The default total deadline is five seconds;
 measure the full path before choosing a larger explicit budget.
 Already-running native retrieval may finish after cancellation, but cannot inject.
 
-Diagnostics distinguish `queries_generated`, `generation_fallback`, `failed`,
-and `judge_candidate_failed`. Gateway logs prefixed
+Diagnostics distinguish v2 planning (`gate_skipped`, `gate_fallback`, `topics_extracted`,
+`extraction_fallback`, `topic_search_failed`), legacy generation (`queries_generated`,
+`generation_fallback`), `failed`, and `judge_candidate_failed`. Gateway logs prefixed
 `unblock-memory memory_whisperer` contain structured JSON with agent/run/session
 IDs, candidate index, elapsed time, request timeout, and safe
 failure codes (`timeout`, `cancelled`, `http_error`, `network_error`,
 `invalid_response`, `credentials`, `unavailable`; HTTP failures include the status).
 Unexpected local errors identify the failed stage without dumping the exception.
 A single completion record per run includes its outcome/reason, available stage
-timings, query/candidate counts, `queryFallback` flag, `requestsSucceeded`/`requestsFailed`,
+timings, `mode`, gate score, topic and query/candidate counts, `queryFallback` flag, `requestsSucceeded`/`requestsFailed`,
 partial-result flag, and emitted hint count. Prompt rebuilds reuse the result without
 duplicate logs. Logs never include queries, prompts, excerpts, credentials, provider
 bodies, or raw exceptions; exact query text is not retained by this telemetry.

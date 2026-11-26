@@ -15,7 +15,7 @@ settings; a rotated credential file is reread without a restart.
 | `memory_search` | Installed/enabled memory slot; configured corpora | Local retrieval-ranked leads with degraded warning | Successful judged siblings returned with a partial warning; total judging failure or unreadable key uses local retrieval fallback |
 | `memory_get` | Installed/enabled memory slot; configured corpora | Unchanged local indexed reads | Unchanged; its own indexing errors still matter |
 | Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Local vector matches meeting `minScore` | Keep active skills and matches from successful batches; no vector-only fallback |
-| Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; deadline failures still suppress the turn; query-API failures fall back to deterministic local queries before decision model judging |
+| Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; deadline failures still suppress the turn; v2 recall-gate failures search every approved corpus, and topic-extraction (or legacy query-API) failures fall back to deterministic local queries before decision model judging |
 | Complementary hints | Enabled Memory Whisperer + `complementaryHints` | No additional judgment; base hints also require a key | Keep baseline hints unless the total deadline expires |
 | Safety Whisperer | `safetyWhisperer.enabled`, at least one scenario, host hooks (conversation access and prompt injection) | Could not check: the turn proceeds without safety prompts (fails open) | Fails open; recorded as could-not-check, never as no match |
 | People store/tools | `people.enabled` | Available; automatic save review needs primer/key or verified manual alternative | Storage/inspection still available |
@@ -87,14 +87,14 @@ in the latency-sensitive whisperers.
     "endpoint": "https://codex.unblocklabs.ai/v1/decisions",
     "model": "liquid/d1.2-ultra",
     "apiKeyFile": "/absolute/path/to/secrets/unblock-memory-decisions.env",
-    "timeoutMs": 1500
+    "timeoutMs": 4000
   }
 }
 ```
 
 This is a **plugin config fragment**, not a top-level OpenClaw configuration.
 Defaults are `enabled: true`, `endpoint: "https://codex.unblocklabs.ai/v1/decisions"`,
-`model: "liquid/d1.2-ultra"`, and `timeoutMs: 1500` (routed through Codex LB to OpenRouter's
+`model: "liquid/d1.2-ultra"`, and `timeoutMs: 4000` (routed through Codex LB to OpenRouter's
 `liquid/d1.2-ultra` Decisions API). For a different provider, set its
 `endpoint`, `model`, and credential explicitly. Plain HTTP is allowed only on
 loopback (`localhost`, `127.0.0.1`, `[::1]`).
@@ -228,8 +228,10 @@ workflow are in [its own guide](response-audit.md).
 See [the extraction guide](extraction.md) for source approval, host LLM policy,
 single-session validation, backfill, and publication. Defaults: disabled,
 `publish: false`, `chatTypes: []`, hourly, six overlap messages, five chunks per run.
-`extraction.minSupport`, `minRetention`, and `minReplacement` independently accept
-0–1 and default to 0.90. Settings are operator-controlled; reload/restart after edits.
+`extraction.minSupport` and `minRetention` independently accept 0–1 and default to 0.90.
+`extraction.minReplacement` (0–1, default 0.90) is accepted but deprecated: extraction appends
+immutable dated observations and never replaces earlier ones. It still forms part of the
+checkpoint policy fingerprint, so changing it rewinds sessions like any other policy change. Settings are operator-controlled; reload/restart after edits.
 Extraction always uses its own 10-second decision model deadline, not `decisionModel.timeoutMs`.
 
 ## Settings reference
@@ -262,20 +264,21 @@ contract; these tables explain their effects.
 | `decisionModel.model` | `liquid/d1.2-ultra` | Requested model alias; dated `liquid/d1.2-ultra-*` snapshots are rejected on the default route |
 | `decisionModel.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
 | `decisionModel.apiKeyFile` | Unset | Absolute plaintext-key or dotenv file; reread at credential resolution. If missing, no fallback |
-| `decisionModel.timeoutMs` | `1500` | 1–10,000 per request for Memory Whisperer, quality/claim/cluster review and response audit; Skill Whisperer uses its own 3-second budget, primer and dossier save use `peoplePrimer.timeoutMs`, and Safety Whisperer uses `safetyWhisperer.timeoutMs` |
+| `decisionModel.timeoutMs` | `4000` | 1–10,000 per request for Memory Whisperer, quality/claim/cluster review and response audit; Skill Whisperer uses its own 3-second budget, primer and dossier save use `peoplePrimer.timeoutMs`, and Safety Whisperer uses `safetyWhisperer.timeoutMs` |
 | `skillWhisperer.enabled` | `true` with a `skills` corpus, else `false` | Needs appropriate host hook access; fixed 3-second total deadline; `false` opts out. An explicit `true` without a skills corpus logs a warning and stays inactive |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for decision model shortlist admission |
 | `skillWhisperer.cooldownTurns` | `10` | Legacy nonnegative integer, accepted for compatibility; no longer used |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, decision model key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
-| `memoryWhisperer.api.endpoint` | Empty | Optional query-model API URL. Unset or empty uses deterministic local queries. |
-| `memoryWhisperer.api.apiKeyFile` | unset | Absolute path to a file containing the API bearer token. Missing credentials, timeouts, or API failures fall back to deterministic local queries before decision model judging. |
+| `memoryWhisperer.mode` | `"v2"` | `"v2"`: decision-model recall gate + corpus router and grounded topic extraction (up to three topics), run in parallel within `min(2 s, timeoutMs / 2)`; never calls a query-model API. `"legacy"`: opt-in rollback to one query pair per turn from `api` (or deterministic local queries). See [Memory Whisperer](retrieval.md#memory-whisperer) |
+| `memoryWhisperer.api.endpoint` | Empty | **Legacy mode only.** Optional query-model API URL; unset or empty uses deterministic local queries. Still accepted in v2 so existing configs load, but ignored there (one `query_api_ignored` startup log note). |
+| `memoryWhisperer.api.apiKeyFile` | unset | **Legacy mode only.** Absolute path to a file containing the API bearer token. Missing credentials, timeouts, or API failures fall back to deterministic local queries before decision model judging. |
 | `memoryWhisperer.mlx` | unset | Deprecated: old absolute `{pythonPath, modelPath}` values are accepted but ignored for upgrade compatibility. Remove after configuring `api`. |
 | `memoryWhisperer.minUsefulness` | `0.5` | 0–1, minimum Noul yes-probability per candidate; explicit overrides are preserved |
 | `memoryWhisperer.maxHints` | `3` | 1–3 |
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
-| `memoryWhisperer.timeoutMs` | `3000` | 1–10,000 total whisper deadline, not just the provider timeout |
+| `memoryWhisperer.timeoutMs` | `5000` | 1–10,000 total whisper deadline, not just the provider timeout. v2 planning (gate + extraction) uses at most half of it |
 | `memoryWhisperer.complementaryHints` | `false` | Optional extra redundancy judgment; does not expand retrieval or enable the feature |
 | `safetyWhisperer.enabled` | `false` | Requires at least one scenario, decision-model credentials and host hooks; see [Safety Whisperer](#safety-whisperer) |
 | `safetyWhisperer.historyMessages` | `6` | 0–20 earlier visible messages, whole messages only, for resolving follow-ups |
@@ -417,7 +420,7 @@ boundary, not multi-tenant authorization. Approve sources for the agent's audien
 | Feature | Evidence sent when explicitly enabled/approved |
 | --- | --- |
 | Skill selection | Bounded visible current/recent conversation + shortlisted skill names/descriptions; not skill procedures or source-path fields |
-| Memory hints | The visible conversation (up to 8,192 `o200k_base` tokens and 24,000 bytes) goes to the configured query API (when available); decision model passage judging receives the whole current request and recent whole messages (up to 4,096 tokens and 24,000 bytes by default) plus one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps and evaluation time per candidate, capped at the top 6 RRF-fused eligible passages from at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
+| Memory hints | v2: the budgeted conversation (whole current request and recent whole messages, up to 4,096 tokens and 24,000 bytes by default), evaluation time and approved corpus names go to the decision endpoint for the recall gate, corpus routing and topic extraction. Legacy: the visible conversation (up to 8,192 `o200k_base` tokens and 24,000 bytes) goes to the configured query API (when available). Decision model passage judging receives the whole current request and recent whole messages (up to 4,096 tokens and 24,000 bytes by default) plus one complete excerpt (up to 1,200 characters), corpus/source path, represented-message timestamps (or an extracted observation's date) and evaluation time per candidate, capped at the top 6 RRF-fused eligible passages from at most 10 BM25 + 10 vector candidates across the approved scope. All indexed sessions in approved corpora are eligible; `chatTypes` controls DMs. |
 | Complementarity | Up to 4 already-qualified excerpts, shared by up to 6 directional redundancy checks per request |
 | People primer | Person identity, agent name, and up to 4 approved retrieved excerpts with their source/session metadata per request (16,000 serialized state bytes); all indexed sessions eligible if approved, not just the current chat |
 | Dossier save/draft review | Proposed blurb, person/agent names and 1–3 exact approved indexed evidence ranges, at most 6,000 characters total; existing dossier is not evidence |

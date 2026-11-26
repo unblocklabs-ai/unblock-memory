@@ -1,5 +1,4 @@
-import { Tiktoken } from "js-tiktoken/lite";
-import o200kBase from "js-tiktoken/ranks/o200k_base";
+import { o200kTokenIds } from "./o200k.js";
 export const QUERY_CONTRACT = { revision: "o200k-v1", conversationBytes: 24_000, conversationTokens: 8192 };
 export class QueryInputBudgetError extends Error {
     constructor() { super("Query input exceeds context budget"); this.name = "QueryInputBudgetError"; }
@@ -16,9 +15,9 @@ export function parseQueryPair(value) {
 export function serializeQueryConversation(conversation) {
     return JSON.stringify({ history: conversation.history, currentRequest: conversation.currentRequest }).replaceAll("<", "\\u003c");
 }
-let tokenizer;
+/** Bounded o200k_base IDs: exact for ordinary text, linear and conservative for long unbroken runs. */
 export function queryTokenIds(text) {
-    return (tokenizer ??= new Tiktoken(o200kBase)).encode(text, [], []);
+    return o200kTokenIds(text);
 }
 /** Never alter the current request or split a history message. */
 export function prepareQueryConversation(history, currentRequest) {

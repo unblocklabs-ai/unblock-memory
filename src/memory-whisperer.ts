@@ -108,13 +108,14 @@ async function planQueriesV2(params: {
   asOf: string;
   apiKey: string;
   decisionModel: UnblockMemoryConfig["decisionModel"];
+  turnTimeoutMs: number;
   signal: AbortSignal;
   turn: TurnTelemetry;
   agentId: string;
   diagnostics?: WhispererDiagnostics;
   log: TurnLogger;
 }): Promise<RecallPlan> {
-  const { conversation, corpora, asOf, apiKey, decisionModel, signal, turn, agentId, diagnostics, log } = params;
+  const { conversation, corpora, asOf, apiKey, decisionModel, turnTimeoutMs, signal, turn, agentId, diagnostics, log } = params;
   turn.stage = "gate";
   const started = performance.now();
   const endPlanning = startTiming("generationMs", turn.measurement, signal);
@@ -122,7 +123,7 @@ async function planQueriesV2(params: {
   try {
     plan = await planRecall({
       apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs,
-      conversation, asOf, corpora, signal, onStage: stage => { turn.stage = stage; },
+      conversation, asOf, corpora, signal, turnTimeoutMs, onStage: stage => { turn.stage = stage; },
     });
   } finally {
     endPlanning();
@@ -306,6 +307,13 @@ export function registerMemoryWhisperer(
   });
   // v2 never constructs the query-model client, even when an old config still names its endpoint.
   const generator = legacy && config.api.endpoint ? new ApiQueryGenerator(config.api) : undefined;
+  if (!legacy && config.api.endpoint) {
+    api.logger.info("unblock-memory memory_whisperer " + JSON.stringify({
+      event: "query_api_ignored", mode,
+      note: "memoryWhisperer.mode \"v2\" plans queries with the decision model (d1.2) and ignores memoryWhisperer.api.endpoint; " +
+        "set mode \"legacy\" to keep using the query-model API",
+    }));
+  }
 
   const beforePrompt: WhispererPrompt = async (event, context, surface) => {
     const { agentId, runId, sessionId, sessionKey } = context;
@@ -409,7 +417,8 @@ export function registerMemoryWhisperer(
         turn.queryCount = 2;
       } else {
         const plan = await planQueriesV2({
-          conversation: judgeConversation.conversation, corpora, asOf, apiKey, decisionModel, signal, turn, agentId, diagnostics, log,
+          conversation: judgeConversation.conversation, corpora, asOf, apiKey, decisionModel, turnTimeoutMs: config.timeoutMs,
+          signal, turn, agentId, diagnostics, log,
         });
         if (signal.aborted) return;
         if (!plan.shouldRecall) {
@@ -461,6 +470,16 @@ export function registerMemoryWhisperer(
       });
       if (signal.aborted || !sessions.isCurrent(state)) return;
       turn.measurement.judgeMs = search.judgeMs;
+      if (search.topicsFailed) {
+        diagnostics?.record(agentId, "memory", "topic_search_failed");
+        log("warn", "topic_search_failed", { topicsFailed: search.topicsFailed, topicCount: turn.topicCount });
+      }
+      if (!search.eligible && search.topicsFailed) {
+        // A partially failed retrieval with nothing to judge is not a clean empty result.
+        turn.reason = "topic_search_failed"; turn.measurement.outcome = "failed";
+        recordLedger("failed", search.rankingMode);
+        return;
+      }
       if (!search.eligible) {
         turn.reason = "no_candidates";
         diagnostics?.record(agentId, "memory", "no_candidates");

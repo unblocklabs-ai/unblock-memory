@@ -67,7 +67,8 @@
     "corpusMinScore": 0.35,
     "maxTopics": 3,
     "gateTimeoutMs": 1500,
-    "extractTimeoutMs": 1500
+    "extractTimeoutMs": 1500,
+    "planningTimeoutMs": 2000
   },
   "skillWhisperer": {
     "maxCandidates": 10,

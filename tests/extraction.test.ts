@@ -10,7 +10,7 @@ import { createStore } from "@unblocklabs/qmd";
 import { ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveConfig } from "../src/config.js";
 import { DEFAULTS } from "../src/defaults.js";
-import { EXTRACTION_INPUT_TARGET, extractWithDecisionModel, validateExtractedMemories, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
+import { EXTRACTION_INPUT_TARGET, EXTRACTION_VERSION, extractWithDecisionModel, validateExtractedMemories, type ExtractionMessage, type MemoryProposal } from "../src/extraction-model.js";
 import { buildCompleteRevision, ExtractionLeaseLostError, extractionPolicyFingerprint, ExtractionStore, type ExtractionSession } from "../src/extraction-store.js";
 import { runExtraction } from "../src/extraction-worker.js";
 import { readExtractionPage, type ExtractionPage } from "../src/extraction-source.js";
@@ -534,7 +534,7 @@ test("policy and prompt version changes invalidate complete_revision and re-scan
   const readsAfter1 = reads;
 
   // Same policy & prompt version skips cleanly without reading delta.
-  const r2 = await runExtraction(makeOpts({ extraction: { ...thresholds, minReplacement: 0 } }, "lasting-facts-v11"));
+  const r2 = await runExtraction(makeOpts({}, "lasting-facts-v11"));
   assert.equal(r2.unchanged, 1);
   assert.equal(reads, readsAfter1);
 
@@ -749,7 +749,8 @@ test("policy change and unversioned legacy partial cursors rewind before process
   const r2 = await runExtraction(makeOpts(cfgB));
   assert.equal(r2.status, "completed");
   assert.equal(r2.accepted, 1);
-  assert.deepEqual(observedCursors, [null, "c1", null, "c1"], "Policy B must rewind instead of resuming Policy A's partial cursor");
+  assert.deepEqual(observedCursors, [null, "c1", "c1", null, "c1"],
+    "Policy B verifies Policy A's partial cursor against the source, then rewinds instead of resuming it");
   store = new ExtractionStore(f.storePath);
   try {
     const cp = store.readCheckpoint(s.sessionId)!;
@@ -823,7 +824,8 @@ test("policy change and unversioned legacy partial cursors rewind before process
   });
   assert.equal(legacyRun.status, "completed");
   assert.equal(legacyRun.accepted, 1);
-  assert.equal(legacyCursors[0], null, "unversioned legacy partial cursor must rewind to null");
+  assert.deepEqual(legacyCursors.slice(0, 2), ["c1", null],
+    "unversioned legacy partial cursor is verified against the source, then rewinds to null");
   const legacyStore = new ExtractionStore(legacy.storePath);
   try {
     const cp = legacyStore.readCheckpoint(s.sessionId)!;
@@ -874,4 +876,104 @@ test("extraction-runtime gateway_stop then gateway_start with extraction disable
   await hooks.get("gateway_start")!();
   assert.equal(scheduledRuns, 0, "gateway_start must not trigger scheduled ticks when extraction is disabled");
   assert.deepEqual(await invoke(), { ok: true, data: { status: "disabled" }, err: undefined });
+});
+
+test("upgrading a v0.15.x node is forward-only: same policy fingerprint, no cursor rewind, no resurrected rows", async () => {
+  const f = await fixture();
+  const cfg = config();
+  assert.equal(EXTRACTION_VERSION, DEFAULTS.extraction.version, "the prompt version is unchanged");
+  // The exact v0.15.3 fingerprint recipe, computed independently of extractionPolicyFingerprint.
+  const legacy = createHash("sha256").update(JSON.stringify({
+    version: DEFAULTS.extraction.version, historyMessages: cfg.extraction.historyMessages,
+    minSupport: cfg.extraction.minSupport, minRetention: cfg.extraction.minRetention,
+    minReplacement: cfg.extraction.minReplacement,
+    extractorModel: cfg.decisionModel.model ?? null, validatorModel: cfg.decisionModel.model ?? null,
+  })).digest("hex");
+  assert.equal(extractionPolicyFingerprint({ version: EXTRACTION_VERSION, ...cfg.extraction,
+    extractorModel: cfg.decisionModel.model, validatorModel: cfg.decisionModel.model }), legacy);
+  // Seed a v0.15.x checkpoint: an advanced cursor, one active fact and one superseded revision.
+  const store = new ExtractionStore(f.storePath), owner = store.claim(false, 0)!;
+  store.checkpoint(session, owner, 0, legacy);
+  store.commit({ session, expected: null, cursor: "c1", context: [], accepted: [{ proposal, observedAt: 1000, judgment: {} }],
+    owner, version: DEFAULTS.extraction.version, policyFingerprint: legacy });
+  store.db.prepare(`INSERT INTO extracted_memories VALUES('old',1,'s1','Bek liked blue.','d','[]',500,'superseded','{}','v11',1)`).run();
+  store.release(owner); store.close();
+  const cursors: (string | null)[] = [];
+  const next = { ...messages[0]!, id: "m2", timestamp: 2000, text: "I live in Brooklyn." };
+  const result = await runExtraction({ config: cfg, storePath: f.storePath, agentId: "main", agentName: "Bill", sessions: () => [session],
+    signal: signal(), validate: acceptAll,
+    readPage: async (_id, _name, _s, cursor) => { cursors.push(cursor); return cursor === "c2" ? page("c2", []) : page("c2", [next]); },
+    extract: async () => [{ text: "Bek lives in Brooklyn.", replaces: null, evidence: [{ messageId: "m2", quote: next.text }] }] });
+  assert.equal(result.accepted, 1);
+  assert.equal(cursors[0], "c1", "resumes the stored cursor");
+  assert.ok(!cursors.includes(null), "never replays history from the start");
+  const reopened = new ExtractionStore(f.storePath);
+  try {
+    assert.equal(reopened.readCheckpoint("s1")?.policyFingerprint, legacy);
+    assert.deepEqual(reopened.records("s1").map(r => r.text), [proposal.text, "Bek lives in Brooklyn."]);
+    assert.equal(reopened.db.prepare("SELECT status FROM extracted_memories WHERE id='old'").get()?.status, "superseded");
+  } finally { reopened.close(); }
+});
+
+test("an intentional rewind verifies the stored cursor first, so a rewritten source withdraws stale observations", async t => {
+  for (const [name, rewind] of [
+    ["broader backfill", { since: 0, config: config() }],
+    ["policy change", { since: undefined, config: config({ extraction: { enabled: true, chatTypes: ["channel"], intervalMinutes: 0, minSupport: 0.8 } }) }],
+  ] as const) {
+    await t.test(name, async () => {
+      const f = await fixture();
+      const store = new ExtractionStore(f.storePath), owner = store.claim(false, 0)!;
+      store.checkpoint(session, owner, 5000);
+      store.commit({ session, expected: null, cursor: "g1:1", context: [], accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
+      store.release(owner); store.close();
+      const cursors: (string | null)[] = [];
+      const fresh = { ...messages[0]!, id: "n1", timestamp: 6000, text: "I moved to Queens." };
+      const result = await runExtraction({ config: rewind.config, storePath: f.storePath, agentId: "main", agentName: "Bill",
+        sessions: () => [session], since: rewind.since, signal: signal(), validate: acceptAll,
+        readPage: async (_id, _name, _s, cursor) => {
+          cursors.push(cursor);
+          // The session was rewritten: the old generation's cursor no longer exists.
+          if (cursor?.startsWith("g1:")) return { kind: "reset", cursor: "g2:0" };
+          return page("g2:1", [fresh]);
+        },
+        extract: async () => [{ text: "Bek moved to Queens.", replaces: null, evidence: [{ messageId: "n1", quote: fresh.text }] }] });
+      assert.equal(result.status, "completed");
+      assert.deepEqual(cursors.slice(0, 2), ["g1:1", null], "verifies the old cursor before replaying from the start");
+      const reopened = new ExtractionStore(f.storePath);
+      try {
+        assert.deepEqual(reopened.records("s1").map(r => r.text), ["Bek moved to Queens."], "deleted-source observations are withdrawn");
+        assert.equal(reopened.db.prepare("SELECT status FROM extracted_memories WHERE text=?").get(proposal.text)?.status, "withdrawn");
+      } finally { reopened.close(); }
+    });
+  }
+  await t.test("an unavailable source keeps the cursor for the next verification", async () => {
+    const f = await fixture();
+    const store = new ExtractionStore(f.storePath), owner = store.claim(false, 0)!;
+    store.checkpoint(session, owner, 5000);
+    store.commit({ session, expected: null, cursor: "g1:1", context: [], accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
+    store.release(owner); store.close();
+    const result = await runExtraction({ config: config(), storePath: f.storePath, agentId: "main", agentName: "Bill",
+      sessions: () => [session], since: 0, signal: signal(), readPage: async () => ({ kind: "unavailable" }) });
+    assert.equal(result.status === "completed" && result.failed, 1);
+    const reopened = new ExtractionStore(f.storePath);
+    try {
+      assert.equal(reopened.readCheckpoint("s1")?.cursor, "g1:1");
+      assert.equal(reopened.readCheckpoint("s1")?.since, 5000);
+      assert.equal(reopened.records("s1").length, 1);
+    } finally { reopened.close(); }
+  });
+});
+
+test("a repeated no-span quote never rebinds to an unrelated speaker", async t => {
+  const text = "The launch moved to Friday.";
+  const bek: ExtractionMessage = { id: "bek", speaker: "Bek", role: "user", text, timestamp: 1000 };
+  const rico: ExtractionMessage = { id: "rico", speaker: "Rico", role: "user", text, timestamp: 2000 };
+  const bekAgain: ExtractionMessage = { ...bek, id: "bek-again", timestamp: 3000 };
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) =>
+    Response.json({ model: JSON.parse(String(init.body)).model, answers: { memories: { value: [text, text, text] } } }));
+  const proposals = await extractWithDecisionModel({ messages: [bek, rico, bekAgain], newIds: ["bek", "rico", "bek-again"],
+    apiKey: "test", signal: signal() });
+  assert.deepEqual(proposals.map(p => [p.text, p.evidence[0]!.messageId]), [[`Bek: ${text}`, "bek"], [`Bek: ${text}`, "bek-again"]]);
+  const single = await extractWithDecisionModel({ messages: [bek, rico], newIds: ["bek", "rico"], apiKey: "test", signal: signal() });
+  assert.deepEqual(single.map(p => p.evidence[0]!.messageId), ["bek"], "the repeat is dropped, not given to Rico");
 });

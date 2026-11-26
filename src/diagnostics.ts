@@ -4,7 +4,7 @@ type Whisperer = "skill" | "memory" | "safety" | "myTurn";
 type Outcome = "missing_key" | "decision_disabled" | "no_candidates" | "rejected" |
   "emitted" | "active_reused" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" |
   "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" |
-  "gate_skipped" | "gate_fallback" | "topics_extracted" | "extraction_fallback" |
+  "gate_skipped" | "gate_fallback" | "topics_extracted" | "extraction_fallback" | "topic_search_failed" |
   "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
 
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */

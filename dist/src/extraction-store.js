@@ -9,12 +9,13 @@ export class ExtractionLeaseLostError extends Error {
     }
 }
 export function extractionPolicyFingerprint(params) {
+    // Byte-for-byte the v0.15.x shape. Any change rewinds every live checkpoint and replays full histories.
     return jsonHash({
         version: params.version,
         historyMessages: params.historyMessages,
         minSupport: params.minSupport,
         minRetention: params.minRetention,
-        immutableObservations: true,
+        minReplacement: params.minReplacement,
         extractorModel: params.extractorModel ?? null,
         validatorModel: params.validatorModel ?? null,
     });
@@ -116,6 +117,25 @@ export class ExtractionStore {
             policyFingerprint: row.policy_fingerprint,
             error: row.error,
         };
+    }
+    /**
+     * The stored cursor that `checkpoint()` would discard by rewinding (a broader backfill or a policy change), or
+     * null when it would resume. The caller must verify this cursor against the source first: once discarded, a
+     * rewritten or deleted session reads as a fresh page and its stale observations would stay active.
+     */
+    rewindCursor(session, since, policyFingerprint) {
+        const row = this.db.prepare("SELECT cursor,extract_since,complete_revision,policy_fingerprint FROM extraction_sessions WHERE session_id=?")
+            .get(session.sessionId);
+        const storedCursor = (row?.cursor ?? null);
+        if (!row || storedCursor === null)
+            return null;
+        if (since !== undefined && since < Number(row.extract_since))
+            return storedCursor;
+        if (policyFingerprint === undefined)
+            return null;
+        const storedCompleteRevision = row.complete_revision;
+        const completeRevisionPolicyMismatch = storedCompleteRevision !== null && parseCompleteRevision(storedCompleteRevision)?.policy !== policyFingerprint;
+        return row.policy_fingerprint !== policyFingerprint || completeRevisionPolicyMismatch ? storedCursor : null;
     }
     checkpoint(session, owner, since, policyFingerprint) {
         return immediateTransaction(this.db, () => {

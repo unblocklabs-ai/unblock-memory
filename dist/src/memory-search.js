@@ -62,6 +62,34 @@ function fuseTopicHits(lists) {
         .map(({ hit, rrf }) => ({ ...hit, score: rrf }));
     return { hits, topicRanks, topicCount: lists.length };
 }
+const timingCounters = new Set(["metadataReloads", "vectorScanAttempts"]);
+/**
+ * Parallel topic searches must not share one mutable timing sink: `startTiming` writes `previous + elapsed`, so
+ * overlapping stages overwrite each other. Each topic records into its own bucket; overlapping durations add
+ * their maximum (wall-clock lower bound) to the outer sink and counters add their sum.
+ */
+function mergeTopicTimings(target, buckets) {
+    if (!target)
+        return;
+    const fields = new Set(buckets.flatMap(bucket => Object.keys(bucket)));
+    for (const field of fields) {
+        const values = buckets.map(bucket => bucket[field] ?? 0);
+        const merged = timingCounters.has(field) ? values.reduce((sum, value) => sum + value, 0) : Math.max(...values);
+        target[field] = (target[field] ?? 0) + merged;
+    }
+}
+async function searchTopics(manager, topics, options) {
+    // One serialized job records its stages sequentially, so it can share the outer timing sink.
+    if (manager.searchCandidateTopics)
+        return manager.searchCandidateTopics(topics, options);
+    const buckets = topics.map(() => ({}));
+    try {
+        return await Promise.allSettled(topics.map((topic, index) => manager.searchCandidates(topic, { ...options, ...(options.timings ? { timings: buckets[index] } : {}) })));
+    }
+    finally {
+        mergeTopicTimings(options.timings, buckets);
+    }
+}
 /** Reserve the best eligible candidate of each topic first, then fill by fused score up to `limit`. */
 function reserveTopicCandidates(candidates, fusion, limit) {
     const ranked = [...candidates].sort((a, b) => b.score - a.score);
@@ -89,9 +117,28 @@ function reserveTopicCandidates(candidates, fusion, limit) {
     return ranked.filter(candidate => picked.has(candidate));
 }
 /**
+ * Finalists after usefulness filtering: reserve the most useful qualifying passage of each topic first, then fill
+ * by usefulness, so one topic's many strong hits cannot push another topic's qualifying hit out of the results.
+ */
+function reserveTopicFinalists(passed, fusion, limit) {
+    const ranked = [...passed].sort((a, b) => b.result.score - a.result.score);
+    const picked = new Set();
+    for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
+        const best = ranked.find(entry => fusion.topicRanks.get(memoryPassageId(entry.result.snippet))?.[topic] !== undefined);
+        if (best)
+            picked.add(best);
+    }
+    for (const entry of ranked) {
+        if (picked.size >= limit)
+            break;
+        picked.add(entry);
+    }
+    return ranked.filter(entry => picked.has(entry));
+}
+/**
  * Both entry points use the same complete passages and independent usefulness judgments.
- * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search in parallel and
- * fuse with passage-level RRF, reserving at least one judge slot per topic.
+ * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search together (one
+ * manager job when supported) and fuse with passage-level RRF, reserving a judge slot and a finalist slot per topic.
  */
 export async function searchMemory(manager, queries, options) {
     const { signal } = options;
@@ -108,16 +155,18 @@ export async function searchMemory(manager, queries, options) {
     };
     let hits;
     let fusion;
+    let topicsFailed;
     try {
         if (topics.length === 1) {
             hits = await manager.searchCandidates(topics[0], searchOptions);
         }
         else {
-            const settled = await Promise.allSettled(topics.map(topic => manager.searchCandidates(topic, searchOptions)));
+            const settled = await searchTopics(manager, topics, searchOptions);
             signal?.throwIfAborted();
             // One failed topic must not hide the others; fail only when every topic search failed.
             if (settled.every(result => result.status === "rejected"))
                 throw settled[0].reason;
+            topicsFailed = settled.filter(result => result.status === "rejected").length;
             fusion = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
             hits = fusion.hits;
         }
@@ -129,7 +178,8 @@ export async function searchMemory(manager, queries, options) {
     }
     signal?.throwIfAborted();
     const observation = { retrievalMs: timings.retrievalMs ?? 0, judgeMs: 0,
-        candidates: hits.length, eligible: 0, requestsSucceeded: 0, requestsFailed: 0 };
+        candidates: hits.length, eligible: 0, requestsSucceeded: 0, requestsFailed: 0,
+        ...(topicsFailed !== undefined ? { topicsFailed } : {}) };
     const trackTrace = Boolean(options.onTrace);
     const candidates = [];
     const traces = [];
@@ -232,8 +282,12 @@ export async function searchMemory(manager, queries, options) {
             try {
                 const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
                     excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
-                    dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
-                            ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],
+                    // Observation dates let the judge order contradictory dated observations (e.g. 2025 vs 2026).
+                    dates: [...new Set([
+                            ...(hit.extracted?.observedAt ? [hit.extracted.observedAt] : []),
+                            ...(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
+                                ?? (hit.messageTimestamp ? [hit.messageTimestamp] : [])),
+                        ])],
                 }, asOf, options.model), { ...options, apiKey });
                 signal?.throwIfAborted();
                 observation.requestsSucceeded++;
@@ -265,10 +319,11 @@ export async function searchMemory(manager, queries, options) {
     observation.judgeMs = timings.judgeMs ?? 0;
     if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
         return fallback("all_judgments_failed");
-    const passed = judged
-        .filter(({ result }) => result.score >= minUsefulness)
-        .sort((a, b) => b.result.score - a.result.score)
-        .slice(0, options.maxResults ?? 5);
+    const qualifying = judged.filter(({ result }) => result.score >= minUsefulness);
+    const maxResults = options.maxResults ?? 5;
+    const passed = fusion
+        ? reserveTopicFinalists(qualifying, fusion, maxResults)
+        : qualifying.sort((a, b) => b.result.score - a.result.score).slice(0, maxResults);
     if (trackTrace) {
         for (const [index, entry] of passed.entries()) {
             if (entry.trace) {

@@ -116,7 +116,7 @@ Everything below is off until you configure it.
 | --- | --- |
 | [Session indexing](docs/retrieval.md#sessions) | Makes past conversations searchable. Group and channel chats by default; DMs only if you add them. |
 | [Skill Whisperer](docs/retrieval.md#skill-whisperer) | Routes relevant skills into a persistent per-session list. Never runs them. Turns on with a `skills` corpus; can also route locally. |
-| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to three relevant past excerpts before the agent replies. Needs a configured decision endpoint (`decisionModel`); optionally uses a self-hosted query-generation API with local fallback. |
+| [Memory Whisperer](docs/retrieval.md#memory-whisperer) | Adds up to three relevant past excerpts before the agent replies. Needs a configured decision endpoint (`decisionModel`). The default `mode: "v2"` first asks the decision model whether the turn needs memory at all and which corpora to search, then searches up to three topics copied verbatim from the conversation; `mode: "legacy"` instead uses a self-hosted query-generation API with local fallback. 5-second turn deadline by default. |
 | [Safety Whisperer](docs/configuration.md#safety-whisperer) | Reminds the agent not to share sensitive topics, such as one person's salary, with requestors you haven't approved. A prompt-level guardrail, not access control; fails open if the decision endpoint is unavailable. |
 | [My Turn](docs/configuration.md#my-turn) | Asks the configured decision model (default `liquid/d1.2-ultra` via Codex LB) whether a group/channel conversation needs this agent's response. Advises `NO_REPLY` only when silence is clearly favored; the agent keeps the final say. Opt-in; failures leave the turn unchanged. |
 | [People dossiers](docs/peoplesql.md) | Lets the agent keep a short, evidence-backed note about each person it works with. |
@@ -198,7 +198,7 @@ first.
 ```sh
 npm install
 npm run build
-npm test            # Node and Python 3 tests
+npm test            # Node test suite
 npm run preflight   # full pre-release check
 ```
 

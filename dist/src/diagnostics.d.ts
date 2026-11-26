@@ -1,6 +1,6 @@
 import { RetrievalTelemetry } from "./retrieval-telemetry.js";
 type Whisperer = "skill" | "memory" | "safety" | "myTurn";
-type Outcome = "missing_key" | "decision_disabled" | "no_candidates" | "rejected" | "emitted" | "active_reused" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" | "gate_skipped" | "gate_fallback" | "topics_extracted" | "extraction_fallback" | "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
+type Outcome = "missing_key" | "decision_disabled" | "no_candidates" | "rejected" | "emitted" | "active_reused" | "failed" | "timed_out" | "cancelled" | "unavailable" | "payload_limit" | "redundancy_unavailable" | "queries_generated" | "generation_fallback" | "judge_candidate_failed" | "input_too_large" | "gate_skipped" | "gate_fallback" | "topics_extracted" | "extraction_fallback" | "topic_search_failed" | "excluded" | "no_scenarios" | "empty_request" | "no_match" | "flagged" | "missing_identity" | "partial_response";
 /** Process-local, content-free and bounded. Agent IDs are keys, never included in snapshots. */
 export declare class WhispererDiagnostics {
     #private;
@@ -32,6 +32,7 @@ export declare class WhispererDiagnostics {
             gate_fallback?: number | undefined;
             topics_extracted?: number | undefined;
             extraction_fallback?: number | undefined;
+            topic_search_failed?: number | undefined;
             excluded?: number | undefined;
             no_scenarios?: number | undefined;
             empty_request?: number | undefined;
@@ -61,6 +62,7 @@ export declare class WhispererDiagnostics {
             gate_fallback?: number | undefined;
             topics_extracted?: number | undefined;
             extraction_fallback?: number | undefined;
+            topic_search_failed?: number | undefined;
             excluded?: number | undefined;
             no_scenarios?: number | undefined;
             empty_request?: number | undefined;
@@ -90,6 +92,7 @@ export declare class WhispererDiagnostics {
             gate_fallback?: number | undefined;
             topics_extracted?: number | undefined;
             extraction_fallback?: number | undefined;
+            topic_search_failed?: number | undefined;
             excluded?: number | undefined;
             no_scenarios?: number | undefined;
             empty_request?: number | undefined;
@@ -122,6 +125,7 @@ export declare class WhispererDiagnostics {
             gate_fallback?: number | undefined;
             topics_extracted?: number | undefined;
             extraction_fallback?: number | undefined;
+            topic_search_failed?: number | undefined;
             excluded?: number | undefined;
             no_scenarios?: number | undefined;
             empty_request?: number | undefined;

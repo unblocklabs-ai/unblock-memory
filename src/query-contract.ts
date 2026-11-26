@@ -1,5 +1,4 @@
-import { Tiktoken } from "js-tiktoken/lite";
-import o200kBase from "js-tiktoken/ranks/o200k_base";
+import { o200kTokenIds } from "./o200k.js";
 
 export type QueryLane = "lex" | "vec";
 export type QueryPair = Record<QueryLane, string>;
@@ -23,9 +22,9 @@ export function serializeQueryConversation(conversation: QueryConversation): str
   return JSON.stringify({ history: conversation.history, currentRequest: conversation.currentRequest }).replaceAll("<", "\\u003c");
 }
 
-let tokenizer: Tiktoken | undefined;
+/** Bounded o200k_base IDs: exact for ordinary text, linear and conservative for long unbroken runs. */
 export function queryTokenIds(text: string): number[] {
-  return (tokenizer ??= new Tiktoken(o200kBase)).encode(text, [], []);
+  return o200kTokenIds(text);
 }
 
 /** Never alter the current request or split a history message. */

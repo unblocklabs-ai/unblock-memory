@@ -964,7 +964,7 @@ const v2Event = {
 type ModelBody = { questions?: Record<string, unknown>; state?: unknown; fields?: unknown };
 type Reply = Response | Promise<Response>;
 function v2Model(t: { mock: { method: typeof import("node:test").mock.method } }, handlers: {
-  gate: (body: ModelBody) => Reply; extract?: (body: ModelBody) => Reply; judge?: (excerpt: string) => Reply;
+  gate: (body: ModelBody) => Reply; extract?: (body: ModelBody, init?: RequestInit) => Reply; judge?: (excerpt: string) => Reply;
 }) {
   const urls: string[] = [];
   const kinds: string[] = [];
@@ -974,7 +974,8 @@ function v2Model(t: { mock: { method: typeof import("node:test").mock.method } }
     const body = JSON.parse(String(init?.body)) as ModelBody;
     if (String(url).endsWith("/v1/extractions")) {
       kinds.push("extract");
-      return handlers.extract ? handlers.extract(body) : assert.fail("unexpected extraction");
+      // Extraction runs alongside the gate; tests without a handler get an empty topic list.
+      return handlers.extract ? handlers.extract(body, init) : topicsReply([]);
     }
     if (body.questions && "need_recall" in body.questions) { kinds.push("gate"); return handlers.gate(body); }
     kinds.push("judge");
@@ -1009,8 +1010,14 @@ test("v2: default mode resolves from config and never constructs or calls the co
   t.after(h.stop);
   assert.match((await h.before(v2Event, context))?.appendContext ?? "", /Deploy only after approval/u);
   assert.equal(generate.mock.callCount(), 0);
-  assert.deepEqual(model.kinds, ["gate", "extract", "judge"]);
+  assert.deepEqual(model.kinds.slice(0, 2).sort(), ["extract", "gate"], "gate and extraction run in parallel");
+  assert.deepEqual(model.kinds.slice(2), ["judge"]);
   assert.ok(model.urls.every(url => url.startsWith("https://codex.unblocklabs.ai/")));
+  const notes = h.logs.filter(line => line.includes('"event":"query_api_ignored"'));
+  assert.equal(notes.length, 1, "one startup note that v2 ignores api.endpoint");
+  assert.match(notes[0]!, /d1\.2/u);
+  await h.before(v2Event, { ...context, runId: "run-2" });
+  assert.equal(h.logs.filter(line => line.includes('"event":"query_api_ignored"')).length, 1, "logged once, not per turn");
 });
 
 test("v2: multi-topic extraction grounds anchors, searches routed corpora in parallel, and emits a hit per topic", async t => {
@@ -1052,15 +1059,44 @@ test("v2: multi-topic extraction grounds anchors, searches routed corpora in par
   assert.equal(ledger?.record.queryFallback, false);
 });
 
+test("v2: a partially failed multi-topic retrieval with no candidates is recorded as failed, not empty", async t => {
+  const { records, sink } = ledgerSink();
+  v2Model(t, {
+    gate: () => gateReply({ need_recall: 0.92, corpus_0: 0.81, corpus_1: 0.81 }),
+    extract: () => topicsReply(["Sarah's invoice", "Pearl's disk"]),
+  });
+  const h = harness([], { config: v2Config, recallLedger: sink, hybrid: async queries => {
+    if (queries.lex === "Pearl's disk") throw new Error("qmd lane failed");
+    return [];
+  } });
+  t.after(h.stop);
+  assert.equal(await h.before(v2Event, context), undefined);
+  assert.equal(h.diagnostics.snapshot("bill").memory.topic_search_failed, 1);
+  assert.ok(h.warnings.some(line => line.includes('"event":"topic_search_failed"')));
+  assert.equal(records[0]?.record.outcome, "failed");
+  const completed = JSON.parse(h.logs.at(-1)!.slice(logPrefix.length));
+  assert.equal(completed.reason, "topic_search_failed");
+});
+
 test("v2: self-contained turns skip QMD, extraction and judging entirely", async t => {
   const { records, sink } = ledgerSink();
-  const model = v2Model(t, { gate: () => gateReply({ need_recall: 0.08, corpus_0: 0.9, corpus_1: 0.9 }) });
+  let extractionAborted = false;
+  const model = v2Model(t, {
+    gate: () => gateReply({ need_recall: 0.08, corpus_0: 0.9, corpus_1: 0.9 }),
+    // The parallel extraction is in flight when the gate skips; it must be aborted, never awaited.
+    extract: (_body, init) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      const abort = () => { extractionAborted = true; reject(signal!.reason); };
+      if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
+    }),
+  });
   const h = harness(undefined, { config: v2Config, recallLedger: sink });
   t.after(h.stop);
   const rewrite = { prompt: "Rewrite that paragraph to be shorter", messages: [{ role: "assistant", content: "Here is a long paragraph." }] };
   assert.equal(await h.before(rewrite, context), undefined);
   assert.equal(await h.before(rewrite, context), undefined, "prompt rebuilds replay the skip");
-  assert.deepEqual(model.kinds, ["gate"]);
+  assert.deepEqual(model.kinds.sort(), ["extract", "gate"], "only the planning calls ran");
+  assert.ok(extractionAborted, "the gate skip aborts the in-flight extraction");
   assert.equal(h.lookups(), 0, "no memory manager lookup");
   assert.equal(h.searches.length, 0);
   assert.equal(h.diagnostics.snapshot("bill").memory.gate_skipped, 1);
