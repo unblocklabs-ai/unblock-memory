@@ -9,7 +9,7 @@ import { resolveInsideOut } from "./inside-out.js";
 import { resolveSafetyWhisperer } from "./safety-config.js";
 import { resolveMyTurn } from "./my-turn.js";
 import { resolveRecallLedger } from "./recall-ledger.js";
-const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"];
+const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
 const CHAT_TYPES = ["channel", "group", "direct"];

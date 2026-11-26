@@ -12,7 +12,7 @@ import { resolveSafetyWhisperer, type SafetyWhispererConfig } from "./safety-con
 import { resolveMyTurn, type MyTurnConfig } from "./my-turn.js";
 import { resolveRecallLedger, type RecallLedgerConfig } from "./recall-ledger.js";
 
-const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/**/*.md"] as const;
+const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
 

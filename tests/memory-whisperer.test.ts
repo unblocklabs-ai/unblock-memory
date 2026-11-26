@@ -583,7 +583,7 @@ test("selected memory keeps delimiter-like source text inside the combined promp
 
 test("memory whisperer requires explicit, known non-skill corpora and bounded controls", () => {
   assert.deepEqual(resolveConfig(undefined).memoryWhisperer, {
-    enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5, maxHints: 3, cooldownTurns: 10, timeoutMs: 3000,
+    enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5, maxHints: 3, cooldownTurns: 10, timeoutMs: 5000,
     api: { endpoint: "" },
   });
   assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.5);

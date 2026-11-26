@@ -9,7 +9,7 @@ test("Decision model is enabled by default with optional explicit credentials, e
     enabled: true,
     endpoint: "https://codex.unblocklabs.ai/v1/decisions",
     model: "liquid/d1.2-ultra",
-    timeoutMs: 1500,
+    timeoutMs: 4000,
   };
   assert.deepEqual(resolveConfig(undefined).decisionModel, defaultDecisionModel);
   assert.deepEqual(resolveConfig({}).decisionModel, defaultDecisionModel);

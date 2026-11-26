@@ -2,7 +2,7 @@
   "decisionModel": {
     "endpoint": "https://codex.unblocklabs.ai/v1/decisions",
     "model": "liquid/d1.2-ultra",
-    "timeoutMs": 1500,
+    "timeoutMs": 4000,
     "unboundedTimeoutMs": 60000
   },
   "extraction": {
@@ -76,7 +76,7 @@
     "defaultMinUsefulness": 0.5,
     "defaultMaxHints": 3,
     "defaultCooldownTurns": 10,
-    "defaultTimeoutMs": 3000
+    "defaultTimeoutMs": 5000
   },
   "skillWhisperer": {
     "maxCandidates": 10,
