@@ -7,6 +7,9 @@ import { parseDailyFilenameDateMs } from "./recall-ledger.js";
 export function memoryPassageId(text) {
     return createHash("sha256").update(text.replace(/\s+/gu, " ").trim()).digest("hex");
 }
+function isQueryList(queries) {
+    return Array.isArray(queries);
+}
 function resolveLocator(hit, passageId) {
     if (hit.locator)
         return hit.locator;
@@ -20,19 +23,104 @@ function resolveLocator(hit, passageId) {
     }
     return { rawLeafId: passageId, observedAtBasis: "unknown" };
 }
-/** Both entry points use the same complete passages and independent usefulness judgments. */
+/** Reciprocal-rank constant for cross-topic fusion, matching QMD's own lane fusion. */
+const TOPIC_RRF_K = 60;
+/**
+ * Deterministic passage-level RRF across topics: score = sum over topics of 1 / (60 + rank). Each passage keeps
+ * the metadata of its highest-scoring occurrence; ties keep first-seen order (topic order, then rank).
+ */
+function fuseTopicHits(lists) {
+    const fused = new Map();
+    const topicRanks = new Map();
+    let order = 0;
+    for (const [topic, hits] of lists.entries()) {
+        const seenInTopic = new Set();
+        let rank = 0;
+        for (const hit of hits) {
+            const passageId = memoryPassageId(hit.snippet);
+            if (seenInTopic.has(passageId))
+                continue;
+            seenInTopic.add(passageId);
+            rank++;
+            const ranks = topicRanks.get(passageId) ?? Array.from({ length: lists.length }, () => undefined);
+            ranks[topic] = rank;
+            topicRanks.set(passageId, ranks);
+            const contribution = 1 / (TOPIC_RRF_K + rank);
+            const existing = fused.get(passageId);
+            if (!existing) {
+                fused.set(passageId, { hit, rrf: contribution, order: order++ });
+            }
+            else {
+                existing.rrf += contribution;
+                if (hit.score > existing.hit.score)
+                    existing.hit = hit;
+            }
+        }
+    }
+    const hits = [...fused.values()]
+        .sort((a, b) => b.rrf - a.rrf || a.order - b.order)
+        .map(({ hit, rrf }) => ({ ...hit, score: rrf }));
+    return { hits, topicRanks, topicCount: lists.length };
+}
+/** Reserve the best eligible candidate of each topic first, then fill by fused score up to `limit`. */
+function reserveTopicCandidates(candidates, fusion, limit) {
+    const ranked = [...candidates].sort((a, b) => b.score - a.score);
+    const picked = new Set();
+    for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
+        let best;
+        let bestRank = Number.POSITIVE_INFINITY;
+        for (const candidate of ranked) {
+            const rank = fusion.topicRanks.get(memoryPassageId(candidate.snippet))?.[topic];
+            if (rank !== undefined && rank < bestRank) {
+                best = candidate;
+                bestRank = rank;
+            }
+        }
+        // A passage that is already the best hit of an earlier topic covers this topic too.
+        if (best)
+            picked.add(best);
+    }
+    for (const candidate of ranked) {
+        if (picked.size >= limit)
+            break;
+        picked.add(candidate);
+    }
+    // Keep the judge pool in fused-score order regardless of reservation order.
+    return ranked.filter(candidate => picked.has(candidate));
+}
+/**
+ * Both entry points use the same complete passages and independent usefulness judgments.
+ * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search in parallel and
+ * fuse with passage-level RRF, reserving at least one judge slot per topic.
+ */
 export async function searchMemory(manager, queries, options) {
     const { signal } = options;
     signal?.throwIfAborted();
     const asOf = options.asOf ?? new Date().toISOString();
     const timings = options.timings ?? {};
     const endRetrieval = startTiming("retrievalMs", timings, signal);
+    const topics = isQueryList(queries) ? queries : [queries];
+    if (!topics.length)
+        throw new RangeError("searchMemory requires at least one query pair");
+    const searchOptions = {
+        corpora: options.corpora, sessionFilter: options.sessionFilter, requestContext: options.requestContext,
+        sources: options.sources, signal, maxSnippetChars: MEMORY_PASSAGE_CHARS, timings,
+    };
     let hits;
+    let fusion;
     try {
-        hits = await manager.searchCandidates(queries, {
-            corpora: options.corpora, sessionFilter: options.sessionFilter, requestContext: options.requestContext,
-            sources: options.sources, signal, maxSnippetChars: MEMORY_PASSAGE_CHARS, timings,
-        });
+        if (topics.length === 1) {
+            hits = await manager.searchCandidates(topics[0], searchOptions);
+        }
+        else {
+            const settled = await Promise.allSettled(topics.map(topic => manager.searchCandidates(topic, searchOptions)));
+            signal?.throwIfAborted();
+            // One failed topic must not hide the others; fail only when every topic search failed.
+            if (settled.every(result => result.status === "rejected"))
+                throw settled[0].reason;
+            fusion = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
+            hits = fusion.hits;
+        }
     }
     finally {
         endRetrieval();
@@ -128,9 +216,11 @@ export async function searchMemory(manager, queries, options) {
     const maxJudge = typeof options.maxJudgeCandidates === "number" && Number.isFinite(options.maxJudgeCandidates)
         ? Math.max(0, Math.floor(options.maxJudgeCandidates))
         : undefined;
-    const judgePool = maxJudge !== undefined
-        ? [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge)
-        : candidates;
+    const judgePool = maxJudge === undefined
+        ? candidates
+        : fusion
+            ? reserveTopicCandidates(candidates, fusion, maxJudge)
+            : [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge);
     const minUsefulness = options.minUsefulness ?? 0.7;
     const apiKey = options.apiKey;
     const endJudge = startTiming("judgeMs", timings, signal);

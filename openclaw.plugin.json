@@ -759,7 +759,7 @@
           "api": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Optional authenticated query-model API. An empty or omitted endpoint uses deterministic local queries unless overridden by operational defaults.",
+            "description": "Optional authenticated query-model API, used only when mode is \"legacy\". Ignored (never called) in the default v2 mode. An empty or omitted endpoint uses deterministic local queries unless overridden by operational defaults.",
             "properties": {
               "endpoint": {
                 "type": "string",
@@ -790,6 +790,14 @@
                 "pattern": "^/"
               }
             }
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "v2",
+              "legacy"
+            ],
+            "description": "Query planning mode. \"v2\" (default) uses one decision-model recall gate and corpus router plus one grounded topic extraction, then local QMD search; it never calls memoryWhisperer.api. \"legacy\" restores the query-model API path."
           },
           "complementaryHints": {
             "type": "boolean",

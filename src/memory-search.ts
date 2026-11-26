@@ -36,6 +36,10 @@ export type RecallCandidateTrace = {
   finalRank?: number;
 };
 
+function isQueryList(queries: QueryPair | readonly QueryPair[]): queries is readonly QueryPair[] {
+  return Array.isArray(queries);
+}
+
 function resolveLocator(hit: CorpusMemorySearchResult, passageId: string): RecallHitLocator {
   if (hit.locator) return hit.locator;
   const extractedMs = hit.extracted?.observedAt ? Date.parse(hit.extracted.observedAt) : Number.NaN;
@@ -49,8 +53,83 @@ function resolveLocator(hit: CorpusMemorySearchResult, passageId: string): Recal
   return { rawLeafId: passageId, observedAtBasis: "unknown" };
 }
 
-/** Both entry points use the same complete passages and independent usefulness judgments. */
-export async function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
+/** Reciprocal-rank constant for cross-topic fusion, matching QMD's own lane fusion. */
+const TOPIC_RRF_K = 60;
+
+type TopicFusion = {
+  hits: CorpusMemorySearchResult[];
+  /** passageId -> 1-based rank within each topic's own result list (undefined when absent). */
+  topicRanks: Map<string, (number | undefined)[]>;
+  topicCount: number;
+};
+
+/**
+ * Deterministic passage-level RRF across topics: score = sum over topics of 1 / (60 + rank). Each passage keeps
+ * the metadata of its highest-scoring occurrence; ties keep first-seen order (topic order, then rank).
+ */
+function fuseTopicHits(lists: readonly CorpusMemorySearchResult[][]): TopicFusion {
+  const fused = new Map<string, { hit: CorpusMemorySearchResult; rrf: number; order: number }>();
+  const topicRanks = new Map<string, (number | undefined)[]>();
+  let order = 0;
+  for (const [topic, hits] of lists.entries()) {
+    const seenInTopic = new Set<string>();
+    let rank = 0;
+    for (const hit of hits) {
+      const passageId = memoryPassageId(hit.snippet);
+      if (seenInTopic.has(passageId)) continue;
+      seenInTopic.add(passageId);
+      rank++;
+      const ranks = topicRanks.get(passageId) ?? Array.from({ length: lists.length }, () => undefined);
+      ranks[topic] = rank;
+      topicRanks.set(passageId, ranks);
+      const contribution = 1 / (TOPIC_RRF_K + rank);
+      const existing = fused.get(passageId);
+      if (!existing) {
+        fused.set(passageId, { hit, rrf: contribution, order: order++ });
+      } else {
+        existing.rrf += contribution;
+        if (hit.score > existing.hit.score) existing.hit = hit;
+      }
+    }
+  }
+  const hits = [...fused.values()]
+    .sort((a, b) => b.rrf - a.rrf || a.order - b.order)
+    .map(({ hit, rrf }) => ({ ...hit, score: rrf }));
+  return { hits, topicRanks, topicCount: lists.length };
+}
+
+/** Reserve the best eligible candidate of each topic first, then fill by fused score up to `limit`. */
+function reserveTopicCandidates(
+  candidates: readonly CorpusMemorySearchResult[],
+  fusion: TopicFusion,
+  limit: number,
+): CorpusMemorySearchResult[] {
+  const ranked = [...candidates].sort((a, b) => b.score - a.score);
+  const picked = new Set<CorpusMemorySearchResult>();
+  for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
+    let best: CorpusMemorySearchResult | undefined;
+    let bestRank = Number.POSITIVE_INFINITY;
+    for (const candidate of ranked) {
+      const rank = fusion.topicRanks.get(memoryPassageId(candidate.snippet))?.[topic];
+      if (rank !== undefined && rank < bestRank) { best = candidate; bestRank = rank; }
+    }
+    // A passage that is already the best hit of an earlier topic covers this topic too.
+    if (best) picked.add(best);
+  }
+  for (const candidate of ranked) {
+    if (picked.size >= limit) break;
+    picked.add(candidate);
+  }
+  // Keep the judge pool in fused-score order regardless of reservation order.
+  return ranked.filter(candidate => picked.has(candidate));
+}
+
+/**
+ * Both entry points use the same complete passages and independent usefulness judgments.
+ * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search in parallel and
+ * fuse with passage-level RRF, reserving at least one judge slot per topic.
+ */
+export async function searchMemory(manager: MemoryCandidateManager, queries: QueryPair | readonly QueryPair[], options: CorpusSearchOptions & {
   apiKey?: string; endpoint?: string; model?: string; timeoutMs: number;
   conversation: QueryConversation | ReturnType<typeof selectJudgeConversation>; asOf?: string;
   /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
@@ -67,12 +146,25 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   const asOf = options.asOf ?? new Date().toISOString();
   const timings = options.timings ?? {};
   const endRetrieval = startTiming("retrievalMs", timings, signal);
+  const topics: readonly QueryPair[] = isQueryList(queries) ? queries : [queries];
+  if (!topics.length) throw new RangeError("searchMemory requires at least one query pair");
+  const searchOptions: CorpusSearchOptions = {
+    corpora: options.corpora, sessionFilter: options.sessionFilter, requestContext: options.requestContext,
+    sources: options.sources, signal, maxSnippetChars: MEMORY_PASSAGE_CHARS, timings,
+  };
   let hits: CorpusMemorySearchResult[];
+  let fusion: TopicFusion | undefined;
   try {
-    hits = await manager.searchCandidates(queries, {
-      corpora: options.corpora, sessionFilter: options.sessionFilter, requestContext: options.requestContext,
-      sources: options.sources, signal, maxSnippetChars: MEMORY_PASSAGE_CHARS, timings,
-    });
+    if (topics.length === 1) {
+      hits = await manager.searchCandidates(topics[0]!, searchOptions);
+    } else {
+      const settled = await Promise.allSettled(topics.map(topic => manager.searchCandidates(topic, searchOptions)));
+      signal?.throwIfAborted();
+      // One failed topic must not hide the others; fail only when every topic search failed.
+      if (settled.every(result => result.status === "rejected")) throw (settled[0] as PromiseRejectedResult).reason;
+      fusion = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
+      hits = fusion.hits;
+    }
   } finally {
     endRetrieval();
     if (timings.retrievalMs !== undefined) timings.retrievalOtherMs = unaccounted(timings.retrievalMs, timings, retrievalParts);
@@ -159,9 +251,11 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   const maxJudge = typeof options.maxJudgeCandidates === "number" && Number.isFinite(options.maxJudgeCandidates)
     ? Math.max(0, Math.floor(options.maxJudgeCandidates))
     : undefined;
-  const judgePool = maxJudge !== undefined
-    ? [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge)
-    : candidates;
+  const judgePool = maxJudge === undefined
+    ? candidates
+    : fusion
+      ? reserveTopicCandidates(candidates, fusion, maxJudge)
+      : [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge);
   const minUsefulness = options.minUsefulness ?? 0.7;
   const apiKey = options.apiKey;
   const endJudge = startTiming("judgeMs", timings, signal);

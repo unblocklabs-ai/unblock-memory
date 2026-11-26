@@ -99,10 +99,12 @@ const DEFAULT_SKILL_WHISPERER = {
     minScore: DEFAULTS.skillWhisperer.defaultMinScore,
     cooldownTurns: DEFAULTS.skillWhisperer.defaultCooldownTurns,
 };
+const MEMORY_WHISPERER_MODES = ["v2", "legacy"];
 const DEFAULT_MEMORY_WHISPERER = {
     enabled: false, complementaryHints: false, corpora: [], minUsefulness: DEFAULTS.memoryWhisperer.defaultMinUsefulness,
     maxHints: DEFAULTS.memoryWhisperer.defaultMaxHints, cooldownTurns: DEFAULTS.memoryWhisperer.defaultCooldownTurns,
-    timeoutMs: DEFAULTS.memoryWhisperer.defaultTimeoutMs, api: { endpoint: DEFAULTS.memoryWhisperer.defaultApiEndpoint },
+    timeoutMs: DEFAULTS.memoryWhisperer.defaultTimeoutMs, mode: DEFAULTS.memoryWhisperer.mode,
+    api: { endpoint: DEFAULTS.memoryWhisperer.defaultApiEndpoint },
 };
 function resolveQueryApi(value) {
     if (value === undefined)
@@ -169,8 +171,13 @@ function resolveMemoryWhisperer(value, corpora) {
     if (typeof minUsefulness !== "number" || !Number.isFinite(minUsefulness) || minUsefulness < 0 || minUsefulness > 1) {
         throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
     }
+    const mode = config.mode ?? DEFAULT_MEMORY_WHISPERER.mode;
+    if (typeof mode !== "string" || !MEMORY_WHISPERER_MODES.includes(mode)) {
+        throw new Error('unblock-memory memoryWhisperer.mode must be "v2" or "legacy"');
+    }
     return {
         enabled, complementaryHints, corpora: [...new Set(selected)], cooldownTurns, minUsefulness,
+        mode: mode,
         maxHints: positiveInteger(config.maxHints, DEFAULT_MEMORY_WHISPERER.maxHints, "memoryWhisperer.maxHints", 3),
         timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_MEMORY_WHISPERER.timeoutMs, "memoryWhisperer.timeoutMs", 10_000),
         api: resolveQueryApi(config.api),

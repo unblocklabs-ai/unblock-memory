@@ -8,6 +8,8 @@ import { searchMemory, memoryPassageId } from "./memory-search.js";
 import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
 import { nonBlank } from "./guards.js";
+import { WhispererAdmissionTracker } from "./whisperer-admission.js";
+import { planRecall } from "./memory-query-v2.js";
 const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
 const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
 const MAX_PAYLOAD_CHARS = DEFAULTS.memoryWhisperer.maxInjectedChars;
@@ -57,6 +59,40 @@ async function generateQueriesWithFallback(params) {
     finally {
         endGeneration();
     }
+}
+/** v2: d1.2 recall gate + corpus router, then grounded topic extraction. Never calls a query-model API. */
+async function planQueriesV2(params) {
+    const { conversation, corpora, asOf, apiKey, decisionModel, signal, turn, agentId, diagnostics, log } = params;
+    turn.stage = "gate";
+    const started = performance.now();
+    const endPlanning = startTiming("generationMs", turn.measurement, signal);
+    let plan;
+    try {
+        plan = await planRecall({
+            apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs,
+            conversation, asOf, corpora, signal, onStage: stage => { turn.stage = stage; },
+        });
+    }
+    finally {
+        endPlanning();
+    }
+    turn.gateScore = plan.gateScore;
+    turn.queryFallback = plan.queryFallback;
+    if (plan.gateFallback) {
+        diagnostics?.record(agentId, "memory", "gate_fallback");
+        log("warn", "gate_fallback", { ...failureFields(plan.gateFallback.cause), elapsedMs: performance.now() - started });
+    }
+    if (plan.extractionFallback) {
+        diagnostics?.record(agentId, "memory", "extraction_fallback");
+        log("warn", "extraction_fallback", {
+            reason: plan.extractionFallback.reason,
+            ...(plan.extractionFallback.cause !== undefined ? failureFields(plan.extractionFallback.cause) : {}),
+            elapsedMs: performance.now() - started,
+        });
+    }
+    if (plan.shouldRecall && !plan.queryFallback)
+        diagnostics?.record(agentId, "memory", "topics_extracted");
+    return plan;
 }
 async function selectComplementaryHints(params) {
     const { ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log } = params;
@@ -187,12 +223,13 @@ function buildRecallHits(traces, emittedRanks, selectedIds, redundantIds) {
 export function registerMemoryWhisperer(api, runtime, config, decisionModel, diagnostics, recallLedger) {
     if (!config.enabled || !decisionModel.enabled)
         return;
-    const sessions = new Map();
-    const generator = config.api.endpoint ? new ApiQueryGenerator(config.api) : undefined;
-    const touchSession = (key, state) => {
-        sessions.delete(key);
-        sessions.set(key, state);
-    };
+    const mode = config.mode ?? DEFAULTS.memoryWhisperer.mode;
+    const legacy = mode === "legacy";
+    const sessions = new WhispererAdmissionTracker({
+        maxSessions: MAX_SESSIONS, maxRunsPerSession: MAX_SEEN_RUNS,
+    });
+    // v2 never constructs the query-model client, even when an old config still names its endpoint.
+    const generator = legacy && config.api.endpoint ? new ApiQueryGenerator(config.api) : undefined;
     const beforePrompt = async (event, context, surface) => {
         const { agentId, runId, sessionId, sessionKey } = context;
         const scope = sessionId || sessionKey;
@@ -201,16 +238,11 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
         const corpora = config.corpora;
         if (!corpora.length)
             return;
-        const key = JSON.stringify([agentId, scope]);
-        const previous = sessions.get(key);
-        if (previous) {
-            touchSession(key, previous);
-            if (previous.runId === runId)
-                return previous.result;
-            // Ignore delayed prompt rebuilds for already-superseded runs so they never replace the latest run.
-            if (previous.seenRuns.has(runId))
-                return undefined;
-        }
+        const admission = sessions.lookup({ agentId, scope, runId });
+        if (admission.kind === "replay")
+            return admission.result;
+        if (admission.kind === "superseded")
+            return undefined;
         const currentUserMessage = typeof event.currentUserMessage === "string" ? event.currentUserMessage : undefined;
         const rawCurrent = currentUserMessage !== undefined ? currentUserMessage : event.prompt;
         if (!rawCurrent.replace(/^\s*From: [^\r\n]+ \([^()\r\n]+\)\s*$/, "").trim())
@@ -226,32 +258,23 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             measurement: { outcome: "skipped", elapsedMs: 0 },
         };
         const log = (level, eventName, fields) => api.logger[level]("unblock-memory memory_whisperer " + JSON.stringify({ event: eventName, agentId, runId, sessionId, stage: turn.stage, ...fields }));
-        previous?.controller.abort();
-        if (!previous && sessions.size >= MAX_SESSIONS) {
-            const oldestKey = sessions.keys().next().value;
-            sessions.get(oldestKey)?.controller.abort();
-            sessions.delete(oldestKey);
-        }
-        const seenRuns = previous?.seenRuns ?? new Set();
-        seenRuns.add(runId);
-        if (seenRuns.size > MAX_SEEN_RUNS)
-            seenRuns.delete(seenRuns.values().next().value);
-        const state = {
-            agentId, sessionId, sessionKey, runId, turn: (previous?.turn ?? 0) + 1,
-            controller: new AbortController(), recent: previous?.recent ?? new Map(), seenRuns,
-        };
-        touchSession(key, state);
-        for (const [id, recordedTurn] of state.recent) {
+        const state = sessions.admit({
+            agentId, scope, runId, sessionId, sessionKey,
+            init: previous => ({ recent: previous?.recent ?? new Map() }),
+        });
+        const { recent } = state.state;
+        for (const [id, recordedTurn] of recent) {
             if (state.turn - recordedTurn > config.cooldownTurns)
-                state.recent.delete(id);
+                recent.delete(id);
         }
-        const { signal } = state.controller;
-        const timer = setTimeout(() => state.controller.abort(new DOMException("Memory deadline", "TimeoutError")), config.timeoutMs);
+        const { signal } = state;
+        const clearDeadline = sessions.deadline(state, config.timeoutMs, "Memory deadline");
         const createdAtMs = Date.now();
         const rawMessageId = nonBlank(event.currentUserMessageId);
         const eventKey = `whisperer:${scope}:${rawMessageId ?? runId}`;
         const origin = whispererOrigin(context, sessionKey);
         let generatedQueries;
+        let searchedCorpora = corpora;
         let traces = [];
         let ledgerRecorded = false;
         const recordLedger = (outcome, rankingMode = "decision", emittedRanks = new Map(), selectedIds = new Set(), redundantIds = new Set()) => {
@@ -269,10 +292,10 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                     sessionKey,
                     runId,
                     ...origin,
-                    lexQuery: generatedQueries?.lex,
-                    vecQuery: generatedQueries?.vec,
+                    lexQuery: generatedQueries?.map(pair => pair.lex).join("\n"),
+                    vecQuery: generatedQueries?.map(pair => pair.vec).join("\n"),
                     queryFallback: turn.queryFallback,
-                    corpora,
+                    corpora: searchedCorpora,
                     rankingMode,
                     decisionModel: decisionModel.model,
                     minUsefulness: config.minUsefulness,
@@ -286,7 +309,10 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             const judgeConversation = selectJudgeConversation(visible);
             if (judgeConversation.status === "input_too_large")
                 throw new QueryInputBudgetError();
-            const { conversation } = prepareQueryConversation(visible.history, visible.currentRequest);
+            // Legacy only: the query-model contract has its own token budget. v2 plans from the bounded judge context.
+            const legacyConversation = legacy
+                ? prepareQueryConversation(visible.history, visible.currentRequest).conversation
+                : undefined;
             turn.stage = "credentials";
             const apiKey = await timeStage("setupMs", turn.measurement, signal, () => resolveDecisionCredential(decisionModel));
             if (signal.aborted)
@@ -297,13 +323,36 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 recordLedger("missing_key");
                 return;
             }
-            const queries = await generateQueriesWithFallback({
-                generator, conversation, timeoutMs: config.timeoutMs, signal, turn, agentId, diagnostics, log,
-            });
-            if (!queries || signal.aborted)
-                return;
-            generatedQueries = queries;
-            turn.queryCount = 2;
+            let queries;
+            if (legacyConversation) {
+                const generated = await generateQueriesWithFallback({
+                    generator, conversation: legacyConversation, timeoutMs: config.timeoutMs, signal, turn, agentId, diagnostics, log,
+                });
+                if (!generated || signal.aborted)
+                    return;
+                queries = generated;
+                generatedQueries = [generated];
+                turn.queryCount = 2;
+            }
+            else {
+                const plan = await planQueriesV2({
+                    conversation: judgeConversation.conversation, corpora, asOf, apiKey, decisionModel, signal, turn, agentId, diagnostics, log,
+                });
+                if (signal.aborted)
+                    return;
+                if (!plan.shouldRecall) {
+                    turn.reason = "gate_skipped";
+                    diagnostics?.record(agentId, "memory", "gate_skipped");
+                    searchedCorpora = [];
+                    recordLedger("skipped");
+                    return;
+                }
+                searchedCorpora = plan.corpora;
+                queries = plan.topics;
+                generatedQueries = plan.topics;
+                turn.topicCount = plan.topics.length;
+                turn.queryCount = plan.topics.length * 2;
+            }
             turn.stage = "retrieval";
             const { manager } = await timeStage("setupMs", turn.measurement, signal, () => runtime.getMemorySearchManager({ cfg: api.config, agentId }));
             if (signal.aborted)
@@ -315,9 +364,9 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 return;
             }
             const search = await searchMemory(manager, queries, {
-                corpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: judgeConversation,
+                corpora: searchedCorpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: judgeConversation,
                 asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: DEFAULTS.memoryWhisperer.maxFinalists,
-                maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
+                maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: recent,
                 onCandidates: observation => {
                     turn.measurement.retrievalMs = observation.retrievalMs;
                     turn.measurement.candidates = observation.candidates;
@@ -339,7 +388,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 },
                 ...(recallLedger ? { onTrace: (recorded) => { traces = recorded; } } : {}),
             });
-            if (signal.aborted || sessions.get(key) !== state)
+            if (signal.aborted || !sessions.isCurrent(state))
                 return;
             turn.measurement.judgeMs = search.judgeMs;
             if (!search.eligible) {
@@ -365,7 +414,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             const { selected, redundantIds } = await selectComplementaryHints({
                 ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log,
             });
-            if (signal.aborted || sessions.get(key) !== state)
+            if (signal.aborted || !sessions.isCurrent(state))
                 return;
             turn.stage = "render";
             const { emitted, rendered } = renderBoundedHints(selected);
@@ -378,7 +427,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 return;
             }
             for (const candidate of emitted)
-                state.recent.set(candidate.id, state.turn);
+                recent.set(candidate.id, state.turn);
             diagnostics?.record(agentId, "memory", "emitted");
             const appendContext = `<memory>\n${rendered}\n</memory>`;
             turn.measurement.outcome = "ok";
@@ -400,7 +449,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                     turn.reason = "input_too_large";
                     turn.measurement.outcome = "skipped";
                     diagnostics?.record(agentId, "memory", "input_too_large");
-                    if (sessions.get(key) === state)
+                    if (sessions.isCurrent(state))
                         recordLedger("skipped");
                     return;
                 }
@@ -408,7 +457,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 turn.measurement.outcome = "failed";
                 diagnostics?.record(agentId, "memory", "failed");
                 log("warn", "stage_failed", failureFields(error));
-                if (sessions.get(key) === state)
+                if (sessions.isCurrent(state))
                     recordLedger("failed");
                 return;
             }
@@ -418,13 +467,16 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 if (signal.aborted) {
                     turn.measurement.outcome = timedOut ? "timed_out" : "cancelled";
                     turn.reason = timedOut ? "deadline" : "cancelled";
-                    if (sessions.get(key) === state)
+                    if (sessions.isCurrent(state))
                         recordLedger(timedOut ? "timed_out" : "cancelled");
                 }
                 diagnostics?.measureMemory(agentId, turn.measurement);
                 log("info", "completed", {
                     ...turn.measurement,
                     reason: turn.reason,
+                    mode,
+                    gateScore: turn.gateScore,
+                    topicCount: turn.topicCount,
                     queryCount: turn.queryCount,
                     queryFallback: turn.queryFallback,
                     requestsSucceeded: turn.requestsSucceeded,
@@ -436,28 +488,13 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 });
                 if (signal.aborted)
                     diagnostics?.record(agentId, "memory", timedOut ? "timed_out" : "cancelled");
-                clearTimeout(timer);
+                clearDeadline();
                 // Stop sibling provider/worker work after an error or an empty early result too.
                 state.controller.abort();
             }
         })();
         return state.result;
     };
-    api.on("session_end", (event, context) => {
-        for (const [key, state] of sessions) {
-            if (context.agentId && state.agentId !== context.agentId)
-                continue;
-            if (state.sessionId === event.sessionId ||
-                (state.sessionKey && (state.sessionKey === event.sessionKey || state.sessionKey === context.sessionKey))) {
-                state.controller.abort();
-                sessions.delete(key);
-            }
-        }
-    });
-    api.on("gateway_stop", () => {
-        for (const state of sessions.values())
-            state.controller.abort();
-        sessions.clear();
-    });
+    sessions.attach(api);
     return beforePrompt;
 }

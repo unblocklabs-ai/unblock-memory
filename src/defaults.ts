@@ -16,7 +16,7 @@ const probabilities = new Set([
   "defaultMinUsefulness", "minDecisionUsefulness", "defaultMinScore", "nudgeMaxProbability",
   "defaultMinProbability", "minClaimSupport", "minRedundancy", "minClusterConfidence",
   "defaultMinNoise", "triageNoiseThreshold", "triageEvidenceHigh", "triageEvidenceLow",
-  "primerUncertainFloor", "scoreHigh", "scoreLow",
+  "primerUncertainFloor", "scoreHigh", "scoreLow", "gateMinScore", "corpusMinScore",
 ]);
 const deprecatedKeys: Record<string, Record<string, string>> = {
   extraction: {
@@ -47,6 +47,9 @@ const ranges: Record<string, readonly [number, number]> = {
   "memoryWhisperer.defaultTimeoutMs": [1, 10_000],
   // A cursor must be able to advance over one astral scalar without splitting it.
   "memoryWhisperer.memoryGetMaxChars": [2, Number.MAX_SAFE_INTEGER],
+  "memoryWhisperer.maxTopics": [1, 3],
+  "memoryWhisperer.gateTimeoutMs": [1, 10_000],
+  "memoryWhisperer.extractTimeoutMs": [1, 10_000],
   "skillWhisperer.defaultHistoryMessages": [0, Number.MAX_SAFE_INTEGER],
   "skillWhisperer.defaultCooldownTurns": [0, Number.MAX_SAFE_INTEGER],
   "skillWhisperer.maxDirectCatalogSkills": [1, 1000],
@@ -111,6 +114,7 @@ function validLeaf(base: unknown, value: unknown, path: string, key: string): bo
   }
   if (typeof base !== "string" || typeof value !== "string") return false;
   if (path === "memoryWhisperer.defaultApiEndpoint") return value === "" || validUrl(value, "any");
+  if (path === "memoryWhisperer.mode") return value === "v2" || value === "legacy";
   if (path === "decisionModel.endpoint") return validUrl(value, "loopback");
   if (path === "people.slackApiUrl") return validUrl(value, "none");
   if (path === "training.teacherReasoning") return reasoningLevels.includes(value);
