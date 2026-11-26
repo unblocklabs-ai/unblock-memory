@@ -12,7 +12,8 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { resolveConfig } from "../src/config.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, reportInsideOutBaselines, runInsideOut } from "../src/inside-out.js";
+import { INSIDE_OUT_WORK_KIND, INSIDE_OUT_WORK_SCOPE, interruptInsideOut, linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, reportInsideOutBaselines, runInsideOut } from "../src/inside-out.js";
+import { WorkFenceLostError } from "../src/work-store.js";
 import { registerInsideOut } from "../src/inside-out-runtime.js";
 import { PeopleStore } from "../src/people-store.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
@@ -820,4 +821,191 @@ test("repeated gateway_start clears prior timers and guards tick/refresh after g
   assert.equal(active.size, 2);
   await hooks.gateway_stop!();
   assert.equal(active.size, 0);
+});
+
+const workRow = (storePath: string) => {
+  if (!existsSync(storePath)) return undefined;
+  const db = new DatabaseSync(storePath, { readOnly: true });
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE name='work_items'").get()) return undefined;
+    return db.prepare("SELECT * FROM work_items WHERE kind=? AND scope=?").get(INSIDE_OUT_WORK_KIND, INSIDE_OUT_WORK_SCOPE);
+  } finally { db.close(); }
+};
+async function eventually(predicate: () => unknown, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Timed out waiting for condition");
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+const graded = (noul: number) => Response.json({ answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul }])) });
+async function oneReplySessions(sessionsDir: string) {
+  await mkdir(sessionsDir, { recursive: true });
+  await writeFile(join(sessionsDir, "s.jsonl"), [
+    { type: "session", id: "s" }, event("a1", assistant("Answer")), event("r1", user("Thanks, that helps")),
+  ].map(e => JSON.stringify(e)).join("\n"));
+}
+
+test("hot replacement: two passes on one store contend through the fenced lease, so only one grades", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-lease-")), sessionsDir = join(root, "sessions");
+  await oneReplySessions(sessionsDir);
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir,
+    storePath: join(root, "unblock-memory.sqlite"), config: cfg() };
+  let release!: (response: Response) => void, started!: () => void;
+  const inflight = new Promise<Response>(resolve => { release = resolve; });
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const fetchMock = t.mock.method(globalThis, "fetch", () => { started(); return inflight; });
+
+  const old = runInsideOut({ ...options, owner: "gateway-old" });
+  await ready;
+  assert.equal(workRow(options.storePath)?.status, "running");
+  // A second instance (hot-replaced plugin, second gateway) sharing the DB sees the live lease, not a process-local Set.
+  assert.deepEqual(await runInsideOut({ ...options, owner: "gateway-new" }), { status: "skipped", reason: "already_running" });
+  await assert.rejects(runInsideOut({ ...options, owner: "cli", manual: true }), /already running/,
+    "an explicit CLI pass rejects cleanly while another process holds the lease");
+  release(graded(0.7));
+  const result = await old;
+  assert.equal("reviewed" in result && result.reviewed, 1);
+  assert.equal(fetchMock.mock.callCount(), 1, "at most one active pass graded");
+  const row = workRow(options.storePath)!;
+  assert.equal(row.status, "pending"); assert.equal(row.attempt, 1); assert.equal(row.owner, null); assert.equal(row.strikes, 0);
+  assert.equal(reportInsideOut(options.storePath).length, 1);
+});
+
+test("a pass that lost its lease cannot publish a late errored grade over the reclaimer's successful grade", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-fence-")), sessionsDir = join(root, "sessions");
+  await oneReplySessions(sessionsDir);
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir,
+    storePath: join(root, "unblock-memory.sqlite"), config: cfg() };
+  let release!: (response: Response) => void, started!: () => void;
+  const inflight = new Promise<Response>(resolve => { release = resolve; });
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", () => {
+    if (++calls === 1) { started(); return inflight; }
+    return Promise.resolve(graded(0.8));
+  });
+  // The old pass stalls mid-inference without renewing (event-loop stall, suspended VM) until its lease expires.
+  const old = runInsideOut({ ...options, owner: "stalled", leaseMs: 40, heartbeatMs: 60_000 });
+  await ready;
+  await new Promise(resolve => setTimeout(resolve, 80));
+  const fresh = await runInsideOut({ ...options, owner: "replacement", manual: true });
+  assert.equal("reviewed" in fresh && fresh.reviewed, 1);
+  assert.equal(workRow(options.storePath)?.attempt, 2);
+  release(Response.json({ answers: {} })); // late errored result from the stalled pass
+  await assert.rejects(old, (error: Error) => error instanceof WorkFenceLostError);
+  const rows = reportInsideOut(options.storePath);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.error, null); assert.equal(rows[0]?.joy, 0.8);
+  const row = workRow(options.storePath)!;
+  assert.equal(row.status, "pending"); assert.equal(row.strikes, 0, "the reclaimer's commit clears the expiry strike");
+});
+
+test("an errored write never overwrites a successful grade even without a lease (e.g. a 0.16 writer)", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-overwrite-")), sessionsDir = join(root, "sessions");
+  await oneReplySessions(sessionsDir);
+  const options = { agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir,
+    storePath: join(root, "unblock-memory.sqlite"), config: cfg() };
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({ answers: {} }));
+  const failed = await runInsideOut(options);
+  assert.equal("failed" in failed && failed.failed, 1);
+  fetchMock.mock.mockImplementation(async () => {
+    // An unfenced concurrent writer lands a successful grade while this retry is mid-inference.
+    const other = new DatabaseSync(options.storePath);
+    try {
+      other.prepare(`UPDATE inside_out SET error=NULL,${emotions.map(e => `${e}=0.6`).join(",")}`).run();
+    } finally { other.close(); }
+    return Response.json({ answers: {} });
+  });
+  const retried = await runInsideOut({ ...options, retry: true, manual: true });
+  assert.equal(fetchMock.mock.callCount(), 2);
+  assert.equal("failed" in retried && retried.failed, 0, "the errored write was rejected");
+  const [row] = reportInsideOut(options.storePath);
+  assert.equal(row?.error, null); assert.equal(row?.joy, 0.6);
+});
+
+function gatewayHarness(root: string) {
+  const agentDir = join(root, "agents/main/agent");
+  const hostConfig = { agents: { entries: { main: { agentDir, workspace: root } } } };
+  const storePath = join(root, "agents/main/unblock-memory/unblock-memory.sqlite");
+  const instance = () => {
+    const hooks: Record<string, () => void | Promise<void>> = {};
+    const warnings: string[] = [];
+    const api = {
+      config: hostConfig, registrationMode: "full", registerCli: () => {},
+      on: (name: string, fn: () => void | Promise<void>) => { hooks[name] = fn; },
+      logger: { warn: (msg: string) => warnings.push(msg) },
+    } as unknown as OpenClawPluginApi;
+    registerInsideOut(api, resolveConfig({ insideOut: { enabled: true, intervalMinutes: 5 },
+      decisionModel: { enabled: true, apiKey: "fake", timeoutMs: 10_000 } }));
+    return { start: () => hooks.gateway_start!(), stop: () => hooks.gateway_stop!(), warnings };
+  };
+  return { agentDir, storePath, sessionsDir: join(root, "agents/main/sessions"), instance };
+}
+
+test("scheduled gateway passes respect due_at: restarts and replacements inside the interval do not re-run", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-gateway-due-"));
+  const previous = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = root;
+  t.after(() => { if (previous === undefined) delete process.env.OPENCLAW_STATE_DIR; else process.env.OPENCLAW_STATE_DIR = previous; });
+  const harness = gatewayHarness(root);
+  await oneReplySessions(harness.sessionsDir);
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => graded(0.5));
+
+  const first = harness.instance();
+  first.start();
+  await eventually(() => workRow(harness.storePath)?.status === "pending" && Number(workRow(harness.storePath)?.due_at) > Date.now());
+  await first.stop();
+  assert.equal(fetchMock.mock.callCount(), 1);
+  const due = Number(workRow(harness.storePath)?.due_at);
+  assert.ok(due > Date.now() + 4 * 60_000, "re-armed one interval out");
+
+  // Append a reply so a re-run would be observable as another inference.
+  await writeFile(join(harness.sessionsDir, "s.jsonl"), [
+    { type: "session", id: "s" }, event("a1", assistant("Answer")), event("r1", user("Thanks, that helps")),
+    event("a2", assistant("More")), event("r2", user("Great")),
+  ].map(e => JSON.stringify(e)).join("\n"));
+  first.start(); // same instance restarted
+  const replacement = harness.instance(); // hot-replaced plugin instance on the same store
+  replacement.start();
+  await first.stop(); await replacement.stop();
+  assert.equal(fetchMock.mock.callCount(), 1, "no pass re-ran inside intervalMinutes");
+  assert.equal(Number(workRow(harness.storePath)?.due_at), due);
+  assert.equal(workRow(harness.storePath)?.attempt, 1);
+  assert.deepEqual([...first.warnings, ...replacement.warnings], []);
+});
+
+test("gateway_stop releases the lease synchronously: graceful stops add no strikes and the next start resumes", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-gateway-stop-"));
+  const previous = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = root;
+  t.after(() => { if (previous === undefined) delete process.env.OPENCLAW_STATE_DIR; else process.env.OPENCLAW_STATE_DIR = previous; });
+  const harness = gatewayHarness(root);
+  await oneReplySessions(harness.sessionsDir);
+  let started = 0;
+  t.mock.method(globalThis, "fetch", (_url: unknown, init: RequestInit) => {
+    started++;
+    return new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    });
+  });
+  const gateway = harness.instance();
+  for (let i = 1; i <= 3; i++) {
+    gateway.start();
+    await eventually(() => started === i);
+    assert.equal(workRow(harness.storePath)?.status, "running");
+    await gateway.stop();
+    const row = workRow(harness.storePath)!;
+    assert.equal(row.status, "pending", `stop ${i} released the lease`);
+    assert.equal(row.owner, null); assert.equal(row.lease_until, 0);
+    assert.equal(row.strikes, 0, `graceful stop ${i} adds no strikes`);
+    assert.equal(row.attempt, i);
+    assert.equal(row.due_at, 0, "an interrupted pass stays due so the next start resumes it");
+  }
+  assert.deepEqual(reportInsideOut(harness.storePath), [], "aborted inference never writes a grade");
+  assert.deepEqual(gateway.warnings, []);
+});
+
+test("interruptInsideOut is a synchronous no-op for owners without an active pass", () => {
+  assert.equal(interruptInsideOut("nobody"), 0);
 });

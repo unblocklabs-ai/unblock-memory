@@ -11,8 +11,10 @@ import {
   judgeMemoryOpportunity,
   type ResponseJudgeParams,
   type ResponseJudgment,
+  type ResponseStages,
 } from "./response-judge.js";
 import { ResponseAuditStore, type ResponseResult } from "./response-store.js";
+import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
 import { ResponsePeople } from "./response-identity.js";
@@ -25,6 +27,40 @@ export function responseCohort(config: UnblockMemoryConfig["responseAudit"], mod
     sentimentEnabled: config.sentimentEnabled,
     senderIds: [...config.senderIds].sort(), chatTypes: [...config.chatTypes].sort(), memoryCorpora: [...config.memoryCorpora].sort(),
   }).slice(0, 16);
+}
+
+/** Tracks stage attempts this run started but never saved, so cancellation can refund them. */
+class CancellableAuditStore extends ResponseAuditStore {
+  readonly inFlight = new Set<string>();
+  override stageBegin(keys: string[], now: number) {
+    super.stageBegin(keys, now);
+    for (const key of keys) this.inFlight.add(key);
+  }
+  override stageSave<K extends keyof ResponseStages>(key: string, result: ResponseStages[K], now: number) {
+    super.stageSave(key, result, now);
+    this.inFlight.delete(key);
+  }
+}
+
+/**
+ * Cancellation (gateway stop, deadline) is not a provider failure: like a stale snapshot, it must not burn
+ * the episode's or its stages' bounded retry budget, or a few restarts would exhaust them permanently.
+ */
+function refundCancelledAttempt(store: CancellableAuditStore, storePath: string, cohort: string, e: ResponseEpisode) {
+  try { store.stale(cohort, e); } catch { /* Best effort: a busy store keeps the attempt, as before. */ }
+  if (!store.inFlight.size) return;
+  const keys = [...store.inFlight];
+  store.inFlight.clear();
+  try {
+    const db = openMemoryDatabase(storePath);
+    try {
+      immediateTransaction(db, () => {
+        const refund = db.prepare(`UPDATE response_stages SET attempts=MAX(0,attempts-1),attempted_at=NULL,status='pending'
+          WHERE key=? AND status='failed'`);
+        for (const key of keys) refund.run(key);
+      });
+    } finally { db.close(); }
+  } catch { /* Best effort, see above. */ }
 }
 
 export type ResponseAuditOptions = {
@@ -46,7 +82,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
     catch { return { status: "unavailable" as const, reason: "Credentials unavailable or audit cancelled" }; }
     if (!key) return { status: "unavailable" as const, reason: "Decision model API key not configured" };
   }
-  let reader: ResponseTranscriptReader | undefined, store: ResponseAuditStore | undefined, lease: string | undefined;
+  let reader: ResponseTranscriptReader | undefined, store: CancellableAuditStore | undefined, lease: string | undefined;
   let people: ResponsePeople | undefined;
   const now = Date.now();
   const coverage = { sessions: 0, sessionLimitReached: false, sessionsOverBudget: 0, completedResponses: 0,
@@ -58,7 +94,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
   try {
     signal.throwIfAborted();
     if (!options.dryRun) {
-      store = new ResponseAuditStore(options.storePath);
+      store = new CancellableAuditStore(options.storePath);
       lease = store.acquire(now);
       if (!lease) return { status: "already_running" as const };
     }
@@ -107,6 +143,7 @@ export async function auditResponses(options: ResponseAuditOptions) {
         if (coverage.attempted >= config.responseAudit.maxEpisodes) { coverage.deferredByLimit++; continue; }
         coverage.attempted++;
         const existing = store!.memoryRetryResult(cohort, e);
+        store!.inFlight.clear();
         store!.attempted(cohort, e, Date.now());
         try {
           const params: ResponseJudgeParams = {
@@ -145,7 +182,13 @@ export async function auditResponses(options: ResponseAuditOptions) {
           store!.save(cohort, e, result, Date.now());
           if (existing && result.memory.status === "unavailable") coverage.failed++;
           else coverage.evaluated++;
-        } catch { coverage.failed++; if (signal.aborted) throw new Error("Audit cancelled"); }
+        } catch {
+          if (signal.aborted) {
+            refundCancelledAttempt(store!, options.storePath, cohort, e);
+            throw new Error("Audit cancelled");
+          }
+          coverage.failed++;
+        }
       }
       // Let stop/cancellation handlers run between bounded synchronous session reads.
       await setImmediate();
