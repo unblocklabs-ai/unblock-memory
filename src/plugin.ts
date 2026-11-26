@@ -808,7 +808,7 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     people: peopleWhisperer,
     myTurn: registerMyTurn(api, config.myTurn, config.decisionModel, diagnostics),
     safety: registerSafetyWhisperer(api, config, diagnostics),
-  });
+  }, config.whispererTriggers);
   api.on("gateway_stop", () => runtime.close());
   api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics, recallLedger), { names: ["memory_search"] });
   api.registerTool((ctx) => createGetTool(runtime, ctx, recallLedger), { names: ["memory_get"] });

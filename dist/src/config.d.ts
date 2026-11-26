@@ -35,6 +35,13 @@ export type DecisionModelPluginConfig = {
     apiKeyFile?: string;
     timeoutMs: number;
 };
+export declare const WHISPERER_NAMES: readonly ["memory", "skill", "people", "myTurn", "safety"];
+export type WhispererName = (typeof WHISPERER_NAMES)[number];
+export type WhispererTriggersConfig = {
+    cron: readonly WhispererName[];
+    subagent: readonly WhispererName[];
+    heartbeat: readonly WhispererName[];
+};
 export type UnblockMemoryConfig = {
     myTurn: MyTurnConfig;
     extraction: ExtractionConfig;
@@ -88,6 +95,7 @@ export type UnblockMemoryConfig = {
         };
     };
     safetyWhisperer: SafetyWhispererConfig;
+    whispererTriggers: WhispererTriggersConfig;
     recallLedger: RecallLedgerConfig;
 };
 export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];

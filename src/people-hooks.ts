@@ -4,6 +4,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { PeopleStores } from "./people-store.js";
 import { nonBlank } from "./guards.js";
 import { renderPeopleDossier } from "./people-background.js";
+import type { WhispererPrompt } from "./whisperer-prompt.js";
 
 const MAX_CORRELATION_ENTRIES = 1000;
 const MAX_PENDING_PER_IDENTITY = 16;
@@ -169,7 +170,7 @@ export function registerPeopleHooks(
   api: OpenClawPluginApi,
   stores: PeopleStores,
   config: UnblockMemoryConfig["people"],
-): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
+): WhispererPrompt | undefined {
   const threadByRun = new Map<string, TimedCorrelation<string>>();
   const pendingThreadByIdentity = new Map<string, TimedCorrelation<string>[]>();
 
@@ -235,8 +236,11 @@ export function registerPeopleHooks(
 
   if (!config.whisperer.enabled) return;
 
-  const beforePrompt: Parameters<typeof api.on<"before_prompt_build">>[1] = (_event, context) => {
-    if (context.trigger !== "user" || context.messageProvider !== "slack") return;
+  const beforePrompt: WhispererPrompt = (_event, context, surface) => {
+    if ((!surface && context.trigger !== "user") || context.messageProvider !== "slack") return;
+    const userSurface = (surface ?? context.trigger) === "user";
+    const origin = context.inputProvenance?.kind;
+    if ((!userSurface || origin !== undefined) && origin !== "external_user") return;
     const sessionKey = nonBlank(context.sessionKey);
     const parsed = parseAgentSessionKey(sessionKey);
     const accountScope = nonBlank(context.accountId);
@@ -256,7 +260,8 @@ export function registerPeopleHooks(
         mapped.messageId,
         now,
       );
-    } else {
+    } else if (userSurface) {
+      // Only primary user turns may claim a pending inbound message without a run match.
       const pending = consumeUnambiguousPendingCorrelation(pendingThreadByIdentity, identityKey, now);
       threadKey = pending?.threadKey;
       if (threadKey) {

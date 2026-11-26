@@ -8,6 +8,7 @@ import { buildSkillWhispererQuery, MAX_SKILL_QUERY_CHARS, recentSkillMessages } 
 import { SkillSessionStore } from "./skill-session-store.js";
 import { abortable } from "./abortable.js";
 import { isRecord } from "./guards.js";
+import { whispererSurface } from "./whisperer-prompt.js";
 const settings = DEFAULTS.skillWhisperer;
 const MAX_SESSIONS = 1_000;
 const MAX_SEEN_RUNS = 64;
@@ -39,8 +40,11 @@ function readSkillName(params) {
 function sessionScope(context) {
     return context.sessionId || context.sessionKey;
 }
-function sessionKey(agentId, scope) {
-    return JSON.stringify([agentId, scope]);
+function sessionKey(agentId, scope, ephemeral = false) {
+    return JSON.stringify([agentId, scope, ephemeral]);
+}
+function isEphemeral(surface) {
+    return surface === "cron" || surface === "heartbeat";
 }
 function escapeXml(text) {
     return text.replace(/[^\u{9}\u{A}\u{D}\u{20}-\u{D7FF}\u{E000}-\u{FFFD}\u{10000}-\u{10FFFF}]/gu, "")
@@ -136,15 +140,14 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         sessions.set(key, state);
         return state;
     };
-    const hydrate = (state) => {
-        const store = storeFor(state.agentId);
+    const hydrate = (state, store) => {
         if (!state.skills) {
             const entries = store?.list(state.scope) ?? [];
             state.skills = new Map(entries.map(entry => [entry.canonicalPath, entry]));
             for (const entry of entries)
                 state.turn = Math.max(state.turn, entry.addedTurn);
         }
-        return { skills: state.skills, store };
+        return state.skills;
     };
     const catalogFor = (params, entries) => {
         const catalog = new Map();
@@ -197,12 +200,13 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         state.lastRunId = undefined;
         state.result = undefined;
     };
-    const beforePrompt = async (event, context) => {
+    const beforePrompt = async (event, context, surface) => {
         const { agentId, runId } = context;
         const scope = sessionScope(context);
-        if (stopped || context.trigger !== "user" || !scope || !runId || !agentId)
+        if (stopped || (!surface && context.trigger !== "user") || !scope || !runId || !agentId)
             return;
-        const key = sessionKey(agentId, scope);
+        const ephemeral = isEphemeral(surface);
+        const key = sessionKey(agentId, scope, ephemeral);
         if (ended.get(key)?.has(runId))
             return;
         const state = stateFor(key, agentId, scope);
@@ -211,6 +215,8 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         if (state.seenRuns.has(runId))
             return;
         retireRun(state);
+        if (ephemeral)
+            state.skills = new Map();
         state.lastRunId = runId;
         const controller = new AbortController();
         state.controller = controller;
@@ -236,8 +242,9 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         };
         const run = async () => {
             try {
-                const hydrated = hydrate(state);
-                store = hydrated.store;
+                if (!ephemeral)
+                    store = storeFor(agentId);
+                const skills = hydrate(state, store);
                 state.turn += 1;
                 const live = runtime.listSkills && await abortable(runtime.listSkills(params), signal);
                 signal.throwIfAborted();
@@ -245,7 +252,7 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
                     catalog = catalogFor(params, live);
                 const entries = activeSkills(state, params, catalog);
                 prune(state, entries, store);
-                if (hydrated.skills.size >= settings.maxActiveSkillsPerSession)
+                if (skills.size >= settings.maxActiveSkillsPerSession)
                     return finish(entries);
                 const apiKey = await abortable(resolveDecisionCredential(decisionModel), signal);
                 signal.throwIfAborted();
@@ -257,7 +264,7 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
                     ? catalog
                     : catalogFor(params, (await abortable(runtime.searchSkills(params, buildSkillWhispererQuery(event.prompt, recent), apiKey ? -1 : config.minScore, settings.maxCandidates), signal)).filter(candidate => apiKey || candidate.score >= config.minScore));
                 signal.throwIfAborted();
-                const eligible = [...candidates].filter(([path]) => !hydrated.skills.has(path));
+                const eligible = [...candidates].filter(([path]) => !skills.has(path));
                 if (!eligible.length)
                     diagnose("no_candidates");
                 const matches = !eligible.length ? [] : apiKey ? await abortable(scoreSkillCatalog({
@@ -282,10 +289,10 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
                 const addedAtMs = nextAddedAt(state, now);
                 const additions = [];
                 for (const { index, score } of matches) {
-                    if (hydrated.skills.size + additions.length >= settings.maxActiveSkillsPerSession)
+                    if (skills.size + additions.length >= settings.maxActiveSkillsPerSession)
                         break;
                     const [canonicalPath, candidate] = eligible[index];
-                    if (hydrated.skills.has(canonicalPath) || runtime.resolveSkillPath(params, candidate.path) !== canonicalPath)
+                    if (skills.has(canonicalPath) || runtime.resolveSkillPath(params, candidate.path) !== canonicalPath)
                         continue;
                     additions.push({ canonicalPath, name: candidate.name, description: candidate.description,
                         source: "whisperer", score, addedTurn: state.turn, addedAtMs, lastUsedAtMs: now });
@@ -333,6 +340,11 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
             return;
         const key = sessionKey(agentId, scope);
         const runId = context.runId ?? event.runId;
+        const ephemeral = sessions.get(sessionKey(agentId, scope, true));
+        // Older tool-hook payloads may omit the trigger; a known ephemeral run still must not pin skills.
+        if (isEphemeral(whispererSurface(context)) ||
+            (ephemeral && (!runId || ephemeral.lastRunId === runId || ephemeral.seenRuns.has(runId))))
+            return;
         if (ended.has(key) || (runId && sessions.get(key)?.seenRuns.has(runId)))
             return;
         try {
@@ -341,7 +353,8 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
             if (isRead && !canonicalPath)
                 return;
             const state = stateFor(key, agentId, scope);
-            const { skills, store } = hydrate(state);
+            const store = storeFor(agentId);
+            const skills = hydrate(state, store);
             let catalog;
             if (runtime.listSkills) {
                 const signal = context.abortSignal
@@ -392,21 +405,25 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         for (const agentId of agents) {
             const previous = new Map();
             for (const scope of scopes) {
-                const key = sessionKey(agentId, scope);
-                const state = sessions.get(key);
-                if (state)
-                    retireRun(state);
-                if (compacted && !successor)
-                    continue;
-                if (state)
-                    previous.set(scope, state);
-                state?.lifetime.abort();
-                sessions.delete(key);
-                const retired = state?.seenRuns ?? ended.get(key) ?? new Set();
-                ended.delete(key);
-                ended.set(key, retired);
-                if (ended.size > MAX_SESSIONS)
-                    ended.delete(ended.keys().next().value);
+                for (const ephemeral of [false, true]) {
+                    const key = sessionKey(agentId, scope, ephemeral);
+                    const state = sessions.get(key);
+                    if (ephemeral && !state)
+                        continue;
+                    if (state)
+                        retireRun(state);
+                    if (compacted && !successor)
+                        continue;
+                    if (state && !ephemeral)
+                        previous.set(scope, state);
+                    state?.lifetime.abort();
+                    sessions.delete(key);
+                    const retired = state?.seenRuns ?? ended.get(key) ?? new Set();
+                    ended.delete(key);
+                    ended.set(key, retired);
+                    if (ended.size > MAX_SESSIONS)
+                        ended.delete(ended.keys().next().value);
+                }
             }
             // These lifecycle notifications do not end the conversation.
             if (event.reason === "shutdown" || event.reason === "restart" || (compacted && !successor))
@@ -422,7 +439,7 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
                 if (!inherited.length)
                     continue;
                 const next = stateFor(sessionKey(agentId, successor), agentId, successor);
-                const { skills } = hydrate(next);
+                const skills = hydrate(next, store);
                 const merged = new Map();
                 for (const entry of inherited)
                     if (!merged.has(entry.canonicalPath))

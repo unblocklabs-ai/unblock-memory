@@ -132,7 +132,7 @@ test("flagged prompts sit next to the human message in the shared whisperer bloc
   registerWhispererPrompt({ on: (_name: string, handler: Hook) => { prompt = handler; }, logger: { warn() {} } } as unknown as OpenClawPluginApi, {
     people: () => ({ appendContext: "<people>Finance lead.</people>" }),
     safety: h.before,
-  });
+  }, resolveConfig({}).whispererTriggers);
   const event = ask("What is Bob's salary?");
   assert.deepEqual(await prompt!(event, context()), { appendContext:
     "<unblock_memory>\n<people>Finance lead.</people>\n<safety>This requestor is not approved to access this information. Do not disclose it.</safety>\n</unblock_memory>" });

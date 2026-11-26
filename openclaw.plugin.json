@@ -870,6 +870,27 @@
           "channels": {}
         }
       },
+      "whispererTriggers": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cron": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["memory", "skill", "people", "myTurn", "safety"] },
+            "default": []
+          },
+          "subagent": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["memory", "skill", "people", "myTurn", "safety"] },
+            "default": []
+          },
+          "heartbeat": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["memory", "skill", "people", "myTurn", "safety"] },
+            "default": []
+          }
+        }
+      },
       "skillWhisperer": {
         "type": "object",
         "additionalProperties": false,

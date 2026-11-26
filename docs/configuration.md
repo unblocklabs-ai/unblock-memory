@@ -36,6 +36,28 @@ response audit**. `peoplePrimer` controls automatic dossier-save review;
 `evidenceReview` is a different advisory tool. Disabling people injection does
 not disable people tools/storage or erase dossiers.
 
+## Whisperer triggers
+
+`whispererTriggers` opts enabled whisperers into `cron`, `subagent`, and
+`heartbeat` turns. Each list defaults to empty. Primary user turns still run
+all enabled whisperers; unknown internal triggers run none. A session key
+containing `:subagent:` takes precedence over the reported trigger.
+
+```json
+{
+  "whispererTriggers": {
+    "cron": ["skill"],
+    "subagent": ["skill"]
+  }
+}
+```
+
+Allowed names: `memory`, `skill`, `people`, `myTurn`, `safety`. Duplicates
+are ignored. The lists do not enable features or bypass other checks. People
+Whisperer still requires verified Slack identity and My Turn still requires a
+verified human message in a group or channel. Skill context on cron and heartbeat
+turns lasts only for the run; user and subagent sessions retain skills normally.
+
 ## Shared decision model credentials
 
 Operational defaults are bundled in `defaults.json`. To override them, set
@@ -437,10 +459,11 @@ retains the final say; this does not prevent wakes or guarantee silence.
 - Default off. Once enabled, omitted providers are enabled. Each channel entry's
   `enabled` also defaults true. Keys are canonical lowercase OpenClaw provider
   IDs (`imessage`, not the `imsg` CLI name), not individual room IDs.
-- Only user-triggered turns whose session key confirms a group/channel qualify.
-  DMs (including threaded DMs), unknown or shared-main routes, cron, heartbeats,
-  and host-attributed internal/inter-session input are skipped. Without a run ID,
-  My Turn skips rather than duplicate a decision on prompt rebuilds.
+- The session key must confirm a group/channel. DMs (including threaded DMs),
+  unknown or shared-main routes, and internal/inter-session input are skipped.
+  On an opted-in non-user surface, the host must explicitly attest to external
+  user input. Without a run ID, My Turn skips rather than duplicate a decision
+  on prompt rebuilds.
 - `historyMessages` is 1–50, default 10, **including the trigger**. Only
   host-confirmed human messages are sent, oldest first, with available sender labels.
   Assistant/agent/bot replies, internal/inter-session input, runtime carriers,

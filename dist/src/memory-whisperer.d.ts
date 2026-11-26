@@ -3,6 +3,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { type MemoryCandidateManager } from "./memory-search.js";
 import type { RecallLedgerWriter } from "./recall-ledger.js";
+import type { WhispererPrompt } from "./whisperer-prompt.js";
 type MemoryWhispererRuntime = {
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;
@@ -15,5 +16,5 @@ type RecallLedgerSink = {
     writer: RecallLedgerWriter;
     dbPathForAgent: (agentId: string) => string;
 };
-export declare function registerMemoryWhisperer(api: OpenClawPluginApi, runtime: MemoryWhispererRuntime, config: UnblockMemoryConfig["memoryWhisperer"], decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics, recallLedger?: RecallLedgerSink): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined;
+export declare function registerMemoryWhisperer(api: OpenClawPluginApi, runtime: MemoryWhispererRuntime, config: UnblockMemoryConfig["memoryWhisperer"], decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics, recallLedger?: RecallLedgerSink): WhispererPrompt | undefined;
 export {};

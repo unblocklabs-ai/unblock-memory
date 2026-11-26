@@ -10,6 +10,7 @@ import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
 import { messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { decideWithModel, estimateDecisionTokens, isDecisionTimeout, resolveDecisionCredential } from "./decision-client.js";
+import type { WhispererPrompt } from "./whisperer-prompt.js";
 
 export type MyTurnConfig = {
   enabled: boolean;
@@ -150,7 +151,7 @@ function buildMyTurnState(params: {
 
 export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
   decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics,
-): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
+): WhispererPrompt | undefined {
   if (!config.enabled) return;
   type Run = { controller: AbortController; result: Promise<{ appendContext: string } | undefined> };
   type Session = { sessionId?: string; latest: string; current?: Run; seenRuns: Set<string> };
@@ -164,12 +165,12 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
     sessions.delete(key);
   };
 
-  const beforePrompt: Parameters<typeof api.on<"before_prompt_build">>[1] = async (event, context) => {
+  const beforePrompt: WhispererPrompt = async (event, context, surface) => {
     const agentId = nonBlank(context.agentId), runId = nonBlank(context.runId), scope = nonBlank(context.sessionKey);
-    if (context.trigger !== "user" || !agentId || !runId || !scope) return;
+    if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope) return;
     // Newer hosts expose provenance; retain compatibility with the plugin's minimum SDK.
     const provenance = "inputProvenance" in context ? context.inputProvenance : undefined;
-    if (isRecord(provenance) && provenance.kind !== "external_user") return;
+    if (isRecord(provenance) ? provenance.kind !== "external_user" : surface && surface !== "user") return;
     const provider = groupProvider(scope, agentId);
     if (!provider || provider !== context.messageProvider?.toLowerCase() || config.channels[provider]?.enabled === false) return;
     if (!decisionModel.enabled) { diagnostics?.record(agentId, "myTurn", "decision_disabled"); return; }

@@ -570,7 +570,7 @@ test("selected memory keeps delimiter-like source text inside the combined promp
     assert.equal(name, "before_prompt_build");
     combined = handler;
   }, logger: { warn() {} } } as unknown as OpenClawPluginApi;
-  registerWhispererPrompt(api, { memory: memory.before });
+  registerWhispererPrompt(api, { memory: memory.before }, resolveConfig({}).whispererTriggers);
   const result = await combined!(event, context);
   assert.ok(result);
   assert.equal((result.appendContext.match(/<\/memory>/gu) ?? []).length, 1);

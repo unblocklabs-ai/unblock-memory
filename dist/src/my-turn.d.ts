@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
+import type { WhispererPrompt } from "./whisperer-prompt.js";
 export type MyTurnConfig = {
     enabled: boolean;
     historyMessages: number;
@@ -9,4 +10,4 @@ export type MyTurnConfig = {
     }>;
 };
 export declare function resolveMyTurn(value: unknown): MyTurnConfig;
-export declare function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig, decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined;
+export declare function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig, decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics): WhispererPrompt | undefined;

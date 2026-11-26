@@ -58,6 +58,14 @@ export type DecisionModelPluginConfig = {
   timeoutMs: number;
 };
 
+export const WHISPERER_NAMES = ["memory", "skill", "people", "myTurn", "safety"] as const;
+export type WhispererName = (typeof WHISPERER_NAMES)[number];
+export type WhispererTriggersConfig = {
+  cron: readonly WhispererName[];
+  subagent: readonly WhispererName[];
+  heartbeat: readonly WhispererName[];
+};
+
 export type UnblockMemoryConfig = {
   myTurn: MyTurnConfig;
   extraction: ExtractionConfig;
@@ -94,6 +102,7 @@ export type UnblockMemoryConfig = {
     api: { endpoint: string; apiKeyFile?: string };
   };
   safetyWhisperer: SafetyWhispererConfig;
+  whispererTriggers: WhispererTriggersConfig;
   recallLedger: RecallLedgerConfig;
 };
 
@@ -251,7 +260,30 @@ function assertOnlyKeys(
   label: string,
 ): void {
   const unknown = Object.keys(value).find((key) => !allowed.includes(key));
-  if (unknown) throw new Error(`unblock-memory ${label} has unknown property: ${unknown}`);
+  if (unknown !== undefined) throw new Error(`unblock-memory ${label} has unknown property: ${unknown}`);
+}
+
+function resolveWhispererTriggers(value: unknown): WhispererTriggersConfig {
+  if (value === undefined) return { cron: [], subagent: [], heartbeat: [] };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("unblock-memory whispererTriggers must be an object");
+  }
+  const config = value as Record<string, unknown>;
+  assertOnlyKeys(config, ["cron", "subagent", "heartbeat"], "whispererTriggers");
+  const namesFor = (surface: keyof WhispererTriggersConfig) => {
+    const names = config[surface];
+    if (names === undefined) return [];
+    const error = `unblock-memory whispererTriggers.${surface} must be an array of: ${WHISPERER_NAMES.join(", ")}`;
+    if (!Array.isArray(names)) throw new Error(error);
+    const unique = new Set<WhispererName>();
+    for (const name of names) {
+      const valid = WHISPERER_NAMES.find(candidate => candidate === name);
+      if (!valid) throw new Error(error);
+      unique.add(valid);
+    }
+    return [...unique];
+  };
+  return { cron: namesFor("cron"), subagent: namesFor("subagent"), heartbeat: namesFor("heartbeat") };
 }
 
 function resolveCorpora(value: unknown): readonly CorpusConfig[] {
@@ -434,7 +466,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "whispererTriggers"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -535,6 +567,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     insideOut: resolveInsideOut(config.insideOut),
     memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
     safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
+    whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),
     recallLedger: resolveRecallLedger(config.recallLedger),
     decisionModel: resolveDecisionModel(config.decisionModel) };
 }

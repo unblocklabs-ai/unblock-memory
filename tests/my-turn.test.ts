@@ -12,14 +12,15 @@ const credentials = { apiKey: "fake-secret", timeoutMs: 1500 };
 
 // Exercise the real plugin registration, config resolver, shared prompt composition, and HTTP client.
 // Only the host registration surface and external transport are replaced.
-function harness(myTurn: unknown = { enabled: true }, decisionModel: unknown = credentials, safetyWhisperer?: unknown) {
+function harness(myTurn: unknown = { enabled: true }, decisionModel: unknown = credentials, safetyWhisperer?: unknown,
+  whispererTriggers?: unknown) {
   const hooks = new Map<string, ((...args: never[]) => unknown)[]>();
   const warnings: string[] = [];
   const api = {
     config: { agents: { entries: { bill: { identity: { name: "Bill" } } } },
       messages: { queue: { mode: "followup" } },
       plugins: { entries: { "unblock-memory": { hooks: { allowConversationAccess: true } } } } },
-    pluginConfig: { myTurn, decisionModel, ...(safetyWhisperer ? { safetyWhisperer } : {}) },
+    pluginConfig: { myTurn, decisionModel, safetyWhisperer, whispererTriggers },
     logger: { warn(message: string) { warnings.push(message); } },
     on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, [...hooks.get(name) ?? [], handler]); },
     registerCli() {}, registerService() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
@@ -198,6 +199,19 @@ test("unverified and non-human triggers skip My Turn, not delivery of the origin
   }
   assert.equal(await h.before({ prompt: "Thanks!", messages: [] }, context()), undefined);
   assert.equal(api.fetch.mock.callCount(), 0);
+});
+
+test("opting My Turn into heartbeat never treats replayed human history as a new human message", async t => {
+  const api = transport(t);
+  const h = harness(undefined, undefined, undefined, { heartbeat: ["myTurn"] });
+  const heartbeat = { trigger: "heartbeat" };
+  assert.equal(await h.before(event(), context(heartbeat)), undefined);
+  assert.equal(await h.before(event(), context({ ...heartbeat, inputProvenance: { kind: "internal_system" } })), undefined);
+  assert.equal(api.fetch.mock.callCount(), 0);
+  // Positive control: the real plugin registers the configured surface when all human checks pass.
+  assert.match((await h.before(event(), context({ ...heartbeat, inputProvenance: { kind: "external_user" } })))?.appendContext ?? "",
+    /<my_turn>/);
+  assert.equal(api.fetch.mock.callCount(), 1);
 });
 
 test("missing credentials, disabled decision model and all provider/response failures leave turns unchanged", async t => {

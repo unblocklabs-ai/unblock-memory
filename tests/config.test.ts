@@ -4,6 +4,30 @@ import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 import { DEFAULT_CORPORA, DEFAULT_PEOPLE_CONFIG, resolveConfig } from "../src/config.js";
 
+test("whisperer trigger allowlists default empty and deduplicate in input order", () => {
+  assert.deepEqual(resolveConfig({}).whispererTriggers, { cron: [], subagent: [], heartbeat: [] });
+  assert.deepEqual(resolveConfig({ whispererTriggers: {
+    cron: ["skill", "memory", "skill", "myTurn", "memory"],
+    subagent: ["people", "safety", "people"],
+  } }).whispererTriggers, {
+    cron: ["skill", "memory", "myTurn"], subagent: ["people", "safety"], heartbeat: [],
+  });
+});
+
+test("host and runtime reject unknown whisperer surfaces and invalid allowlists", async () => {
+  const validate = await manifestValidator("unblock-memory:test:whisperer-triggers");
+  const valid = validate({ whispererTriggers: { cron: ["skill", "skill"], heartbeat: ["memory", "people", "myTurn", "safety"] } });
+  assert.equal(valid.ok, true);
+  assert.deepEqual(resolveConfig(valid.value).whispererTriggers, {
+    cron: ["skill"], subagent: [], heartbeat: ["memory", "people", "myTurn", "safety"],
+  });
+  for (const value of [null, false, [], { "": [] }, { user: [] }, { memory: [] }, { cron: "skill" },
+    { subagent: ["unknown"] }, { heartbeat: [1] }, { heartbeat: null }]) {
+    assert.equal(validate({ whispererTriggers: value }).ok, false, JSON.stringify(value));
+    assert.throws(() => resolveConfig({ whispererTriggers: value }), /whispererTriggers/);
+  }
+});
+
 test("Decision model is enabled by default with optional explicit credentials, endpoint, and model", () => {
   const defaultDecisionModel = {
     enabled: true,
@@ -41,7 +65,7 @@ test("Decision model is enabled by default with optional explicit credentials, e
   }
 });
 
-test("host and runtime reject the old provider key and unsafe endpoint forms", async () => {
+async function manifestValidator(cacheKey: string) {
   const { validateJsonSchemaValue } = await import(import.meta.resolve("openclaw/plugin-sdk/json-schema-runtime")) as {
     validateJsonSchemaValue: (args: {
       schema: Record<string, unknown>;
@@ -50,12 +74,16 @@ test("host and runtime reject the old provider key and unsafe endpoint forms", a
       applyDefaults?: boolean;
     }) => { ok: boolean; value?: Record<string, unknown>; errors?: unknown[] };
   };
-  const validate = (value: unknown) => validateJsonSchemaValue({
+  return (value: unknown) => validateJsonSchemaValue({
     schema: manifest.configSchema,
-    cacheKey: "unblock-memory:test:manifest",
+    cacheKey,
     value,
     applyDefaults: true,
   });
+}
+
+test("host and runtime reject the old provider key and unsafe endpoint forms", async () => {
+  const validate = await manifestValidator("unblock-memory:test:manifest");
   for (const valid of [
     "https://codex.unblocklabs.ai/v1/decisions",
     "https://other.example/v1/decisions",

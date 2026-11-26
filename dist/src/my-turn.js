@@ -139,13 +139,13 @@ export function registerMyTurn(api, config, decisionModel, diagnostics) {
         sessions.get(key)?.current?.controller.abort();
         sessions.delete(key);
     };
-    const beforePrompt = async (event, context) => {
+    const beforePrompt = async (event, context, surface) => {
         const agentId = nonBlank(context.agentId), runId = nonBlank(context.runId), scope = nonBlank(context.sessionKey);
-        if (context.trigger !== "user" || !agentId || !runId || !scope)
+        if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope)
             return;
         // Newer hosts expose provenance; retain compatibility with the plugin's minimum SDK.
         const provenance = "inputProvenance" in context ? context.inputProvenance : undefined;
-        if (isRecord(provenance) && provenance.kind !== "external_user")
+        if (isRecord(provenance) ? provenance.kind !== "external_user" : surface && surface !== "user")
             return;
         const provider = groupProvider(scope, agentId);
         if (!provider || provider !== context.messageProvider?.toLowerCase() || config.channels[provider]?.enabled === false)

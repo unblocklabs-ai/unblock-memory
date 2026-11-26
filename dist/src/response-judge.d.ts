@@ -18,7 +18,7 @@ export type ResponseJudgeParams = {
 declare const qualitySchema: Type.TObject<{
     taskType: Type.TObject<{
         type: Type.TLiteral<"choice">;
-        choice: Type.TEnum<("question" | "action" | "other" | "artifact" | "discussion")[]>;
+        choice: Type.TEnum<("action" | "question" | "other" | "artifact" | "discussion")[]>;
         confidence: Type.TNumber;
         probabilities: Type.TObject<{
             [k: string]: Type.TNumber;

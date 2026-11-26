@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
+import type { WhispererPrompt } from "./whisperer-prompt.js";
 type SafetyPluginConfig = Pick<UnblockMemoryConfig, "safetyWhisperer" | "decisionModel" | "memoryWhisperer" | "skillWhisperer">;
 /**
  * The complete current human message, the channel context that arrived with it, and whole recent
@@ -27,5 +28,5 @@ export declare function safetyStatus(cfg: unknown, config: SafetyPluginConfig): 
     enabled: boolean;
     active: boolean;
 };
-export declare function registerSafetyWhisperer(api: OpenClawPluginApi, plugin: SafetyPluginConfig, diagnostics?: WhispererDiagnostics): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined;
+export declare function registerSafetyWhisperer(api: OpenClawPluginApi, plugin: SafetyPluginConfig, diagnostics?: WhispererDiagnostics): WhispererPrompt | undefined;
 export {};

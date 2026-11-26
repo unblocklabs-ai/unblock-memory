@@ -252,9 +252,9 @@ export function registerSafetyWhisperer(api, plugin, diagnostics) {
             activeControllers.delete(controller);
         }
     };
-    const beforePrompt = async (event, context) => {
+    const beforePrompt = async (event, context, surface) => {
         const agentId = nonBlank(context.agentId), runId = nonBlank(context.runId);
-        if (context.trigger !== "user" || !agentId)
+        if ((!surface && context.trigger !== "user") || !agentId)
             return;
         const scope = nonBlank(context.sessionId) ?? nonBlank(context.sessionKey);
         const runs = scope ? sessions.get(scope) : undefined;

@@ -182,8 +182,12 @@ export function registerPeopleHooks(api, stores, config) {
     });
     if (!config.whisperer.enabled)
         return;
-    const beforePrompt = (_event, context) => {
-        if (context.trigger !== "user" || context.messageProvider !== "slack")
+    const beforePrompt = (_event, context, surface) => {
+        if ((!surface && context.trigger !== "user") || context.messageProvider !== "slack")
+            return;
+        const userSurface = (surface ?? context.trigger) === "user";
+        const origin = context.inputProvenance?.kind;
+        if ((!userSurface || origin !== undefined) && origin !== "external_user")
             return;
         const sessionKey = nonBlank(context.sessionKey);
         const parsed = parseAgentSessionKey(sessionKey);
@@ -200,7 +204,8 @@ export function registerPeopleHooks(api, stores, config) {
             threadKey = mapped.threadKey;
             removeMatchingPendingCorrelation(pendingThreadByIdentity, identityKey, mapped.threadKey, mapped.messageId, now);
         }
-        else {
+        else if (userSurface) {
+            // Only primary user turns may claim a pending inbound message without a run match.
             const pending = consumeUnambiguousPendingCorrelation(pendingThreadByIdentity, identityKey, now);
             threadKey = pending?.threadKey;
             if (threadKey) {

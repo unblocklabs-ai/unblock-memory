@@ -1,18 +1,35 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { WHISPERER_NAMES as ORDER, type WhispererName, type WhispererTriggersConfig } from "./config.js";
 
-const ORDER = ["memory", "skill", "people", "myTurn", "safety"] as const;
+declare const apiTypes: OpenClawPluginApi;
+type PromptHook = Parameters<typeof apiTypes.on<"before_prompt_build">>[1];
+export type WhispererSurface = "user" | keyof WhispererTriggersConfig;
+export type WhispererPrompt = (...args: [...Parameters<PromptHook>, surface?: WhispererSurface]) => ReturnType<PromptHook>;
+
+export function whispererSurface(context: Pick<Parameters<PromptHook>[1], "sessionKey" | "trigger">): WhispererSurface | undefined {
+  if (typeof context.sessionKey === "string" && context.sessionKey.includes(":subagent:")) return "subagent";
+  const { trigger } = context;
+  if (trigger === "cron" || trigger === "heartbeat" || trigger === "user") return trigger;
+}
 
 /** One host contribution keeps every whisperer after the user in a stable order; safety stays closest to the reply. */
 export function registerWhispererPrompt(
   api: OpenClawPluginApi,
-  whisperers: Partial<Record<(typeof ORDER)[number], Parameters<typeof api.on<"before_prompt_build">>[1]>>,
+  whisperers: Partial<Record<WhispererName, WhispererPrompt>>,
+  triggers: WhispererTriggersConfig,
 ): void {
-  const ordered = ORDER.flatMap(name => whisperers[name] ? [{ name, handler: whisperers[name] }] : []);
+  const ordered = ORDER.flatMap(name => {
+    const handler = whisperers[name];
+    return handler ? [{ name, handler }] : [];
+  });
   if (!ordered.length) return;
   api.on("before_prompt_build", async (event, context) => {
-    const results = await Promise.all(ordered.map(async ({ name, handler }) => {
+    const surface = whispererSurface(context);
+    if (!surface) return;
+    const admitted = surface === "user" ? ordered : ordered.filter(({ name }) => triggers[surface].includes(name));
+    const results = await Promise.all(admitted.map(async ({ name, handler }) => {
       try {
-        return (await handler(event, context))?.appendContext;
+        return (await handler(event, context, surface))?.appendContext;
       } catch {
         // One unavailable whisperer must not discard the others' context. Safety records its own failures first.
         api.logger.warn(`unblock-memory ${name} whisperer contribution failed`);

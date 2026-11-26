@@ -193,10 +193,10 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
         sessions.delete(key);
         sessions.set(key, state);
     };
-    const beforePrompt = async (event, context) => {
+    const beforePrompt = async (event, context, surface) => {
         const { agentId, runId, sessionId, sessionKey } = context;
         const scope = sessionId || sessionKey;
-        if (context.trigger !== "user" || !agentId || !runId || !scope)
+        if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope)
             return;
         const corpora = config.corpora;
         if (!corpora.length)

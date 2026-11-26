@@ -20,6 +20,7 @@ export const DEFAULT_CORPORA = [
         paths: DEFAULT_PATHS,
     },
 ];
+export const WHISPERER_NAMES = ["memory", "skill", "people", "myTurn", "safety"];
 export const DEFAULT_PEOPLE_CONFIG = {
     enabled: false,
     whisperer: { enabled: false, maxChars: DEFAULTS.people.defaultWhispererMaxChars },
@@ -177,8 +178,34 @@ function resolveMemoryWhisperer(value, corpora) {
 }
 function assertOnlyKeys(value, allowed, label) {
     const unknown = Object.keys(value).find((key) => !allowed.includes(key));
-    if (unknown)
+    if (unknown !== undefined)
         throw new Error(`unblock-memory ${label} has unknown property: ${unknown}`);
+}
+function resolveWhispererTriggers(value) {
+    if (value === undefined)
+        return { cron: [], subagent: [], heartbeat: [] };
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("unblock-memory whispererTriggers must be an object");
+    }
+    const config = value;
+    assertOnlyKeys(config, ["cron", "subagent", "heartbeat"], "whispererTriggers");
+    const namesFor = (surface) => {
+        const names = config[surface];
+        if (names === undefined)
+            return [];
+        const error = `unblock-memory whispererTriggers.${surface} must be an array of: ${WHISPERER_NAMES.join(", ")}`;
+        if (!Array.isArray(names))
+            throw new Error(error);
+        const unique = new Set();
+        for (const name of names) {
+            const valid = WHISPERER_NAMES.find(candidate => candidate === name);
+            if (!valid)
+                throw new Error(error);
+            unique.add(valid);
+        }
+        return [...unique];
+    };
+    return { cron: namesFor("cron"), subagent: namesFor("subagent"), heartbeat: namesFor("heartbeat") };
 }
 function resolveCorpora(value) {
     if (value === undefined)
@@ -316,7 +343,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "whispererTriggers"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -402,6 +429,7 @@ export function resolveConfig(value) {
         insideOut: resolveInsideOut(config.insideOut),
         memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
         safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
+        whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),
         recallLedger: resolveRecallLedger(config.recallLedger),
         decisionModel: resolveDecisionModel(config.decisionModel) };
 }

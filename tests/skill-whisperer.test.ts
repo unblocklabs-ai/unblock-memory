@@ -17,7 +17,8 @@ type Runtime = Parameters<typeof registerSkillWhisperer>[1];
 type DecisionModel = UnblockMemoryConfig["decisionModel"];
 type Context = { trigger: string; agentId: string; sessionId: string; sessionKey?: string; runId: string };
 type Prompt = (event: { prompt: string; messages: unknown[] }, context: Context) => Promise<{ appendContext: string } | undefined>;
-type Read = (event: { toolName: string; params: Record<string, unknown>; error?: string; result?: unknown }, context: Context) => Promise<void>;
+type Read = (event: { toolName: string; params: Record<string, unknown>; error?: string; result?: unknown },
+  context: Omit<Context, "trigger"> & { trigger?: string }) => Promise<void>;
 type End = (event: { sessionId: string; sessionKey?: string; reason?: string; nextSessionId?: string }, context: Context) => void;
 
 const enabled = { enabled: true, historyMessages: 2, minScore: 0.6, cooldownTurns: 2 };
@@ -30,7 +31,8 @@ const hit = (name: string, score = 0.9, description = `Use ${name} for its workf
   ({ name, description, path: `/skills/${name}/SKILL.md`, score });
 const read = (path: string) => ({ toolName: "read", params: { file_path: path } });
 
-function harness(runtime: Runtime, decision = active, cfg: OpenClawPluginApi["config"] = {}, config = enabled) {
+function harness(runtime: Runtime, decision = active, cfg: OpenClawPluginApi["config"] = {}, config = enabled,
+  triggers = resolveConfig({}).whispererTriggers) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
   const warnings: string[] = [];
   const diagnostics = new WhispererDiagnostics();
@@ -40,11 +42,46 @@ function harness(runtime: Runtime, decision = active, cfg: OpenClawPluginApi["co
     on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, handler); },
   } as unknown as OpenClawPluginApi;
   const skill = registerSkillWhisperer(api, runtime, config, decision, diagnostics);
-  registerWhispererPrompt(api, { skill });
+  registerWhispererPrompt(api, { skill }, triggers);
   return { hooks, warnings, diagnostics, before: skill as Prompt,
     after: hooks.get("after_tool_call") as Read, end: hooks.get("session_end") as End,
     stop: hooks.get("gateway_stop") as () => void, prompt: hooks.get("before_prompt_build") as Prompt };
 }
+
+test("cron and heartbeat skills are run-local, while opted-in subagents persist skills", async t => {
+  const { whispererTriggers } = resolveConfig({ whispererTriggers: { cron: ["skill"], heartbeat: ["skill"], subagent: ["skill"] } });
+  const directory = await mkdtempDisposable(join(tmpdir(), "unblock-skill-triggers-"));
+  const dbPath = join(directory.path, "unblock-memory.sqlite");
+  const entries = [hit("deploy")];
+  let matches = entries;
+  const h = harness({ ...catalogRuntime(entries, async () => matches), memoryDatabasePath: () => dbPath },
+    local, {}, enabled, whispererTriggers);
+  const store = new SkillSessionStore(dbPath);
+  t.after(async () => { h.stop(); store.close(); await directory.remove(); });
+
+  for (const trigger of ["cron", "heartbeat"]) {
+    matches = entries;
+    const first = { ...ctx(`${trigger}-first`, trigger), trigger };
+    const result = await h.prompt(prompt(), first);
+    assert.match(result?.appendContext ?? "", /<skills>[\s\S]+<skill name="deploy"/);
+    assert.deepEqual(await h.prompt(prompt("rebuild"), first), result);
+    assert.deepEqual(store.list(trigger), []);
+    // The tool hook can omit trigger metadata. It must not pin into the persistent session.
+    await h.after(read(entries[0].path), { ...first, trigger: undefined });
+    assert.deepEqual(store.list(trigger), []);
+    matches = [];
+    assert.equal(await h.prompt(prompt("unrelated"), { ...first, runId: `${trigger}-next` }), undefined);
+    matches = entries;
+    const last = { ...first, runId: `${trigger}-last` };
+    assert.deepEqual(await h.prompt(prompt(), last), result);
+    h.end({ sessionId: trigger, reason: "compaction", nextSessionId: `${trigger}-successor` }, last);
+    assert.deepEqual(store.list(`${trigger}-successor`), []);
+  }
+  matches = entries;
+  const child = { ...ctx("child", "child-session"), sessionKey: "agent:main:subagent:child" };
+  assert.match((await h.prompt(prompt(), child))?.appendContext ?? "", /<skills>[\s\S]+<skill name="deploy"/);
+  assert.deepEqual(store.list(child.sessionId).map(row => row.name), ["deploy"]);
+});
 
 function catalogRuntime(entries: ReturnType<typeof hit>[], searchSkills: Runtime["searchSkills"] = async () => {
   assert.fail("The direct catalog route must not search QMD");

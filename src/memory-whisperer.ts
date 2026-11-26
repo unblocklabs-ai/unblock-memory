@@ -13,6 +13,7 @@ import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
 import { nonBlank } from "./guards.js";
 import type { RecallHitDisposition, RecallHitRecord, RecallLedgerWriter, RecallQueryOutcome } from "./recall-ledger.js";
+import type { WhispererPrompt } from "./whisperer-prompt.js";
 
 const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
 const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
@@ -256,7 +257,7 @@ export function registerMemoryWhisperer(
   decisionModel: UnblockMemoryConfig["decisionModel"],
   diagnostics?: WhispererDiagnostics,
   recallLedger?: RecallLedgerSink,
-): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
+): WhispererPrompt | undefined {
   if (!config.enabled || !decisionModel.enabled) return;
   const sessions = new Map<string, SessionState>();
   const generator = config.api.endpoint ? new ApiQueryGenerator(config.api) : undefined;
@@ -265,10 +266,10 @@ export function registerMemoryWhisperer(
     sessions.set(key, state);
   };
 
-  const beforePrompt: Parameters<typeof api.on<"before_prompt_build">>[1] = async (event, context) => {
+  const beforePrompt: WhispererPrompt = async (event, context, surface) => {
     const { agentId, runId, sessionId, sessionKey } = context;
     const scope = sessionId || sessionKey;
-    if (context.trigger !== "user" || !agentId || !runId || !scope) return;
+    if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope) return;
     const corpora = config.corpora;
     if (!corpora.length) return;
     const key = JSON.stringify([agentId, scope]);

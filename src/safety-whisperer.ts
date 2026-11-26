@@ -10,6 +10,7 @@ import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
 import { nonBlank, record } from "./guards.js";
+import type { WhispererPrompt } from "./whisperer-prompt.js";
 
 const { stateMaxTokens: MAX_STATE_TOKENS, maxTrackedSessions: MAX_SESSIONS, maxRunsPerSession: RUNS_PER_SESSION } = DEFAULTS.safetyWhisperer;
 
@@ -177,7 +178,7 @@ export function registerSafetyWhisperer(
   api: OpenClawPluginApi,
   plugin: SafetyPluginConfig,
   diagnostics?: WhispererDiagnostics,
-): Parameters<typeof api.on<"before_prompt_build">>[1] | undefined {
+): WhispererPrompt | undefined {
   const config = plugin.safetyWhisperer, decisionModel = plugin.decisionModel;
   if (!config.enabled) return;
   const status = safetyStatus(api.config, plugin);
@@ -263,9 +264,9 @@ export function registerSafetyWhisperer(
     }
   };
 
-  const beforePrompt: Parameters<typeof api.on<"before_prompt_build">>[1] = async (event, context) => {
+  const beforePrompt: WhispererPrompt = async (event, context, surface) => {
     const agentId = nonBlank(context.agentId), runId = nonBlank(context.runId);
-    if (context.trigger !== "user" || !agentId) return;
+    if ((!surface && context.trigger !== "user") || !agentId) return;
     const scope = nonBlank(context.sessionId) ?? nonBlank(context.sessionKey);
     const runs = scope ? sessions.get(scope) : undefined;
     const previous = runId ? runs?.get(runId) : undefined;
