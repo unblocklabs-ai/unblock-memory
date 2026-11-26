@@ -44,7 +44,7 @@ test("operational override files reject malformed JSON, unknown keys and invalid
     ['{"decisionModel":{"timeoutMs":0}}', /decisionModel.timeoutMs/u],
     ['{"extraction":{"minProposalConfidence":1.01}}', /extraction.minProposalConfidence/u],
     ['{"extraction":{"inputTargetTokens":31000}}', /token budgets conflict/u],
-    ['{"training":{"leaseMs":9000}}', /heartbeats must be shorter/u],
+    ['{"extraction":{"leaseMs":9000}}', /heartbeat must be shorter/u],
     ['{"memoryWhisperer":{"defaultApiEndpoint":"file:///tmp/query"}}', /memoryWhisperer.defaultApiEndpoint/u],
     ['{"skillWhisperer":{"maxDirectCatalogSkills":0}}', /skillWhisperer.maxDirectCatalogSkills/u],
     ['{"skillWhisperer":{"catalogBatchSize":81}}', /skillWhisperer.catalogBatchSize/u],
@@ -149,25 +149,6 @@ test("host-validated people primer config defers to the operational timeout unle
       assert.equal(host.ok, true, JSON.stringify(host.errors));
       assert.equal(resolveConfig(host.value).peoplePrimer.timeoutMs, expected);
     }
-  `], { env: { ...process.env, UNBLOCK_MEMORY_DEFAULTS_FILE: file }, encoding: "utf8" });
-  assert.equal(run.status, 0, run.stderr);
-});
-
-test("training accepts only the isolated completion name derived from the configured teacher", t => {
-  const { file, write } = overrideFixture(t);
-  write(JSON.stringify({ training: { teacherModel: "custom/replacement-teacher", candidatesPerRound: 2 } }));
-  const run = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
-    import assert from "node:assert/strict";
-    import { trainingTeacher } from "./src/training-models.ts";
-    let model = "replacement-teacher";
-    const teacher = trainingTeacher({ llm: { async complete(request) {
-      assert.equal(request.model, "custom/replacement-teacher");
-      return { model, execution: { mode: "isolated-agent-runtime" }, text: '{"queries":["one","two"]}' };
-    } } }, "main");
-    const input = { history: [], currentRequest: "Recall the decision." };
-    assert.deepEqual((await teacher(input, "lex")).queries, ["one", "two"]);
-    model = "gpt-6-luna";
-    await assert.rejects(teacher(input, "lex"), /requires isolated replacement-teacher output/u);
   `], { env: { ...process.env, UNBLOCK_MEMORY_DEFAULTS_FILE: file }, encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr);
 });

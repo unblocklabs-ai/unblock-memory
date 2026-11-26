@@ -10,9 +10,8 @@ const here = new URL(import.meta.url);
 // Use the package-root copy even when tsc emits a type-import copy under dist/.
 const bundledPath = new URL(basename(fileURLToPath(new URL("../", here))) === "dist"
   ? "../../defaults.json" : "../defaults.json", here);
-const reasoningLevels = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const probabilities = new Set([
-  "minProposalConfidence", "minSupport", "minRetention", "minReplacement", "gateThreshold",
+  "minProposalConfidence", "minSupport", "minRetention", "minReplacement",
   "defaultMinUsefulness", "minDecisionUsefulness", "defaultMinScore", "nudgeMaxProbability",
   "defaultMinProbability", "minClaimSupport", "minRedundancy", "minClusterConfidence",
   "defaultMinNoise", "triageNoiseThreshold", "triageEvidenceHigh", "triageEvidenceLow",
@@ -41,7 +40,6 @@ const ranges: Record<string, readonly [number, number]> = {
   "extraction.replacementBatchMaxPayloadBytes": [1, 60_000],
   "extraction.validatorBatchSize": [1, 4],
   "extraction.validatorBatchMaxStateBytes": [1, 240_000],
-  "training.decisionTimeoutMs": [1, 60_000],
   "memoryWhisperer.defaultMaxHints": [1, 3],
   "memoryWhisperer.defaultCooldownTurns": [0, 1000],
   "memoryWhisperer.defaultTimeoutMs": [1, 10_000],
@@ -113,8 +111,6 @@ function validLeaf(base: unknown, value: unknown, path: string, key: string): bo
   if (path === "memoryWhisperer.defaultApiEndpoint") return value === "" || validUrl(value, "any");
   if (path === "decisionModel.endpoint") return validUrl(value, "loopback");
   if (path === "people.slackApiUrl") return validUrl(value, "none");
-  if (path === "training.teacherReasoning") return reasoningLevels.includes(value);
-  if (path === "training.teacherModel") return /^[^/\s]+\/[^\s]+$/u.test(value);
   return value.trim() === value && value.length > 0 && !/\s/u.test(value);
 }
 
@@ -149,13 +145,13 @@ export function loadOperationalDefaults(overridePath = process.env.UNBLOCK_MEMOR
   const base = readJson(bundledPath);
   if (!record(base)) throw new Error("Bundled defaults.json must be an object");
   const result = merge(base, overridePath === undefined ? {} : readJson(overridePath)) as OperationalDefaults;
-  const { extraction, training, quality, responseAudit } = result;
+  const { extraction, quality, responseAudit } = result;
   if (extraction.inputTargetTokens > extraction.inputLimitTokens ||
       extraction.historyTokenBudget + extraction.promptReserveTokens >= extraction.inputTargetTokens) {
     throw new Error("Invalid operational defaults: extraction history, reserve, target and limit token budgets conflict");
   }
-  if (extraction.heartbeatMs >= extraction.leaseMs || training.heartbeatMs >= training.leaseMs) {
-    throw new Error("Invalid operational defaults: extraction and training heartbeats must be shorter than their leases");
+  if (extraction.heartbeatMs >= extraction.leaseMs) {
+    throw new Error("Invalid operational defaults: extraction heartbeat must be shorter than its lease");
   }
   if (quality.triageEvidenceLow > quality.triageEvidenceHigh || responseAudit.scoreLow > responseAudit.scoreHigh) {
     throw new Error("Invalid operational defaults: low score threshold exceeds high score threshold");

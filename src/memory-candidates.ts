@@ -1,8 +1,8 @@
 import type { AllowedDocumentPaths, QMDStore, VectorSearchTrace } from "@unblocklabs/qmd";
 import type { QueryLane } from "./query-contract.js";
 
-/** Runtime and training share the exact ten-candidate recipe, not hybrid ranking. */
-export async function trainingCandidates(qmd: QMDStore, query: string, collection: string | string[], lane: QueryLane, signal?: AbortSignal, allowedPaths?: AllowedDocumentPaths, trace?: VectorSearchTrace) {
+/** Discover the top ten passages for one lane before fusing lane rankings. */
+export async function discoverLaneCandidates(qmd: QMDStore, query: string, collection: string | string[], lane: QueryLane, signal?: AbortSignal, allowedPaths?: AllowedDocumentPaths, trace?: VectorSearchTrace) {
   const hits = await qmd.discoverCandidates({ query, lane, collection, limit: 10, signal,
     // Preserve keyword chunk tie-breaking against this lane's own query.
     intent: query, allowedPaths, trace });

@@ -4,8 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
-import { judgeMemoryPassage, judgeQuality, scoreSkillCatalog, memoryUsefulnessRequest, MEMORY_JUDGE_VERSION } from "../src/decision-ranking.js";
-import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "../src/training-judge.js";
+import { judgeMemoryPassage, judgeQuality, scoreSkillCatalog, memoryUsefulnessRequest } from "../src/decision-ranking.js";
 import { decisionModelScope, matchesDecisionModel, requestDecision, resolveDecisionCredential } from "../src/decision-client.js";
 
 const config = { enabled: true, timeoutMs: 100 };
@@ -173,7 +172,8 @@ test("model matching restricts suffixes to dated snapshots or jev-latest, scope 
 const memoryJudgment = {
   apiKey: "test-secret", timeoutMs: 100, signal: new AbortController().signal,
   conversation: { currentRequest: "Deploy alpha", history: [] }, asOf: "2026-09-28T00:00:00Z",
-  candidates: [{ excerpt: "Alpha requires approval", corpus: "knowledge", sourcePath: "qmd://knowledge/alpha.md", dates: [] }],
+  candidates: [{ excerpt: "Alpha requires approval", corpus: "knowledge", sourcePath: "qmd://knowledge/alpha.md", dates: [],
+    score: 0.99, query: "generated retrieval terms" }],
 };
 const judgeMemory = (params = memoryJudgment) =>
   judgeMemoryPassage(memoryUsefulnessRequest(params.conversation, params.candidates[0]!, params.asOf), params);
@@ -186,7 +186,9 @@ test("memory judgments use Noul probabilities, accept dated Liquid snapshots, an
     assert.equal(request.model, "liquid/d1.2-ultra");
     assert.equal(request.questions.memory_0.type, "noul");
     assert.match(JSON.stringify(request.questions.memory_0.instructions), /conversation\.currentRequest/);
-    assert.equal(request.state[0].candidates[0].excerpt, "Alpha requires approval");
+    assert.deepEqual(request.state[0].candidates, [
+      { excerpt: "Alpha requires approval", corpus: "knowledge", sourcePath: "qmd://knowledge/alpha.md", dates: [] },
+    ]);
     return Response.json({
       model: "liquid/d1.2-ultra-20261116",
       usage: { input_tokens: 42, output_tokens: 0, cost: 0.0000018 },
@@ -388,29 +390,4 @@ test("catalog responses cannot substitute answer keys or malformed probabilities
     fetch.mock.mockImplementation(async () => skillResponse(answers));
     await assert.rejects(scoreSkillCatalog(params), { code: "invalid_response" });
   }
-});
-
-test("offline and runtime use exactly the same blind request and retain raw probabilities and usage", async t => {
-  const candidate = memoryJudgment.candidates[0]!;
-  const hit = { path: candidate.sourcePath, text: candidate.excerpt, corpus: candidate.corpus, dates: [],
-    position: 17, startLine: 1, endLine: 1, score: 0.99, methods: ["bm25"], query: "forbidden generated query" };
-  const offline = contextJudgeRequest(memoryJudgment.conversation, memoryJudgment.asOf, hit);
-  const runtime = memoryUsefulnessRequest(memoryJudgment.conversation, candidate, memoryJudgment.asOf);
-  assert.deepEqual(offline, runtime);
-  assert.equal(CONTEXT_JUDGE_VERSION, MEMORY_JUDGE_VERSION);
-  assert.doesNotMatch(JSON.stringify(offline), /forbidden|position|methods|bm25|"score"/);
-  const requests: unknown[] = [];
-  const usage = { input_tokens: 117, output_tokens: 0 };
-  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof fetch>) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return Response.json({ model: "liquid/d1.2-ultra-20261116", usage, answers: { memory_0: { type: "noul", noul: 0.831 } } });
-  });
-  assert.equal((await judgeMemory()).probability, 0.831);
-  assert.deepEqual(await judgeTrainingPassage(offline, "key"), {
-    probability: 0.831, answer: { type: "noul", noul: 0.831 }, model: "liquid/d1.2-ultra-20261116", usage,
-  });
-  assert.deepEqual(requests, [
-    { ...runtime, state: [runtime.state] },
-    { ...offline, state: [offline.state] },
-  ]);
 });

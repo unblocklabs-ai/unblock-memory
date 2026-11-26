@@ -175,8 +175,6 @@ skill allowlist.
   and publishing facts to search.
 - [Response audit](docs/response-audit.md): operator commands, cadence and
   reports.
-- [Memory training](docs/memory-training.md): operator-only collection of
-  training data for Memory Whisperer's query model.
 
 [Vision](https://github.com/unblocklabs-ai/unblock-memory/blob/main/docs/vision.md)
 describes where the project is headed. Documents in `docs/planning/` are

@@ -1,7 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { Tokenizer } from "@huggingface/tokenizers";
-import contract from "./query-tokenizer/contract.json" with { type: "json" };
-export const QUERY_CONTRACT = contract;
+import { Tiktoken } from "js-tiktoken/lite";
+import o200kBase from "js-tiktoken/ranks/o200k_base";
+export const QUERY_CONTRACT = { revision: "o200k-v1", conversationBytes: 24_000, conversationTokens: 8192 };
 export class QueryInputBudgetError extends Error {
     constructor() { super("Query input exceeds context budget"); this.name = "QueryInputBudgetError"; }
 }
@@ -13,18 +12,13 @@ export function parseQueryPair(value) {
     }
     return { lex: value.lex.trim(), vec: value.vec.trim() };
 }
-/** Escape template delimiters identically in the student worker and dataset preparation. */
+/** Escape template delimiters before budgeting the serialized conversation. */
 export function serializeQueryConversation(conversation) {
     return JSON.stringify({ history: conversation.history, currentRequest: conversation.currentRequest }).replaceAll("<", "\\u003c");
 }
 let tokenizer;
 export function queryTokenIds(text) {
-    if (!tokenizer) {
-        const adjacent = new URL("./query-tokenizer/tokenizer.json", import.meta.url);
-        const root = existsSync(adjacent) ? new URL("./query-tokenizer/", import.meta.url) : new URL("../../src/query-tokenizer/", import.meta.url);
-        tokenizer = new Tokenizer(JSON.parse(readFileSync(new URL("tokenizer.json", root), "utf8")), JSON.parse(readFileSync(new URL("tokenizer_config.json", root), "utf8")));
-    }
-    return tokenizer.encode(text, { add_special_tokens: false }).ids;
+    return (tokenizer ??= new Tiktoken(o200kBase)).encode(text, [], []);
 }
 /** Never alter the current request or split a history message. */
 export function prepareQueryConversation(history, currentRequest) {
@@ -32,21 +26,21 @@ export function prepareQueryConversation(history, currentRequest) {
         throw new Error("Missing or unparseable current request");
     const conversation = { history: [], currentRequest };
     let bytes = Buffer.byteLength(serializeQueryConversation(conversation));
-    if (bytes > contract.conversationBytes)
+    if (bytes > QUERY_CONTRACT.conversationBytes)
         throw new QueryInputBudgetError();
     // Start with the byte-bounded suffix, rather than repeatedly serializing the
     // entire retained session. This is a byte bound, never a message-count cap.
     for (let index = history.length - 1; index >= 0; index--) {
         const message = history[index];
         const added = Buffer.byteLength(JSON.stringify(message).replaceAll("<", "\\u003c")) + (conversation.history.length ? 1 : 0);
-        if (bytes + added > contract.conversationBytes)
+        if (bytes + added > QUERY_CONTRACT.conversationBytes)
             break;
         conversation.history.unshift(message);
         bytes += added;
     }
     const fits = (start) => queryTokenIds(serializeQueryConversation({
         history: conversation.history.slice(start), currentRequest,
-    })).length <= contract.conversationTokens;
+    })).length <= QUERY_CONTRACT.conversationTokens;
     if (fits(0))
         return { conversation, contextLimited: conversation.history.length < history.length };
     if (!fits(conversation.history.length))

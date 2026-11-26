@@ -113,7 +113,7 @@ actual output order. A third comparison also excludes oversized passages.
 - These metrics evaluate ranking within the union, not undiscovered evidence.
 
 Offline checks: `tsc -p eval/memory-ranking/tsconfig.json --noEmit` and
-`node --import tsx --test tests/memory-ranking.test.ts tests/training-queries.test.ts`.
+`node --import tsx --test tests/memory-ranking.test.ts`.
 
 ## Frozen-input prompt trials
 

@@ -8,20 +8,15 @@ export type QueryConversation = {
     currentRequest: string;
 };
 export declare const QUERY_CONTRACT: {
-    version: string;
-    model: string;
-    revision: string;
-    conversationTokens: number;
-    conversationBytes: number;
-    contextTokens: number;
-    outputTokens: number;
-    system: string;
+    readonly revision: "o200k-v1";
+    readonly conversationBytes: 24000;
+    readonly conversationTokens: 8192;
 };
 export declare class QueryInputBudgetError extends Error {
     constructor();
 }
 export declare function parseQueryPair(value: unknown): QueryPair;
-/** Escape template delimiters identically in the student worker and dataset preparation. */
+/** Escape template delimiters before budgeting the serialized conversation. */
 export declare function serializeQueryConversation(conversation: QueryConversation): string;
 export declare function queryTokenIds(text: string): number[];
 /** Never alter the current request or split a history message. */

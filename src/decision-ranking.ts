@@ -1,6 +1,6 @@
 import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul, type NoulQuestion } from "@unblocklabs/decisions";
-import { JUDGE_CONTEXT_VERSION, selectJudgeConversation, type SelectedJudgeConversation } from "./judge-context.js";
+import { selectJudgeConversation, type SelectedJudgeConversation } from "./judge-context.js";
 import type { QueryConversation } from "./query-contract.js";
 import {
   decideWithModel,
@@ -128,10 +128,6 @@ export async function judgeQuality(params: {
   }));
 }
 
-export function memoryJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint?: string): string {
-  return `${decisionModelScope(model, endpoint)}:memory-usefulness-v2:${JUDGE_CONTEXT_VERSION}`;
-}
-export const MEMORY_JUDGE_VERSION = memoryJudgeVersion();
 export type MemoryPassage = { excerpt: string; corpus: string; sourcePath: string; dates: readonly string[] };
 
 const MEMORY_QUESTIONS = {
@@ -151,7 +147,7 @@ const MEMORY_QUESTIONS = {
   ),
 } as const;
 
-/** The sole versioned passage prompt/state builder for both training and runtime. */
+/** Build a blind request for one candidate passage. */
 export function memoryUsefulnessRequest(input: QueryConversation | SelectedJudgeConversation, candidate: MemoryPassage, asOf: string, model = DEFAULT_DECISION_MODEL) {
   if (!Number.isFinite(Date.parse(asOf))) throw new Error("Invalid judgment time");
   if (!candidate.excerpt.trim() || candidate.excerpt.length > MEMORY_PASSAGE_CHARS) throw new Error("Invalid judgment passage");

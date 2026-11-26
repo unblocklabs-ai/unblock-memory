@@ -1,5 +1,5 @@
-/** Runtime and training share the exact ten-candidate recipe, not hybrid ranking. */
-export async function trainingCandidates(qmd, query, collection, lane, signal, allowedPaths, trace) {
+/** Discover the top ten passages for one lane before fusing lane rankings. */
+export async function discoverLaneCandidates(qmd, query, collection, lane, signal, allowedPaths, trace) {
     const hits = await qmd.discoverCandidates({ query, lane, collection, limit: 10, signal,
         // Preserve keyword chunk tie-breaking against this lane's own query.
         intent: query, allowedPaths, trace });

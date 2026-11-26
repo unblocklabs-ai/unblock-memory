@@ -1,6 +1,6 @@
 import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
-import { JUDGE_CONTEXT_VERSION, selectJudgeConversation } from "./judge-context.js";
+import { selectJudgeConversation } from "./judge-context.js";
 import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, } from "./decision-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 import { decisionStateBytes } from "./decision-packs.js";
@@ -92,10 +92,6 @@ export async function judgeQuality(params) {
         evidence: answers[`evidence_${index}`].noul,
     }));
 }
-export function memoryJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint) {
-    return `${decisionModelScope(model, endpoint)}:memory-usefulness-v2:${JUDGE_CONTEXT_VERSION}`;
-}
-export const MEMORY_JUDGE_VERSION = memoryJudgeVersion();
 const MEMORY_QUESTIONS = {
     memory_0: noul("Would a careful assistant use a specific factual detail from `candidates[0].excerpt` when " +
         "answering `conversation.currentRequest`? Judge the excerpt independently. The conversation history is " +
@@ -109,7 +105,7 @@ const MEMORY_QUESTIONS = {
             "alone does not establish a person's title, role, or personal history.",
     }),
 };
-/** The sole versioned passage prompt/state builder for both training and runtime. */
+/** Build a blind request for one candidate passage. */
 export function memoryUsefulnessRequest(input, candidate, asOf, model = DEFAULT_DECISION_MODEL) {
     if (!Number.isFinite(Date.parse(asOf)))
         throw new Error("Invalid judgment time");

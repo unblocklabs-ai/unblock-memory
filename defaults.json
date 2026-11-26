@@ -37,21 +37,6 @@
     "minRetention": 0.9,
     "minReplacement": 0.9
   },
-  "training": {
-    "teacherModel": "openai/gpt-6-luna",
-    "teacherReasoning": "xhigh",
-    "teacherMaxTokens": 12000,
-    "teacherTimeoutMs": 300000,
-    "candidatesPerRound": 5,
-    "decisionTimeoutMs": 30000,
-    "gateThreshold": 0.7,
-    "leaseMs": 120000,
-    "heartbeatMs": 10000,
-    "retrievalDepth": 10,
-    "topScoreCount": 3,
-    "maxInputEvents": 50000,
-    "maxInputBytes": 32000000
-  },
   "memoryWhisperer": {
     "defaultApiEndpoint": "",
     "maxJudgeCandidates": 6,

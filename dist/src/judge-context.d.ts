@@ -7,6 +7,6 @@ export type SelectedJudgeConversation = {
 type JudgeConversationSelection = SelectedJudgeConversation | {
     status: "input_too_large";
 };
-/** Budget the actual judge JSON, using the bundled tokenizer as a provider-independent proxy. */
+/** Budget the actual judge JSON, using o200k_base as a provider-independent proxy. */
 export declare function selectJudgeConversation({ history, currentRequest }: QueryConversation): JudgeConversationSelection;
 export {};

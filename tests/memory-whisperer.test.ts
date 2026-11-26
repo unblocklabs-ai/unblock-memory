@@ -272,7 +272,7 @@ test("query API failures and inner timeouts fall back to deterministic lex/vec q
 test("oversized input is reported as skipped before provider calls, including prompt rebuilds", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { assert.fail("Oversized input reached decision model"); });
   const generation = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => { assert.fail("Oversized input reached query generation"); });
-  for (const prompt of ["private ".repeat(3001), "🚀".repeat(1500)]) {
+  for (const prompt of ["private ".repeat(3001), "🚀 ".repeat(2200)]) {
     const h = harness();
     t.after(() => h.stop());
     const oversized = { prompt, messages: [] };

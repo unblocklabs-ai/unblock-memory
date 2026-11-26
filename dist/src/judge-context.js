@@ -2,7 +2,7 @@ import { DEFAULTS } from "./defaults.js";
 import { QUERY_CONTRACT, queryTokenIds } from "./query-contract.js";
 const { judgeConversationMaxTokens: maxTokens, judgeConversationMaxBytes: maxBytes } = DEFAULTS.memoryWhisperer;
 export const JUDGE_CONTEXT_VERSION = `whole-messages-v1:${QUERY_CONTRACT.revision}:${maxTokens}:${maxBytes}`;
-/** Budget the actual judge JSON, using the bundled tokenizer as a provider-independent proxy. */
+/** Budget the actual judge JSON, using o200k_base as a provider-independent proxy. */
 export function selectJudgeConversation({ history, currentRequest }) {
     const current = { history: [], currentRequest };
     let bytes = Buffer.byteLength(JSON.stringify(current));

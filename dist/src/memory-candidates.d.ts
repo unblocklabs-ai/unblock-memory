@@ -1,7 +1,7 @@
 import type { AllowedDocumentPaths, QMDStore, VectorSearchTrace } from "@unblocklabs/qmd";
 import type { QueryLane } from "./query-contract.js";
-/** Runtime and training share the exact ten-candidate recipe, not hybrid ranking. */
-export declare function trainingCandidates(qmd: QMDStore, query: string, collection: string | string[], lane: QueryLane, signal?: AbortSignal, allowedPaths?: AllowedDocumentPaths, trace?: VectorSearchTrace): Promise<{
+/** Discover the top ten passages for one lane before fusing lane rankings. */
+export declare function discoverLaneCandidates(qmd: QMDStore, query: string, collection: string | string[], lane: QueryLane, signal?: AbortSignal, allowedPaths?: AllowedDocumentPaths, trace?: VectorSearchTrace): Promise<{
     vector?: {
         score: number;
         rank: number;

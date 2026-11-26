@@ -1,7 +1,7 @@
-import { abortedByTimeout, classifyDecisionFailure, createDecisionClient, DEFAULT_DECISIONS_ENDPOINT, DecisionError, decisionModelScope as sdkDecisionModelScope, matchesDecisionModel, resolveDecisionApiKey, resolveDecisionConfig, validateDecisionEndpoint, } from "@unblocklabs/decisions";
+import { abortedByTimeout, createDecisionClient, DEFAULT_DECISIONS_ENDPOINT, DecisionError, decisionModelScope as sdkDecisionModelScope, matchesDecisionModel, resolveDecisionApiKey, resolveDecisionConfig, validateDecisionEndpoint, } from "@unblocklabs/decisions";
 import { Type } from "typebox";
 import { DEFAULTS } from "./defaults.js";
-export { classifyDecisionFailure, matchesDecisionModel, DecisionError as DecisionRequestError, };
+export { matchesDecisionModel, DecisionError as DecisionRequestError, };
 export const NOUL_SCHEMA = Type.Object({
     type: Type.Literal("noul"), noul: Type.Number({ minimum: 0, maximum: 1 }),
 });
