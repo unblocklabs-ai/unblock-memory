@@ -1,5 +1,6 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { DEFAULTS } from "./defaults.js";
 export const peoplePrimerSchema = Type.Object({
     enabled: Type.Boolean({ default: false }),
     corpora: Type.Array(Type.String({ minLength: 1 }), { default: [] }),
@@ -7,7 +8,7 @@ export const peoplePrimerSchema = Type.Object({
     minScore: Type.Number({ minimum: 0, maximum: 1, default: 0.35 }),
     minUsefulness: Type.Number({ minimum: 0.5, maximum: 1, default: 0.8 }),
     maxEvidencePerQuestion: Type.Integer({ minimum: 1, maximum: 10, default: 3 }),
-    timeoutMs: Type.Integer({ minimum: 1, maximum: 60000, default: 30000 }),
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 60000 })),
 }, { additionalProperties: false });
 export function resolvePeoplePrimer(value, corpora, peopleEnabled) {
     let config;
@@ -26,5 +27,5 @@ export function resolvePeoplePrimer(value, corpora, peopleEnabled) {
     if (config.enabled && (!peopleEnabled || !config.corpora.length)) {
         throw new Error("peoplePrimer requires people.enabled and explicit approved corpora");
     }
-    return { ...config, corpora: [...new Set(config.corpora)] };
+    return { ...config, corpora: [...new Set(config.corpora)], timeoutMs: config.timeoutMs ?? DEFAULTS.people.primerRequestTimeoutMs };
 }

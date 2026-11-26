@@ -70,7 +70,7 @@ export function extractionValidationTranscriptBudget(existing) {
     // A UTF-16 code unit can require up to six bytes as a JSON escape.
     const quote = jsonBytes({ messageId: "", quote: "" }) + 1 + 6 * limits.maxQuoteChars;
     const singleton = empty + largestPrior + 6 * limits.maxFactChars + limits.maxEvidencePerProposal * quote;
-    return limits.validatorBatchMaxChars - singleton;
+    return limits.validatorBatchMaxStateBytes - singleton;
 }
 function spanQuotes(bodies, span) {
     const [start, end] = span;
@@ -108,7 +108,7 @@ async function findReplacement(proposal, quotes, params) {
         blocks.push({ key: `replacement_${blocks.length}`, options, question });
     }
     // The prior facts are in the Choice criteria, so budget the questions as well as state.
-    const packs = packDecisionState(blocks, limits.replacementBatchSize, limits.replacementBatchMaxChars, items => ({
+    const packs = packDecisionState(blocks, limits.replacementBatchSize, limits.replacementBatchMaxPayloadBytes, items => ({
         state: proposalState,
         questions: Object.fromEntries(items.map(({ key, question }) => [key, question])),
     }));
@@ -277,7 +277,7 @@ export async function validateExtractedMemories(params) {
     if (!eligible.length)
         return judgments;
     const datedMessages = messages.map(datedMessage);
-    const packs = packDecisionState(eligible, limits.validatorBatchSize, limits.validatorBatchMaxChars, items => ({
+    const packs = packDecisionState(eligible, limits.validatorBatchSize, limits.validatorBatchMaxStateBytes, items => ({
         messages: datedMessages, newMessageIds: newIds, proposals: items.map(({ claim }) => claim),
     }));
     for (const { items, state } of packs) {

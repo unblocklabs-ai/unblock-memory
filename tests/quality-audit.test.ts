@@ -212,7 +212,7 @@ test("byte-bounded packs preserve later cache writes when the cursor stops at a 
   let fail = true;
   t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request: QualityRequest = JSON.parse(String(init?.body));
-    assert.ok(Buffer.byteLength(JSON.stringify(request.state)) <= DEFAULTS.quality.judgeBatchMaxChars);
+    assert.ok(Buffer.byteLength(JSON.stringify(request.state)) <= DEFAULTS.quality.judgeBatchMaxStateBytes);
     const captions = request.state[0].chunks.map(chunk => chunk.text.slice(0, 7));
     packs.push(captions);
     if (fail && captions[0] === "noise 2") return new Response("failure", { status: 529 });

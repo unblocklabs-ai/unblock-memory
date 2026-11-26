@@ -65,13 +65,13 @@ test("decision pack limits are bounded startup overrides", t => {
     extraction: {
       replacementOptionsPerChoice: 20,
       replacementBatchSize: 5,
-      replacementBatchMaxChars: 60_000,
+      replacementBatchMaxPayloadBytes: 60_000,
       validatorBatchSize: 4,
-      validatorBatchMaxChars: 240_000,
+      validatorBatchMaxStateBytes: 240_000,
     },
-    review: { maxRedundancyPairs: 6, maxRedundancyChars: 24_000 },
-    quality: { judgeBatchSize: 6, judgeBatchMaxChars: 18_000 },
-    people: { primerBatchSize: 4, primerBatchMaxChars: 16_000 },
+    review: { maxRedundancyPairs: 6, maxRedundancyStateBytes: 24_000 },
+    quality: { judgeBatchSize: 6, judgeBatchMaxStateBytes: 18_000 },
+    people: { primerBatchSize: 4, primerBatchMaxStateBytes: 16_000 },
   } as const;
   write("{}");
   const bundled = loadOperationalDefaults(file);
@@ -87,6 +87,70 @@ test("decision pack limits are bounded startup overrides", t => {
       }
     }
   }
+});
+
+test("deprecated decision pack limits normalize to byte keys without hiding conflicting overrides", t => {
+  const { file, write } = overrideFixture(t);
+  for (const [section, alias, key] of [
+    ["extraction", "replacementBatchMaxChars", "replacementBatchMaxPayloadBytes"],
+    ["extraction", "validatorBatchMaxChars", "validatorBatchMaxStateBytes"],
+    ["review", "maxRedundancyChars", "maxRedundancyStateBytes"],
+    ["quality", "judgeBatchMaxChars", "judgeBatchMaxStateBytes"],
+    ["people", "primerBatchMaxChars", "primerBatchMaxStateBytes"],
+  ] as const) {
+    for (const patch of [{ [alias]: 4096 }, { [alias]: 4096, [key]: 4096 }]) {
+      write(JSON.stringify({ [section]: patch }));
+      const resolved = loadOperationalDefaults(file)[section];
+      assert.equal(Object.entries(resolved).find(([name]) => name === key)?.[1], 4096);
+      assert.equal(Object.hasOwn(resolved, alias), false);
+    }
+    write(JSON.stringify({ [section]: { [alias]: 4096, [key]: 4097 } }));
+    assert.throws(() => loadOperationalDefaults(file), {
+      message: `Conflicting operational defaults ${section}.${alias} and ${section}.${key}`,
+    });
+  }
+});
+
+test("hardening limits preserve the bundled operational values", t => {
+  const { file, write } = overrideFixture(t);
+  write("{}");
+  const limits = loadOperationalDefaults(file);
+  assert.partialDeepStrictEqual(limits, {
+    memoryWhisperer: {
+      judgeConversationMaxTokens: 4096, judgeConversationMaxBytes: 24_000, memoryGetDefaultLines: 120,
+      fallbackMaxLexTerms: 12, fallbackMaxTermChars: 64, fallbackMaxLexChars: 256,
+      fallbackMaxVecChars: 450, fallbackHistoryUserMessages: 2,
+    },
+    people: {
+      primerRequestTimeoutMs: 30_000, learningStartupRetryMs: 5000, learningReconcileRetryMs: 60_000,
+      learningStartupRetryLimit: 8, slackTokenMaxChars: 10_000, slackIdMaxChars: 200, slackHandleMaxChars: 200,
+      slackCursorMaxChars: 2000, slackAvatarUrlMaxChars: 2000, slackDisplayNameMaxChars: 500,
+    },
+    sqlite: { skillSessionBusyTimeoutMs: 100 },
+    responseAudit: {
+      maxFollowupChars: 12_000, maxFollowupMessages: 6, maxFeedbackMessages: 6, memoryCandidateMaxDocChars: 2000,
+      memoryCandidateLimit: 3, memoryQueryMaxTerms: 16, memoryQueryMinTermChars: 4,
+    },
+    analysis: { memberExcerptMaxBytes: 2000, totalExcerptMaxBytes: 12_000, clusterPreviewMaxBytes: 600 },
+  });
+});
+
+test("host-validated people primer config defers to the operational timeout unless explicitly set", t => {
+  const { file, write } = overrideFixture(t);
+  write(JSON.stringify({ people: { primerRequestTimeoutMs: 4321 } }));
+  const run = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import { validateJsonSchemaValue } from "openclaw/plugin-sdk/json-schema-runtime";
+    import { resolveConfig } from "./src/config.ts";
+    import manifest from "./openclaw.plugin.json" with { type: "json" };
+    for (const [value, expected] of [[{}, 4321], [{ peoplePrimer: {} }, 4321], [{ peoplePrimer: { timeoutMs: 2345 } }, 2345]]) {
+      const host = validateJsonSchemaValue({ schema: manifest.configSchema, cacheKey: "unblock-memory:test:primer-timeout",
+        value, applyDefaults: true });
+      assert.equal(host.ok, true, JSON.stringify(host.errors));
+      assert.equal(resolveConfig(host.value).peoplePrimer.timeoutMs, expected);
+    }
+  `], { env: { ...process.env, UNBLOCK_MEMORY_DEFAULTS_FILE: file }, encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
 });
 
 test("training accepts only the isolated completion name derived from the configured teacher", t => {

@@ -2,13 +2,12 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { chunkFingerprint } from "./curation.js";
+import { DEFAULTS } from "./defaults.js";
 
 const DEFAULT_CLUSTER_LIMIT = 20;
 const MAX_CLUSTER_LIMIT = 50;
 const DEFAULT_MEMBER_LIMIT = 20;
 const MAX_MEMBER_LIMIT = 50;
-const MAX_EXCERPT_BYTES = 2_000;
-const MAX_TOTAL_EXCERPT_BYTES = 12_000;
 const MAX_ALIASES_PER_MEMBER = 5;
 const MAX_TOTAL_ALIASES = 50;
 
@@ -514,11 +513,11 @@ function members(
     limit,
     offset,
   );
-  let remaining = MAX_TOTAL_EXCERPT_BYTES;
+  let remaining = DEFAULTS.analysis.totalExcerptMaxBytes;
   let remainingAliases = MAX_TOTAL_ALIASES;
   return rows.map((row, index) => {
     const remainingRows = rows.length - index;
-    const excerptBudget = Math.min(MAX_EXCERPT_BYTES, Math.floor(remaining / remainingRows));
+    const excerptBudget = Math.min(DEFAULTS.analysis.memberExcerptMaxBytes, Math.floor(remaining / remainingRows));
     const fullText = row.doc.slice(row.pos, row.pos + row.chunk_len);
     const text = byteSlice(fullText, excerptBudget);
     remaining -= Buffer.byteLength(text);
@@ -660,10 +659,10 @@ export function readClusters(
     ORDER BY c.size DESC, c.cluster_id
     LIMIT ?
   `).all<ClusterRow>(run.id, limit);
-  let remainingBytes = MAX_TOTAL_EXCERPT_BYTES;
+  let remainingBytes = DEFAULTS.analysis.totalExcerptMaxBytes;
   let remainingAliases = MAX_TOTAL_ALIASES;
   const clusters = rows.map((row) => {
-    const previewBytes = Math.min(600, remainingBytes);
+    const previewBytes = Math.min(DEFAULTS.analysis.clusterPreviewMaxBytes, remainingBytes);
     const summary = toSummary(db, run, row, previewBytes, remainingAliases);
     remainingBytes -= Buffer.byteLength(summary.preview?.text ?? "");
     remainingAliases -= summary.preview?.sourcePaths.length ?? 0;

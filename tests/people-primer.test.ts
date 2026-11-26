@@ -93,7 +93,7 @@ test("primer splits by serialized bytes, retries failed packs and keeps evidence
     const body: PrimerRequest = JSON.parse(String(init?.body));
     const [{ excerpts }] = body.state;
     packs.push(excerpts.map(item => item.excerpt));
-    assert.ok(Buffer.byteLength(JSON.stringify(body.state)) <= DEFAULTS.people.primerBatchMaxChars);
+    assert.ok(Buffer.byteLength(JSON.stringify(body.state)) <= DEFAULTS.people.primerBatchMaxStateBytes);
     for (const [key, question] of Object.entries(body.questions)) {
       const index = Number(key.split("_").at(-1));
       assert.ok(excerpts[index]);

@@ -93,7 +93,7 @@ test("single oversized Unicode message splits losslessly and resumes through ser
 test("the transcript reader fragments oversized serialized state even when tokens fit", async () => {
   const original = message("wide", " configuration".repeat(18_000));
   assert.ok(extractionMessageTokens(original) < EXTRACTION_INPUT_TARGET);
-  assert.ok(Buffer.byteLength(original.text) > DEFAULTS.extraction.validatorBatchMaxChars);
+  assert.ok(Buffer.byteLength(original.text) > DEFAULTS.extraction.validatorBatchMaxStateBytes);
   const read = fixture([[original]]);
   const first = await readExtractionChunk(params(read));
   assert.equal(first.kind, "page");

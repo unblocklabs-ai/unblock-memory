@@ -88,7 +88,7 @@ export async function auditQualityPage(params) {
         });
         const missing = [...new Map(batch.filter(item => item.eligible && item.text.length <= MAX_CHUNK_CHARS &&
                 item.structure !== "empty" && !item.judgment).map(item => [item.cacheKey, item])).values()];
-        const packs = packDecisionState(missing, DEFAULTS.quality.judgeBatchSize, DEFAULTS.quality.judgeBatchMaxChars, items => ({ chunks: items.map(item => item.chunk) }));
+        const packs = packDecisionState(missing, DEFAULTS.quality.judgeBatchSize, DEFAULTS.quality.judgeBatchMaxStateBytes, items => ({ chunks: items.map(item => item.chunk) }));
         const oversized = new Set();
         const jobs = [];
         for (const { items, state } of packs) {

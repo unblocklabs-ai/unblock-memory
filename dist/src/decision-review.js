@@ -164,12 +164,12 @@ export async function reviewClaim(params) {
 }
 /** Directional coverage, not topic similarity. Each pack shares its referenced excerpts. */
 export async function reviewMemoryRedundancy(params) {
-    const { maxRedundancyCandidates, maxRedundancyPairs, maxRedundancyChars } = DEFAULTS.review;
+    const { maxRedundancyCandidates, maxRedundancyPairs, maxRedundancyStateBytes } = DEFAULTS.review;
     if (params.excerpts.length > maxRedundancyCandidates)
         throw new Error("Too many redundancy candidates");
     const excerpts = params.excerpts.map((text, id) => ({ id, text }));
     const pairs = excerpts.flatMap(({ id: later }) => excerpts.slice(0, later).map(({ id: earlier }) => ({ earlier, later })));
-    const packs = Array.from(packDecisionState(pairs, maxRedundancyPairs, maxRedundancyChars, pack => ({
+    const packs = Array.from(packDecisionState(pairs, maxRedundancyPairs, maxRedundancyStateBytes, pack => ({
         excerpts: excerpts.filter(({ id }) => pack.some(({ earlier, later }) => id === earlier || id === later)),
     })), ({ items, state }) => {
         if (!state)

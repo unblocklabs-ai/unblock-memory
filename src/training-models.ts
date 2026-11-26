@@ -3,16 +3,22 @@ import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import type { TrainingInput } from "./training-input.js";
 import type { QueryLane } from "./query-contract.js";
+import { jsonHash } from "./json-hash.js";
 
 export const TRAINING_RECIPE_VERSION = "lex-vec-v2";
-export const TRAINING_TEACHER_MODEL = DEFAULTS.training.teacherModel;
-export const TRAINING_TEACHER_VERSION = "lex-vec-teacher-v2-xhigh";
+const { teacherModel: TRAINING_TEACHER_MODEL, teacherReasoning, teacherMaxTokens, teacherTimeoutMs,
+  candidatesPerRound: TRAINING_CANDIDATES_PER_ROUND, topScoreCount } = DEFAULTS.training;
+export { TRAINING_TEACHER_MODEL };
 const TRAINING_TEACHER_PROMPT_VERSION = "lex-vec-teacher-prompt-v2";
-const TRAINING_CANDIDATES_PER_ROUND = DEFAULTS.training.candidatesPerRound;
 export type TrainingRound = 1 | 2;
 export type QueryFeedback = { query: string; score: number };
 const queriesSchema = Type.Object({ queries: Type.Array(Type.String({ minLength: 1, maxLength: 500 }),
   { minItems: TRAINING_CANDIDATES_PER_ROUND, maxItems: TRAINING_CANDIDATES_PER_ROUND }) }, { additionalProperties: false });
+export const TRAINING_TEACHER_VERSION = jsonHash({
+  model: TRAINING_TEACHER_MODEL, reasoning: teacherReasoning, maxTokens: teacherMaxTokens, timeoutMs: teacherTimeoutMs,
+  candidatesPerRound: TRAINING_CANDIDATES_PER_ROUND, topScoreCount,
+  promptVersion: TRAINING_TEACHER_PROMPT_VERSION, schema: queriesSchema,
+});
 
 export function trainingTeacherPrompt(lane: QueryLane) {
   return `You generate memory-search queries for a training dataset. You are not a participant in the supplied conversation.
@@ -30,7 +36,7 @@ Target evidence needed for currentRequest, not the conversation's broad topic:
 - Seek useful historical details not already supplied. Treat earlier assistant explanations as claims to investigate, not established causes. Do not invent names, aliases, premises, screenshot contents or predicted answers.
 - Vary relevant evidence angles and wording. When context is sparse, use grounded paraphrases rather than inventing topics to fill the set.
 
-If a lane_feedback block is present, it contains only this lane's earlier queries and their raw top-${DEFAULTS.training.topScoreCount} passage-usefulness averages. Use that feedback to propose improved candidates. It is not evidence about the answer. You may retain a strong candidate.
+If a lane_feedback block is present, it contains only this lane's earlier queries and their raw top-${topScoreCount} passage-usefulness averages. Use that feedback to propose improved candidates. It is not evidence about the answer. You may retain a strong candidate.
 Never answer or continue the conversation, ask clarification questions, execute tools, include credentials, or use knowledge of events beyond the supplied conversation. Code supplies the historical cutoff. Return JSON only.`;
 }
 
@@ -55,9 +61,9 @@ export function trainingTeacher(runtime: unknown, agentId: string) {
   const complete = llm.complete.bind(llm);
   const expectedModel = TRAINING_TEACHER_MODEL.slice(TRAINING_TEACHER_MODEL.indexOf("/") + 1);
   return async (input: TrainingInput, lane: QueryLane, feedback?: readonly QueryFeedback[]): Promise<TeacherResult> => {
-    const result: unknown = await complete({ agentId, model: TRAINING_TEACHER_MODEL, reasoning: DEFAULTS.training.teacherReasoning, maxTokens: DEFAULTS.training.teacherMaxTokens,
+    const result: unknown = await complete({ agentId, model: TRAINING_TEACHER_MODEL, reasoning: teacherReasoning, maxTokens: teacherMaxTokens,
       purpose: "unblock-memory.training-queries", systemPrompt: trainingTeacherPrompt(lane),
-      signal: AbortSignal.timeout(DEFAULTS.training.teacherTimeoutMs), execution: { mode: "isolated-agent-runtime", timeoutMs: DEFAULTS.training.teacherTimeoutMs },
+      signal: AbortSignal.timeout(teacherTimeoutMs), execution: { mode: "isolated-agent-runtime", timeoutMs: teacherTimeoutMs },
       messages: [{ role: "user", content: trainingTeacherMessage(input, lane, feedback) }] });
     const schema = Type.Object({ text: Type.String(), model: Type.Literal(expectedModel),
       execution: Type.Object({ mode: Type.Literal("isolated-agent-runtime") }),

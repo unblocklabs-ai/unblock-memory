@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { createStore } from "@unblocklabs/qmd";
 import { LEGACY_SYSTEMONE_ENDPOINT } from "@unblocklabs/decisions";
-import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, type QueryFeedback } from "../src/training-models.js";
+import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAINING_TEACHER_VERSION, type QueryFeedback } from "../src/training-models.js";
 import { TrainingStore, type QueryEvaluation } from "../src/training-store.js";
 import { currentTrainingCorpusHashes, generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining, selectTrainingQueries, trainingQueryScore } from "../src/training-queries.js";
 import { historicalTrainingSearch, HistoricalCorpusUnavailableError, type TrainingHit } from "../src/training-retrieval.js";
@@ -37,7 +38,7 @@ function runtime(capture?: (request: TeacherRequest, lane: QueryLane, round: num
     return teacherResponse(candidates(lane, round));
   } } };
 }
-function fixture(t: { after: (f: () => void) => void }) {
+function fixture(t: { after: (f: () => void) => void }, currentRequest = input.currentRequest) {
   const stateDir = mkdtempSync(join(tmpdir(), "training-query-test-"));
   const source = { stateDir, databasePath: join(stateDir, "agent.sqlite"), agentId: "main" };
   const storePath = join(stateDir, "training.sqlite");
@@ -49,12 +50,12 @@ function fixture(t: { after: (f: () => void) => void }) {
       db.prepare("INSERT INTO session_transcript_active_events VALUES (?,?,?,?)").run(sessionId, i + 1, i + 1, i + 1);
     }
   };
-  add("test", input.currentRequest);
+  add("test", currentRequest);
   const initialize = (probability: number | null = 0.9) => {
     collectTraining(source, store);
     if (probability !== null) for (const job of store.pending()) store.finish(job.id, store.start(job.id), { probability, model: "liquid/d1.2-ultra-20261116", usage });
   };
-  t.after(() => { db.close(); store.close(); });
+  t.after(() => { db.close(); store.close(); rmSync(stateDir, { recursive: true, force: true }); });
   return { source, store, storePath, db, initialize, add };
 }
 const hit = (text = "Evidence 0.9", path = "shared"): TrainingHit => ({ path: `qmd://sessions/${path}`,
@@ -280,6 +281,80 @@ test("generation failures continue unrelated inputs, preserve ambiguous billing 
     assert.equal(f.store.retry(false, [String(retryable[0]!.id)]), 0);
     assert.equal(f.store.retry(true, [String(retryable[0]!.id)]), 1);
     assert.equal((await generateTrainingQueries(f.source, f.store, runtime(), options)).calls, 1);
+  });
+});
+
+test("teacher recipe changes invalidate completions and bypass both initial and revision failure holds", async t => {
+  const f = fixture(t);
+  f.add("second", "Find the earlier plan", 200_000);
+  const host = runtime((request, lane, round) => {
+    const first = request.messages[0]!.content.includes(input.currentRequest);
+    if (lane === "lex" && (first ? round === 1 : round === 2)) throw new Error("Unresolved completion");
+  });
+  await f.store.locked(() => f.initialize());
+  const versions = new Set([TRAINING_TEACHER_VERSION]);
+  const overrides = join(f.source.stateDir, "teacher-defaults.json");
+  for (const teacher of [{ teacherReasoning: "high" }, { topScoreCount: 4 }]) {
+    await f.store.locked(async () => {
+      await generateTrainingQueries(f.source, f.store, host, options);
+      await evaluateTrainingQueries(f.source, f.store, config, host, {}, searchFixture(async () => []));
+      assert.deepEqual(f.store.reviews().map(review => review.reason).sort(), ["evaluation-unresolved", "generation-unresolved"]);
+    });
+    writeFileSync(overrides, JSON.stringify({ training: teacher }));
+    const run = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), "--input-type=module", "-e", `
+      import { TRAINING_TEACHER_VERSION } from "./src/training-models.ts";
+      import { TrainingStore } from "./src/training-store.ts";
+      import { generateTrainingQueries, evaluateTrainingQueries, exportQueryTraining } from "./src/training-queries.ts";
+      import { resolveConfig } from "./src/config.ts";
+      const source = JSON.parse(process.argv[1]);
+      const store = new TrainingStore(process.argv[2], "main");
+      try {
+        const config = resolveConfig({ corpora: [
+          { name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "sessions", kind: "sessions" },
+        ] });
+        const host = { llm: { complete: async () => ({
+          model: "gpt-6-luna", text: JSON.stringify({ queries: ["one", "two", "three", "four", "five"] }),
+          execution: { mode: "isolated-agent-runtime" },
+        }) } };
+        const historical = async (_root, _chat, cutoff) => ({
+          corpusHash: "proven-empty", maxDate: new Date(cutoff).toISOString(),
+          report: { sessions: 0, chunks: 0, excluded: 0, truncated: 0, excludedChunks: 0 },
+          search: async () => [], close: async () => {},
+        });
+        const outcome = await store.locked(async () => {
+          const generated = await generateTrainingQueries(source, store, host, { maxInputBytes: 3_000_000 });
+          const evaluated = await evaluateTrainingQueries(source, store, config, host, {}, historical);
+          return { generated: generated.calls, evaluated: evaluated.evaluated, exported: [...exportQueryTraining(store)].length };
+        });
+        console.log(JSON.stringify({ ...outcome, version: TRAINING_TEACHER_VERSION }));
+      } finally { store.close(); }
+    `, JSON.stringify(f.source), f.storePath], {
+      cwd: new URL("../", import.meta.url), env: { ...process.env, UNBLOCK_MEMORY_DEFAULTS_FILE: overrides },
+      encoding: "utf8", timeout: 10_000,
+    });
+    assert.equal(run.status, 0, run.stderr);
+    const { version, ...outcome } = JSON.parse(run.stdout);
+    assert.match(version, /^[0-9a-f]{64}$/u);
+    assert.equal(versions.has(version), false, "each effective recipe gets a new cache identity");
+    versions.add(version);
+    assert.deepEqual(outcome, { generated: 4, evaluated: 2, exported: 2 });
+  }
+});
+
+test("evaluation flags judge overflow as incomplete even when retrieval might be proven empty", async t => {
+  const f = fixture(t, "🚀".repeat(1500));
+  await f.store.locked(async () => {
+    f.initialize();
+    const host = runtime();
+    assert.equal((await generateTrainingQueries(f.source, f.store, host, options)).completed, 2, "student input remains valid");
+    const result = await evaluateTrainingQueries(f.source, f.store, config, host, {}, async () => {
+      assert.fail("overflow must not open a historical snapshot or label an apparent zero");
+    });
+    assert.equal(result.flagged, 1);
+    assert.equal(result.calls, 0);
+    assert.equal(result.evaluated, 0);
+    assert.equal(f.store.reviews()[0]?.reason, "judge-input-too-large");
+    assert.deepEqual([...exportQueryTraining(f.store)], []);
   });
 });
 

@@ -29,6 +29,7 @@ import type {
   CorpusSearchOptions,
   MemoryEmbeddingProbeResult,
   MemoryProviderStatus,
+  MemoryReadCursor,
   MemoryReadResult,
   MemoryRequestContext,
   MemorySearchManagerContract,
@@ -70,11 +71,17 @@ import { attachHitLocator, parseDailyFilenameDateMs, sha256Text } from "./recall
 import { memoryPassageId } from "./memory-search.js";
 export { expandSessionSearchHit } from "./memory-passage.js";
 
-const DEFAULT_READ_LINES = 120;
-const MAX_READ_CHARS = DEFAULTS.memoryWhisperer.memoryGetMaxChars;
 const WATCH_DEBOUNCE_MS = DEFAULTS.sqlite.watchDebounceMs;
 const WATCH_RETRY_MS = DEFAULTS.sqlite.watchRetryMs;
 const MANAGER_CLOSED_ERROR = "QmdMemoryManager is closed";
+
+type MemoryReadParams = {
+  relPath: string;
+  from?: number;
+  lines?: number;
+  cursor?: MemoryReadCursor;
+  requestContext?: MemoryRequestContext;
+};
 
 export type ManagerStore = Pick<
   QMDStore,
@@ -264,44 +271,73 @@ function pruneStaleCollections(
   return removed;
 }
 
-export function buildReadResult(params: {
+function staleReadCursor(path: string): MemoryReadResult {
+  return { status: "stale_cursor", text: "", path, error: "Read cursor no longer matches this source or position. Restart without cursor." };
+}
+
+function splitsSurrogatePair(line: string, offset: number): boolean {
+  const left = line.charCodeAt(offset - 1);
+  const right = line.charCodeAt(offset);
+  return left >= 0xd800 && left <= 0xdbff && right >= 0xdc00 && right <= 0xdfff;
+}
+
+export function buildReadResult({ content, path, from: start, lines, cursor }: {
   content: string;
   path: string;
   from?: number;
   lines?: number;
+  cursor?: MemoryReadCursor;
 }): MemoryReadResult {
-  const fileLines = params.content.split("\n");
+  const { memoryGetDefaultLines, memoryGetMaxChars, memoryGetMaxLines } = DEFAULTS.memoryWhisperer;
+  const fileLines = content.split("\n");
   if (fileLines.at(-1) === "") fileLines.pop();
-  const from = Math.max(1, Math.floor(params.from ?? 1));
-  const requestedLines = Math.min(DEFAULTS.memoryWhisperer.memoryGetMaxLines, Math.max(1, Math.floor(params.lines ?? DEFAULT_READ_LINES)));
+  const from = cursor?.line ?? Math.max(1, Math.floor(start ?? 1));
+  const offset = cursor?.offset ?? 0;
+  const revision = () => sha256Text(JSON.stringify([path, sha256Text(content)]));
+  if (cursor) {
+    const firstLine = fileLines[from - 1];
+    if (start !== undefined || !Number.isSafeInteger(from) || from < 1 || firstLine === undefined ||
+        !Number.isSafeInteger(offset) || offset < 0 || (offset > 0 && offset >= firstLine.length) ||
+        splitsSurrogatePair(firstLine, offset) || cursor.revision !== revision()) {
+      return staleReadCursor(path);
+    }
+  }
+  const requestedLines = Math.min(memoryGetMaxLines, Math.max(1, Math.floor(lines ?? memoryGetDefaultLines)));
   const selected = fileLines.slice(from - 1, from - 1 + requestedLines);
 
-  let includedLines = 0;
-  let length = 0;
+  const fragments: string[] = [];
+  let contentChars = 0;
+  let nextCursor: MemoryReadCursor | undefined;
   for (const line of selected) {
-    const nextLength = length + line.length + (includedLines > 0 ? 1 : 0);
-    if (includedLines > 0 && nextLength > MAX_READ_CHARS) break;
-    length = nextLength;
-    includedLines += 1;
+    const first = fragments.length === 0;
+    const fragment = first ? line.slice(offset) : line;
+    const nextLength = contentChars + fragment.length + (first ? 0 : 1);
+    if (nextLength > memoryGetMaxChars) {
+      if (first) {
+        let end = offset + memoryGetMaxChars;
+        if (splitsSurrogatePair(line, end)) end--;
+        fragments.push(line.slice(offset, end));
+        contentChars = end - offset;
+        nextCursor = { line: from, offset: end, revision: cursor?.revision ?? revision() };
+      }
+      break;
+    }
+    fragments.push(fragment);
+    contentChars = nextLength;
   }
-  const hardTruncated = length > MAX_READ_CHARS;
-  const moreLinesRemain = from - 1 + includedLines < fileLines.length;
-  const truncated = hardTruncated || moreLinesRemain || includedLines < selected.length;
-  const nextFrom = hardTruncated ? undefined : truncated ? from + includedLines : undefined;
-  selected.length = includedLines;
-  let text = selected.join("\n");
-  if (hardTruncated) text = text.slice(0, MAX_READ_CHARS);
-  if (truncated) {
-    text += `\n\n[More content available.${nextFrom ? ` Use from=${nextFrom} to continue.` : ""}]`;
-  }
+  const nextLine = from + fragments.length;
+  const nextFrom = !nextCursor && nextLine <= fileLines.length ? nextLine : undefined;
+  const notice = nextCursor ? "Use nextCursor as cursor to continue." :
+    nextFrom !== undefined ? `Use from=${nextFrom} to continue.` : undefined;
   return {
     status: "ok",
-    text,
-    path: params.path,
+    text: fragments.join("\n") + (notice ? `\n\n[More content available. ${notice}]` : ""),
+    path,
     from,
-    lines: includedLines,
-    ...(truncated ? { truncated: true } : {}),
-    ...(nextFrom ? { nextFrom } : {}),
+    lines: fragments.length,
+    ...(notice ? { truncated: true, contentChars } : {}),
+    ...(nextCursor ? { nextCursor } : {}),
+    ...(nextFrom !== undefined ? { nextFrom } : {}),
   };
 }
 
@@ -1387,34 +1423,26 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     });
   }
 
-  async readFile(params: {
-    relPath: string;
-    from?: number;
-    lines?: number;
-    requestContext?: MemoryRequestContext;
-  }): Promise<MemoryReadResult> {
+  // OpenClaw's line-only read contract cannot return a stale cursor.
+  readFile(params: MemoryReadParams & { cursor?: undefined }): Promise<Exclude<MemoryReadResult, { status: "stale_cursor" }>>;
+  readFile(params: MemoryReadParams): Promise<MemoryReadResult>;
+  async readFile(params: MemoryReadParams): Promise<MemoryReadResult> {
     return this.#runFenced(async () => {
-      if (params.relPath.startsWith(EXTRACTED_PREFIX)) {
-        const record = this.#currentExtracted([params.relPath]).find(r => params.relPath === extractedUri(r));
+      const { relPath, from, lines, cursor } = params;
+      const notFound = (): MemoryReadResult => cursor ? staleReadCursor(relPath) :
+        { status: "not_found", text: "", path: relPath };
+      if (relPath.startsWith(EXTRACTED_PREFIX)) {
+        const record = this.#currentExtracted([relPath]).find(r => relPath === extractedUri(r));
         return record ? buildReadResult({ content: `${record.text}\nObserved: ${new Date(record.observedAt).toISOString()}\nSource: ${extractedHit(record, 1).citation}`,
-          path: params.relPath, from: params.from, lines: params.lines }) : { status: "not_found", text: "", path: params.relPath };
+          path: relPath, from, lines, cursor }) : notFound();
       }
-      const safe = parseSafeVirtualPath(params.relPath, this.#sources);
-      if (!safe || safe.source.kind === "skills") {
-        return { status: "not_found", text: "", path: params.relPath };
-      }
+      const safe = parseSafeVirtualPath(relPath, this.#sources);
+      if (!safe || safe.source.kind === "skills") return notFound();
       await this.#operationChain;
       const store = await this.#getStore();
       const doc = await store.get(safe.normalized, { includeBody: true });
-      if ("error" in doc || doc.filepath !== safe.normalized || doc.body === undefined) {
-        return { status: "not_found", text: "", path: params.relPath };
-      }
-      return buildReadResult({
-        content: doc.body,
-        path: safe.normalized,
-        from: params.from,
-        lines: params.lines,
-      });
+      if ("error" in doc || doc.filepath !== safe.normalized || doc.body === undefined) return notFound();
+      return buildReadResult({ content: doc.body, path: safe.normalized, from, lines, cursor });
     });
   }
 

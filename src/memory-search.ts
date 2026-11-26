@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { QueryConversation, QueryPair } from "./query-contract.js";
+import { selectJudgeConversation } from "./judge-context.js";
 import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "./decision-ranking.js";
 import { startTiming, retrievalParts, unaccounted, type RetrievalTimings } from "./retrieval-timing.js";
@@ -21,7 +22,7 @@ export type MemorySearchObservation = RetrievalTimings & {
 
 export type MemoryRanking = {
   rankingMode: "decision" | "retrieval";
-  fallbackReason?: "key_unavailable" | "all_judgments_failed";
+  fallbackReason?: "key_unavailable" | "all_judgments_failed" | "input_too_large";
 };
 
 export type RecallCandidateTrace = {
@@ -51,7 +52,8 @@ function resolveLocator(hit: CorpusMemorySearchResult, passageId: string): Recal
 
 /** Both entry points use the same complete passages and independent usefulness judgments. */
 export async function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
-  apiKey?: string; endpoint?: string; model?: string; timeoutMs: number; conversation: QueryConversation; asOf?: string;
+  apiKey?: string; endpoint?: string; model?: string; timeoutMs: number;
+  conversation: QueryConversation | ReturnType<typeof selectJudgeConversation>; asOf?: string;
   /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
   allowRetrievalFallback?: boolean;
   /** Cap top retrieval-ranked candidates sent to the decision endpoint (after dedup and cooldown filtering). */
@@ -145,9 +147,14 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
     }
     return { ...timings, ...observation, rankingMode: "retrieval" as const, fallbackReason: reason, results };
   };
-  if (!options.apiKey) {
+  const conversation = "status" in options.conversation
+    ? options.conversation
+    : selectJudgeConversation(options.conversation);
+  if (conversation.status === "input_too_large" || !options.apiKey) {
     signal?.throwIfAborted();
-    if (options.allowRetrievalFallback) return fallback("key_unavailable");
+    if (options.allowRetrievalFallback) {
+      return fallback(conversation.status === "input_too_large" ? "input_too_large" : "key_unavailable");
+    }
     if (trackTrace) options.onTrace?.(traces);
     return { ...timings, ...observation, rankingMode: "decision", results: [] };
   }
@@ -166,7 +173,7 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
       const requestStarted = performance.now();
       const trace = trackTrace ? traceByCandidate.get(hit) : undefined;
       try {
-        const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(options.conversation, {
+        const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
           excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
           dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
             ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],

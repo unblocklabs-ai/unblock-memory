@@ -1,4 +1,5 @@
 import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
+import { DEFAULTS } from "./defaults.js";
 
 export type ActiveSkillEntry = {
   canonicalPath: string;
@@ -16,7 +17,7 @@ export class SkillSessionStore {
 
   constructor(dbPath: string) {
     // This handle also serves prompt hooks; don't block the gateway on a background writer.
-    this.#db = openMemoryDatabase(dbPath, { busyTimeoutMs: 100 });
+    this.#db = openMemoryDatabase(dbPath, { busyTimeoutMs: DEFAULTS.sqlite.skillSessionBusyTimeoutMs });
     try {
       this.#db.exec(`CREATE TABLE IF NOT EXISTS skill_whisper_sessions (
         session_scope TEXT NOT NULL,

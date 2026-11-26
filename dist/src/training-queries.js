@@ -6,6 +6,7 @@ import { trainingTeacher, trainingTeacherMessage, trainingTeacherPrompt, TRAININ
 import { historicalTrainingSource, HistoricalCorpusUnavailableError, TRAINING_RETRIEVAL_VERSION, TRAINING_SEARCH_OPTIONS } from "./training-retrieval.js";
 import { contextJudgeRequest, judgeTrainingPassage, CONTEXT_JUDGE_VERSION } from "./training-judge.js";
 import { memoryJudgeVersion } from "./decision-ranking.js";
+import { selectJudgeConversation } from "./judge-context.js";
 import { jsonHash } from "./json-hash.js";
 const LANES = ["lex", "vec"];
 const SELECTION_VERSION = `independent-lanes-top${DEFAULTS.training.topScoreCount}-mean-v2`;
@@ -161,6 +162,8 @@ export function selectTrainingQueries(queries) {
 function stepBelongsToJudge(info, judgeVersion) {
     if (!info)
         return false;
+    if (info.stage === "generate")
+        return info.request.version === TRAINING_TEACHER_VERSION;
     if (info.stage === "evaluate" || info.stage === "score")
         return info.request.judgeVersion === judgeVersion;
     if (info.stage === "judge") {
@@ -176,6 +179,9 @@ function isCorpusScopedRetrievalStep(info) {
 function blockedStepsForExample(store, reviews, judgeVersion, corpusHash) {
     return reviews.flatMap(review => {
         if (!("steps" in review.details))
+            return [];
+        // The current initial step statuses below are authoritative, not old-generation review receipts.
+        if (review.reason === "generation-unresolved")
             return [];
         if (review.reason === "evaluation-unresolved") {
             if (review.scope && review.scope !== "__legacy__" && review.scope !== judgeVersion)
@@ -198,7 +204,15 @@ function blockedStepsForExample(store, reviews, judgeVersion, corpusHash) {
     });
 }
 /** Export holds: any uncleared review row for this judge blocks exporting prior evaluations. */
-function reviewBlocksJudge(store, review, judgeVersion) {
+function reviewBlocksJudge(store, review, source, judgeVersion) {
+    if (review.reason === "generation-unresolved") {
+        if (!("steps" in review.details))
+            return false;
+        const steps = review.details.steps;
+        return LANES.some(lane => steps.includes(store.step("generate", teacherRequest(source, lane)).id));
+    }
+    if (review.reason === "judge-input-too-large")
+        return review.scope === judgeVersion;
     if (review.reason !== "evaluation-unresolved")
         return true;
     if (review.scope && review.scope !== "__legacy__")
@@ -357,6 +371,13 @@ async function evaluateExample(ctx, example) {
     }
     if (ctx.options.maxExamples !== undefined && ctx.result.examples >= ctx.options.maxExamples)
         return;
+    const input = JSON.parse(example.inputJson);
+    const judgeConversation = selectJudgeConversation(input);
+    if (judgeConversation.status === "input_too_large") {
+        ctx.store.flagReview(example, "judge-input-too-large", { timestamp: example.timestamp }, ctx.judgeVersion);
+        ctx.result.flagged++;
+        return;
+    }
     ctx.store.renew();
     let snapshot;
     try {
@@ -398,11 +419,10 @@ async function evaluateExample(ctx, example) {
         ctx.result.examples++;
         if (ctx.options.dryRun)
             return;
-        const input = JSON.parse(example.inputJson);
         const problems = new Set();
         const lanes = await drain(initial.map(async ({ lane, step }) => {
             try {
-                const first = await scoreLaneQueries(ctx, example, input, snapshot, lane, 1, step.result, step.id, problems);
+                const first = await scoreLaneQueries(ctx, example, judgeConversation, snapshot, lane, 1, step.result, step.id, problems);
                 if (first.some(item => !item) || shouldStop(ctx))
                     return;
                 const feedback = first.map(item => ({ query: item.query, score: item.score }));
@@ -413,7 +433,7 @@ async function evaluateExample(ctx, example) {
                         problems.add(revision.id);
                     return;
                 }
-                const second = await scoreLaneQueries(ctx, example, input, snapshot, lane, 2, revision.result, revision.id, problems);
+                const second = await scoreLaneQueries(ctx, example, judgeConversation, snapshot, lane, 2, revision.result, revision.id, problems);
                 if (second.some(item => !item))
                     return;
                 return { teacherIds: [step.id, revision.id], queries: [...first, ...second].filter((item) => !!item) };
@@ -526,11 +546,16 @@ function hasMatchingRetrievalProof(store, source, evaluation, expectedCorpusHash
 }
 export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD, judgeVersion = CONTEXT_JUDGE_VERSION, options) {
     const active = new Map(store.queryExamples(threshold).map(e => [e.id, e]));
-    const unresolved = new Set(store.reviews().filter(review => reviewBlocksJudge(store, review, judgeVersion)).map(review => review.sourceId));
+    const unresolved = new Set(store.reviews().filter(review => {
+        const source = active.get(review.sourceId);
+        return source && reviewBlocksJudge(store, review, source, judgeVersion);
+    }).map(review => review.sourceId));
     const exported = new Set();
     for (const evaluation of store.completedEvaluations({ selection: SELECTION_VERSION, retrieval: TRAINING_RETRIEVAL_VERSION, judge: judgeVersion })) {
         const source = active.get(evaluation.sourceId);
         if (!source || source.inputHash !== evaluation.inputHash || source.timestamp !== evaluation.timestamp || exported.has(source.id))
+            continue;
+        if (!LANES.every(lane => evaluation.teacherIds.includes(store.step("generate", teacherRequest(source, lane)).id)))
             continue;
         if (unresolved.has(source.id)) {
             exported.add(source.id);
@@ -548,8 +573,6 @@ export function* exportQueryTraining(store, threshold = TRAINING_GATE_THRESHOLD,
         }
         exported.add(source.id); // Never fall back to an older accepted corpus after a newer flagged result.
         if (!hasMatchingRetrievalProof(store, source, evaluation, expectedCorpusHash))
-            continue;
-        if (!LANES.every(lane => evaluation.teacherIds.includes(store.step("generate", teacherRequest(source, lane)).id)))
             continue;
         // Selection is a local policy over completed scores, not another paid step.
         // This also recovers v2 checkpoints whose old usefulness policy saved null.

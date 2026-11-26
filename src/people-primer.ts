@@ -166,7 +166,7 @@ export async function primePersonDossier(params: {
       failed++;
     }
   }
-  const packs = packDecisionState(misses, DEFAULTS.people.primerBatchSize, DEFAULTS.people.primerBatchMaxChars,
+  const packs = packDecisionState(misses, DEFAULTS.people.primerBatchSize, DEFAULTS.people.primerBatchMaxStateBytes,
     items => ({ person: personState, agent: params.agentName, excerpts: items.map(item => item.excerpt) }));
   // Bound provider concurrency, not the shortlist after the vector threshold.
   const worker = async () => {

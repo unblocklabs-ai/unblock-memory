@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { selectJudgeConversation } from "./judge-context.js";
 import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "./decision-ranking.js";
 import { startTiming, retrievalParts, unaccounted } from "./retrieval-timing.js";
@@ -115,10 +116,14 @@ export async function searchMemory(manager, queries, options) {
         }
         return { ...timings, ...observation, rankingMode: "retrieval", fallbackReason: reason, results };
     };
-    if (!options.apiKey) {
+    const conversation = "status" in options.conversation
+        ? options.conversation
+        : selectJudgeConversation(options.conversation);
+    if (conversation.status === "input_too_large" || !options.apiKey) {
         signal?.throwIfAborted();
-        if (options.allowRetrievalFallback)
-            return fallback("key_unavailable");
+        if (options.allowRetrievalFallback) {
+            return fallback(conversation.status === "input_too_large" ? "input_too_large" : "key_unavailable");
+        }
         if (trackTrace)
             options.onTrace?.(traces);
         return { ...timings, ...observation, rankingMode: "decision", results: [] };
@@ -138,7 +143,7 @@ export async function searchMemory(manager, queries, options) {
             const requestStarted = performance.now();
             const trace = trackTrace ? traceByCandidate.get(hit) : undefined;
             try {
-                const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(options.conversation, {
+                const { probability } = await judgeMemoryPassage(memoryUsefulnessRequest(conversation, {
                     excerpt: hit.snippet, corpus: hit.corpus, sourcePath: hit.path,
                     dates: [...new Set(hit.sessionMessages?.flatMap(message => message.timestamp ? [message.timestamp] : [])
                             ?? (hit.messageTimestamp ? [hit.messageTimestamp] : []))],

@@ -66,9 +66,10 @@ Read the **returned** path, substituting its actual source/line values:
 docids. It accepts exact configured `qmd://` paths, excludes skills, defaults to
 120 lines and bounds content to 12,000 characters. `from` is 1-based; requested
 `lines` is 1–1,000. `status: "ok"` can still have `truncated: true`: use
-`nextFrom` to continue when present. A single oversized line can be clipped
-without a continuation line; inspect the authorized original source if that
-complete line matters. `not_found` and `unavailable` are not successful empty reads.
+`nextFrom` as `from`, or pass `nextCursor` as `cursor` without `from` when a
+read ends mid-line. On truncated reads, `contentChars` is the UTF-16 length of
+the content before the continuation notice. If a cursor becomes stale, restart
+without it. `not_found` and `unavailable` are not successful empty reads.
 
 Search snippets are leads. Inspect attribution, qualifications, dates and adjacent
 context before relying on a factual claim. An old plan is not proof it happened,
@@ -77,12 +78,12 @@ a high threshold, an unsynced session or an unavailable index—not absence of t
 When enabled and configured, the decision endpoint receives the semantic query,
 candidate excerpts, dates, corpus and source paths. The default route is Codex LB →
 OpenRouter `liquid/d1.2-ultra`. If disabled, missing/unreadable credentials,
-or **all** eligible usefulness requests fail (including billing HTTP 402, timeouts,
-network or invalid responses), explicit search returns local retrieval-ranked leads.
+the query exceeds the judge context budget, or **all** eligible usefulness
+requests fail, explicit search returns local retrieval-ranked leads.
 The response includes `rankingMode: "retrieval"`, `scoreMeaning: "retrieval_rank"`,
-`minUsefulnessApplied: false`, `fallbackReason` (`key_unavailable` or
-`all_judgments_failed`), and a degraded warning. The requested `minUsefulness` is
-not applied to unjudged scores. Corpus/session restrictions, complete passage
+`minUsefulnessApplied: false`, `fallbackReason` (`key_unavailable`,
+`input_too_large`, or `all_judgments_failed`), and a degraded warning. The requested
+`minUsefulness` is not applied to unjudged scores. Corpus/session restrictions, complete passage
 limits, deduplication, original source links, cancellation and `maxResults` remain
 in force. Read sources with `memory_get` before drawing conclusions.
 
@@ -92,7 +93,8 @@ judgments below `minUsefulness` still return no results, not fallback evidence.
 An empty eligible set is an ordinary empty search when judging is available.
 Automatic Memory Whisperer/People review policies remain strict: this fallback
 is opt-in only for explicit `memory_search`, not automatic context injection.
-Oversized queries are rejected before credentials, retrieval or provider calls.
+Queries that exceed the tool's input validation budget are rejected before credentials,
+retrieval or provider calls.
 Search initialization errors include an `error` alongside empty `results`;
 other failures may surface as tool errors. Investigate them instead of reporting
 “nothing is remembered.”

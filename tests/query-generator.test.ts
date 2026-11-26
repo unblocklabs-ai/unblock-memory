@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createStore } from "@unblocklabs/qmd";
-import { ApiQueryGenerator, compactJudgeConversation, fallbackQueries, QueryApiError } from "../src/query-generator.js";
+import { ApiQueryGenerator, fallbackQueries, QueryApiError } from "../src/query-generator.js";
 import { resolveConfig } from "../src/config.js";
 
 test("query API uses authenticated HTTP, validates pairs and IDs, rejects redirects/errors, and cancels", async t => {
@@ -128,54 +128,6 @@ test("fallbackQueries extracts clean lex/vec queries and handles terse, stopword
   });
   assert.equal(isWellFormed(emojiHistory.vec), true);
   assert.throws(() => fallbackQueries({ history: [], currentRequest: "   " }), /Missing or unparseable/);
-});
-
-test("compactJudgeConversation caps history to two messages, 1500 total chars, and preserves valid UTF-16 surrogates", () => {
-  const isWellFormed = (value: string) => !/(?:^|[^\ud800-\udbff])[\udc00-\udfff]|[\ud800-\udbff](?:$|[^\udc00-\udfff])/.test(value);
-  const short = compactJudgeConversation({
-    history: [
-      { role: "user", content: "first" },
-      { role: "assistant", content: "second" },
-      { role: "user", content: "third" },
-    ],
-    currentRequest: "now",
-  });
-  assert.deepEqual(short, {
-    history: [{ role: "assistant", content: "second" }, { role: "user", content: "third" }],
-    currentRequest: "now",
-  });
-
-  const hugeHistory = compactJudgeConversation({
-    history: [{ role: "assistant", content: `START ${"a".repeat(3000)} END` }],
-    currentRequest: "what about that?",
-  });
-  assert.equal(hugeHistory.history.length, 1);
-  assert.match(hugeHistory.history[0]!.content, /^START/);
-  assert.match(hugeHistory.history[0]!.content, /END$/);
-  assert.ok(hugeHistory.currentRequest.length + hugeHistory.history[0]!.content.length <= 1_500);
-
-  const hugeRequest = compactJudgeConversation({
-    history: [{ role: "user", content: "ignored because budget full" }],
-    currentRequest: `OPEN ${"x".repeat(4000)} QUESTION?`,
-  });
-  assert.deepEqual(hugeRequest.history, []);
-  assert.ok(hugeRequest.currentRequest.length <= 1_500);
-  assert.match(hugeRequest.currentRequest, /^OPEN/);
-  assert.match(hugeRequest.currentRequest, /QUESTION\?$/);
-
-  const emojiHistory = compactJudgeConversation({
-    history: [{ role: "user", content: "🚀".repeat(100) }],
-    currentRequest: "x".repeat(1419),
-  });
-  assert.equal(isWellFormed(emojiHistory.history[0]!.content), true);
-  assert.ok(emojiHistory.currentRequest.length + emojiHistory.history[0]!.content.length <= 1_500);
-
-  const emojiRequest = compactJudgeConversation({
-    history: [],
-    currentRequest: `A${"🚀".repeat(800)}`,
-  });
-  assert.equal(isWellFormed(emojiRequest.currentRequest), true);
-  assert.ok(emojiRequest.currentRequest.length <= 1_500);
 });
 
 test("API defaults to no endpoint; loopback override and legacy migration are safe", () => {

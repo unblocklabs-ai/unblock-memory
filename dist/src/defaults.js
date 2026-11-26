@@ -13,6 +13,15 @@ const probabilities = new Set([
     "defaultMinNoise", "triageNoiseThreshold", "triageEvidenceHigh", "triageEvidenceLow",
     "primerUncertainFloor", "scoreHigh", "scoreLow",
 ]);
+const deprecatedKeys = {
+    extraction: {
+        replacementBatchMaxChars: "replacementBatchMaxPayloadBytes",
+        validatorBatchMaxChars: "validatorBatchMaxStateBytes",
+    },
+    review: { maxRedundancyChars: "maxRedundancyStateBytes" },
+    quality: { judgeBatchMaxChars: "judgeBatchMaxStateBytes" },
+    people: { primerBatchMaxChars: "primerBatchMaxStateBytes" },
+};
 const ranges = {
     "decisionModel.timeoutMs": [1, 10_000],
     "decisionModel.unboundedTimeoutMs": [1, 60_000],
@@ -24,13 +33,15 @@ const ranges = {
     "extraction.inputLimitTokens": [1, 32_000],
     "extraction.replacementOptionsPerChoice": [1, 20],
     "extraction.replacementBatchSize": [1, 5],
-    "extraction.replacementBatchMaxChars": [1, 60_000],
+    "extraction.replacementBatchMaxPayloadBytes": [1, 60_000],
     "extraction.validatorBatchSize": [1, 4],
-    "extraction.validatorBatchMaxChars": [1, 240_000],
+    "extraction.validatorBatchMaxStateBytes": [1, 240_000],
     "training.decisionTimeoutMs": [1, 60_000],
     "memoryWhisperer.defaultMaxHints": [1, 3],
     "memoryWhisperer.defaultCooldownTurns": [0, 1000],
     "memoryWhisperer.defaultTimeoutMs": [1, 10_000],
+    // A cursor must be able to advance over one astral scalar without splitting it.
+    "memoryWhisperer.memoryGetMaxChars": [2, Number.MAX_SAFE_INTEGER],
     "skillWhisperer.defaultHistoryMessages": [0, Number.MAX_SAFE_INTEGER],
     "skillWhisperer.defaultCooldownTurns": [0, Number.MAX_SAFE_INTEGER],
     "skillWhisperer.maxDirectCatalogSkills": [1, 1000],
@@ -44,13 +55,14 @@ const ranges = {
     "safetyWhisperer.defaultHistoryMessages": [0, 20],
     "safetyWhisperer.defaultTimeoutMs": [1, 10_000],
     "review.maxRedundancyPairs": [1, 6],
-    "review.maxRedundancyChars": [1, 24_000],
+    "review.maxRedundancyStateBytes": [1, 24_000],
     "quality.judgeBatchSize": [1, 6],
-    "quality.judgeBatchMaxChars": [1, 18_000],
+    "quality.judgeBatchMaxStateBytes": [1, 18_000],
     "people.defaultWhispererMaxChars": [1, 4000],
     "people.defaultTodosMaxOpen": [1, 10_000],
     "people.primerBatchSize": [1, 4],
-    "people.primerBatchMaxChars": [1, 16_000],
+    "people.primerBatchMaxStateBytes": [1, 16_000],
+    "people.primerRequestTimeoutMs": [1, 60_000],
     "responseAudit.defaultHistoryMessages": [0, 20],
     "responseAudit.defaultLookbackDays": [1, 90],
     "responseAudit.defaultMaxEpisodes": [1, 100],
@@ -110,13 +122,23 @@ function validLeaf(base, value, path, key) {
 function merge(base, patch, parent = "") {
     if (!record(patch))
         throw new Error(`Invalid operational default ${parent || "(root)"}: expected an object`);
-    for (const key of Object.keys(patch)) {
+    const normalized = { ...patch };
+    for (const [oldKey, newKey] of Object.entries(deprecatedKeys[parent] ?? {})) {
+        if (!Object.hasOwn(normalized, oldKey))
+            continue;
+        if (Object.hasOwn(normalized, newKey) && normalized[newKey] !== normalized[oldKey]) {
+            throw new Error(`Conflicting operational defaults ${parent}.${oldKey} and ${parent}.${newKey}`);
+        }
+        normalized[newKey] = normalized[oldKey];
+        delete normalized[oldKey];
+    }
+    for (const key of Object.keys(normalized)) {
         if (!Object.hasOwn(base, key))
             throw new Error(`Unknown operational default ${parent ? `${parent}.` : ""}${key}`);
     }
     return Object.freeze(Object.fromEntries(Object.entries(base).map(([key, fallback]) => {
         const path = parent ? `${parent}.${key}` : key;
-        const value = Object.hasOwn(patch, key) ? patch[key] : fallback;
+        const value = Object.hasOwn(normalized, key) ? normalized[key] : fallback;
         if (record(fallback))
             return [key, merge(fallback, value, path)];
         if (!validLeaf(fallback, value, path, key))

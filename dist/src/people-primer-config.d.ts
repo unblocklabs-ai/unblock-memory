@@ -7,7 +7,9 @@ export declare const peoplePrimerSchema: Type.TObject<{
     minScore: Type.TNumber;
     minUsefulness: Type.TNumber;
     maxEvidencePerQuestion: Type.TInteger;
-    timeoutMs: Type.TInteger;
+    timeoutMs: Type.TOptional<Type.TInteger>;
 }>;
-export type PeoplePrimerConfig = Static<typeof peoplePrimerSchema>;
+export type PeoplePrimerConfig = Static<typeof peoplePrimerSchema> & {
+    timeoutMs: number;
+};
 export declare function resolvePeoplePrimer(value: unknown, corpora: readonly CorpusConfig[], peopleEnabled: boolean): PeoplePrimerConfig;

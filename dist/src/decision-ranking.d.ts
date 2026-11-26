@@ -1,4 +1,5 @@
 import { type NoulQuestion } from "@unblocklabs/decisions";
+import { type SelectedJudgeConversation } from "./judge-context.js";
 import type { QueryConversation } from "./query-contract.js";
 /** Rank independent applicability judgments; only code maps answers to catalog entries. */
 export declare function scoreSkillCatalog(params: {
@@ -50,16 +51,10 @@ export type MemoryPassage = {
     dates: readonly string[];
 };
 /** The sole versioned passage prompt/state builder for both training and runtime. */
-export declare function memoryUsefulnessRequest(conversation: QueryConversation, candidate: MemoryPassage, asOf: string, model?: string): {
+export declare function memoryUsefulnessRequest(input: QueryConversation | SelectedJudgeConversation, candidate: MemoryPassage, asOf: string, model?: string): {
     model: string;
     state: {
-        conversation: {
-            history: {
-                role: "user" | "assistant";
-                content: string;
-            }[];
-            currentRequest: string;
-        };
+        conversation: QueryConversation;
         asOf: string;
         candidates: {
             excerpt: string;

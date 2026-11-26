@@ -5,8 +5,9 @@ import type { CorpusMemorySearchResult } from "./contracts.js";
 import { resolveDecisionCredential, DecisionRequestError } from "./decision-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./decision-review.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
-import { ApiQueryGenerator, compactJudgeConversation, fallbackQueries, QueryApiError, queryConversation } from "./query-generator.js";
-import { QueryInputBudgetError, type QueryPair } from "./query-contract.js";
+import { ApiQueryGenerator, fallbackQueries, QueryApiError, visibleQueryConversation } from "./query-generator.js";
+import { selectJudgeConversation } from "./judge-context.js";
+import { prepareQueryConversation, QueryInputBudgetError, type QueryConversation, type QueryPair } from "./query-contract.js";
 import { searchMemory, memoryPassageId, type MemoryCandidateManager, type RecallCandidateTrace } from "./memory-search.js";
 import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
@@ -63,7 +64,7 @@ type TurnLogger = (level: "info" | "warn", event: string, fields: Record<string,
 
 async function generateQueriesWithFallback(params: {
   generator?: ApiQueryGenerator;
-  conversation: ReturnType<typeof queryConversation>;
+  conversation: QueryConversation;
   timeoutMs: number;
   signal: AbortSignal;
   turn: TurnTelemetry;
@@ -352,7 +353,10 @@ export function registerMemoryWhisperer(
       });
     };
     const run = async () => {
-      const conversation = queryConversation(event.prompt, event.messages, currentUserMessage);
+      const visible = visibleQueryConversation(event.prompt, event.messages, currentUserMessage);
+      const judgeConversation = selectJudgeConversation(visible);
+      if (judgeConversation.status === "input_too_large") throw new QueryInputBudgetError();
+      const { conversation } = prepareQueryConversation(visible.history, visible.currentRequest);
       turn.stage = "credentials";
       const apiKey = await timeStage("setupMs", turn.measurement, signal, () => resolveDecisionCredential(decisionModel));
       if (signal.aborted) return;
@@ -379,7 +383,7 @@ export function registerMemoryWhisperer(
         return;
       }
       const search = await searchMemory(manager, queries, {
-        corpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: compactJudgeConversation(conversation),
+        corpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: judgeConversation,
         asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: DEFAULTS.memoryWhisperer.maxFinalists,
         maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: state.recent,
         onCandidates: observation => {

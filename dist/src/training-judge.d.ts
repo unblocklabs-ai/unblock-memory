@@ -1,16 +1,11 @@
 import type { TrainingInput } from "./training-input.js";
+import type { SelectedJudgeConversation } from "./judge-context.js";
 import type { TrainingHit } from "./training-retrieval.js";
 export declare const CONTEXT_JUDGE_VERSION: string;
-export declare function contextJudgeRequest(input: TrainingInput, asOf: string, hit: TrainingHit, model?: string): {
+export declare function contextJudgeRequest(input: TrainingInput | SelectedJudgeConversation, asOf: string, hit: TrainingHit, model?: string): {
     model: string;
     state: {
-        conversation: {
-            history: {
-                role: "user" | "assistant";
-                content: string;
-            }[];
-            currentRequest: string;
-        };
+        conversation: import("./query-contract.js").QueryConversation;
         asOf: string;
         candidates: {
             excerpt: string;

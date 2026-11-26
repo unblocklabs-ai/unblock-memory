@@ -59,6 +59,13 @@ export type MemorySyncParams = Parameters<
   NonNullable<MemorySearchManagerContract["sync"]>
 >[0];
 
+export type MemoryReadCursor = {
+  line: number;
+  /** UTF-16 code units from the start of the line, at a scalar boundary. */
+  offset: number;
+  revision: string;
+};
+
 export type MemoryReadResult =
   | {
       status: "ok";
@@ -68,5 +75,9 @@ export type MemoryReadResult =
       from?: number;
       lines?: number;
       nextFrom?: number;
+      nextCursor?: MemoryReadCursor;
+      /** UTF-16 length of the content prefix, excluding the continuation notice. */
+      contentChars?: number;
     }
-  | { status: "not_found"; text: ""; path: string };
+  | { status: "not_found"; text: ""; path: string }
+  | { status: "stale_cursor"; text: ""; path: string; error: string };

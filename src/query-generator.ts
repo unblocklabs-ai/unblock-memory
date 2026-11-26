@@ -9,7 +9,7 @@ import { parseQueryPair, prepareQueryConversation, type QueryConversation, type 
 import { nonBlank, record } from "./guards.js";
 
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
-export function queryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string): QueryConversation {
+export function visibleQueryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string): QueryConversation {
   const currentRequest = queryUserText(currentUserMessage !== undefined ? currentUserMessage : prompt) ?? "";
   const visible: QueryConversation["history"] = [];
   const assistantTexts = new Map<string, boolean>();
@@ -52,7 +52,12 @@ export function queryConversation(prompt: string, messages: readonly unknown[], 
   }
   const last = visible.at(-1);
   if (last?.role === "user" && last.content.replaceAll("\r\n", "\n") === currentRequest.replaceAll("\r\n", "\n")) visible.pop();
-  return prepareQueryConversation(visible, currentRequest).conversation;
+  return { history: visible, currentRequest };
+}
+
+export function queryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string): QueryConversation {
+  const { history, currentRequest } = visibleQueryConversation(prompt, messages, currentUserMessage);
+  return prepareQueryConversation(history, currentRequest).conversation;
 }
 
 const FALLBACK_STOP_WORDS = new Set(
@@ -62,13 +67,8 @@ const FALLBACK_STOP_WORDS = new Set(
     "she should so some still such than that the their them then there these they think this those through " +
     "to too under up very was we were what whats when where which who why will with would you your").split(" "),
 );
-const MAX_FALLBACK_LEX_TERMS = 12;
-const MAX_FALLBACK_TERM_CHARS = 64;
-const MAX_FALLBACK_LEX_CHARS = 256;
-const MAX_FALLBACK_VEC_CHARS = 450;
-const MAX_JUDGE_HISTORY_MESSAGES = 2;
-const MAX_JUDGE_CONVERSATION_CHARS = 1_500;
-const MIN_COMPACT_HISTORY_CHARS = 80;
+const { fallbackMaxLexTerms, fallbackMaxTermChars, fallbackMaxLexChars, fallbackMaxVecChars,
+  fallbackHistoryUserMessages } = DEFAULTS.memoryWhisperer;
 
 function sliceHeadSafe(text: string, maxChars: number): string {
   if (maxChars <= 0) return "";
@@ -93,11 +93,11 @@ function extractFallbackTerms(text: string): string[] {
   const terms: string[] = [];
   for (const token of text.match(/[\p{L}\p{N}_]+/gu) ?? []) {
     const lower = token.toLowerCase();
-    if (token.length > MAX_FALLBACK_TERM_CHARS || (lower.length === 1 && /^[a-z]$/u.test(lower)) ||
+    if (token.length > fallbackMaxTermChars || (lower.length === 1 && /^[a-z]$/u.test(lower)) ||
       seen.has(lower) || FALLBACK_STOP_WORDS.has(lower)) continue;
     seen.add(lower);
     terms.push(token);
-    if (terms.length >= MAX_FALLBACK_LEX_TERMS) break;
+    if (terms.length >= fallbackMaxLexTerms) break;
   }
   return terms;
 }
@@ -106,10 +106,10 @@ function joinBoundedTerms(tokens: readonly string[]): string {
   const parts: string[] = [];
   let length = 0;
   for (const token of tokens) {
-    const bounded = sliceHeadSafe(token, MAX_FALLBACK_TERM_CHARS);
+    const bounded = sliceHeadSafe(token, fallbackMaxTermChars);
     if (!bounded) continue;
     const added = bounded.length + (parts.length ? 1 : 0);
-    if (length + added > MAX_FALLBACK_LEX_CHARS) break;
+    if (length + added > fallbackMaxLexChars) break;
     parts.push(bounded);
     length += added;
   }
@@ -123,60 +123,33 @@ export function fallbackQueries(conversation: QueryConversation): QueryPair {
   const requestTerms = extractFallbackTerms(request);
   const terms = [...requestTerms];
   const seen = new Set(terms.map(term => term.toLowerCase()));
-  const recentUsers = conversation.history.filter(message => message.role === "user").slice(-2);
+  const recentUsers = fallbackHistoryUserMessages
+    ? conversation.history.filter(message => message.role === "user").slice(-fallbackHistoryUserMessages)
+    : [];
   if (terms.length < 4) {
-    for (let index = recentUsers.length - 1; index >= 0 && terms.length < MAX_FALLBACK_LEX_TERMS; index--) {
+    for (let index = recentUsers.length - 1; index >= 0 && terms.length < fallbackMaxLexTerms; index--) {
       for (const token of extractFallbackTerms(recentUsers[index]!.content)) {
         const lower = token.toLowerCase();
         if (seen.has(lower)) continue;
         seen.add(lower);
         terms.push(token);
-        if (terms.length >= MAX_FALLBACK_LEX_TERMS) break;
+        if (terms.length >= fallbackMaxLexTerms) break;
       }
     }
   }
   const rawTokens = [...new Set((request.match(/[\p{L}\p{N}_]+/gu) ?? [])
-    .map(token => sliceHeadSafe(token, MAX_FALLBACK_TERM_CHARS).toLowerCase())
-    .filter(Boolean))].slice(0, MAX_FALLBACK_LEX_TERMS);
-  const lex = (joinBoundedTerms(terms) || joinBoundedTerms(rawTokens) || sliceHeadSafe(request, MAX_FALLBACK_LEX_CHARS)).trim();
+    .map(token => sliceHeadSafe(token, fallbackMaxTermChars).toLowerCase())
+    .filter(Boolean))].slice(0, fallbackMaxLexTerms);
+  const lex = (joinBoundedTerms(terms) || joinBoundedTerms(rawTokens) || sliceHeadSafe(request, fallbackMaxLexChars)).trim();
   const vecSource = requestTerms.length < 4 && recentUsers.length
     ? `${recentUsers.at(-1)!.content.trim()}\n${request}`
     : request;
-  const vec = (vecSource.length <= MAX_FALLBACK_VEC_CHARS
+  const vec = (vecSource.length <= fallbackMaxVecChars
     ? vecSource
-    : request.length >= MAX_FALLBACK_VEC_CHARS
-      ? sliceHeadSafe(request, MAX_FALLBACK_VEC_CHARS)
-      : sliceTailSafe(vecSource, MAX_FALLBACK_VEC_CHARS)).trim();
+    : request.length >= fallbackMaxVecChars
+      ? sliceHeadSafe(request, fallbackMaxVecChars)
+      : sliceTailSafe(vecSource, fallbackMaxVecChars)).trim();
   return { lex, vec };
-}
-
-function clampHeadTail(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  const ellipsis = "\n…\n";
-  const half = Math.floor((maxChars - ellipsis.length) / 2);
-  return `${sliceHeadSafe(text, half).trimEnd()}${ellipsis}${sliceTailSafe(text, half).trimStart()}`;
-}
-
-/** Bound conversation context repeated across automatic passage usefulness judgments. */
-export function compactJudgeConversation(conversation: QueryConversation): QueryConversation {
-  const currentRequest = clampHeadTail(conversation.currentRequest, MAX_JUDGE_CONVERSATION_CHARS);
-  let remaining = MAX_JUDGE_CONVERSATION_CHARS - currentRequest.length;
-  const history: QueryConversation["history"] = [];
-  for (let index = conversation.history.length - 1;
-    index >= 0 && history.length < MAX_JUDGE_HISTORY_MESSAGES && remaining > 0;
-    index--) {
-    const message = conversation.history[index]!;
-    if (message.content.length <= remaining) {
-      history.unshift(message);
-      remaining -= message.content.length;
-    } else if (remaining >= MIN_COMPACT_HISTORY_CHARS) {
-      history.unshift({ role: message.role, content: clampHeadTail(message.content, remaining) });
-      remaining = 0;
-    } else {
-      break;
-    }
-  }
-  return { history, currentRequest };
 }
 
 export class QueryApiError extends Error {

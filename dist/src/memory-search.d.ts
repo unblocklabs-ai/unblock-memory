@@ -1,5 +1,6 @@
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { QueryConversation, QueryPair } from "./query-contract.js";
+import { selectJudgeConversation } from "./judge-context.js";
 import { type RetrievalTimings } from "./retrieval-timing.js";
 import { type RecallHitDisposition, type RecallHitLocator } from "./recall-ledger.js";
 export type MemoryCandidateManager = {
@@ -16,7 +17,7 @@ export type MemorySearchObservation = RetrievalTimings & {
 };
 export type MemoryRanking = {
     rankingMode: "decision" | "retrieval";
-    fallbackReason?: "key_unavailable" | "all_judgments_failed";
+    fallbackReason?: "key_unavailable" | "all_judgments_failed" | "input_too_large";
 };
 export type RecallCandidateTrace = {
     hit: CorpusMemorySearchResult;
@@ -34,7 +35,7 @@ export declare function searchMemory(manager: MemoryCandidateManager, queries: Q
     endpoint?: string;
     model?: string;
     timeoutMs: number;
-    conversation: QueryConversation;
+    conversation: QueryConversation | ReturnType<typeof selectJudgeConversation>;
     asOf?: string;
     /** Only explicit, agent-requested search opts in. Automatic injection stays strict. */
     allowRetrievalFallback?: boolean;

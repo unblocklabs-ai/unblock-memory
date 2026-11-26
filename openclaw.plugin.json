@@ -440,8 +440,7 @@
           "timeoutMs": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 60000,
-            "default": 30000
+            "maximum": 60000
           }
         },
         "default": {
@@ -450,8 +449,7 @@
           "hitsPerQuestion": 30,
           "minScore": 0.35,
           "minUsefulness": 0.8,
-          "maxEvidencePerQuestion": 3,
-          "timeoutMs": 30000
+          "maxEvidencePerQuestion": 3
         }
       },
       "evidenceReview": {

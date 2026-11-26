@@ -26,12 +26,13 @@ type End = (event: { sessionId: string; sessionKey?: string }, context: Context)
 
 beforeEach(t => { if ("mock" in t) t.mock.method(ApiQueryGenerator.prototype, "generate", async () => ({ lex: "test lexical", vec: "test semantic" })); });
 
-test("API generation caps decision model passage judgments to top 6 with compact context and reuses prompt rebuilds", { timeout: 2000 }, async t => {
+test("API generation caps judgments to top 6, judges whole visible context, and reuses prompt rebuilds", { timeout: 2000 }, async t => {
   const judged = deferred<void>(), release = deferred<void>();
   const queries = { lex: "generated A", vec: "generated B" };
+  const assistantReply = `Whole payload: ${"<".repeat(4000)}`;
   t.mock.method(ApiQueryGenerator.prototype, "generate", async (conversation: ReturnType<typeof queryConversation>) => {
     assert.equal(conversation.currentRequest, dmRequest);
-    assert.equal(conversation.history.length, 4, "query generator receives full visible history");
+    assert.deepEqual(conversation.history, [], "student escaping exhausts its independent byte budget on newest message");
     assert.doesNotMatch(JSON.stringify(conversation), /Conversation info|openclaw:ctx|Slack DM/);
     return queries;
   });
@@ -41,8 +42,7 @@ test("API generation caps decision model passage judgments to top 6 with compact
     const [state] = request.state;
     assert.equal(request.questions.recall_needed, undefined, "live whisperer runs without recall gate");
     assert.equal(state.conversation.currentRequest, dmRequest);
-    assert.equal(state.conversation.history.length, 2, "judge receives compact 2-message history");
-    assert.deepEqual(state.conversation.history.map((m: { content: string }) => m.content), ["m3", "m4"]);
+    assert.deepEqual(state.conversation.history.map((m: { content: string }) => m.content), ["m1", "m2", "m3", assistantReply]);
     assert.doesNotMatch(JSON.stringify(request.state), /generated [ABC]|vectorScore|"score"/);
     assert.equal(state.candidates.length, 1);
     assert.equal(Object.keys(request.questions).length, 1);
@@ -63,7 +63,7 @@ test("API generation caps decision model passage judgments to top 6 with compact
       { role: "user", content: "m1" },
       { role: "assistant", content: "m2" },
       { role: "user", content: "m3" },
-      { role: "assistant", content: "m4" },
+      { role: "assistant", content: assistantReply },
       { role: "user", content: dmPrompt },
     ],
   };
@@ -272,7 +272,7 @@ test("query API failures and inner timeouts fall back to deterministic lex/vec q
 test("oversized input is reported as skipped before provider calls, including prompt rebuilds", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { assert.fail("Oversized input reached decision model"); });
   const generation = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => { assert.fail("Oversized input reached query generation"); });
-  for (const prompt of ["private ".repeat(3001), "🚀".repeat(4000)]) {
+  for (const prompt of ["private ".repeat(3001), "🚀".repeat(1500)]) {
     const h = harness();
     t.after(() => h.stop());
     const oversized = { prompt, messages: [] };
@@ -436,7 +436,7 @@ test("complementary review splits over the serialized byte limit without droppin
       state: [{ excerpts: { id: number; text: string }[] }];
       questions: Record<string, unknown>;
     };
-    assert.ok(Buffer.byteLength(JSON.stringify(state)) <= DEFAULTS.review.maxRedundancyChars);
+    assert.ok(Buffer.byteLength(JSON.stringify(state)) <= DEFAULTS.review.maxRedundancyStateBytes);
     const ids = new Set(state[0].excerpts.map(({ id }) => String(id)));
     return Response.json({ answers: Object.fromEntries(Object.keys(questions).map(key => {
       const [, earlier, later] = key.split("_");
@@ -626,7 +626,6 @@ test("isolated judges rank useful hits, enforce threshold, deduplicate and injec
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
     const request = JSON.parse(String(init?.body));
     const [state] = request.state;
-    assert.equal(state.conversation.history.length, 2);
     assert.equal(state.candidates.length, 1);
     assert.equal(state.candidates[0].sourcePath.startsWith("qmd://"), true);
     assert.equal(Object.keys(request.questions).length, 1);

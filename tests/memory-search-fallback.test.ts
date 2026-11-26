@@ -93,8 +93,10 @@ test("caller cancellation while judging never becomes degraded success", async t
   await assert.rejects(searchMemory(manager, queries, { ...options, signal: controller.signal }), { name: "AbortError" });
 });
 
-for (const credential of ["missing", "disabled", "unreadable"] as const) {
-  test(`public tool returns explicitly labeled retrieval evidence with ${credential} credential`, async t => {
+for (const scenario of ["missing credential", "disabled credential", "unreadable credential", "oversized judge input"] as const) {
+  test(`public tool returns explicitly labeled retrieval evidence with ${scenario}`, async t => {
+    const overflow = scenario === "oversized judge input";
+    const vectorQuery = overflow ? `Find evidence about ${"🚀".repeat(1500)}` : queries.vec;
     let providerCalls = 0;
     t.mock.method(globalThis, "fetch", async () => { providerCalls++; throw new Error("must not call provider"); });
     const previousCodex = process.env.CODEX_LB_API_KEY;
@@ -106,8 +108,9 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
     let factory: ((ctx: OpenClawPluginToolContext) => Tool) | undefined;
     let diagnosticsFactory: typeof factory;
     registerUnblockMemory({
-      pluginConfig: { decisionModel: credential === "disabled" ? { enabled: false, apiKey: "ignored" }
-        : credential === "unreadable" ? { apiKeyFile: "/dev/null/not-a-file" } : {} },
+      pluginConfig: { decisionModel: scenario === "disabled credential" ? { enabled: false, apiKey: "ignored" }
+        : scenario === "unreadable credential" ? { apiKeyFile: "/dev/null/not-a-file" }
+        : overflow ? { apiKey: "configured" } : {} },
       registerCli() {}, registerService() {}, on() {}, registerGatewayMethod() {},
       registerMemoryCapability({ runtime }: { runtime: QmdMemoryRuntime }) {
         Object.defineProperty(runtime, "getMemorySearchManager", { value: async () => ({ manager }) });
@@ -117,13 +120,13 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
         if (params.names.includes("memory_diagnostics")) diagnosticsFactory = candidate;
       },
     } as unknown as OpenClawPluginApi);
-    const context = { agentId: `fallback-${credential}`, config: {} } as OpenClawPluginToolContext;
+    const context = { agentId: `fallback-${scenario.replaceAll(" ", "-")}`, config: {} } as OpenClawPluginToolContext;
     const result = await factory!(context)
-      .execute("search", { bm25Query: queries.lex, vectorQuery: queries.vec, minUsefulness: 1 });
+      .execute("search", { bm25Query: queries.lex, vectorQuery, minUsefulness: 1 });
     assert.equal(result.details.rankingMode, "retrieval");
     assert.equal(result.details.scoreMeaning, "retrieval_rank");
     assert.equal(result.details.minUsefulnessApplied, false);
-    assert.equal(result.details.fallbackReason, "key_unavailable");
+    assert.equal(result.details.fallbackReason, overflow ? "input_too_large" : "key_unavailable");
     assert.equal(result.details.error, undefined);
     assert.match(String(result.details.warning), /memory_get/);
     const results = result.details.results as CorpusMemorySearchResult[];
@@ -131,7 +134,7 @@ for (const credential of ["missing", "disabled", "unreadable"] as const) {
     assert.equal(results[0]!.score, hits[0]!.score, "retrieval precision is retained, not rounded into zero");
     assert.equal(results[0]!.vectorScore, undefined, "raw lane scores are not mislabeled vector similarities");
     assert.equal(results[0]!.textScore, undefined);
-    assert.equal(providerCalls, 0, "missing, disabled or unreadable keys never reach the provider");
+    assert.equal(providerCalls, 0, "skipped judging never reaches the provider");
     const diagnostics = await diagnosticsFactory!(context).execute("diagnostics", {}) as { details: {
       whisperers: { telemetry: { operations: { memorySearch: { measurements: { judgeMs: { samples: number } } } } } };
     } };

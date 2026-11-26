@@ -15,6 +15,7 @@ import {
   type ManagerStore,
 } from "../src/manager.js";
 import { clusterReference, ensureMemoryAnalysisSchema } from "../src/analysis.js";
+import { DEFAULTS } from "../src/defaults.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSource, resolveSources } from "../src/sources.js";
 import { createAgentDatabase } from "./helpers/session-database.js";
 import { reviewFixture } from "./helpers/review-store.js";
@@ -198,6 +199,59 @@ test("bounds default memory reads and provides continuation", () => {
   assert.equal(result.nextFrom, 121);
   assert.equal(result.truncated, true);
   assert.match(result.text, /Use from=121/);
+});
+
+test("indexed memory reads reconstruct a long emoji line and reject invalid or stale cursors", async () => {
+  await using root = await mkdtempDisposable(join(tmpdir(), "unblock-memory-read-"));
+  const maxChars = DEFAULTS.memoryWhisperer.memoryGetMaxChars;
+  const line = `x${"😀".repeat(maxChars + 16)}!`;
+  const writeSource = (text: string) => writeFile(join(root.path, "long.md"), text);
+  await writeSource(line);
+  await writeFile(join(root.path, "copy.md"), line);
+  const source = resolveSource(root.path, "*.md", "memory");
+  const backing = await createStore({ dbPath: join(root.path, "index.sqlite"), config: {
+    collections: { [source.collection]: { path: source.root, pattern: source.pattern } },
+  } });
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath, workspaceDir: root.path, sources: [source], storeFactory: async () => backing,
+  });
+  const relPath = `qmd://${source.collection}/long.md`;
+  try {
+    await backing.update();
+    const first = await manager.readFile({ relPath });
+    assert.equal(first.status, "ok");
+    assert.ok(first.nextCursor && first.truncated);
+    assert.equal(first.nextFrom, undefined);
+    const cursor = first.nextCursor;
+
+    let read = first;
+    let text = "";
+    for (let page = 0; page < 3; page++) {
+      const fragment = read.text.slice(0, read.contentChars ?? read.text.length);
+      assert.ok(fragment.length <= maxChars);
+      assert.doesNotMatch(fragment, /[\uD800-\uDFFF]/u);
+      text += fragment;
+      if (!read.nextCursor) break;
+      assert.equal(read.nextCursor.offset, text.length);
+      const next = await manager.readFile({ relPath, cursor: read.nextCursor });
+      assert.equal(next.status, "ok");
+      read = next;
+    }
+    assert.equal(text, line);
+    assert.equal(read.truncated, undefined);
+
+    for (const invalid of [{ ...cursor, line: 2 }, { ...cursor, offset: cursor.offset + 1 }, { ...cursor, offset: line.length + 1 }]) {
+      assert.equal((await manager.readFile({ relPath, cursor: invalid })).status, "stale_cursor");
+    }
+    assert.equal((await manager.readFile({ relPath: `qmd://${source.collection}/copy.md`, cursor })).status, "stale_cursor");
+    await writeSource(`changed ${line}`);
+    await backing.update();
+    const stale = await manager.readFile({ relPath, cursor });
+    assert.equal(stale.status, "stale_cursor");
+    assert.match(stale.error, /restart/i);
+  } finally {
+    await manager.close();
+  }
 });
 
 test("expands a session leaf to the largest complete context within the token limit", async () => {

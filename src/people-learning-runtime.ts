@@ -22,6 +22,7 @@ import { getContext } from "./tool-context.js";
 import { record } from "./guards.js";
 import { jsonHash } from "./json-hash.js";
 import { reviewWindow } from "./people-learning-time.js";
+import { DEFAULTS } from "./defaults.js";
 
 const LEARNING_PARAMETERS = Type.Union([
   Type.Object({ action: Type.Literal("inventory"), kind: Type.Enum(["nightly", "weekly"]) }, { additionalProperties: false }),
@@ -400,10 +401,6 @@ function handleCheckpointAction(options: {
   });
 }
 
-const STARTUP_RETRY_DELAY_MS = 5_000;
-const RETRY_DELAY_MS = 60_000;
-const MAX_QUIET_STARTUP_RETRIES = 8;
-
 function isStartupPrepError(error: unknown): boolean {
   return /not completed startup inspection and preparation/i.test(String(error));
 }
@@ -470,7 +467,7 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
           if (live && version === generation) {
             rerun = false;
             api.logger.warn("unblock-memory people learning incomplete: this host does not expose service getCron; upgrade the host");
-            scheduleRetry(RETRY_DELAY_MS);
+            scheduleRetry(DEFAULTS.people.learningReconcileRetryMs);
           }
           return;
         }
@@ -491,16 +488,17 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
       .catch(error => {
         if (!live || version !== generation) return;
         rerun = false;
-        if (isStartupPrepError(error) && scheduler && !scheduler.signal?.aborted && startupRetries < MAX_QUIET_STARTUP_RETRIES) {
+        if (isStartupPrepError(error) && scheduler && !scheduler.signal?.aborted &&
+            startupRetries < DEFAULTS.people.learningStartupRetryLimit) {
           startupRetries++;
           if (startupRetries === 1) {
             api.logger.info?.("unblock-memory people learning scheduling deferred until agent startup preparation completes");
           }
-          scheduleRetry(STARTUP_RETRY_DELAY_MS);
+          scheduleRetry(DEFAULTS.people.learningStartupRetryMs);
           return;
         }
         api.logger.warn(`unblock-memory people learning scheduling incomplete: ${String(error)}`);
-        scheduleRetry(RETRY_DELAY_MS);
+        scheduleRetry(DEFAULTS.people.learningReconcileRetryMs);
       })
       .finally(() => { reconciliation = undefined; });
     return reconciliation;

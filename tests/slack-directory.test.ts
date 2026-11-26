@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { resolveConfig } from "../src/config.js";
+import { DEFAULTS } from "../src/defaults.js";
 import { primePersonDossier } from "../src/people-primer.js";
 import { PeopleStore } from "../src/people-store.js";
 import { createOpenClawSlackDirectory, syncSlackDirectory } from "../src/slack-directory.js";
@@ -30,11 +31,11 @@ test("reads Slack users in-process from the active resolved account", async () =
             ok: true,
             members: [
               {
-                id: " U123 ",
-                name: " bek ",
+                id: "U123",
+                name: "bek",
                 profile: {
                   display_name: " Bek ",
-                  image_192: " https://example.test/bek.png ",
+                  image_192: "https://example.test/bek.png?name=A%2BB",
                   title: "not persisted",
                 },
               },
@@ -50,7 +51,7 @@ test("reads Slack users in-process from the active resolved account", async () =
       id: "U123",
       name: "Bek",
       handle: "bek",
-      avatarUrl: "https://example.test/bek.png",
+      avatarUrl: "https://example.test/bek.png?name=A%2BB",
       isBot: undefined,
       isDeactivated: undefined,
     },
@@ -60,27 +61,115 @@ test("reads Slack users in-process from the active resolved account", async () =
   assert.equal(requests[0]?.authorization, "Bearer resolved-token");
 });
 
-test("paginates Slack users and rejects repeated cursors", async () => {
-  let calls = 0;
+test("rejects invalid preferred Slack credentials without falling back or exposing the token", async () => {
+  for (const userToken of ["", 123, " padded-token ", "u".repeat(DEFAULTS.people.slackTokenMaxChars + 1)]) {
+    let requests = 0;
+    const reader = createOpenClawSlackDirectory({
+      getConfig: () => ({}),
+      inspectAccount: async () => ({ userToken, botToken: "fallback-bot-token" }),
+      request: async () => {
+        requests++;
+        return { ok: true, status: 200, json: async () => ({ ok: true, members: [] }) };
+      },
+    });
+    await assert.rejects(reader.listUsers({ accountId: "default", limit: 1 }), {
+      message: "Slack directory account has an invalid userToken",
+    });
+    assert.equal(requests, 0);
+  }
+});
+
+test("does not echo a Slack credential from a failed request or response", async () => {
+  const userToken = "synthetic-user-secret";
+  for (const request of [
+    async () => { throw new Error(userToken); },
+    async () => ({ ok: true, status: 200, json: async () => ({ ok: false, error: userToken }) }),
+  ]) {
+    const reader = createOpenClawSlackDirectory({
+      getConfig: () => ({}),
+      inspectAccount: async () => ({ userToken }),
+      request,
+    });
+    await assert.rejects(reader.listUsers({ accountId: "default", limit: 1 }), (error: Error) =>
+      /Slack directory request failed/.test(error.message) && !error.message.includes(userToken));
+  }
+});
+
+test("skips invalid Slack member IDs and omits invalid metadata; only display names are cropped", async t => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-slack-values-"));
+  const store = new PeopleStore(join(root, "people.sqlite"), { maxOpenTodos: 10, maxBlurbChars: 1200 });
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  const validId = "U".repeat(DEFAULTS.people.slackIdMaxChars);
+  const validName = "a".repeat(DEFAULTS.people.slackDisplayNameMaxChars - 1);
   const reader = createOpenClawSlackDirectory({
     getConfig: () => ({}),
-    inspectAccount: async () => ({ identity: "bot", userToken: "resolved-user-token" }),
+    inspectAccount: async () => ({ botToken: "resolved-bot-token" }),
     request: async () => ({
       ok: true,
       status: 200,
       async json() {
-        calls += 1;
         return {
           ok: true,
-          members: calls === 1 ? [{ id: "U1", raw_secret: "DO_NOT_COPY" }] : [],
-          response_metadata: { next_cursor: "same-cursor" },
+          members: [
+            { id: " U-padded " },
+            { id: validId + "X", profile: { display_name: "Must not overwrite" } },
+            {
+              id: validId,
+              name: "a".repeat(DEFAULTS.people.slackHandleMaxChars + 1),
+              profile: {
+                display_name: ` ${validName}🦉suffix `,
+                image_512: "https://example.test/" + "a".repeat(DEFAULTS.people.slackAvatarUrlMaxChars),
+                image_192: "not-a-url",
+              },
+            },
+          ],
         };
       },
     }),
   });
+  assert.equal((await syncSlackDirectory({ store, reader, accountId: "default", limit: 10 })).created, 1);
+  assert.equal(store.findIdentity("slack", "default", "U-padded"), undefined);
+  const saved = store.findIdentity("slack", "default", validId);
+  assert.equal(saved?.displayName, validName);
+  assert.equal(saved?.handle, null);
+  assert.equal(saved?.avatarUrl, null);
+});
 
-  await assert.rejects(reader.listUsers({ accountId: "default", limit: 2 }), /repeated cursor/);
-  assert.equal(calls, 2);
+test("Slack sync refuses malformed, oversized, and repeated cursors before writing any page", async t => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-slack-cursors-"));
+  const store = new PeopleStore(join(root, "people.sqlite"), { maxOpenTodos: 10, maxBlurbChars: 1200 });
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  const validCursor = "a+b/c==";
+  for (const [cursor, error] of [
+    [123, /invalid cursor/],
+    [" ", /invalid cursor/],
+    ["a".repeat(DEFAULTS.people.slackCursorMaxChars + 1), /invalid cursor/],
+    [validCursor, /repeated cursor/],
+  ] as const) {
+    const requests: URL[] = [];
+    const reader = createOpenClawSlackDirectory({
+      getConfig: () => ({}),
+      inspectAccount: async () => ({ userToken: "resolved-user-token" }),
+      request: async (input) => {
+        requests.push(new URL(input));
+        const firstPage = requests.length === 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            members: [{ id: firstPage ? "U1" : "U2" }],
+            response_metadata: { next_cursor: firstPage ? validCursor : cursor },
+          }),
+        };
+      },
+    });
+    await assert.rejects(syncSlackDirectory({ store, reader, accountId: "default", limit: 2 }), error);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1]?.searchParams.get("cursor"), validCursor);
+    assert.equal(store.findIdentity("slack", "default", "U1"), undefined);
+    assert.equal(store.findIdentity("slack", "default", "U2"), undefined);
+  }
 });
 
 test("directory sync repairs already-enriched ID names and primer searches the human name", async t => {

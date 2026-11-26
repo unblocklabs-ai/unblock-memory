@@ -23,6 +23,7 @@ import { registerMemoryTraining } from "./training-runtime.js";
 import { resolveTimezone } from "./session-projector.js";
 import { searchMemory } from "./memory-search.js";
 import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
+import { selectJudgeConversation } from "./judge-context.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
@@ -59,8 +60,13 @@ const searchParameters = Type.Object({
 const getParameters = Type.Object({
     path: Type.String({ pattern: "\\S" }),
     from: Type.Optional(Type.Integer({ minimum: 1, description: "First source line, 1-based; default 1. Use nextFrom from a truncated read to continue." })),
-    lines: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULTS.memoryWhisperer.memoryGetMaxLines, description: `Requested lines; default 120, also bounded by ${DEFAULTS.memoryWhisperer.memoryGetMaxChars} content characters.` })),
-}, { additionalProperties: false });
+    cursor: Type.Optional(Type.Object({
+        line: Type.Integer({ minimum: 1 }),
+        offset: Type.Integer({ minimum: 0 }),
+        revision: Type.String({ pattern: "\\S" }),
+    }, { additionalProperties: false, description: "Use nextCursor from a truncated read, without from." })),
+    lines: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULTS.memoryWhisperer.memoryGetMaxLines, description: `Requested lines; default ${DEFAULTS.memoryWhisperer.memoryGetDefaultLines}, also bounded by ${DEFAULTS.memoryWhisperer.memoryGetMaxChars} content characters.` })),
+}, { additionalProperties: false, not: { required: ["from", "cursor"] } });
 const syncSessionsParameters = Type.Object({
     force: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
@@ -197,7 +203,8 @@ function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger
                     sessionFilter,
                     maxResults,
                     minUsefulness,
-                    apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation, allowRetrievalFallback: true,
+                    apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs,
+                    conversation: selectJudgeConversation(conversation), allowRetrievalFallback: true,
                     signal, timings: measurement,
                     requestContext: active.requestContext,
                     onCandidates: ({ retrievalMs, candidates, eligible }) => {
@@ -218,7 +225,7 @@ function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger
                         : measurement.outcome === "empty" && search.eligible > 0 && search.rankingMode === "decision"
                             ? "rejected"
                             : measurement.outcome;
-                    enqueueToolQuery(ledgerOutcome, search.rankingMode, toolTraceToHits(traces), search.fallbackReason);
+                    enqueueToolQuery(ledgerOutcome, search.rankingMode, toolTraceToHits(traces), search.fallbackReason === "input_too_large" ? undefined : search.fallbackReason);
                 }
                 // Compact only the public tool response; internal ranking and consumers keep
                 // full-precision scores and the host's source/citation compatibility fields.
@@ -274,12 +281,13 @@ function createGetTool(runtime, ctx, recallLedger) {
     return {
         name: "memory_get",
         label: "Memory Get",
-        description: "Read an exact indexed qmd:// source path returned by memory tools. Defaults to 120 lines, bounded to 12,000 content characters. Check truncated/nextFrom and continue when present; not_found or unavailable is not a successful empty read.",
+        description: `Read an exact indexed qmd:// source path. Defaults to ${DEFAULTS.memoryWhisperer.memoryGetDefaultLines} lines and at most ${DEFAULTS.memoryWhisperer.memoryGetMaxChars} content characters. Continue with nextFrom as from or nextCursor as cursor. On stale_cursor, restart the read.`,
         parameters: getParameters,
         async execute(toolCallId, params) {
             const readAtMs = Date.now();
-            const { path: untrimmedPath, from, lines } = Value.Parse(getParameters, params);
+            const { path: untrimmedPath, from, lines, cursor } = Value.Parse(getParameters, params);
             const path = untrimmedPath.trim();
+            const startLine = cursor?.line ?? from;
             const eventKey = `get:${toolEventScope(active)}:${nonBlank(toolCallId) ?? randomUUID()}`;
             const { manager, error } = await runtime.getMemorySearchManager(active);
             if (!manager) {
@@ -292,7 +300,7 @@ function createGetTool(runtime, ctx, recallLedger) {
                         sessionId: active.requestContext.sessionId,
                         runId: active.runId,
                         sourcePath: path,
-                        startLine: from,
+                        startLine,
                         lineCount: lines,
                         status: "unavailable",
                     },
@@ -304,6 +312,7 @@ function createGetTool(runtime, ctx, recallLedger) {
                     relPath: path,
                     from,
                     lines,
+                    ...(cursor ? { cursor } : {}),
                     requestContext: active.requestContext,
                 });
                 recallLedger?.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
@@ -315,9 +324,9 @@ function createGetTool(runtime, ctx, recallLedger) {
                         sessionId: active.requestContext.sessionId,
                         runId: active.runId,
                         sourcePath: result.path || path,
-                        startLine: result.status === "ok" ? (result.from ?? from) : from,
+                        startLine: result.status === "ok" ? (result.from ?? startLine) : startLine,
                         lineCount: result.status === "ok" ? (result.lines ?? lines) : lines,
-                        status: result.status,
+                        status: result.status === "stale_cursor" ? "unavailable" : result.status,
                     },
                 });
                 return jsonResult(result);
@@ -332,7 +341,7 @@ function createGetTool(runtime, ctx, recallLedger) {
                         sessionId: active.requestContext.sessionId,
                         runId: active.runId,
                         sourcePath: path,
-                        startLine: from,
+                        startLine,
                         lineCount: lines,
                         status: "unavailable",
                     },

@@ -1,5 +1,6 @@
 import { DEFAULTS } from "./defaults.js";
 import { DecisionError, noul } from "@unblocklabs/decisions";
+import { JUDGE_CONTEXT_VERSION, selectJudgeConversation } from "./judge-context.js";
 import { decideWithModel, decisionModelScope, DEFAULT_DECISION_MODEL, } from "./decision-client.js";
 import { MEMORY_PASSAGE_CHARS } from "./memory-passage.js";
 import { decisionStateBytes } from "./decision-packs.js";
@@ -76,7 +77,7 @@ export async function judgeQuality(params) {
     if (!chunks.length)
         return [];
     const state = { chunks };
-    if (chunks.length > DEFAULTS.quality.judgeBatchSize || decisionStateBytes(state) > DEFAULTS.quality.judgeBatchMaxChars) {
+    if (chunks.length > DEFAULTS.quality.judgeBatchSize || decisionStateBytes(state) > DEFAULTS.quality.judgeBatchMaxStateBytes) {
         throw new RangeError("Quality judgment pack exceeds its budget");
     }
     const questions = {};
@@ -92,7 +93,7 @@ export async function judgeQuality(params) {
     }));
 }
 export function memoryJudgeVersion(model = DEFAULT_DECISION_MODEL, endpoint) {
-    return `${decisionModelScope(model, endpoint)}:memory-usefulness-v2`;
+    return `${decisionModelScope(model, endpoint)}:memory-usefulness-v2:${JUDGE_CONTEXT_VERSION}`;
 }
 export const MEMORY_JUDGE_VERSION = memoryJudgeVersion();
 const MEMORY_QUESTIONS = {
@@ -109,16 +110,19 @@ const MEMORY_QUESTIONS = {
     }),
 };
 /** The sole versioned passage prompt/state builder for both training and runtime. */
-export function memoryUsefulnessRequest(conversation, candidate, asOf, model = DEFAULT_DECISION_MODEL) {
+export function memoryUsefulnessRequest(input, candidate, asOf, model = DEFAULT_DECISION_MODEL) {
     if (!Number.isFinite(Date.parse(asOf)))
         throw new Error("Invalid judgment time");
     if (!candidate.excerpt.trim() || candidate.excerpt.length > MEMORY_PASSAGE_CHARS)
         throw new Error("Invalid judgment passage");
+    const selected = "status" in input ? input : selectJudgeConversation(input);
+    if (selected.status === "input_too_large")
+        throw new RangeError("Memory judgment conversation exceeds its budget");
     // Deliberate allowlist: no generated query, rank, backend, score, or other candidates.
     return {
         model,
         state: {
-            conversation: { history: conversation.history, currentRequest: conversation.currentRequest },
+            conversation: selected.conversation,
             asOf,
             candidates: [{ excerpt: candidate.excerpt, corpus: candidate.corpus, sourcePath: candidate.sourcePath, dates: candidate.dates }],
         },

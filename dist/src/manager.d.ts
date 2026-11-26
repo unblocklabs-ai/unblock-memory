@@ -1,7 +1,7 @@
 import type { ExtractionConfig } from "./extraction-config.js";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
-import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadResult, MemoryRequestContext, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
+import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadCursor, MemoryReadResult, MemoryRequestContext, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
 import type { ChatType } from "./config.js";
 import { type MaintenanceStatus, type MaintenanceTask, type TemporalBasis } from "./curation.js";
 import { type SessionSyncResult } from "./session-sync.js";
@@ -12,6 +12,13 @@ import { reviewIndexedClaim } from "./evidence-review.js";
 import { reviewClusterIngestion } from "./cluster-review.js";
 import type { QueryPair } from "./query-contract.js";
 export { expandSessionSearchHit } from "./memory-passage.js";
+type MemoryReadParams = {
+    relPath: string;
+    from?: number;
+    lines?: number;
+    cursor?: MemoryReadCursor;
+    requestContext?: MemoryRequestContext;
+};
 export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "vsearch" | "get" | "close">;
 export type ManagerSessionConfig = {
     agentId: string;
@@ -35,11 +42,12 @@ export type SkillSearchCandidate = SkillCatalogEntry & {
 export declare function readSkillCatalogEntry(path: string): SkillCatalogEntry;
 export declare function enableSecureDelete(store: QMDStore): void;
 export declare function cleanupRemovedDocuments(store: QMDStore, changedDocuments?: number): number;
-export declare function buildReadResult(params: {
+export declare function buildReadResult({ content, path, from: start, lines, cursor }: {
     content: string;
     path: string;
     from?: number;
     lines?: number;
+    cursor?: MemoryReadCursor;
 }): MemoryReadResult;
 export declare class QmdMemoryManager implements MemorySearchManagerContract {
     #private;
@@ -277,12 +285,12 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     listSkills(): Promise<SkillCatalogEntry[]>;
     skillAliases(canonicalPath: string): readonly string[];
     searchSkills(query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
-    readFile(params: {
-        relPath: string;
-        from?: number;
-        lines?: number;
-        requestContext?: MemoryRequestContext;
-    }): Promise<MemoryReadResult>;
+    readFile(params: MemoryReadParams & {
+        cursor?: undefined;
+    }): Promise<Exclude<MemoryReadResult, {
+        status: "stale_cursor";
+    }>>;
+    readFile(params: MemoryReadParams): Promise<MemoryReadResult>;
     status(): MemoryProviderStatus;
     probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult>;
     probeVectorAvailability(): Promise<boolean>;

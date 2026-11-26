@@ -50,7 +50,8 @@ export function responseEpisodes(session: ResponseSession, rows: readonly Row[],
   const closeFollowup = (safe: boolean, partial = false) => {
     if (!followupTarget) return;
     if (!safe || !current?.answer.length || (!partial && !current.final)) followupTarget.followup = { status: "unavailable", messages: [] };
-    else if (current.answer.length > 6 || JSON.stringify(current.answer).length > 12_000) {
+    else if (current.answer.length > DEFAULTS.responseAudit.maxFollowupMessages ||
+        JSON.stringify(current.answer).length > DEFAULTS.responseAudit.maxFollowupChars) {
       followupTarget.followup = { status: "oversized", messages: [] };
     } else followupTarget.followup = { status: partial ? "partial" : "complete", messages: [...current.answer] };
     followupTarget = undefined;
@@ -64,7 +65,8 @@ export function responseEpisodes(session: ResponseSession, rows: readonly Row[],
     coverage.completedResponses++;
     if (!current.feedback.length) coverage.noFeedback++;
     else if (!closed) coverage.pendingFeedback++;
-    else if (current.feedback.length > 6 || JSON.stringify(current).length > MAX_EPISODE_CHARS) coverage.oversized++;
+    else if (current.feedback.length > DEFAULTS.responseAudit.maxFeedbackMessages ||
+        JSON.stringify(current).length > MAX_EPISODE_CHARS) coverage.oversized++;
     else {
       const { final: _final, ...content } = current;
       const id = jsonHash([session.sessionId, current.answer.at(-1)!.seq]);

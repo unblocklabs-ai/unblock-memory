@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, mkdtempDisposable } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -151,7 +151,7 @@ test("replacement selection sends five independently normalized choice blocks on
       return Response.json({ model: body.model, answers: { memories: { value: [messages[0]!.text] } } });
     }
     choices++;
-    assert.ok(Buffer.byteLength(String(init.body)) <= DEFAULTS.extraction.replacementBatchMaxChars);
+    assert.ok(Buffer.byteLength(String(init.body)) <= DEFAULTS.extraction.replacementBatchMaxPayloadBytes);
     return Response.json({ answers: Object.fromEntries(Object.entries(body.questions).map(([key, question]) => {
       const { criteria } = question as { criteria: Record<string, { text: string } | string> };
       assert.ok(criteria.none);
@@ -395,6 +395,35 @@ test("extracted facts survive manager startup and ordinary file sync", async () 
     const indexed = await createStore({ dbPath });
     try { assert.equal(indexed.internal.getActiveDocumentPaths(EXTRACTED_COLLECTION).length, 1); }
     finally { await indexed.close(); }
+  } finally { await manager.close(); store.close(); }
+});
+
+test("an extracted fact cursor resumes its active revision but cannot read withdrawn text", async () => {
+  await using root = await mkdtempDisposable(join(tmpdir(), "extracted-memory-read-"));
+  const storePath = join(root.path, "unblock-memory.sqlite");
+  const store = new ExtractionStore(storePath);
+  const manager = new QmdMemoryManager({ dbPath: join(root.path, "index.sqlite"),
+    curationPath: storePath, workspaceDir: root.path,
+    sources: [resolveSource(root.path, "memory", "memory")], extraction: { ...config().extraction, publish: true } });
+  try {
+    const owner = store.claim(false, 0)!;
+    const text = "🌈".repeat(DEFAULTS.memoryWhisperer.memoryGetMaxChars);
+    store.checkpoint(session, owner);
+    store.commit({ session, expected: null, cursor: "c1", context: messages,
+      accepted: [{ proposal: { ...proposal, text }, observedAt: 1000, judgment: {} }], owner, version: "test" });
+    const relPath = `qmd://${EXTRACTED_COLLECTION}/${extractedPath(store.records()[0]!)}`;
+    const first = await manager.readFile({ relPath });
+    assert.equal(first.status, "ok");
+    assert.ok(first.nextCursor);
+    const cursor = first.nextCursor;
+    const tail = await manager.readFile({ relPath, cursor, lines: 1 });
+    assert.equal(tail.status, "ok");
+    assert.equal(first.text.slice(0, first.contentChars) + tail.text.slice(0, tail.contentChars), text);
+    assert.equal(tail.nextFrom, 2, "after the long text, continue at the observed date");
+    store.reset(session.sessionId, null, owner);
+    const withdrawn = await manager.readFile({ relPath, cursor });
+    assert.equal(withdrawn.status, "stale_cursor");
+    assert.equal(withdrawn.text, "");
   } finally { await manager.close(); store.close(); }
 });
 

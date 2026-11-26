@@ -192,6 +192,8 @@ test("registers exactly the clean memory tool contract and validates every tool 
     ["memory_get", { path: "qmd://memory/MEMORY.md", lines: 1_001 }],
     ["memory_get", { path: "   " }],
     ["memory_get", { path: "qmd://memory/MEMORY.md", extra: true }],
+    ["memory_get", { path: "qmd://memory/MEMORY.md", from: 1, cursor: { line: 1, offset: 3, revision: "revision" } }],
+    ["memory_get", { path: "qmd://memory/MEMORY.md", cursor: { line: 1, offset: -1, revision: "revision" } }],
     ["memory_sync_sessions", { force: "yes" }],
     ["memory_sync_sessions", { extra: true }],
     ["memory_sync_status", { extra: true }],
@@ -293,7 +295,7 @@ test("memory search compacts judged results without changing evidence or request
   };
   const originalResults = structuredClone([internalResult, fileResult]);
   let searchContext: unknown;
-  let readContext: unknown;
+  let readParams: { requestContext?: unknown; cursor?: unknown } | undefined;
   Object.defineProperty(runtime, "getMemorySearchManager", {
     value: async () => ({
       manager: {
@@ -301,9 +303,9 @@ test("memory search compacts judged results without changing evidence or request
           searchContext = options.requestContext;
           return [internalResult, fileResult, unknownSessionResult];
         },
-        readFile: async (params: { requestContext?: unknown }) => {
-          readContext = params.requestContext;
-          return { status: "not_found", text: "", path: "qmd://memory/missing.md" };
+        readFile: async (params: NonNullable<typeof readParams>) => {
+          readParams = params;
+          return { status: "stale_cursor", text: "", path: "qmd://memory/missing.md", error: "Restart without cursor." };
         },
       },
     }),
@@ -332,7 +334,9 @@ test("memory search compacts judged results without changing evidence or request
     details: unknown;
   };
   const result = parseJsonResult(response);
-  await getFactory(context)!.execute("get", { path: "qmd://memory/missing.md" });
+  const cursor = { line: 2, offset: 3, revision: "revision" };
+  const readResult = parseJsonResult(await getFactory(context)!.execute("get", { path: "qmd://memory/missing.md", cursor }));
+  assert.equal(readResult.status, "stale_cursor");
   assert.deepEqual(result, {
     rankingMode: "decision",
     scoreMeaning: "usefulness_probability",
@@ -374,7 +378,8 @@ test("memory search compacts judged results without changing evidence or request
     deliveryContext: context.deliveryContext,
   };
   assert.deepEqual(searchContext, expected);
-  assert.deepEqual(readContext, expected);
+  assert.deepEqual(readParams?.requestContext, expected);
+  assert.deepEqual(readParams?.cursor, cursor);
 });
 
 test("session sync tools accept and report status without awaiting cold initialization", async () => {

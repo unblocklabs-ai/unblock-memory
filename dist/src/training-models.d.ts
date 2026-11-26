@@ -2,13 +2,14 @@ import { Type, type Static } from "typebox";
 import type { TrainingInput } from "./training-input.js";
 import type { QueryLane } from "./query-contract.js";
 export declare const TRAINING_RECIPE_VERSION = "lex-vec-v2";
-export declare const TRAINING_TEACHER_MODEL: string;
-export declare const TRAINING_TEACHER_VERSION = "lex-vec-teacher-v2-xhigh";
+declare const TRAINING_TEACHER_MODEL: string;
+export { TRAINING_TEACHER_MODEL };
 export type TrainingRound = 1 | 2;
 export type QueryFeedback = {
     query: string;
     score: number;
 };
+export declare const TRAINING_TEACHER_VERSION: string;
 export declare function trainingTeacherPrompt(lane: QueryLane): string;
 export declare function trainingTeacherMessage(input: TrainingInput, lane: QueryLane, feedback?: readonly QueryFeedback[]): string;
 declare const usageSchema: Type.TObject<{
@@ -25,4 +26,3 @@ export type TeacherResult = {
 };
 /** Host owns credentials/routing. No fallback model, tools, workspace prompt or session history. */
 export declare function trainingTeacher(runtime: unknown, agentId: string): (input: TrainingInput, lane: QueryLane, feedback?: readonly QueryFeedback[]) => Promise<TeacherResult>;
-export {};

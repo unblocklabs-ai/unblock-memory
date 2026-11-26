@@ -2,7 +2,7 @@ import { DEFAULTS } from "./defaults.js";
 import { inspectReadOnlyChannelAccount } from "openclaw/plugin-sdk/directory-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { PeopleStore } from "./people-store.js";
-import { record } from "./guards.js";
+import { nonBlank, record } from "./guards.js";
 
 type SlackDirectoryEntry = {
   id: string;
@@ -28,31 +28,65 @@ type SlackRequest = (
   init: { headers: { authorization: string }; signal: AbortSignal },
 ) => Promise<Pick<Response, "json" | "ok" | "status">>;
 
-function text(value: unknown, maxLength: number): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim().slice(0, maxLength) : undefined;
+function displayName(value: unknown): string | undefined {
+  return nonBlank(value)?.slice(0, DEFAULTS.people.slackDisplayNameMaxChars)
+    .replace(/\p{Cs}/gu, "").trimEnd() || undefined;
+}
+
+function opaqueValue(value: unknown, maxChars: number): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= maxChars &&
+    !/[\s\p{Cc}\p{Cs}]/u.test(value) ? value : undefined;
+}
+
+function slackAvatarUrl(value: unknown): string | undefined {
+  const url = opaqueValue(value, DEFAULTS.people.slackAvatarUrlMaxChars);
+  if (!url || !/^https?:\/\//iu.test(url)) return undefined;
+  try {
+    const parsed = new URL(url);
+    return parsed.username || parsed.password ? undefined : url;
+  } catch {
+    return undefined;
+  }
 }
 
 function slackToken(account: Record<string, unknown>): string | undefined {
-  return text(account.userToken, 10_000) ?? text(account.botToken, 10_000);
+  const key = account.userToken === undefined ? "botToken" : "userToken";
+  const value = account[key];
+  if (value === undefined) return undefined;
+  const token = opaqueValue(value, DEFAULTS.people.slackTokenMaxChars);
+  if (!token || !/^[!-~]+$/u.test(token)) {
+    throw new Error(`Slack directory account has an invalid ${key}`);
+  }
+  return token;
+}
+
+function paginationCursor(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  const metadata = record(value);
+  const cursor = metadata?.next_cursor;
+  if (metadata && (cursor === undefined || cursor === "")) return undefined;
+  const next = opaqueValue(cursor, DEFAULTS.people.slackCursorMaxChars);
+  if (!next) throw new Error("Slack directory returned an invalid cursor");
+  return next;
 }
 
 function slackEntry(value: unknown): SlackDirectoryEntry | undefined {
   const member = record(value);
-  const id = text(member?.id, 200);
+  const id = opaqueValue(member?.id, DEFAULTS.people.slackIdMaxChars);
   if (!id) return undefined;
   const profile = record(member?.profile);
   return {
     id,
     name:
-      text(profile?.display_name, 500) ??
-      text(profile?.real_name, 500) ??
-      text(member?.real_name, 500) ??
-      text(member?.name, 500),
-    handle: text(member?.name, 200),
+      displayName(profile?.display_name) ??
+      displayName(profile?.real_name) ??
+      displayName(member?.real_name) ??
+      displayName(member?.name),
+    handle: opaqueValue(member?.name, DEFAULTS.people.slackHandleMaxChars),
     avatarUrl:
-      text(profile?.image_512, 2_000) ??
-      text(profile?.image_192, 2_000) ??
-      text(profile?.image_72, 2_000),
+      slackAvatarUrl(profile?.image_512) ??
+      slackAvatarUrl(profile?.image_192) ??
+      slackAvatarUrl(profile?.image_72),
     isBot: typeof member?.is_bot === "boolean" ? member.is_bot : undefined,
     isDeactivated: typeof member?.deleted === "boolean" ? member.deleted : undefined,
   };
@@ -69,12 +103,12 @@ export function createOpenClawSlackDirectory(params: {
     async listUsers({ accountId, limit }) {
       const cfg = params.getConfig();
       if (!cfg) throw new Error("OpenClaw runtime config is unavailable");
-      const account = await inspectAccount({ channelId: "slack", cfg, accountId });
+      const account = await inspectAccount({ channelId: "slack", cfg, accountId }).catch(() => {
+        throw new Error("OpenClaw could not inspect the Slack directory account");
+      });
       const token = account ? slackToken(account) : undefined;
       if (!token) {
-        throw new Error(
-          `Slack credentials for account "${accountId}" are unavailable in the active runtime snapshot`,
-        );
+        throw new Error("Slack credentials are unavailable in the active runtime snapshot");
       }
 
       const entries: SlackDirectoryEntry[] = [];
@@ -87,21 +121,27 @@ export function createOpenClawSlackDirectory(params: {
         const response = await request(url, {
           headers: { authorization: `Bearer ${token}` },
           signal: AbortSignal.timeout(DEFAULTS.people.slackTimeoutMs),
+        }).catch(() => {
+          throw new Error("Slack directory request failed before receiving a response");
         });
-        const payload = record(await response.json());
+        const payload = record(await response.json().catch(() => {
+          throw new Error("Slack directory returned an invalid response");
+        }));
         if (!response.ok || payload?.ok !== true) {
-          const detail = text(payload?.error, 200) ?? `HTTP ${response.status}`;
+          // Do not reflect arbitrary response content back to the tool caller.
+          const detail = ["invalid_auth", "not_authed", "missing_scope", "token_revoked", "account_inactive"]
+            .find(code => code === payload?.error) ?? `HTTP ${response.status}`;
           throw new Error(`Slack directory request failed: ${detail}`);
         }
+        const next = paginationCursor(payload.response_metadata);
+        if (next && cursors.has(next)) throw new Error("Slack directory returned a repeated cursor");
         const members = Array.isArray(payload.members) ? payload.members : [];
         for (const member of members) {
           const entry = slackEntry(member);
           if (entry) entries.push(entry);
           if (entries.length === limit) break;
         }
-        const next = text(record(payload.response_metadata)?.next_cursor, 2_000);
         if (!next) break;
-        if (cursors.has(next)) throw new Error("Slack directory returned a repeated cursor");
         cursors.add(next);
         cursor = next;
       }
@@ -124,11 +164,14 @@ export async function syncSlackDirectory(params: {
   const counts = { created: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0 };
   const syncedAt = params.syncedAt ?? new Date().toISOString();
   for (const entry of entries.slice(0, params.limit)) {
-    const externalId = text(entry.id, 200);
+    const externalId = opaqueValue(entry.id, DEFAULTS.people.slackIdMaxChars);
     if (!externalId) {
       counts.skipped += 1;
       continue;
     }
+    const name = displayName(entry.name);
+    const handle = opaqueValue(entry.handle, DEFAULTS.people.slackHandleMaxChars);
+    const avatarUrl = slackAvatarUrl(entry.avatarUrl);
     try {
       const existing = params.store.findIdentity("slack", params.accountId, externalId);
       const existingPerson = existing ? params.store.getPerson(existing.personId) : undefined;
@@ -138,18 +181,18 @@ export async function syncSlackDirectory(params: {
       }
       const changed =
         existing !== undefined &&
-        ((entry.name !== undefined && entry.name !== existing.displayName) ||
-          (entry.handle !== undefined && entry.handle !== existing.handle) ||
-          (entry.avatarUrl !== undefined && entry.avatarUrl !== existing.avatarUrl) ||
+        ((name !== undefined && name !== existing.displayName) ||
+          (handle !== undefined && handle !== existing.handle) ||
+          (avatarUrl !== undefined && avatarUrl !== existing.avatarUrl) ||
           (entry.isBot !== undefined && entry.isBot !== existing.isBot) ||
           (entry.isDeactivated !== undefined && entry.isDeactivated !== existing.isDeactivated));
       const result = params.store.upsertIdentity({
         provider: "slack",
         accountScope: params.accountId,
         externalId,
-        displayName: entry.name,
-        handle: entry.handle,
-        avatarUrl: entry.avatarUrl,
+        displayName: name,
+        handle,
+        avatarUrl,
         isBot: entry.isBot,
         isDeactivated: entry.isDeactivated,
         syncedAt,

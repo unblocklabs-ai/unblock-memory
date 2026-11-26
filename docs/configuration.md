@@ -44,6 +44,10 @@ the Gateway (or running a standalone command). Supply only the keys you want
 to change; unknown keys and invalid values fail startup. Explicit plugin config
 takes precedence for settings exposed there.
 
+Decision pack limits use `*StateBytes` or `*PayloadBytes`. The five previous
+`*Chars` keys still work in override files. If both names are supplied, their
+values must agree.
+
 All plugin decision-model features use `plugins.entries.unblock-memory.config.decisionModel`.
 Older provider config keys are rejected. When upgrading, remove the old block and
 configure a credential for the endpoint you intend to use; do not copy the old key into the default route.

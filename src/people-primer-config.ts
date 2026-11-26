@@ -1,6 +1,7 @@
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import type { CorpusConfig } from "./config.js";
+import { DEFAULTS } from "./defaults.js";
 
 export const peoplePrimerSchema = Type.Object({
   enabled: Type.Boolean({ default: false }),
@@ -9,13 +10,13 @@ export const peoplePrimerSchema = Type.Object({
   minScore: Type.Number({ minimum: 0, maximum: 1, default: 0.35 }),
   minUsefulness: Type.Number({ minimum: 0.5, maximum: 1, default: 0.8 }),
   maxEvidencePerQuestion: Type.Integer({ minimum: 1, maximum: 10, default: 3 }),
-  timeoutMs: Type.Integer({ minimum: 1, maximum: 60000, default: 30000 }),
+  timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 60000 })),
 }, { additionalProperties: false });
 
-export type PeoplePrimerConfig = Static<typeof peoplePrimerSchema>;
+export type PeoplePrimerConfig = Static<typeof peoplePrimerSchema> & { timeoutMs: number };
 
 export function resolvePeoplePrimer(value: unknown, corpora: readonly CorpusConfig[], peopleEnabled: boolean): PeoplePrimerConfig {
-  let config: PeoplePrimerConfig;
+  let config: Static<typeof peoplePrimerSchema>;
   try {
     const withDefaults: unknown = Value.Default(peoplePrimerSchema, value === undefined ? {} : value);
     if (!Value.Check(peoplePrimerSchema, withDefaults)) throw new Error("Invalid config");
@@ -28,5 +29,5 @@ export function resolvePeoplePrimer(value: unknown, corpora: readonly CorpusConf
   if (config.enabled && (!peopleEnabled || !config.corpora.length)) {
     throw new Error("peoplePrimer requires people.enabled and explicit approved corpora");
   }
-  return { ...config, corpora: [...new Set(config.corpora)] };
+  return { ...config, corpora: [...new Set(config.corpora)], timeoutMs: config.timeoutMs ?? DEFAULTS.people.primerRequestTimeoutMs };
 }
