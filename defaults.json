@@ -61,7 +61,13 @@
     "defaultMinUsefulness": 0.5,
     "defaultMaxHints": 3,
     "defaultCooldownTurns": 10,
-    "defaultTimeoutMs": 5000
+    "defaultTimeoutMs": 5000,
+    "mode": "v2",
+    "gateMinScore": 0.45,
+    "corpusMinScore": 0.35,
+    "maxTopics": 3,
+    "gateTimeoutMs": 1500,
+    "extractTimeoutMs": 1500
   },
   "skillWhisperer": {
     "maxCandidates": 10,

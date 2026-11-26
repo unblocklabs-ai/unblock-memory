@@ -29,8 +29,12 @@ export type RecallCandidateTrace = {
     disposition: RecallHitDisposition | "passed";
     finalRank?: number;
 };
-/** Both entry points use the same complete passages and independent usefulness judgments. */
-export declare function searchMemory(manager: MemoryCandidateManager, queries: QueryPair, options: CorpusSearchOptions & {
+/**
+ * Both entry points use the same complete passages and independent usefulness judgments.
+ * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search in parallel and
+ * fuse with passage-level RRF, reserving at least one judge slot per topic.
+ */
+export declare function searchMemory(manager: MemoryCandidateManager, queries: QueryPair | readonly QueryPair[], options: CorpusSearchOptions & {
     apiKey?: string;
     endpoint?: string;
     model?: string;

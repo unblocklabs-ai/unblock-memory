@@ -409,3 +409,27 @@ test("rejects malformed or ambiguous corpora", () => {
     /must be named "skills"/,
   );
 });
+
+test("memoryWhisperer.mode defaults to v2, accepts legacy, and keeps old fleet api/mlx configs loading", async () => {
+  const validate = await manifestValidator("unblock-memory:test:memory-whisperer-mode");
+  assert.equal(resolveConfig({}).memoryWhisperer.mode, "v2");
+  assert.deepEqual(manifest.configSchema.properties.memoryWhisperer.properties.mode.enum, ["v2", "legacy"]);
+  const fleet = { memoryWhisperer: { enabled: true, corpora: ["memory"],
+    api: { endpoint: "http://192.168.1.191:18087", apiKeyFile: "/Users/agent/.openclaw/query-token" } } };
+  const hosted = validate(fleet);
+  assert.equal(hosted.ok, true, JSON.stringify(hosted.errors));
+  const resolved = resolveConfig(hosted.value).memoryWhisperer;
+  assert.equal(resolved.mode, "v2", "an old query endpoint does not opt back into legacy");
+  assert.equal(resolved.api.endpoint, "http://192.168.1.191:18087");
+  const deprecated = { memoryWhisperer: { mlx: { pythonPath: "/usr/bin/python3", modelPath: "/models/query" } } };
+  assert.equal(validate(deprecated).ok, true);
+  assert.equal(resolveConfig(deprecated).memoryWhisperer.mode, "v2");
+  for (const mode of ["v2", "legacy"] as const) {
+    assert.equal(validate({ memoryWhisperer: { mode } }).ok, true);
+    assert.equal(resolveConfig({ memoryWhisperer: { mode } }).memoryWhisperer.mode, mode);
+  }
+  for (const mode of ["v1", "", "V2", 2]) {
+    assert.equal(validate({ memoryWhisperer: { mode } }).ok, false, JSON.stringify(mode));
+    assert.throws(() => resolveConfig({ memoryWhisperer: { mode } }), /memoryWhisperer\.mode/u);
+  }
+});

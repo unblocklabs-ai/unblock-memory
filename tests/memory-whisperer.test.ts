@@ -13,7 +13,8 @@ import { reviewMemoryRedundancy } from "../src/decision-review.js";
 import { ApiQueryGenerator, QueryApiError, queryConversation } from "../src/query-generator.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 
-const config = { ...resolveConfig({ memoryWhisperer: { api: { endpoint: "https://query.example.test" } } }).memoryWhisperer, enabled: true, corpora: ["memory", "sessions"], cooldownTurns: 2 };
+// These suites cover the legacy query-model path; v2 coverage lives in the "v2:" tests below.
+const config = { ...resolveConfig({ memoryWhisperer: { mode: "legacy", api: { endpoint: "https://query.example.test" } } }).memoryWhisperer, enabled: true, corpora: ["memory", "sessions"], cooldownTurns: 2 };
 const decisionModel = resolveConfig({ decisionModel: { enabled: true, apiKey: "fake-secret", timeoutMs: 100 } }).decisionModel;
 const context = { trigger: "user", agentId: "bill", sessionId: "current", sessionKey: "key", runId: "run-1" };
 const logPrefix = "unblock-memory memory_whisperer ";
@@ -531,6 +532,7 @@ function harness(
   hits: CorpusMemorySearchResult[] = [hit("Deploy only after approval")],
   options: { config?: Partial<ReturnType<typeof resolveConfig>["memoryWhisperer"]>; decisionModel?: ReturnType<typeof resolveConfig>["decisionModel"];
     search?: () => Promise<CorpusMemorySearchResult[]>;
+    recallLedger?: Parameters<typeof registerMemoryWhisperer>[5];
     hybrid?: (queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">) => Promise<CorpusMemorySearchResult[]> } = {},
 ) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
@@ -551,7 +553,7 @@ function harness(
         return options.search ? options.search() : hits;
       }) } };
     },
-  }, { ...config, ...options.config }, options.decisionModel ?? decisionModel, diagnostics);
+  }, { ...config, ...options.config }, options.decisionModel ?? decisionModel, diagnostics, options.recallLedger);
   return { hooks, warnings, logs, searches, diagnostics, lookups: () => lookups,
     before: before as Before,
     end: hooks.get("session_end") as unknown as End,
@@ -584,7 +586,7 @@ test("selected memory keeps delimiter-like source text inside the combined promp
 test("memory whisperer requires explicit, known non-skill corpora and bounded controls", () => {
   assert.deepEqual(resolveConfig(undefined).memoryWhisperer, {
     enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5, maxHints: 3, cooldownTurns: 10, timeoutMs: 5000,
-    api: { endpoint: "" },
+    mode: "v2", api: { endpoint: "" },
   });
   assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.5);
   assert.equal(resolveConfig({ memoryWhisperer: { minUsefulness: 0.9, maxHints: 3 } }).memoryWhisperer.minUsefulness, 0.9);
@@ -597,14 +599,15 @@ test("memory whisperer requires explicit, known non-skill corpora and bounded co
     { corpora: ["skills"] }, { corpora: "memory" }, { enabled: 1 }, { extra: true },
     { historyMessages: 5 },
     { minUsefulness: NaN }, { minUsefulness: 1.1 }, { minUsefulness: -0.1 }, { maxHints: 0 }, { maxHints: 4 },
-    { cooldownTurns: -1 }, { cooldownTurns: 1001 }, { cooldownTurns: "2" }, { timeoutMs: 0 }, { timeoutMs: 10001 }]) {
+    { cooldownTurns: -1 }, { cooldownTurns: 1001 }, { cooldownTurns: "2" }, { timeoutMs: 0 }, { timeoutMs: 10001 },
+    { mode: "v3" }, { mode: "" }, { mode: 2 }]) {
     assert.throws(() => resolveConfig({ memoryWhisperer: value }), /memoryWhisperer/);
   }
 });
 
 test("omitting the query endpoint uses deterministic retrieval without a generator request", async t => {
   const config = resolveConfig({ memoryWhisperer: {
-    enabled: true, corpora: ["memory"], api: { apiKeyFile: "/unused/query-token" },
+    enabled: true, corpora: ["memory"], mode: "legacy", api: { apiKeyFile: "/unused/query-token" },
   } }).memoryWhisperer;
   const generation = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => {
     assert.fail("No endpoint: remote query generation must not start");
@@ -944,4 +947,215 @@ test("session cap evicts least-recently-used session and aborts its in-flight co
   pendingFirst.resolve([]);
   pendingSecond.resolve([]);
   assert.equal(await p0Rebuild, await p0);
+});
+
+// ---- v2: d1.2 recall gate + corpus router + grounded topic extraction (no query-model API) ----
+
+const LAN_QUERY_ENDPOINT = "http://192.168.1.191:18087";
+const v2Config = { ...resolveConfig({ memoryWhisperer: { api: { endpoint: LAN_QUERY_ENDPOINT, apiKeyFile: "/unused/query-token" } } }).memoryWhisperer,
+  enabled: true, corpora: ["memory", "sessions"] };
+const v2Event = {
+  prompt: "Check Sarah's invoice and Pearl's disk",
+  messages: [
+    { role: "user", content: "Sarah sent invoice INV-2207 yesterday." },
+    { role: "assistant", content: "Noted. Pearl's disk alert also fired." },
+  ],
+};
+type ModelBody = { questions?: Record<string, unknown>; state?: unknown; fields?: unknown };
+type Reply = Response | Promise<Response>;
+function v2Model(t: { mock: { method: typeof import("node:test").mock.method } }, handlers: {
+  gate: (body: ModelBody) => Reply; extract?: (body: ModelBody) => Reply; judge?: (excerpt: string) => Reply;
+}) {
+  const urls: string[] = [];
+  const kinds: string[] = [];
+  const fetch = t.mock.method(globalThis, "fetch", async (...[url, init]: Parameters<typeof globalThis.fetch>) => {
+    urls.push(String(url));
+    assert.doesNotMatch(String(url), /192\.168\.1\.191|18087|query\.example/u, "v2 never calls the query-model API");
+    const body = JSON.parse(String(init?.body)) as ModelBody;
+    if (String(url).endsWith("/v1/extractions")) {
+      kinds.push("extract");
+      return handlers.extract ? handlers.extract(body) : assert.fail("unexpected extraction");
+    }
+    if (body.questions && "need_recall" in body.questions) { kinds.push("gate"); return handlers.gate(body); }
+    kinds.push("judge");
+    const excerpt = (body.state as [{ candidates: [{ excerpt: string }] }])[0].candidates[0].excerpt;
+    return handlers.judge ? handlers.judge(excerpt) : response(0.95);
+  });
+  return { fetch, urls, kinds };
+}
+function gateReply(scores: Record<string, number>) {
+  return Response.json({ model: "liquid/d1.2-ultra-20261116",
+    answers: Object.fromEntries(Object.entries(scores).map(([key, noul]) => [key, { type: "noul", noul }])) });
+}
+function topicsReply(value: unknown[]) {
+  return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { topics: { type: "list", value } } });
+}
+function ledgerSink() {
+  const records: { kind: string; record: Record<string, unknown> }[] = [];
+  return { records, sink: { writer: { enqueue: (_path: string, entry: never) => { records.push(entry); } },
+    dbPathForAgent: () => "/unused/ledger.sqlite" } as unknown as Parameters<typeof registerMemoryWhisperer>[5] };
+}
+
+test("v2: default mode resolves from config and never constructs or calls the configured query API", async t => {
+  assert.equal(v2Config.mode, "v2");
+  assert.equal(v2Config.api.endpoint, LAN_QUERY_ENDPOINT, "old fleet api config still loads");
+  assert.equal(resolveConfig({ memoryWhisperer: { mlx: { pythonPath: "/py", modelPath: "/model" } } }).memoryWhisperer.mode, "v2");
+  const generate = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => assert.fail("v2 must not generate"));
+  const model = v2Model(t, {
+    gate: () => gateReply({ need_recall: 0.9, corpus_0: 0.9, corpus_1: 0.9 }),
+    extract: () => topicsReply(["Sarah's invoice"]),
+  });
+  const h = harness(undefined, { config: v2Config });
+  t.after(h.stop);
+  assert.match((await h.before(v2Event, context))?.appendContext ?? "", /Deploy only after approval/u);
+  assert.equal(generate.mock.callCount(), 0);
+  assert.deepEqual(model.kinds, ["gate", "extract", "judge"]);
+  assert.ok(model.urls.every(url => url.startsWith("https://codex.unblocklabs.ai/")));
+});
+
+test("v2: multi-topic extraction grounds anchors, searches routed corpora in parallel, and emits a hit per topic", async t => {
+  const { records, sink } = ledgerSink();
+  v2Model(t, {
+    gate: body => {
+      assert.deepEqual(Object.keys(body.questions!), ["need_recall", "corpus_0", "corpus_1"]);
+      return gateReply({ need_recall: 0.92, corpus_0: 0.81, corpus_1: 0.12 });
+    },
+    extract: body => {
+      assert.equal(body.state, "User: Sarah sent invoice INV-2207 yesterday.\nAssistant: Noted. Pearl's disk alert also fired.\n" +
+        "Current request: Check Sarah's invoice and Pearl's disk");
+      return topicsReply(["Sarah's invoice", "Pearl's disk", "Acme renewal contract"]);
+    },
+    judge: excerpt => response(/invoice|disk/u.test(excerpt) ? 0.9 : 0.1),
+  });
+  const searched: { lex: string; corpora?: readonly string[] }[] = [];
+  const h = harness([], { config: { ...v2Config, maxHints: 3 }, recallLedger: sink, hybrid: async (queries, opts) => {
+    searched.push({ lex: queries.lex, corpora: opts.corpora });
+    assert.match(queries.vec, /: Check Sarah's invoice and Pearl's disk$/u);
+    return queries.lex === "Sarah's invoice"
+      ? [hit("Sarah invoice INV-2207 paid on Nov 20", { score: 0.9 }), ...Array.from({ length: 8 }, (_, i) => hit(`Sarah filler ${i}`, { score: 0.8 }))]
+      : [hit("Pearl disk at 97 percent on pearlperelel", { score: 0.01 })];
+  } });
+  t.after(h.stop);
+  const result = await h.before(v2Event, context);
+  assert.ok(result);
+  assert.deepEqual(searched, [{ lex: "Sarah's invoice", corpora: ["memory"] }, { lex: "Pearl's disk", corpora: ["memory"] }],
+    "the hallucinated anchor is discarded and routing narrows to the winning corpus");
+  const bodies = JSON.parse(result.appendContext.split("\n")[1]!).map((hint: { body: string }) => hint.body);
+  assert.ok(bodies.includes("Sarah invoice INV-2207 paid on Nov 20"));
+  assert.ok(bodies.includes("Pearl disk at 97 percent on pearlperelel"), "low-scoring second topic still reaches the judge");
+  assert.equal(h.diagnostics.snapshot("bill").memory.topics_extracted, 1);
+  const [ledger] = records;
+  assert.equal(ledger?.record.outcome, "emitted");
+  assert.equal(ledger?.record.lexQuery, "Sarah's invoice\nPearl's disk");
+  assert.equal(ledger?.record.vecQuery, "Sarah's invoice: Check Sarah's invoice and Pearl's disk\nPearl's disk: Check Sarah's invoice and Pearl's disk");
+  assert.deepEqual(ledger?.record.corpora, ["memory"]);
+  assert.equal(ledger?.record.queryFallback, false);
+});
+
+test("v2: self-contained turns skip QMD, extraction and judging entirely", async t => {
+  const { records, sink } = ledgerSink();
+  const model = v2Model(t, { gate: () => gateReply({ need_recall: 0.08, corpus_0: 0.9, corpus_1: 0.9 }) });
+  const h = harness(undefined, { config: v2Config, recallLedger: sink });
+  t.after(h.stop);
+  const rewrite = { prompt: "Rewrite that paragraph to be shorter", messages: [{ role: "assistant", content: "Here is a long paragraph." }] };
+  assert.equal(await h.before(rewrite, context), undefined);
+  assert.equal(await h.before(rewrite, context), undefined, "prompt rebuilds replay the skip");
+  assert.deepEqual(model.kinds, ["gate"]);
+  assert.equal(h.lookups(), 0, "no memory manager lookup");
+  assert.equal(h.searches.length, 0);
+  assert.equal(h.diagnostics.snapshot("bill").memory.gate_skipped, 1);
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.record.outcome, "skipped");
+  assert.deepEqual(records[0]!.record.corpora, []);
+  const completed = JSON.parse(h.logs.at(-1)!.slice(logPrefix.length));
+  assert.equal(completed.reason, "gate_skipped");
+  assert.equal(completed.mode, "v2");
+  assert.equal(completed.gateScore, 0.08);
+});
+
+test("v2: routing falls back to every configured corpus when none clear the threshold", async t => {
+  v2Model(t, {
+    gate: () => gateReply({ need_recall: 0.7, corpus_0: 0.2, corpus_1: 0.3 }),
+    extract: () => topicsReply(["INV-2207"]),
+  });
+  const h = harness(undefined, { config: v2Config });
+  t.after(h.stop);
+  assert.ok(await h.before(v2Event, context));
+  assert.deepEqual(h.searches[0]?.options?.corpora, ["memory", "sessions"]);
+  assert.deepEqual(JSON.parse(h.searches[0]!.query).lex, "INV-2207");
+});
+
+test("v2: gate or extraction failure degrades to deterministic fallback queries without a LAN call", async t => {
+  const never = (body: ModelBody) => new Promise<Response>(() => { void body; });
+  for (const [name, handlers, outcome] of [
+    ["gate http error", { gate: () => new Response("upstream down", { status: 503 }) }, "gate_fallback"],
+    ["gate timeout", { gate: never }, "gate_fallback"],
+    ["extraction timeout", { gate: () => gateReply({ need_recall: 0.9, corpus_0: 0.9, corpus_1: 0.9 }), extract: never }, "extraction_fallback"],
+    ["extraction error", { gate: () => gateReply({ need_recall: 0.9, corpus_0: 0.9, corpus_1: 0.9 }),
+      extract: () => new Response("bad", { status: 500 }) }, "extraction_fallback"],
+    ["no grounded topics", { gate: () => gateReply({ need_recall: 0.9, corpus_0: 0.9, corpus_1: 0.9 }),
+      extract: () => topicsReply(["Invented Q9 roadmap"]) }, "extraction_fallback"],
+  ] as const) {
+    await t.test(name, async t => {
+      const generate = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => assert.fail("no LAN query generation"));
+      const { records, sink } = ledgerSink();
+      v2Model(t, handlers as Parameters<typeof v2Model>[1]);
+      const h = harness(undefined, { config: v2Config, recallLedger: sink });
+      t.after(h.stop);
+      assert.match((await h.before(v2Event, context))?.appendContext ?? "", /Deploy only after approval/u);
+      assert.equal(generate.mock.callCount(), 0);
+      assert.equal(h.diagnostics.snapshot("bill").memory[outcome], 1);
+      assert.deepEqual(h.searches[0]?.options?.corpora, ["memory", "sessions"]);
+      const queries = JSON.parse(h.searches[0]!.query) as QueryPair;
+      assert.match(queries.lex, /Sarah/u, "deterministic fallback lexical terms come from the request");
+      assert.equal(records[0]?.record.queryFallback, true);
+      assert.ok(h.warnings.some(line => JSON.parse(line.slice(logPrefix.length)).event === outcome));
+      assert.doesNotMatch(h.warnings.join("\n"), /Sarah|Pearl|upstream down/u, "fallback logs stay content-free");
+    });
+  }
+});
+
+test("legacy: mode legacy escape hatch still routes through ApiQueryGenerator without a recall gate", async t => {
+  const generate = t.mock.method(ApiQueryGenerator.prototype, "generate", async () => ({ lex: "legacy lex", vec: "legacy vec" }));
+  const kinds: string[] = [];
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const body = JSON.parse(String(init?.body));
+    kinds.push(Object.keys(body.questions).join(","));
+    return response(0.95);
+  });
+  const legacyConfig = resolveConfig({ memoryWhisperer: { mode: "legacy", enabled: true, corpora: ["memory"],
+    api: { endpoint: LAN_QUERY_ENDPOINT, apiKeyFile: "/unused/query-token" } } }).memoryWhisperer;
+  assert.equal(legacyConfig.mode, "legacy");
+  const h = harness(undefined, { config: legacyConfig });
+  t.after(h.stop);
+  assert.ok(await h.before(v2Event, context));
+  assert.equal(generate.mock.callCount(), 1);
+  assert.deepEqual(kinds, ["memory_0"]);
+  assert.deepEqual(JSON.parse(h.searches[0]!.query), { lex: "legacy lex", vec: "legacy vec" });
+  assert.equal(h.diagnostics.snapshot("bill").memory.queries_generated, 1);
+});
+
+test("v2: superseding a run during the gate cancels it without emitting or recording a stale ledger row", async t => {
+  const { records, sink } = ledgerSink();
+  let gateCalls = 0;
+  const firstGate = deferred<void>();
+  v2Model(t, {
+    gate: () => {
+      gateCalls++;
+      if (gateCalls === 1) { firstGate.resolve(); return new Promise<Response>(() => {}); }
+      return gateReply({ need_recall: 0.1, corpus_0: 0.9, corpus_1: 0.9 });
+    },
+  });
+  const h = harness(undefined, { config: v2Config, recallLedger: sink });
+  t.after(h.stop);
+  const first = h.before(v2Event, context);
+  await firstGate.promise;
+  const second = await h.before({ ...v2Event, prompt: "thanks!" }, { ...context, runId: "run-2" });
+  assert.equal(await first, undefined);
+  assert.equal(second, undefined);
+  assert.equal(await h.before(v2Event, context), undefined, "a delayed rebuild of the superseded run is ignored");
+  assert.equal(gateCalls, 2);
+  assert.equal(h.searches.length, 0);
+  assert.deepEqual(records.map(entry => entry.record.outcome), ["skipped"]);
+  assert.equal(h.diagnostics.snapshot("bill").memory.cancelled, 1);
 });

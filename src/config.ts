@@ -99,6 +99,12 @@ export type UnblockMemoryConfig = {
     maxHints: number;
     cooldownTurns: number;
     timeoutMs: number;
+    /**
+     * `v2`: d1.2 recall gate + grounded topic extraction. `legacy`: the optional query-model API path.
+     * Always set by `resolveConfig`; hand-built configs that omit it get the operational default (`v2`).
+     */
+    mode?: MemoryWhispererMode;
+    /** Only used by `mode: "legacy"`; still accepted in `v2` so existing fleet configs keep loading. */
     api: { endpoint: string; apiKeyFile?: string };
   };
   safetyWhisperer: SafetyWhispererConfig;
@@ -184,10 +190,14 @@ const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
   cooldownTurns: DEFAULTS.skillWhisperer.defaultCooldownTurns,
 };
 
+export type MemoryWhispererMode = "v2" | "legacy";
+const MEMORY_WHISPERER_MODES: readonly MemoryWhispererMode[] = ["v2", "legacy"];
+
 const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
   enabled: false, complementaryHints: false, corpora: [], minUsefulness: DEFAULTS.memoryWhisperer.defaultMinUsefulness,
   maxHints: DEFAULTS.memoryWhisperer.defaultMaxHints, cooldownTurns: DEFAULTS.memoryWhisperer.defaultCooldownTurns,
-  timeoutMs: DEFAULTS.memoryWhisperer.defaultTimeoutMs, api: { endpoint: DEFAULTS.memoryWhisperer.defaultApiEndpoint },
+  timeoutMs: DEFAULTS.memoryWhisperer.defaultTimeoutMs, mode: DEFAULTS.memoryWhisperer.mode as MemoryWhispererMode,
+  api: { endpoint: DEFAULTS.memoryWhisperer.defaultApiEndpoint },
 };
 
 function resolveQueryApi(value: unknown): UnblockMemoryConfig["memoryWhisperer"]["api"] {
@@ -246,8 +256,13 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   if (typeof minUsefulness !== "number" || !Number.isFinite(minUsefulness) || minUsefulness < 0 || minUsefulness > 1) {
     throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
   }
+  const mode = config.mode ?? DEFAULT_MEMORY_WHISPERER.mode;
+  if (typeof mode !== "string" || !MEMORY_WHISPERER_MODES.includes(mode as MemoryWhispererMode)) {
+    throw new Error('unblock-memory memoryWhisperer.mode must be "v2" or "legacy"');
+  }
   return {
     enabled, complementaryHints, corpora: [...new Set(selected)], cooldownTurns, minUsefulness,
+    mode: mode as MemoryWhispererMode,
     maxHints: positiveInteger(config.maxHints, DEFAULT_MEMORY_WHISPERER.maxHints, "memoryWhisperer.maxHints", 3),
     timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_MEMORY_WHISPERER.timeoutMs, "memoryWhisperer.timeoutMs", 10_000),
     api: resolveQueryApi(config.api),

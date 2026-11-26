@@ -89,6 +89,12 @@ export type UnblockMemoryConfig = {
         maxHints: number;
         cooldownTurns: number;
         timeoutMs: number;
+        /**
+         * `v2`: d1.2 recall gate + grounded topic extraction. `legacy`: the optional query-model API path.
+         * Always set by `resolveConfig`; hand-built configs that omit it get the operational default (`v2`).
+         */
+        mode?: MemoryWhispererMode;
+        /** Only used by `mode: "legacy"`; still accepted in `v2` so existing fleet configs keep loading. */
         api: {
             endpoint: string;
             apiKeyFile?: string;
@@ -99,5 +105,6 @@ export type UnblockMemoryConfig = {
     recallLedger: RecallLedgerConfig;
 };
 export declare const DEFAULT_PEOPLE_CONFIG: UnblockMemoryConfig["people"];
+export type MemoryWhispererMode = "v2" | "legacy";
 export declare function resolveConfig(value: unknown): UnblockMemoryConfig;
 export {};
