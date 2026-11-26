@@ -502,8 +502,8 @@ covers the skills you want, you can set OpenClaw `skills.limits.maxSkillsInPromp
 
 With [decision-model credentials](configuration.md#shared-decision-model-credentials),
 it reads the catalog directly from skill frontmatter and scores unpinned skills
-in one request per 80 skills, without QMD embeddings. Catalogs above 150 skills
-are prefiltered by QMD. Without a key or with `decisionModel.enabled: false`, it
+in parallel batches of up to 80 skills, without QMD embeddings. Catalogs above
+500 skills are prefiltered by QMD. Without a key or with `decisionModel.enabled: false`, it
 uses local vector matches above `skillWhisperer.minScore`. Provider failures and
 the three-second routing deadline preserve existing skills without switching to
 vector-only routing. Superseded or ended runs emit nothing.

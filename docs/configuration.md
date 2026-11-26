@@ -48,7 +48,8 @@ All plugin decision-model features use `plugins.entries.unblock-memory.config.de
 Older provider config keys are rejected. When upgrading, remove the old block and
 configure a credential for the endpoint you intend to use; do not copy the old key into the default route.
 
-Skill Whisperer scores up to 80 skills per HTTP request. Memory Whisperer scores
+Skill Whisperer routes catalogs of up to 500 skills directly in parallel HTTP
+requests of up to 80 skills each. Memory Whisperer scores
 up to six candidates in parallel, one request per candidate, then batches the
 directional redundancy checks for its finalists. There is no automatic retry
 in the latency-sensitive whisperers.
@@ -102,8 +103,9 @@ out of Git, chat, shell arguments and logs.
 
 `decisionModel.timeoutMs` is not a universal total deadline: People Primer and dossier
 save review use `peoplePrimer.timeoutMs` per request; Memory Whisperer has its
-own overall budget. Skill Whisperer's fixed three-second total budget includes
-credential resolution, retrieval and judging, even when its provider timeout is longer.
+own overall budget. Skill Whisperer uses a three-second request timeout instead,
+bounded by a shared three-second deadline that includes credential resolution,
+retrieval and judging.
 
 ## Example profiles
 
@@ -234,7 +236,7 @@ contract; these tables explain their effects.
 | `decisionModel.model` | `liquid/d1.2-ultra` | Requested model alias; dated `liquid/d1.2-ultra-*` snapshots are rejected on the default route |
 | `decisionModel.apiKey` | Unset | Explicit inline key; mutually exclusive with key file; prefer file |
 | `decisionModel.apiKeyFile` | Unset | Absolute plaintext-key or dotenv file; reread at credential resolution. If missing, no fallback |
-| `decisionModel.timeoutMs` | `1500` | 1–10,000 per request for Skill/Memory Whisperer, quality/claim/cluster review and response audit; **primer and dossier save use `peoplePrimer.timeoutMs` and Safety Whisperer uses `safetyWhisperer.timeoutMs` instead** |
+| `decisionModel.timeoutMs` | `1500` | 1–10,000 per request for Memory Whisperer, quality/claim/cluster review and response audit; Skill Whisperer uses its own 3-second budget, primer and dossier save use `peoplePrimer.timeoutMs`, and Safety Whisperer uses `safetyWhisperer.timeoutMs` |
 | `skillWhisperer.enabled` | `true` with a `skills` corpus, else `false` | Needs appropriate host hook access; fixed 3-second total deadline; `false` opts out. An explicit `true` without a skills corpus logs a warning and stays inactive |
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for decision model shortlist admission |

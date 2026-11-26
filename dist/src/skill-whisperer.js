@@ -261,7 +261,7 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
                 if (!eligible.length)
                     diagnose("no_candidates");
                 const matches = !eligible.length ? [] : apiKey ? await abortable(scoreSkillCatalog({
-                    apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, signal,
+                    apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: SKILL_WHISPERER_TIMEOUT_MS, signal,
                     ...decisionConversation(event.prompt, recent), candidates: eligible.map(([, candidate]) => candidate),
                     onBatchFailure: (batchIndex, error) => {
                         if (signal.aborted)

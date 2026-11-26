@@ -72,7 +72,7 @@
   },
   "skillWhisperer": {
     "maxCandidates": 10,
-    "maxDirectCatalogSkills": 150,
+    "maxDirectCatalogSkills": 500,
     "catalogBatchSize": 80,
     "maxMatchesPerTurn": 5,
     "maxActiveSkillsPerSession": 15,

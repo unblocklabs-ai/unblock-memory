@@ -100,6 +100,35 @@ test("direct routing sends bounded visible history and up to 79 skills once per 
   assert.deepEqual(h.diagnostics.snapshot("main").skill, { emitted: 1, rejected: 1, active_reused: 1 });
 });
 
+test("400 skills route directly in five parallel batches with a 3-second request timeout", async t => {
+  const candidates = Array.from({ length: 400 }, (_, index) => hit(`skill-${index}`));
+  const search = t.mock.fn<Runtime["searchSkills"]>(async () => []);
+  const h = harness(catalogRuntime(candidates, search));
+  const requests: DecisionState[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const timeout = t.mock.method(AbortSignal, "timeout");
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const state = decisionState(init);
+    requests.push(state);
+    await gate;
+    return scores(state, name => name === "skill-399" ? 0.9 : 0.1);
+  });
+  const result = h.prompt(prompt(), ctx("large-catalog"));
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(search.mock.callCount(), 0, "the direct route must not search QMD");
+    assert.deepEqual(requests.map(({ skills }) => skills.length), [80, 80, 80, 80, 80]);
+    assert.deepEqual(requests.flatMap(({ skills }) => skills.map(({ name }) => name)).sort(),
+      candidates.map(({ name }) => name).sort());
+    assert.deepEqual(timeout.mock.calls.map(({ arguments: [ms] }) => ms), [3000, 3000, 3000, 3000, 3000]);
+  } finally {
+    release();
+    await result;
+  }
+  assert.match((await result)?.appendContext ?? "", /name="skill-399"/);
+});
+
 test("oversized and no-key catalogs use the right QMD fallback and filter pinned, invalid and weak hits", async t => {
   const candidates = Array.from({ length: DEFAULTS.skillWhisperer.maxDirectCatalogSkills + 1 }, (_, index) => hit(`skill-${index}`));
   const searches: { query: string; minScore: number; names: string[] }[] = [];
@@ -130,7 +159,7 @@ test("oversized and no-key catalogs use the right QMD fallback and filter pinned
 
 test("active skills survive provider errors/timeouts but never supersession or session teardown", async t => {
   const entries = [hit("pinned"), hit("new")];
-  const h = harness(catalogRuntime(entries), { ...active, timeoutMs: 40 });
+  const h = harness(catalogRuntime(entries));
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) =>
     scores(decisionState(init), name => name === "pinned" ? 0.9 : 0.1));
   const first = await h.before(prompt(), ctx("pin"));
@@ -140,10 +169,21 @@ test("active skills survive provider errors/timeouts but never supersession or s
   assert.equal(await h.before(prompt(), ctx("fail-empty", "different-thread")), undefined);
   assert.ok(h.warnings.every(message => !message.includes("private provider error")));
 
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let timeoutStarted!: (signal: AbortSignal | null | undefined) => void;
+  const timeoutWaiting = new Promise<AbortSignal | null | undefined>(resolve => { timeoutStarted = resolve; });
   fetch.mock.mockImplementation(async (...[_url, init]: Parameters<typeof globalThis.fetch>) => new Promise<Response>((_resolve, reject) => {
     init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    timeoutStarted(init?.signal);
   }));
-  assert.deepEqual(await h.before(prompt(), ctx("timeout")), first);
+  const timedOut = h.before(prompt(), ctx("timeout"));
+  const timeoutSignal = await timeoutWaiting;
+  t.mock.timers.tick(2999);
+  assert.equal(timeoutSignal?.aborted, false);
+  t.mock.timers.tick(1);
+  assert.equal(timeoutSignal?.reason?.name, "TimeoutError");
+  assert.deepEqual(await timedOut, first);
+  t.mock.timers.reset();
 
   for (const cancellation of ["supersede", "end", "stop"] as const) {
     let release!: () => void;
