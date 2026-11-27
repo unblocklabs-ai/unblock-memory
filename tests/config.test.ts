@@ -434,17 +434,17 @@ test("memoryWhisperer.mode defaults to v2, accepts legacy, and keeps old fleet a
   }
 });
 
-test("steward is optional and off by default; host manifest and runtime resolver agree on its shape", async () => {
+test("steward is optional and enabled by default; host manifest and runtime resolver agree on its shape", async () => {
   const validate = await manifestValidator("unblock-memory:test:steward");
-  // Existing fleet configs carry no steward section: both host defaults and the runtime keep it off.
+  // Existing fleet configs carry no steward section: both host defaults and the runtime enable it by default.
   for (const fleet of [{}, { decisionModel: { enabled: true } }]) {
     const host = validate(fleet);
     assert.equal(host.ok, true);
-    assert.deepEqual(host.value?.steward, { enabled: false });
+    assert.deepEqual(host.value?.steward, { enabled: true });
     const steward = resolveConfig(host.value).steward;
-    assert.equal(steward.enabled, false);
-    assert.equal(steward.deepThought.enabled, false);
-    assert.equal(steward.peopleShadow.enabled, false);
+    assert.equal(steward.enabled, true);
+    assert.equal(steward.deepThought.enabled, true);
+    assert.equal(steward.peopleShadow.enabled, true);
     assert.deepEqual(resolveConfig(fleet).steward, steward);
   }
   const enabled = {

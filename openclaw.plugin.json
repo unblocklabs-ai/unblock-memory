@@ -1180,12 +1180,12 @@
       },
       "steward": {
         "type": "object",
-        "description": "Opt-in Steward sub-agent: the deep_thought memory curator tool and proposal-only People shadow adjudication. Off by default.",
+        "description": "Steward sub-agent: the deep_thought memory curator tool and proposal-only People shadow adjudication. Enabled by default; set enabled: false to opt out.",
         "additionalProperties": false,
         "properties": {
           "enabled": {
             "type": "boolean",
-            "default": false
+            "default": true
           },
           "model": {
             "type": "string",
@@ -1285,7 +1285,7 @@
           }
         },
         "default": {
-          "enabled": false
+          "enabled": true
         }
       }
     }

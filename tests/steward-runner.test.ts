@@ -39,9 +39,9 @@ function scripted(...responses: Response[]) {
 }
 
 test("config defaults, nested overrides and strict boundaries", () => {
-  assert.deepEqual(config, { enabled: false, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
-    maxActiveBackground: 1, deepThought: { enabled: false, maxTurns: 6, maxToolCalls: 16, maxConcurrent: 2, timeoutMs: 60000,
-      maxToolResultChars: 8000, maxInputTokens: 48000 }, peopleShadow: { enabled: false, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45000 } });
+  assert.deepEqual(config, { enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
+    maxActiveBackground: 1, deepThought: { enabled: true, maxTurns: 6, maxToolCalls: 16, maxConcurrent: 2, timeoutMs: 60000,
+      maxToolResultChars: 8000, maxInputTokens: 48000 }, peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45000 } });
   const overridden = resolveStewardConfig({ reasoning: "off", endpoint: "http://localhost:123/v1/responses/", deepThought: { maxTurns: 12 } });
   assert.equal(overridden.endpoint, "http://localhost:123/v1/responses");
   assert.equal(overridden.deepThought.maxTurns, 12);

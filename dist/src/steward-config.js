@@ -3,11 +3,11 @@ import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const DEFAULT_STEWARD_CONFIG = {
-    enabled: false, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
+    enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
     maxActiveBackground: 1,
-    deepThought: { enabled: false, maxTurns: 6, maxToolCalls: 16, maxConcurrent: 2, timeoutMs: 60_000,
+    deepThought: { enabled: true, maxTurns: 6, maxToolCalls: 16, maxConcurrent: 2, timeoutMs: 60_000,
         maxToolResultChars: 8000, maxInputTokens: 48_000 },
-    peopleShadow: { enabled: false, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
+    peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
 };
 function section(value = {}, defaults, label, optional = []) {
     if (!isRecord(value))

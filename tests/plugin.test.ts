@@ -142,6 +142,7 @@ test("registers exactly the clean memory tool contract and validates every tool 
       "memory_diagnostics",
       "memory_review_claim",
       "memory_review_cluster",
+      "deep_thought",
     ],
   );
   assert.ok(
@@ -479,7 +480,7 @@ test("an explicit Skill Whisperer enable without a skills corpus warns instead o
   }
 });
 
-test("steward: memory-steward CLI always registers; deep_thought and the shadow loop only when explicitly enabled", () => {
+test("steward: memory-steward CLI always registers; deep_thought and the shadow loop default on and honor opt-out", () => {
   const register = (pluginConfig: Record<string, unknown>, registrationMode = "full") => {
     const tools: string[] = [], cli: string[] = [], hooks: string[] = [];
     registerUnblockMemory({
@@ -494,19 +495,18 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
     } as unknown as OpenClawPluginApi);
     return { tools, cli, hooks };
   };
-  const off = register({});
-  assert.ok(off.cli.includes("memory-steward"));
-  assert.equal(off.tools.includes("deep_thought"), false);
-  // Section enabled without a sub-feature, or a sub-feature without the master switch, stays inert.
-  assert.equal(register({ steward: { enabled: true } }).tools.includes("deep_thought"), false);
-  assert.equal(register({ steward: { deepThought: { enabled: true } } }).tools.includes("deep_thought"), false);
-  const on = register({ steward: { enabled: true, deepThought: { enabled: true } } });
-  assert.deepEqual(on.tools.filter(name => name === "deep_thought"), ["deep_thought"]);
+  const defaults = register({});
+  assert.ok(defaults.cli.includes("memory-steward"));
+  assert.deepEqual(defaults.tools.filter(name => name === "deep_thought"), ["deep_thought"]);
+  // Master switch off disables both sub-features even if sub-feature flags are true; sub-feature opt-out works individually.
+  assert.equal(register({ steward: { enabled: false } }).tools.includes("deep_thought"), false);
+  assert.equal(register({ steward: { enabled: false, deepThought: { enabled: true } } }).tools.includes("deep_thought"), false);
+  assert.equal(register({ steward: { enabled: true, deepThought: { enabled: false } } }).tools.includes("deep_thought"), false);
   const metadata = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }, "cli-metadata");
   assert.ok(metadata.cli.includes("memory-steward"), "CLI descriptors are available to cli-metadata loads");
   assert.equal(metadata.hooks.length, 0, "cli-metadata never starts background work");
   const shadowHooks = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }).hooks;
-  const quietHooks = register({ steward: { enabled: true } }).hooks;
+  const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false } } }).hooks;
   assert.equal(shadowHooks.filter(name => name === "gateway_start").length, quietHooks.filter(name => name === "gateway_start").length + 1,
     "the People shadow loop adds exactly one gateway_start hook");
 });

@@ -907,8 +907,10 @@ baseline. Soft-deleting a person in PeopleSQL does not remove Inside Out data.
 
 ## Steward
 
-The Steward is an opt-in sub-agent with two independent features, both off by
-default. Fleet configs without a `steward` section load unchanged.
+The Steward is an embedded sub-agent with two independent features (`deep_thought`
+and proposal-only People shadow), both **enabled by default**. Fleet configs without
+a `steward` section load cleanly and automatically get both features; set
+`steward.enabled: false` (or disable either sub-feature individually) to opt out.
 
 ```json
 {
@@ -937,20 +939,20 @@ default. Fleet configs without a `steward` section load unchanged.
 
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
-| `steward.enabled` | `false` | Master switch; each feature below also needs its own `enabled` |
+| `steward.enabled` | `true` | Master switch; set `false` to disable all Steward features |
 | `steward.model` | `gpt-6.2-sol` | Responses model id |
 | `steward.reasoning` | `medium` | `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` |
 | `steward.endpoint` | `https://codex.unblocklabs.ai/v1/responses` | HTTPS (or loopback HTTP) Responses endpoint without credentials, query or fragment |
 | `steward.apiKey` / `steward.apiKeyFile` | Unset | Explicit Steward credential (`apiKeyFile` must be an absolute path). When unset, the `decisionModel` credential is reused **only** when both endpoints share an origin |
 | `steward.maxActiveBackground` | `1` | 1–4 concurrent background Steward passes per Gateway process |
-| `steward.deepThought.enabled` | `false` | Registers `deep_thought` |
+| `steward.deepThought.enabled` | `true` | Registers `deep_thought` |
 | `steward.deepThought.maxTurns` | `6` | 1–12 model turns; a call's `maxHops` can only narrow it |
 | `steward.deepThought.maxToolCalls` | `16` | 1–32 tool calls per investigation |
 | `steward.deepThought.maxConcurrent` | `2` | 1–4 in-flight investigations per process; extra calls return `busy` |
 | `steward.deepThought.timeoutMs` | `60000` | 5,000–180,000 ms wall clock per investigation |
 | `steward.deepThought.maxToolResultChars` | `8000` | 500–32,000 characters per tool result returned to the model |
 | `steward.deepThought.maxInputTokens` | `48000` | 2,000–128,000 input tokens per model request (retries are not double-charged) |
-| `steward.peopleShadow.enabled` | `false` | Starts the background shadow loop on Gateway start |
+| `steward.peopleShadow.enabled` | `true` | Starts the background shadow loop on Gateway start |
 | `steward.peopleShadow.intervalMinutes` | `60` | 5–1,440 minutes between passes |
 | `steward.peopleShadow.maxItemsPerRun` | `10` | 1–50 model calls per agent per pass |
 | `steward.peopleShadow.timeoutMs` | `45000` | 5,000–180,000 ms per proposal |
