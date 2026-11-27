@@ -21,7 +21,7 @@ import { ResponseAuditStore } from "./response-store.js";
 import { getContext } from "./tool-context.js";
 import { record } from "./guards.js";
 import { jsonHash } from "./json-hash.js";
-import { reviewWindow } from "./people-learning-time.js";
+import { reviewWindow, shiftDate } from "./people-learning-time.js";
 import { DEFAULTS } from "./defaults.js";
 
 const LEARNING_PARAMETERS = Type.Union([
@@ -61,6 +61,11 @@ function isLearningEnabled(config: UnblockMemoryConfig, agentId: string, kind?: 
 
 function isLearningAuthorized(cfg: OpenClawConfig, config: UnblockMemoryConfig, job: LearningJob): boolean {
   return listAgentIds(cfg).includes(job.agentId) && isLearningEnabled(config, job.agentId, job.kind);
+}
+
+/** Whether automatic external analysis is approved for People Learning receipts (else receipts record `not_approved`). */
+export function isPeopleLearningAnalysisApproved(config: UnblockMemoryConfig): boolean {
+  return isAnalysisApproved(config);
 }
 
 function isAnalysisApproved(config: UnblockMemoryConfig): boolean {
@@ -401,11 +406,88 @@ function handleCheckpointAction(options: {
   });
 }
 
+export type PeopleManifestEnsureResult = {
+  kind: ReviewKind;
+  runId?: string;
+  manifestRevision?: string;
+  status: "fresh" | "created" | "disabled" | "error";
+  error?: string;
+};
+
+/** A nightly manifest is fresh for the latest completed local day; a weekly one for any of the last 7 completed days. */
+function freshRun(ledger: PeopleLearningStore, kind: ReviewKind, timezone: string, now: number) {
+  const latest = reviewWindow(now, timezone, kind).localDay;
+  const days = kind === "nightly" ? 1 : 7;
+  for (let offset = 0; offset < days; offset++) {
+    const run = ledger.get(`${kind}:${shiftDate(latest, -offset)}`);
+    if (run && !run.manifest.inventoryPending) return run;
+  }
+  return undefined;
+}
+
+/**
+ * Self-sufficient Steward publishing: create the immutable nightly/weekly People Learning manifest for the current
+ * review window through the same `inventoryPeople` pipeline the cron's `inventory` action uses, but only when no fresh
+ * manifest exists. Honors `people.learning` opt-outs exactly like the cron. Never touches cron jobs.
+ */
+export function ensurePeopleLearningManifests(options: {
+  cfg: OpenClawConfig;
+  config: UnblockMemoryConfig;
+  agentId: string;
+  stateRoot?: string;
+  stores?: PeopleStores;
+  kinds?: readonly ReviewKind[];
+}): PeopleManifestEnsureResult[] {
+  const { cfg, config, agentId } = options;
+  const stateRoot = options.stateRoot ?? resolveStateDir();
+  const kinds = options.kinds ?? ["nightly", "weekly"];
+  const results: PeopleManifestEnsureResult[] = [];
+  if (!listAgentIds(cfg).includes(agentId)) {
+    return kinds.map(kind => ({ kind, status: "error" as const, error: "Unknown people-learning agent" }));
+  }
+  const stores = options.stores ?? new PeopleStores({ stateRoot, maxOpenTodos: config.people.todos.maxOpen,
+    maxBlurbChars: config.people.whisperer.maxChars });
+  try {
+    const settings = learningForAgent(config.people.learning, agentId);
+    const timezone = settings.timezone ?? resolveTimezone(cfg.agents?.defaults?.userTimezone);
+    for (const kind of kinds) {
+      if (!isLearningEnabled(config, agentId, kind)) { results.push({ kind, status: "disabled" }); continue; }
+      try {
+        const paths = reviewPaths(cfg, config, agentId, stateRoot);
+        const fresh = withLearningStore(paths.storePath, agentId, ledger => freshRun(ledger, kind, timezone, Date.now()));
+        if (fresh) {
+          results.push({ kind, runId: fresh.manifest.id, manifestRevision: fresh.manifestRevision, status: "fresh" });
+          continue;
+        }
+        const created = beginReview(cfg, config, stores, agentId, kind, stateRoot);
+        results.push({ kind, runId: created.manifest.id, manifestRevision: created.manifestRevision, status: "created" });
+      } catch (error) {
+        results.push({ kind, status: "error", error: String(error) });
+      }
+    }
+  } finally {
+    if (!options.stores) stores.closeAll();
+  }
+  return results;
+}
+
 function isStartupPrepError(error: unknown): boolean {
   return /not completed startup inspection and preparation/i.test(String(error));
 }
 
-export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockMemoryConfig, stores: PeopleStores) {
+export type RegisterPeopleLearningOptions = {
+  /**
+   * When Steward publishes People Learning directly (`steward.peopleShadow.mode: "publish"`), the legacy
+   * `unblock-memory:people-learning:*` crons are disabled (history preserved) and never created. Evaluated against the
+   * live plugin config on every reconcile so a reload that switches back to `"shadow"` re-enables them.
+   */
+  stewardOwnsPublishing?: boolean | ((config: UnblockMemoryConfig) => boolean);
+};
+
+export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockMemoryConfig, stores: PeopleStores,
+  options: RegisterPeopleLearningOptions = {}) {
+  const stewardOwnsPublishing = (current: UnblockMemoryConfig) => typeof options.stewardOwnsPublishing === "function"
+    ? options.stewardOwnsPublishing(current) === true : options.stewardOwnsPublishing === true;
   let cfg = api.config, config = initial, stateRoot = resolveStateDir(), live = false;
   // Separate durable cron declaration recognition from current authorization:
   // recognizedJobs persists across transient reconcile/reload failures so private-session
@@ -460,6 +542,7 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
             Object.entries(config.people.learning.agents ?? {}).map(([id, agent]) => [id, { ...agent, enabled: false }]),
           ),
         };
+    const stewardManaged = stewardOwnsPublishing(config);
     reconciliation = Promise.resolve()
       .then(async () => {
         const cron = getCron?.();
@@ -479,6 +562,7 @@ export function registerPeopleLearning(api: OpenClawPluginApi, initial: UnblockM
           (discovered, replace) => {
             if (live && version === generation) mergeRecognized(discovered, replace);
           },
+          { stewardOwnsPublishing: stewardManaged },
         );
         if (live && version === generation) {
           startupRetries = 0;

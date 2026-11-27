@@ -8,7 +8,7 @@ import { Value } from "typebox/value";
 import { resolveConfig } from "../src/config.js";
 import { learningForAgent, PEOPLE_LEARNING_SCHEMA } from "../src/people-learning-config.js";
 import { reviewWindow } from "../src/people-learning-time.js";
-import { learningSession, reconcilePeopleLearning, type PeopleCron } from "../src/people-learning-cron.js";
+import { learningSession, reconcilePeopleLearning, STEWARD_MANAGED_MARKER, type PeopleCron } from "../src/people-learning-cron.js";
 import { inventoryPeople, privateJson, type ReviewManifest } from "../src/people-learning-inventory.js";
 import { manifestRevision, PeopleLearningStore, verifyLearningCoverage, type LearningReceipt } from "../src/people-learning-store.js";
 import { PeopleStores } from "../src/people-store.js";
@@ -155,6 +155,87 @@ test("a lost scheduler response and previously paused legacy job do not create d
   assert.equal(h.jobs.find(j => j.declarationKey?.endsWith(":weekly"))!.enabled, false);
   await reconcilePeopleLearning(h.cron, cfg, { ...settings, agents: { ...settings.agents, alpha: { enabled: true } } });
   assert.equal(h.jobs.find(j => j.declarationKey?.endsWith(":weekly"))!.enabled, true);
+});
+
+test("stewardOwnsPublishing disables every people-learning cron with a marker, never creates one, and switching back re-enables them", async () => {
+  const state = { lastRunAtMs: 456, lastRunStatus: "ok" as const };
+  const settings = { ...enabled().people.learning, agents: { beta: { enabled: false } } };
+  const h = hostCron();
+  const owned = await reconcilePeopleLearning(h.cron, cfg, settings);
+  assert.equal(owned.length, 2);
+  for (const job of h.jobs) job.state = structuredClone(state);
+  const writes = h.writes.length;
+
+  const managed = await reconcilePeopleLearning(h.cron, cfg, settings, undefined, undefined, { stewardOwnsPublishing: true });
+  assert.ok(!h.writes.slice(writes).some(w => w.startsWith("add:")), "never creates a cron while Steward publishes");
+  assert.deepEqual(managed.map(j => j.id).sort(), owned.map(j => j.id).sort(), "existing declarations stay recognized");
+  for (const job of h.jobs) {
+    assert.equal(job.enabled, false);
+    assert.ok(String(job.description).includes(STEWARD_MANAGED_MARKER));
+    assert.deepEqual(job.state, state, "cron history preserved");
+  }
+  const settled = h.writes.length;
+  await reconcilePeopleLearning(h.cron, cfg, settings, undefined, undefined, { stewardOwnsPublishing: true });
+  assert.equal(h.writes.length, settled, "steady steward-managed state performs no scheduler mutations");
+
+  await reconcilePeopleLearning(h.cron, cfg, settings, undefined, undefined, { stewardOwnsPublishing: false });
+  for (const job of h.jobs) {
+    assert.equal(job.enabled, true, "switching back to shadow mode re-enables the crons");
+    assert.doesNotMatch(String(job.description), /steward-managed/u);
+    // The host resets error counters on re-enable; the run history itself survives the round trip.
+    assert.equal(record(job.state)?.lastRunAtMs, state.lastRunAtMs);
+    assert.equal(record(job.state)?.lastRunStatus, state.lastRunStatus);
+  }
+  assert.equal(h.jobs.length, 2, "re-enabling reuses the original jobs");
+
+  // A host with only an exact legacy original: Steward pauses it without creating a declaration, and a switch back
+  // migrates it normally (the steward pause is never mistaken for an operator's migration pause).
+  const legacy = hostCron([
+    { id: "legacy", agentId: "alpha", name: "People Whisperer — nightly dreaming and interaction learning", enabled: true, state },
+    { id: "operator-paused", agentId: "alpha", name: "People Whisperer — full weekly statement validation", enabled: false, state },
+    { id: "unowned", agentId: "alpha", name: "Billing maintenance", enabled: true, state },
+  ]);
+  await reconcilePeopleLearning(legacy.cron, cfg, settings, undefined, undefined, { stewardOwnsPublishing: true });
+  assert.ok(!legacy.writes.some(w => w.startsWith("add:")));
+  assert.equal(legacy.jobs.find(j => j.id === "legacy")!.enabled, false);
+  assert.match(String(legacy.jobs.find(j => j.id === "legacy")!.description), /\[steward-managed\]/u);
+  assert.equal(legacy.jobs.find(j => j.id === "operator-paused")!.description, undefined, "operator pauses are left untouched");
+  assert.equal(legacy.jobs.find(j => j.id === "unowned")!.enabled, true, "never sweeps unowned jobs");
+  await reconcilePeopleLearning(legacy.cron, cfg, settings, undefined, undefined, { stewardOwnsPublishing: false });
+  const nightly = legacy.jobs.find(j => j.declarationKey === "unblock-memory:people-learning:alpha:nightly")!;
+  assert.equal(nightly.enabled, true, "the steward-paused legacy job migrates to an active declaration");
+  const weekly = legacy.jobs.find(j => j.declarationKey === "unblock-memory:people-learning:alpha:weekly")!;
+  assert.equal(weekly.enabled, false, "the operator-paused legacy job stays a migration pause");
+  assert.equal(legacy.jobs.find(j => j.id === "legacy")!.enabled, false, "legacy history stays on the disabled original");
+});
+
+test("registerPeopleLearning evaluates stewardOwnsPublishing against the live config on every reconcile", async t => {
+  const root = mkdtempSync(join(tmpdir(), "people-steward-"));
+  const stores = new PeopleStores({ stateRoot: root, maxOpenTodos: 10, maxBlurbChars: 1200 }); t.after(() => stores.closeAll());
+  const hostConfig: OpenClawConfig = { agents: { entries: { alpha: {} } } };
+  const h = hostCron();
+  let service: OpenClawPluginService | undefined;
+  const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  let stewardPublishes = false;
+  const api = { config: hostConfig, pluginConfig: { people: { enabled: true, whisperer: { enabled: true } } },
+    logger: { warn(message: string) { assert.fail(message); } },
+    registerService(value: OpenClawPluginService) { service = value; },
+    registerTool() {},
+    on(name: string, handler: (...args: unknown[]) => unknown) { hooks.set(name, handler); },
+  } as unknown as OpenClawPluginApi;
+  registerPeopleLearning(api, enabled(), stores, { stewardOwnsPublishing: () => stewardPublishes });
+  await service!.start({ config: hostConfig, stateDir: root, logger: api.logger,
+    getCron: () => ({ ...h.cron, remove: async () => ({}), removeStaleJobFamily: async () => 0 }) });
+  await hooks.get("gateway_start")!({}, {});
+  assert.equal(h.jobs.length, 2);
+  assert.ok(h.jobs.every(job => job.enabled));
+  stewardPublishes = true;
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: hostConfig });
+  assert.ok(h.jobs.every(job => job.enabled === false && String(job.description).includes("[steward-managed]")));
+  stewardPublishes = false;
+  await hooks.get("cron_reconciled")!({ reason: "reload" }, { config: hostConfig });
+  assert.ok(h.jobs.every(job => job.enabled), "switching back re-enables");
+  await service!.stop!({ config: hostConfig, stateDir: root, logger: api.logger });
 });
 
 function fixture() {

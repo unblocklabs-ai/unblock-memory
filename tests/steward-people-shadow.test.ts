@@ -550,3 +550,312 @@ test("disabled runtime registers only the CLI", () => {
   assert.equal(runtime.enabled, false);
   assert.deepEqual(events, []);
 });
+
+/* ───────────── Publish mode ───────────── */
+
+const PUBLISH_DEFAULTS = { mode: "publish" as const, analysisApproved: false };
+
+function dossierChanges(dbPath: string, personId: string) {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    return db.prepare("SELECT id, reason, before_dossier_json, after_dossier_json FROM person_dossier_changes WHERE person_id=? ORDER BY rowid")
+      .all(personId) as { id: string; reason: string; before_dossier_json: string | null; after_dossier_json: string | null }[];
+  } finally { db.close(); }
+}
+
+function readPeople(dbPath: string) {
+  return new PeopleStore(dbPath, { maxOpenTodos: 10, maxBlurbChars: 1200 });
+}
+
+test("publish mode applies revalidated/corrected/retired to the dossier and checkpoints a LearningReceipt; unresolved and hallucinated stay untouched", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const [blurb, recFirst, asyncUpdates, fridayDigest, workingStyle] = f.assertions;
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+  const { runner } = scriptedRunner((prompt, handles) => {
+    if (prompt.includes(recFirst!.statement)) return { disposition: "revalidated", reason: "Mira asked for it directly",
+      citedHandles: [handleFor(prompt, "lead with the recommendation")], confidence: "high" };
+    if (prompt.includes(asyncUpdates!.statement)) return { disposition: "corrected", proposedClaim: "Prefers live syncs over async updates.",
+      reason: "Newer statement reverses it", citedHandles: [handleFor(prompt, "live syncs")], confidence: "medium" };
+    if (prompt.includes(fridayDigest!.statement)) return { disposition: "retired", reason: "Digest request was withdrawn",
+      citedHandles: [handles[0]!], confidence: "high" };
+    if (prompt.includes(workingStyle!.statement)) return { disposition: "retired", reason: "trust me", citedHandles: ["ev_99"], confidence: "high" };
+    return { disposition: "unresolved", reason: "Blurb is not addressed by the evidence", citedHandles: [], confidence: "low" };
+  });
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner,
+    owner: "steward:publish", maxStrikes: 1 });
+  assert.equal(result.mode, "publish");
+  assert.deepEqual(result.published, { applied: 3, recorded: 0, skipped: 0, unresolved: 1 });
+  assert.equal(result.rejected, 1, "hallucinated handle never publishes");
+
+  // Dossier: exactly the three target claims changed; blurb, the hallucinated target and every other field preserved.
+  const people = readPeople(f.dbPath);
+  t.after(() => people.close());
+  const dossier = people.getDossier(f.mira.id)!.dossier;
+  assert.equal(dossier.blurb, DOSSIER.blurb);
+  const preferences = dossier.sections.find(s => s.category === "preferences")!.claims;
+  assert.deepEqual(preferences.map(c => c.statement), ["Give the recommendation first.", "Prefers live syncs over async updates."]);
+  assert.notEqual(preferences[0]!.reviewedAt, DOSSIER.sections[0]!.claims[0]!.reviewedAt, "revalidation re-stamps reviewedAt");
+  assert.deepEqual(preferences[0]!.evidence, DOSSIER.sections[0]!.claims[0]!.evidence, "revalidation keeps evidence (stable assertion id)");
+  assert.equal(preferences[1]!.scope, "Weekly sync");
+  assert.deepEqual(preferences[1]!.evidence.map(e => [e.source, e.locator]), [["session", "session:s1#6"]],
+    "corrected claim cites exactly the verified handle's source");
+  assert.deepEqual(dossier.sections.find(s => s.category === "workingStyle"), DOSSIER.sections[1], "rejected proposal: claim untouched");
+  const changes = dossierChanges(f.dbPath, f.mira.id).slice(baseline);
+  assert.equal(changes.length, 3);
+  for (const change of changes) {
+    assert.match(change.reason, /^Steward People Learning (revalidated|corrected|retired)/u);
+    assert.match(change.reason, /sources: session:s1#\d+/u);
+    assert.ok(!change.reason.includes(f.root), "audit reason carries no filesystem paths");
+  }
+  assert.equal(people.isDossierVerified(f.mira.id), false, "an unverified dossier is never marked verified by a partial review");
+
+  // Receipt: live Steward completion in people_learning_runs, exact revision, dispositions, refs and change ids.
+  assert.equal(result.checkpoints.length, 1);
+  assert.equal(result.checkpoints[0]!.status, "partial");
+  assert.deepEqual(result.checkpoints[0]!.errors, []);
+  const run = f.ledger.get(f.manifest.id)!;
+  assert.equal(run.status, "partial");
+  const reviews = new Map(run.receipt!.assertionReviews.map(r => [r.assertionId, r]));
+  assert.equal(reviews.get(blurb!.id)?.disposition, "unresolved");
+  assert.equal(reviews.get(recFirst!.id)?.disposition, "revalidated");
+  assert.equal(reviews.get(asyncUpdates!.id)?.disposition, "corrected");
+  assert.deepEqual(reviews.get(asyncUpdates!.id)?.sourceRefs, ["session:s1#6"]);
+  assert.ok(reviews.get(asyncUpdates!.id)?.correctionsCheckedAt);
+  assert.equal(reviews.get(fridayDigest!.id)?.disposition, "retired");
+  assert.equal(reviews.has(workingStyle!.id), false, "rejected proposals are never receipted");
+  assert.deepEqual(new Set(run.receipt!.changes.map(c => c.changeId)), new Set(changes.map(c => c.id)));
+  assert.equal(run.receipt!.analysis.status, "not_approved");
+  assert.equal(run.receipt!.peopleReviews.find(p => p.personId === f.mira.id)?.status, "unresolved",
+    "Steward never claims interaction learning it did not do");
+
+  // Report shows live published status.
+  const report = buildPeopleShadowReport(f.dbPath, f.manifest.id);
+  assert.deepEqual(report.published, { applied: 3, recorded: 0, skipped: 0, unresolved: 1 });
+  assert.equal(report.publishedItems.filter(i => i.changeId).length, 3);
+  assert.deepEqual(report.runs.map(r => [r.manifestId, r.status]), [[f.manifest.id, "partial"]]);
+
+  // Re-running never re-publishes resolved assertions or double-applies an edit.
+  const quiet = scriptedRunner(() => ({ disposition: "unresolved", reason: "nothing new", citedHandles: [], confidence: "low" }));
+  const again = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: quiet.runner, owner: "steward:publish", maxStrikes: 1 });
+  assert.equal(again.published.applied, 0);
+  for (const prompt of quiet.prompts) {
+    for (const resolved of [recFirst, asyncUpdates, fridayDigest]) assert.ok(!prompt.includes(`Assertion: ${resolved!.statement}`));
+  }
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length - baseline, 3, "no second dossier revision");
+  const after = f.ledger.get(f.manifest.id)!;
+  assert.equal(new Map(after.receipt!.assertionReviews.map(r => [r.assertionId, r])).get(asyncUpdates!.id)?.disposition, "corrected",
+    "a later unresolved pass never downgrades a resolved review");
+});
+
+test("publish mode: a fenced worker can never double-apply; the staged proposal resumes and publishes exactly once", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const asyncUpdates = f.assertions[2]!;
+  const target = `${f.manifest.id}:${f.mira.id}:${asyncUpdates.id}`;
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+  /** Fences the target right after its proposal is staged, as a reclaim/interrupt would between stage and commit. */
+  class FencingStore extends WorkStore {
+    fenced?: WorkClaim;
+    override stageArtifact(claim: WorkClaim, options: Parameters<WorkStore["stageArtifact"]>[1]) {
+      const staged = super.stageArtifact(claim, options);
+      if (claim.scope === target && !this.fenced) { this.fenced = staged; this.interruptOwner(claim.owner); }
+      return staged;
+    }
+  }
+  type WorkClaim = Parameters<WorkStore["stageArtifact"]>[0];
+  const fencing = new FencingStore(f.dbPath);
+  t.after(() => fencing.close());
+  let calls = 0;
+  const { runner } = scriptedRunner((prompt) => {
+    calls += 1;
+    return prompt.includes(asyncUpdates.statement)
+      ? { disposition: "corrected", proposedClaim: "Prefers live syncs over async updates.", reason: "Newer statement",
+          citedHandles: [handleFor(prompt, "live syncs")], confidence: "high" }
+      : { disposition: "unresolved", reason: "n/a", citedHandles: [], confidence: "low" };
+  });
+  const first = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: fencing, runner, owner: "w1" });
+  assert.deepEqual(first.items.find(i => i.scope === target), { scope: target, outcome: "staged", detail: "commit_fenced" });
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length, baseline, "the fenced worker published nothing");
+  assert.equal(fencing.get(PEOPLE_SHADOW_KIND, target)!.status, "staged");
+
+  // The fenced claim stays dead even when replayed directly.
+  assert.throws(() => fencing.commitWithDomain(fencing.fenced!, { keepArtifact: true }, () => assert.fail("domain must not run")),
+    /fence lost/u);
+
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const callsBefore = calls;
+  const resumed = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "w2" });
+  assert.equal(resumed.items.find(i => i.scope === target)?.outcome, "resumed");
+  assert.equal(calls, callsBefore, "resume publishes the staged proposal without another model call");
+  assert.equal(resumed.published.applied, 1);
+  const changes = dossierChanges(f.dbPath, f.mira.id).slice(baseline);
+  assert.equal(changes.length, 1, "published exactly once");
+  const row = store.get(PEOPLE_SHADOW_KIND, target)!;
+  assert.equal(row.status, "completed");
+  const artifact = JSON.parse(row.artifactJson!) as PeopleShadowArtifact;
+  assert.equal(artifact.publication?.status, "applied");
+  assert.equal(artifact.publication?.changeId, changes[0]!.id, "the completed row records the exact revision it wrote");
+
+  // Replaying the same edit in a later pass is a no-op: the row is completed and the receipt resolved it.
+  await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "w3" });
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length - baseline, 1);
+});
+
+test("publish mode never overwrites newer edits, skips low confidence and paused people, and records them as unresolved", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const [, recFirst, asyncUpdates, fridayDigest] = f.assertions;
+  // A human edits the async-updates claim after the manifest was inventoried.
+  const people = readPeople(f.dbPath);
+  t.after(() => people.close());
+  const edited = structuredClone(DOSSIER);
+  edited.sections[0]!.claims[1] = { ...edited.sections[0]!.claims[1]!, statement: "Prefers async updates on Mondays." };
+  people.replaceDossier(f.mira.id, "Human edit", edited);
+  const humanRevision = people.getDossierRevision(f.mira.id);
+  const { runner } = scriptedRunner((prompt, handles) => {
+    if (prompt.includes(asyncUpdates!.statement)) return { disposition: "corrected", proposedClaim: "Prefers live syncs.",
+      reason: "Newer statement", citedHandles: [handleFor(prompt, "live syncs")], confidence: "high" };
+    if (prompt.includes(fridayDigest!.statement)) return { disposition: "retired", reason: "weak signal", citedHandles: [handles[0]!], confidence: "low" };
+    if (prompt.includes(recFirst!.statement)) return { disposition: "revalidated", reason: "ok", citedHandles: [handles[0]!], confidence: "high" };
+    return { disposition: "unresolved", reason: "n/a", citedHandles: [], confidence: "low" };
+  });
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o",
+    manifestIds: [f.manifest.id] });
+  assert.equal(result.published.skipped, 2, "stale correction + low-confidence retirement");
+  const current = people.getDossier(f.mira.id)!.dossier;
+  assert.equal(current.sections[0]!.claims[1]!.statement, "Prefers async updates on Mondays.", "the newer human edit wins");
+  assert.ok(current.sections[0]!.claims.some(c => c.statement === "Wants weekly Friday digests."), "low confidence never retires");
+  const receipt = new Map(f.ledger.get(f.manifest.id)!.receipt!.assertionReviews.map(r => [r.assertionId, r]));
+  assert.equal(receipt.get(asyncUpdates!.id)?.disposition, "unresolved");
+  assert.match(receipt.get(asyncUpdates!.id)?.reason ?? "", /newer edits win/u);
+  assert.equal(receipt.get(fridayDigest!.id)?.disposition, "unresolved");
+  assert.equal(receipt.get(recFirst!.id)?.disposition, "revalidated");
+  assert.notEqual(people.getDossierRevision(f.mira.id), humanRevision, "only the revalidation stamp was written on top");
+
+  // Paused people are review-only: nothing is published for them.
+  const g = await fixture();
+  t.after(g.cleanup);
+  const paused = readPeople(g.dbPath);
+  paused.setInjection(g.mira.id, false);
+  const before = dossierChanges(g.dbPath, g.mira.id).length;
+  paused.close();
+  const pausedStore = new WorkStore(g.dbPath);
+  t.after(() => pausedStore.close());
+  const all = scriptedRunner((_prompt, handles) => ({ disposition: "retired", reason: "x", citedHandles: [handles[0]!], confidence: "high" }));
+  const skipped = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: g.dbPath, agentId: "main", workStore: pausedStore,
+    runner: all.runner, owner: "o" });
+  assert.equal(skipped.published.applied, 0);
+  assert.equal(skipped.published.skipped, 5);
+  assert.equal(dossierChanges(g.dbPath, g.mira.id).length, before);
+});
+
+test("shadow mode stays strictly read-only even with inventoryContext; publish mode inventories missing manifests itself", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const workspace = join(f.root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  const { resolveConfig } = await import("../src/config.js");
+  const inventoryContext = {
+    cfg: { agents: { defaults: { workspace, userTimezone: "UTC" }, entries: { main: { workspace } } } },
+    config: resolveConfig({ people: { enabled: true, whisperer: { enabled: true } } }),
+    stateRoot: f.root,
+  };
+  const audit = installWriteAudit(f.dbPath);
+  t.after(audit.close);
+  const before = audit.snapshot();
+  const { runner } = scriptedRunner((_prompt, handles) => ({ disposition: "retired", reason: "x", citedHandles: [handles[0]!], confidence: "high" }));
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const shadow = await runPeopleShadowPass({ mode: "shadow", inventoryContext, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner, owner: "o" });
+  assert.equal(shadow.mode, "shadow");
+  assert.deepEqual(shadow.inventory, [], "shadow mode never inventories");
+  assert.deepEqual(shadow.published, { applied: 0, recorded: 0, skipped: 0, unresolved: 0 });
+  assert.deepEqual(shadow.checkpoints, []);
+  assert.equal(shadow.completed, 5);
+  assert.deepEqual(audit.writes(), [], "0 writes to person_dossiers / people_learning_* / people");
+  assert.equal(audit.snapshot(), before);
+  audit.close();
+
+  // Publish: the current nightly window is fresh, the weekly one is missing → Steward creates it (no cron needed).
+  const quiet = scriptedRunner(() => ({ disposition: "unresolved", reason: "n/a", citedHandles: [], confidence: "low" }));
+  const published = await runPeopleShadowPass({ mode: "publish", inventoryContext, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: quiet.runner, owner: "o" });
+  const byKind = new Map(published.inventory.map(r => [r.kind, r]));
+  assert.equal(byKind.get("nightly")?.status, "fresh");
+  assert.equal(byKind.get("nightly")?.runId, f.manifest.id);
+  assert.equal(byKind.get("weekly")?.status, "created");
+  const weeklyId = byKind.get("weekly")!.runId!;
+  assert.match(weeklyId, /^weekly:/u);
+  assert.ok(f.ledger.get(weeklyId), "the immutable weekly manifest is in people_learning_runs");
+  assert.ok(published.manifests.some(m => m.manifestId === weeklyId && m.assertions > 0), "and its assertions are adjudicated");
+  assert.ok(published.checkpoints.some(c => c.manifestId === weeklyId), "with a receipt checkpoint");
+  // The shadow-mode rows were re-driven under the publish recipe (a shadow proposal is never mistaken for a publication).
+  assert.ok(store.list(PEOPLE_SHADOW_KIND).filter(i => i.scope.startsWith(`${f.manifest.id}:`))
+    .every(i => (JSON.parse(i.artifactJson ?? "{}") as PeopleShadowArtifact).mode === "publish"));
+
+  // A second pass finds both windows fresh and inventories nothing new.
+  const again = await runPeopleShadowPass({ mode: "publish", inventoryContext, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: quiet.runner, owner: "o" });
+  assert.ok(again.inventory.every(r => r.status === "fresh"));
+});
+
+test("configurable limits: 0 = unlimited for handles, excerpt chars and items; timeoutMs 0 is forwarded", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const timeouts: (number | undefined)[] = [];
+  const prompts: string[] = [];
+  const runner: CompleteRunner = {
+    async complete<T>(request: StewardCompleteRequest<T>): Promise<StewardCompleteResult<T>> {
+      timeouts.push(request.timeoutMs);
+      prompts.push(request.userPrompt);
+      return { ok: true, backend: "host_llm", usage: { requests: 1 },
+        data: { disposition: "unresolved", reason: "n/a", citedHandles: [], confidence: "low" } as T };
+    },
+  };
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o",
+    maxItems: 0, maxHandles: 0, maxExcerptChars: 0, maxExportBytes: 0, timeoutMs: 0 });
+  assert.equal(result.attempted, 5, "maxItems 0 = unlimited");
+  assert.deepEqual(timeouts, [0, 0, 0, 0, 0], "timeoutMs 0 reaches the runner (unlimited)");
+  const g = await fixture();
+  t.after(g.cleanup);
+  const store2 = new WorkStore(g.dbPath);
+  t.after(() => store2.close());
+  prompts.length = 0;
+  await runPeopleShadowPass({ dbPath: g.dbPath, agentId: "main", workStore: store2, runner, owner: "o", maxHandles: 1, maxExcerptChars: 5 });
+  assert.equal([...prompts[0]!.matchAll(/\[ev_\d+\]/gu)].length, 1, "maxHandles bounds the packet when set");
+  assert.match(prompts[0]!, /user: Actu…/u, "maxExcerptChars clips when set");
+});
+
+test("publish mode completes a full-validation weekly receipt and verifies the dossier at the published revision", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const weekly: ReviewManifest = { ...f.manifest, id: `weekly:${f.manifest.window.localDay}`, kind: "weekly", fullValidation: true };
+  const begun = f.ledger.begin(weekly);
+  const { runner } = scriptedRunner((_prompt, handles) => ({ disposition: "revalidated", reason: "Consistent with recent requests",
+    citedHandles: [handles[0]!], confidence: "high" }));
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner,
+    owner: "o", manifestIds: [weekly.id] });
+  // Blurb sentence: recorded. Expired agent lesson: recorded (re-stamping would break the 30-day lesson rule). Claims: applied.
+  assert.deepEqual(result.published, { applied: 3, recorded: 2, skipped: 0, unresolved: 0 });
+  assert.equal(result.checkpoints[0]?.status, "complete");
+  const run = f.ledger.get(weekly.id)!;
+  assert.equal(run.status, "complete");
+  assert.equal(run.manifestRevision, begun.manifestRevision, "stable assertion ids: revalidation never refreshes the manifest");
+  assert.equal(run.receipt!.assertionReviews.length, 5);
+  assert.ok(run.receipt!.assertionReviews.every(r => r.disposition === "revalidated" && r.sourceRefs.length > 0));
+  const people = readPeople(f.dbPath);
+  t.after(() => people.close());
+  assert.equal(people.isDossierVerified(f.mira.id), true, "complete source validation binds verification to the current revision");
+});
