@@ -445,6 +445,11 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     assert.equal(steward.enabled, true);
     assert.equal(steward.deepThought.enabled, true);
     assert.equal(steward.peopleShadow.enabled, true);
+    assert.equal(steward.peopleShadow.includeInteractionLearning, undefined);
+    assert.equal(steward.peopleShadow.includeResponseAudit, true);
+    assert.deepEqual(steward.outcomeLedger, {
+      enabled: true, intervalMinutes: 60, lookbackMs: 604_800_000, maxRowsPerPass: 0, matchWindowMs: 1_800_000, retentionDays: 0,
+    });
     assert.deepEqual(resolveConfig(fleet).steward, steward);
   }
   const enabled = {
@@ -459,10 +464,14 @@ test("steward is optional and enabled by default; host manifest and runtime reso
       peopleShadow: {
         enabled: true, mode: "shadow" as const, intervalMinutes: 120, maxItemsPerRun: 5, timeoutMs: 30_000,
         minConfidence: "high" as const, maxHandles: 12, maxExcerptChars: 1000, maxExportBytes: 2_000_000,
+        includeInteractionLearning: true, maxNewClaimsPerPerson: 3, maxInteractionHandles: 24, includeResponseAudit: false,
       },
       captainsLog: {
         enabled: true, intervalMinutes: 120, lookbackMinutes: 130, maxSessionsPerRun: 10,
         maxCharsPerSession: 8_000, maxExistingLogChars: 12_000, timeoutMs: 60_000, excludeChatTypes: ["direct" as const],
+      },
+      outcomeLedger: {
+        enabled: false, intervalMinutes: 30, lookbackMs: 86_400_000, maxRowsPerPass: 5_000, matchWindowMs: 600_000, retentionDays: 90,
       },
     },
   };
@@ -473,6 +482,7 @@ test("steward is optional and enabled by default; host manifest and runtime reso
   assert.deepEqual(steward.deepThought, enabled.steward.deepThought);
   assert.deepEqual(steward.peopleShadow, enabled.steward.peopleShadow);
   assert.deepEqual(steward.captainsLog, enabled.steward.captainsLog);
+  assert.deepEqual(steward.outcomeLedger, enabled.steward.outcomeLedger);
   for (const invalid of [
     { steward: { extra: true } },
     { steward: { deepThought: { extra: 1 } } },
@@ -487,6 +497,17 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     { steward: { endpoint: "https://user:pass@remote.example/v1/responses" } },
     { steward: { apiKey: "two words" } },
     { steward: { maxActiveBackground: 0 } },
+    { steward: { peopleShadow: { includeInteractionLearning: "yes" } } },
+    { steward: { peopleShadow: { maxNewClaimsPerPerson: -1 } } },
+    { steward: { peopleShadow: { maxInteractionHandles: 1.5 } } },
+    { steward: { peopleShadow: { includeResponseAudit: 1 } } },
+    { steward: { outcomeLedger: { extra: true } } },
+    { steward: { outcomeLedger: { enabled: "true" } } },
+    { steward: { outcomeLedger: { intervalMinutes: 0 } } },
+    { steward: { outcomeLedger: { lookbackMs: 0 } } },
+    { steward: { outcomeLedger: { maxRowsPerPass: -1 } } },
+    { steward: { outcomeLedger: { matchWindowMs: 0 } } },
+    { steward: { outcomeLedger: { retentionDays: -1 } } },
   ]) {
     assert.equal(validate(invalid).ok, false, JSON.stringify(invalid));
     assert.throws(() => resolveConfig(invalid), /steward/, JSON.stringify(invalid));

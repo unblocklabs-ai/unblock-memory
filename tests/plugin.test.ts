@@ -9,6 +9,8 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
+import { createHash } from "node:crypto";
+import { DeepThoughtStore } from "../src/deep-thought-store.js";
 import { registerUnblockMemory, resolveFlushPlan } from "../src/plugin.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 
@@ -506,7 +508,69 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
   assert.ok(metadata.cli.includes("memory-steward"), "CLI descriptors are available to cli-metadata loads");
   assert.equal(metadata.hooks.length, 0, "cli-metadata never starts background work");
   const shadowHooks = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }).hooks;
-  const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false } } }).hooks;
+  const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
+    outcomeLedger: { enabled: false } } }).hooks;
+  const ledgerOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false } } }).hooks;
+  assert.equal(ledgerOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
+    "the default-on Outcome Ledger alone still starts the background Steward loop");
   assert.equal(shadowHooks.filter(name => name === "gateway_start").length, quietHooks.filter(name => name === "gateway_start").length + 1,
     "the background Steward loop adds exactly one gateway_start hook");
+});
+
+test("deep_thought gets a per-agent durable store and live QMD generations; gateway_stop closes the store", async () => {
+  const registrations = new Map<string, (ctx: OpenClawPluginToolContext) => Tool | null>();
+  const handlers = new Map<string, (() => unknown)[]>();
+  let runtime: QmdMemoryRuntime | undefined;
+  const api = {
+    pluginConfig: { corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }] },
+    on(name: string, handler: () => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+    registerCli() {}, registerService() {}, registerGatewayMethod() {},
+    registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) { runtime = capability.runtime; },
+    registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+      for (const name of options.names) registrations.set(name, factory);
+    },
+    logger: { warn() {}, info() {}, debug() {}, error() {} },
+  } as unknown as OpenClawPluginApi;
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "unblock-memory-plugin-deep-thought-"));
+  try { registerUnblockMemory(api); } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+  }
+  let generation = 3;
+  const generationRequests: (readonly string[])[] = [];
+  Object.defineProperty(runtime!, "getMemorySearchManager", {
+    value: async () => ({ manager: { async getCollectionGenerations(corpora: readonly string[]) {
+      generationRequests.push(corpora);
+      return { "memory-collection": generation };
+    } } }),
+  });
+  const context = { agentId: "bill", config: {}, sessionKey: "agent:bill:slack:direct:u1", messageChannel: "slack",
+    agentAccountId: "workspace" } as OpenClawPluginToolContext;
+  const audienceKey = `caller:${createHash("sha256").update(JSON.stringify(["bill", context.sessionKey, "slack", "workspace", ""])).digest("hex")}`;
+  const seed = new DeepThoughtStore(runtime!.memoryDatabasePath("bill"));
+  seed.saveDerivedObservation({ agentId: "bill", question: "Who owns the launch?", audienceKey, corpora: ["memory"],
+    collectionGenerations: { "memory-collection": 3 }, answer: "Mira owns it.", confidence: "high", citations: [] });
+  seed.close();
+
+  const ask = async () => parseJsonResult(await registrations.get("deep_thought")!(context)!.execute("dt", { question: "Who owns the launch?" }));
+  const hit = await ask();
+  assert.equal(hit.cached, true, JSON.stringify(hit));
+  assert.equal(hit.answer, "Mira owns it.");
+  assert.deepEqual(generationRequests, [["memory"]], "generations are read for exactly the approved corpora");
+
+  for (const handler of handlers.get("gateway_stop") ?? []) await handler();
+  generation = 4;
+  // Reopened lazily after a stop; an advanced generation invalidates the stored answer.
+  const reopened = registrations.get("deep_thought")!(context)!;
+  assert.ok(reopened);
+  const check = new DeepThoughtStore(runtime!.memoryDatabasePath("bill"));
+  try {
+    const before = check.listDerivedObservations({ agentId: "bill" });
+    assert.equal(before.length, 1);
+    assert.equal(before[0]!.status, "fresh");
+    assert.equal(check.findFreshDerivedObservation({ agentId: "bill", question: "Who owns the launch?", audienceKey,
+      corpora: ["memory"], currentGenerations: { "memory-collection": 4 } }), undefined);
+    assert.equal(check.listDerivedObservations({ agentId: "bill" })[0]!.status, "stale");
+  } finally { check.close(); }
 });

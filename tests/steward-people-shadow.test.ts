@@ -12,9 +12,13 @@ import { PeopleStore, type PersonDossier } from "../src/people-store.js";
 import { jsonHash } from "../src/json-hash.js";
 import {
   buildPeopleShadowReport,
+  PEOPLE_INTERACTION_SCHEMA,
+  PEOPLE_INTERACTIONS_KIND,
   PEOPLE_SHADOW_KIND,
   PEOPLE_SHADOW_PROPOSAL_SCHEMA,
   runPeopleShadowPass,
+  type PeopleInteractionArtifact,
+  type PeopleInteractionResult,
   type PeopleShadowArtifact,
   type PeopleShadowProposal,
 } from "../src/steward-people-shadow.js";
@@ -54,7 +58,7 @@ const DOSSIER: PersonDossier = {
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture() {
+async function fixture(options: { sessionIds?: string[]; withoutAssertions?: boolean; secondPerson?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "people-shadow-"));
   const state = join(root, "agents", "main", "unblock-memory");
   mkdirSync(state, { recursive: true });
@@ -64,6 +68,9 @@ async function fixture() {
   const mira = people.upsertIdentity({ provider: "slack", accountScope: "acct-a", externalId: "U1", displayName: "Mira" }).person;
   people.replaceDossier(mira.id, "Seed dossier", DOSSIER);
   const dossier = people.getDossier(mira.id)!.dossier;
+  const bo = options.secondPerson
+    ? people.upsertIdentity({ provider: "slack", accountScope: "acct-a", externalId: "U2", displayName: "Bo" }).person : undefined;
+  if (bo) people.replaceDossier(bo.id, "Seed dossier", { schemaVersion: 1, blurb: "Bo runs QA.", sections: [] });
   people.close();
   const assertions = dossierAssertions(mira.id, dossier);
   assert.equal(assertions.length, 5);
@@ -98,11 +105,18 @@ async function fixture() {
   writeFileSync(outsideFile, JSON.stringify(outsideValue));
   const s3 = { sessionId: "s3", revision: jsonHash(outsideValue), file: outsideFile };
 
+  const s4 = bo ? exported("s4", "acct-a", [
+    { seq: 1, role: "user", personId: bo.id, accountScope: "acct-a", timestamp: now - 30 * 60_000, text: "SECRET-BO: I want release notes in bullets." },
+  ]) : undefined;
+  const sessionIds = options.sessionIds ?? ["s1", "s2", "s3"];
   const manifest: ReviewManifest = {
     id: `nightly:${window.localDay}`, agentId: "main", kind: "nightly", createdAt, window, fullValidation: true,
     roster: [{ personId: mira.id, name: "Mira", status: "active", injectionEnabled: true,
-      identities: [{ provider: "slack", accountScope: "acct-a", externalId: "U1" }], sessionIds: ["s1", "s2", "s3"] }],
-    assertions, sourceGaps: [], sessions: [s1, s2, s3],
+      identities: [{ provider: "slack", accountScope: "acct-a", externalId: "U1" }], sessionIds },
+      ...(bo ? [{ personId: bo.id, name: "Bo", status: "active", injectionEnabled: true,
+        identities: [{ provider: "slack", accountScope: "acct-a", externalId: "U2" }], sessionIds: ["s4"] }] : [])],
+    assertions: options.withoutAssertions ? [] : assertions, sourceGaps: [],
+    sessions: [...[s1, s2, s3].filter(s => sessionIds.includes(s.sessionId)), ...(s4 ? [s4] : [])],
   };
   const ledger = new PeopleLearningStore(dbPath, "main");
   const run = ledger.begin(manifest);
@@ -115,7 +129,7 @@ async function fixture() {
     manifestRevision: revision, peopleReviews: [], assertionReviews: reviews, sourceGapReviews: [],
     analysis: { status: "not_approved", reason: "test" }, changes: [], executionFollowups: [],
   } satisfies LearningReceipt, now, undefined, undefined, revision);
-  return { root, dbPath, exportRoot, mira, assertions, manifest, revision, ledger, review, checkpoint, now,
+  return { root, dbPath, exportRoot, mira, bo, assertions, manifest, revision, ledger, review, checkpoint, now,
     cleanup: () => { try { ledger.close(); } catch {} rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -140,20 +154,29 @@ function installWriteAudit(dbPath: string) {
 }
 
 type Decide = (prompt: string, handles: string[]) => PeopleShadowProposal;
+type Learn = (prompt: string, handles: string[]) => PeopleInteractionResult;
+const NO_NEWS: Learn = () => ({ status: "no_new_claims", proposals: [], summary: "Nothing durable and new" });
 
-function scriptedRunner(decide: Decide) {
+/** Assertion prompts go to `decide` (recorded in `prompts`); interaction-learning prompts go to `learn` (`learnPrompts`). */
+function scriptedRunner(decide: Decide, learn: Learn = NO_NEWS) {
   const prompts: string[] = [];
+  const learnPrompts: string[] = [];
   const runner: CompleteRunner = {
     async complete<T>(request: StewardCompleteRequest<T>): Promise<StewardCompleteResult<T>> {
-      assert.equal(request.schema, PEOPLE_SHADOW_PROPOSAL_SCHEMA);
       const prompt = request.userPrompt;
-      prompts.push(prompt);
       const handles = [...prompt.matchAll(/\[(ev_\d+)\]/gu)].map(match => match[1]!);
+      if (request.schema === PEOPLE_INTERACTION_SCHEMA) {
+        learnPrompts.push(prompt);
+        return { ok: true, data: learn(prompt, handles) as T, backend: "responses_api",
+          usage: { requests: 1, inputTokens: 300, outputTokens: 60 } };
+      }
+      assert.equal(request.schema, PEOPLE_SHADOW_PROPOSAL_SCHEMA);
+      prompts.push(prompt);
       return { ok: true, data: decide(prompt, handles) as T, backend: "responses_api",
         usage: { requests: 1, inputTokens: 200, outputTokens: 40 } };
     },
   };
-  return { runner, prompts };
+  return { runner, prompts, learnPrompts };
 }
 
 function handleFor(prompt: string, needle: string): string {
@@ -550,7 +573,8 @@ test("disabled runtime registers only the CLI", () => {
   const events: string[] = [];
   const api = { registrationMode: "full", config: {}, logger: { warn() {} },
     on: (event: string) => events.push(event), registerCli: () => {} } as unknown as OpenClawPluginApi;
-  const runtime = registerStewardRuntime(api, { config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false } }),
+  const runtime = registerStewardRuntime(api, { config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
+    outcomeLedger: { enabled: false } }),
     createRunner: () => undefined, openWorkStore: () => { throw new Error("unused"); } });
   assert.equal(runtime.enabled, false);
   assert.deepEqual(events, []);
@@ -633,8 +657,12 @@ test("publish mode applies revalidated/corrected/retired to the dossier and chec
   assert.equal(reviews.has(workingStyle!.id), false, "rejected proposals are never receipted");
   assert.deepEqual(new Set(run.receipt!.changes.map(c => c.changeId)), new Set(changes.map(c => c.id)));
   assert.equal(run.receipt!.analysis.status, "not_approved");
-  assert.equal(run.receipt!.peopleReviews.find(p => p.personId === f.mira.id)?.status, "unresolved",
-    "Steward never claims interaction learning it did not do");
+  // Interaction learning ran (no new claims), but s2 (other account) and s3 (outside the export root) were never
+  // readable, so Steward never claims a complete interaction review it did not do.
+  const miraReview = run.receipt!.peopleReviews.find(p => p.personId === f.mira.id)!;
+  assert.equal(miraReview.status, "unresolved");
+  assert.match(miraReview.reason, /no approved export for session\(s\) s2, s3/u);
+  assert.deepEqual(result.learned, { applied: 0, recorded: 1, skipped: 0, unresolved: 0, claimsAdded: 0 });
 
   // Report shows live published status.
   const report = buildPeopleShadowReport(f.dbPath, f.manifest.id);
@@ -941,4 +969,414 @@ test("publish mode re-checks the stored manifest revision inside the fenced comm
     assert.match(artifact.publication!.reason, /Manifest was refreshed/u);
     assert.equal(artifact.publication!.disposition, "unresolved");
   }
+});
+
+/* ───────────── Interaction learning (net-new claims) ───────────── */
+
+const UNRESOLVED: Decide = () => ({ disposition: "unresolved", reason: "n/a", citedHandles: [], confidence: "low" });
+const learnScope = (f: Fixture) => `${f.manifest.id}:${f.mira.id}:interactions`;
+const NEW_CLAIM = "Prefers live syncs over async updates.";
+
+function learnedClaim(prompt: string, overrides: Partial<PeopleInteractionResult["proposals"][number]> = {}) {
+  return { section: "preferences" as const, statement: NEW_CLAIM, scope: "Team syncs", epistemicType: "reported" as const,
+    confidence: "high" as const, reason: "Mira said so directly", citedHandles: [handleFor(prompt, "live syncs")], ...overrides };
+}
+
+test("interaction learning (publish): a net-new claim is discovered, cited, written, receipted as reviewed — duplicates, low confidence and agent-only grounding are not", async t => {
+  const f = await fixture({ sessionIds: ["s1"] });
+  t.after(f.cleanup);
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+  const { runner, learnPrompts } = scriptedRunner(UNRESOLVED, prompt => ({
+    status: "learned", summary: "One durable new preference",
+    proposals: [
+      learnedClaim(prompt),
+      // Already in the dossier, re-cased and re-punctuated: suppressed.
+      learnedClaim(prompt, { statement: "give the recommendation FIRST!", scope: "Status updates",
+        citedHandles: [handleFor(prompt, "lead with the recommendation")] }),
+      learnedClaim(prompt, { statement: "Might like Friday launches.", confidence: "low" }),
+      // Grounded only in the agent's own words: never a fact about the person.
+      learnedClaim(prompt, { statement: "Ships on Fridays.", citedHandles: [handleFor(prompt, "ship Friday")] }),
+    ],
+  }));
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner,
+    owner: "steward:publish" });
+
+  // Prompt: opaque handles over Mira's own in-account exchanges only, plus the existing dossier for duplicate suppression.
+  assert.equal(learnPrompts.length, 1);
+  const prompt = learnPrompts[0]!;
+  assert.equal([...prompt.matchAll(/\[ev_\d+\]/gu)].length, 3);
+  assert.match(prompt, /- \[preferences\] Give the recommendation first\. \(scope: Status updates\)/u);
+  assert.match(prompt, /- \[blurb\] Mira leads launch planning at ExampleCo\./u);
+  for (const leak of [f.root, f.exportRoot, ".json", "SECRET-OTHER-PERSON", "SECRET-OTHER-REPLY", "should-not-leak", f.revision]) {
+    assert.ok(!prompt.includes(leak), `prompt must not contain ${leak}`);
+  }
+
+  assert.deepEqual(result.learned, { applied: 1, recorded: 0, skipped: 0, unresolved: 0, claimsAdded: 1 });
+  const people = readPeople(f.dbPath);
+  t.after(() => people.close());
+  const preferences = people.getDossier(f.mira.id)!.dossier.sections.find(s => s.category === "preferences")!.claims;
+  assert.deepEqual(preferences.map(c => c.statement), [...DOSSIER.sections[0]!.claims.map(c => c.statement), NEW_CLAIM]);
+  const added = preferences.at(-1)!;
+  assert.deepEqual(added.evidence.map(e => [e.source, e.locator]), [["session", "session:s1#6"]], "cites exactly the verified handle");
+  assert.equal(added.scope, "Team syncs");
+  assert.equal(added.epistemicType, "reported");
+  assert.equal(added.confidence, "high");
+  assert.ok(added.reviewedAt);
+  assert.deepEqual(preferences.slice(0, 3), DOSSIER.sections[0]!.claims, "existing claims untouched byte-for-byte");
+
+  const changes = dossierChanges(f.dbPath, f.mira.id).slice(baseline);
+  assert.equal(changes.length, 1, "one audited revision for the whole person");
+  assert.match(changes[0]!.reason, /^Steward People Learning learned 1 new claim\(s\)/u);
+  assert.match(changes[0]!.reason, /sources: session:s1#6/u);
+  assert.ok(!changes[0]!.reason.includes(f.root));
+
+  const row = store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))!;
+  assert.equal(row.status, "completed");
+  assert.equal(row.mode, "item");
+  assert.ok(row.inputRevision, "keyed on the person's evidence");
+  assert.notEqual(row.inputRevision, f.revision, "not on the manifest revision, which moves when assertions are appended");
+  assert.ok(!row.artifactJson!.includes(f.root), "artifact carries no filesystem paths");
+  const artifact = JSON.parse(row.artifactJson!) as PeopleInteractionArtifact;
+  assert.equal(artifact.publication?.status, "applied");
+  assert.equal(artifact.publication?.changeId, changes[0]!.id, "the completed row records the exact revision it wrote");
+  assert.deepEqual(artifact.publication?.claims.map(c => [c.statement, c.outcome, c.reason?.split(" ")[0]]), [
+    ["give the recommendation FIRST!", "skipped", "duplicate"],
+    ["Might like Friday launches.", "skipped", "confidence"],
+    ["Ships on Fridays.", "skipped", "not"],
+    [NEW_CLAIM, "applied", undefined],
+  ]);
+
+  // Operator report surfaces the interaction outcome next to assertion publications.
+  const report = buildPeopleShadowReport(f.dbPath, f.manifest.id);
+  assert.deepEqual([report.interactions.learned, report.interactions.claimsProposed, report.interactions.claimsAccepted,
+    report.interactions.claimsApplied], [1, 4, 1, 1]);
+  assert.equal(report.interactions.items[0]?.changeId, changes[0]!.id);
+  assert.equal(report.interactions.usageTotals.requests, 1);
+
+  // Receipt: the person is finally `reviewed` with the manifest's exact sessions and the reviewed excerpts as refs.
+  assert.equal(result.checkpoints[0]?.peopleReviews, 1);
+  const run = f.ledger.get(f.manifest.id)!;
+  const review = run.receipt!.peopleReviews.find(p => p.personId === f.mira.id)!;
+  assert.equal(review.status, "reviewed");
+  assert.deepEqual(review.sessionIds, ["s1"]);
+  assert.deepEqual(review.sourceRefs, ["session:s1#1", "session:s1#2", "session:s1#6"]);
+  assert.match(review.reason, /added 1 claim/u);
+  assert.ok(run.receipt!.changes.some(c => c.changeId === changes[0]!.id));
+  // The new claim is a new assertion: the checkpoint folds it into the manifest so it gets validated too.
+  assert.ok(run.manifest.assertions.some(a => a.statement === NEW_CLAIM));
+  assert.notEqual(run.manifestRevision, f.revision);
+
+  // Re-running never re-learns a reviewed person or double-adds the claim; the new assertion is adjudicated.
+  const again = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "again", proposals: [learnedClaim(prompt)] }));
+  const second = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: again.runner, owner: "steward:publish" });
+  assert.equal(again.learnPrompts.length, 0, "a reviewed person is never re-learned");
+  assert.deepEqual([store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))?.status, store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))?.inputRevision],
+    ["completed", row.inputRevision], "the appended assertion does not re-enqueue interaction learning");
+  assert.equal(second.learned.claimsAdded, 0);
+  assert.ok(again.prompts.some(p => p.includes(`Assertion: ${NEW_CLAIM}`)), "the learned claim is itself validated next");
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length - baseline, 1);
+  assert.equal(f.ledger.get(f.manifest.id)!.receipt!.peopleReviews.find(p => p.personId === f.mira.id)?.status, "reviewed",
+    "a later pass never downgrades the people review");
+});
+
+test("interaction learning: hallucinated handles strike to quarantine and write nothing; low-only results publish nothing", async t => {
+  const f = await fixture({ sessionIds: ["s1"] });
+  t.after(f.cleanup);
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+  const { runner } = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "trust me",
+    proposals: [learnedClaim(prompt, { citedHandles: [handleFor(prompt, "live syncs"), "ev_99", "/etc/passwd"] })] }));
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner,
+    owner: "o", maxStrikes: 1 });
+  const row = store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))!;
+  assert.equal(row.status, "quarantined");
+  assert.equal(row.artifactJson, null);
+  assert.match(row.lastError ?? "", /hallucinated_handles: ev_99, \/etc\/passwd/u);
+  assert.ok(result.items.some(i => i.scope === learnScope(f) && i.outcome === "rejected"));
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length, baseline, "nothing published");
+  const review = f.ledger.get(f.manifest.id)!.receipt!.peopleReviews.find(p => p.personId === f.mira.id)!;
+  assert.equal(review.status, "unresolved");
+  assert.match(review.reason, /has not completed yet/u);
+
+  // Only low-confidence proposals: the person is reviewed, nothing is written.
+  const g = await fixture({ sessionIds: ["s1"] });
+  t.after(g.cleanup);
+  const gBaseline = dossierChanges(g.dbPath, g.mira.id).length;
+  const low = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "weak", proposals: [learnedClaim(prompt, { confidence: "low" })] }));
+  const lowStore = new WorkStore(g.dbPath);
+  t.after(() => lowStore.close());
+  const lowResult = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: g.dbPath, agentId: "main", workStore: lowStore,
+    runner: low.runner, owner: "o", minConfidence: "low" });
+  assert.deepEqual(lowResult.learned, { applied: 0, recorded: 1, skipped: 0, unresolved: 0, claimsAdded: 0 },
+    "low confidence never publishes, even with minConfidence low");
+  assert.equal(dossierChanges(g.dbPath, g.mira.id).length, gBaseline);
+  assert.equal(g.ledger.get(g.manifest.id)!.receipt!.peopleReviews.find(p => p.personId === g.mira.id)?.status, "reviewed");
+});
+
+test("interaction learning: shadow mode stages proposals with 0 production writes; off by default in shadow and opt-out in publish", async t => {
+  const f = await fixture({ sessionIds: ["s1"] });
+  t.after(f.cleanup);
+  const audit = installWriteAudit(f.dbPath);
+  t.after(audit.close);
+  const before = audit.snapshot();
+  const { runner, learnPrompts } = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "s", proposals: [learnedClaim(prompt)] }));
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+
+  const plain = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
+  assert.equal(plain.enqueued, 5, "shadow default: assertion parity only");
+  assert.deepEqual(store.list(PEOPLE_INTERACTIONS_KIND), []);
+
+  const shadow = await runPeopleShadowPass({ dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o",
+    includeInteractionLearning: true });
+  assert.equal(learnPrompts.length, 1);
+  assert.deepEqual(shadow.learned, { applied: 0, recorded: 0, skipped: 0, unresolved: 0, claimsAdded: 0 });
+  const artifact = JSON.parse(store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))!.artifactJson!) as PeopleInteractionArtifact;
+  assert.equal(artifact.mode, "shadow");
+  assert.equal(artifact.publication, undefined);
+  assert.deepEqual(artifact.decisions, [{ index: 0, outcome: "accepted" }]);
+  assert.equal(artifact.result.proposals[0]!.statement, NEW_CLAIM);
+  assert.deepEqual(audit.writes(), [], "0 writes to person_dossiers / people_learning_* / people");
+  assert.equal(audit.snapshot(), before);
+  audit.close();
+
+  // Publish with interaction learning switched off: assertions only, and the receipt says so.
+  const g = await fixture({ sessionIds: ["s1"] });
+  t.after(g.cleanup);
+  const off = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "s", proposals: [learnedClaim(prompt)] }));
+  const offStore = new WorkStore(g.dbPath);
+  t.after(() => offStore.close());
+  await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: g.dbPath, agentId: "main", workStore: offStore, runner: off.runner,
+    owner: "o", includeInteractionLearning: false });
+  assert.equal(off.learnPrompts.length, 0);
+  assert.match(g.ledger.get(g.manifest.id)!.receipt!.peopleReviews[0]!.reason, /assertions only/u);
+});
+
+test("interaction learning: paused people are skipped; a dossier edited mid-call is never overwritten and is re-learned next pass", async t => {
+  // Paused: no tokens, no rows, honest receipt.
+  const p = await fixture({ sessionIds: ["s1"] });
+  t.after(p.cleanup);
+  const pausing = readPeople(p.dbPath);
+  pausing.setInjection(p.mira.id, false);
+  pausing.close();
+  const paused = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "s", proposals: [learnedClaim(prompt)] }));
+  const pausedStore = new WorkStore(p.dbPath);
+  t.after(() => pausedStore.close());
+  await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: p.dbPath, agentId: "main", workStore: pausedStore, runner: paused.runner, owner: "o" });
+  assert.equal(paused.learnPrompts.length, 0);
+  assert.deepEqual(pausedStore.list(PEOPLE_INTERACTIONS_KIND), []);
+
+  // Stale dossier fence: a human edits the dossier while the model is learning.
+  const f = await fixture({ sessionIds: ["s1"] });
+  t.after(f.cleanup);
+  const people = readPeople(f.dbPath);
+  t.after(() => people.close());
+  const human = structuredClone(DOSSIER);
+  human.sections[0]!.claims.push(claim("Wants a TL;DR on every doc.", "Docs"));
+  let edited = false;
+  const racing = scriptedRunner(UNRESOLVED, prompt => {
+    if (!edited) { edited = true; people.replaceDossier(f.mira.id, "Human edit mid-learning", human); }
+    return { status: "learned", summary: "s", proposals: [learnedClaim(prompt)] };
+  });
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const first = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: racing.runner, owner: "o" });
+  assert.deepEqual(first.items.find(i => i.scope === learnScope(f)), { scope: learnScope(f), outcome: "staged", detail: "stale_dossier" });
+  assert.equal(first.learned.claimsAdded, 0);
+  assert.deepEqual(people.getDossier(f.mira.id)!.dossier, human, "the newer human edit wins untouched");
+  assert.equal(store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))!.strikes, 0, "a stale context is not the item's fault");
+
+  // Next pass re-learns against the current dossier (the stale proposal is never resumed) and publishes on top of it.
+  const second = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: racing.runner, owner: "o" });
+  assert.equal(racing.learnPrompts.length, 2);
+  assert.match(racing.learnPrompts[1]!, /Wants a TL;DR on every doc\./u, "the re-learn prompt shows the human edit");
+  assert.equal(second.learned.claimsAdded, 1);
+  const statements = people.getDossier(f.mira.id)!.dossier.sections[0]!.claims.map(c => c.statement);
+  assert.deepEqual(statements.slice(-2), ["Wants a TL;DR on every doc.", NEW_CLAIM]);
+});
+
+test("interaction learning: refreshed manifest is never published against; maxNewClaimsPerPerson keeps the strongest; response-audit annotations", async t => {
+  // Manifest refreshed mid-call: nothing is published inside the fenced commit, and the row is re-learned next pass.
+  const f = await fixture({ sessionIds: ["s1"] });
+  t.after(f.cleanup);
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+  const refreshing = scriptedRunner(UNRESOLVED, prompt => {
+    const db = new DatabaseSync(f.dbPath);
+    try {
+      db.prepare("UPDATE people_learning_runs SET manifest=json_set(manifest,'$.createdAt',?) WHERE id=?")
+        .run(new Date(f.now - 5 * 60_000).toISOString(), f.manifest.id);
+    } finally { db.close(); }
+    return { status: "learned", summary: "s", proposals: [learnedClaim(prompt)] };
+  });
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const refreshed = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: refreshing.runner, owner: "o", manifestIds: [f.manifest.id] });
+  assert.deepEqual(refreshed.items.find(i => i.scope === learnScope(f)), { scope: learnScope(f), outcome: "staged", detail: "stale_manifest" });
+  assert.deepEqual(refreshed.learned, { applied: 0, recorded: 0, skipped: 0, unresolved: 0, claimsAdded: 0 });
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length, baseline);
+  const refreshedRow = store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))!;
+  assert.notEqual(refreshedRow.status, "completed", "a fenced-out proposal never completes the row");
+  assert.equal(refreshedRow.strikes, 0);
+  const relearn = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "s", proposals: [learnedClaim(prompt)] }));
+  const relearned = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: relearn.runner, owner: "o", manifestIds: [f.manifest.id] });
+  assert.equal(relearn.learnPrompts.length, 1, "re-learned against the current manifest revision");
+  assert.equal(relearned.learned.claimsAdded, 1);
+
+  // maxNewClaimsPerPerson = 1 keeps the highest-confidence claim; response-audit outcomes annotate the answer excerpt.
+  const g = await fixture({ sessionIds: ["s1"] });
+  t.after(g.cleanup);
+  const audit = new DatabaseSync(g.dbPath);
+  audit.exec(`CREATE TABLE IF NOT EXISTS response_results (cohort TEXT, id TEXT, session_id TEXT NOT NULL, input_hash TEXT NOT NULL,
+    episode_at INTEGER NOT NULL, active INTEGER NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+    attempted_at INTEGER, assessed_at INTEGER, result TEXT, PRIMARY KEY(cohort,id))`);
+  const judged = (personId: string) => JSON.stringify({
+    quality: { underdelivery: { noul: 0 }, failureReason: { choice: "none_or_unclear", confidence: 0 } },
+    retrospective: { judgment: { correction: { noul: 0 }, deliveryAdmission: { noul: 0 }, regression: { noul: 0 },
+      outcome: { choice: "acknowledged_success", confidence: 1 }, scopeClarification: { noul: 0 }, reason: { choice: "none_or_unclear", confidence: 0 } } },
+    references: { sessionId: "s1", request: [1], answer: [2], feedback: [], followup: [], inputHash: "h" }, human: { personId },
+  });
+  audit.prepare("INSERT INTO response_results VALUES ('c','e1','s1','h',1,1,'ok',1,1,1,?)").run(judged(g.mira.id));
+  audit.prepare("INSERT INTO response_results VALUES ('c','e2','s1','h',2,1,'ok',1,1,1,?)").run("{not json");
+  audit.close();
+  const capped = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "two", proposals: [
+    learnedClaim(prompt, { statement: "Likes Monday planning.", confidence: "medium" }),
+    learnedClaim(prompt),
+  ] }));
+  const cappedStore = new WorkStore(g.dbPath);
+  t.after(() => cappedStore.close());
+  const cappedResult = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: g.dbPath, agentId: "main", workStore: cappedStore,
+    runner: capped.runner, owner: "o", maxNewClaimsPerPerson: 1 });
+  assert.match(capped.learnPrompts[0]!, /assistant: Recommendation: ship Friday\. \{response audit: acknowledged_success\}/u);
+  assert.equal(cappedResult.learned.claimsAdded, 1);
+  const people = readPeople(g.dbPath);
+  t.after(() => people.close());
+  const statements = people.getDossier(g.mira.id)!.dossier.sections[0]!.claims.map(c => c.statement);
+  assert.equal(statements.at(-1), NEW_CLAIM, "the high-confidence claim wins the budget");
+  assert.ok(!statements.includes("Likes Monday planning."));
+  const cappedArtifact = JSON.parse(cappedStore.get(PEOPLE_INTERACTIONS_KIND, learnScope(g))!.artifactJson!) as PeopleInteractionArtifact;
+  assert.match(cappedArtifact.decisions[0]!.reason ?? "", /over maxNewClaimsPerPerson \(1\)/u);
+
+  // 0 = unlimited.
+  const h = await fixture({ sessionIds: ["s1"] });
+  t.after(h.cleanup);
+  const unlimited = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "two", proposals: [
+    learnedClaim(prompt, { statement: "Likes Monday planning.", confidence: "medium" }), learnedClaim(prompt)] }));
+  const hStore = new WorkStore(h.dbPath);
+  t.after(() => hStore.close());
+  const all = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: h.dbPath, agentId: "main", workStore: hStore,
+    runner: unlimited.runner, owner: "o", maxNewClaimsPerPerson: 0 });
+  assert.equal(all.learned.claimsAdded, 2);
+});
+
+test("interaction learning: an unresolved person whose claim was published is not re-learned over identical evidence", async t => {
+  // s3 has no approved export, so Mira's review stays unresolved even though a claim is published.
+  const f = await fixture({ sessionIds: ["s1", "s3"] });
+  t.after(f.cleanup);
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+  const { runner, learnPrompts } = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "s", proposals: [learnedClaim(prompt)] }));
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const first = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
+  assert.equal(first.learned.claimsAdded, 1);
+  const run = f.ledger.get(f.manifest.id)!;
+  const review = run.receipt!.peopleReviews.find(p => p.personId === f.mira.id)!;
+  assert.equal(review.status, "unresolved");
+  assert.match(review.reason, /no approved export for session\(s\) s3/u);
+  assert.notEqual(run.manifestRevision, f.revision, "the published claim was appended as an assertion");
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    const next = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
+    assert.equal(next.learned.claimsAdded, 0);
+    assert.ok(next.items.some(i => i.scope === learnScope(f) && i.outcome === "skipped" && i.detail === "completed"));
+  }
+  assert.equal(learnPrompts.length, 1, "identical evidence is never re-learned, however often the manifest revision moves");
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length - baseline, 1);
+  assert.equal(f.ledger.get(f.manifest.id)!.receipt!.peopleReviews.find(p => p.personId === f.mira.id)?.status, "unresolved");
+});
+
+test("interaction learning: an interaction-only person's verified assertions are never reopened by the checkpoint", async t => {
+  // Nightly manifests omit verified dossiers' assertions: Mira is in the roster only.
+  const f = await fixture({ sessionIds: ["s1"], withoutAssertions: true });
+  t.after(f.cleanup);
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const quiet = scriptedRunner(UNRESOLVED);
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner: quiet.runner, owner: "o" });
+  assert.equal(result.learned.recorded, 1, "no_new_claims");
+  const run = f.ledger.get(f.manifest.id)!;
+  assert.equal(run.receipt!.peopleReviews.find(p => p.personId === f.mira.id)?.status, "reviewed");
+  assert.deepEqual(run.manifest.assertions, [], "no_new_claims adds no assertions");
+  assert.equal(run.manifestRevision, f.revision, "the manifest is not reopened");
+  assert.equal(quiet.prompts.length, 0, "no verified assertion is re-adjudicated");
+
+  // A published claim adds exactly that claim, on this and every later checkpoint.
+  const g = await fixture({ sessionIds: ["s1"], withoutAssertions: true });
+  t.after(g.cleanup);
+  const gStore = new WorkStore(g.dbPath);
+  t.after(() => gStore.close());
+  const learning = scriptedRunner(UNRESOLVED, prompt => ({ status: "learned", summary: "s", proposals: [learnedClaim(prompt)] }));
+  await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: g.dbPath, agentId: "main", workStore: gStore, runner: learning.runner, owner: "o" });
+  assert.deepEqual(g.ledger.get(g.manifest.id)!.manifest.assertions.map(a => a.statement), [NEW_CLAIM]);
+  await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: g.dbPath, agentId: "main", workStore: gStore, runner: learning.runner, owner: "o" });
+  assert.ok(learning.prompts.some(p => p.includes(`Assertion: ${NEW_CLAIM}`)), "the learned claim is adjudicated");
+  assert.deepEqual(g.ledger.get(g.manifest.id)!.manifest.assertions.map(a => a.statement), [NEW_CLAIM],
+    "later checkpoints still never pull in the verified dossier");
+  assert.equal(learning.prompts.length, 1);
+});
+
+test("interaction learning: clipped excerpts are incomplete coverage, never a reviewed person", async t => {
+  const f = await fixture({ sessionIds: ["s1"] });
+  t.after(f.cleanup);
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const { runner, learnPrompts } = scriptedRunner(UNRESOLVED);
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store,
+    runner, owner: "o", maxExcerptChars: 20 });
+  assert.equal(learnPrompts.length, 1);
+  assert.match(learnPrompts[0]!, /user: Actually I now pref…/u);
+  assert.equal(result.learned.recorded, 1);
+  const artifact = JSON.parse(store.get(PEOPLE_INTERACTIONS_KIND, learnScope(f))!.artifactJson!) as PeopleInteractionArtifact;
+  assert.ok(artifact.coverage.clippedExcerpts > 0);
+  const review = f.ledger.get(f.manifest.id)!.receipt!.peopleReviews.find(p => p.personId === f.mira.id)!;
+  assert.equal(review.status, "unresolved");
+  assert.match(review.reason, /excerpt\(s\) clipped by maxExcerptChars/u);
+  assert.deepEqual(review.sessionIds, []);
+});
+
+test("interaction learning: a person paused mid-pass is rechecked live and never dispatched to the model", async t => {
+  const f = await fixture({ sessionIds: ["s1"], secondPerson: true });
+  t.after(f.cleanup);
+  const people = readPeople(f.dbPath);
+  t.after(() => people.close());
+  const { runner, learnPrompts } = scriptedRunner(UNRESOLVED, prompt => {
+    // While Mira is being reviewed, an operator pauses Bo.
+    if (prompt.startsWith("Person: Mira")) people.setInjection(f.bo!.id, false);
+    return { status: "no_new_claims", proposals: [], summary: "Nothing durable and new" };
+  });
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
+  const boScope = `${f.manifest.id}:${f.bo!.id}:interactions`;
+  assert.equal(learnPrompts.length, 1, "only Mira's packet reached the model");
+  assert.ok(learnPrompts.every(p => !p.includes("SECRET-BO") && !p.includes("Bo runs QA.")), "Bo's excerpts and dossier never left");
+  assert.deepEqual(result.items.find(i => i.scope === boScope), { scope: boScope, outcome: "skipped", detail: "paused" });
+  const row = store.get(PEOPLE_INTERACTIONS_KIND, boScope)!;
+  assert.notEqual(row.status, "completed", "a paused person is released, not completed, so un-pausing resumes learning");
+  assert.equal(row.strikes, 0);
+  assert.equal(f.ledger.get(f.manifest.id)!.receipt!.peopleReviews.find(p => p.personId === f.bo!.id)?.status, "unresolved");
+
+  // Un-paused: the next pass learns Bo.
+  people.setInjection(f.bo!.id, true);
+  await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
+  assert.equal(learnPrompts.length, 2);
+  assert.match(learnPrompts[1]!, /SECRET-BO/u);
 });

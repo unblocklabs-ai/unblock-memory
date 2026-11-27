@@ -3,6 +3,7 @@ import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { MemoryReadCursor, MemoryReadResult, MemoryRequestContext } from "./contracts.js";
+import { type DeepThoughtStore } from "./deep-thought-store.js";
 import { type MemoryCandidateManager } from "./memory-search.js";
 import { getContext } from "./tool-context.js";
 import type { StewardConfig } from "./steward-config.js";
@@ -27,6 +28,7 @@ declare const deepThoughtParameters: Type.TObject<{
     maxHops: Type.TOptional<Type.TInteger>;
     jobId: Type.TOptional<Type.TString>;
     cancel: Type.TOptional<Type.TBoolean>;
+    fresh: Type.TOptional<Type.TBoolean>;
 }>;
 export type DeepThoughtParams = Static<typeof deepThoughtParameters>;
 type DeepThoughtManager = MemoryCandidateManager & {
@@ -138,6 +140,29 @@ export type DeepThoughtDeps = {
     /** Test seam; defaults to the plugin's origin-bound decision credential resolver. */
     resolveCredential?: () => Promise<string | undefined>;
     now?: () => number;
+    /**
+     * Durable jobs + derived observations. When omitted, jobs live only in this process (pre-1B behavior) and nothing is cached.
+     */
+    store?: DeepThoughtStore;
+    /**
+     * Current QMD `collection_generations` (`{ [collection]: generation }`) covering every collection behind `corpora`.
+     * Required for the verified-answer cache: without it (or when it returns `{}`/throws) answers are never cached or served.
+     */
+    getCollectionGenerations?: (corpora: readonly string[]) => Promise<Record<string, number>> | Record<string, number>;
+    /**
+     * Cache isolation key: a cached answer is only ever served to the exact same audience. A string is used verbatim (only
+     * safe when deps are built per caller); a function derives it per call. Default: the caller's agent + session key +
+     * channel + account + native channel, so answers never cross a DM/private-session boundary.
+     */
+    audienceKey?: string | ((caller: DeepThoughtCaller) => string | undefined);
+    /** Never serve cached answers (verified answers are still saved for later/offline use). */
+    bypassCache?: boolean;
+};
+/** Caller identity passed to an `audienceKey` resolver. */
+type DeepThoughtCaller = {
+    agentId: string;
+    requestContext: MemoryRequestContext;
+    requesterSenderId?: string;
 };
 type DeepThoughtCitation = DeepThoughtResult["citations"][number];
 export type DeepThoughtOutcome = {
@@ -156,6 +181,10 @@ export type DeepThoughtOutcome = {
     unverifiedCitationsDropped?: number;
     corpora?: string[];
     error?: string;
+    /** True when served from a stored verified synthesis over unchanged collection generations (0 hops, 0 model calls). */
+    cached?: boolean;
+    /** Stored derived observation that served (or was saved from) this answer. */
+    derivedObservationId?: string;
 };
 /** Current process-wide in-flight `deep_thought` investigations (diagnostics/tests). */
 export declare function activeDeepThoughts(): number;
@@ -173,6 +202,7 @@ export declare function createDeepThoughtTool(ctx: OpenClawPluginToolContext, de
         maxHops: Type.TOptional<Type.TInteger>;
         jobId: Type.TOptional<Type.TString>;
         cancel: Type.TOptional<Type.TBoolean>;
+        fresh: Type.TOptional<Type.TBoolean>;
     }>;
     execute(_toolCallId: string, raw: unknown, signal?: AbortSignal): Promise<ReturnType<typeof jsonResult>>;
 } | null;

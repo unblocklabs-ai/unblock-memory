@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
@@ -7,6 +7,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import type { MemoryReadCursor, MemoryReadResult, MemoryRequestContext } from "./contracts.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 import { nonBlank } from "./guards.js";
+import { canonicalCorpora, DEFAULT_DEEP_THOUGHT_JOB_RETENTION_MS, type DeepThoughtStore } from "./deep-thought-store.js";
 import { searchMemory, type MemoryCandidateManager } from "./memory-search.js";
 import { prepareQueryConversation } from "./query-contract.js";
 import { selectJudgeConversation } from "./judge-context.js";
@@ -20,9 +21,10 @@ const ISO_TIMESTAMP_PATTERN = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\
 const PEOPLE_PAGE = 100;
 const DEFAULT_SEARCH_RESULTS = 10;
 const DEFAULT_SYNC_WAIT_MS = 65_000;
-const DEFAULT_JOB_RETENTION_MS = 1_800_000;
+const DEFAULT_JOB_RETENTION_MS = DEFAULT_DEEP_THOUGHT_JOB_RETENTION_MS;
 const ACTIVE_COUNTER = Symbol.for("unblock-memory.deepThought.active");
 const JOB_REGISTRY = Symbol.for("unblock-memory.deepThought.jobs");
+const RECOVERED_STORES = Symbol.for("unblock-memory.deepThought.recoveredStores");
 
 /** The curator's final answer (wrapped by the runner's `submit_result` with a status). */
 export const DEEP_THOUGHT_RESULT_SCHEMA = Type.Object({
@@ -51,6 +53,8 @@ const deepThoughtParameters = Type.Object({
     description: "Existing jobId returned with status 'running'. Waits for and collects the finished background investigation." })),
   cancel: Type.Optional(Type.Boolean({
     description: "When true alongside jobId, cancels that running background investigation." })),
+  fresh: Type.Optional(Type.Boolean({
+    description: "When true, skips the cached verified answer (if any) and re-investigates from scratch; the new answer replaces the cached one." })),
 }, { additionalProperties: false });
 export type DeepThoughtParams = Static<typeof deepThoughtParameters>;
 
@@ -165,7 +169,27 @@ export type DeepThoughtDeps = {
   /** Test seam; defaults to the plugin's origin-bound decision credential resolver. */
   resolveCredential?: () => Promise<string | undefined>;
   now?: () => number;
+  /**
+   * Durable jobs + derived observations. When omitted, jobs live only in this process (pre-1B behavior) and nothing is cached.
+   */
+  store?: DeepThoughtStore;
+  /**
+   * Current QMD `collection_generations` (`{ [collection]: generation }`) covering every collection behind `corpora`.
+   * Required for the verified-answer cache: without it (or when it returns `{}`/throws) answers are never cached or served.
+   */
+  getCollectionGenerations?: (corpora: readonly string[]) => Promise<Record<string, number>> | Record<string, number>;
+  /**
+   * Cache isolation key: a cached answer is only ever served to the exact same audience. A string is used verbatim (only
+   * safe when deps are built per caller); a function derives it per call. Default: the caller's agent + session key +
+   * channel + account + native channel, so answers never cross a DM/private-session boundary.
+   */
+  audienceKey?: string | ((caller: DeepThoughtCaller) => string | undefined);
+  /** Never serve cached answers (verified answers are still saved for later/offline use). */
+  bypassCache?: boolean;
 };
+
+/** Caller identity passed to an `audienceKey` resolver. */
+type DeepThoughtCaller = { agentId: string; requestContext: MemoryRequestContext; requesterSenderId?: string };
 
 type DeepThoughtCitation = DeepThoughtResult["citations"][number];
 
@@ -185,6 +209,10 @@ export type DeepThoughtOutcome = {
   unverifiedCitationsDropped?: number;
   corpora?: string[];
   error?: string;
+  /** True when served from a stored verified synthesis over unchanged collection generations (0 hops, 0 model calls). */
+  cached?: boolean;
+  /** Stored derived observation that served (or was saved from) this answer. */
+  derivedObservationId?: string;
 };
 
 /* ───────────────────────────── Concurrency & Job Registry ───────────────────────────── */
@@ -192,8 +220,13 @@ export type DeepThoughtOutcome = {
 type ActiveCounter = { active: number };
 type DeepThoughtJob = {
   id: string;
+  agentId: string;
   ownerKey: string;
+  question: string;
+  focus?: string;
   started: number;
+  /** Epoch ms (durable records); `started` is the elapsed-time clock. */
+  startedAtMs: number;
   corpora: string[];
   controller: AbortController;
   toolCallsUsed: number;
@@ -225,6 +258,91 @@ function pruneExpiredJobs(nowMs: number): void {
     }
   }
 }
+
+/** Stores whose orphaned `running` rows were already recovered in this process, per agent. */
+function recoveredStores(): WeakMap<DeepThoughtStore, Set<string>> {
+  const global = globalThis as typeof globalThis & { [RECOVERED_STORES]?: WeakMap<DeepThoughtStore, Set<string>> };
+  global[RECOVERED_STORES] ??= new WeakMap();
+  return global[RECOVERED_STORES];
+}
+
+/** Durability is layered on top of the in-process registry: a store failure never fails an investigation. */
+function safely<T>(fn: () => T): T | undefined {
+  try { return fn(); } catch { return undefined; }
+}
+
+/**
+ * First store use per agent in this process: `running` rows no live job in this process owns were orphaned by a restart.
+ * Jobs still in the (process-global) registry survive plugin reloads and are kept running.
+ */
+function recoverInterruptedJobs(store: DeepThoughtStore, agentId: string, retentionMs: number): void {
+  const seen = recoveredStores();
+  let agents = seen.get(store);
+  if (!agents) { agents = new Set(); seen.set(store, agents); }
+  if (agents.has(agentId)) return;
+  const live = [...jobRegistry().values()].filter(job => !job.outcome).map(job => job.id);
+  // Only a successful sweep completes recovery: a transient failure (e.g. SQLite busy) retries on the next call.
+  try {
+    store.markInterruptedJobs(agentId, Date.now(), { keepJobIds: live, retentionMs });
+    agents.add(agentId);
+  } catch { /* Durability never fails an investigation. */ }
+}
+
+function persistJob(store: DeepThoughtStore | undefined, job: DeepThoughtJob,
+  finished?: { outcome: DeepThoughtOutcome; retentionMs: number }): void {
+  if (!store) return;
+  const nowMs = Date.now();
+  safely(() => store.upsertJob({
+    jobId: job.id, agentId: job.agentId, ownerKey: job.ownerKey, question: job.question,
+    ...(job.focus ? { focus: job.focus } : {}), corpora: job.corpora,
+    status: finished?.outcome.status ?? "running", toolCallsUsed: job.toolCallsUsed,
+    ...(job.lastTool ? { lastTool: job.lastTool } : {}),
+    ...(finished ? { outcome: finished.outcome as unknown as Record<string, unknown>, completedAt: nowMs,
+      ...(finished.retentionMs > 0 ? { expiresAt: nowMs + finished.retentionMs } : {}) } : {}),
+    startedAt: job.startedAtMs, nowMs,
+  }));
+}
+
+/** A job collected from the durable store (finished in an earlier process, or still running in another one). */
+function storedJobOutcome(record: NonNullable<ReturnType<DeepThoughtStore["getJob"]>>): DeepThoughtOutcome {
+  if (record.outcome && record.status !== "running") return { ...(record.outcome as unknown as DeepThoughtOutcome), jobId: record.jobId };
+  return {
+    status: "running", jobId: record.jobId, citations: [], openQuestions: [], hopsUsed: 0, toolCallsUsed: record.toolCallsUsed,
+    elapsedMs: Math.max(0, Date.now() - record.startedAt), ...(record.lastTool ? { lastTool: record.lastTool } : {}),
+    corpora: record.corpora,
+    note: "Investigation is owned by another Gateway process and is still running there; poll this jobId again later.",
+  };
+}
+
+function defaultAudienceKey(active: ActiveContext): string {
+  const request = active.requestContext;
+  const identity = [active.agentId, request.sessionKey ?? "", request.messageChannel ?? "", request.agentAccountId ?? "",
+    request.nativeChannelId ?? ""];
+  return `caller:${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+}
+
+function resolveAudienceKey(active: ActiveContext, deps: DeepThoughtDeps): string | undefined {
+  const configured = typeof deps.audienceKey === "function"
+    ? deps.audienceKey({ agentId: active.agentId, requestContext: active.requestContext,
+      ...(active.requesterSenderId ? { requesterSenderId: active.requesterSenderId } : {}) })
+    : deps.audienceKey;
+  if (deps.audienceKey !== undefined) return nonBlank(configured);
+  return defaultAudienceKey(active);
+}
+
+/** Only a complete, non-empty generations snapshot can key (or verify) a cached answer. */
+async function captureGenerations(deps: DeepThoughtDeps, corpora: readonly string[]): Promise<Record<string, number> | undefined> {
+  if (!deps.store || !deps.getCollectionGenerations) return undefined;
+  try {
+    const generations = await deps.getCollectionGenerations(corpora);
+    if (!generations || typeof generations !== "object") return undefined;
+    const entries = Object.entries(generations);
+    if (!entries.length || entries.some(([, value]) => !Number.isSafeInteger(value) || value < 0)) return undefined;
+    return { ...generations };
+  } catch { return undefined; }
+}
+
+const CONFIDENCE_LEVELS: readonly string[] = ["high", "medium", "low"];
 
 /** Current process-wide in-flight `deep_thought` investigations (diagnostics/tests). */
 export function activeDeepThoughts(): number {
@@ -325,6 +443,7 @@ const DESCRIPTION =
   "returns one concise synthesis whose citations are verified against sources it actually opened. If a deep " +
   "investigation exceeds the sync wait window, it keeps running in the background and returns { status: 'running', jobId }; " +
   "call deep_thought({ jobId }) to wait for and collect the final synthesis (repeat until status !== 'running'). " +
+  "Repeat questions over unchanged memory may return a stored verified synthesis instantly (cached: true); pass fresh: true to re-investigate. " +
   "Prefer memory_search for a single quick lookup. Not proof of absence; historical memory is not current authorization.";
 
 const CURATOR_SYSTEM_PROMPT = [
@@ -339,13 +458,29 @@ const CURATOR_SYSTEM_PROMPT = [
   "Finish by calling submit_result exactly once.",
 ].join(" ");
 
+/** JSON-encoded (never NUL-joined: SQLite TEXT truncates at NUL), so the durable job store round-trips it exactly. */
 function ownerKey(active: ActiveContext): string {
-  return [
+  // Sender and native peer too: `dmScope=main` peers can share one session key.
+  return JSON.stringify([
     active.agentId,
     active.requestContext.sessionKey ?? "",
     active.requestContext.messageChannel ?? "",
     active.requestContext.agentAccountId ?? "",
-  ].join("\0");
+    active.requesterSenderId ?? "",
+    active.requestContext.nativeChannelId ?? "",
+  ]);
+}
+
+/** Resolves with the value if `promise` settles within `waitMs` (`0` = no limit); never rejects (inputs never reject). */
+async function settleWithin<T>(promise: Promise<T>, waitMs: number): Promise<{ settled: true; value: T } | { settled: false }> {
+  if (waitMs <= 0) return { settled: true, value: await promise };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(value => ({ settled: true as const, value })),
+      new Promise<{ settled: false }>(resolve => { timer = setTimeout(() => resolve({ settled: false }), waitMs); timer.unref?.(); }),
+    ]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
 function runningSnapshot(job: DeepThoughtJob, now: () => number): DeepThoughtOutcome {
@@ -441,21 +576,36 @@ async function runDeepThought(
   const syncWaitMs = deps.config.syncWaitMs ?? DEFAULT_SYNC_WAIT_MS;
   const jobRetentionMs = deps.config.jobRetentionMs ?? DEFAULT_JOB_RETENTION_MS;
   const caller = ownerKey(active);
+  const store = deps.store;
+  if (store) {
+    recoverInterruptedJobs(store, active.agentId, jobRetentionMs);
+    safely(() => store.pruneExpiredJobs(Date.now()));
+  }
 
   if (params.jobId !== undefined) {
     if (params.question !== undefined) {
       return { ...base(), status: "invalid_request", error: "Pass either question or jobId, not both" };
     }
     const jobs = jobRegistry();
-    const job = jobs.get(params.jobId.trim());
+    const requestedId = params.jobId.trim();
+    const job = jobs.get(requestedId);
     if (!job || job.ownerKey !== caller) {
-      return { ...base(), status: "invalid_request", error: `Unknown or expired deep_thought jobId: ${params.jobId.trim()}` };
+      // Restart fallback: the same caller can still collect a job persisted by an earlier process.
+      const stored = !job && store ? safely(() => store.getJob(requestedId)) : undefined;
+      if (stored && stored.ownerKey === caller && stored.agentId === active.agentId &&
+          (stored.expiresAt === undefined || Date.now() < stored.expiresAt)) {
+        const outcome = storedJobOutcome(stored);
+        if (params.cancel && outcome.status !== "running") safely(() => store!.deleteJob(requestedId));
+        return outcome;
+      }
+      return { ...base(), status: "invalid_request", error: `Unknown or expired deep_thought jobId: ${requestedId}` };
     }
     if (params.cancel) {
       if (!job.outcome) job.controller.abort(new DOMException("Cancelled by caller", "AbortError"));
       const outcome = await job.promise;
       if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
       jobs.delete(job.id);
+      if (store) safely(() => store.deleteJob(job.id));
       return outcome;
     }
     const waited = await awaitJob(job, syncWaitMs, signal, now, false);
@@ -470,6 +620,40 @@ async function runDeepThought(
   if ("error" in allowed) return { ...base(), status: "invalid_request", error: allowed.error };
   const approvedCorpora = allowed.corpora;
   const narrowed = approvedCorpora.length < deps.runtime.searchableCorpora().length;
+  const question = params.question!.trim();
+  const focus = nonBlank(params.focus);
+
+  // Verified-answer cache: generations are captured BEFORE the run, so anything indexed mid-run makes the saved row stale.
+  // A cold index can make capturing them slow; that wait counts against syncWaitMs. When it does not settle in time,
+  // the cache lookup is skipped and the job (which still awaits the snapshot before its run) is handed off.
+  const waitStarted = performance.now();
+  const audienceKey = store ? resolveAudienceKey(active, deps) : undefined;
+  const generationsReady = audienceKey ? captureGenerations(deps, approvedCorpora) : Promise.resolve(undefined);
+  const timely = await settleWithin(generationsReady, syncWaitMs);
+  const keyFor = (generations: Record<string, number> | undefined) => audienceKey && generations
+    ? { agentId: active.agentId, question, ...(focus ? { focus } : {}), audienceKey, corpora: canonicalCorpora(approvedCorpora) }
+    : undefined;
+  const generations = timely.settled ? timely.value : undefined;
+  const cacheKey = keyFor(generations);
+  if (store && cacheKey && generations && !params.fresh && !deps.bypassCache) {
+    const hit = safely(() => store.findFreshDerivedObservation({ ...cacheKey, currentGenerations: generations }));
+    if (hit && CONFIDENCE_LEVELS.includes(hit.confidence)) {
+      return {
+        status: "complete",
+        answer: hit.answer,
+        confidence: hit.confidence as DeepThoughtResult["confidence"],
+        citations: hit.citations,
+        openQuestions: hit.openQuestions,
+        hopsUsed: 0,
+        toolCallsUsed: 0,
+        elapsedMs: Math.max(0, now() - started),
+        corpora: approvedCorpora,
+        cached: true,
+        derivedObservationId: hit.id,
+        note: `Verified synthesis from ${new Date(hit.createdAt).toISOString()}; every searched collection is unchanged since. Pass fresh: true to re-investigate.`,
+      };
+    }
+  }
 
   const counter = activeCounter();
   const maxConcurrent = deps.config.maxConcurrent ?? 0;
@@ -484,6 +668,8 @@ async function runDeepThought(
   const timeoutSignal = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
   const runSignal = timeoutSignal ? AbortSignal.any([jobController.signal, timeoutSignal]) : jobController.signal;
 
+  /** Set once `lookup_person` runs: People dossiers can be corrected or revoked without a collection generation change. */
+  let usedPeopleLookup = false;
   const executeJob = async (job: DeepThoughtJob): Promise<DeepThoughtOutcome> => {
     /** Text each visited path/handle actually returned to the model: citation quotes must be grounded in it. */
     const visitedEvidence = new Map<string, string[]>();
@@ -491,6 +677,11 @@ async function runDeepThought(
       const texts = visitedEvidence.get(source) ?? [];
       if (text) texts.push(text);
       visitedEvidence.set(source, texts);
+    };
+    const recordToolCall = (name: string) => {
+      job.toolCallsUsed += 1;
+      job.lastTool = name;
+      persistJob(store, job);
     };
     /** Paths surfaced by search; when corpora are narrowed, reads are confined to these. */
     const surfacedPaths = new Set<string>();
@@ -502,6 +693,8 @@ async function runDeepThought(
     const maxPeopleMatches = deps.config.maxPeopleMatches ?? 0;
 
     try {
+      runSignal.throwIfAborted();
+      await generationsReady;
       runSignal.throwIfAborted();
       const { manager, error } = await deps.runtime.getMemorySearchManager(active);
       if (!manager) return { ...base(), status: "unavailable", error: error ?? "memory unavailable" };
@@ -518,8 +711,7 @@ async function runDeepThought(
         description: `Search approved memory corpora (${approvedCorpora.join(", ") || "none"}) with BM25 + vector queries. Returns qmd:// paths and snippets. Safe to call in parallel for multiple angles.`,
         parameters: searchMemoryArgs,
         async execute(raw, toolSignal) {
-          job.toolCallsUsed += 1;
-          job.lastTool = "search_memory";
+          recordToolCall("search_memory");
           const args = Value.Parse(searchMemoryArgs, raw);
           const requested = resolveCorpora(args.corpora, approvedCorpora);
           if ("error" in requested) return { status: "invalid_request", error: requested.error };
@@ -563,8 +755,7 @@ async function runDeepThought(
         description: "Read an exact qmd:// path returned by search_memory. Continue truncated reads with nextFrom (as from) or nextCursor (as cursor). Safe to call in parallel across multiple files.",
         parameters: readMemoryArgs,
         async execute(raw) {
-          job.toolCallsUsed += 1;
-          job.lastTool = "read_memory";
+          recordToolCall("read_memory");
           const args = Value.Parse(readMemoryArgs, raw);
           const path = args.path.trim();
           if (narrowed && !surfacedPaths.has(path)) {
@@ -593,8 +784,8 @@ async function runDeepThought(
           description: "Read-only lookup of verified People dossiers within the caller's own account. Cite results as person:<id>.",
           parameters: lookupPersonArgs,
           async execute(raw) {
-            job.toolCallsUsed += 1;
-            job.lastTool = "lookup_person";
+            recordToolCall("lookup_person");
+            usedPeopleLookup = true;
             const { query } = Value.Parse(lookupPersonArgs, raw);
             const store = peopleSource.get(active.agentId);
             const matches: unknown[] = [];
@@ -638,8 +829,8 @@ async function runDeepThought(
       }
 
       const input = [
-        `Question: ${params.question!.trim()}`,
-        ...(nonBlank(params.focus) ? [`Focus: ${params.focus!.trim()}`] : []),
+        `Question: ${question}`,
+        ...(focus ? [`Focus: ${focus}`] : []),
         `Approved corpora: ${approvedCorpora.join(", ") || "(none)"}`,
         `Today: ${new Date().toISOString().slice(0, 10)}`,
       ].join("\n");
@@ -699,15 +890,34 @@ async function runDeepThought(
   const jobs = jobRegistry();
   const job: DeepThoughtJob = {
     id: jobId,
+    agentId: active.agentId,
     ownerKey: caller,
+    question,
+    ...(focus ? { focus } : {}),
     started,
+    startedAtMs: Date.now(),
     corpora: approvedCorpora,
     controller: jobController,
     toolCallsUsed: 0,
     promise: undefined as unknown as Promise<DeepThoughtOutcome>,
   };
-  job.promise = executeJob(job).then(outcome => {
-    const finalOutcome = jobs.has(jobId) ? { ...outcome, jobId } : outcome;
+  persistJob(store, job);
+  job.promise = executeJob(job).then(async outcome => {
+    let finalOutcome = jobs.has(jobId) ? { ...outcome, jobId } : outcome;
+    // Compound: a complete answer with at least one grounded citation, none dropped, and no People lookup becomes the
+    // cached answer for this exact key.
+    const citationsVerified = finalOutcome.citations.length > 0 && !finalOutcome.unverifiedCitationsDropped;
+    const snapshot = generations ?? await generationsReady;
+    const saveKey = keyFor(snapshot);
+    if (store && saveKey && snapshot && finalOutcome.status === "complete" && nonBlank(finalOutcome.answer) &&
+        finalOutcome.confidence && citationsVerified && !usedPeopleLookup) {
+      const saved = safely(() => store.saveDerivedObservation({
+        ...saveKey, collectionGenerations: snapshot, answer: finalOutcome.answer!, confidence: finalOutcome.confidence!,
+        citations: finalOutcome.citations, openQuestions: finalOutcome.openQuestions, sourceJobId: jobId,
+      }));
+      if (saved) finalOutcome = { ...finalOutcome, derivedObservationId: saved.id };
+    }
+    persistJob(store, job, { outcome: { ...finalOutcome, jobId }, retentionMs: jobRetentionMs });
     job.outcome = finalOutcome;
     if (jobs.has(jobId) && jobRetentionMs > 0) {
       job.expiresAt = Date.now() + jobRetentionMs;
@@ -718,7 +928,9 @@ async function runDeepThought(
   });
   jobs.set(jobId, job);
 
-  const waited = await awaitJob(job, syncWaitMs, signal, now, true);
+  // The generations wait already spent part of syncWaitMs (0 = wait forever stays forever).
+  const remainingWaitMs = syncWaitMs > 0 ? Math.max(1, syncWaitMs - (performance.now() - waitStarted)) : 0;
+  const waited = await awaitJob(job, remainingWaitMs, signal, now, true);
   if (waited.finished) {
     if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
     jobs.delete(jobId);

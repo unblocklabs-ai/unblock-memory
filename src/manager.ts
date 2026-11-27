@@ -720,6 +720,21 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
       .map((source) => source.collection), ...(selected.has("extracted") ? extracted : [])];
   }
 
+  /**
+   * Current QMD generation of every collection behind `corpora` (omitted or `["all"]` = every indexed collection), for
+   * caches that must invalidate on any indexed change. Unknown corpora throw. Reads committed state without waiting
+   * behind queued indexing, so a snapshot is never newer than what a search issued now could observe.
+   */
+  getCollectionGenerations(corpora?: readonly string[]): Promise<Record<string, number>> {
+    return this.#runFenced(async () => {
+      const collections = this.#collectionNames(corpora);
+      const store = await this.#getStore();
+      const generations: Record<string, number> = {};
+      for (const collection of collections) generations[collection] = await store.getCollectionGeneration(collection);
+      return generations;
+    });
+  }
+
   syncExtracted(): Promise<void> {
     return this.#enqueue(async () => {
       if (!this.#publishedExtraction) return;

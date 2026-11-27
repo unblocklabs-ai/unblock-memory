@@ -61,6 +61,14 @@ type StewardPeopleShadowConfig = {
   maxExcerptChars: number;
   /** Largest export file read in bytes (`0` = unlimited). */
   maxExportBytes: number;
+  /** Net-new claim discovery on nightly manifests. Unset = runtime default: ON in `"publish"`, OFF in `"shadow"`. */
+  includeInteractionLearning?: boolean;
+  /** New claims published per person per manifest, highest confidence first (`0` = unlimited). */
+  maxNewClaimsPerPerson: number;
+  /** Evidence handles per interaction packet (`0` = unlimited; a packet that drops excerpts never completes a review). */
+  maxInteractionHandles: number;
+  /** Annotate interaction excerpts with Response Audit outcome signals when that table exists. */
+  includeResponseAudit: boolean;
 };
 type StewardCaptainsLogConfig = {
   enabled: boolean;
@@ -77,11 +85,24 @@ type StewardCaptainsLogConfig = {
   /** Chat types excluded from workspace `memory/YYYY-MM-DD.md` distillation (default: `["direct"]`). */
   excludeChatTypes: ChatType[];
 };
+/** Deterministic (no model call) outcome scoring of memory hits, skills and person whispers into `memory_outcomes`. */
+type StewardOutcomeLedgerConfig = {
+  enabled: boolean;
+  intervalMinutes: number;
+  /** First-sweep history and Inside Out personal-baseline window in ms; later sweeps resume from the watermark. */
+  lookbackMs: number;
+  /** Exposures scored per pass; a capped pass resumes from its cursor next pass (`0` = unlimited). */
+  maxRowsPerPass: number;
+  /** How long after an exposure its use/outcome evidence may arrive, in ms. */
+  matchWindowMs: number;
+  /** Days `memory_outcomes` rows are kept (`0` = unlimited). */
+  retentionDays: number;
+};
 export type StewardConfig = {
   enabled: boolean; model: string; reasoning: typeof efforts[number]; endpoint: string;
   apiKey?: string; apiKeyFile?: string; maxActiveBackground: number;
   deepThought: StewardDeepThoughtConfig; peopleShadow: StewardPeopleShadowConfig;
-  captainsLog: StewardCaptainsLogConfig;
+  captainsLog: StewardCaptainsLogConfig; outcomeLedger: StewardOutcomeLedgerConfig;
 };
 
 const DEFAULT_STEWARD_CONFIG: StewardConfig = {
@@ -115,6 +136,9 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     maxHandles: 0,
     maxExcerptChars: 0,
     maxExportBytes: 0,
+    maxNewClaimsPerPerson: 0,
+    maxInteractionHandles: 0,
+    includeResponseAudit: true,
   },
   captainsLog: {
     enabled: true,
@@ -125,6 +149,14 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     maxExistingLogChars: 0,
     timeoutMs: 0,
     excludeChatTypes: ["direct"],
+  },
+  outcomeLedger: {
+    enabled: true,
+    intervalMinutes: 60,
+    lookbackMs: 604_800_000,
+    maxRowsPerPass: 0,
+    matchWindowMs: 1_800_000,
+    retentionDays: 0,
   },
 };
 
@@ -149,7 +181,10 @@ function unitInterval(value: unknown, key: string) {
   return value;
 }
 function enabled(value: unknown, label: string) {
-  if (typeof value !== "boolean") throw new Error(`${label}.enabled must be a boolean`);
+  return boolean(value, `${label}.enabled`);
+}
+function boolean(value: unknown, label: string) {
+  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
   return value;
 }
 function chatTypeList(value: unknown, key: string): ChatType[] {
@@ -186,8 +221,9 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
   const defaults = DEFAULT_STEWARD_CONFIG;
   const c = section(value, defaults, "steward", ["apiKey", "apiKeyFile"]);
   const d = section(c.deepThought, defaults.deepThought, "steward.deepThought", ["reasoning"]);
-  const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow");
+  const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow", ["includeInteractionLearning"]);
   const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
+  const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger");
   const reasoning = efforts.find(e => e === c.reasoning);
   if (!reasoning) throw new Error("Invalid steward.reasoning");
   const deepThoughtReasoning = d.reasoning === undefined ? undefined : efforts.find(e => e === d.reasoning);
@@ -232,6 +268,11 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       maxHandles: integer(p.maxHandles, 0, "peopleShadow.maxHandles"),
       maxExcerptChars: integer(p.maxExcerptChars, 0, "peopleShadow.maxExcerptChars"),
       maxExportBytes: integer(p.maxExportBytes, 0, "peopleShadow.maxExportBytes"),
+      ...(p.includeInteractionLearning === undefined ? {}
+        : { includeInteractionLearning: boolean(p.includeInteractionLearning, "steward.peopleShadow.includeInteractionLearning") }),
+      maxNewClaimsPerPerson: integer(p.maxNewClaimsPerPerson, 0, "peopleShadow.maxNewClaimsPerPerson"),
+      maxInteractionHandles: integer(p.maxInteractionHandles, 0, "peopleShadow.maxInteractionHandles"),
+      includeResponseAudit: boolean(p.includeResponseAudit, "steward.peopleShadow.includeResponseAudit"),
     },
     captainsLog: {
       enabled: enabled(cl.enabled, "steward.captainsLog"),
@@ -242,6 +283,14 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       maxExistingLogChars: integer(cl.maxExistingLogChars, 0, "captainsLog.maxExistingLogChars"),
       timeoutMs: integer(cl.timeoutMs, 0, "captainsLog.timeoutMs"),
       excludeChatTypes: chatTypeList(cl.excludeChatTypes, "captainsLog.excludeChatTypes"),
+    },
+    outcomeLedger: {
+      enabled: enabled(o.enabled, "steward.outcomeLedger"),
+      intervalMinutes: integer(o.intervalMinutes, 1, "outcomeLedger.intervalMinutes"),
+      lookbackMs: integer(o.lookbackMs, 1, "outcomeLedger.lookbackMs"),
+      maxRowsPerPass: integer(o.maxRowsPerPass, 0, "outcomeLedger.maxRowsPerPass"),
+      matchWindowMs: integer(o.matchWindowMs, 1, "outcomeLedger.matchWindowMs"),
+      retentionDays: integer(o.retentionDays, 0, "outcomeLedger.retentionDays"),
     },
   };
 }

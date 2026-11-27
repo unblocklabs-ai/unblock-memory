@@ -907,10 +907,10 @@ baseline. Soft-deleting a person in PeopleSQL does not remove Inside Out data.
 
 ## Steward
 
-The Steward is an embedded sub-agent with two independent features (`deep_thought`
-and proposal-only People shadow), both **enabled by default**. Fleet configs without
-a `steward` section load cleanly and automatically get both features; set
-`steward.enabled: false` (or disable either sub-feature individually) to opt out.
+The Steward is an embedded sub-agent with independent features (`deep_thought`,
+People Learning, Captain's Log and the Outcome Ledger), all **enabled by default**.
+Fleet configs without a `steward` section load cleanly and automatically get every
+feature; set `steward.enabled: false` (or disable any sub-feature individually) to opt out.
 
 ```json
 {
@@ -928,14 +928,53 @@ a `steward` section load cleanly and automatically get both features; set
   citations are kept only if the curator actually opened the cited source and the
   quote is grounded in the text that source returned. If the turn or tool budget
   runs out first, one final submit-only turn asks for the best cited answer from
-  the evidence already gathered. It never writes.
+  the evidence already gathered. It never writes to memory. Jobs persist in
+  `unblock-memory.sqlite`, so a `jobId` stays collectible after a Gateway restart
+  (orphaned running jobs become `cancelled`); a job can only be collected by the
+  caller that started it (agent, session key, channel, account, sender and native
+  channel). A complete answer with at least one verified citation, none dropped,
+  and no `lookup_person` call (People dossiers can change without a collection
+  generation change) is stored as a derived observation keyed by question,
+  corpora and caller audience (agent + session key + channel + account + native
+  channel, so a private session's answer is never served elsewhere) and stamped
+  with the QMD generation of every searched collection. A repeat question returns it
+  instantly with `cached: true` until any of those collections changes; pass
+  `fresh: true` to re-investigate. Reading those generations (which may wait on a
+  cold index) counts against `syncWaitMs`, so a slow index still hands off a `jobId`
+  on time.
 - **People shadow**: a background, proposal-only reviewer of People Learning
   manifests. Verified proposals are stored only in `work_items`; dossiers, learning
   runs and cron jobs are never touched. Compare with the cron using
   `openclaw memory-steward shadow-report --agent main`; `memory-steward status`
   lists backlog and quarantined items, and `memory-steward requeue --scope <scope>`
-  re-drives one item. Leases are renewed during model calls; a Gateway stop
-  releases them without strikes.
+  re-drives one item (`--kind people_interactions`, `captains_log` or
+  `outcome_ledger` for other work kinds). Leases are renewed during model calls; a
+  Gateway stop releases them without strikes. On nightly manifests, interaction
+  learning (`people_interactions`) also proposes net-new dossier claims; it is on by
+  default in `publish` mode and off in `shadow` mode unless
+  `includeInteractionLearning` is set. Each person's item is keyed on the evidence it
+  reads (roster entry and session export fingerprints), so appending a learned claim
+  to the manifest never re-learns an unchanged person; pause/opt-out is rechecked
+  right before each model call, and an interaction-only person contributes only the
+  claims Steward published to the manifest, never their verified dossier.
+- **Captain's Log**: entries are also recorded in `captains_log_entries`;
+  `openclaw memory-steward blockers --agent main [--limit <n>]` lists open
+  `[BLOCKED]` entries, newest first. `blockers` and `outcomes` open the database
+  read-only and never create or migrate it.
+- **Outcome Ledger**: a deterministic background pass (no model call, so it runs
+  without a Steward credential) that scores each delivered memory hit, whispered
+  skill and person whisper as `helped`, `ignored` or `hurt` from reads, skill opens,
+  Response Audit outcomes and Inside Out valence, into `memory_outcomes`.
+  Memory candidates that were neither delivered nor read (`below_threshold`,
+  `rank_limit`, `cooldown`, …) are not scored, so `whisperUsedRate` is used hits
+  over delivered hits. Response Audit evidence is attached only when Response Audit
+  is enabled, and only from its configured cohort. The first sweep covers
+  `lookbackMs`; later sweeps resume from the watermark and re-score at most the
+  previous two days (bounded by `lookbackMs`) to pick up late audit results and
+  Inside Out grades.
+  `openclaw memory-steward outcomes --agent main [--since-hours <n>] [--recipe <hash>]`
+  prints `whisperUsedRate`, `skillOpenRate`, `shortfallsPer100Turns` and per-recipe
+  breakdowns.
 
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
@@ -969,8 +1008,12 @@ a `steward` section load cleanly and automatically get both features; set
 | `steward.peopleShadow.timeoutMs` | `0` | `>= 0` ms per item (`0` = unlimited) |
 | `steward.peopleShadow.minConfidence` | `"medium"` | Lowest confidence (`"high"`, `"medium"`, `"low"`) that may mutate/verify a dossier in publish mode |
 | `steward.peopleShadow.maxHandles` | `0` | `>= 0` evidence handles per packet (`0` = unlimited) |
-| `steward.peopleShadow.maxExcerptChars` | `0` | `>= 0` characters per evidence excerpt (`0` = unlimited) |
+| `steward.peopleShadow.maxExcerptChars` | `0` | `>= 0` characters per evidence excerpt (`0` = unlimited; an interaction packet that clips an excerpt never completes a person review) |
 | `steward.peopleShadow.maxExportBytes` | `0` | `>= 0` bytes read per approved export file (`0` = unlimited) |
+| `steward.peopleShadow.includeInteractionLearning` | Unset | Net-new claim discovery on nightly manifests; unset = on in `"publish"`, off in `"shadow"` |
+| `steward.peopleShadow.maxNewClaimsPerPerson` | `0` | `>= 0` new claims published per person per manifest, highest confidence first (`0` = unlimited) |
+| `steward.peopleShadow.maxInteractionHandles` | `0` | `>= 0` evidence handles per interaction packet (`0` = unlimited; a packet that drops excerpts never completes a person review) |
+| `steward.peopleShadow.includeResponseAudit` | `true` | Annotate interaction excerpts with Response Audit outcome signals when available |
 | `steward.captainsLog.enabled` | `true` | Starts the background Captain's Log distillation loop on Gateway start |
 | `steward.captainsLog.intervalMinutes` | `180` | `>= 1` minutes between Captain's Log passes (a transient failure retries after at most 15 minutes) |
 | `steward.captainsLog.lookbackMinutes` | `190` | `>= 1` minutes of recent session activity examined per pass, extended back to the last capture after a failed pass or downtime (deduplicated via watermark) |
@@ -979,6 +1022,12 @@ a `steward` section load cleanly and automatically get both features; set
 | `steward.captainsLog.maxExistingLogChars` | `0` | `>= 0` characters from existing `memory/YYYY-MM-DD.md` passed for dedup (`0` = unlimited) |
 | `steward.captainsLog.timeoutMs` | `0` | `>= 0` ms model timeout (`0` = unlimited) |
 | `steward.captainsLog.excludeChatTypes` | `["direct"]` | Chat types (`"channel"`, `"group"`, `"direct"`) excluded from workspace `memory/YYYY-MM-DD.md` |
+| `steward.outcomeLedger.enabled` | `true` | Starts the deterministic Outcome Ledger loop on Gateway start (needs no Steward credential) |
+| `steward.outcomeLedger.intervalMinutes` | `60` | `>= 1` minutes between passes |
+| `steward.outcomeLedger.lookbackMs` | `604800000` | `>= 1` ms of history scored on the first sweep and used for Inside Out personal baselines; later sweeps resume from the watermark, re-scoring at most `min(lookbackMs, 2 days)` behind it for late evidence |
+| `steward.outcomeLedger.maxRowsPerPass` | `0` | `>= 0` exposures scored per pass; a capped pass resumes from its cursor (`0` = unlimited) |
+| `steward.outcomeLedger.matchWindowMs` | `1800000` | `>= 1` ms after an exposure during which use and outcome evidence may arrive |
+| `steward.outcomeLedger.retentionDays` | `0` | `>= 0` days `memory_outcomes` rows are kept (`0` = unlimited) |
 
 **Enabling `deep_thought` approves sending the question plus the memory excerpts it
 opens to the Steward endpoint. Enabling the People shadow approves sending one

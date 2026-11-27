@@ -29,6 +29,7 @@ import { registerExtraction } from "./extraction-runtime.js";
 import { registerPeopleLearning, registerPeopleLearningCli } from "./people-learning-runtime.js";
 import { nonBlank } from "./guards.js";
 import { cancelAllDeepThoughtJobs, createDeepThoughtTool } from "./deep-thought.js";
+import { DeepThoughtStore } from "./deep-thought-store.js";
 import { resolveStewardCredential } from "./steward-config.js";
 import { createStewardRunner } from "./steward-runner.js";
 import { registerStewardRuntime } from "./steward-runtime.js";
@@ -773,7 +774,56 @@ export function registerUnblockMemory(api) {
             decisionModel: config.decisionModel,
             ...(config.people.enabled ? { people: { enabled: true, stores: peopleStores } } : {}),
         };
-        api.registerTool((ctx) => createDeepThoughtTool(ctx, deepThought), { names: ["deep_thought"] });
-        api.on("gateway_stop", () => cancelAllDeepThoughtJobs());
+        // One lazily opened durable store per agent memory database (jobs survive restarts; verified answers are cached).
+        const deepThoughtStores = new Map();
+        const deepThoughtStoreWarnings = new Set();
+        const deepThoughtStore = (agentId) => {
+            let store = deepThoughtStores.get(agentId);
+            if (store)
+                return store;
+            try {
+                store = new DeepThoughtStore(runtime.memoryDatabasePath(agentId));
+            }
+            catch (error) {
+                // Durability is optional: fall back to in-process jobs and no cache rather than failing the tool.
+                if (!deepThoughtStoreWarnings.has(agentId)) {
+                    deepThoughtStoreWarnings.add(agentId);
+                    api.logger.warn(`unblock-memory deep_thought store unavailable for ${agentId}: ${String(error)}`);
+                }
+                return undefined;
+            }
+            deepThoughtStores.set(agentId, store);
+            return store;
+        };
+        api.registerTool((ctx) => {
+            const active = getContext(ctx);
+            if (!active)
+                return createDeepThoughtTool(ctx, deepThought);
+            const store = deepThoughtStore(active.agentId);
+            return createDeepThoughtTool(ctx, {
+                ...deepThought,
+                ...(store ? { store } : {}),
+                // Generations are per agent index; any indexed change behind the searched corpora invalidates a cached answer.
+                getCollectionGenerations: async (corpora) => {
+                    const { manager, error } = await runtime.getMemorySearchManager(active);
+                    if (!manager)
+                        throw new Error(error ?? "memory manager unavailable");
+                    return manager.getCollectionGenerations(corpora);
+                },
+                // audienceKey stays unset: the default isolates cached answers per agent + session key + channel + account +
+                // native channel, so a private DM/session answer is never served to another session.
+            });
+        }, { names: ["deep_thought"] });
+        api.on("gateway_stop", () => {
+            cancelAllDeepThoughtJobs();
+            for (const store of deepThoughtStores.values()) {
+                try {
+                    store.close();
+                }
+                catch { }
+            }
+            deepThoughtStores.clear();
+            deepThoughtStoreWarnings.clear();
+        });
     }
 }

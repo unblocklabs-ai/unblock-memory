@@ -1,3 +1,4 @@
+import { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import type { ChatType } from "./config.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
@@ -13,6 +14,14 @@ export declare const CAPTAINS_LOG_SCHEMA: Type.TObject<{
     }>>;
     skipReason: Type.TOptional<Type.TString>;
 }>;
+declare const CAPTURED_ENTRY: Type.TObject<{
+    topic: Type.TString;
+    summary: Type.TString;
+    blocked: Type.TBoolean;
+    channels: Type.TArray<Type.TString>;
+    sessionRefs: Type.TArray<Type.TString>;
+}>;
+type CapturedEntry = Static<typeof CAPTURED_ENTRY>;
 declare const ARTIFACT: Type.TObject<{
     pendingAppend: Type.TOptional<Type.TObject<{
         day: Type.TString;
@@ -21,6 +30,13 @@ declare const ARTIFACT: Type.TObject<{
         priorMatches: Type.TInteger;
         capturedAtMs: Type.TInteger;
         sessionMaxSeq: Type.TRecord<"^.*$", Type.TInteger>;
+        entries: Type.TOptional<Type.TArray<Type.TObject<{
+            topic: Type.TString;
+            summary: Type.TString;
+            blocked: Type.TBoolean;
+            channels: Type.TArray<Type.TString>;
+            sessionRefs: Type.TArray<Type.TString>;
+        }>>>;
     }>>;
     schemaVersion: Type.TLiteral<1>;
     lastCapturedAtMs: Type.TInteger;
@@ -28,6 +44,33 @@ declare const ARTIFACT: Type.TObject<{
     lastEntryHash: Type.TOptional<Type.TString>;
 }>;
 export type CaptainsLogWatermark = Omit<Static<typeof ARTIFACT>, "pendingAppend">;
+type CaptainsLogEntry = CapturedEntry & {
+    id: string;
+    agentId: string;
+    day: string;
+    capturedAtMs: number;
+    sectionHash: string;
+    ordinal: number;
+    resolvedAtMs: number | null;
+    resolutionNote: string | null;
+};
+/** Newest captures first, with entries from each section in rendered order. Zero or omitted limit is unlimited. */
+export declare function listCaptainsLogEntries(db: DatabaseSync, options: {
+    agentId: string;
+    day?: string;
+    sinceMs?: number;
+    blockedOnly?: boolean;
+    openOnly?: boolean;
+    limit?: number;
+}): CaptainsLogEntry[];
+export declare function listOpenBlockers(db: DatabaseSync, agentId: string, limit?: number): CaptainsLogEntry[];
+/** Resolve an open blocker once, without modifying its original capture or reopening it on replay. */
+export declare function resolveCaptainsLogBlocker(db: DatabaseSync, options: {
+    id: string;
+    agentId: string;
+    resolvedAtMs?: number;
+    note?: string;
+}): boolean;
 export type CaptainsLogPassOptions = {
     agentId: string;
     /** The live OpenClaw agent database, not the plugin work database. */

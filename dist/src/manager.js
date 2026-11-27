@@ -581,6 +581,21 @@ export class QmdMemoryManager {
                 .filter((source) => selected.has(source.corpus))
                 .map((source) => source.collection), ...(selected.has("extracted") ? extracted : [])];
     }
+    /**
+     * Current QMD generation of every collection behind `corpora` (omitted or `["all"]` = every indexed collection), for
+     * caches that must invalidate on any indexed change. Unknown corpora throw. Reads committed state without waiting
+     * behind queued indexing, so a snapshot is never newer than what a search issued now could observe.
+     */
+    getCollectionGenerations(corpora) {
+        return this.#runFenced(async () => {
+            const collections = this.#collectionNames(corpora);
+            const store = await this.#getStore();
+            const generations = {};
+            for (const collection of collections)
+                generations[collection] = await store.getCollectionGeneration(collection);
+            return generations;
+        });
+    }
     syncExtracted() {
         return this.#enqueue(async () => {
             if (!this.#publishedExtraction)

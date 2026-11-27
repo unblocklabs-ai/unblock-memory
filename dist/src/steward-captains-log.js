@@ -8,6 +8,7 @@ import { abortable } from "./abortable.js";
 import { AgentTranscriptReader } from "./agent-transcript.js";
 import { DEFAULTS } from "./defaults.js";
 import { record } from "./guards.js";
+import { immediateTransaction, tableExists } from "./memory-database.js";
 import { resolveTimezone } from "./session-projector.js";
 import { startWorkHeartbeat, WorkFenceLostError } from "./work-store.js";
 export const CAPTAINS_LOG_KIND = "captains_log";
@@ -27,12 +28,93 @@ const WATERMARK = {
     schemaVersion: Type.Literal(1), lastCapturedAtMs: Type.Integer({ minimum: 0 }),
     sessionMaxSeq: SEQUENCES, lastEntryHash: Type.Optional(HASH),
 };
+const CAPTURED_ENTRY = Type.Object({
+    topic: Type.String(), summary: Type.String(), blocked: Type.Boolean(),
+    channels: Type.Array(Type.String()), sessionRefs: Type.Array(Type.String()),
+}, { additionalProperties: false });
 const PENDING_APPEND = Type.Object({
     day: Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
     hash: HASH, sectionChars: Type.Integer({ minimum: 1 }), priorMatches: Type.Integer({ minimum: 0 }),
     capturedAtMs: WATERMARK.lastCapturedAtMs, sessionMaxSeq: SEQUENCES,
+    entries: Type.Optional(Type.Array(CAPTURED_ENTRY)), // Older receipts only carry the watermark delta.
 });
 const ARTIFACT = Type.Object({ ...WATERMARK, pendingAppend: Type.Optional(PENDING_APPEND) });
+const LEDGER_TABLE = "captains_log_entries";
+const LEDGER_SCHEMA_VERSION = 1;
+const LEDGER_SCHEMA = `CREATE TABLE IF NOT EXISTS captains_log_entries (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  day TEXT NOT NULL,
+  captured_at_ms INTEGER NOT NULL,
+  section_hash TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  topic TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  blocked INTEGER NOT NULL CHECK(blocked IN (0, 1)),
+  resolved_at_ms INTEGER,
+  resolution_note TEXT,
+  channels_json TEXT NOT NULL CHECK(json_valid(channels_json)),
+  session_refs_json TEXT NOT NULL CHECK(json_valid(session_refs_json))
+) STRICT;
+CREATE INDEX IF NOT EXISTS captains_log_entries_day ON captains_log_entries(agent_id, day, captured_at_ms);
+CREATE INDEX IF NOT EXISTS captains_log_entries_blockers ON captains_log_entries(agent_id, blocked, resolved_at_ms);`;
+function ensureCaptainsLogSchema(db) {
+    const ready = () => {
+        const version = db.prepare("SELECT version FROM memory_schema WHERE component=?").get(CAPTAINS_LOG_KIND)?.version;
+        if (version !== undefined && version !== LEDGER_SCHEMA_VERSION)
+            throw new Error("Unsupported Captain's Log schema version");
+        return version === LEDGER_SCHEMA_VERSION && tableExists(db, LEDGER_TABLE);
+    };
+    if (ready())
+        return;
+    immediateTransaction(db, () => {
+        if (ready())
+            return;
+        db.exec(LEDGER_SCHEMA);
+        db.prepare("INSERT OR IGNORE INTO memory_schema VALUES (?,?)").run(CAPTAINS_LOG_KIND, LEDGER_SCHEMA_VERSION);
+    });
+}
+/** Newest captures first, with entries from each section in rendered order. Zero or omitted limit is unlimited. */
+export function listCaptainsLogEntries(db, options) {
+    const { agentId, day, sinceMs, blockedOnly, openOnly, limit = 0 } = options;
+    if (!Number.isSafeInteger(limit) || limit < 0)
+        throw new RangeError("limit must be a non-negative integer");
+    if (!tableExists(db, LEDGER_TABLE))
+        return [];
+    const where = ["agent_id=?"], params = [agentId];
+    if (day !== undefined) {
+        where.push("day=?");
+        params.push(day);
+    }
+    if (sinceMs !== undefined) {
+        where.push("captured_at_ms>=?");
+        params.push(sinceMs);
+    }
+    if (blockedOnly)
+        where.push("blocked=1");
+    if (openOnly)
+        where.push("resolved_at_ms IS NULL");
+    return db.prepare(`SELECT * FROM captains_log_entries WHERE ${where.join(" AND ")}
+    ORDER BY captured_at_ms DESC, section_hash, ordinal LIMIT ?`).all(...params, limit || -1).map(row => ({
+        id: String(row.id), agentId: String(row.agent_id), day: String(row.day), capturedAtMs: Number(row.captured_at_ms),
+        sectionHash: String(row.section_hash), ordinal: Number(row.ordinal), topic: String(row.topic), summary: String(row.summary),
+        blocked: row.blocked === 1, resolvedAtMs: row.resolved_at_ms === null ? null : Number(row.resolved_at_ms),
+        resolutionNote: row.resolution_note === null ? null : String(row.resolution_note),
+        channels: JSON.parse(String(row.channels_json)), sessionRefs: JSON.parse(String(row.session_refs_json)),
+    }));
+}
+export function listOpenBlockers(db, agentId, limit) {
+    return listCaptainsLogEntries(db, { agentId, blockedOnly: true, openOnly: true, limit });
+}
+/** Resolve an open blocker once, without modifying its original capture or reopening it on replay. */
+export function resolveCaptainsLogBlocker(db, options) {
+    if (!tableExists(db, LEDGER_TABLE))
+        return false;
+    const { id, agentId, resolvedAtMs = Date.now(), note } = options;
+    return Number(db.prepare(`UPDATE captains_log_entries SET resolved_at_ms=?, resolution_note=?
+    WHERE id=? AND agent_id=? AND blocked=1 AND resolved_at_ms IS NULL`)
+        .run(resolvedAtMs, note === undefined ? null : redactSecrets(note), id, agentId).changes) > 0;
+}
 const LOG_HEADING = "## Captain's Log (";
 const AUTOMATION = /captain[’']?s[\s_-]+log|\[cron:|\bheartbeat(?:[_-]ok)?\b|unblock-memory:people-learning|deep-thought-smoke/iu;
 const INJECTED_CONTEXT = /^(?:<relevant-memories>|\[Subagent Context\]|\[Inter-session message\]|<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>)/u;
@@ -53,13 +135,13 @@ function humanChannelLabel(chatType, rawLabel) {
     if (chatType === "direct" || typeof rawLabel !== "string")
         return undefined;
     const cleaned = redactSecrets(rawLabel).replace(/\s+/gu, " ").trim();
-    if (!cleaned || cleaned === "[redacted]")
+    if (!cleaned || cleaned.includes("[redacted]"))
         return undefined;
     const hashMatch = cleaned.match(/#[a-z0-9][a-z0-9._-]*/iu);
     if (hashMatch)
         return hashMatch[0];
     const stripped = cleaned.replace(/^[a-z0-9_-]+:(?:g-)?/iu, "").trim();
-    if (!stripped || stripped === "[redacted]" || OPAQUE_CHANNEL_ID.test(stripped))
+    if (!stripped || OPAQUE_CHANNEL_ID.test(stripped))
         return undefined;
     return stripped;
 }
@@ -102,7 +184,7 @@ function readExcerpts(options, from, to, cursor, signal) {
         const reader = new AgentTranscriptReader(db, options.agentId);
         const placeholders = chatTypes.map(() => "?").join(",");
         const windows = db.prepare(`SELECT w.session_id AS sessionId, w.session_key AS sessionKey, w.chat_type AS chatType,
-        c.label AS conversationLabel,
+        c.label AS conversationLabel, c.kind AS conversationKind,
         MAX(e.seq) AS latestSeq, MAX(e.created_at) AS latestAt
       FROM session_windows w
       JOIN session_transcript_active_events a ON a.session_id = w.session_id
@@ -116,7 +198,7 @@ function readExcerpts(options, from, to, cursor, signal) {
         const maxSessions = options.maxSessionsPerRun ?? 0, maxChars = options.maxCharsPerSession ?? 0;
         for (const window of windows) {
             signal?.throwIfAborted();
-            const { sessionId, sessionKey, chatType, conversationLabel, latestSeq } = window;
+            const { sessionId, sessionKey, chatType, conversationLabel, conversationKind, latestSeq } = window;
             const seenSeq = Object.hasOwn(cursor, sessionId) ? cursor[sessionId] : 0;
             if (latestSeq <= seenSeq || AUTOMATION.test(sessionKey) || /(?:^|:)cron(?=:|$)/iu.test(sessionKey))
                 continue;
@@ -163,7 +245,7 @@ function readExcerpts(options, from, to, cursor, signal) {
                 if (maxChars > 0 && chars >= maxChars)
                     break;
             }
-            const channel = humanChannelLabel(chatType, conversationLabel);
+            const channel = humanChannelLabel(conversationKind === "direct" ? "direct" : chatType, conversationLabel);
             if (messages.length)
                 excerpts.push({ sessionId, chatType, ...(channel ? { channel } : {}), messages, maxSeq });
             if (maxSessions > 0 && excerpts.length >= maxSessions)
@@ -232,6 +314,38 @@ function appendDaily(workspaceDir, day, expectedPath, markdown) {
     });
 }
 const hash = (text) => createHash("sha256").update(text).digest("hex");
+const oneLine = (text) => redactSecrets(text).replace(/\s+/gu, " ").trim();
+function captureEntries(entries, excerpts) {
+    const sessions = new Map(excerpts.map((excerpt, i) => [`s${i + 1}`, excerpt]));
+    const captured = entries.flatMap(entry => {
+        const topic = oneLine(entry.topic).replace(/^(?:\[BLOCKED\]\s*:?\s*)+/iu, "");
+        const summary = oneLine(entry.summary);
+        if (!topic || !summary)
+            return [];
+        const sessionRefs = new Set(), channels = new Set();
+        for (const ref of entry.sessionRefs ?? []) {
+            const session = sessions.get(ref);
+            if (!session)
+                continue;
+            sessionRefs.add(session.sessionId);
+            if (session.channel)
+                channels.add(session.channel);
+        }
+        return [{ topic, summary, blocked: entry.blocked === true, channels: [...channels], sessionRefs: [...sessionRefs] }];
+    });
+    return captured.sort((a, b) => Number(b.blocked) - Number(a.blocked));
+}
+function persistEntries(db, agentId, receipt) {
+    if (!receipt.entries?.length)
+        return;
+    const insert = db.prepare(`INSERT INTO captains_log_entries
+    (id, agent_id, day, captured_at_ms, section_hash, ordinal, topic, summary, blocked, channels_json, session_refs_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`);
+    for (const [ordinal, entry] of receipt.entries.entries()) {
+        const id = hash(JSON.stringify([agentId, receipt.day, receipt.hash, ordinal]));
+        insert.run(id, agentId, receipt.day, receipt.capturedAtMs, receipt.hash, ordinal, entry.topic, entry.summary, Number(entry.blocked), JSON.stringify(entry.channels), JSON.stringify(entry.sessionRefs));
+    }
+}
 function sectionMatches(log, digest, chars) {
     let matches = 0;
     for (let start = log.indexOf(LOG_HEADING); start !== -1; start = log.indexOf(LOG_HEADING, start + LOG_HEADING.length)) {
@@ -250,7 +364,8 @@ function recoverWatermark(workspaceDir, artifactJson) {
     if (pendingAppend) {
         const log = readDaily(dailyPath(workspaceDir, pendingAppend.day));
         if (sectionMatches(log, pendingAppend.hash, pendingAppend.sectionChars) > pendingAppend.priorMatches) {
-            return { pending: true, watermark: applyCapture(watermark, pendingAppend.capturedAtMs, pendingAppend.sessionMaxSeq, pendingAppend.hash) };
+            return { pending: true, recovered: pendingAppend,
+                watermark: applyCapture(watermark, pendingAppend.capturedAtMs, pendingAppend.sessionMaxSeq, pendingAppend.hash) };
         }
     }
     return { watermark, pending: Boolean(pendingAppend) };
@@ -283,41 +398,62 @@ export async function runCaptainsLogPass(options) {
     const signal = options.signal ? AbortSignal.any([options.signal, fence.signal]) : fence.signal;
     let sessions = 0, usage, nextDueAt;
     const result = (outcome) => ({ sessions, ...(usage ? { usage } : {}), ...(nextDueAt !== undefined ? { nextDueAt } : {}), ...outcome });
+    const acquireClaim = (at) => workStore.claim({ ...key, owner: options.owner, leaseMs, now: at });
+    const startHeartbeat = (held) => {
+        heartbeat = startWorkHeartbeat(workStore, held, {
+            intervalMs: options.heartbeatMs ?? Math.max(1, Math.floor(leaseMs / 3)), leaseMs, now,
+            onFenceLost: error => fence.abort(error), onError: error => fence.abort(error),
+        });
+    };
+    const unavailable = () => {
+        const item = workStore.get(key.kind, key.scope);
+        nextDueAt = item?.dueAt;
+        return result({ status: item?.status === "running" ? "already_running" : "not_due" });
+    };
     try {
         if (!dryRun) {
             workStore.enqueue({ ...key, dueAt: 0, now: startedAt });
-            claim = workStore.claim({ ...key, owner: options.owner, leaseMs, now: startedAt });
-            if (!claim) {
-                const item = workStore.get(key.kind, key.scope);
-                nextDueAt = item?.dueAt;
-                return result({ status: item?.status === "running" ? "already_running" : "not_due" });
-            }
-            heartbeat = startWorkHeartbeat(workStore, claim, {
-                intervalMs: options.heartbeatMs ?? Math.max(1, Math.floor(leaseMs / 3)), leaseMs, now,
-                onFenceLost: error => fence.abort(error), onError: error => fence.abort(error),
-            });
+            claim = acquireClaim(startedAt);
+            if (!claim)
+                return unavailable();
+            startHeartbeat(claim);
+            ensureCaptainsLogSchema(workStore.db);
         }
-        const { watermark, pending } = recoverWatermark(workspaceDir, claim?.artifactJson ??
+        const readWatermark = () => recoverWatermark(workspaceDir, claim?.artifactJson ??
             (dryRun ? workStore.get(key.kind, key.scope)?.artifactJson : null) ?? null);
+        const usageJson = () => usage ? JSON.stringify(usage) : undefined;
+        const finish = (captured, publish, dueAt = targetDueAt) => {
+            signal.throwIfAborted();
+            if (!claim)
+                return;
+            const held = claim;
+            workStore.commitWithDomain(held, { nextDueAt: dueAt, keepArtifact: true, usageJson: usageJson(), now: now() }, db => {
+                publish?.(db);
+                if (captured)
+                    workStore.stageArtifact(held, { stage: "watermark", artifactJson: JSON.stringify(captured), now: now() });
+            });
+            claim = undefined;
+            heartbeat?.stop();
+            nextDueAt = dueAt;
+        };
+        let snapshot = readWatermark();
+        while (claim && snapshot.recovered) {
+            // Commit the recovered rows before a fresh receipt can replace their only durable copy.
+            const { watermark, recovered } = snapshot;
+            const at = now();
+            finish(watermark, db => persistEntries(db, agentId, recovered), at);
+            claim = acquireClaim(at);
+            if (!claim)
+                return unavailable();
+            startHeartbeat(claim);
+            snapshot = readWatermark();
+        }
+        const { watermark, pending } = snapshot;
         // Catch up from the last capture after a failed pass or downtime instead of dropping that activity.
         const windowStart = watermark.lastCapturedAtMs > 0
             ? Math.min(startedAt - lookback * 60_000, watermark.lastCapturedAtMs) : startedAt - lookback * 60_000;
         const excerpts = readExcerpts(options, windowStart, startedAt, watermark.sessionMaxSeq, signal);
         sessions = excerpts.length;
-        const usageJson = () => usage ? JSON.stringify(usage) : undefined;
-        const finish = (captured, publish) => {
-            signal.throwIfAborted();
-            if (!claim)
-                return;
-            const held = claim;
-            workStore.commitWithDomain(held, { nextDueAt: targetDueAt, keepArtifact: true, usageJson: usageJson(), now: now() }, () => {
-                publish?.();
-                if (captured)
-                    workStore.stageArtifact(held, { stage: "watermark", artifactJson: JSON.stringify(captured), now: now() });
-            });
-            claim = undefined;
-            nextDueAt = targetDueAt;
-        };
         if (!sessions) {
             finish(pending ? watermark : undefined);
             return result({ status: "empty" });
@@ -341,36 +477,28 @@ export async function runCaptainsLogPass(options) {
             return release("failed", completion.code);
         }
         const sequences = Object.fromEntries(excerpts.map(({ sessionId, maxSeq }) => [sessionId, maxSeq]));
-        const oneLine = (text) => redactSecrets(text).replace(/\s+/gu, " ").trim();
-        const orderedEntries = completion.data.shouldAppend
-            ? [...completion.data.entries.filter(entry => entry.blocked === true),
-                ...completion.data.entries.filter(entry => entry.blocked !== true)]
-            : [];
-        const bullets = orderedEntries.flatMap(entry => {
-            const rawTopic = oneLine(entry.topic), summary = oneLine(entry.summary);
-            if (!rawTopic || !summary)
-                return [];
-            const topic = entry.blocked === true && !/^\[BLOCKED\](?:[\s:]|$)/iu.test(rawTopic)
-                ? `[BLOCKED] ${rawTopic}` : rawTopic;
-            return [`- **${topic}:** ${summary}`];
-        });
-        if (!bullets.length) {
+        const entries = completion.data.shouldAppend ? captureEntries(completion.data.entries, excerpts) : [];
+        if (!entries.length) {
             finish(applyCapture(watermark, startedAt, sequences));
             return result({ status: "no_append", ...(completion.data.skipReason ? { skipReason: oneLine(completion.data.skipReason) } : {}) });
         }
+        const bullets = entries.map(({ topic, summary, blocked }) => `- **${blocked ? "[BLOCKED] " : ""}${topic}:** ${summary}`);
         const section = `${LOG_HEADING}${stamp.time})\n\n${bullets.join("\n")}\n`;
         const markdown = `\n\n${section}`;
         if (!claim)
             return result({ status: "preview", filePath, markdown });
-        // Files and SQLite cannot commit atomically together. Stage only a fingerprint and the proposed delta:
-        // on a crash after O_APPEND the exact section proves which sequences were already published.
+        // Files and SQLite cannot commit atomically together. Stage the fingerprint and redacted ledger delta
+        // before appending so the exact Markdown section can prove which entries and sequences to commit on retry.
         const digest = hash(section);
         const receipt = { day: stamp.day, hash: digest, sectionChars: section.length,
             priorMatches: sectionMatches(rawExisting, digest, section.length),
-            capturedAtMs: startedAt, sessionMaxSeq: sequences };
+            capturedAtMs: startedAt, sessionMaxSeq: sequences, entries };
         signal.throwIfAborted();
         workStore.stageArtifact(claim, { stage: "pending_append", artifactJson: JSON.stringify({ ...watermark, pendingAppend: receipt }), now: now() });
-        finish(applyCapture(watermark, startedAt, sequences, receipt.hash), () => appendDaily(workspaceDir, stamp.day, filePath, markdown));
+        finish(applyCapture(watermark, startedAt, sequences, receipt.hash), db => {
+            persistEntries(db, agentId, receipt);
+            appendDaily(workspaceDir, stamp.day, filePath, markdown);
+        });
         return result({ status: "appended", filePath, markdown });
     }
     catch (error) {

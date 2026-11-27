@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
@@ -7,8 +9,10 @@ import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import { DEFAULTS } from "./defaults.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
+import { runOutcomeLedgerPass, summarizeOutcomeMetrics, type OutcomeLedgerPassResult } from "./outcome-ledger.js";
+import { responseCohort } from "./response-audit.js";
 import { resolveTimezone } from "./session-projector.js";
-import { runCaptainsLogPass, type CaptainsLogPassResult } from "./steward-captains-log.js";
+import { listOpenBlockers, runCaptainsLogPass, type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
 import {
   buildPeopleShadowReport,
@@ -54,7 +58,7 @@ type StewardRuntimeOptions = {
   config: StewardConfig;
   /** Full plugin config (needed by publish-mode People Learning inventory and Captain's Log). */
   pluginConfig?: UnblockMemoryConfig;
-  /** Lazily built on the first background tick; undefined skips background work without error. */
+  /** Lazily built on the first background tick; undefined skips model-backed work (the Outcome Ledger still runs). */
   createRunner(): Pick<StewardRunner, "complete"> | undefined;
   /** Test seam; defaults to a dedicated `WorkStore` connection on the agent's memory database. */
   openWorkStore?(dbPath: string): WorkStore;
@@ -85,6 +89,12 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
   let running: Promise<void> | undefined;
   const lastResults = new Map<string, PeopleShadowPassResult>();
   const lastCaptainsLogResults = new Map<string, CaptainsLogPassResult>();
+  const lastOutcomeLedgerResults = new Map<string, OutcomeLedgerPassResult>();
+  const outcomeLedger = options.config.outcomeLedger;
+  // Same cohort Response Audit writes, so outcomes never mix verdicts from another judge configuration.
+  const outcomeCohort = options.pluginConfig?.responseAudit.enabled
+    ? responseCohort(options.pluginConfig.responseAudit, options.pluginConfig.decisionModel.model, options.pluginConfig.decisionModel.endpoint)
+    : undefined;
 
   const tick = (): Promise<void> => {
     if (running) return running;
@@ -97,7 +107,12 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
       let runner: Pick<StewardRunner, "complete"> | undefined;
       try {
         runner = options.createRunner();
-        agents = runner ? listAgents(api.config) : [];
+      } catch (error) {
+        // The deterministic Outcome Ledger needs no model; keep closing the loop without a runner.
+        if (!signal.aborted) api.logger.warn(`unblock-memory steward: ${String(error)}`);
+      }
+      try {
+        agents = runner || outcomeLedger.enabled ? listAgents(api.config) : [];
       } catch (error) {
         // `void tick()` must never surface an unhandled rejection.
         if (!signal.aborted) api.logger.warn(`unblock-memory steward: ${String(error)}`);
@@ -114,7 +129,24 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
           const dbPath = dbPathForAgent(agentId);
           store = openWorkStore(dbPath);
           openStores.add(store);
-          if (options.config.peopleShadow.enabled && runner) {
+          if (outcomeLedger.enabled) {
+            try {
+              lastOutcomeLedgerResults.set(agentId, await runOutcomeLedgerPass({
+                agentId, owner, workStore: store, signal,
+                intervalMinutes: outcomeLedger.intervalMinutes,
+                lookbackMs: outcomeLedger.lookbackMs,
+                maxRowsPerPass: outcomeLedger.maxRowsPerPass,
+                matchWindowMs: outcomeLedger.matchWindowMs,
+                retentionDays: outcomeLedger.retentionDays,
+                ...(options.pluginConfig ? { baselineMinInteractions: options.pluginConfig.insideOut.baselineMinInteractions } : {}),
+                ...(outcomeCohort ? { responseCohort: outcomeCohort } : {}),
+              }));
+            } catch (error) {
+              // Isolated: a ledger fault must not skip this agent's model-backed passes.
+              if (!signal.aborted) api.logger.warn(`unblock-memory steward outcome ledger (${agentId}): ${String(error)}`);
+            }
+          }
+          if (options.config.peopleShadow.enabled && runner && !signal.aborted) {
             lastResults.set(agentId, await runPeopleShadowPass({
               mode: options.config.peopleShadow.mode,
               ...(inventoryContext ? { inventoryContext } : {}),
@@ -122,6 +154,11 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
               maxHandles: options.config.peopleShadow.maxHandles,
               maxExcerptChars: options.config.peopleShadow.maxExcerptChars,
               maxExportBytes: options.config.peopleShadow.maxExportBytes,
+              ...(options.config.peopleShadow.includeInteractionLearning === undefined ? {}
+                : { includeInteractionLearning: options.config.peopleShadow.includeInteractionLearning }),
+              maxNewClaimsPerPerson: options.config.peopleShadow.maxNewClaimsPerPerson,
+              maxInteractionHandles: options.config.peopleShadow.maxInteractionHandles,
+              includeResponseAudit: options.config.peopleShadow.includeResponseAudit,
               dbPath, agentId, workStore: store, runner, owner, signal,
               maxItems: options.config.peopleShadow.maxItemsPerRun, timeoutMs: options.config.peopleShadow.timeoutMs,
             }));
@@ -175,7 +212,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
   };
 
   const enabled = api.registrationMode !== "cli-metadata" && options.config.enabled &&
-    (options.config.peopleShadow.enabled || options.config.captainsLog.enabled);
+    (options.config.peopleShadow.enabled || options.config.captainsLog.enabled || outcomeLedger.enabled);
   if (enabled) {
     api.on("gateway_start", () => {
       if (timer) clearInterval(timer);
@@ -183,6 +220,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
       const intervals: number[] = [];
       if (options.config.peopleShadow.enabled) intervals.push(options.config.peopleShadow.intervalMinutes);
       if (options.config.captainsLog.enabled) intervals.push(options.config.captainsLog.intervalMinutes);
+      if (outcomeLedger.enabled) intervals.push(outcomeLedger.intervalMinutes);
       const intervalMs = Math.max(1, Math.min(...intervals)) * 60_000;
       timer = setInterval(() => { void tick(); }, intervalMs);
       timer.unref();
@@ -196,6 +234,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
     stop,
     lastResults: () => new Map(lastResults),
     lastCaptainsLogResults: () => new Map(lastCaptainsLogResults),
+    lastOutcomeLedgerResults: () => new Map(lastOutcomeLedgerResults),
     enabled,
   };
 }
@@ -227,6 +266,17 @@ function registerStewardCli(
     const store = openWorkStore(dbPath);
     try { return fn(store); } finally { store.close(); }
   };
+  /**
+   * Reporting never creates or migrates the database. An absent file reads as an empty in-memory
+   * database; readers already treat missing tables as empty.
+   */
+  const withReadOnlyDb = <T>(dbPath: string, fn: (db: DatabaseSync) => T): T => {
+    const db = existsSync(dbPath) ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(":memory:");
+    try {
+      db.exec(`PRAGMA busy_timeout=${DEFAULTS.sqlite.mainBusyTimeoutMs}`);
+      return fn(db);
+    } finally { db.close(); }
+  };
   api.registerCli(({ program, config: cfg }) => {
     const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, re-drive");
     root.command("status").description("Work item counts by kind/status plus the quarantined backlog")
@@ -241,6 +291,7 @@ function registerStewardCli(
             peopleShadow: options.config.peopleShadow.enabled,
             peopleMode: options.config.peopleShadow.mode,
             captainsLog: options.config.captainsLog.enabled,
+            outcomeLedger: options.config.outcomeLedger.enabled,
             counts: summarize(items),
             quarantined: items.filter(item => item.status === "quarantined")
               .map(({ kind, scope, strikes, lastError }) => ({ kind, scope, strikes, lastError })),
@@ -281,8 +332,44 @@ function registerStewardCli(
           console.log(JSON.stringify(result, null, 2));
         } finally { store.close(); }
       });
+    root.command("outcomes").description("Outcome Ledger KPIs: whisper use, skill opens, shortfalls, by recipe (read-only)")
+      .option("--agent <id>", "Agent id", "main").option("--since-hours <n>", "Only exposures from the last n hours")
+      .option("--recipe <hash>", "Only one retrieval recipe hash")
+      .action((opts: { agent: string; sinceHours?: string; recipe?: string }) => {
+        const sinceHours = opts.sinceHours === undefined ? undefined : Number(opts.sinceHours);
+        if (sinceHours !== undefined && !(Number.isFinite(sinceHours) && sinceHours > 0)) {
+          throw new Error("--since-hours must be a positive number");
+        }
+        const recipeHash = opts.recipe?.trim();
+        if (opts.recipe !== undefined && !recipeHash) throw new Error("--recipe must be a non-empty hash");
+        const dbPath = knownAgent(cfg, opts.agent);
+        withReadOnlyDb(dbPath, db => {
+          console.log(JSON.stringify({
+            agentId: opts.agent,
+            ...(sinceHours === undefined ? {} : { sinceHours }),
+            ...(recipeHash ? { recipeHash } : {}),
+            ...summarizeOutcomeMetrics(db, {
+              agentId: opts.agent,
+              ...(sinceHours === undefined ? {} : { sinceMs: Date.now() - Math.round(sinceHours * 3_600_000) }),
+              ...(recipeHash ? { recipeHash } : {}),
+            }),
+          }, null, 2));
+        });
+      });
+    root.command("blockers").description("Open [BLOCKED] Captain's Log entries, newest first (read-only)")
+      .option("--agent <id>", "Agent id", "main").option("--limit <n>", "Maximum entries (0 = unlimited)", "0")
+      .action((opts: { agent: string; limit: string }) => {
+        const limit = Number(opts.limit);
+        if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("--limit must be a non-negative integer");
+        const dbPath = knownAgent(cfg, opts.agent);
+        withReadOnlyDb(dbPath, db => {
+          const blockers = listOpenBlockers(db, opts.agent, limit);
+          console.log(JSON.stringify({ agentId: opts.agent, count: blockers.length, blockers }, null, 2));
+        });
+      });
     root.command("requeue").description("Explicitly re-drive one quarantined or completed work item")
-      .requiredOption("--scope <scope>", "Exact work scope").option("--kind <kind>", "Work kind", PEOPLE_SHADOW_KIND)
+      .requiredOption("--scope <scope>", "Exact work scope")
+      .option("--kind <kind>", "Work kind (e.g. people_shadow, people_interactions, captains_log, outcome_ledger)", PEOPLE_SHADOW_KIND)
       .option("--agent <id>", "Agent id", "main")
       .action((opts: { agent: string; kind: string; scope: string }) => {
         const dbPath = knownAgent(cfg, opts.agent);
@@ -296,5 +383,5 @@ function registerStewardCli(
           console.log(JSON.stringify({ status: "requeued", item: store.get(opts.kind, opts.scope) }, null, 2));
         });
       });
-  }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report and Captain's Log", hasSubcommands: true }] });
+  }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report, Captain's Log, outcomes and blockers", hasSubcommands: true }] });
 }

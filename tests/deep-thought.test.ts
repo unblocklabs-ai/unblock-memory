@@ -21,6 +21,7 @@ import { resolveStewardConfig } from "../src/steward-config.js";
 import { createStewardRunner, type StewardRunner, type StewardRunRequest, type StewardRunResult, type StewardUsage } from "../src/steward-runner.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { PeopleStores, type PersonDossier } from "../src/people-store.js";
+import { DeepThoughtStore } from "../src/deep-thought-store.js";
 
 // Compile-time proof the real runtime satisfies the curator's structural contract.
 const _runtimeCompat: (runtime: QmdMemoryRuntime) => DeepThoughtRuntime = runtime => runtime;
@@ -587,4 +588,333 @@ test("async jobId handoff: returns running past syncWaitMs, isolates caller, col
   const cancelled = await execute(cancelTool, { jobId: started.jobId, cancel: true });
   assert.equal(cancelled.status, "cancelled");
   assert.equal(activeDeepThoughts(), 0);
+});
+
+/* ───────────── Step 1B: durable jobs + generation-keyed derived observations ───────────── */
+
+function storeFixture(t: { after(fn: () => void): void }) {
+  const dir = mkdtempSync(join(tmpdir(), "deep-thought-durable-"));
+  const path = join(dir, "unblock-memory-test.sqlite");
+  const opened: DeepThoughtStore[] = [];
+  const open = () => { const store = new DeepThoughtStore(path); opened.push(store); return store; };
+  t.after(() => { for (const store of opened) store.close(); rmSync(dir, { recursive: true, force: true }); });
+  return { path, open };
+}
+
+const GROUNDED = [
+  [{ call: "search_memory", args: { bm25Query: "launch", vectorQuery: "launch date" } }],
+  { submit: () => ({ answer: "The launch moved to Friday.", confidence: "high" as const, openQuestions: ["Retro?"],
+    citations: [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }] }) },
+] satisfies ScriptStep[];
+
+test("durable jobs: a completed jobId is collectible after a simulated restart, owner-fenced, and retention 0 never expires", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const fixture = storeFixture(t);
+  const { runtime } = fakeRuntime();
+  let finish!: () => void;
+  const done = new Promise<void>(resolve => { finish = resolve; });
+  const slow: RunRunner = {
+    async run<T>(request: StewardRunRequest<T>): Promise<StewardRunResult<T>> {
+      await request.tools.find(tool => tool.name === "search_memory")!.execute({ bm25Query: "launch", vectorQuery: "launch" }, request.signal!);
+      await done;
+      return { ok: true, status: "complete", summary: "Friday.", turns: 2, toolCalls: 1, usage: { requests: 2 },
+        data: { answer: "Friday.", confidence: "high", citations: [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }] } as T };
+    },
+  };
+  const config: DeepThoughtConfig = { ...CONFIG, timeoutMs: 0, syncWaitMs: 20, jobRetentionMs: 0 };
+  const store = fixture.open();
+  const running = await execute(createDeepThoughtTool(toolContext(), deps(runtime, slow, { config, store })), { question: "Deep question?" });
+  assert.equal(running.status, "running");
+  const persisted = store.getJob(running.jobId!)!;
+  assert.equal(persisted.status, "running");
+  assert.equal(persisted.toolCallsUsed, 1, "tool-call progress is persisted while running");
+  assert.equal(persisted.lastTool, "search_memory");
+  finish();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(store.getJob(running.jobId!)!.status, "complete");
+  assert.equal(store.getJob(running.jobId!)!.expiresAt, undefined, "jobRetentionMs 0 = unlimited: no expiry");
+
+  // Simulated restart: in-process registry is gone, a new connection opens the same database.
+  cancelAllDeepThoughtJobs();
+  const reopened = fixture.open();
+  const restarted = (ctx = toolContext()) => createDeepThoughtTool(ctx, deps(runtime, slow, { config, store: reopened }));
+  const collected = await execute(restarted(), { jobId: running.jobId });
+  assert.equal(collected.status, "complete");
+  assert.equal(collected.jobId, running.jobId);
+  assert.equal(collected.answer, "Friday.");
+  assert.deepEqual(collected.citations.map(c => c.source), ["qmd://memory/launch.md"]);
+  const intruder = await execute(restarted(toolContext({ sessionKey: "agent:main:slack:direct:u2" })), { jobId: running.jobId });
+  assert.equal(intruder.status, "invalid_request", "another session cannot collect a persisted job");
+  assert.equal((await execute(restarted(toolContext({ agentAccountId: "acct-b" })), { jobId: running.jobId })).status, "invalid_request");
+  assert.equal((await execute(restarted(), { jobId: running.jobId, cancel: true })).status, "complete", "cancel on a finished job returns it…");
+  assert.equal((await execute(restarted(), { jobId: running.jobId })).status, "invalid_request", "…and forgets it");
+  assert.equal(activeDeepThoughts(), 0);
+});
+
+test("durable jobs: a running job orphaned by a restart is recovered as cancelled instead of hanging forever", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const fixture = storeFixture(t);
+  const { runtime } = fakeRuntime();
+  const hanging: RunRunner = {
+    run: request => new Promise(resolve => {
+      request.signal!.addEventListener("abort", () => resolve({ ok: false, code: "aborted", error: "Steward aborted", retryable: false,
+        usage: { requests: 1 }, turns: 1, toolCalls: 0 }), { once: true });
+    }),
+  };
+  const config: DeepThoughtConfig = { ...CONFIG, timeoutMs: 0, syncWaitMs: 20, jobRetentionMs: 60_000 };
+  const running = await execute(createDeepThoughtTool(toolContext(), deps(runtime, hanging, { config, store: fixture.open() })),
+    { question: "Never finishes" });
+  assert.equal(running.status, "running");
+
+  // Simulate a hard crash: the process-global registry loses the job while the database still says running.
+  const registry = (globalThis as Record<symbol, Map<string, { controller: AbortController; promise: Promise<unknown> }>>)[
+    Symbol.for("unblock-memory.deepThought.jobs")]!;
+  const orphan = registry.get(running.jobId!)!;
+  registry.delete(running.jobId!);
+  t.after(async () => { orphan.controller.abort(); await orphan.promise; });
+
+  const reopened = fixture.open();
+  const polled = await execute(createDeepThoughtTool(toolContext(), deps(runtime, hanging, { config, store: reopened })), { jobId: running.jobId });
+  assert.equal(polled.status, "cancelled");
+  assert.equal(polled.jobId, running.jobId);
+  assert.match(polled.note ?? "", /interrupted when the Gateway restarted/u);
+  assert.equal(reopened.getJob(running.jobId!)!.status, "cancelled");
+  assert.ok(reopened.getJob(running.jobId!)!.expiresAt! > Date.now(), "recovered record honors jobRetentionMs");
+});
+
+test("derived observations: repeat asks are served cached in 0 hops; generation advance, ACL and fresh: true all re-run", async t => {
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("no network in tests"); });
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime, recorded } = fakeRuntime();
+  const { runner, requests } = scriptedRunner(GROUNDED);
+  const generations: Record<string, number> = { memory: 3, sessions: 7 };
+  const generationCalls: (readonly string[])[] = [];
+  const getCollectionGenerations = (corpora: readonly string[]) => {
+    generationCalls.push([...corpora]);
+    return Object.fromEntries(corpora.map(name => [name, generations[name]!]));
+  };
+  const tool = (ctx = toolContext(), extra: Partial<DeepThoughtDeps> = {}) =>
+    createDeepThoughtTool(ctx, deps(runtime, runner, { store, getCollectionGenerations, ...extra }));
+
+  const first = await execute(tool(), { question: "When did the launch move?" });
+  assert.equal(first.status, "complete");
+  assert.equal(first.cached, undefined);
+  assert.ok(first.derivedObservationId, "a verified complete answer is saved");
+  assert.equal(requests.length, 1);
+
+  const searchesBefore = recorded.searches.length;
+  const cached = await execute(tool(), { question: "  when did the LAUNCH move " });
+  assert.equal(cached.status, "complete");
+  assert.equal(cached.cached, true);
+  assert.equal(cached.derivedObservationId, first.derivedObservationId);
+  assert.equal(cached.answer, "The launch moved to Friday.");
+  assert.equal(cached.confidence, "high");
+  assert.deepEqual(cached.citations, first.citations);
+  assert.deepEqual(cached.openQuestions, ["Retro?"]);
+  assert.equal(cached.hopsUsed, 0);
+  assert.equal(cached.toolCallsUsed, 0);
+  assert.equal(cached.usage, undefined, "no model usage");
+  assert.equal(requests.length, 1, "zero model calls");
+  assert.equal(recorded.searches.length, searchesBefore, "zero memory searches");
+  assert.equal(store.getDerivedObservation(first.derivedObservationId!)!.hitCount, 1);
+  assert.deepEqual(generationCalls.at(-1), ["memory", "sessions"], "generations are requested for the approved corpora");
+
+  // ACL: another session's audience and a different corpora set never see this answer.
+  const otherSession = await execute(tool(toolContext({ sessionKey: "agent:main:slack:direct:u2" })), { question: "When did the launch move?" });
+  assert.equal(otherSession.cached, undefined);
+  assert.equal(requests.length, 2);
+  const narrowed = await execute(tool(), { question: "When did the launch move?", corpora: ["memory"] });
+  assert.equal(narrowed.cached, undefined);
+  assert.equal(requests.length, 3);
+  const focused = await execute(tool(), { question: "When did the launch move?", focus: "who decided" });
+  assert.equal(focused.cached, undefined, "a different focus is a different investigation");
+  assert.equal(requests.length, 4);
+
+  // Advancing ANY searched collection's generation invalidates and re-runs.
+  generations.sessions = 8;
+  const advanced = await execute(tool(), { question: "When did the launch move?" });
+  assert.equal(advanced.cached, undefined);
+  assert.equal(requests.length, 5);
+  assert.equal(store.getDerivedObservation(first.derivedObservationId!)!.status, "stale");
+  assert.notEqual(advanced.derivedObservationId, first.derivedObservationId);
+  assert.equal((await execute(tool(), { question: "When did the launch move?" })).cached, true, "the re-run answer now serves");
+  assert.equal(requests.length, 5);
+
+  // fresh: true bypasses the cache and supersedes the served row.
+  const forced = await execute(tool(), { question: "When did the launch move?", fresh: true });
+  assert.equal(forced.cached, undefined);
+  assert.equal(requests.length, 6);
+  assert.equal(store.getDerivedObservation(advanced.derivedObservationId!)!.status, "superseded");
+  assert.equal(store.getDerivedObservation(forced.derivedObservationId!)!.status, "fresh");
+
+  // bypassCache dep never serves (but still saves).
+  const bypassed = await execute(tool(toolContext(), { bypassCache: true }), { question: "When did the launch move?" });
+  assert.equal(bypassed.cached, undefined);
+  assert.equal(requests.length, 7);
+
+  // A shared audienceKey resolver deliberately lets two sessions share answers.
+  const team = { audienceKey: () => "team:acct-a" };
+  await execute(tool(toolContext(), team), { question: "Team question?" });
+  const shared = await execute(tool(toolContext({ sessionKey: "agent:main:slack:direct:u2" }), team), { question: "Team question?" });
+  assert.equal(shared.cached, true);
+  assert.equal(requests.length, 8);
+
+  const fresh = store.listDerivedObservations({ agentId: "main", status: "fresh", limit: 0 });
+  assert.ok(fresh.every(row => Object.keys(row.collectionGenerations).length > 0));
+  assert.equal(new Set(fresh.map(row => `${row.questionHash}|${row.audienceKey}|${row.corpora.join(",")}`)).size, fresh.length,
+    "one fresh row per exact key");
+});
+
+test("derived observations are never saved or served without generations, and never for fabricated-citation answers", async t => {
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime } = fakeRuntime();
+  const { runner, requests } = scriptedRunner(GROUNDED);
+
+  for (const getCollectionGenerations of [undefined, () => ({}), () => { throw new Error("qmd offline"); },
+    async () => ({ memory: -1, sessions: 1 })]) {
+    const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, runner, { store, getCollectionGenerations })),
+      { question: "Uncacheable?" });
+    assert.equal(outcome.status, "complete", "investigation still succeeds");
+    assert.equal(outcome.derivedObservationId, undefined);
+  }
+  assert.equal(requests.length, 4);
+  assert.equal(store.listDerivedObservations({ agentId: "main" }).length, 0);
+
+  const { runner: fabricated } = scriptedRunner([{ submit: () => ({ answer: "Guess.", confidence: "high",
+    citations: [{ source: "qmd://memory/never-seen.md", quote: "x" }] }) }]);
+  const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, fabricated,
+    { store, getCollectionGenerations: async () => ({ memory: 1, sessions: 1 }) })), { question: "Fabricated?" });
+  assert.equal(outcome.status, "complete");
+  assert.equal(outcome.derivedObservationId, undefined, "an answer whose every citation was dropped is never cached");
+  assert.equal(store.listDerivedObservations({ agentId: "main" }).length, 0);
+
+  // Without a store, behavior is the pre-1B in-memory path (nothing persisted, nothing cached).
+  const { runner: plain, requests: plainRequests } = scriptedRunner(GROUNDED);
+  for (let i = 0; i < 2; i += 1) {
+    const result = await execute(createDeepThoughtTool(toolContext(), deps(runtime, plain, { getCollectionGenerations: () => ({ memory: 1 }) })),
+      { question: "No store?" });
+    assert.equal(result.cached, undefined);
+  }
+  assert.equal(plainRequests.length, 2);
+});
+
+test("derived observations are never saved for investigations that used lookup_person or cite nothing", async t => {
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("no network in tests"); });
+  const people = peopleFixture();
+  t.after(people.cleanup);
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime } = fakeRuntime();
+  const getCollectionGenerations = async () => ({ memory: 1, sessions: 1 });
+
+  // Grounded citations, but a People dossier was consulted: it can be revoked without a generation change.
+  const { runner: withPerson, requests: personRequests } = scriptedRunner([
+    [{ call: "search_memory", args: { bm25Query: "launch", vectorQuery: "launch date" } },
+      { call: "lookup_person", args: { query: "Mira" } }],
+    { submit: () => ({ answer: "The launch moved to Friday.", confidence: "high" as const,
+      citations: [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }] }) },
+  ]);
+  const personTool = () => createDeepThoughtTool(toolContext(), deps(runtime, withPerson,
+    { store, getCollectionGenerations, people: { enabled: true, stores: people.stores } }));
+  const first = await execute(personTool(), { question: "Who moved the launch?" });
+  assert.equal(first.status, "complete");
+  assert.equal(first.citations.length, 1);
+  assert.equal(first.derivedObservationId, undefined, "a lookup_person investigation is never cached");
+  const second = await execute(personTool(), { question: "Who moved the launch?" });
+  assert.equal(second.cached, undefined);
+  assert.equal(personRequests.length, 2, "the repeat re-investigates instead of serving stale People facts");
+
+  // A complete answer with zero citations is not grounded evidence.
+  const { runner: uncited } = scriptedRunner([
+    [{ call: "search_memory", args: { bm25Query: "launch", vectorQuery: "launch date" } }],
+    { submit: () => ({ answer: "Probably Friday.", confidence: "medium" as const, citations: [] }) },
+  ]);
+  const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, uncited, { store, getCollectionGenerations })),
+    { question: "Uncited?" });
+  assert.equal(outcome.status, "complete");
+  assert.deepEqual(outcome.citations, []);
+  assert.equal(outcome.derivedObservationId, undefined, "citations: [] is never cached");
+  assert.equal(store.listDerivedObservations({ agentId: "main" }).length, 0);
+});
+
+test("job ownership binds the requester sender and native peer, not just a shared session key", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime } = fakeRuntime();
+  const hanging: RunRunner = {
+    run: request => new Promise(resolve => {
+      request.signal!.addEventListener("abort", () => resolve({ ok: false, code: "aborted", error: "Steward aborted", retryable: false,
+        usage: { requests: 1 }, turns: 1, toolCalls: 0 }), { once: true });
+    }),
+  };
+  const config: DeepThoughtConfig = { ...CONFIG, timeoutMs: 0, syncWaitMs: 20, jobRetentionMs: 60_000 };
+  // dmScope=main: two peers share one session key.
+  const shared = { sessionKey: "agent:main:main" };
+  const tool = (ctx: Partial<OpenClawPluginToolContext>) =>
+    createDeepThoughtTool(toolContext({ ...shared, ...ctx }), deps(runtime, hanging, { config, store }));
+  const alice = { requesterSenderId: "U-alice", nativeChannelId: "D-alice" } as Partial<OpenClawPluginToolContext>;
+  const running = await execute(tool(alice), { question: "Alice's private question" });
+  assert.equal(running.status, "running");
+
+  for (const peer of [{ requesterSenderId: "U-bob", nativeChannelId: "D-alice" }, { requesterSenderId: "U-alice", nativeChannelId: "D-bob" },
+    {}] as Partial<OpenClawPluginToolContext>[]) {
+    assert.equal((await execute(tool(peer), { jobId: running.jobId })).status, "invalid_request", JSON.stringify(peer));
+  }
+  // The durable fallback is fenced the same way after a restart.
+  const registry = (globalThis as Record<symbol, Map<string, { controller: AbortController; promise: Promise<unknown> }>>)[
+    Symbol.for("unblock-memory.deepThought.jobs")]!;
+  const live = registry.get(running.jobId!)!;
+  live.controller.abort();
+  await live.promise;
+  registry.delete(running.jobId!);
+  assert.equal((await execute(tool({ requesterSenderId: "U-bob", nativeChannelId: "D-alice" } as Partial<OpenClawPluginToolContext>),
+    { jobId: running.jobId })).status, "invalid_request");
+  assert.equal((await execute(tool(alice), { jobId: running.jobId })).status, "cancelled", "the owner still collects it");
+});
+
+test("a slow cold generations snapshot still hands off a jobId within syncWaitMs and the job waits for it", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime } = fakeRuntime();
+  const { runner, requests } = scriptedRunner(GROUNDED);
+  let release!: (value: Record<string, number>) => void;
+  const cold = new Promise<Record<string, number>>(resolve => { release = resolve; });
+  const config: DeepThoughtConfig = { ...CONFIG, timeoutMs: 0, syncWaitMs: 30, jobRetentionMs: 60_000 };
+  const tool = createDeepThoughtTool(toolContext(), deps(runtime, runner, { config, store, getCollectionGenerations: () => cold }));
+  const startedAt = performance.now();
+  const running = await execute(tool, { question: "Cold index?" });
+  assert.ok(performance.now() - startedAt < 500, "the caller is not blocked by cold indexing");
+  assert.equal(running.status, "running");
+  assert.ok(running.jobId);
+  assert.equal(requests.length, 0, "the run waits for the pre-run generations snapshot");
+
+  release({ memory: 2, sessions: 5 });
+  const collected = await execute(tool, { jobId: running.jobId });
+  assert.equal(collected.status, "complete");
+  assert.ok(collected.derivedObservationId, "the late snapshot still keys the saved answer");
+  assert.deepEqual(store.getDerivedObservation(collected.derivedObservationId!)!.collectionGenerations, { memory: 2, sessions: 5 });
+});
+
+test("restart recovery retries after a transient markInterruptedJobs failure", async t => {
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime } = fakeRuntime();
+  const { runner } = scriptedRunner(GROUNDED);
+  let calls = 0;
+  const original = store.markInterruptedJobs.bind(store);
+  t.mock.method(store, "markInterruptedJobs", (...args: Parameters<DeepThoughtStore["markInterruptedJobs"]>) => {
+    calls += 1;
+    if (calls === 1) throw new Error("database is locked");
+    return original(...args);
+  });
+  const tool = () => createDeepThoughtTool(toolContext(), deps(runtime, runner, { store }));
+  assert.equal((await execute(tool(), { question: "First?" })).status, "complete");
+  assert.equal((await execute(tool(), { question: "Second?" })).status, "complete");
+  assert.equal(calls, 2, "a failed sweep is retried on the next call");
+  await execute(tool(), { question: "Third?" });
+  assert.equal(calls, 2, "a successful sweep is not repeated");
 });

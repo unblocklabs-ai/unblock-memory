@@ -50,10 +50,14 @@ test("config defaults, nested overrides and strict boundaries", () => {
     peopleShadow: {
       enabled: true, mode: "publish", intervalMinutes: 60, maxItemsPerRun: 0, timeoutMs: 0,
       minConfidence: "medium", maxHandles: 0, maxExcerptChars: 0, maxExportBytes: 0,
+      maxNewClaimsPerPerson: 0, maxInteractionHandles: 0, includeResponseAudit: true,
     },
     captainsLog: {
       enabled: true, intervalMinutes: 180, lookbackMinutes: 190, maxSessionsPerRun: 0,
       maxCharsPerSession: 0, maxExistingLogChars: 0, timeoutMs: 0, excludeChatTypes: ["direct"],
+    },
+    outcomeLedger: {
+      enabled: true, intervalMinutes: 60, lookbackMs: 604_800_000, maxRowsPerPass: 0, matchWindowMs: 1_800_000, retentionDays: 0,
     },
   });
   const overridden = resolveStewardConfig({

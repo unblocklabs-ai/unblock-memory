@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import type { Static } from "typebox";
-import { CAPTAINS_LOG_KIND, CAPTAINS_LOG_SCHEMA, runCaptainsLogPass,
+import { CAPTAINS_LOG_KIND, CAPTAINS_LOG_SCHEMA, listCaptainsLogEntries, listOpenBlockers, resolveCaptainsLogBlocker, runCaptainsLogPass,
   type CaptainsLogPassOptions, type CaptainsLogWatermark } from "../src/steward-captains-log.js";
 import { resolveStewardConfig } from "../src/steward-config.js";
 import { createStewardRunner } from "../src/steward-runner.js";
@@ -185,12 +185,15 @@ test("dry run gives proposed markdown without creating a path or changing any Wo
   assert.equal(preview.nextDueAt, undefined);
   assert.equal(existsSync(f.memoryDir), false);
   assert.equal(f.item(), undefined);
+  assert.equal(f.store.db.prepare("SELECT name FROM sqlite_schema WHERE name='captains_log_entries'").get(), undefined);
+  assert.equal(f.store.db.prepare("SELECT version FROM memory_schema WHERE component='captains_log'").get(), undefined);
   assert.equal((await f.run({ runner: provider(() => noAppend).runner })).status, "no_append");
   const before = f.item();
   f.advance(MINUTE);
   addEvent(f.database(), "preview", 2, START + MINUTE, "assistant", "Release notes are ready.");
   assert.equal((await f.run({ dryRun: true })).status, "preview");
   assert.deepEqual(f.item(), before);
+  assert.deepEqual(listCaptainsLogEntries(f.store.db, { agentId: "main" }), []);
   assert.equal(existsSync(f.memoryDir), false);
 });
 
@@ -207,6 +210,9 @@ test("redacts transcript, existing notes and generated markdown; configured budg
   assert.match(result.markdown, /\[redacted\]/u);
   assert.doesNotMatch(result.markdown, /fixture-output/u);
   assert.doesNotMatch(readFileSync(f.file, "utf8"), /fixture-output/u);
+  const [entry] = listCaptainsLogEntries(f.store.db, { agentId: "main" });
+  assert.equal(entry?.topic, "[redacted]");
+  assert.equal(entry?.summary, "password=[redacted]");
   assert.equal(prompts[0]?.sessions[0]?.messages[0]?.text, "[redacted] shipped Friday");
   assert.equal(prompts[0]?.sessions.length, 1);
   assert.equal(prompts[0]?.sessions[0]?.messages.length, 1);
@@ -295,28 +301,85 @@ test("a superseded attempt cannot append even if the model returns a successful 
   assert.match(readFileSync(f.file, "utf8"), /Approved the Friday release/u);
   assert.doesNotMatch(readFileSync(f.file, "utf8"), /Stale/u);
   assert.deepEqual(f.artifact()?.sessionMaxSeq, { work: 1 });
+  assert.deepEqual(listCaptainsLogEntries(f.store.db, { agentId: "main" }).map(entry => entry.topic), ["Release"]);
 });
 
 test("recovers an appended section after the watermark transaction rolled back, even across local midnight", async t => {
+  for (const legacy of [false, true]) await t.test(legacy ? "legacy receipt" : "structured receipt", async t => {
+    const f = fixture(t);
+    const db = f.store.db;
+    f.seed("work", "Approved the Friday release.");
+    failFinalWatermark(db);
+    const first = await f.run();
+    assert.equal(first.status, "failed");
+    assert.match(first.reason, /synthetic post-append failure/u);
+    assert.deepEqual(f.artifact()?.sessionMaxSeq, {});
+    assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main" }), []);
+    const published = readFileSync(f.file, "utf8");
+    assert.match(published, /Approved the Friday release/u);
+    db.exec("DROP TRIGGER fail_final_watermark");
+    if (legacy) db.exec("UPDATE work_items SET artifact_json=json_remove(artifact_json, '$.pendingAppend.entries')");
+    const pendingJson = f.item()?.artifactJson;
+    assert.ok(pendingJson);
+    f.advance(INTERVAL);
+    assert.equal((await f.run({ dryRun: true })).status, "empty");
+    assert.equal(f.item()?.artifactJson, pendingJson);
+    assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main" }), []);
+    assert.equal((await f.run()).status, "empty");
+    assert.equal(f.prompts.length, 1);
+    assert.equal(readFileSync(f.file, "utf8"), published);
+    assert.equal(existsSync(join(f.memoryDir, "2026-11-27.md")), false);
+    assert.deepEqual(f.artifact()?.sessionMaxSeq, { work: 1 });
+    assert.equal(f.artifact()?.lastCapturedAtMs, START);
+    assert.equal(f.item()?.strikes, 0);
+    const rows = listCaptainsLogEntries(db, { agentId: "main" });
+    if (legacy) {
+      assert.deepEqual(rows, []);
+    } else {
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]?.sectionHash, f.artifact()?.lastEntryHash);
+      assert.equal(rows[0]?.day, "2026-11-26");
+      assert.equal(rows[0]?.capturedAtMs, START);
+      assert.deepEqual(rows[0]?.sessionRefs, ["work"]);
+      // Replaying the same already-committed receipt must not produce a second row or change its ID.
+      db.prepare("UPDATE work_items SET stage='pending_append', artifact_json=? WHERE kind=? AND scope=?")
+        .run(pendingJson, CAPTAINS_LOG_KIND, "main");
+      f.advance(INTERVAL);
+      assert.equal((await f.run()).status, "empty");
+      assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main" }), rows);
+    }
+  });
+});
+
+function failFinalWatermark(db: DatabaseSync, afterMs = 0): void {
+  db.exec(`CREATE TRIGGER fail_final_watermark BEFORE UPDATE OF stage ON work_items
+    WHEN NEW.stage = 'watermark' AND json_extract(NEW.artifact_json, '$.lastCapturedAtMs') > ${afterMs}
+    BEGIN SELECT RAISE(ABORT, 'synthetic post-append failure'); END`);
+}
+
+test("a second post-append crash cannot overwrite an already-published section's recovery data", async t => {
   const f = fixture(t);
-  f.seed("work", "Approved the Friday release.");
-  f.store.db.exec(`CREATE TRIGGER fail_final_watermark BEFORE UPDATE OF stage ON work_items
-    WHEN NEW.stage = 'watermark' BEGIN SELECT RAISE(ABORT, 'synthetic post-append failure'); END`);
-  const first = await f.run();
-  assert.equal(first.status, "failed");
-  assert.match(first.reason, /synthetic post-append failure/u);
-  assert.deepEqual(f.artifact()?.sessionMaxSeq, {});
-  const published = readFileSync(f.file, "utf8");
-  assert.match(published, /Approved the Friday release/u);
-  f.store.db.exec("DROP TRIGGER fail_final_watermark");
+  const db = f.store.db;
+  f.seed("release", "Approved the Friday release.");
+  failFinalWatermark(db);
+  assert.equal((await f.run()).status, "failed");
+  db.exec("DROP TRIGGER fail_final_watermark");
+
+  f.advance(INTERVAL);
+  f.seed("rollback", "Rolled back the cache config.", "channel", START + INTERVAL - MINUTE);
+  failFinalWatermark(db, START);
+  const { runner } = provider(() => ({ shouldAppend: true, entries: [{ topic: "Rollback", summary: "Rolled back the cache config." }] }));
+  const second = await f.run({ runner });
+  assert.equal(second.status, "failed");
+  assert.match(second.reason, /synthetic post-append failure/u);
+  assert.deepEqual(f.artifact()?.sessionMaxSeq, { release: 1 });
+  assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main" }).map(row => row.topic), ["Release"]);
+
+  db.exec("DROP TRIGGER fail_final_watermark");
   f.advance(INTERVAL);
   assert.equal((await f.run()).status, "empty");
-  assert.equal(f.prompts.length, 1);
-  assert.equal(readFileSync(f.file, "utf8"), published);
-  assert.equal(existsSync(join(f.memoryDir, "2026-11-27.md")), false);
-  assert.deepEqual(f.artifact()?.sessionMaxSeq, { work: 1 });
-  assert.equal(f.artifact()?.lastCapturedAtMs, START);
-  assert.equal(f.item()?.strikes, 0);
+  assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main" }).map(row => row.topic), ["Rollback", "Release"]);
+  assert.deepEqual(f.artifact()?.sessionMaxSeq, { release: 1, rollback: 1 });
 });
 
 function addRawMessage(db: DatabaseSync, sessionId: string, seq: number, at: number, message: Record<string, unknown>) {
@@ -368,8 +431,9 @@ test("a failed pass retries within 15 minutes and later catches up from the wate
   assert.deepEqual(f.artifact()?.sessionMaxSeq, { early: 1, late: 1 });
 });
 
-test("includes sanitized channel context for channels/groups only and sorts active blockers first with [BLOCKED]", async t => {
+test("appends ordered, queryable entries with sanitized channel context and resolvable blockers", async t => {
   const f = fixture(t);
+  const db = f.store.db;
   f.seed("slack-named", "Policy requires approval for saved ads.", "channel", START - 4 * MINUTE);
   f.database().exec("UPDATE conversations SET label='slack:unblock-labs-#fga-unblocklabs' WHERE conversation_id='conversation-slack-named'");
   f.seed("slack-opaque", "Cleared disk caches.", "channel", START - 3 * MINUTE);
@@ -378,30 +442,62 @@ test("includes sanitized channel context for channels/groups only and sorts acti
   f.database().exec("UPDATE conversations SET label='loggie:g-unblock-labs-weekly-standup' WHERE conversation_id='conversation-loggie-group'");
   f.seed("dm-private", "Private check-in.", "direct", START - MINUTE);
   f.database().exec("UPDATE conversations SET label='DM with Alice #secret-channel' WHERE conversation_id='conversation-dm-private'");
+  f.seed("credential-label", "Recovered the queue.", "channel", START - 30_000);
+  f.database().exec("UPDATE conversations SET label='slack:password=fixture-label-secret' WHERE conversation_id='conversation-credential-label'");
 
   const { runner, prompts } = provider(() => ({
     shouldAppend: true,
     entries: [
       { topic: "Blastoise RAM upgrade", summary: "Host reports 235.5 GiB usable RAM." },
-      { topic: "Loggie monthly quota", summary: "Exhausted 350,000-request cap; automations halted.", blocked: true },
+      { topic: "Loggie monthly quota", summary: "Exhausted 350,000-request cap; automations halted.", blocked: true,
+        sessionRefs: ["s1", "s1", "s2", "s3", "s4", "s5", "s99", "s01", "slack-named"] },
       { topic: "Mobile Shop menu", summary: "Published CSS scroll fix.", blocked: false },
-      { topic: "[BLOCKED] Email-agent sign-in", summary: "Daily sign-in failed with unrecognised-signin.", blocked: true },
+      { topic: "[BLOCKED]: Email-agent sign-in", summary: "Daily sign-in failed with unrecognised-signin.", blocked: true },
     ],
   }));
 
-  const preview = await f.run({ dryRun: true, excludeChatTypes: [], runner });
-  assert.equal(preview.status, "preview");
+  const result = await f.run({ excludeChatTypes: [], runner });
+  assert.equal(result.status, "appended");
   assert.deepEqual(prompts[0]?.sessions.map(s => ({ chatType: s.chatType, channel: s.channel })), [
     { chatType: "channel", channel: "#fga-unblocklabs" },
     { chatType: "channel", channel: undefined },
     { chatType: "group", channel: "unblock-labs-weekly-standup" },
     { chatType: "direct", channel: undefined },
+    { chatType: "channel", channel: undefined },
   ]);
-  const lines = preview.markdown.trim().split("\n").filter(l => l.startsWith("- "));
+  const lines = readFileSync(f.file, "utf8").trim().split("\n").filter(l => l.startsWith("- "));
   assert.deepEqual(lines, [
     "- **[BLOCKED] Loggie monthly quota:** Exhausted 350,000-request cap; automations halted.",
     "- **[BLOCKED] Email-agent sign-in:** Daily sign-in failed with unrecognised-signin.",
     "- **Blastoise RAM upgrade:** Host reports 235.5 GiB usable RAM.",
     "- **Mobile Shop menu:** Published CSS scroll fix.",
   ]);
+  assert.equal(db.prepare("SELECT version FROM memory_schema WHERE component='captains_log'").get()?.version, 1);
+  const rows = listCaptainsLogEntries(db, { agentId: "main", day: "2026-11-26", sinceMs: START, limit: 0 });
+  assert.deepEqual(rows.map(({ sectionHash, ordinal, topic, blocked }) => ({ sectionHash, ordinal, topic, blocked })), [
+    { sectionHash: f.artifact()?.lastEntryHash, ordinal: 0, topic: "Loggie monthly quota", blocked: true },
+    { sectionHash: f.artifact()?.lastEntryHash, ordinal: 1, topic: "Email-agent sign-in", blocked: true },
+    { sectionHash: f.artifact()?.lastEntryHash, ordinal: 2, topic: "Blastoise RAM upgrade", blocked: false },
+    { sectionHash: f.artifact()?.lastEntryHash, ordinal: 3, topic: "Mobile Shop menu", blocked: false },
+  ]);
+  const [quota, signIn, upgrade] = rows;
+  assert.ok(quota && signIn && upgrade);
+  assert.deepEqual(quota.sessionRefs, ["slack-named", "slack-opaque", "loggie-group", "dm-private", "credential-label"]);
+  assert.deepEqual(quota.channels, ["#fga-unblocklabs", "unblock-labs-weekly-standup"]);
+  assert.deepEqual(signIn.channels, []);
+  assert.deepEqual(signIn.sessionRefs, []);
+  assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main", sinceMs: START + 1 }), []);
+  assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main", day: "2026-11-27" }), []);
+
+  assert.deepEqual(listOpenBlockers(db, "main"), [quota, signIn]);
+  assert.deepEqual(listOpenBlockers(db, "main", 1), [quota]);
+  assert.deepEqual(listOpenBlockers(db, "other"), []);
+  assert.equal(resolveCaptainsLogBlocker(db, { agentId: "other", id: quota.id }), false);
+  assert.equal(resolveCaptainsLogBlocker(db, { agentId: "main", id: upgrade.id }), false);
+  const resolvedAtMs = START + MINUTE;
+  assert.equal(resolveCaptainsLogBlocker(db, { agentId: "main", id: quota.id, resolvedAtMs, note: "Raised the quota." }), true);
+  assert.equal(resolveCaptainsLogBlocker(db, { agentId: "main", id: quota.id, note: "Overwrite attempt." }), false);
+  assert.deepEqual(listOpenBlockers(db, "main"), [signIn]);
+  assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main", blockedOnly: true }),
+    [{ ...quota, resolvedAtMs, resolutionNote: "Raised the quota." }, signIn]);
 });

@@ -37,6 +37,9 @@ const DEFAULT_STEWARD_CONFIG = {
         maxHandles: 0,
         maxExcerptChars: 0,
         maxExportBytes: 0,
+        maxNewClaimsPerPerson: 0,
+        maxInteractionHandles: 0,
+        includeResponseAudit: true,
     },
     captainsLog: {
         enabled: true,
@@ -47,6 +50,14 @@ const DEFAULT_STEWARD_CONFIG = {
         maxExistingLogChars: 0,
         timeoutMs: 0,
         excludeChatTypes: ["direct"],
+    },
+    outcomeLedger: {
+        enabled: true,
+        intervalMinutes: 60,
+        lookbackMs: 604_800_000,
+        maxRowsPerPass: 0,
+        matchWindowMs: 1_800_000,
+        retentionDays: 0,
     },
 };
 function section(value = {}, defaults, label, optional = []) {
@@ -71,8 +82,11 @@ function unitInterval(value, key) {
     return value;
 }
 function enabled(value, label) {
+    return boolean(value, `${label}.enabled`);
+}
+function boolean(value, label) {
     if (typeof value !== "boolean")
-        throw new Error(`${label}.enabled must be a boolean`);
+        throw new Error(`${label} must be a boolean`);
     return value;
 }
 function chatTypeList(value, key) {
@@ -113,8 +127,9 @@ export function resolveStewardConfig(value) {
     const defaults = DEFAULT_STEWARD_CONFIG;
     const c = section(value, defaults, "steward", ["apiKey", "apiKeyFile"]);
     const d = section(c.deepThought, defaults.deepThought, "steward.deepThought", ["reasoning"]);
-    const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow");
+    const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow", ["includeInteractionLearning"]);
     const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
+    const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger");
     const reasoning = efforts.find(e => e === c.reasoning);
     if (!reasoning)
         throw new Error("Invalid steward.reasoning");
@@ -165,6 +180,11 @@ export function resolveStewardConfig(value) {
             maxHandles: integer(p.maxHandles, 0, "peopleShadow.maxHandles"),
             maxExcerptChars: integer(p.maxExcerptChars, 0, "peopleShadow.maxExcerptChars"),
             maxExportBytes: integer(p.maxExportBytes, 0, "peopleShadow.maxExportBytes"),
+            ...(p.includeInteractionLearning === undefined ? {}
+                : { includeInteractionLearning: boolean(p.includeInteractionLearning, "steward.peopleShadow.includeInteractionLearning") }),
+            maxNewClaimsPerPerson: integer(p.maxNewClaimsPerPerson, 0, "peopleShadow.maxNewClaimsPerPerson"),
+            maxInteractionHandles: integer(p.maxInteractionHandles, 0, "peopleShadow.maxInteractionHandles"),
+            includeResponseAudit: boolean(p.includeResponseAudit, "steward.peopleShadow.includeResponseAudit"),
         },
         captainsLog: {
             enabled: enabled(cl.enabled, "steward.captainsLog"),
@@ -175,6 +195,14 @@ export function resolveStewardConfig(value) {
             maxExistingLogChars: integer(cl.maxExistingLogChars, 0, "captainsLog.maxExistingLogChars"),
             timeoutMs: integer(cl.timeoutMs, 0, "captainsLog.timeoutMs"),
             excludeChatTypes: chatTypeList(cl.excludeChatTypes, "captainsLog.excludeChatTypes"),
+        },
+        outcomeLedger: {
+            enabled: enabled(o.enabled, "steward.outcomeLedger"),
+            intervalMinutes: integer(o.intervalMinutes, 1, "outcomeLedger.intervalMinutes"),
+            lookbackMs: integer(o.lookbackMs, 1, "outcomeLedger.lookbackMs"),
+            maxRowsPerPass: integer(o.maxRowsPerPass, 0, "outcomeLedger.maxRowsPerPass"),
+            matchWindowMs: integer(o.matchWindowMs, 1, "outcomeLedger.matchWindowMs"),
+            retentionDays: integer(o.retentionDays, 0, "outcomeLedger.retentionDays"),
         },
     };
 }

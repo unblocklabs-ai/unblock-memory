@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.18.1",
+  "version": "0.19.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -224,6 +224,10 @@
     "steward.peopleShadow.enabled": {
       "label": "People Shadow",
       "help": "Background, proposal-only review of People Learning manifests. Never publishes; compare with `openclaw memory-steward shadow-report`."
+    },
+    "steward.outcomeLedger.enabled": {
+      "label": "Outcome Ledger",
+      "help": "Deterministic (no model call) background scoring of whether memory hits, skills and person whispers helped, were ignored or hurt. Inspect with `openclaw memory-steward outcomes`."
     },
     "steward.endpoint": {
       "label": "Steward Endpoint",
@@ -1348,6 +1352,20 @@
               "maxExportBytes": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "includeInteractionLearning": {
+                "type": "boolean"
+              },
+              "maxNewClaimsPerPerson": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxInteractionHandles": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "includeResponseAudit": {
+                "type": "boolean"
               }
             }
           },
@@ -1392,6 +1410,35 @@
                     "direct"
                   ]
                 }
+              }
+            }
+          },
+          "outcomeLedger": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "intervalMinutes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "lookbackMs": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "maxRowsPerPass": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "matchWindowMs": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "retentionDays": {
+                "type": "integer",
+                "minimum": 0
               }
             }
           }

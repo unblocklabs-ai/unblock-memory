@@ -138,6 +138,12 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         trackRecallLocators?: boolean;
     });
     start(): Promise<void>;
+    /**
+     * Current QMD generation of every collection behind `corpora` (omitted or `["all"]` = every indexed collection), for
+     * caches that must invalidate on any indexed change. Unknown corpora throw. Reads committed state without waiting
+     * behind queued indexing, so a snapshot is never newer than what a search issued now could observe.
+     */
+    getCollectionGenerations(corpora?: readonly string[]): Promise<Record<string, number>>;
     syncExtracted(): Promise<void>;
     sync(params?: MemorySyncParams): Promise<void>;
     syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void, options?: {

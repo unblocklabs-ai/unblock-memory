@@ -54,6 +54,14 @@ type StewardPeopleShadowConfig = {
     maxExcerptChars: number;
     /** Largest export file read in bytes (`0` = unlimited). */
     maxExportBytes: number;
+    /** Net-new claim discovery on nightly manifests. Unset = runtime default: ON in `"publish"`, OFF in `"shadow"`. */
+    includeInteractionLearning?: boolean;
+    /** New claims published per person per manifest, highest confidence first (`0` = unlimited). */
+    maxNewClaimsPerPerson: number;
+    /** Evidence handles per interaction packet (`0` = unlimited; a packet that drops excerpts never completes a review). */
+    maxInteractionHandles: number;
+    /** Annotate interaction excerpts with Response Audit outcome signals when that table exists. */
+    includeResponseAudit: boolean;
 };
 type StewardCaptainsLogConfig = {
     enabled: boolean;
@@ -70,6 +78,19 @@ type StewardCaptainsLogConfig = {
     /** Chat types excluded from workspace `memory/YYYY-MM-DD.md` distillation (default: `["direct"]`). */
     excludeChatTypes: ChatType[];
 };
+/** Deterministic (no model call) outcome scoring of memory hits, skills and person whispers into `memory_outcomes`. */
+type StewardOutcomeLedgerConfig = {
+    enabled: boolean;
+    intervalMinutes: number;
+    /** First-sweep history and Inside Out personal-baseline window in ms; later sweeps resume from the watermark. */
+    lookbackMs: number;
+    /** Exposures scored per pass; a capped pass resumes from its cursor next pass (`0` = unlimited). */
+    maxRowsPerPass: number;
+    /** How long after an exposure its use/outcome evidence may arrive, in ms. */
+    matchWindowMs: number;
+    /** Days `memory_outcomes` rows are kept (`0` = unlimited). */
+    retentionDays: number;
+};
 export type StewardConfig = {
     enabled: boolean;
     model: string;
@@ -81,6 +102,7 @@ export type StewardConfig = {
     deepThought: StewardDeepThoughtConfig;
     peopleShadow: StewardPeopleShadowConfig;
     captainsLog: StewardCaptainsLogConfig;
+    outcomeLedger: StewardOutcomeLedgerConfig;
 };
 export declare function resolveStewardConfig(value: unknown): StewardConfig;
 /** Bind the runner's resolveApiKey callback to its destination. Never inherit another origin's key. */

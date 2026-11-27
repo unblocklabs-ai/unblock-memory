@@ -2166,3 +2166,36 @@ test("skill catalog ignores hidden dot-directories like .archive unless explicit
     await manager.close();
   }
 });
+
+test("reports per-collection QMD generations for named corpora and advances only the changed one", async () => {
+  await using root = await mkdtempDisposable(join(tmpdir(), "unblock-memory-generations-"));
+  await mkdir(join(root.path, "projects"));
+  await writeFile(join(root.path, "MEMORY.md"), "memory body\n");
+  await writeFile(join(root.path, "projects", "note.md"), "projects body\n");
+  const memory = resolveSource(root.path, "MEMORY.md", "memory");
+  const projects = resolveSource(root.path, "projects/**/*.md", "projects");
+  const backing = await createStore({ dbPath: join(root.path, "index.sqlite"), config: { collections: {
+    [memory.collection]: { path: memory.root, pattern: memory.pattern },
+    [projects.collection]: { path: projects.root, pattern: projects.pattern },
+  } } });
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath, workspaceDir: root.path, sources: [memory, projects], storeFactory: async () => backing,
+  });
+  try {
+    await backing.update();
+    const before = await manager.getCollectionGenerations(["memory", "projects"]);
+    assert.deepEqual(Object.keys(before).sort(), [memory.collection, projects.collection].sort());
+    assert.ok(Object.values(before).every(generation => Number.isSafeInteger(generation) && generation > 0));
+    assert.deepEqual(await manager.getCollectionGenerations(["projects"]), { [projects.collection]: before[projects.collection] });
+    assert.deepEqual(await manager.getCollectionGenerations(), before, "omitted corpora cover every indexed collection");
+
+    await writeFile(join(root.path, "projects", "note.md"), "projects body, revised\n");
+    await backing.update();
+    const after = await manager.getCollectionGenerations(["memory", "projects"]);
+    assert.equal(after[memory.collection], before[memory.collection], "an unchanged collection keeps its generation");
+    assert.ok(after[projects.collection]! > before[projects.collection]!, "an indexed edit advances its collection");
+    await assert.rejects(manager.getCollectionGenerations(["nope"]), /unknown corpus/u);
+  } finally {
+    await manager.close();
+  }
+});
