@@ -1,7 +1,13 @@
-import type { DecisionModelPluginConfig } from "./config.js";
+import type { ChatType, DecisionModelPluginConfig } from "./config.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
+
+const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const searchRankings = ["retrieval", "decision"] as const;
+const peopleModes = ["publish", "shadow"] as const;
+const confidences = ["high", "medium", "low"] as const;
+const chatTypes = ["channel", "group", "direct"] as const;
 
 type StewardDeepThoughtConfig = {
   enabled: boolean;
@@ -39,14 +45,43 @@ type StewardDeepThoughtConfig = {
   reasoning?: typeof efforts[number];
 };
 type StewardPeopleShadowConfig = {
-  enabled: boolean; intervalMinutes: number; maxItemsPerRun: number; timeoutMs: number;
+  enabled: boolean;
+  /** `"publish"` (default) applies verified dossier updates and retires legacy people-learning crons; `"shadow"` is proposal-only. */
+  mode: typeof peopleModes[number];
+  intervalMinutes: number;
+  /** Maximum items per pass (`0` = unlimited). */
+  maxItemsPerRun: number;
+  /** Per-item model timeout in ms (`0` = unlimited). */
+  timeoutMs: number;
+  /** Lowest proposal confidence that may mutate/verify a dossier in publish mode. */
+  minConfidence: typeof confidences[number];
+  /** Evidence handles per packet (`0` = unlimited). */
+  maxHandles: number;
+  /** Characters per evidence excerpt (`0` = unlimited). */
+  maxExcerptChars: number;
+  /** Largest export file read in bytes (`0` = unlimited). */
+  maxExportBytes: number;
 };
-const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-const searchRankings = ["retrieval", "decision"] as const;
+type StewardCaptainsLogConfig = {
+  enabled: boolean;
+  intervalMinutes: number;
+  lookbackMinutes: number;
+  /** Maximum eligible sessions distilled per run (`0` = unlimited). */
+  maxSessionsPerRun: number;
+  /** Character budget per session transcript excerpt (`0` = unlimited). */
+  maxCharsPerSession: number;
+  /** Character budget for existing daily log tail (`0` = unlimited). */
+  maxExistingLogChars: number;
+  /** Model timeout in ms (`0` = unlimited). */
+  timeoutMs: number;
+  /** Chat types excluded from workspace `memory/YYYY-MM-DD.md` distillation (default: `["direct"]`). */
+  excludeChatTypes: ChatType[];
+};
 export type StewardConfig = {
   enabled: boolean; model: string; reasoning: typeof efforts[number]; endpoint: string;
   apiKey?: string; apiKeyFile?: string; maxActiveBackground: number;
   deepThought: StewardDeepThoughtConfig; peopleShadow: StewardPeopleShadowConfig;
+  captainsLog: StewardCaptainsLogConfig;
 };
 
 const DEFAULT_STEWARD_CONFIG: StewardConfig = {
@@ -70,7 +105,27 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     maxQuoteChars: 0,
     maxPeopleMatches: 0,
   },
-  peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
+  peopleShadow: {
+    enabled: true,
+    mode: "publish",
+    intervalMinutes: 60,
+    maxItemsPerRun: 0,
+    timeoutMs: 0,
+    minConfidence: "medium",
+    maxHandles: 0,
+    maxExcerptChars: 0,
+    maxExportBytes: 0,
+  },
+  captainsLog: {
+    enabled: true,
+    intervalMinutes: 180,
+    lookbackMinutes: 190,
+    maxSessionsPerRun: 0,
+    maxCharsPerSession: 0,
+    maxExistingLogChars: 0,
+    timeoutMs: 0,
+    excludeChatTypes: ["direct"],
+  },
 };
 
 function section(value: unknown = {}, defaults: object, label: string, optional: string[] = []) {
@@ -97,6 +152,16 @@ function enabled(value: unknown, label: string) {
   if (typeof value !== "boolean") throw new Error(`${label}.enabled must be a boolean`);
   return value;
 }
+function chatTypeList(value: unknown, key: string): ChatType[] {
+  if (!Array.isArray(value)) throw new Error(`steward.${key} must be an array`);
+  const out: ChatType[] = [];
+  for (const entry of value) {
+    const matched = chatTypes.find(t => t === entry);
+    if (!matched) throw new Error(`Invalid steward.${key} entry`);
+    if (!out.includes(matched)) out.push(matched);
+  }
+  return out;
+}
 function text(value: unknown, key: string) {
   if (typeof value !== "string" || !value.trim()) throw new Error(`steward.${key} must be a non-empty string`);
   return value.trim();
@@ -122,12 +187,17 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
   const c = section(value, defaults, "steward", ["apiKey", "apiKeyFile"]);
   const d = section(c.deepThought, defaults.deepThought, "steward.deepThought", ["reasoning"]);
   const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow");
+  const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
   const reasoning = efforts.find(e => e === c.reasoning);
   if (!reasoning) throw new Error("Invalid steward.reasoning");
   const deepThoughtReasoning = d.reasoning === undefined ? undefined : efforts.find(e => e === d.reasoning);
   if (d.reasoning !== undefined && !deepThoughtReasoning) throw new Error("Invalid steward.deepThought.reasoning");
   const searchRanking = searchRankings.find(mode => mode === d.searchRanking);
   if (!searchRanking) throw new Error("Invalid steward.deepThought.searchRanking");
+  const peopleMode = peopleModes.find(mode => mode === p.mode);
+  if (!peopleMode) throw new Error("Invalid steward.peopleShadow.mode");
+  const minConfidence = confidences.find(level => level === p.minConfidence);
+  if (!minConfidence) throw new Error("Invalid steward.peopleShadow.minConfidence");
   const apiKey = c.apiKey === undefined ? undefined : text(c.apiKey, "apiKey");
   if (apiKey && /\s/u.test(apiKey)) throw new Error("steward.apiKey must not contain whitespace");
   return { enabled: enabled(c.enabled, "steward"), model: text(c.model, "model"), reasoning, endpoint: endpoint(c.endpoint),
@@ -154,9 +224,24 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
     },
     peopleShadow: {
       enabled: enabled(p.enabled, "steward.peopleShadow"),
+      mode: peopleMode,
       intervalMinutes: integer(p.intervalMinutes, 1, "peopleShadow.intervalMinutes"),
-      maxItemsPerRun: integer(p.maxItemsPerRun, 1, "peopleShadow.maxItemsPerRun"),
+      maxItemsPerRun: integer(p.maxItemsPerRun, 0, "peopleShadow.maxItemsPerRun"),
       timeoutMs: integer(p.timeoutMs, 0, "peopleShadow.timeoutMs"),
+      minConfidence,
+      maxHandles: integer(p.maxHandles, 0, "peopleShadow.maxHandles"),
+      maxExcerptChars: integer(p.maxExcerptChars, 0, "peopleShadow.maxExcerptChars"),
+      maxExportBytes: integer(p.maxExportBytes, 0, "peopleShadow.maxExportBytes"),
+    },
+    captainsLog: {
+      enabled: enabled(cl.enabled, "steward.captainsLog"),
+      intervalMinutes: integer(cl.intervalMinutes, 1, "captainsLog.intervalMinutes"),
+      lookbackMinutes: integer(cl.lookbackMinutes, 1, "captainsLog.lookbackMinutes"),
+      maxSessionsPerRun: integer(cl.maxSessionsPerRun, 0, "captainsLog.maxSessionsPerRun"),
+      maxCharsPerSession: integer(cl.maxCharsPerSession, 0, "captainsLog.maxCharsPerSession"),
+      maxExistingLogChars: integer(cl.maxExistingLogChars, 0, "captainsLog.maxExistingLogChars"),
+      timeoutMs: integer(cl.timeoutMs, 0, "captainsLog.timeoutMs"),
+      excludeChatTypes: chatTypeList(cl.excludeChatTypes, "captainsLog.excludeChatTypes"),
     },
   };
 }

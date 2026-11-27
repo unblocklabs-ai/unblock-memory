@@ -512,7 +512,7 @@ test("gateway_stop interrupts the owner synchronously before aborting: 0 strikes
   };
   const stores: RecordingWorkStore[] = [];
   const runtime = registerStewardRuntime(api, {
-    config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: true } }),
+    config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: true, mode: "shadow" }, captainsLog: { enabled: false } }),
     createRunner: () => blocking,
     openWorkStore: path => { const store = new RecordingWorkStore(path, () => order.push("interrupt")); stores.push(store); return store; },
     dbPathForAgent: () => f.dbPath,
@@ -545,7 +545,7 @@ test("disabled runtime registers only the CLI", () => {
   const events: string[] = [];
   const api = { registrationMode: "full", config: {}, logger: { warn() {} },
     on: (event: string) => events.push(event), registerCli: () => {} } as unknown as OpenClawPluginApi;
-  const runtime = registerStewardRuntime(api, { config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: false } }),
+  const runtime = registerStewardRuntime(api, { config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false } }),
     createRunner: () => undefined, openWorkStore: () => { throw new Error("unused"); } });
   assert.equal(runtime.enabled, false);
   assert.deepEqual(events, []);

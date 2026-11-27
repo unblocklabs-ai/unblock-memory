@@ -456,7 +456,14 @@ test("steward is optional and enabled by default; host manifest and runtime reso
         wrapUpReserveMs: 15_000, maxToolResultChars: 64_000, maxInputTokens: 200_000, searchRanking: "decision" as const, searchMinUsefulness: 0.25,
         defaultSearchResults: 15, maxSnippetChars: 4_000, maxQuoteChars: 1_200, maxPeopleMatches: 20, reasoning: "low" as const,
       },
-      peopleShadow: { enabled: true, intervalMinutes: 120, maxItemsPerRun: 5, timeoutMs: 30_000 },
+      peopleShadow: {
+        enabled: true, mode: "shadow" as const, intervalMinutes: 120, maxItemsPerRun: 5, timeoutMs: 30_000,
+        minConfidence: "high" as const, maxHandles: 12, maxExcerptChars: 1000, maxExportBytes: 2_000_000,
+      },
+      captainsLog: {
+        enabled: true, intervalMinutes: 120, lookbackMinutes: 130, maxSessionsPerRun: 10,
+        maxCharsPerSession: 8_000, maxExistingLogChars: 12_000, timeoutMs: 60_000, excludeChatTypes: ["direct" as const],
+      },
     },
   };
   const host = validate(enabled);
@@ -465,6 +472,7 @@ test("steward is optional and enabled by default; host manifest and runtime reso
   assert.equal(steward.endpoint, "http://127.0.0.1:8787/v1/responses");
   assert.deepEqual(steward.deepThought, enabled.steward.deepThought);
   assert.deepEqual(steward.peopleShadow, enabled.steward.peopleShadow);
+  assert.deepEqual(steward.captainsLog, enabled.steward.captainsLog);
   for (const invalid of [
     { steward: { extra: true } },
     { steward: { deepThought: { extra: 1 } } },

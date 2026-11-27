@@ -47,11 +47,20 @@ test("config defaults, nested overrides and strict boundaries", () => {
       wrapUpReserveMs: 20_000, maxToolResultChars: 0, maxInputTokens: 0, searchRanking: "retrieval", searchMinUsefulness: 0,
       defaultSearchResults: 10, maxSnippetChars: 0, maxQuoteChars: 0, maxPeopleMatches: 0,
     },
-    peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
+    peopleShadow: {
+      enabled: true, mode: "publish", intervalMinutes: 60, maxItemsPerRun: 0, timeoutMs: 0,
+      minConfidence: "medium", maxHandles: 0, maxExcerptChars: 0, maxExportBytes: 0,
+    },
+    captainsLog: {
+      enabled: true, intervalMinutes: 180, lookbackMinutes: 190, maxSessionsPerRun: 0,
+      maxCharsPerSession: 0, maxExistingLogChars: 0, timeoutMs: 0, excludeChatTypes: ["direct"],
+    },
   });
   const overridden = resolveStewardConfig({
     reasoning: "off", endpoint: "http://localhost:123/v1/responses/",
     deepThought: { maxTurns: 40, timeoutMs: 600_000, syncWaitMs: 0, jobRetentionMs: 60_000, reasoning: "low", searchRanking: "decision", searchMinUsefulness: 0.4 },
+    peopleShadow: { mode: "shadow", minConfidence: "high", maxItemsPerRun: 5 },
+    captainsLog: { intervalMinutes: 60, lookbackMinutes: 70, excludeChatTypes: ["direct", "group"] },
   });
   assert.equal(overridden.endpoint, "http://localhost:123/v1/responses");
   assert.equal(overridden.deepThought.maxTurns, 40);
@@ -60,16 +69,23 @@ test("config defaults, nested overrides and strict boundaries", () => {
   assert.equal(overridden.deepThought.reasoning, "low");
   assert.equal(overridden.deepThought.searchRanking, "decision");
   assert.equal(overridden.deepThought.searchMinUsefulness, 0.4);
+  assert.equal(overridden.peopleShadow.mode, "shadow");
+  assert.equal(overridden.peopleShadow.minConfidence, "high");
+  assert.deepEqual(overridden.captainsLog.excludeChatTypes, ["direct", "group"]);
   for (const bad of [null, [], { extra: false }, { deepThought: { extra: 0 } }, { peopleShadow: { other: true } },
-    { enabled: null }, { peopleShadow: { enabled: 1 } }, { deepThought: [] }, { model: " " }, { reasoning: "adaptive" },
+    { captainsLog: { extra: true } }, { enabled: null }, { peopleShadow: { enabled: 1 } }, { deepThought: [] }, { model: " " }, { reasoning: "adaptive" },
     { apiKey: "bad key" }, { apiKeyFile: 2 }, { apiKeyFile: "relative/secret.env" }, { apiKeyFile: "./secret.env" }, { maxActiveBackground: 0 },
     { deepThought: { maxTurns: -1 } }, { deepThought: { maxToolCalls: -1 } }, { deepThought: { maxConcurrent: 1.5 } },
     { deepThought: { timeoutMs: -1 } }, { deepThought: { syncWaitMs: -1 } }, { deepThought: { jobRetentionMs: -1 } },
     { deepThought: { wrapUpReserveMs: -1 } }, { deepThought: { reasoning: "adaptive" } }, { deepThought: { maxToolResultChars: -1 } },
     { deepThought: { maxInputTokens: -1 } }, { deepThought: { searchRanking: "other" } }, { deepThought: { searchMinUsefulness: 1.1 } },
     { deepThought: { defaultSearchResults: 0 } }, { deepThought: { maxSnippetChars: -1 } }, { deepThought: { maxQuoteChars: -1 } },
-    { deepThought: { maxPeopleMatches: -1 } }, { peopleShadow: { intervalMinutes: 0 } }, { peopleShadow: { maxItemsPerRun: 0 } },
-    { peopleShadow: { timeoutMs: -1 } }]) {
+    { deepThought: { maxPeopleMatches: -1 } }, { peopleShadow: { mode: "auto" } }, { peopleShadow: { minConfidence: "sure" } },
+    { peopleShadow: { intervalMinutes: 0 } }, { peopleShadow: { maxItemsPerRun: -1 } }, { peopleShadow: { timeoutMs: -1 } },
+    { peopleShadow: { maxHandles: -1 } }, { peopleShadow: { maxExcerptChars: -1 } }, { peopleShadow: { maxExportBytes: -1 } },
+    { captainsLog: { intervalMinutes: 0 } }, { captainsLog: { lookbackMinutes: 0 } }, { captainsLog: { maxSessionsPerRun: -1 } },
+    { captainsLog: { maxCharsPerSession: -1 } }, { captainsLog: { maxExistingLogChars: -1 } }, { captainsLog: { timeoutMs: -1 } },
+    { captainsLog: { excludeChatTypes: ["thread"] } }]) {
     assert.throws(() => resolveStewardConfig(bad));
   }
   for (const endpoint of ["not a URL", "file:///private", "https://u:p@x.test", "https://x.test/?", "https://x.test/#fragment",

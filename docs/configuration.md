@@ -962,10 +962,23 @@ a `steward` section load cleanly and automatically get both features; set
 | `steward.deepThought.maxSnippetChars` | `0` | `>= 0` characters per `search_memory` snippet (`0` = unlimited) |
 | `steward.deepThought.maxQuoteChars` | `0` | `>= 0` characters per citation quote (`0` = unlimited) |
 | `steward.deepThought.maxPeopleMatches` | `0` | `>= 0` matches returned by `lookup_person` (`0` = unlimited) |
-| `steward.peopleShadow.enabled` | `true` | Starts the background shadow loop on Gateway start |
+| `steward.peopleShadow.enabled` | `true` | Starts the background People Learning loop on Gateway start |
+| `steward.peopleShadow.mode` | `"publish"` | `"publish"` (applies verified dossier updates & retires legacy people-learning crons) or `"shadow"` (proposal-only) |
 | `steward.peopleShadow.intervalMinutes` | `60` | `>= 1` minutes between passes |
-| `steward.peopleShadow.maxItemsPerRun` | `10` | `>= 1` model calls per agent per pass |
-| `steward.peopleShadow.timeoutMs` | `45000` | `>= 0` ms per proposal (`0` = unlimited) |
+| `steward.peopleShadow.maxItemsPerRun` | `0` | `>= 0` model calls per agent per pass (`0` = unlimited) |
+| `steward.peopleShadow.timeoutMs` | `0` | `>= 0` ms per item (`0` = unlimited) |
+| `steward.peopleShadow.minConfidence` | `"medium"` | Lowest confidence (`"high"`, `"medium"`, `"low"`) that may mutate/verify a dossier in publish mode |
+| `steward.peopleShadow.maxHandles` | `0` | `>= 0` evidence handles per packet (`0` = unlimited) |
+| `steward.peopleShadow.maxExcerptChars` | `0` | `>= 0` characters per evidence excerpt (`0` = unlimited) |
+| `steward.peopleShadow.maxExportBytes` | `0` | `>= 0` bytes read per approved export file (`0` = unlimited) |
+| `steward.captainsLog.enabled` | `true` | Starts the background Captain's Log distillation loop on Gateway start |
+| `steward.captainsLog.intervalMinutes` | `180` | `>= 1` minutes between Captain's Log passes |
+| `steward.captainsLog.lookbackMinutes` | `190` | `>= 1` minutes of recent session activity examined per pass (deduplicated via watermark) |
+| `steward.captainsLog.maxSessionsPerRun` | `0` | `>= 0` eligible sessions distilled per pass (`0` = unlimited) |
+| `steward.captainsLog.maxCharsPerSession` | `0` | `>= 0` transcript characters per session (`0` = unlimited) |
+| `steward.captainsLog.maxExistingLogChars` | `0` | `>= 0` characters from existing `memory/YYYY-MM-DD.md` passed for dedup (`0` = unlimited) |
+| `steward.captainsLog.timeoutMs` | `0` | `>= 0` ms model timeout (`0` = unlimited) |
+| `steward.captainsLog.excludeChatTypes` | `["direct"]` | Chat types (`"channel"`, `"group"`, `"direct"`) excluded from workspace `memory/YYYY-MM-DD.md` |
 
 **Enabling `deep_thought` approves sending the question plus the memory excerpts it
 opens to the Steward endpoint. Enabling the People shadow approves sending one

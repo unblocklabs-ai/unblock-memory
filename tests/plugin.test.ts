@@ -506,7 +506,7 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
   assert.ok(metadata.cli.includes("memory-steward"), "CLI descriptors are available to cli-metadata loads");
   assert.equal(metadata.hooks.length, 0, "cli-metadata never starts background work");
   const shadowHooks = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }).hooks;
-  const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false } } }).hooks;
+  const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false } } }).hooks;
   assert.equal(shadowHooks.filter(name => name === "gateway_start").length, quietHooks.filter(name => name === "gateway_start").length + 1,
-    "the People shadow loop adds exactly one gateway_start hook");
+    "the background Steward loop adds exactly one gateway_start hook");
 });

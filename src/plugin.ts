@@ -767,9 +767,10 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   registerResponseAudit(api, config);
   registerInsideOut(api, config);
   const stewardRunner = stewardRunnerFactory(config);
-  // Registers `memory-steward` CLI always; the People shadow loop only when steward + peopleShadow are enabled.
+  // Registers `memory-steward` CLI always; background loops only when steward + peopleShadow/captainsLog are enabled.
   registerStewardRuntime(api, {
     config: config.steward,
+    pluginConfig: config,
     createRunner: () => config.steward.enabled ? stewardRunner() : undefined,
   });
   if (api.registrationMode === "cli-metadata") { registerExtraction(api, config); return; }
@@ -803,8 +804,11 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     maxOpenTodos: config.people.todos.maxOpen,
     maxBlurbChars: config.people.whisperer.maxChars,
   });
-  // Always reconcile so disabling PeopleSQL also disables previously owned jobs.
-  registerPeopleLearning(api, config, peopleStores);
+  // Always reconcile so disabling PeopleSQL or promoting Steward publishing disables previously owned jobs.
+  registerPeopleLearning(api, config, peopleStores, {
+    stewardOwnsPublishing: (resolved) =>
+      resolved.steward.enabled && resolved.steward.peopleShadow.enabled && resolved.steward.peopleShadow.mode === "publish",
+  });
   if (config.people.enabled) {
     peopleWhisperer = registerPeopleHooks(api, peopleStores, config.people);
     registerPeopleTools(api, peopleStores, config, runtime);

@@ -1310,17 +1310,88 @@
               "enabled": {
                 "type": "boolean"
               },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "publish",
+                  "shadow"
+                ]
+              },
               "intervalMinutes": {
                 "type": "integer",
                 "minimum": 1
               },
               "maxItemsPerRun": {
                 "type": "integer",
-                "minimum": 1
+                "minimum": 0
               },
               "timeoutMs": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "minConfidence": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ]
+              },
+              "maxHandles": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxExcerptChars": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxExportBytes": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "captainsLog": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "intervalMinutes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "lookbackMinutes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "maxSessionsPerRun": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxCharsPerSession": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxExistingLogChars": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "excludeChatTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "channel",
+                    "group",
+                    "direct"
+                  ]
+                }
               }
             }
           }
