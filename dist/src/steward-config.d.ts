@@ -9,6 +9,10 @@ type StewardDeepThoughtConfig = {
     maxConcurrent: number;
     /** Wall-clock timeout in milliseconds (`0` = unlimited). */
     timeoutMs: number;
+    /** How long each tool call waits synchronously before handing off a running `jobId` (`0` = wait until completion). */
+    syncWaitMs: number;
+    /** How long finished background `deep_thought` jobs remain collectible in memory (`0` = until process exit). */
+    jobRetentionMs: number;
     /** When `timeoutMs > 0`, reserve this many ms to force a final wrap-up submission (`0` = disabled). */
     wrapUpReserveMs: number;
     /** Maximum characters returned per tool result (`0` = unlimited). */
@@ -27,6 +31,8 @@ type StewardDeepThoughtConfig = {
     maxQuoteChars: number;
     /** Maximum people returned by `lookup_person` (`0` = unlimited). */
     maxPeopleMatches: number;
+    /** Optional reasoning effort override for `deep_thought` (defaults to `steward.reasoning`). */
+    reasoning?: typeof efforts[number];
 };
 type StewardPeopleShadowConfig = {
     enabled: boolean;

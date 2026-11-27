@@ -12,6 +12,8 @@ const DEFAULT_STEWARD_CONFIG = {
         maxToolCalls: 0,
         maxConcurrent: 0,
         timeoutMs: 0,
+        syncWaitMs: 65_000,
+        jobRetentionMs: 1_800_000,
         wrapUpReserveMs: 20_000,
         maxToolResultChars: 0,
         maxInputTokens: 0,
@@ -74,11 +76,14 @@ function endpoint(value) {
 export function resolveStewardConfig(value) {
     const defaults = DEFAULT_STEWARD_CONFIG;
     const c = section(value, defaults, "steward", ["apiKey", "apiKeyFile"]);
-    const d = section(c.deepThought, defaults.deepThought, "steward.deepThought");
+    const d = section(c.deepThought, defaults.deepThought, "steward.deepThought", ["reasoning"]);
     const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow");
     const reasoning = efforts.find(e => e === c.reasoning);
     if (!reasoning)
         throw new Error("Invalid steward.reasoning");
+    const deepThoughtReasoning = d.reasoning === undefined ? undefined : efforts.find(e => e === d.reasoning);
+    if (d.reasoning !== undefined && !deepThoughtReasoning)
+        throw new Error("Invalid steward.deepThought.reasoning");
     const searchRanking = searchRankings.find(mode => mode === d.searchRanking);
     if (!searchRanking)
         throw new Error("Invalid steward.deepThought.searchRanking");
@@ -94,6 +99,8 @@ export function resolveStewardConfig(value) {
             maxToolCalls: integer(d.maxToolCalls, 0, "deepThought.maxToolCalls"),
             maxConcurrent: integer(d.maxConcurrent, 0, "deepThought.maxConcurrent"),
             timeoutMs: integer(d.timeoutMs, 0, "deepThought.timeoutMs"),
+            syncWaitMs: integer(d.syncWaitMs, 0, "deepThought.syncWaitMs"),
+            jobRetentionMs: integer(d.jobRetentionMs, 0, "deepThought.jobRetentionMs"),
             wrapUpReserveMs: integer(d.wrapUpReserveMs, 0, "deepThought.wrapUpReserveMs"),
             maxToolResultChars: integer(d.maxToolResultChars, 0, "deepThought.maxToolResultChars"),
             maxInputTokens: integer(d.maxInputTokens, 0, "deepThought.maxInputTokens"),
@@ -103,6 +110,7 @@ export function resolveStewardConfig(value) {
             maxSnippetChars: integer(d.maxSnippetChars, 0, "deepThought.maxSnippetChars"),
             maxQuoteChars: integer(d.maxQuoteChars, 0, "deepThought.maxQuoteChars"),
             maxPeopleMatches: integer(d.maxPeopleMatches, 0, "deepThought.maxPeopleMatches"),
+            ...(deepThoughtReasoning ? { reasoning: deepThoughtReasoning } : {}),
         },
         peopleShadow: {
             enabled: enabled(p.enabled, "steward.peopleShadow"),

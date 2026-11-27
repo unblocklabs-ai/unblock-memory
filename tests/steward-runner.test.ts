@@ -43,26 +43,29 @@ test("config defaults, nested overrides and strict boundaries", () => {
     enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
     maxActiveBackground: 1,
     deepThought: {
-      enabled: true, maxTurns: 0, maxToolCalls: 0, maxConcurrent: 0, timeoutMs: 0, wrapUpReserveMs: 20_000,
-      maxToolResultChars: 0, maxInputTokens: 0, searchRanking: "retrieval", searchMinUsefulness: 0,
+      enabled: true, maxTurns: 0, maxToolCalls: 0, maxConcurrent: 0, timeoutMs: 0, syncWaitMs: 65_000, jobRetentionMs: 1_800_000,
+      wrapUpReserveMs: 20_000, maxToolResultChars: 0, maxInputTokens: 0, searchRanking: "retrieval", searchMinUsefulness: 0,
       defaultSearchResults: 10, maxSnippetChars: 0, maxQuoteChars: 0, maxPeopleMatches: 0,
     },
     peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
   });
   const overridden = resolveStewardConfig({
     reasoning: "off", endpoint: "http://localhost:123/v1/responses/",
-    deepThought: { maxTurns: 40, timeoutMs: 600_000, searchRanking: "decision", searchMinUsefulness: 0.4 },
+    deepThought: { maxTurns: 40, timeoutMs: 600_000, syncWaitMs: 0, jobRetentionMs: 60_000, reasoning: "low", searchRanking: "decision", searchMinUsefulness: 0.4 },
   });
   assert.equal(overridden.endpoint, "http://localhost:123/v1/responses");
   assert.equal(overridden.deepThought.maxTurns, 40);
   assert.equal(overridden.deepThought.timeoutMs, 600_000);
+  assert.equal(overridden.deepThought.syncWaitMs, 0);
+  assert.equal(overridden.deepThought.reasoning, "low");
   assert.equal(overridden.deepThought.searchRanking, "decision");
   assert.equal(overridden.deepThought.searchMinUsefulness, 0.4);
   for (const bad of [null, [], { extra: false }, { deepThought: { extra: 0 } }, { peopleShadow: { other: true } },
     { enabled: null }, { peopleShadow: { enabled: 1 } }, { deepThought: [] }, { model: " " }, { reasoning: "adaptive" },
     { apiKey: "bad key" }, { apiKeyFile: 2 }, { apiKeyFile: "relative/secret.env" }, { apiKeyFile: "./secret.env" }, { maxActiveBackground: 0 },
     { deepThought: { maxTurns: -1 } }, { deepThought: { maxToolCalls: -1 } }, { deepThought: { maxConcurrent: 1.5 } },
-    { deepThought: { timeoutMs: -1 } }, { deepThought: { wrapUpReserveMs: -1 } }, { deepThought: { maxToolResultChars: -1 } },
+    { deepThought: { timeoutMs: -1 } }, { deepThought: { syncWaitMs: -1 } }, { deepThought: { jobRetentionMs: -1 } },
+    { deepThought: { wrapUpReserveMs: -1 } }, { deepThought: { reasoning: "adaptive" } }, { deepThought: { maxToolResultChars: -1 } },
     { deepThought: { maxInputTokens: -1 } }, { deepThought: { searchRanking: "other" } }, { deepThought: { searchMinUsefulness: 1.1 } },
     { deepThought: { defaultSearchResults: 0 } }, { deepThought: { maxSnippetChars: -1 } }, { deepThought: { maxQuoteChars: -1 } },
     { deepThought: { maxPeopleMatches: -1 } }, { peopleShadow: { intervalMinutes: 0 } }, { peopleShadow: { maxItemsPerRun: 0 } },

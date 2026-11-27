@@ -452,9 +452,9 @@ test("steward is optional and enabled by default; host manifest and runtime reso
       enabled: true, model: "gpt-6.2-sol", reasoning: "low", endpoint: "http://127.0.0.1:8787/v1/responses",
       apiKeyFile: "/run/secrets/steward", maxActiveBackground: 6,
       deepThought: {
-        enabled: true, maxTurns: 25, maxToolCalls: 100, maxConcurrent: 8, timeoutMs: 300_000, wrapUpReserveMs: 15_000,
-        maxToolResultChars: 64_000, maxInputTokens: 200_000, searchRanking: "decision" as const, searchMinUsefulness: 0.25,
-        defaultSearchResults: 15, maxSnippetChars: 4_000, maxQuoteChars: 1_200, maxPeopleMatches: 20,
+        enabled: true, maxTurns: 25, maxToolCalls: 100, maxConcurrent: 8, timeoutMs: 300_000, syncWaitMs: 60_000, jobRetentionMs: 600_000,
+        wrapUpReserveMs: 15_000, maxToolResultChars: 64_000, maxInputTokens: 200_000, searchRanking: "decision" as const, searchMinUsefulness: 0.25,
+        defaultSearchResults: 15, maxSnippetChars: 4_000, maxQuoteChars: 1_200, maxPeopleMatches: 20, reasoning: "low" as const,
       },
       peopleShadow: { enabled: true, intervalMinutes: 120, maxItemsPerRun: 5, timeoutMs: 30_000 },
     },

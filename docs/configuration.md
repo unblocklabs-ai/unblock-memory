@@ -950,7 +950,10 @@ a `steward` section load cleanly and automatically get both features; set
 | `steward.deepThought.maxToolCalls` | `0` | `>= 0` tool calls per investigation (`0` = unlimited) |
 | `steward.deepThought.maxConcurrent` | `0` | `>= 0` in-flight investigations per process (`0` = unlimited); when `> 0`, extra calls return `busy` |
 | `steward.deepThought.timeoutMs` | `0` | `>= 0` ms wall clock per investigation (`0` = unlimited; caller cancellation still aborts) |
+| `steward.deepThought.syncWaitMs` | `65000` | `>= 0` ms each `deep_thought` call waits synchronously before returning `{ status: "running", jobId }` while the investigation keeps running in the background (`0` = wait until completion) |
+| `steward.deepThought.jobRetentionMs` | `1800000` | `>= 0` ms finished background `deep_thought` jobs remain collectible in memory (`0` = keep until process exit) |
 | `steward.deepThought.wrapUpReserveMs` | `20000` | `>= 0` ms reserved before a finite `timeoutMs` expires to force a final wrap-up submission (`0` = disabled) |
+| `steward.deepThought.reasoning` | Unset | Optional reasoning effort override for `deep_thought` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`; defaults to `steward.reasoning`) |
 | `steward.deepThought.maxToolResultChars` | `0` | `>= 0` characters per tool result returned to the model (`0` = unlimited) |
 | `steward.deepThought.maxInputTokens` | `0` | `>= 0` client-side input tokens per model request (`0` = unlimited; retries are not double-charged) |
 | `steward.deepThought.searchRanking` | `"retrieval"` | `"retrieval"` (fast local BM25 + vector hybrid RRF) or `"decision"` (decision-model reranking) |

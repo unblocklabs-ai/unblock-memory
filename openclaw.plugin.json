@@ -1242,6 +1242,14 @@
                 "type": "integer",
                 "minimum": 0
               },
+              "syncWaitMs": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "jobRetentionMs": {
+                "type": "integer",
+                "minimum": 0
+              },
               "wrapUpReserveMs": {
                 "type": "integer",
                 "minimum": 0
@@ -1281,6 +1289,17 @@
               "maxPeopleMatches": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "reasoning": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "minimal",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh"
+                ]
               }
             }
           },

@@ -8,6 +8,7 @@ import type { OpenClawConfig, OpenClawPluginToolContext } from "openclaw/plugin-
 import type { CorpusMemorySearchResult, MemoryReadResult } from "../src/contracts.js";
 import {
   activeDeepThoughts,
+  cancelAllDeepThoughtJobs,
   createDeepThoughtTool,
   DEEP_THOUGHT_RESULT_SCHEMA,
   type DeepThoughtConfig,
@@ -516,4 +517,74 @@ test("default unlimited config fans out freely with retrieval ranking and zero a
   assert.equal(requests[0]!.maxTurns, 0);
   assert.equal(requests[0]!.maxToolCalls, 0);
   assert.equal(requests[0]!.wallTimeoutMs, 0);
+});
+
+test("async jobId handoff: returns running past syncWaitMs, isolates caller, collects final synthesis and supports cancel", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const { runtime } = fakeRuntime();
+  let finish!: () => void;
+  const done = new Promise<void>(resolve => { finish = resolve; });
+  const slowRunner: RunRunner = {
+    async run<T>(request: StewardRunRequest<T>): Promise<StewardRunResult<T>> {
+      const search = request.tools.find(tool => tool.name === "search_memory")!;
+      await search.execute({ bm25Query: "launch", vectorQuery: "launch" }, request.signal!);
+      await done;
+      return {
+        ok: true,
+        status: "complete",
+        data: {
+          answer: "Finished deep dive after handoff.",
+          confidence: "high",
+          citations: [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }],
+        } as T,
+        summary: "Finished deep dive after handoff.",
+        turns: 2,
+        toolCalls: 1,
+        usage: { requests: 2, inputTokens: 120, outputTokens: 30 },
+      };
+    },
+  };
+  const handoffConfig: DeepThoughtConfig = { ...CONFIG, timeoutMs: 0, syncWaitMs: 30, jobRetentionMs: 60_000 };
+  const callerTool = createDeepThoughtTool(toolContext(), deps(runtime, slowRunner, { config: handoffConfig }));
+  const otherSessionTool = createDeepThoughtTool(toolContext({ sessionKey: "agent:main:slack:direct:u2" }),
+    deps(runtime, slowRunner, { config: handoffConfig }));
+
+  // Initial call hands off at syncWaitMs while keeping the background job running even if initial signal aborts afterwards.
+  const initialController = new AbortController();
+  const running = await execute(callerTool, { question: "Deep question?" }, initialController.signal);
+  assert.equal(running.status, "running");
+  assert.ok(running.jobId);
+  assert.equal(running.toolCallsUsed, 1);
+  assert.equal(running.lastTool, "search_memory");
+  assert.equal(activeDeepThoughts(), 1);
+  initialController.abort();
+
+  // Different session cannot inspect or hijack the jobId.
+  const wrongCaller = await execute(otherSessionTool, { jobId: running.jobId });
+  assert.equal(wrongCaller.status, "invalid_request");
+
+  // Finish the background investigation, then poll with jobId to collect the grounded result.
+  finish();
+  const collected = await execute(callerTool, { jobId: running.jobId });
+  assert.equal(collected.status, "complete");
+  assert.equal(collected.jobId, running.jobId);
+  assert.equal(collected.answer, "Finished deep dive after handoff.");
+  assert.deepEqual(collected.citations.map(c => c.source), ["qmd://memory/launch.md"]);
+  assert.equal(activeDeepThoughts(), 0);
+
+  // Explicit cancel stops a running background job cleanly.
+  const hanging: RunRunner = {
+    run: request => new Promise(resolve => {
+      request.signal!.addEventListener("abort", () => resolve({ ok: false, code: "aborted", error: "Steward aborted", retryable: false,
+        usage: { requests: 1 }, turns: 1, toolCalls: 0 }), { once: true });
+    }),
+  };
+  const cancelTool = createDeepThoughtTool(toolContext(), deps(runtime, hanging, { config: handoffConfig }));
+  const started = await execute(cancelTool, { question: "Long job to cancel" });
+  assert.equal(started.status, "running");
+  assert.ok(started.jobId);
+  assert.equal(activeDeepThoughts(), 1);
+  const cancelled = await execute(cancelTool, { jobId: started.jobId, cancel: true });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(activeDeepThoughts(), 0);
 });

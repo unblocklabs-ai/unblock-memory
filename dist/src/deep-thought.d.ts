@@ -21,10 +21,12 @@ export declare const DEEP_THOUGHT_RESULT_SCHEMA: Type.TObject<{
 }>;
 export type DeepThoughtResult = Static<typeof DEEP_THOUGHT_RESULT_SCHEMA>;
 declare const deepThoughtParameters: Type.TObject<{
-    question: Type.TString;
+    question: Type.TOptional<Type.TString>;
     focus: Type.TOptional<Type.TString>;
     corpora: Type.TOptional<Type.TArray<Type.TString>>;
     maxHops: Type.TOptional<Type.TInteger>;
+    jobId: Type.TOptional<Type.TString>;
+    cancel: Type.TOptional<Type.TBoolean>;
 }>;
 export type DeepThoughtParams = Static<typeof deepThoughtParameters>;
 type DeepThoughtManager = MemoryCandidateManager & {
@@ -97,6 +99,10 @@ export type DeepThoughtConfig = {
     maxToolCalls: number;
     /** Wall-clock timeout in ms (`0` = unlimited). */
     timeoutMs: number;
+    /** Sync fast-path wait window in ms before handing off a running `jobId` (`0` = wait until completion). */
+    syncWaitMs?: number;
+    /** How long finished background jobs remain collectible in ms (`0` = until process exit). */
+    jobRetentionMs?: number;
     /** Reserve ms for forced wrap-up when `timeoutMs > 0` (`0` = disabled). */
     wrapUpReserveMs?: number;
     /** Maximum concurrent deep_thought calls (`0` = unlimited). */
@@ -135,7 +141,8 @@ export type DeepThoughtDeps = {
 };
 type DeepThoughtCitation = DeepThoughtResult["citations"][number];
 export type DeepThoughtOutcome = {
-    status: "complete" | "incomplete" | "needs_decision" | "busy" | "timed_out" | "cancelled" | "failed" | "invalid_request" | "unavailable";
+    status: "complete" | "incomplete" | "needs_decision" | "running" | "busy" | "timed_out" | "cancelled" | "failed" | "invalid_request" | "unavailable";
+    jobId?: string;
     answer?: string;
     confidence?: DeepThoughtResult["confidence"];
     citations: DeepThoughtCitation[];
@@ -143,6 +150,8 @@ export type DeepThoughtOutcome = {
     hopsUsed: number;
     toolCallsUsed: number;
     elapsedMs: number;
+    lastTool?: string;
+    note?: string;
     usage?: StewardUsage;
     unverifiedCitationsDropped?: number;
     corpora?: string[];
@@ -150,16 +159,20 @@ export type DeepThoughtOutcome = {
 };
 /** Current process-wide in-flight `deep_thought` investigations (diagnostics/tests). */
 export declare function activeDeepThoughts(): number;
+/** Abort and clear any background `deep_thought` jobs on Gateway stop (or test cleanup). */
+export declare function cancelAllDeepThoughtJobs(): void;
 /** Tool factory: `api.registerTool((ctx) => createDeepThoughtTool(ctx, deps), { names: ["deep_thought"] })`. */
 export declare function createDeepThoughtTool(ctx: OpenClawPluginToolContext, deps: DeepThoughtDeps | undefined): {
     name: string;
     label: string;
     description: string;
     parameters: Type.TObject<{
-        question: Type.TString;
+        question: Type.TOptional<Type.TString>;
         focus: Type.TOptional<Type.TString>;
         corpora: Type.TOptional<Type.TArray<Type.TString>>;
         maxHops: Type.TOptional<Type.TInteger>;
+        jobId: Type.TOptional<Type.TString>;
+        cancel: Type.TOptional<Type.TBoolean>;
     }>;
     execute(_toolCallId: string, raw: unknown, signal?: AbortSignal): Promise<ReturnType<typeof jsonResult>>;
 } | null;

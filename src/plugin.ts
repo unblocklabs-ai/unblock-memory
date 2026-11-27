@@ -34,7 +34,7 @@ import { abortedByTimeout } from "./abortable.js";
 import { registerExtraction } from "./extraction-runtime.js";
 import { registerPeopleLearning, registerPeopleLearningCli } from "./people-learning-runtime.js";
 import { nonBlank } from "./guards.js";
-import { createDeepThoughtTool, type DeepThoughtDeps } from "./deep-thought.js";
+import { cancelAllDeepThoughtJobs, createDeepThoughtTool, type DeepThoughtDeps } from "./deep-thought.js";
 import { resolveStewardCredential } from "./steward-config.js";
 import { createStewardRunner, type StewardRunner } from "./steward-runner.js";
 import { registerStewardRuntime } from "./steward-runtime.js";
@@ -868,5 +868,6 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
       ...(config.people.enabled ? { people: { enabled: true, stores: peopleStores } } : {}),
     };
     api.registerTool((ctx) => createDeepThoughtTool(ctx, deepThought), { names: ["deep_thought"] });
+    api.on("gateway_stop", () => cancelAllDeepThoughtJobs());
   }
 }

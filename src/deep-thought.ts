@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
@@ -18,7 +19,10 @@ import type { StewardRunner, StewardToolDef, StewardUsage } from "./steward-runn
 const ISO_TIMESTAMP_PATTERN = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$";
 const PEOPLE_PAGE = 100;
 const DEFAULT_SEARCH_RESULTS = 10;
+const DEFAULT_SYNC_WAIT_MS = 65_000;
+const DEFAULT_JOB_RETENTION_MS = 1_800_000;
 const ACTIVE_COUNTER = Symbol.for("unblock-memory.deepThought.active");
+const JOB_REGISTRY = Symbol.for("unblock-memory.deepThought.jobs");
 
 /** The curator's final answer (wrapped by the runner's `submit_result` with a status). */
 export const DEEP_THOUGHT_RESULT_SCHEMA = Type.Object({
@@ -35,13 +39,18 @@ export const DEEP_THOUGHT_RESULT_SCHEMA = Type.Object({
 export type DeepThoughtResult = Static<typeof DEEP_THOUGHT_RESULT_SCHEMA>;
 
 const deepThoughtParameters = Type.Object({
-  question: Type.String({ pattern: "\\S", description: "The nuanced question to investigate across memory." }),
+  question: Type.Optional(Type.String({ pattern: "\\S",
+    description: "The nuanced question to investigate across memory (required when starting a new investigation; omit when polling a jobId)." })),
   focus: Type.Optional(Type.String({
     description: "Specific angles, time window, contradictions or entities to verify." })),
   corpora: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }), { minItems: 1,
     description: 'Configured non-skill corpus names; default is all searchable corpora. Use ["all"] alone for explicit all-corpora recall.' })),
   maxHops: Type.Optional(Type.Integer({ minimum: 1,
     description: "Optional maximum investigation turns; omit to let the curator investigate freely (bounded only if steward.deepThought.maxTurns > 0)." })),
+  jobId: Type.Optional(Type.String({ pattern: "\\S",
+    description: "Existing jobId returned with status 'running'. Waits for and collects the finished background investigation." })),
+  cancel: Type.Optional(Type.Boolean({
+    description: "When true alongside jobId, cancels that running background investigation." })),
 }, { additionalProperties: false });
 export type DeepThoughtParams = Static<typeof deepThoughtParameters>;
 
@@ -119,6 +128,10 @@ export type DeepThoughtConfig = {
   maxToolCalls: number;
   /** Wall-clock timeout in ms (`0` = unlimited). */
   timeoutMs: number;
+  /** Sync fast-path wait window in ms before handing off a running `jobId` (`0` = wait until completion). */
+  syncWaitMs?: number;
+  /** How long finished background jobs remain collectible in ms (`0` = until process exit). */
+  jobRetentionMs?: number;
   /** Reserve ms for forced wrap-up when `timeoutMs > 0` (`0` = disabled). */
   wrapUpReserveMs?: number;
   /** Maximum concurrent deep_thought calls (`0` = unlimited). */
@@ -157,7 +170,8 @@ export type DeepThoughtDeps = {
 type DeepThoughtCitation = DeepThoughtResult["citations"][number];
 
 export type DeepThoughtOutcome = {
-  status: "complete" | "incomplete" | "needs_decision" | "busy" | "timed_out" | "cancelled" | "failed" | "invalid_request" | "unavailable";
+  status: "complete" | "incomplete" | "needs_decision" | "running" | "busy" | "timed_out" | "cancelled" | "failed" | "invalid_request" | "unavailable";
+  jobId?: string;
   answer?: string;
   confidence?: DeepThoughtResult["confidence"];
   citations: DeepThoughtCitation[];
@@ -165,15 +179,30 @@ export type DeepThoughtOutcome = {
   hopsUsed: number;
   toolCallsUsed: number;
   elapsedMs: number;
+  lastTool?: string;
+  note?: string;
   usage?: StewardUsage;
   unverifiedCitationsDropped?: number;
   corpora?: string[];
   error?: string;
 };
 
-/* ───────────────────────────── Concurrency guard ───────────────────────────── */
+/* ───────────────────────────── Concurrency & Job Registry ───────────────────────────── */
 
 type ActiveCounter = { active: number };
+type DeepThoughtJob = {
+  id: string;
+  ownerKey: string;
+  started: number;
+  corpora: string[];
+  controller: AbortController;
+  toolCallsUsed: number;
+  lastTool?: string;
+  outcome?: DeepThoughtOutcome;
+  expiresAt?: number;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
+  promise: Promise<DeepThoughtOutcome>;
+};
 
 function activeCounter(): ActiveCounter {
   const global = globalThis as typeof globalThis & { [ACTIVE_COUNTER]?: ActiveCounter };
@@ -181,9 +210,35 @@ function activeCounter(): ActiveCounter {
   return global[ACTIVE_COUNTER];
 }
 
+function jobRegistry(): Map<string, DeepThoughtJob> {
+  const global = globalThis as typeof globalThis & { [JOB_REGISTRY]?: Map<string, DeepThoughtJob> };
+  global[JOB_REGISTRY] ??= new Map<string, DeepThoughtJob>();
+  return global[JOB_REGISTRY];
+}
+
+function pruneExpiredJobs(nowMs: number): void {
+  const jobs = jobRegistry();
+  for (const [id, job] of jobs) {
+    if (job.expiresAt !== undefined && nowMs >= job.expiresAt) {
+      if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+      jobs.delete(id);
+    }
+  }
+}
+
 /** Current process-wide in-flight `deep_thought` investigations (diagnostics/tests). */
 export function activeDeepThoughts(): number {
   return activeCounter().active;
+}
+
+/** Abort and clear any background `deep_thought` jobs on Gateway stop (or test cleanup). */
+export function cancelAllDeepThoughtJobs(): void {
+  const jobs = jobRegistry();
+  for (const job of jobs.values()) {
+    if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+    if (!job.outcome) job.controller.abort(new DOMException("Gateway stopping", "AbortError"));
+  }
+  jobs.clear();
 }
 
 /* ───────────────────────────── Helpers ───────────────────────────── */
@@ -266,9 +321,11 @@ function personMatches(query: string, person: PersonLike, identities: readonly I
 const DESCRIPTION =
   "System 2 memory curator. Use when a nuanced question needs multi-hop investigation — following leads across " +
   "memory files, past sessions, dates, contradictions or people — instead of running many manual memory_search/" +
-  "memory_get calls in your main context. A read-only sub-agent searches and reads with exactly your access, then " +
-  "returns one concise synthesis whose citations are verified against sources it actually opened. Prefer " +
-  "memory_search for a single quick lookup. Not proof of absence; historical memory is not current authorization.";
+  "memory_get calls in your main context. A read-only sub-agent fans out in parallel with exactly your access, then " +
+  "returns one concise synthesis whose citations are verified against sources it actually opened. If a deep " +
+  "investigation exceeds the sync wait window, it keeps running in the background and returns { status: 'running', jobId }; " +
+  "call deep_thought({ jobId }) to wait for and collect the final synthesis (repeat until status !== 'running'). " +
+  "Prefer memory_search for a single quick lookup. Not proof of absence; historical memory is not current authorization.";
 
 const CURATOR_SYSTEM_PROMPT = [
   "You are a thorough, independent System 2 memory curator for an AI agent. Investigate the question using only the read-only tools provided.",
@@ -282,11 +339,92 @@ const CURATOR_SYSTEM_PROMPT = [
   "Finish by calling submit_result exactly once.",
 ].join(" ");
 
+function ownerKey(active: ActiveContext): string {
+  return [
+    active.agentId,
+    active.requestContext.sessionKey ?? "",
+    active.requestContext.messageChannel ?? "",
+    active.requestContext.agentAccountId ?? "",
+  ].join("\0");
+}
+
+function runningSnapshot(job: DeepThoughtJob, now: () => number): DeepThoughtOutcome {
+  return {
+    status: "running",
+    jobId: job.id,
+    citations: [],
+    openQuestions: [],
+    hopsUsed: 0,
+    toolCallsUsed: job.toolCallsUsed,
+    elapsedMs: Math.max(0, now() - job.started),
+    ...(job.lastTool ? { lastTool: job.lastTool } : {}),
+    corpora: job.corpora,
+    note: `Investigation is still running in the background. Call deep_thought({ jobId: "${job.id}" }) to wait for the final synthesis, or pass cancel: true to stop it.`,
+  };
+}
+
+/**
+ * Waits up to `syncWaitMs` (0 = forever) for a background job to finish.
+ * When `abortJobOnCallerAbort` is true (initial call before handoff), caller abort cancels the job itself.
+ * On poll calls (`abortJobOnCallerAbort === false`), caller abort only ends the wait.
+ */
+async function awaitJob(
+  job: DeepThoughtJob,
+  syncWaitMs: number,
+  signal: AbortSignal | undefined,
+  now: () => number,
+  abortJobOnCallerAbort: boolean,
+): Promise<{ finished: true; outcome: DeepThoughtOutcome } | { finished: false; outcome: DeepThoughtOutcome }> {
+  if (job.outcome) return { finished: true, outcome: job.outcome };
+  if (signal?.aborted) {
+    if (abortJobOnCallerAbort) {
+      job.controller.abort(signal.reason);
+      return { finished: true, outcome: await job.promise };
+    }
+    return { finished: false, outcome: runningSnapshot(job, now) };
+  }
+  return await new Promise(resolve => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (abortJobOnCallerAbort) {
+        job.controller.abort(signal?.reason);
+        void job.promise.then(outcome => resolve({ finished: true, outcome }));
+      } else {
+        resolve({ finished: false, outcome: runningSnapshot(job, now) });
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (syncWaitMs > 0) {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ finished: false, outcome: runningSnapshot(job, now) });
+      }, syncWaitMs);
+      timer.unref?.();
+    }
+    void job.promise.then(outcome => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ finished: true, outcome });
+    });
+  });
+}
+
 /* ───────────────────────────── Core ───────────────────────────── */
 
 /**
- * Runs one caller-scoped multi-hop investigation. Every tool is bound to the caller's exact context:
- * identical `requestContext`, `agentId`, approved corpora and account. Never writes, never escalates.
+ * Runs one caller-scoped multi-hop investigation (or polls/cancels a handed-off background job).
+ * Every tool is bound to the caller's exact context: identical `requestContext`, `agentId`, approved corpora and account.
  */
 async function runDeepThought(
   active: ActiveContext,
@@ -298,6 +436,35 @@ async function runDeepThought(
   const started = now();
   const base = (): Pick<DeepThoughtOutcome, "citations" | "openQuestions" | "hopsUsed" | "toolCallsUsed" | "elapsedMs"> =>
     ({ citations: [], openQuestions: [], hopsUsed: 0, toolCallsUsed: 0, elapsedMs: Math.max(0, now() - started) });
+
+  pruneExpiredJobs(Date.now());
+  const syncWaitMs = deps.config.syncWaitMs ?? DEFAULT_SYNC_WAIT_MS;
+  const jobRetentionMs = deps.config.jobRetentionMs ?? DEFAULT_JOB_RETENTION_MS;
+  const caller = ownerKey(active);
+
+  if (params.jobId !== undefined) {
+    if (params.question !== undefined) {
+      return { ...base(), status: "invalid_request", error: "Pass either question or jobId, not both" };
+    }
+    const jobs = jobRegistry();
+    const job = jobs.get(params.jobId.trim());
+    if (!job || job.ownerKey !== caller) {
+      return { ...base(), status: "invalid_request", error: `Unknown or expired deep_thought jobId: ${params.jobId.trim()}` };
+    }
+    if (params.cancel) {
+      if (!job.outcome) job.controller.abort(new DOMException("Cancelled by caller", "AbortError"));
+      const outcome = await job.promise;
+      if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+      jobs.delete(job.id);
+      return outcome;
+    }
+    const waited = await awaitJob(job, syncWaitMs, signal, now, false);
+    return waited.outcome;
+  }
+
+  if (params.cancel || !nonBlank(params.question)) {
+    return { ...base(), status: "invalid_request", error: "Provide question to start an investigation or jobId to check a running one" };
+  }
 
   const allowed = resolveCorpora(params.corpora, deps.runtime.searchableCorpora());
   if ("error" in allowed) return { ...base(), status: "invalid_request", error: allowed.error };
@@ -311,216 +478,254 @@ async function runDeepThought(
   }
   counter.active += 1;
 
-  /** Text each visited path/handle actually returned to the model: citation quotes must be grounded in it. */
-  const visitedEvidence = new Map<string, string[]>();
-  const remember = (source: string, text: string) => {
-    const texts = visitedEvidence.get(source) ?? [];
-    if (text) texts.push(text);
-    visitedEvidence.set(source, texts);
-  };
-  /** Paths surfaced by search; when corpora are narrowed, reads are confined to these. */
-  const surfacedPaths = new Set<string>();
-  let toolCallsUsed = 0;
+  const jobId = `dt_${randomUUID().slice(0, 12)}`;
+  const jobController = new AbortController();
   const timeoutMs = deps.config.timeoutMs;
   const timeoutSignal = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
-  const runSignal = signal && timeoutSignal ? AbortSignal.any([signal, timeoutSignal]) : (signal ?? timeoutSignal);
-  const searchRanking = deps.config.searchRanking ?? "retrieval";
-  const searchMinUsefulness = deps.config.searchMinUsefulness ?? 0;
-  const defaultSearchResults = deps.config.defaultSearchResults ?? DEFAULT_SEARCH_RESULTS;
-  const maxSnippetChars = deps.config.maxSnippetChars ?? 0;
-  const maxQuoteChars = deps.config.maxQuoteChars ?? 0;
-  const maxPeopleMatches = deps.config.maxPeopleMatches ?? 0;
+  const runSignal = timeoutSignal ? AbortSignal.any([jobController.signal, timeoutSignal]) : jobController.signal;
 
-  try {
-    runSignal?.throwIfAborted();
-    const { manager, error } = await deps.runtime.getMemorySearchManager(active);
-    if (!manager) return { ...base(), status: "unavailable", error: error ?? "memory unavailable" };
-    let apiKey: string | undefined;
-    if (searchRanking === "decision") {
-      try {
-        apiKey = await (deps.resolveCredential ?? (() => resolveDecisionCredential(deps.decisionModel)))();
-      } catch { /* Judging is optional; retrieval fallback still returns local evidence. */ }
-    }
+  const executeJob = async (job: DeepThoughtJob): Promise<DeepThoughtOutcome> => {
+    /** Text each visited path/handle actually returned to the model: citation quotes must be grounded in it. */
+    const visitedEvidence = new Map<string, string[]>();
+    const remember = (source: string, text: string) => {
+      const texts = visitedEvidence.get(source) ?? [];
+      if (text) texts.push(text);
+      visitedEvidence.set(source, texts);
+    };
+    /** Paths surfaced by search; when corpora are narrowed, reads are confined to these. */
+    const surfacedPaths = new Set<string>();
+    const searchRanking = deps.config.searchRanking ?? "retrieval";
+    const searchMinUsefulness = deps.config.searchMinUsefulness ?? 0;
+    const defaultSearchResults = deps.config.defaultSearchResults ?? DEFAULT_SEARCH_RESULTS;
+    const maxSnippetChars = deps.config.maxSnippetChars ?? 0;
+    const maxQuoteChars = deps.config.maxQuoteChars ?? 0;
+    const maxPeopleMatches = deps.config.maxPeopleMatches ?? 0;
 
-    const tools: StewardToolDef[] = [];
-    tools.push({
-      name: "search_memory",
-      description: `Search approved memory corpora (${approvedCorpora.join(", ") || "none"}) with BM25 + vector queries. Returns qmd:// paths and snippets. Safe to call in parallel for multiple angles.`,
-      parameters: searchMemoryArgs,
-      async execute(raw, toolSignal) {
-        toolCallsUsed += 1;
-        const args = Value.Parse(searchMemoryArgs, raw);
-        const requested = resolveCorpora(args.corpora, approvedCorpora);
-        if ("error" in requested) return { status: "invalid_request", error: requested.error };
-        const queries = { lex: args.bm25Query.trim(), vec: args.vectorQuery.trim() };
-        const { conversation } = prepareQueryConversation([], queries.vec);
-        const search = await searchMemory(manager, queries, {
-          corpora: requested.corpora,
-          sessionFilter: args.sessionFilter,
-          maxResults: args.maxResults ?? defaultSearchResults,
-          apiKey: searchRanking === "decision" ? apiKey : undefined,
-          minUsefulness: searchMinUsefulness,
-          endpoint: deps.decisionModel.endpoint,
-          model: deps.decisionModel.model,
-          timeoutMs: deps.decisionModel.timeoutMs,
-          conversation: selectJudgeConversation(conversation),
-          allowRetrievalFallback: true,
-          signal: toolSignal,
-          requestContext: active.requestContext,
-        });
-        const results = search.results.map(hit => {
-          const snippet = clip(hit.snippet, maxSnippetChars);
-          remember(hit.path, snippet);
-          surfacedPaths.add(hit.path);
-          return {
-            path: hit.path,
-            corpus: hit.corpus,
-            startLine: hit.startLine,
-            endLine: hit.endLine,
-            score: Number(hit.score.toFixed(3)),
-            ...(hit.session ? { sessionStartedAt: new Date(hit.session.startedAt).toISOString() } : {}),
-            ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
-            ...(hit.extracted ? { observedAt: hit.extracted.observedAt } : {}),
-            snippet,
-          };
-        });
-        return { rankingMode: search.rankingMode, results };
-      },
-    });
-    tools.push({
-      name: "read_memory",
-      description: "Read an exact qmd:// path returned by search_memory. Continue truncated reads with nextFrom (as from) or nextCursor (as cursor). Safe to call in parallel across multiple files.",
-      parameters: readMemoryArgs,
-      async execute(raw) {
-        toolCallsUsed += 1;
-        const args = Value.Parse(readMemoryArgs, raw);
-        const path = args.path.trim();
-        if (narrowed && !surfacedPaths.has(path)) {
-          return { status: "not_found", path, text: "", note: "Only paths returned by search_memory in approved corpora can be read" };
-        }
-        const result = await manager.readFile({
-          relPath: path,
-          ...(args.from !== undefined ? { from: args.from } : {}),
-          ...(args.lines !== undefined ? { lines: args.lines } : {}),
-          ...(args.cursor ? { cursor: args.cursor } : {}),
-          requestContext: active.requestContext,
-        });
-        if (result.status === "ok") {
-          remember(path, result.text);
-          if (result.path && result.path !== path) remember(result.path, result.text);
-        }
-        return result;
-      },
-    });
+    try {
+      runSignal.throwIfAborted();
+      const { manager, error } = await deps.runtime.getMemorySearchManager(active);
+      if (!manager) return { ...base(), status: "unavailable", error: error ?? "memory unavailable" };
+      let apiKey: string | undefined;
+      if (searchRanking === "decision") {
+        try {
+          apiKey = await (deps.resolveCredential ?? (() => resolveDecisionCredential(deps.decisionModel)))();
+        } catch { /* Judging is optional; retrieval fallback still returns local evidence. */ }
+      }
 
-    const origin = callerOrigin(active);
-    if (deps.people?.enabled && origin.provider && origin.accountId) {
-      const peopleSource = deps.people.stores;
+      const tools: StewardToolDef[] = [];
       tools.push({
-        name: "lookup_person",
-        description: "Read-only lookup of verified People dossiers within the caller's own account. Cite results as person:<id>.",
-        parameters: lookupPersonArgs,
-        async execute(raw) {
-          toolCallsUsed += 1;
-          const { query } = Value.Parse(lookupPersonArgs, raw);
-          const store = peopleSource.get(active.agentId);
-          const matches: unknown[] = [];
-          for (let offset = 0; maxPeopleMatches <= 0 || matches.length < maxPeopleMatches; offset += PEOPLE_PAGE) {
-            const page = store.listActivePeople(PEOPLE_PAGE, offset, false);
-            for (const person of page) {
-              // People excluded from injection stay invisible here too (matches the People prompt hooks).
-              if (person.injectionEnabled === false) continue;
-              // Strict account fence: only identities in the caller's exact provider + account are visible.
-              const scoped = store.listIdentities(person.id).filter(identity => !identity.isDeactivated && identity.isBot !== true &&
-                identity.provider.toLowerCase() === origin.provider && identity.accountScope.toLowerCase() === origin.accountId);
-              if (!scoped.length || !personMatches(query, person, scoped)) continue;
-              const verified = store.getVerifiedDossier(person.id);
-              const handle = `person:${person.id}`;
-              const name = person.preferredName ?? person.displayName;
-              const identities = scoped.map(identity => ({ provider: identity.provider, externalId: identity.externalId,
-                handle: identity.handle, title: identity.title }));
-              const sections = verified?.dossier.sections.map(section => ({
-                category: section.category,
-                claims: section.claims.map(({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt }) =>
-                  ({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt })),
-              }));
-              remember(handle, [name, person.displayName, ...identities.flatMap(i => [i.handle, i.title, i.externalId]),
-                verified?.dossier.blurb, ...(sections ?? []).flatMap(section => section.claims.flatMap(c => [c.statement, c.scope]))]
-                .filter((text): text is string => typeof text === "string" && text.length > 0).join("\n"));
-              matches.push({
-                source: handle,
-                name,
-                status: person.status,
-                identities,
-                dossier: verified ? { reviewedAt: verified.reviewedAt, blurb: verified.dossier.blurb, sections } : null,
-                dossierStatus: verified ? "verified" : "unverified_or_missing",
-              });
-              if (maxPeopleMatches > 0 && matches.length >= maxPeopleMatches) break;
-            }
-            if (page.length < PEOPLE_PAGE) break;
-          }
-          return { status: matches.length ? "ok" : "not_found", matches };
+        name: "search_memory",
+        description: `Search approved memory corpora (${approvedCorpora.join(", ") || "none"}) with BM25 + vector queries. Returns qmd:// paths and snippets. Safe to call in parallel for multiple angles.`,
+        parameters: searchMemoryArgs,
+        async execute(raw, toolSignal) {
+          job.toolCallsUsed += 1;
+          job.lastTool = "search_memory";
+          const args = Value.Parse(searchMemoryArgs, raw);
+          const requested = resolveCorpora(args.corpora, approvedCorpora);
+          if ("error" in requested) return { status: "invalid_request", error: requested.error };
+          const queries = { lex: args.bm25Query.trim(), vec: args.vectorQuery.trim() };
+          const { conversation } = prepareQueryConversation([], queries.vec);
+          const search = await searchMemory(manager, queries, {
+            corpora: requested.corpora,
+            sessionFilter: args.sessionFilter,
+            maxResults: args.maxResults ?? defaultSearchResults,
+            apiKey: searchRanking === "decision" ? apiKey : undefined,
+            minUsefulness: searchMinUsefulness,
+            endpoint: deps.decisionModel.endpoint,
+            model: deps.decisionModel.model,
+            timeoutMs: deps.decisionModel.timeoutMs,
+            conversation: selectJudgeConversation(conversation),
+            allowRetrievalFallback: true,
+            signal: toolSignal,
+            requestContext: active.requestContext,
+          });
+          const results = search.results.map(hit => {
+            const snippet = clip(hit.snippet, maxSnippetChars);
+            remember(hit.path, snippet);
+            surfacedPaths.add(hit.path);
+            return {
+              path: hit.path,
+              corpus: hit.corpus,
+              startLine: hit.startLine,
+              endLine: hit.endLine,
+              score: Number(hit.score.toFixed(3)),
+              ...(hit.session ? { sessionStartedAt: new Date(hit.session.startedAt).toISOString() } : {}),
+              ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
+              ...(hit.extracted ? { observedAt: hit.extracted.observedAt } : {}),
+              snippet,
+            };
+          });
+          return { rankingMode: search.rankingMode, results };
         },
       });
-    }
+      tools.push({
+        name: "read_memory",
+        description: "Read an exact qmd:// path returned by search_memory. Continue truncated reads with nextFrom (as from) or nextCursor (as cursor). Safe to call in parallel across multiple files.",
+        parameters: readMemoryArgs,
+        async execute(raw) {
+          job.toolCallsUsed += 1;
+          job.lastTool = "read_memory";
+          const args = Value.Parse(readMemoryArgs, raw);
+          const path = args.path.trim();
+          if (narrowed && !surfacedPaths.has(path)) {
+            return { status: "not_found", path, text: "", note: "Only paths returned by search_memory in approved corpora can be read" };
+          }
+          const result = await manager.readFile({
+            relPath: path,
+            ...(args.from !== undefined ? { from: args.from } : {}),
+            ...(args.lines !== undefined ? { lines: args.lines } : {}),
+            ...(args.cursor ? { cursor: args.cursor } : {}),
+            requestContext: active.requestContext,
+          });
+          if (result.status === "ok") {
+            remember(path, result.text);
+            if (result.path && result.path !== path) remember(result.path, result.text);
+          }
+          return result;
+        },
+      });
 
-    const input = [
-      `Question: ${params.question.trim()}`,
-      ...(nonBlank(params.focus) ? [`Focus: ${params.focus!.trim()}`] : []),
-      `Approved corpora: ${approvedCorpora.join(", ") || "(none)"}`,
-      `Today: ${new Date().toISOString().slice(0, 10)}`,
-    ].join("\n");
-    const configMaxTurns = deps.config.maxTurns;
-    const maxTurns = params.maxHops !== undefined && configMaxTurns > 0
-      ? Math.min(params.maxHops, configMaxTurns)
-      : (params.maxHops ?? configMaxTurns);
-    const run = await deps.runner.run<DeepThoughtResult>({
-      purpose: "deep_thought",
-      systemPrompt: CURATOR_SYSTEM_PROMPT,
-      userPrompt: input,
-      tools,
-      submitSchema: DEEP_THOUGHT_RESULT_SCHEMA,
-      maxTurns,
-      maxToolCalls: deps.config.maxToolCalls,
-      wallTimeoutMs: timeoutMs,
-      ...(deps.config.wrapUpReserveMs !== undefined ? { wrapUpReserveMs: deps.config.wrapUpReserveMs } : {}),
-      signal: runSignal,
-      ...(deps.config.maxInputTokens !== undefined ? { maxInputTokens: deps.config.maxInputTokens } : {}),
-      ...(deps.config.maxToolResultChars !== undefined ? { maxToolResultChars: deps.config.maxToolResultChars } : {}),
-      ...(deps.config.model ? { model: deps.config.model } : {}),
-      ...(deps.config.reasoning ? { reasoning: deps.config.reasoning } : {}),
-    });
-    const elapsedMs = Math.max(0, now() - started);
-    const counts = { hopsUsed: run.turns, toolCallsUsed, elapsedMs, usage: run.usage, corpora: approvedCorpora };
-    if (!run.ok) {
-      const status: DeepThoughtOutcome["status"] = signal?.aborted ? "cancelled"
-        : run.code === "timeout" ? "timed_out"
-        : run.code === "aborted" ? (timeoutSignal?.aborted ? "timed_out" : "cancelled")
-        : run.code === "budget_exhausted" ? "incomplete"
-        : run.code === "missing_credentials" ? "unavailable"
-        : "failed";
-      return { status, citations: [], openQuestions: [], ...counts, error: clip(run.error, 300) };
+      const origin = callerOrigin(active);
+      if (deps.people?.enabled && origin.provider && origin.accountId) {
+        const peopleSource = deps.people.stores;
+        tools.push({
+          name: "lookup_person",
+          description: "Read-only lookup of verified People dossiers within the caller's own account. Cite results as person:<id>.",
+          parameters: lookupPersonArgs,
+          async execute(raw) {
+            job.toolCallsUsed += 1;
+            job.lastTool = "lookup_person";
+            const { query } = Value.Parse(lookupPersonArgs, raw);
+            const store = peopleSource.get(active.agentId);
+            const matches: unknown[] = [];
+            for (let offset = 0; maxPeopleMatches <= 0 || matches.length < maxPeopleMatches; offset += PEOPLE_PAGE) {
+              const page = store.listActivePeople(PEOPLE_PAGE, offset, false);
+              for (const person of page) {
+                // People excluded from injection stay invisible here too (matches the People prompt hooks).
+                if (person.injectionEnabled === false) continue;
+                // Strict account fence: only identities in the caller's exact provider + account are visible.
+                const scoped = store.listIdentities(person.id).filter(identity => !identity.isDeactivated && identity.isBot !== true &&
+                  identity.provider.toLowerCase() === origin.provider && identity.accountScope.toLowerCase() === origin.accountId);
+                if (!scoped.length || !personMatches(query, person, scoped)) continue;
+                const verified = store.getVerifiedDossier(person.id);
+                const handle = `person:${person.id}`;
+                const name = person.preferredName ?? person.displayName;
+                const identities = scoped.map(identity => ({ provider: identity.provider, externalId: identity.externalId,
+                  handle: identity.handle, title: identity.title }));
+                const sections = verified?.dossier.sections.map(section => ({
+                  category: section.category,
+                  claims: section.claims.map(({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt }) =>
+                    ({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt })),
+                }));
+                remember(handle, [name, person.displayName, ...identities.flatMap(i => [i.handle, i.title, i.externalId]),
+                  verified?.dossier.blurb, ...(sections ?? []).flatMap(section => section.claims.flatMap(c => [c.statement, c.scope]))]
+                  .filter((text): text is string => typeof text === "string" && text.length > 0).join("\n"));
+                matches.push({
+                  source: handle,
+                  name,
+                  status: person.status,
+                  identities,
+                  dossier: verified ? { reviewedAt: verified.reviewedAt, blurb: verified.dossier.blurb, sections } : null,
+                  dossierStatus: verified ? "verified" : "unverified_or_missing",
+                });
+                if (maxPeopleMatches > 0 && matches.length >= maxPeopleMatches) break;
+              }
+              if (page.length < PEOPLE_PAGE) break;
+            }
+            return { status: matches.length ? "ok" : "not_found", matches };
+          },
+        });
+      }
+
+      const input = [
+        `Question: ${params.question!.trim()}`,
+        ...(nonBlank(params.focus) ? [`Focus: ${params.focus!.trim()}`] : []),
+        `Approved corpora: ${approvedCorpora.join(", ") || "(none)"}`,
+        `Today: ${new Date().toISOString().slice(0, 10)}`,
+      ].join("\n");
+      const configMaxTurns = deps.config.maxTurns;
+      const maxTurns = params.maxHops !== undefined && configMaxTurns > 0
+        ? Math.min(params.maxHops, configMaxTurns)
+        : (params.maxHops ?? configMaxTurns);
+      const run = await deps.runner.run<DeepThoughtResult>({
+        purpose: "deep_thought",
+        systemPrompt: CURATOR_SYSTEM_PROMPT,
+        userPrompt: input,
+        tools,
+        submitSchema: DEEP_THOUGHT_RESULT_SCHEMA,
+        maxTurns,
+        maxToolCalls: deps.config.maxToolCalls,
+        wallTimeoutMs: timeoutMs,
+        ...(deps.config.wrapUpReserveMs !== undefined ? { wrapUpReserveMs: deps.config.wrapUpReserveMs } : {}),
+        signal: runSignal,
+        ...(deps.config.maxInputTokens !== undefined ? { maxInputTokens: deps.config.maxInputTokens } : {}),
+        ...(deps.config.maxToolResultChars !== undefined ? { maxToolResultChars: deps.config.maxToolResultChars } : {}),
+        ...(deps.config.model ? { model: deps.config.model } : {}),
+        ...(deps.config.reasoning ? { reasoning: deps.config.reasoning } : {}),
+      });
+      const elapsedMs = Math.max(0, now() - started);
+      const counts = { hopsUsed: run.turns, toolCallsUsed: job.toolCallsUsed, elapsedMs, usage: run.usage, corpora: approvedCorpora };
+      if (!run.ok) {
+        const status: DeepThoughtOutcome["status"] = jobController.signal.aborted ? "cancelled"
+          : run.code === "timeout" ? "timed_out"
+          : run.code === "aborted" ? (timeoutSignal?.aborted ? "timed_out" : "cancelled")
+          : run.code === "budget_exhausted" ? "incomplete"
+          : run.code === "missing_credentials" ? "unavailable"
+          : "failed";
+        return { status, citations: [], openQuestions: [], ...counts, error: clip(run.error, 300) };
+      }
+      const result = Value.Check(DEEP_THOUGHT_RESULT_SCHEMA, run.data) ? run.data : undefined;
+      const { kept, dropped } = verifyCitations(result?.citations ?? [], visitedEvidence, maxQuoteChars);
+      return {
+        status: result ? run.status : "incomplete",
+        ...(result ? { answer: result.answer, confidence: kept.length || !result.citations.length ? result.confidence : "low" } : {}),
+        citations: kept,
+        openQuestions: result?.openQuestions ?? [],
+        ...counts,
+        ...(dropped ? { unverifiedCitationsDropped: dropped } : {}),
+      };
+    } catch (error) {
+      const outcome = { ...base(), toolCallsUsed: job.toolCallsUsed, corpora: approvedCorpora };
+      if (jobController.signal.aborted) return { ...outcome, status: "cancelled", error: "cancelled by caller" };
+      if (timeoutSignal?.aborted) return { ...outcome, status: "timed_out", error: `deep_thought exceeded ${timeoutMs}ms` };
+      const usage = (error as { usage?: StewardUsage } | undefined)?.usage;
+      return { ...outcome, status: "failed", error: clip(error instanceof Error ? error.message : String(error), 300),
+        ...(usage ? { usage } : {}) };
+    } finally {
+      counter.active = Math.max(0, counter.active - 1);
     }
-    const result = Value.Check(DEEP_THOUGHT_RESULT_SCHEMA, run.data) ? run.data : undefined;
-    const { kept, dropped } = verifyCitations(result?.citations ?? [], visitedEvidence, maxQuoteChars);
-    return {
-      status: result ? run.status : "incomplete",
-      ...(result ? { answer: result.answer, confidence: kept.length || !result.citations.length ? result.confidence : "low" } : {}),
-      citations: kept,
-      openQuestions: result?.openQuestions ?? [],
-      ...counts,
-      ...(dropped ? { unverifiedCitationsDropped: dropped } : {}),
-    };
-  } catch (error) {
-    const outcome = { ...base(), toolCallsUsed, corpora: approvedCorpora };
-    if (signal?.aborted) return { ...outcome, status: "cancelled", error: "cancelled by caller" };
-    if (timeoutSignal?.aborted) return { ...outcome, status: "timed_out", error: `deep_thought exceeded ${timeoutMs}ms` };
-    const usage = (error as { usage?: StewardUsage } | undefined)?.usage;
-    return { ...outcome, status: "failed", error: clip(error instanceof Error ? error.message : String(error), 300),
-      ...(usage ? { usage } : {}) };
-  } finally {
-    counter.active = Math.max(0, counter.active - 1);
+  };
+
+  const jobs = jobRegistry();
+  const job: DeepThoughtJob = {
+    id: jobId,
+    ownerKey: caller,
+    started,
+    corpora: approvedCorpora,
+    controller: jobController,
+    toolCallsUsed: 0,
+    promise: undefined as unknown as Promise<DeepThoughtOutcome>,
+  };
+  job.promise = executeJob(job).then(outcome => {
+    const finalOutcome = jobs.has(jobId) ? { ...outcome, jobId } : outcome;
+    job.outcome = finalOutcome;
+    if (jobs.has(jobId) && jobRetentionMs > 0) {
+      job.expiresAt = Date.now() + jobRetentionMs;
+      job.cleanupTimer = setTimeout(() => jobs.delete(jobId), jobRetentionMs);
+      job.cleanupTimer.unref?.();
+    }
+    return finalOutcome;
+  });
+  jobs.set(jobId, job);
+
+  const waited = await awaitJob(job, syncWaitMs, signal, now, true);
+  if (waited.finished) {
+    if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+    jobs.delete(jobId);
+    const { jobId: _droppedJobId, ...syncOutcome } = waited.outcome;
+    return syncOutcome;
   }
+  return waited.outcome;
 }
 
 /** Tool factory: `api.registerTool((ctx) => createDeepThoughtTool(ctx, deps), { names: ["deep_thought"] })`. */
