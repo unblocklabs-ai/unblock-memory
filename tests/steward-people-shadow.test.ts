@@ -347,7 +347,12 @@ test("heartbeat keeps a slow model call's lease alive; a lost fence aborts the c
   let aborted = false;
   const reset: CompleteRunner = {
     complete: request => new Promise((_resolve, reject) => {
-      request.signal!.addEventListener("abort", () => { aborted = true; reject(request.signal!.reason); }, { once: true });
+      const keepAlive = setTimeout(() => reject(new Error("expected fence-lost abort")), 5_000);
+      request.signal!.addEventListener("abort", () => {
+        clearTimeout(keepAlive);
+        aborted = true;
+        reject(request.signal!.reason);
+      }, { once: true });
       const item = running();
       rival.enqueue({ kind: item.kind, scope: item.scope, mode: "item", inputRevision: "newer", recipeHash: item.recipeHash });
     }),

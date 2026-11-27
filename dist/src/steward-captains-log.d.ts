@@ -8,6 +8,7 @@ export declare const CAPTAINS_LOG_SCHEMA: Type.TObject<{
     entries: Type.TArray<Type.TObject<{
         topic: Type.TString;
         summary: Type.TString;
+        blocked: Type.TOptional<Type.TBoolean>;
         sessionRefs: Type.TOptional<Type.TArray<Type.TString>>;
     }>>;
     skipReason: Type.TOptional<Type.TString>;

@@ -16,7 +16,7 @@ const MINUTE = 60_000;
 const START = Date.parse("2026-11-27T04:30:00Z"); // 23:30 EST on Nov 26
 const INTERVAL = 180 * MINUTE;
 type Completion = Static<typeof CAPTAINS_LOG_SCHEMA>;
-type Prompt = { existingDailyLog: string; sessions: { ref: string; chatType: string; messages: { role: string; text: string }[] }[] };
+type Prompt = { existingDailyLog: string; sessions: { ref: string; chatType: string; channel?: string; messages: { role: string; text: string }[] }[] };
 const noAppend = { shouldAppend: false, entries: [], skipReason: "Already noted." } satisfies Completion;
 const append = { shouldAppend: true, entries: [{ topic: "Release", summary: "Approved the Friday release.", sessionRefs: ["s1"] }] } satisfies Completion;
 const config = resolveStewardConfig(undefined);
@@ -366,4 +366,42 @@ test("a failed pass retries within 15 minutes and later catches up from the wate
   assert.equal(result.sessions, 1);
   assert.deepEqual(caught.prompts[0]!.sessions[0]!.messages, [{ role: "user", text: "Rolled back the broken cache config." }]);
   assert.deepEqual(f.artifact()?.sessionMaxSeq, { early: 1, late: 1 });
+});
+
+test("includes sanitized channel context for channels/groups only and sorts active blockers first with [BLOCKED]", async t => {
+  const f = fixture(t);
+  f.seed("slack-named", "Policy requires approval for saved ads.", "channel", START - 4 * MINUTE);
+  f.database().exec("UPDATE conversations SET label='slack:unblock-labs-#fga-unblocklabs' WHERE conversation_id='conversation-slack-named'");
+  f.seed("slack-opaque", "Cleared disk caches.", "channel", START - 3 * MINUTE);
+  f.database().exec("UPDATE conversations SET label='slack:g-c0ahzfcas1k' WHERE conversation_id='conversation-slack-opaque'");
+  f.seed("loggie-group", "Weekly sync decisions.", "group", START - 2 * MINUTE);
+  f.database().exec("UPDATE conversations SET label='loggie:g-unblock-labs-weekly-standup' WHERE conversation_id='conversation-loggie-group'");
+  f.seed("dm-private", "Private check-in.", "direct", START - MINUTE);
+  f.database().exec("UPDATE conversations SET label='DM with Alice #secret-channel' WHERE conversation_id='conversation-dm-private'");
+
+  const { runner, prompts } = provider(() => ({
+    shouldAppend: true,
+    entries: [
+      { topic: "Blastoise RAM upgrade", summary: "Host reports 235.5 GiB usable RAM." },
+      { topic: "Loggie monthly quota", summary: "Exhausted 350,000-request cap; automations halted.", blocked: true },
+      { topic: "Mobile Shop menu", summary: "Published CSS scroll fix.", blocked: false },
+      { topic: "[BLOCKED] Email-agent sign-in", summary: "Daily sign-in failed with unrecognised-signin.", blocked: true },
+    ],
+  }));
+
+  const preview = await f.run({ dryRun: true, excludeChatTypes: [], runner });
+  assert.equal(preview.status, "preview");
+  assert.deepEqual(prompts[0]?.sessions.map(s => ({ chatType: s.chatType, channel: s.channel })), [
+    { chatType: "channel", channel: "#fga-unblocklabs" },
+    { chatType: "channel", channel: undefined },
+    { chatType: "group", channel: "unblock-labs-weekly-standup" },
+    { chatType: "direct", channel: undefined },
+  ]);
+  const lines = preview.markdown.trim().split("\n").filter(l => l.startsWith("- "));
+  assert.deepEqual(lines, [
+    "- **[BLOCKED] Loggie monthly quota:** Exhausted 350,000-request cap; automations halted.",
+    "- **[BLOCKED] Email-agent sign-in:** Daily sign-in failed with unrecognised-signin.",
+    "- **Blastoise RAM upgrade:** Host reports 235.5 GiB usable RAM.",
+    "- **Mobile Shop menu:** Published CSS scroll fix.",
+  ]);
 });
