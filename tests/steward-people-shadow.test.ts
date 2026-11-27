@@ -859,3 +859,81 @@ test("publish mode completes a full-validation weekly receipt and verifies the d
   t.after(() => people.close());
   assert.equal(people.isDossierVerified(f.mira.id), true, "complete source validation binds verification to the current revision");
 });
+
+test("scheduled publish honors opt-outs: a disabled agent or review kind adjudicates nothing, never stored manifests", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const workspace = join(f.root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  const { resolveConfig } = await import("../src/config.js");
+  const context = (learning: Record<string, unknown>) => ({
+    cfg: { agents: { defaults: { workspace, userTimezone: "UTC" }, entries: { main: { workspace } } } },
+    config: resolveConfig({ people: { enabled: true, whisperer: { enabled: true }, learning } }),
+    stateRoot: f.root,
+  });
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const { runner, prompts } = scriptedRunner((_prompt, handles) =>
+    ({ disposition: "retired", reason: "x", citedHandles: [handles[0]!], confidence: "high" }));
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+
+  // The whole agent opted out: the stored nightly manifest is NOT a fallback.
+  const optedOut = await runPeopleShadowPass({ mode: "publish", inventoryContext: context({ agents: { main: { enabled: false } } }),
+    dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
+  assert.deepEqual(optedOut.inventory.map(r => r.status), ["disabled", "disabled"]);
+  assert.deepEqual(optedOut.manifests, []);
+  assert.equal(optedOut.enqueued, 0);
+  assert.equal(prompts.length, 0);
+  assert.deepEqual(store.list(PEOPLE_SHADOW_KIND), []);
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length, baseline);
+
+  // Only nightly opted out: the weekly run is created and adjudicated, the stored nightly manifest never is.
+  const weeklyOnly = await runPeopleShadowPass({ mode: "publish", inventoryContext: context({ nightly: false }),
+    dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o" });
+  const byKind = new Map(weeklyOnly.inventory.map(r => [r.kind, r]));
+  assert.equal(byKind.get("nightly")?.status, "disabled");
+  assert.equal(byKind.get("weekly")?.status, "created");
+  assert.deepEqual(weeklyOnly.manifests.map(m => m.manifestId), [byKind.get("weekly")!.runId]);
+  assert.ok(store.list(PEOPLE_SHADOW_KIND).every(i => !i.scope.startsWith(`${f.manifest.id}:`)));
+
+  // An explicit manual override still adjudicates exactly the requested manifest.
+  const manual = await runPeopleShadowPass({ mode: "publish", inventoryContext: context({ agents: { main: { enabled: false } } }),
+    dbPath: f.dbPath, agentId: "main", workStore: store, runner, owner: "o", manifestIds: [f.manifest.id] });
+  assert.deepEqual(manual.manifests.map(m => m.manifestId), [f.manifest.id]);
+});
+
+test("publish mode re-checks the stored manifest revision inside the fenced commit and never applies a stale edit", async t => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const baseline = dossierChanges(f.dbPath, f.mira.id).length;
+  let refreshed = false;
+  const { runner } = scriptedRunner((_prompt, handles) => {
+    if (!refreshed) {
+      // The manifest is refreshed (reopened at a new revision) while the model is adjudicating.
+      refreshed = true;
+      const db = new DatabaseSync(f.dbPath);
+      try {
+        db.prepare("UPDATE people_learning_runs SET manifest=json_set(manifest,'$.createdAt',?) WHERE id=?")
+          .run(new Date(f.now - 5 * 60_000).toISOString(), f.manifest.id);
+      } finally { db.close(); }
+    }
+    return handles.length
+      ? { disposition: "retired", reason: "Withdrawn", citedHandles: [handles[0]!], confidence: "high" }
+      : { disposition: "unresolved", reason: "n/a", citedHandles: [], confidence: "low" };
+  });
+  const store = new WorkStore(f.dbPath);
+  t.after(() => store.close());
+  const result = await runPeopleShadowPass({ ...PUBLISH_DEFAULTS, dbPath: f.dbPath, agentId: "main", workStore: store, runner,
+    owner: "o", manifestIds: [f.manifest.id] });
+  assert.ok(refreshed);
+  assert.equal(result.published.applied, 0, "no dossier edit against a refreshed manifest");
+  assert.ok(result.published.skipped > 0);
+  assert.equal(dossierChanges(f.dbPath, f.mira.id).length, baseline);
+  const skipped = store.list(PEOPLE_SHADOW_KIND).map(i => JSON.parse(i.artifactJson ?? "{}") as PeopleShadowArtifact)
+    .filter(a => a.publication?.status === "skipped");
+  assert.ok(skipped.length > 0);
+  for (const artifact of skipped) {
+    assert.match(artifact.publication!.reason, /Manifest was refreshed/u);
+    assert.equal(artifact.publication!.disposition, "unresolved");
+  }
+});

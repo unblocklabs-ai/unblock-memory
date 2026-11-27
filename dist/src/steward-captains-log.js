@@ -59,8 +59,13 @@ function transcriptMessage(eventJson) {
         return undefined;
     if (record(message.provenance)?.kind === "inter_session")
         return undefined;
-    const text = (typeof message.content === "string" ? message.content : Array.isArray(message.content)
-        ? message.content.flatMap(value => {
+    // Only host-visible assistant output: never hidden reasoning, and an explicit empty display ([]) shows nothing.
+    if (message.role === "assistant" && message.channel === "analysis")
+        return undefined;
+    const content = message.role === "assistant" && Array.isArray(message.openclawDisplayContent)
+        ? message.openclawDisplayContent : message.content;
+    const text = (typeof content === "string" ? content : Array.isArray(content)
+        ? content.flatMap(value => {
             const block = record(value);
             return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
         }).join("\n") : "").trim();
@@ -248,6 +253,8 @@ export async function runCaptainsLogPass(options) {
     if (options.signal?.aborted)
         return { status: "aborted", sessions: 0 };
     const targetDueAt = startedAt + interval * 60_000;
+    // A transient failure retries sooner than a full interval; its window is caught up from the watermark.
+    const retryDueAt = () => now() + Math.min(interval * 60_000, 15 * 60_000);
     const leaseMs = options.leaseMs ?? DEFAULTS.steward.leaseMs;
     const key = { kind: CAPTAINS_LOG_KIND, scope: agentId, mode: "run" };
     let claim;
@@ -272,7 +279,10 @@ export async function runCaptainsLogPass(options) {
         }
         const { watermark, pending } = recoverWatermark(workspaceDir, claim?.artifactJson ??
             (dryRun ? workStore.get(key.kind, key.scope)?.artifactJson : null) ?? null);
-        const excerpts = readExcerpts(options, startedAt - lookback * 60_000, startedAt, watermark.sessionMaxSeq, signal);
+        // Catch up from the last capture after a failed pass or downtime instead of dropping that activity.
+        const windowStart = watermark.lastCapturedAtMs > 0
+            ? Math.min(startedAt - lookback * 60_000, watermark.lastCapturedAtMs) : startedAt - lookback * 60_000;
+        const excerpts = readExcerpts(options, windowStart, startedAt, watermark.sessionMaxSeq, signal);
         sessions = excerpts.length;
         const usageJson = () => usage ? JSON.stringify(usage) : undefined;
         const finish = (captured, publish) => {
@@ -345,8 +355,9 @@ export async function runCaptainsLogPass(options) {
     function release(status, reason = "aborted") {
         if (claim) {
             try {
-                workStore.fail(claim, { error: reason, retryAt: targetDueAt, usageJson: usage ? JSON.stringify(usage) : undefined, now: now() });
-                nextDueAt = targetDueAt;
+                const retryAt = status === "failed" ? retryDueAt() : targetDueAt;
+                workStore.fail(claim, { error: reason, retryAt, usageJson: usage ? JSON.stringify(usage) : undefined, now: now() });
+                nextDueAt = retryAt;
             }
             catch (error) {
                 if (!(error instanceof WorkFenceLostError))

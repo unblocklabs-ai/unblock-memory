@@ -478,7 +478,7 @@ test("records brand-new failed/unavailable windows in failedSessions and clears 
     assert.equal(first.manifest.sessions["cold-new"], undefined);
     assert.equal(typeof first.manifest.failedSessions?.["cold-new"], "string");
     assert.ok(first.manifest.failedSessions!["cold-new"]!.length > 0);
-    assert.equal(first.manifest.generation, undefined, "a partial reconcile must reconcile again");
+    assert.equal(first.manifest.generation, await fake.index.generation(), "a partial reconcile still certifies its generation");
 
     assert.deepEqual(sqlite.state.readManifest().failedSessions, first.manifest.failedSessions);
     assert.equal(await unchangedSessionSync(params, indexPath), undefined);
@@ -494,4 +494,104 @@ test("records brand-new failed/unavailable windows in failedSessions and clears 
   } finally {
     db.close();
   }
+});
+
+async function coldCapableDatabase(databasePath: string, sessions: Record<string, string>) {
+  const db = createAgentDatabase(databasePath, "main", "2026.9.2", 19);
+  for (const [sessionId, content] of Object.entries(sessions)) {
+    insertSession(db, { sessionId, chatType: "channel", message: { type: "message", message: { role: "user", content } } });
+  }
+  db.exec(`PRAGMA user_version=24; UPDATE schema_meta SET schema_version=24;
+    ALTER TABLE transcript_events ADD COLUMN event_zstd BLOB;
+    ALTER TABLE transcript_events ADD COLUMN event_utf8_bytes INTEGER;
+    CREATE TABLE session_transcript_cold_archives (session_id TEXT PRIMARY KEY);`);
+  return db;
+}
+
+test("a reconcile with a permanently cold window keeps its document, sweeps true strays and stays incremental", async (t) => {
+  const h = await harness("unblock-memory-partial-reconcile-");
+  t.after(h.close);
+  const databasePath = join(h.root, "agent.sqlite");
+  const db = await coldCapableDatabase(databasePath, { healthy: "Healthy window", frozen: "Frozen window" });
+  t.after(() => db.close());
+  const params = { databasePath, state: h.store, index: h.fake.index,
+    agentId: "main", agentName: "Theo", timezone: "UTC", chatTypes: ["channel"] as const };
+  const first = await syncSessionProjections(params);
+  const frozenPath = first.manifest.sessions.frozen!.documentPath;
+  const frozenText = h.fake.content(frozenPath);
+  assert.ok(frozenText);
+  // The window goes permanently cold, and someone else changes the collection (a stray appears): reconcile.
+  db.prepare("INSERT INTO session_transcript_cold_archives VALUES ('frozen')").run();
+  await h.fake.index.upsert({ path: "slack/channel/w/stray.md", content: "stale stray", createdAt: "x", modifiedAt: "x" });
+  const replacesBefore = h.fake.stats.replaces;
+  const partial = await syncSessionProjections(params);
+  assert.equal(partial.result.failed, 1);
+  assert.equal(h.fake.stats.replaces, replacesBefore, "a partial reconcile never replaces the whole collection");
+  assert.equal(h.fake.content(frozenPath), frozenText, "the failed window keeps its existing document");
+  assert.equal(h.fake.content("slack/channel/w/stray.md"), undefined, "a true stray is retracted");
+  assert.ok(h.fake.content(first.manifest.sessions.healthy!.documentPath));
+  assert.equal(partial.manifest.generation, await h.fake.index.generation(), "the swept generation is certified");
+  assert.equal(typeof partial.manifest.failedSessions?.frozen, "string");
+
+  // Later syncs are incremental: no full reconcile, no re-upsert of healthy windows, the cold window just retried.
+  h.fake.writes.length = 0;
+  const next = await syncSessionProjections(params);
+  assert.equal(next.result.failed, 1);
+  assert.equal(next.result.unchanged, 1);
+  assert.deepEqual(h.fake.writes, [], "no QMD writes at all");
+  assert.equal(next.manifest.generation, await h.fake.index.generation());
+
+  // Once the window recovers it reprojects incrementally, still without a full reconcile.
+  db.exec("DELETE FROM session_transcript_cold_archives");
+  const recovered = await syncSessionProjections(params);
+  assert.equal(recovered.result.failed, 0);
+  assert.equal(recovered.manifest.failedSessions, undefined);
+  assert.equal(h.fake.stats.replaces, replacesBefore);
+});
+
+test("a fenced-out sync never mutates QMD and the reconcile replace receives the abort signal", async (t) => {
+  const h = await harness("unblock-memory-fenced-sync-");
+  t.after(h.close);
+  const databasePath = join(h.root, "agent.sqlite");
+  const db = createAgentDatabase(databasePath);
+  insertSession(db, { sessionId: "s", chatType: "channel",
+    message: { type: "message", message: { role: "user", content: "Fenced content" } } });
+  db.close();
+  const params = { databasePath, state: h.store, index: h.fake.index,
+    agentId: "main", agentName: "Agent", timezone: "UTC", chatTypes: ["channel"] as const };
+
+  // Fence lost right before the first write: the probe aborts, nothing reaches QMD or the manifest.
+  const fenced = new AbortController();
+  let probes = 0;
+  await assert.rejects(syncSessionProjections({ ...params, signal: fenced.signal,
+    beforeWrite: () => { probes += 1; fenced.abort(new Error("fence lost")); } }), /fence lost/u);
+  assert.equal(probes, 1);
+  assert.deepEqual(h.fake.writes, []);
+  assert.equal(h.fake.documents.size, 0);
+  assert.equal(h.state.revision(), 0, "no manifest from the fenced attempt");
+
+  // The live attempt hands its signal to QMD's bulk reconcile.
+  const live = new AbortController();
+  const seen: (AbortSignal | undefined)[] = [];
+  const replace = h.fake.index.replace;
+  const index = { ...h.fake.index, replace: (documents: Parameters<typeof replace>[0], signal?: AbortSignal) => {
+    seen.push(signal);
+    return replace(documents, signal);
+  } };
+  const synced = await syncSessionProjections({ ...params, index, signal: live.signal, beforeWrite: () => { probes += 1; } });
+  assert.deepEqual(seen, [live.signal]);
+  assert.ok(probes >= 3, "probed before the replace and before embedding");
+  assert.equal(synced.result.updated, 1);
+
+  // Incremental writes probe before every upsert/retract: a fence lost mid-batch stops the remaining writes.
+  const changed = new DatabaseSync(databasePath);
+  insertSession(changed, { sessionId: "t", chatType: "channel",
+    message: { type: "message", message: { role: "user", content: "Second" } } });
+  changed.prepare("DELETE FROM session_windows WHERE session_id='s'").run();
+  changed.close();
+  h.fake.writes.length = 0;
+  const midway = new AbortController();
+  await assert.rejects(syncSessionProjections({ ...params, signal: midway.signal,
+    beforeWrite: () => { if (h.fake.writes.length) midway.abort(new Error("fence lost mid-batch")); } }), /mid-batch/u);
+  assert.equal(h.fake.writes.length, 1, "exactly one write before the fence loss, none after");
 });

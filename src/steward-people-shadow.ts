@@ -243,6 +243,14 @@ function readRuns(db: DatabaseSync, agentId: string, ids?: readonly string[]): S
   return runs;
 }
 
+/** The current revision of one stored manifest, read inside the caller's transaction. */
+function storedManifestRevision(db: DatabaseSync, manifestId: string): string | undefined {
+  if (!hasTable(db, "people_learning_runs")) return undefined;
+  const row = db.prepare("SELECT manifest FROM people_learning_runs WHERE id=?").get(manifestId);
+  if (!row) return undefined;
+  try { return manifestRevision(JSON.parse(String(row.manifest)) as ReviewManifest); } catch { return undefined; }
+}
+
 /** Cron dispositions for exactly one manifest revision (current run receipt or a historical receipt). */
 function cronDispositions(db: DatabaseSync, manifestId: string, revision: string): Map<string, Disposition> | undefined {
   if (!hasTable(db, "people_learning_runs")) return undefined;
@@ -509,6 +517,10 @@ function publishInTransaction(db: DatabaseSync, input: {
     return publication;
   };
   if (proposal.disposition === "unresolved") return done("unresolved", proposal.reason);
+  // The manifest may have been refreshed (reopened) since this proposal was staged: never publish a stale edit.
+  if (storedManifestRevision(db, artifact.manifestId) !== artifact.manifestRevision) {
+    return done("skipped", "Manifest was refreshed since this proposal; re-adjudicate against the current revision");
+  }
   // Defense in depth: verifyProposal already required ≥1 minted handle for every non-unresolved disposition.
   if (!sourceRefs.length) return done("skipped", "No verified handle source refs; never publish uncited evidence");
   if (CONFIDENCE_RANK[proposal.confidence] < CONFIDENCE_RANK[input.minConfidence]) {
@@ -759,15 +771,23 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
     interrupted: false, usage: emptyUsage(), items: [],
   };
   // Self-sufficient publishing: with no cron, the Steward creates the current window's immutable manifest itself.
+  // Scheduled publishing then adjudicates ONLY those authorized runs: a disabled (opted-out) agent or review kind, or
+  // one whose inventory failed, contributes nothing, never a fallback to stored manifests. Explicit ids still win.
   if (publishing && options.inventoryContext && !options.signal?.aborted) {
     result.inventory = await ensureManifests(options.inventoryContext, options.agentId);
+  }
+  let manifestIds = options.manifestIds;
+  if (publishing && options.inventoryContext && !manifestIds?.length) {
+    manifestIds = result.inventory.flatMap(entry =>
+      (entry.status === "fresh" || entry.status === "created") && entry.runId ? [entry.runId] : []);
+    if (!manifestIds.length) return result;
   }
   const db = openReadOnly(options.dbPath);
   if (!db) return result;
   type Task = { scope: string; manifest: ReviewManifest; revision: string; assertion: ReviewAssertion };
   const tasks: Task[] = [];
   try {
-    for (const run of readRuns(db, options.agentId, options.manifestIds)) {
+    for (const run of readRuns(db, options.agentId, manifestIds)) {
       // Publish mode never re-adjudicates an assertion this revision's receipt already resolved (cron or Steward).
       const cron = options.skipCronResolved || publishing ? cronDispositions(db, run.manifest.id, run.revision) : undefined;
       const assertions = run.manifest.assertions.filter(a => {

@@ -8,7 +8,7 @@ import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-ru
 import { QmdMemoryManager } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
 import { unchangedSessionSync } from "./session-sync.js";
-import { SessionSyncState, removeLegacySessionSyncArtifacts } from "./session-sync-state.js";
+import { SessionSyncState, legacySessionArtifactsRetirable, removeLegacySessionSyncArtifacts, } from "./session-sync-state.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
 import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
@@ -258,6 +258,13 @@ export class QmdMemoryRuntime {
             onFenceLost: (error) => abort.abort(error),
             onError: (error) => this.#reportError(error),
         });
+        // Probe the fence before every QMD mutation (a cheap read): a reclaimed or interrupted attempt aborts at once
+        // instead of writing until the next heartbeat notices.
+        const beforeWrite = () => {
+            const row = work.get(claim.kind, claim.scope);
+            if (row?.status !== "running" || row.attempt !== claim.attempt)
+                abort.abort(new WorkFenceLostError(claim, "session sync write"));
+        };
         const writePhase = (phase) => {
             try {
                 work.withFence(claim, () => state.writeReceipt({ status: "running", phase, startedAt, attempt: claim.attempt }));
@@ -279,15 +286,18 @@ export class QmdMemoryRuntime {
                     throw new Error(error ?? "memory unavailable");
                 result = await manager.syncSessions(force, writePhase, {
                     signal: abort.signal,
+                    beforeWrite,
                     // A fenced-out (reclaimed or interrupted) attempt can never publish its manifest.
                     persist: (manifest) => work.withFence(claim, () => state.writeManifest(manifest)),
                 });
             }
             const completed = { status: "completed", startedAt, completedAt: new Date().toISOString(), ...result };
             work.commitWithDomain(claim, { nextDueAt: 0 }, () => state.writeReceipt(completed));
-            // SQLite now owns the manifest: retire the Markdown-transport sidecars and plaintext projections.
-            if (result.failed === 0 && state.revision() > 0)
+            // SQLite now owns a certified manifest: retire the Markdown-transport sidecars and plaintext projections, unless
+            // a still-failing (cold, unreadable) window still has a usable legacy disk projection.
+            if (state.revision() > 0 && legacySessionArtifactsRetirable(run.directory, state.readManifest())) {
                 removeLegacySessionSyncArtifacts(run.directory);
+            }
         }
         catch (error) {
             // Released by gateway_stop or reclaimed elsewhere: the lease is gone, so record nothing here.

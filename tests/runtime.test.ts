@@ -809,6 +809,73 @@ test("retires legacy Markdown, manifest, lock and status sidecars after the firs
   assert.deepEqual(listFiles(stateDir).filter(file => !file.startsWith(MEMORY_DATABASE)), []);
 });
 
+test("a fence lost mid-sync aborts the signal at the very next QMD write probe, before any heartbeat", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-fence-probe-"));
+  const stateDir = stateDirFor(stateRoot);
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  t.after(() => runtime.close());
+  let observed: { before: boolean; after: boolean; reason: unknown } | undefined;
+  Object.defineProperty(runtime, "getMemorySearchManager", {
+    value: async () => ({
+      manager: {
+        async syncSessions(_force: boolean, _onPhase: unknown, options: { signal: AbortSignal; beforeWrite(): void }) {
+          options.beforeWrite();
+          const before = options.signal.aborted;
+          // Another process supersedes this attempt between two QMD writes.
+          withWork(stateDir, work => work.interruptOwner(sessionSyncRow(stateDir)!.owner!));
+          options.beforeWrite();
+          observed = { before, after: options.signal.aborted, reason: options.signal.reason };
+          options.signal.throwIfAborted();
+          return emptyResult();
+        },
+      },
+    }),
+  });
+  assert.equal((await runtime.startSessionSync(active, true)).status, "started");
+  await waitFor(() => observed !== undefined, "probed sync");
+  assert.equal(observed!.before, false, "a live fence never aborts");
+  assert.equal(observed!.after, true, "fence loss aborts immediately");
+  assert.ok(observed!.reason instanceof WorkFenceLostError);
+});
+
+test("legacy sidecars retire after a certified partial sync unless a failing window still has its disk projection", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-legacy-partial-"));
+  const stateDir = stateDirFor(stateRoot);
+  const projection = join(stateDir, "sessions", "slack", "channel", "frozen.md");
+  await mkdir(join(stateDir, "sessions", "slack", "channel"), { recursive: true });
+  await writeFile(projection, "# Transcript\n\nonly copy\n");
+  await writeFile(join(stateDir, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: {} }));
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  t.after(() => runtime.close());
+  const frozen = { sessionId: "frozen", chatType: "channel", startedAt: 1000, sourceGeneration: "g", maxSeq: 1,
+    activeEventCount: 1, sizeBytes: 1, projectionHash: "h", documentPath: "slack/channel/frozen.md", projectorVersion: 8 };
+  let manifest: Record<string, unknown> = { version: 1, generation: 3, failedSessions: { frozen: "fp" }, sessions: { frozen } };
+  Object.defineProperty(runtime, "getMemorySearchManager", {
+    value: async () => ({
+      manager: {
+        async syncSessions(_force: boolean, _onPhase: unknown, options: { persist(manifest: unknown): void }) {
+          options.persist(manifest);
+          return { ...emptyResult(), failed: 1 };
+        },
+      },
+    }),
+  });
+  const sync = async (generation: number) => {
+    assert.equal((await runtime.startSessionSync(active, true)).status, "started");
+    await waitFor(async () => (await runtime.sessionSyncStatus(active.agentId)).status === "completed" &&
+      withWork(stateDir, (_work, state) => state.readManifest().generation === generation), `sync ${generation}`);
+  };
+  await sync(3);
+  assert.ok(lstatSync(projection, { throwIfNoEntry: false }), "the cold window's only plaintext copy is kept");
+  assert.ok(lstatSync(join(stateDir, "sessions-manifest.json"), { throwIfNoEntry: false }));
+
+  // The same persistent failure with no usable disk projection: the certified manifest retires every sidecar.
+  await unlink(projection);
+  manifest = { ...manifest, generation: 4 };
+  await sync(4);
+  assert.deepEqual(listFiles(stateDir).filter(file => !file.startsWith(MEMORY_DATABASE)), []);
+});
+
 test("prepareReload fences admissions, drains managers/syncs with error reporting, and resumes only if retained", async (t) => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-prepare-reload-"));
   const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });

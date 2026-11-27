@@ -59,6 +59,11 @@ export declare class SessionSyncState {
 /** Read-only manifest snapshot for offline tools (never creates tables in a live database). */
 export declare function readSessionManifestSnapshot(databasePath: string, agentId: string, legacyDir?: string): SessionManifest;
 /**
+ * The legacy sidecars may retire once the SQLite manifest certifies a QMD collection generation and every window
+ * that still fails (cold, unreadable) has no usable legacy disk projection left to lose.
+ */
+export declare function legacySessionArtifactsRetirable(stateDir: string, manifest: SessionManifest): boolean;
+/**
  * Best-effort removal of retired sidecars once SQLite owns the manifest: the legacy JSON files, the
  * SQLite/PID lock files, and the private `sessions/**\/*.md` projections (plaintext transcripts).
  */

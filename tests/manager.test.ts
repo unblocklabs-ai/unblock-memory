@@ -2038,6 +2038,47 @@ test("syncSessions writes projected sessions straight into QMD: memory_get reads
   }
 });
 
+test("an incremental session rewrite purges the superseded projection's plaintext from QMD content", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-session-superseded-"));
+  const databasePath = join(root, "openclaw-agent.sqlite");
+  const source = resolveSessionSource(join(root, "sessions"), ["channel"]);
+  const marker = "supersededsessionsecretz";
+  const agent = createAgentDatabase(databasePath);
+  insertSession(agent, { sessionId: "rewritten", chatType: "channel",
+    message: { type: "message", message: { role: "user", content: `Before redaction ${marker}` } } });
+  agent.close();
+  const backing = await createStore({
+    dbPath: join(root, "index.sqlite"),
+    config: { collections: { [source.collection]: { projected: true } } },
+  });
+  t.mock.method(backing, "embed", async () => ({ docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }));
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath, workspaceDir: root, sources: [source], storeFactory: async () => backing,
+    sessions: { agentId: "main", agentName: "Agent", chatTypes: ["channel"], maxExpandedTokens: 500,
+      collection: source.collection, databasePath, statePath: join(root, MEMORY_DATABASE), timezone: "UTC" },
+  });
+  const contentWith = (needle: string) => (backing.internal.db
+    .prepare("SELECT COUNT(*) AS count FROM content WHERE doc LIKE ?").get(`%${needle}%`) as { count: number }).count;
+  try {
+    await manager.start();
+    assert.equal((await manager.syncSessions()).updated, 1);
+    assert.equal(contentWith(marker), 1);
+    // OpenClaw redacts the transcript in place: same session, same path, new projection hash (an upsert, not a retract).
+    const redact = new DatabaseSync(databasePath);
+    redact.prepare("UPDATE transcript_events SET event_json=? WHERE session_id='rewritten'")
+      .run(JSON.stringify({ type: "message", message: { role: "user", content: "Before redaction [redacted]" } }));
+    redact.prepare("UPDATE transcript_rewrite_watermarks SET generation='redacted' WHERE session_id='rewritten'").run();
+    redact.close();
+    const rewritten = await manager.syncSessions();
+    assert.equal(rewritten.updated, 1);
+    assert.equal(rewritten.removed, 0);
+    assert.equal(contentWith(marker), 0, "the superseded plaintext is purged from QMD's content table");
+    assert.equal(contentWith("[redacted]"), 1);
+  } finally {
+    await manager.close();
+  }
+});
+
 test("failed reclustering preserves stale results and successful reclustering replaces them fresh", async () => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-recluster-lifecycle-"));
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });

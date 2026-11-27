@@ -972,8 +972,8 @@ a `steward` section load cleanly and automatically get both features; set
 | `steward.peopleShadow.maxExcerptChars` | `0` | `>= 0` characters per evidence excerpt (`0` = unlimited) |
 | `steward.peopleShadow.maxExportBytes` | `0` | `>= 0` bytes read per approved export file (`0` = unlimited) |
 | `steward.captainsLog.enabled` | `true` | Starts the background Captain's Log distillation loop on Gateway start |
-| `steward.captainsLog.intervalMinutes` | `180` | `>= 1` minutes between Captain's Log passes |
-| `steward.captainsLog.lookbackMinutes` | `190` | `>= 1` minutes of recent session activity examined per pass (deduplicated via watermark) |
+| `steward.captainsLog.intervalMinutes` | `180` | `>= 1` minutes between Captain's Log passes (a transient failure retries after at most 15 minutes) |
+| `steward.captainsLog.lookbackMinutes` | `190` | `>= 1` minutes of recent session activity examined per pass, extended back to the last capture after a failed pass or downtime (deduplicated via watermark) |
 | `steward.captainsLog.maxSessionsPerRun` | `0` | `>= 0` eligible sessions distilled per pass (`0` = unlimited) |
 | `steward.captainsLog.maxCharsPerSession` | `0` | `>= 0` transcript characters per session (`0` = unlimited) |
 | `steward.captainsLog.maxExistingLogChars` | `0` | `>= 0` characters from existing `memory/YYYY-MM-DD.md` passed for dedup (`0` = unlimited) |

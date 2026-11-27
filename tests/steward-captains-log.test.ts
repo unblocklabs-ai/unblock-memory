@@ -318,3 +318,52 @@ test("recovers an appended section after the watermark transaction rolled back, 
   assert.equal(f.artifact()?.lastCapturedAtMs, START);
   assert.equal(f.item()?.strikes, 0);
 });
+
+function addRawMessage(db: DatabaseSync, sessionId: string, seq: number, at: number, message: Record<string, unknown>) {
+  db.prepare("INSERT INTO transcript_events VALUES (?, ?, ?, ?)").run(sessionId, seq, JSON.stringify({ type: "message", message }), at);
+  db.prepare("INSERT INTO session_transcript_active_events VALUES (?, ?, ?, ?)").run(sessionId, seq - 1, seq, seq - 1);
+}
+
+test("only host-visible assistant content reaches Steward: display content wins, [] and analysis stay hidden", async t => {
+  const f = fixture(t);
+  f.seed("visible", "Did the release ship?");
+  addRawMessage(f.database(), "visible", 2, START - MINUTE, { role: "assistant",
+    content: [{ type: "text", text: "RAW_UNDISPLAYED_MARKER" }],
+    openclawDisplayContent: [{ type: "text", text: "Shipped the release to production." }] });
+  addRawMessage(f.database(), "visible", 3, START - MINUTE, { role: "assistant", channel: "analysis",
+    content: [{ type: "text", text: "ANALYSIS_THOUGHT_MARKER" }] });
+  addRawMessage(f.database(), "visible", 4, START - MINUTE, { role: "assistant",
+    content: [{ type: "text", text: "SUPPRESSED_REPLY_MARKER" }], openclawDisplayContent: [] });
+  const result = await f.run({ dryRun: true });
+  assert.equal(result.sessions, 1);
+  const prompt = f.prompts.at(-1)!;
+  assert.deepEqual(prompt.sessions[0]!.messages, [
+    { role: "user", text: "Did the release ship?" },
+    { role: "assistant", text: "Shipped the release to production." },
+  ]);
+  assert.doesNotMatch(JSON.stringify(prompt), /_MARKER/u);
+});
+
+test("a failed pass retries within 15 minutes and later catches up from the watermark instead of dropping activity", async t => {
+  const f = fixture(t);
+  f.seed("early", "Approved the Friday release.");
+  assert.equal((await f.run()).status, "appended");
+  assert.equal(f.artifact()?.lastCapturedAtMs, START);
+  // Activity right after the capture; then the next pass fails transiently.
+  f.seed("late", "Rolled back the broken cache config.", "channel", START + 10 * MINUTE);
+  f.advance(INTERVAL);
+  const outage = provider(() => new Response(null, { status: 503, headers: { "retry-after": "60" } }));
+  const failed = await f.run({ runner: outage.runner, timeoutMs: 5000 });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.nextDueAt, START + INTERVAL + 15 * MINUTE, "a transient failure retries soon, not a full interval later");
+  assert.equal(f.item()?.dueAt, failed.nextDueAt);
+  assert.equal(f.item()?.strikes, 0);
+  // Gateway downtime pushes the next pass far past the lookback: the window still starts at the last capture.
+  f.advance(INTERVAL + 60 * MINUTE);
+  const caught = provider(() => append);
+  const result = await f.run({ runner: caught.runner });
+  assert.equal(result.status, "appended");
+  assert.equal(result.sessions, 1);
+  assert.deepEqual(caught.prompts[0]!.sessions[0]!.messages, [{ role: "user", text: "Rolled back the broken cache config." }]);
+  assert.deepEqual(f.artifact()?.sessionMaxSeq, { early: 1, late: 1 });
+});

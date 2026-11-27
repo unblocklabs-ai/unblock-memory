@@ -16,23 +16,25 @@ export function fakeSessionIndex(options: { path?: string } = {}) {
   const touch = () => { if (options.path) writeFileSync(options.path, `generation-${generation}-embed-${stats.embeds}`); };
   const same = (left: SessionDocument | undefined, right: SessionDocument) =>
     left?.content === right.content && left.createdAt === right.createdAt && left.modifiedAt === right.modifiedAt;
+  const writes: string[] = [];
   const index: SessionIndex = {
     path: options.path,
     async generation() { return generation; },
     async upsert(document) {
-      stats.upserts++;
+      stats.upserts++; writes.push(`upsert:${document.path}`);
       if (same(documents.get(document.path), document)) return false;
       documents.set(document.path, document); generation++; touch();
       return true;
     },
     async retract(path) {
-      stats.retracts++;
+      stats.retracts++; writes.push(`retract:${path}`);
       if (!documents.delete(path)) return false;
       generation++; touch();
       return true;
     },
-    async replace(desired) {
-      stats.replaces++;
+    async replace(desired, signal) {
+      stats.replaces++; writes.push("replace");
+      signal?.throwIfAborted();
       const wanted = new Map(desired.map(document => [document.path, document]));
       let changed = 0;
       for (const path of [...documents.keys()]) if (!wanted.has(path)) { documents.delete(path); changed++; }
@@ -43,6 +45,7 @@ export function fakeSessionIndex(options: { path?: string } = {}) {
       if (changed) { generation++; touch(); }
       return changed;
     },
+    async activePaths() { return [...documents.keys()]; },
     async embed() {
       stats.embeds++;
       const embedded = hooks.embed ? await hooks.embed() : 1;
@@ -52,7 +55,7 @@ export function fakeSessionIndex(options: { path?: string } = {}) {
     async ready() { return hooks.ready ? await hooks.ready() : true; },
   };
   return {
-    index, documents, stats, hooks,
+    index, documents, stats, hooks, writes,
     content: (path: string) => documents.get(path)?.content,
     /** Simulate another writer changing the collection behind the manifest's back. */
     externalChange() { generation++; },

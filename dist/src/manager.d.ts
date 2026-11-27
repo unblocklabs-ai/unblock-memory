@@ -143,6 +143,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void, options?: {
         persist?: (manifest: SessionManifest) => void;
         signal?: AbortSignal;
+        beforeWrite?: () => void;
     }): Promise<SessionSyncResult>;
     recluster(options?: MemoryReclusterOptions, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
     listClusters(limit?: number): Promise<MemoryClusterList>;

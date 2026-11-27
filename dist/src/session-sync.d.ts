@@ -37,7 +37,9 @@ export type SessionIndex = {
     upsert(document: SessionDocument): Promise<boolean>;
     retract(path: string): Promise<boolean>;
     /** Reconcile the complete desired set atomically; returns the number of changed documents. */
-    replace(documents: readonly SessionDocument[]): Promise<number>;
+    replace(documents: readonly SessionDocument[], signal?: AbortSignal): Promise<number>;
+    /** Paths of every active document in the collection (for a partial reconcile's explicit stray sweep). */
+    activePaths(): Promise<readonly string[]>;
     /** Embed pending chunks; returns the number of chunks embedded. */
     embed(): Promise<number>;
     ready(): Promise<boolean>;
@@ -63,14 +65,18 @@ export declare function sessionMetadataByPath(manifest: SessionManifest): Map<st
  *
  * - Incremental (manifest generation equals QMD's): upsert changed documents, retract removed ones.
  * - Reconcile (force, legacy import, or anyone else changed the collection): re-read every window and, when all
- *   succeed, atomically replace the collection's complete document set (`syncProjectedCollection`).
+ *   succeed, atomically replace the collection's complete document set (`syncProjectedCollection`). When some windows
+ *   fail (cold, unreadable), keep their existing documents, upsert the rest and retract only true strays, then certify
+ *   the generation anyway: the failed windows stay in `failedSessions` and are retried incrementally.
  * The manifest is persisted only after QMD accepted the writes; a crash in between reconciles next time.
+ * `beforeWrite` runs before every QMD mutation (a fence probe may abort `signal` there), then `signal` is checked.
  */
 export declare function syncSessionProjections(params: ProjectionOptions & {
     state: SessionManifestStore;
     index: SessionIndex;
     force?: boolean;
     signal?: AbortSignal;
+    beforeWrite?: () => void;
     onIndexing?: () => void;
 }): Promise<{
     result: SessionSyncResult;

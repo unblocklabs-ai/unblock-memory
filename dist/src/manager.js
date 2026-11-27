@@ -139,6 +139,12 @@ async function ensureSemanticChunking(store) {
 export function enableSecureDelete(store) {
     store.internal.db.exec("PRAGMA secure_delete = ON");
 }
+/** Securely purge content and vectors no live document references (e.g. a projection replaced in place). */
+function cleanupSupersededContent(store) {
+    store.internal.db.exec("PRAGMA secure_delete = ON");
+    store.internal.cleanupOrphanedVectors();
+    store.internal.cleanupOrphanedContent();
+}
 export function cleanupRemovedDocuments(store, changedDocuments = 0) {
     enableSecureDelete(store);
     const cleaned = changedDocuments +
@@ -676,6 +682,7 @@ export class QmdMemoryManager {
             onPhase?.("projecting");
             const state = this.#getSessionState();
             const store = await this.#getStore();
+            const index = this.#sessionIndex(store, sessions.collection);
             const synced = await syncSessionProjections({
                 databasePath: sessions.databasePath,
                 agentId: sessions.agentId,
@@ -684,9 +691,16 @@ export class QmdMemoryManager {
                 chatTypes: sessions.chatTypes,
                 force,
                 signal: options.signal,
+                ...(options.beforeWrite ? { beforeWrite: options.beforeWrite } : {}),
                 state: { read: () => state.readManifest(), write: options.persist ?? (manifest => state.writeManifest(manifest)) },
-                index: this.#sessionIndex(store, sessions.collection),
+                index,
                 onIndexing: () => onPhase?.("indexing"),
+            }).finally(() => {
+                // Already a no-op after a successful embed; on a failed or aborted batch, purge best-effort.
+                try {
+                    index.purge();
+                }
+                catch { /* The original error wins. */ }
             });
             this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
             this.#sessionManifest = synced.manifest;
@@ -701,31 +715,50 @@ export class QmdMemoryManager {
     #sessionIndex(store, collection) {
         const analysis = store;
         let removed = 0;
+        let superseded = false;
         const changed = (count) => {
             if (count > 0 && analysis.internal)
                 markMemoryAnalysisStale(analysis.internal.db);
             return count;
         };
+        // Securely purge retracted or superseded (rewritten, redacted) transcript plaintext and vectors once per batch.
+        // Idempotent: runs before embedding and again when the sync settles, so an aborted batch never leaves plaintext.
+        const purge = () => {
+            if (removed > 0)
+                this.#cleanupRemovedDocuments?.(removed);
+            else if (superseded && analysis.internal)
+                cleanupSupersededContent(analysis);
+            removed = 0;
+            superseded = false;
+        };
         return {
             path: this.#dbPath,
+            purge,
             generation: () => store.getCollectionGeneration(collection),
-            upsert: async ({ path, content, createdAt, modifiedAt }) => changed(Number((await store.upsertDocument(collection, path, content, { createdAt, modifiedAt })).changed)) > 0,
+            upsert: async ({ path, content, createdAt, modifiedAt }) => {
+                const written = (await store.upsertDocument(collection, path, content, { createdAt, modifiedAt })).changed;
+                if (written)
+                    superseded = true;
+                return changed(Number(written)) > 0;
+            },
             retract: async (path) => {
                 const { deactivated } = await store.retractDocument(collection, path);
                 if (deactivated)
                     removed += changed(1);
                 return deactivated;
             },
-            replace: async (documents) => {
-                const result = await store.syncProjectedCollection(collection, documents, { cleanup: true });
+            replace: async (documents, signal) => {
+                const result = await store.syncProjectedCollection(collection, documents, { cleanup: true, ...(signal ? { signal } : {}) });
                 removed += result.retracted;
                 return changed(result.upserted + result.retracted);
             },
+            activePaths: async () => {
+                if (!analysis.internal)
+                    throw new Error("memory session reconcile requires QMD's internal store");
+                return analysis.internal.getActiveDocumentPaths(collection);
+            },
             embed: async () => {
-                // Securely purge retracted transcript plaintext and vectors once per run, before embedding.
-                if (removed > 0)
-                    this.#cleanupRemovedDocuments?.(removed);
-                removed = 0;
+                purge();
                 const result = await store.embed({ collection, chunkStrategy: "semantic" });
                 this.#recordEmbedding(result);
                 return changed(completedEmbeddingCount(result));

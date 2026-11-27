@@ -282,11 +282,15 @@ async function certifyIndex(index) {
  *
  * - Incremental (manifest generation equals QMD's): upsert changed documents, retract removed ones.
  * - Reconcile (force, legacy import, or anyone else changed the collection): re-read every window and, when all
- *   succeed, atomically replace the collection's complete document set (`syncProjectedCollection`).
+ *   succeed, atomically replace the collection's complete document set (`syncProjectedCollection`). When some windows
+ *   fail (cold, unreadable), keep their existing documents, upsert the rest and retract only true strays, then certify
+ *   the generation anyway: the failed windows stay in `failedSessions` and are retried incrementally.
  * The manifest is persisted only after QMD accepted the writes; a crash in between reconciles next time.
+ * `beforeWrite` runs before every QMD mutation (a fence probe may abort `signal` there), then `signal` is checked.
  */
 export async function syncSessionProjections(params) {
     const { index, signal } = params;
+    const guardWrite = () => { params.beforeWrite?.(); signal?.throwIfAborted(); };
     signal?.throwIfAborted();
     const previousManifest = params.state.read();
     for (const session of Object.values(previousManifest.sessions))
@@ -308,6 +312,8 @@ export async function syncSessionProjections(params) {
     const documents = [];
     const upserts = [];
     const retractions = new Set();
+    // A failed window keeps whatever QMD already holds for it, at its previous or current path.
+    const failedPaths = new Set();
     for (const window of snapshot.windows) {
         signal?.throwIfAborted();
         const outcome = syncWindow({
@@ -326,6 +332,7 @@ export async function syncSessionProjections(params) {
         if (outcome.kind === "failed") {
             counts.failed += 1;
             failedSessions[window.sessionId] = snapshot.fingerprints.get(window.sessionId);
+            failedPaths.add(sessionDocumentPath(windowMetadata(window)));
             if (outcome.session)
                 sessions[window.sessionId] = outcome.session;
         }
@@ -367,28 +374,39 @@ export async function syncSessionProjections(params) {
         retractions.add(session.documentPath);
         counts.removed += 1;
     }
-    const kept = new Set(Object.values(sessions).map(session => session.documentPath));
+    const kept = new Set([...Object.values(sessions).map(session => session.documentPath), ...failedPaths]);
     for (const path of kept)
         retractions.delete(path);
     signal?.throwIfAborted();
     // Every snapshot window was read, so the desired set is complete: let QMD sweep anything else.
     const replaceAll = reconcile && counts.failed === 0;
+    if (reconcile && !replaceAll) {
+        // Partial reconcile: sweep true strays explicitly, never a document a failed window may still need.
+        for (const document of documents)
+            kept.add(document.path);
+        for (const path of await index.activePaths())
+            if (!kept.has(path))
+                retractions.add(path);
+    }
     const writes = replaceAll || upserts.length > 0 || retractions.size > 0;
     if (writes)
         params.onIndexing?.();
     let changedDocuments = 0;
     if (replaceAll) {
-        changedDocuments = await index.replace(documents);
+        guardWrite();
+        changedDocuments = await index.replace(documents, signal);
     }
     else {
         for (const document of upserts) {
-            signal?.throwIfAborted();
+            guardWrite();
             if (await index.upsert(document))
                 changedDocuments += 1;
         }
-        for (const path of retractions)
+        for (const path of retractions) {
+            guardWrite();
             if (await index.retract(path))
                 changedDocuments += 1;
+        }
     }
     // The index changed since the last certification (or never was): embedding is incremental, so re-check it.
     const needsIndex = reconcile || changedDocuments > 0 || !previousManifest.indexSignature || !index.path ||
@@ -396,7 +414,10 @@ export async function syncSessionProjections(params) {
         previousManifest.projectionKey !== currentProjectionKey;
     if (needsIndex && !writes)
         params.onIndexing?.();
-    signal?.throwIfAborted();
+    if (needsIndex)
+        guardWrite();
+    else
+        signal?.throwIfAborted();
     const embedded = needsIndex ? await index.embed() : 0;
     const generationAfter = await index.generation();
     const checkedAt = Date.now();
@@ -407,15 +428,15 @@ export async function syncSessionProjections(params) {
     const manifestProjectionKey = counts.failed === 0
         ? currentProjectionKey
         : previousManifest.projectionKey;
-    // A partial reconcile could not sweep strays, so the next run must reconcile again.
-    const generation = reconcile && counts.failed > 0 ? undefined : generationAfter;
+    // Even a partial reconcile swept its strays, so its generation is certified and the next run stays incremental.
+    const generation = generationAfter;
     const manifest = {
         version: previousManifest.version,
         lastSuccessfulSyncAt,
         lastIndexedAt,
         projectionKey: manifestProjectionKey,
         ...(indexSignature !== undefined ? { indexSignature } : {}),
-        ...(generation !== undefined ? { generation } : {}),
+        generation,
         ignoredSessions,
         ...(Object.keys(failedSessions).length ? { failedSessions } : {}),
         sessions,

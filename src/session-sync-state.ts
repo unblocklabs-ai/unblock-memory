@@ -201,6 +201,19 @@ export function readSessionManifestSnapshot(databasePath: string, agentId: strin
 }
 
 /**
+ * The legacy sidecars may retire once the SQLite manifest certifies a QMD collection generation and every window
+ * that still fails (cold, unreadable) has no usable legacy disk projection left to lose.
+ */
+export function legacySessionArtifactsRetirable(stateDir: string, manifest: SessionManifest): boolean {
+  if (manifest.generation === undefined) return false;
+  return Object.keys(manifest.failedSessions ?? {}).every(sessionId => {
+    const documentPath = manifest.sessions[sessionId]?.documentPath;
+    return !documentPath ||
+      !lstatSync(join(stateDir, LEGACY_PROJECTION_DIR, ...documentPath.split("/")), { throwIfNoEntry: false })?.isFile();
+  });
+}
+
+/**
  * Best-effort removal of retired sidecars once SQLite owns the manifest: the legacy JSON files, the
  * SQLite/PID lock files, and the private `sessions/**\/*.md` projections (plaintext transcripts).
  */
