@@ -15,8 +15,13 @@ type SkillWhispererRuntime = {
     searchSkills(params: RuntimeParams, query: string, minScore: number, limit: number): Promise<SkillSearchCandidate[]>;
     resolveSkillPath(params: RuntimeParams, path: string): string | undefined;
 };
+/** Fingerprint the effective routing settings; the legacy cooldown no longer affects routing.
+ * @public For callers assigning experiment recipes.
+ */
+export declare function skillRecipeHash(config: UnblockMemoryConfig["skillWhisperer"]): string;
 export declare function registerSkillWhisperer(api: OpenClawPluginApi, runtime: SkillWhispererRuntime, config: UnblockMemoryConfig["skillWhisperer"], decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics, recallLedger?: {
     writer: RecallLedgerWriter;
     dbPathForAgent: (agentId: string) => string;
+    recipeHash?: string;
 }): WhispererPrompt | undefined;
 export {};

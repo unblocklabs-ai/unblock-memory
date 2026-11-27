@@ -59,6 +59,10 @@ test("config defaults, nested overrides and strict boundaries", () => {
     outcomeLedger: {
       enabled: true, intervalMinutes: 60, lookbackMs: 604_800_000, maxRowsPerPass: 0, matchWindowMs: 1_800_000, retentionDays: 0,
     },
+    expectations: {
+      enabled: true, intervalMinutes: 60, lookbackMinutes: 70, dueLeadMinutes: 60, sweepAfterMinutes: 1440, maxSessionsPerRun: 0,
+      maxCharsPerSession: 0, maxSweepItems: 0, timeoutMs: 0, excludeChatTypes: ["direct"], extract: true, sweep: true, blockerAutoExpireMinutes: 4320,
+    },
   });
   const overridden = resolveStewardConfig({
     reasoning: "off", endpoint: "http://localhost:123/v1/responses/",

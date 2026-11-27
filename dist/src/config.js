@@ -10,6 +10,8 @@ import { resolveSafetyWhisperer } from "./safety-config.js";
 import { resolveMyTurn } from "./my-turn.js";
 import { resolveRecallLedger } from "./recall-ledger.js";
 import { resolveStewardConfig } from "./steward-config.js";
+import { EXPECTATIONS_WHISPERER_DEFAULTS } from "./expectations-whisperer.js";
+import { DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS, DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP } from "./deep-thought-store.js";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
 const MAX_SESSION_MAX_EXPANDED_TOKENS = 10_000;
@@ -21,7 +23,7 @@ export const DEFAULT_CORPORA = [
         paths: DEFAULT_PATHS,
     },
 ];
-export const WHISPERER_NAMES = ["memory", "skill", "people", "myTurn", "safety"];
+export const WHISPERER_NAMES = ["memory", "skill", "people", "myTurn", "expectations", "safety"];
 export const DEFAULT_PEOPLE_CONFIG = {
     enabled: false,
     whisperer: { enabled: false, maxChars: DEFAULTS.people.defaultWhispererMaxChars },
@@ -94,11 +96,20 @@ function resolveDecisionModel(value) {
         timeoutMs: resolved.timeoutMs,
     };
 }
+const DEFAULT_RECIPE_HASH = "default";
+function recipeHash(value, label) {
+    if (value === undefined)
+        return DEFAULT_RECIPE_HASH;
+    if (typeof value !== "string" || !value.trim())
+        throw new Error(`unblock-memory ${label}.recipeHash must be a non-empty string`);
+    return value.trim();
+}
 const DEFAULT_SKILL_WHISPERER = {
     enabled: true,
     historyMessages: DEFAULTS.skillWhisperer.defaultHistoryMessages,
     minScore: DEFAULTS.skillWhisperer.defaultMinScore,
     cooldownTurns: DEFAULTS.skillWhisperer.defaultCooldownTurns,
+    recipeHash: DEFAULT_RECIPE_HASH,
 };
 const MEMORY_WHISPERER_MODES = ["v2", "legacy"];
 const DEFAULT_MEMORY_WHISPERER = {
@@ -106,6 +117,9 @@ const DEFAULT_MEMORY_WHISPERER = {
     maxHints: DEFAULTS.memoryWhisperer.defaultMaxHints, cooldownTurns: DEFAULTS.memoryWhisperer.defaultCooldownTurns,
     timeoutMs: DEFAULTS.memoryWhisperer.defaultTimeoutMs, mode: DEFAULTS.memoryWhisperer.mode,
     api: { endpoint: DEFAULTS.memoryWhisperer.defaultApiEndpoint },
+    recipeHash: DEFAULT_RECIPE_HASH, derivedObservations: true,
+    derivedMaxHints: 2, derivedMinTokenOverlap: DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP,
+    derivedMinSharedTokens: DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS,
 };
 function resolveQueryApi(value) {
     if (value === undefined)
@@ -172,6 +186,21 @@ function resolveMemoryWhisperer(value, corpora) {
     if (typeof minUsefulness !== "number" || !Number.isFinite(minUsefulness) || minUsefulness < 0 || minUsefulness > 1) {
         throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
     }
+    const derivedObservations = config.derivedObservations ?? true;
+    if (typeof derivedObservations !== "boolean")
+        throw new Error("unblock-memory memoryWhisperer.derivedObservations must be a boolean");
+    const derivedMaxHints = config.derivedMaxHints ?? DEFAULT_MEMORY_WHISPERER.derivedMaxHints;
+    if (typeof derivedMaxHints !== "number" || !Number.isSafeInteger(derivedMaxHints) || derivedMaxHints < 0) {
+        throw new Error("unblock-memory memoryWhisperer.derivedMaxHints must be a non-negative integer (0 = unlimited)");
+    }
+    const derivedMinTokenOverlap = config.derivedMinTokenOverlap ?? DEFAULT_MEMORY_WHISPERER.derivedMinTokenOverlap;
+    if (typeof derivedMinTokenOverlap !== "number" || !Number.isFinite(derivedMinTokenOverlap) || derivedMinTokenOverlap < 0 || derivedMinTokenOverlap > 1) {
+        throw new Error("unblock-memory memoryWhisperer.derivedMinTokenOverlap must be between 0 and 1");
+    }
+    const derivedMinSharedTokens = config.derivedMinSharedTokens ?? DEFAULT_MEMORY_WHISPERER.derivedMinSharedTokens;
+    if (typeof derivedMinSharedTokens !== "number" || !Number.isSafeInteger(derivedMinSharedTokens) || derivedMinSharedTokens < 1) {
+        throw new Error("unblock-memory memoryWhisperer.derivedMinSharedTokens must be a positive integer");
+    }
     const mode = config.mode ?? DEFAULT_MEMORY_WHISPERER.mode;
     if (typeof mode !== "string" || !MEMORY_WHISPERER_MODES.includes(mode)) {
         throw new Error('unblock-memory memoryWhisperer.mode must be "v2" or "legacy"');
@@ -182,6 +211,35 @@ function resolveMemoryWhisperer(value, corpora) {
         maxHints: positiveInteger(config.maxHints, DEFAULT_MEMORY_WHISPERER.maxHints, "memoryWhisperer.maxHints", 3),
         timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_MEMORY_WHISPERER.timeoutMs, "memoryWhisperer.timeoutMs", 10_000),
         api: resolveQueryApi(config.api),
+        recipeHash: recipeHash(config.recipeHash, "memoryWhisperer"),
+        derivedObservations, derivedMaxHints, derivedMinTokenOverlap, derivedMinSharedTokens,
+    };
+}
+function resolveExpectationsWhisperer(value) {
+    if (value === undefined)
+        return { ...EXPECTATIONS_WHISPERER_DEFAULTS };
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("unblock-memory expectationsWhisperer must be an object");
+    }
+    const config = value;
+    assertOnlyKeys(config, Object.keys(EXPECTATIONS_WHISPERER_DEFAULTS), "expectationsWhisperer");
+    const flag = (key) => {
+        const resolved = config[key] ?? EXPECTATIONS_WHISPERER_DEFAULTS[key];
+        if (typeof resolved !== "boolean")
+            throw new Error(`unblock-memory expectationsWhisperer.${key} must be a boolean`);
+        return resolved;
+    };
+    // `0` is meaningful and preserved: unlimited hints/payload, no cooldown, overdue-only due window.
+    const count = (key) => {
+        const resolved = config[key] ?? EXPECTATIONS_WHISPERER_DEFAULTS[key];
+        if (typeof resolved !== "number" || !Number.isSafeInteger(resolved) || resolved < 0) {
+            throw new Error(`unblock-memory expectationsWhisperer.${key} must be a non-negative integer`);
+        }
+        return resolved;
+    };
+    return {
+        enabled: flag("enabled"), maxHints: count("maxHints"), cooldownTurns: count("cooldownTurns"), dueLeadMs: count("dueLeadMs"),
+        maxPayloadChars: count("maxPayloadChars"), includeWorkspaceBlockers: flag("includeWorkspaceBlockers"),
     };
 }
 function assertOnlyKeys(value, allowed, label) {
@@ -351,7 +409,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -397,7 +455,7 @@ export function resolveConfig(value) {
             throw new Error("unblock-memory skillWhisperer must be an object");
         }
         const value = config.skillWhisperer;
-        assertOnlyKeys(value, ["enabled", "historyMessages", "minScore", "cooldownTurns"], "skillWhisperer");
+        assertOnlyKeys(value, ["enabled", "historyMessages", "minScore", "cooldownTurns", "recipeHash"], "skillWhisperer");
         const enabled = value.enabled ?? DEFAULT_SKILL_WHISPERER.enabled;
         const historyMessages = value.historyMessages ?? DEFAULT_SKILL_WHISPERER.historyMessages;
         const minScore = value.minScore ?? DEFAULT_SKILL_WHISPERER.minScore;
@@ -420,7 +478,7 @@ export function resolveConfig(value) {
             cooldownTurns < 0) {
             throw new Error("unblock-memory skillWhisperer.cooldownTurns must be a non-negative integer");
         }
-        skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns };
+        skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns, recipeHash: recipeHash(value.recipeHash, "skillWhisperer") };
     }
     // Default-on means "on once skills exist": without a skills corpus it could never
     // hint, so it registers no prompt hook and reports inactive. An explicit true is
@@ -437,6 +495,7 @@ export function resolveConfig(value) {
         insideOut: resolveInsideOut(config.insideOut),
         memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
         safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
+        expectationsWhisperer: resolveExpectationsWhisperer(config.expectationsWhisperer),
         whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),
         recallLedger: resolveRecallLedger(config.recallLedger),
         steward: resolveStewardConfig(config.steward),

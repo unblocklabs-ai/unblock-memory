@@ -132,15 +132,24 @@ function renderSkills(entries: readonly ActiveSkillEntry[], emitted?: string[]):
   return block === header ? undefined : block + footer;
 }
 
+/** Fingerprint the effective routing settings; the legacy cooldown no longer affects routing.
+ * @public For callers assigning experiment recipes.
+ */
+export function skillRecipeHash(config: UnblockMemoryConfig["skillWhisperer"]): string {
+  const { enabled, historyMessages, minScore } = config;
+  return createHash("sha256").update(JSON.stringify(["skill_whisperer", enabled, historyMessages, minScore])).digest("hex");
+}
+
 export function registerSkillWhisperer(
   api: OpenClawPluginApi,
   runtime: SkillWhispererRuntime,
   config: UnblockMemoryConfig["skillWhisperer"],
   decisionModel: UnblockMemoryConfig["decisionModel"],
   diagnostics?: WhispererDiagnostics,
-  recallLedger?: { writer: RecallLedgerWriter; dbPathForAgent: (agentId: string) => string },
+  recallLedger?: { writer: RecallLedgerWriter; dbPathForAgent: (agentId: string) => string; recipeHash?: string },
 ): WhispererPrompt | undefined {
   if (!config.enabled) return;
+  const recipeHash = nonBlank(recallLedger?.recipeHash) ?? "default";
   const sessions = new Map<string, SessionState>();
   const ended = new Map<string, Set<string>>();
   const stores = new Map<string, { store: SkillSessionStore; prunedAt: number }>();
@@ -274,7 +283,8 @@ export function registerSkillWhisperer(
       agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
       // A missing run id must never collapse distinct routing events onto one key.
       eventKey: JSON.stringify([agentId, scope, nonBlank(runId) ?? randomUUID()]), createdAtMs: Date.now(),
-      surface: surface ?? whispererSurface(context), mode: "fallback", candidateCount: 0, scores: [], emitted, outcome: "no_candidates",
+      recipeHash, surface: surface ?? whispererSurface(context), mode: "fallback",
+      candidateCount: 0, scores: [], emitted, outcome: "no_candidates",
     };
 
     const emit = (entries: readonly ActiveSkillEntry[], added = false) => {

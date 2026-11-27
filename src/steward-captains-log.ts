@@ -38,6 +38,8 @@ const WATERMARK = {
 const CAPTURED_ENTRY = Type.Object({
   topic: Type.String(), summary: Type.String(), blocked: Type.Boolean(),
   channels: Type.Array(Type.String()), sessionRefs: Type.Array(Type.String()),
+  // Native conversation ids (e.g. Slack `C0…`) for trigger matching; ledger-only, never rendered. Older receipts omit it.
+  nativeChannels: Type.Optional(Type.Array(Type.String())),
 }, { additionalProperties: false });
 type CapturedEntry = Static<typeof CAPTURED_ENTRY>;
 type PendingAppend = Static<typeof PENDING_APPEND>;
@@ -65,21 +67,28 @@ const LEDGER_SCHEMA = `CREATE TABLE IF NOT EXISTS captains_log_entries (
   resolved_at_ms INTEGER,
   resolution_note TEXT,
   channels_json TEXT NOT NULL CHECK(json_valid(channels_json)),
-  session_refs_json TEXT NOT NULL CHECK(json_valid(session_refs_json))
+  session_refs_json TEXT NOT NULL CHECK(json_valid(session_refs_json)),
+  native_channels_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(native_channels_json))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS captains_log_entries_day ON captains_log_entries(agent_id, day, captured_at_ms);
 CREATE INDEX IF NOT EXISTS captains_log_entries_blockers ON captains_log_entries(agent_id, blocked, resolved_at_ms);`;
 
+const hasNativeChannels = (db: DatabaseSync) =>
+  db.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name='native_channels_json'").get(LEDGER_TABLE) !== undefined;
+
+/** Idempotent; additively upgrades 0.19 ledgers (no `native_channels_json`) in place without a version bump. */
 function ensureCaptainsLogSchema(db: DatabaseSync): void {
   const ready = () => {
     const version = db.prepare("SELECT version FROM memory_schema WHERE component=?").get(CAPTAINS_LOG_KIND)?.version;
     if (version !== undefined && version !== LEDGER_SCHEMA_VERSION) throw new Error("Unsupported Captain's Log schema version");
-    return version === LEDGER_SCHEMA_VERSION && tableExists(db, LEDGER_TABLE);
+    return version === LEDGER_SCHEMA_VERSION && tableExists(db, LEDGER_TABLE) && hasNativeChannels(db);
   };
   if (ready()) return;
   immediateTransaction(db, () => {
     if (ready()) return;
+    db.exec("CREATE TABLE IF NOT EXISTS memory_schema (component TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT");
     db.exec(LEDGER_SCHEMA);
+    if (!hasNativeChannels(db)) db.exec(`ALTER TABLE ${LEDGER_TABLE} ADD COLUMN native_channels_json TEXT NOT NULL DEFAULT '[]'`);
     db.prepare("INSERT OR IGNORE INTO memory_schema VALUES (?,?)").run(CAPTAINS_LOG_KIND, LEDGER_SCHEMA_VERSION);
   });
 }
@@ -108,6 +117,7 @@ export function listCaptainsLogEntries(db: DatabaseSync, options: {
     blocked: row.blocked === 1, resolvedAtMs: row.resolved_at_ms === null ? null : Number(row.resolved_at_ms),
     resolutionNote: row.resolution_note === null ? null : String(row.resolution_note),
     channels: JSON.parse(String(row.channels_json)) as string[], sessionRefs: JSON.parse(String(row.session_refs_json)) as string[],
+    nativeChannels: typeof row.native_channels_json === "string" ? JSON.parse(row.native_channels_json) as string[] : [],
   }));
 }
 
@@ -167,7 +177,8 @@ const SYSTEM_PROMPT = `Distill recent eligible session activity into net-new dur
 
 // Keep in step with the runner's redactor; also cover labeled credentials, private keys and URL userinfo.
 function redactSecrets(text: string): string {
-  return text.replace(/-----BEGIN [\w ]*PRIVATE KEY-----[\s\S]*?(?:-----END [\w ]*PRIVATE KEY-----|$)/gu, "[redacted]")
+  return text.replace(/https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]+/giu, "[redacted]")
+    .replace(/-----BEGIN [\w ]*PRIVATE KEY-----[\s\S]*?(?:-----END [\w ]*PRIVATE KEY-----|$)/gu, "[redacted]")
     .replace(/\b(?:Bearer|Authorization\s*:\s*Basic)\s+[^\s"',;\]}]+|\b(?:sk-|xox[baprs]-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}/giu, "[redacted]")
     .replace(/\b([\w-]*(?:api[_ -]?key|token|credential|password|passwd|secret)[\w-]*["'`]?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|`(?:\\.|[^`\\\r\n])*`|[^\s,;]+)/giu, "$1[redacted]")
     .replace(/(\b[a-z][\w+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/giu, "$1[redacted]@");
@@ -178,7 +189,9 @@ function clip(text: string, chars: number): string {
 }
 
 type Message = { role: "user" | "assistant"; text: string };
-type SessionExcerpt = { sessionId: string; chatType: ChatType; channel?: string; maxSeq: number; messages: Message[] };
+type SessionExcerpt = {
+  sessionId: string; chatType: ChatType; channel?: string; nativeChannelId?: string; maxSeq: number; messages: Message[];
+};
 
 const OPAQUE_CHANNEL_ID = /^(?:[cdg][0-9a-z]{8,}|\d+)$/iu;
 
@@ -224,7 +237,7 @@ function readExcerpts(options: CaptainsLogPassOptions, from: number, to: number,
     const reader = new AgentTranscriptReader(db, options.agentId);
     const placeholders = chatTypes.map(() => "?").join(",");
     const windows = db.prepare(`SELECT w.session_id AS sessionId, w.session_key AS sessionKey, w.chat_type AS chatType,
-        c.label AS conversationLabel, c.kind AS conversationKind,
+        c.label AS conversationLabel, c.kind AS conversationKind, c.native_channel_id AS nativeChannelId,
         MAX(e.seq) AS latestSeq, MAX(e.created_at) AS latestAt
       FROM session_windows w
       JOIN session_transcript_active_events a ON a.session_id = w.session_id
@@ -238,9 +251,9 @@ function readExcerpts(options: CaptainsLogPassOptions, from: number, to: number,
     const maxSessions = options.maxSessionsPerRun ?? 0, maxChars = options.maxCharsPerSession ?? 0;
     for (const window of windows) {
       signal?.throwIfAborted();
-      const { sessionId, sessionKey, chatType, conversationLabel, conversationKind, latestSeq } = window as {
+      const { sessionId, sessionKey, chatType, conversationLabel, conversationKind, latestSeq, nativeChannelId } = window as {
         sessionId: string; sessionKey: string; chatType: ChatType; conversationKind: ChatType | null;
-        conversationLabel: string | null; latestSeq: number;
+        conversationLabel: string | null; latestSeq: number; nativeChannelId: unknown;
       };
       const seenSeq = Object.hasOwn(cursor, sessionId) ? cursor[sessionId]! : 0;
       if (latestSeq <= seenSeq || AUTOMATION.test(sessionKey) || /(?:^|:)cron(?=:|$)/iu.test(sessionKey)) continue;
@@ -277,8 +290,14 @@ function readExcerpts(options: CaptainsLogPassOptions, from: number, to: number,
         maxSeq = seq;
         if (maxChars > 0 && chars >= maxChars) break;
       }
-      const channel = humanChannelLabel(conversationKind === "direct" ? "direct" : chatType, conversationLabel);
-      if (messages.length) excerpts.push({ sessionId, chatType, ...(channel ? { channel } : {}), messages, maxSeq });
+      const effective: ChatType = conversationKind === "direct" ? "direct" : chatType;
+      const channel = humanChannelLabel(effective, conversationLabel);
+      // A DM's native id is a person's, never a channel trigger.
+      const native = effective !== "direct" && typeof nativeChannelId === "string" && nativeChannelId.trim()
+        ? nativeChannelId.trim().split(/:(?:thread|topic):/iu, 1)[0] : undefined;
+      if (messages.length) {
+        excerpts.push({ sessionId, chatType, ...(channel ? { channel } : {}), ...(native ? { nativeChannelId: native } : {}), messages, maxSeq });
+      }
       if (maxSessions > 0 && excerpts.length >= maxSessions) break;
     }
     return excerpts;
@@ -344,14 +363,16 @@ function captureEntries(entries: Static<typeof CAPTAINS_LOG_SCHEMA>["entries"], 
     const topic = oneLine(entry.topic).replace(/^(?:\[BLOCKED\]\s*:?\s*)+/iu, "");
     const summary = oneLine(entry.summary);
     if (!topic || !summary) return [];
-    const sessionRefs = new Set<string>(), channels = new Set<string>();
+    const sessionRefs = new Set<string>(), channels = new Set<string>(), nativeChannels = new Set<string>();
     for (const ref of entry.sessionRefs ?? []) {
       const session = sessions.get(ref);
       if (!session) continue;
       sessionRefs.add(session.sessionId);
       if (session.channel) channels.add(session.channel);
+      if (session.nativeChannelId) nativeChannels.add(session.nativeChannelId);
     }
-    return [{ topic, summary, blocked: entry.blocked === true, channels: [...channels], sessionRefs: [...sessionRefs] }];
+    return [{ topic, summary, blocked: entry.blocked === true, channels: [...channels], sessionRefs: [...sessionRefs],
+      nativeChannels: [...nativeChannels] }];
   });
   return captured.sort((a, b) => Number(b.blocked) - Number(a.blocked));
 }
@@ -359,12 +380,13 @@ function captureEntries(entries: Static<typeof CAPTAINS_LOG_SCHEMA>["entries"], 
 function persistEntries(db: DatabaseSync, agentId: string, receipt: PendingAppend): void {
   if (!receipt.entries?.length) return;
   const insert = db.prepare(`INSERT INTO captains_log_entries
-    (id, agent_id, day, captured_at_ms, section_hash, ordinal, topic, summary, blocked, channels_json, session_refs_json)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`);
+    (id, agent_id, day, captured_at_ms, section_hash, ordinal, topic, summary, blocked, channels_json, session_refs_json,
+     native_channels_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`);
   for (const [ordinal, entry] of receipt.entries.entries()) {
     const id = hash(JSON.stringify([agentId, receipt.day, receipt.hash, ordinal]));
     insert.run(id, agentId, receipt.day, receipt.capturedAtMs, receipt.hash, ordinal, entry.topic, entry.summary,
-      Number(entry.blocked), JSON.stringify(entry.channels), JSON.stringify(entry.sessionRefs));
+      Number(entry.blocked), JSON.stringify(entry.channels), JSON.stringify(entry.sessionRefs), JSON.stringify(entry.nativeChannels ?? []));
   }
 }
 

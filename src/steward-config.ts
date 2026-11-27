@@ -97,12 +97,44 @@ type StewardOutcomeLedgerConfig = {
   matchWindowMs: number;
   /** Days `memory_outcomes` rows are kept (`0` = unlimited). */
   retentionDays: number;
+  /** History re-scored behind the watermark for late audit/Inside Out evidence, in ms (`0` = full `lookbackMs`; unset = up to 2 days). */
+  lateEvidenceRescanMs?: number;
+};
+/**
+ * The Expectations pass (6th primitive). Deterministic Captain's Log blocker + people todo ingestion always runs, with
+ * no model; session extraction and the due/resolution sweep additionally need the Steward runner.
+ */
+type StewardExpectationsConfig = {
+  enabled: boolean;
+  intervalMinutes: number;
+  lookbackMinutes: number;
+  /** Sweep open expectations due within this many minutes (overdue ones always qualify). */
+  dueLeadMinutes: number;
+  /** Sweep open expectations older than this, due date or not. */
+  sweepAfterMinutes: number;
+  /** Maximum eligible sessions read per run (`0` = unlimited). */
+  maxSessionsPerRun: number;
+  /** Character budget per session transcript excerpt (`0` = unlimited). */
+  maxCharsPerSession: number;
+  /** Open expectations judged per sweep (`0` = unlimited). */
+  maxSweepItems: number;
+  /** Per model call timeout in ms (`0` = unlimited). */
+  timeoutMs: number;
+  /** Chat types excluded from session extraction (default: `["direct"]`). Opted-in DMs stay in strict per-person audiences. */
+  excludeChatTypes: ChatType[];
+  /** Model-backed extraction of commitments/predictions/blockers/decision outcomes from sessions. */
+  extract: boolean;
+  /** Model-backed due/resolution sweep of open expectations. */
+  sweep: boolean;
+  /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
+  blockerAutoExpireMinutes: number;
 };
 export type StewardConfig = {
   enabled: boolean; model: string; reasoning: typeof efforts[number]; endpoint: string;
   apiKey?: string; apiKeyFile?: string; maxActiveBackground: number;
   deepThought: StewardDeepThoughtConfig; peopleShadow: StewardPeopleShadowConfig;
   captainsLog: StewardCaptainsLogConfig; outcomeLedger: StewardOutcomeLedgerConfig;
+  expectations: StewardExpectationsConfig;
 };
 
 const DEFAULT_STEWARD_CONFIG: StewardConfig = {
@@ -157,6 +189,21 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     maxRowsPerPass: 0,
     matchWindowMs: 1_800_000,
     retentionDays: 0,
+  },
+  expectations: {
+    enabled: true,
+    intervalMinutes: 60,
+    lookbackMinutes: 70,
+    dueLeadMinutes: 60,
+    sweepAfterMinutes: 1440,
+    maxSessionsPerRun: 0,
+    maxCharsPerSession: 0,
+    maxSweepItems: 0,
+    timeoutMs: 0,
+    excludeChatTypes: ["direct"],
+    extract: true,
+    sweep: true,
+    blockerAutoExpireMinutes: 4320,
   },
 };
 
@@ -223,7 +270,8 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
   const d = section(c.deepThought, defaults.deepThought, "steward.deepThought", ["reasoning"]);
   const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow", ["includeInteractionLearning"]);
   const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
-  const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger");
+  const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger", ["lateEvidenceRescanMs"]);
+  const e = section(c.expectations, defaults.expectations, "steward.expectations");
   const reasoning = efforts.find(e => e === c.reasoning);
   if (!reasoning) throw new Error("Invalid steward.reasoning");
   const deepThoughtReasoning = d.reasoning === undefined ? undefined : efforts.find(e => e === d.reasoning);
@@ -291,6 +339,23 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       maxRowsPerPass: integer(o.maxRowsPerPass, 0, "outcomeLedger.maxRowsPerPass"),
       matchWindowMs: integer(o.matchWindowMs, 1, "outcomeLedger.matchWindowMs"),
       retentionDays: integer(o.retentionDays, 0, "outcomeLedger.retentionDays"),
+      ...(o.lateEvidenceRescanMs === undefined ? {}
+        : { lateEvidenceRescanMs: integer(o.lateEvidenceRescanMs, 0, "outcomeLedger.lateEvidenceRescanMs") }),
+    },
+    expectations: {
+      enabled: enabled(e.enabled, "steward.expectations"),
+      intervalMinutes: integer(e.intervalMinutes, 1, "expectations.intervalMinutes"),
+      lookbackMinutes: integer(e.lookbackMinutes, 1, "expectations.lookbackMinutes"),
+      dueLeadMinutes: integer(e.dueLeadMinutes, 0, "expectations.dueLeadMinutes"),
+      sweepAfterMinutes: integer(e.sweepAfterMinutes, 0, "expectations.sweepAfterMinutes"),
+      maxSessionsPerRun: integer(e.maxSessionsPerRun, 0, "expectations.maxSessionsPerRun"),
+      maxCharsPerSession: integer(e.maxCharsPerSession, 0, "expectations.maxCharsPerSession"),
+      maxSweepItems: integer(e.maxSweepItems, 0, "expectations.maxSweepItems"),
+      timeoutMs: integer(e.timeoutMs, 0, "expectations.timeoutMs"),
+      excludeChatTypes: chatTypeList(e.excludeChatTypes, "expectations.excludeChatTypes"),
+      extract: boolean(e.extract, "steward.expectations.extract"),
+      sweep: boolean(e.sweep, "steward.expectations.sweep"),
+      blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
     },
   };
 }

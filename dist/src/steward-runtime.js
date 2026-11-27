@@ -6,11 +6,13 @@ import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import { DEFAULTS } from "./defaults.js";
+import { EXPECTATION_STATUSES, ExpectationsStore } from "./expectations-store.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { runOutcomeLedgerPass, summarizeOutcomeMetrics } from "./outcome-ledger.js";
 import { responseCohort } from "./response-audit.js";
 import { resolveTimezone } from "./session-projector.js";
 import { listOpenBlockers, runCaptainsLogPass } from "./steward-captains-log.js";
+import { runExpectationsPass } from "./steward-expectations.js";
 import { buildPeopleShadowReport, runPeopleShadowPass, PEOPLE_SHADOW_KIND, } from "./steward-people-shadow.js";
 import { WorkStore } from "./work-store.js";
 /* ═════════════════════════ Background semaphore ═════════════════════════ */
@@ -37,6 +39,26 @@ export function tryAcquireBackgroundSlot(maxActive) {
 export function activeBackgroundStewards() {
     return slots().active;
 }
+/** One Expectations pass, shared by the background tick and `memory-steward expectations --run`. */
+function expectationsPassOptions(config, base, runner, databasePath) {
+    return {
+        ...base,
+        intervalMinutes: config.intervalMinutes,
+        lookbackMinutes: config.lookbackMinutes,
+        dueLeadMinutes: config.dueLeadMinutes,
+        sweepAfterMinutes: config.sweepAfterMinutes,
+        maxSessionsPerRun: config.maxSessionsPerRun,
+        maxCharsPerSession: config.maxCharsPerSession,
+        maxSweepItems: config.maxSweepItems,
+        timeoutMs: config.timeoutMs,
+        excludeChatTypes: config.excludeChatTypes,
+        extract: config.extract,
+        sweep: config.sweep,
+        blockerAutoExpireMinutes: config.blockerAutoExpireMinutes,
+        // Without a runner the pass is deterministic-only and never reads transcripts.
+        ...(runner ? { runner, databasePath: databasePath() } : {}),
+    };
+}
 class StewardShutdownError extends Error {
     name = "StewardShutdownError";
     constructor() { super("gateway stopping"); }
@@ -56,7 +78,9 @@ export function registerStewardRuntime(api, options) {
     const lastResults = new Map();
     const lastCaptainsLogResults = new Map();
     const lastOutcomeLedgerResults = new Map();
+    const lastExpectationsResults = new Map();
     const outcomeLedger = options.config.outcomeLedger;
+    const expectations = options.config.expectations;
     // Same cohort Response Audit writes, so outcomes never mix verdicts from another judge configuration.
     const outcomeCohort = options.pluginConfig?.responseAudit.enabled
         ? responseCohort(options.pluginConfig.responseAudit, options.pluginConfig.decisionModel.model, options.pluginConfig.decisionModel.endpoint)
@@ -77,12 +101,12 @@ export function registerStewardRuntime(api, options) {
                 runner = options.createRunner();
             }
             catch (error) {
-                // The deterministic Outcome Ledger needs no model; keep closing the loop without a runner.
+                // The Outcome Ledger and Expectations ingestion need no model; keep closing the loop without a runner.
                 if (!signal.aborted)
                     api.logger.warn(`unblock-memory steward: ${String(error)}`);
             }
             try {
-                agents = runner || outcomeLedger.enabled ? listAgents(api.config) : [];
+                agents = runner || outcomeLedger.enabled || expectations.enabled ? listAgents(api.config) : [];
             }
             catch (error) {
                 // `void tick()` must never surface an unhandled rejection.
@@ -111,6 +135,7 @@ export function registerStewardRuntime(api, options) {
                                 maxRowsPerPass: outcomeLedger.maxRowsPerPass,
                                 matchWindowMs: outcomeLedger.matchWindowMs,
                                 retentionDays: outcomeLedger.retentionDays,
+                                ...(outcomeLedger.lateEvidenceRescanMs === undefined ? {} : { lateEvidenceRescanMs: outcomeLedger.lateEvidenceRescanMs }),
                                 ...(options.pluginConfig ? { baselineMinInteractions: options.pluginConfig.insideOut.baselineMinInteractions } : {}),
                                 ...(outcomeCohort ? { responseCohort: outcomeCohort } : {}),
                             }));
@@ -119,6 +144,17 @@ export function registerStewardRuntime(api, options) {
                             // Isolated: a ledger fault must not skip this agent's model-backed passes.
                             if (!signal.aborted)
                                 api.logger.warn(`unblock-memory steward outcome ledger (${agentId}): ${String(error)}`);
+                        }
+                    }
+                    if (expectations.enabled && !signal.aborted) {
+                        try {
+                            // Runs without a runner too: Captain's Log blockers + people todos are mirrored at zero model cost.
+                            lastExpectationsResults.set(agentId, await runExpectationsPass(expectationsPassOptions(expectations, { agentId, workStore: store, owner, timezone, signal }, runner, () => transcriptDbForAgent(api.config, agentId))));
+                        }
+                        catch (error) {
+                            // Isolated: an Expectations fault must not skip this agent's People / Captain's Log passes.
+                            if (!signal.aborted)
+                                api.logger.warn(`unblock-memory steward expectations (${agentId}): ${String(error)}`);
                         }
                     }
                     if (options.config.peopleShadow.enabled && runner && !signal.aborted) {
@@ -204,7 +240,7 @@ export function registerStewardRuntime(api, options) {
             clearTimeout(graceTimer);
     };
     const enabled = api.registrationMode !== "cli-metadata" && options.config.enabled &&
-        (options.config.peopleShadow.enabled || options.config.captainsLog.enabled || outcomeLedger.enabled);
+        (options.config.peopleShadow.enabled || options.config.captainsLog.enabled || outcomeLedger.enabled || expectations.enabled);
     if (enabled) {
         api.on("gateway_start", () => {
             if (timer)
@@ -218,6 +254,8 @@ export function registerStewardRuntime(api, options) {
                 intervals.push(options.config.captainsLog.intervalMinutes);
             if (outcomeLedger.enabled)
                 intervals.push(outcomeLedger.intervalMinutes);
+            if (expectations.enabled)
+                intervals.push(expectations.intervalMinutes);
             const intervalMs = Math.max(1, Math.min(...intervals)) * 60_000;
             timer = setInterval(() => { void tick(); }, intervalMs);
             timer.unref();
@@ -232,6 +270,7 @@ export function registerStewardRuntime(api, options) {
         lastResults: () => new Map(lastResults),
         lastCaptainsLogResults: () => new Map(lastCaptainsLogResults),
         lastOutcomeLedgerResults: () => new Map(lastOutcomeLedgerResults),
+        lastExpectationsResults: () => new Map(lastExpectationsResults),
         enabled,
     };
 }
@@ -274,7 +313,7 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore, transcr
         }
     };
     api.registerCli(({ program, config: cfg }) => {
-        const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, re-drive");
+        const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, expectations, re-drive");
         root.command("status").description("Work item counts by kind/status plus the quarantined backlog")
             .option("--agent <id>", "Agent id", "main").option("--kind <kind>", "Filter one work kind")
             .action((opts) => {
@@ -288,6 +327,7 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore, transcr
                     peopleMode: options.config.peopleShadow.mode,
                     captainsLog: options.config.captainsLog.enabled,
                     outcomeLedger: options.config.outcomeLedger.enabled,
+                    expectations: options.config.expectations.enabled,
                     counts: summarize(items),
                     quarantined: items.filter(item => item.status === "quarantined")
                         .map(({ kind, scope, strikes, lastError }) => ({ kind, scope, strikes, lastError })),
@@ -372,9 +412,53 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore, transcr
                 console.log(JSON.stringify({ agentId: opts.agent, count: blockers.length, blockers }, null, 2));
             });
         });
+        root.command("expectations").description("Open/resolved expectations (read-only); --run triggers one Expectations pass now")
+            .option("--agent <id>", "Agent id", "main")
+            .option("--status <status>", `Filter one status (${EXPECTATION_STATUSES.join(", ")})`)
+            .option("--limit <n>", "Maximum expectations (0 = unlimited)", "0")
+            .option("--run", "Run one Expectations pass for this agent and print its result", false)
+            .action(async (opts) => {
+            const limit = Number(opts.limit);
+            if (!Number.isSafeInteger(limit) || limit < 0)
+                throw new Error("--limit must be a non-negative integer");
+            const status = opts.status === undefined ? undefined : EXPECTATION_STATUSES.find(value => value === opts.status?.trim());
+            if (opts.status !== undefined && !status)
+                throw new Error(`--status must be one of: ${EXPECTATION_STATUSES.join(", ")}`);
+            const dbPath = knownAgent(cfg, opts.agent);
+            if (opts.run) {
+                let runner;
+                try {
+                    runner = options.createRunner();
+                }
+                catch (error) {
+                    console.warn(`unblock-memory steward runner unavailable; running deterministic ingestion only: ${String(error)}`);
+                }
+                const store = openWorkStore(dbPath);
+                try {
+                    const result = await runExpectationsPass(expectationsPassOptions(options.config.expectations, {
+                        agentId: opts.agent, workStore: store, owner: `steward-cli:${process.pid}:${randomUUID()}`,
+                        timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
+                    }, runner, () => transcriptDbForAgent(cfg, opts.agent)));
+                    console.log(JSON.stringify(result, null, 2));
+                    if (result.status === "failed")
+                        process.exitCode = 1;
+                }
+                finally {
+                    store.close();
+                }
+                return;
+            }
+            const read = (db) => ({
+                summary: ExpectationsStore.summarize(db, opts.agent),
+                expectations: ExpectationsStore.list(db, { agentId: opts.agent, ...(status ? { status } : {}), limit }),
+            });
+            // Never creates or migrates an absent database: that reads as an empty in-memory one.
+            const report = ExpectationsStore.readOnly(dbPath, undefined, read) ?? withReadOnlyDb(dbPath, read);
+            console.log(JSON.stringify({ agentId: opts.agent, ...(status ? { status } : {}), ...report }, null, 2));
+        });
         root.command("requeue").description("Explicitly re-drive one quarantined or completed work item")
             .requiredOption("--scope <scope>", "Exact work scope")
-            .option("--kind <kind>", "Work kind (e.g. people_shadow, people_interactions, captains_log, outcome_ledger)", PEOPLE_SHADOW_KIND)
+            .option("--kind <kind>", "Work kind (e.g. people_shadow, people_interactions, captains_log, outcome_ledger, expectations)", PEOPLE_SHADOW_KIND)
             .option("--agent <id>", "Agent id", "main")
             .action((opts) => {
             const dbPath = knownAgent(cfg, opts.agent);
@@ -392,5 +476,5 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore, transcr
                 console.log(JSON.stringify({ status: "requeued", item: store.get(opts.kind, opts.scope) }, null, 2));
             });
         });
-    }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report, Captain's Log, outcomes and blockers", hasSubcommands: true }] });
+    }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report, Captain's Log, outcomes, blockers and expectations", hasSubcommands: true }] });
 }

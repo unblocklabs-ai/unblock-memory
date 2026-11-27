@@ -20,6 +20,7 @@ declare const CAPTURED_ENTRY: Type.TObject<{
     blocked: Type.TBoolean;
     channels: Type.TArray<Type.TString>;
     sessionRefs: Type.TArray<Type.TString>;
+    nativeChannels: Type.TOptional<Type.TArray<Type.TString>>;
 }>;
 type CapturedEntry = Static<typeof CAPTURED_ENTRY>;
 declare const ARTIFACT: Type.TObject<{
@@ -36,6 +37,7 @@ declare const ARTIFACT: Type.TObject<{
             blocked: Type.TBoolean;
             channels: Type.TArray<Type.TString>;
             sessionRefs: Type.TArray<Type.TString>;
+            nativeChannels: Type.TOptional<Type.TArray<Type.TString>>;
         }>>>;
     }>>;
     schemaVersion: Type.TLiteral<1>;

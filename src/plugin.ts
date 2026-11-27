@@ -19,6 +19,7 @@ import { registerSafetyWhisperer } from "./safety-whisperer.js";
 import { registerMyTurn } from "./my-turn.js";
 import { registerMemoryWhisperer } from "./memory-whisperer.js";
 import { registerWhispererPrompt } from "./whisperer-prompt.js";
+import { createExpectationsWhisperer } from "./expectations-whisperer.js";
 import { getContext } from "./tool-context.js";
 import { WhispererDiagnostics } from "./diagnostics.js";
 import { registerReviewTools, reviewRequestContext } from "./review-tools.js";
@@ -111,6 +112,8 @@ const syncStatusParameters = Type.Object({}, { additionalProperties: false });
 type RecallLedgerSink = {
   writer: RecallLedgerWriter;
   dbPathForAgent: (agentId: string) => string;
+  /** Retrieval recipe label stamped on every exposure this sink records. */
+  recipeHash?: string;
 };
 
 function toolOrigin(active: NonNullable<ReturnType<typeof getContext>>) {
@@ -224,6 +227,7 @@ function createSearchTool(
             minUsefulness: requestedMinUsefulness ?? 0.7,
             outcome,
             ...usage,
+            ...(recallLedger.recipeHash ? { recipeHash: recallLedger.recipeHash } : {}),
             hits,
           },
         });
@@ -835,15 +839,42 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   if (skillSettings?.enabled === true && !config.skillWhisperer.enabled) {
     api.logger.warn('unblock-memory skillWhisperer.enabled is true but no corpus has kind "skills"; Skill Whisperer is inactive');
   }
+  const memoryDatabasePath = (agentId: string) => runtime.memoryDatabasePath(agentId);
   registerWhispererPrompt(api, {
-    memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics, recallLedger),
-    skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics, recallLedger),
+    memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics, recallLedger, {
+      ...(config.memoryWhisperer.derivedObservations !== false ? {
+        derivedObservations: {
+          dbPathForAgent: memoryDatabasePath,
+          ...(config.memoryWhisperer.derivedMaxHints !== undefined ? { maxHints: config.memoryWhisperer.derivedMaxHints } : {}),
+          ...(config.memoryWhisperer.derivedMinTokenOverlap !== undefined
+            ? { minTokenOverlap: config.memoryWhisperer.derivedMinTokenOverlap } : {}),
+          ...(config.memoryWhisperer.derivedMinSharedTokens !== undefined
+            ? { minSharedTokens: config.memoryWhisperer.derivedMinSharedTokens } : {}),
+          // Same per-agent index snapshot deep_thought stamps on a synthesis; any advance retires the whisper.
+          getCollectionGenerations: async (agentId, corpora) => {
+            const { manager, error } = await runtime.getMemorySearchManager({ cfg: api.config, agentId });
+            if (!manager) throw new Error(error ?? "memory manager unavailable");
+            return manager.getCollectionGenerations(corpora);
+          },
+        },
+      } : {}),
+      ...(config.memoryWhisperer.recipeHash ? { recipeHash: config.memoryWhisperer.recipeHash } : {}),
+    }),
+    skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics, recallLedger && {
+      writer: recallLedger.writer, dbPathForAgent: memoryDatabasePath,
+      ...(config.skillWhisperer.recipeHash ? { recipeHash: config.skillWhisperer.recipeHash } : {}),
+    }),
     people: peopleWhisperer,
     myTurn: registerMyTurn(api, config.myTurn, config.decisionModel, diagnostics),
+    // A disabled whisperer must not register the conversation-access prompt hook at all.
+    expectations: config.expectationsWhisperer.enabled
+      ? createExpectationsWhisperer(api, memoryDatabasePath, config.expectationsWhisperer) : undefined,
     safety: registerSafetyWhisperer(api, config, diagnostics),
   }, config.whispererTriggers);
   api.on("gateway_stop", () => runtime.close());
-  api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics, recallLedger), { names: ["memory_search"] });
+  const searchLedger = recallLedger && config.memoryWhisperer.recipeHash
+    ? { ...recallLedger, recipeHash: config.memoryWhisperer.recipeHash } : recallLedger;
+  api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics, searchLedger), { names: ["memory_search"] });
   api.registerTool((ctx) => createGetTool(runtime, ctx, recallLedger), { names: ["memory_get"] });
   api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
     names: ["memory_sync_sessions"],

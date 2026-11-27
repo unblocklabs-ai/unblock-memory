@@ -85,6 +85,98 @@ export declare function normalizeDeepThoughtQuestion(question: string): string;
 export declare function deepThoughtQuestionHash(question: string, focus?: string): string;
 /** Sorted, de-duplicated, trimmed corpus names. */
 export declare function canonicalCorpora(corpora: readonly string[]): string[];
+/**
+ * Public form of the exact freshness rule: `current` must record exactly the collections in `recorded`, each at exactly
+ * the same generation. An empty snapshot on either side never verifies.
+ */
+export declare function derivedObservationGenerationsFresh(recorded: Readonly<Record<string, number>>, current: Readonly<Record<string, number>> | undefined): boolean;
+/**
+ * Caller identity fields that isolate cached `deep_thought` answers. Only fields the host derives from the SAME run
+ * parameter on both surfaces are used, so the `deep_thought` tool (writer) and the `before_prompt_build` Memory
+ * Whisperer (reader) compute identical keys:
+ *
+ * | field        | tool context (`createTool`)          | hook context (`before_prompt_build`)  | host source            |
+ * |--------------|--------------------------------------|---------------------------------------|------------------------|
+ * | `sessionKey` | `sessionKey`                         | `sessionKey`                          | `run.sessionKey`       |
+ * | `provider`   | `messageChannel` (normalized)        | `messageProvider` ?? `channel`        | `run.messageProvider`  |
+ * | `accountId`  | `agentAccountId`                     | `accountId`                           | `run.agentAccountId`   |
+ * | `senderId`   | `requesterSenderId`                  | `senderId`                            | `run.senderId`         |
+ *
+ * The tool's `nativeChannelId` is deliberately NOT used: hooks never receive it, and hook `chatId`/`channelId` is a
+ * different derivation (the lowercased session-key conversation id, thread suffixes included, or `currentChannelId`).
+ */
+export type DeepThoughtAudienceIdentity = {
+    agentId: string;
+    sessionKey?: string;
+    /** Channel/provider id (e.g. `slack`). Case-folded: the tool side is host-normalized, the hook side is raw. */
+    provider?: string;
+    accountId?: string;
+    /** Requesting sender. Part of the key only outside shared `group`/`channel` sessions (see `deepThoughtAudienceKey`). */
+    senderId?: string;
+};
+/**
+ * The default `deep_thought` cache audience key. A group/channel session key already names one shared conversation,
+ * so everyone in it shares answers. Any other session (DMs, including `dmScope=main` where several peers share one
+ * session key such as `agent:main:main`) is additionally split per requesting sender, so an answer never crosses a
+ * DM/private boundary. Such a session without a verified sender returns `undefined`: callers must skip the cache
+ * (never read or write) rather than pool every unidentified caller under one key.
+ * Every producer and consumer of `derived_observations.audience_key` must call this so they stay in lockstep.
+ */
+export declare function deepThoughtAudienceKey(identity: DeepThoughtAudienceIdentity): string | undefined;
+/** Default minimum overlap score (share of the stored question's meaningful tokens the turn covers). */
+export declare const DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP = 0.45;
+/** Default minimum count of shared meaningful tokens: one shared word is never enough to fire. */
+export declare const DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS = 2;
+/**
+ * Meaningful tokens of a question or turn: normalized like `normalizeDeepThoughtQuestion`, split on anything that is
+ * not a letter/number, possessives and simple plurals folded, stop words and 1-letter words dropped (numbers are kept).
+ */
+export declare function derivedObservationTokens(text: string): Set<string>;
+type DerivedObservationMatchKind = "exact" | "overlap";
+export type DerivedObservationMatch = {
+    observation: DerivedObservation;
+    /** `1` for an exact normalized-question match; otherwise the overlap score in `[0, 1)`. */
+    score: number;
+    kind: DerivedObservationMatchKind;
+    sharedTokens: number;
+};
+export type DerivedObservationMatchQuery = {
+    agentId: string;
+    /** The current user turn (or any text) to match against stored questions. */
+    queryText: string;
+    /** Exact audience key; rows for any other audience are never considered. */
+    audienceKey: string;
+    /** Every corpus a row searched must be in this set, or the row is never surfaced. */
+    allowedCorpora: readonly string[];
+    /** Minimum overlap score in `[0, 1]` (default 0.45). `0` keeps any row meeting `minSharedTokens`. */
+    minTokenOverlap?: number;
+    /** Minimum shared meaningful tokens for a non-exact match (default 2; `0`/`1` are clamped to 1). */
+    minSharedTokens?: number;
+    /** Maximum matches returned; `0` (default) = unlimited. */
+    maxResults?: number;
+};
+/**
+ * Current collection generations used to verify freshness:
+ * - a function returns the exact snapshot for one row's (canonical) corpora — the strict per-row check;
+ * - a flat record is a snapshot taken for exactly `allowedCorpora`. Rows over that same corpora set get the exact check;
+ *   rows over a narrower set are only verifiable as stale (a recorded collection moved or vanished), never as fresh,
+ *   because the flat snapshot cannot reveal a collection newly added under the narrower set.
+ */
+type DerivedObservationGenerationsSource = Readonly<Record<string, number>> | ((corpora: readonly string[]) => Readonly<Record<string, number>> | undefined);
+export type FindMatchingDerivedObservationsParams = DerivedObservationMatchQuery & {
+    currentGenerations: DerivedObservationGenerationsSource;
+    nowMs?: number;
+};
+/**
+ * Read-only candidate lookup (ACL + deterministic scoring, no freshness check) against an existing database file.
+ * Returns `[]` — never throws for a missing database or table — so callers on the hot path can probe cheaply.
+ */
+export declare function readDerivedObservationCandidates(dbPath: string, query: DerivedObservationMatchQuery): DerivedObservationMatch[];
+/**
+ * Read-only `findMatchingDerivedObservations`: identical matching and verification, but never writes (stale rows are
+ * skipped, not marked). `[]` when the database or `derived_observations` table does not exist.
+ */
+export declare function findMatchingDerivedObservationsReadOnly(dbPath: string, params: FindMatchingDerivedObservationsParams): DerivedObservationMatch[];
 export declare class DeepThoughtStore {
     #private;
     readonly db: DatabaseSync;
@@ -119,6 +211,13 @@ export declare class DeepThoughtStore {
         currentGenerations: Readonly<Record<string, number>>;
         nowMs?: number;
     }): DerivedObservation | undefined;
+    /**
+     * Fresh, generation-verified observations whose question matches `queryText` (see `DerivedObservationMatchQuery`).
+     * Strict ACL: exact agent + audience, every searched corpus allowed. An empty `currentGenerations` returns `[]`.
+     * Rows that verify as stale (a recorded collection moved, vanished, or a new one appeared) are marked `stale`.
+     * Never counts hits: a whisper is not a served `deep_thought` answer.
+     */
+    findMatchingDerivedObservations(params: FindMatchingDerivedObservationsParams): DerivedObservationMatch[];
     getDerivedObservation(id: string): DerivedObservation | undefined;
     /** Newest first. `limit` `0` (default) = unlimited. */
     listDerivedObservations(options: {

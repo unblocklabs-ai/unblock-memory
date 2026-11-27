@@ -39,10 +39,10 @@ function hit(path: string, disposition: RecallHitRecord["disposition"] = "emitte
     startLine: line, endLine: line + 2, observedAtBasis: "unknown", retrievalRank: rank, disposition };
 }
 
-function query(runId: string, at: number, hits: RecallHitRecord[], sessionId = "session"): RecallLedgerEvent {
+function query(runId: string, at: number, hits: RecallHitRecord[], sessionId = "session", recipeHash?: string): RecallLedgerEvent {
   return { kind: "query", record: { agentId, eventKey: runId, sessionId, runId, createdAtMs: at, source: "whisperer",
     provider: "slack", accountId: "workspace", senderId: "sender", queryFallback: false, corpora: ["memory"],
-    rankingMode: "decision", outcome: "emitted", hits } };
+    rankingMode: "decision", outcome: "emitted", recipeHash, hits } };
 }
 
 function route(runId: string, at: number, emitted: string[], hasRunId = true): RecallLedgerEvent {
@@ -108,7 +108,7 @@ test("joins delivered memory, opened skills and People receipts; deduplicates tu
     query("good", base, [hit(memory), hit(memory, "emitted", 2, 20), hit(hidden, "below_threshold", 3)]),
     route("good", base, [skill, skill, unopened], false),
     read("good", base + 10, memory), open("good", base + 12, skill),
-    query("bad", base + 200, [hit(memory), hit(hidden, "below_threshold", 2)]),
+    query("bad", base + 200, [hit(memory), hit(hidden, "below_threshold", 2)], "session", "trial-b"),
     route("bad", base + 200, [skill, unopened]),
     open("bad", base + 210, skill), open("another-run", base + 210, unopened),
     query("unknown", base + 400, [hit(memory, "returned")]),
@@ -116,8 +116,6 @@ test("joins delivered memory, opened skills and People receipts; deduplicates tu
     // A later run's shortfall must not get pulled backward to the unevaluated run.
     route("later", base + 470, []),
   ]);
-  db.exec("ALTER TABLE recall_queries ADD COLUMN recipe_hash TEXT");
-  db.exec("UPDATE recall_queries SET recipe_hash='trial-b' WHERE run_id='bad'");
   new ResponseAuditStore(dbPath).close();
   const insertAudit = db.prepare(`INSERT INTO response_results
     (cohort,id,session_id,input_hash,episode_at,active,status,assessed_at,result) VALUES
@@ -169,6 +167,41 @@ test("joins delivered memory, opened skills and People receipts; deduplicates tu
   assert.equal(unknown.get()?.id, before?.id);
   assert.equal(unknown.get()?.verdict, "helped");
   assert.equal(summarizeOutcomeMetrics(db, { agentId }).totalOutcomes, 10);
+});
+
+test("unstamped historical exposure tables stay in the default cohort without a schema upgrade", async t => {
+  const { dbPath, db, run } = fixture(t);
+  writeRecallBatch(dbPath, [
+    query("legacy", base, [hit("qmd://memory/guide.md")]),
+    route("legacy", base, ["/skills/guide/SKILL.md"]),
+  ]);
+  const hasRecipe = db.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name='recipe_hash'");
+  const tables = ["recall_queries", "skill_routing_events"];
+  for (const table of tables) {
+    if (hasRecipe.get(table)) db.exec(`ALTER TABLE ${table} DROP COLUMN recipe_hash`);
+  }
+  assert.equal((await run(base + 1_000, { recipeHash: "current" })).status, "ok");
+  const { byRecipe } = summarizeOutcomeMetrics(db, { agentId });
+  assert.deepEqual(Object.keys(byRecipe), ["default"]);
+  assert.deepEqual(byRecipe.default?.bySubjectKind, { memory_hit: 1, skill: 1, person_whisper: 0 });
+  for (const table of tables) assert.equal(hasRecipe.get(table), undefined);
+});
+
+test("a zero late-evidence rescan re-scores the full lookback", async t => {
+  const { dbPath, db, run } = fixture(t);
+  const old = base - 3 * day;
+  writeRecallBatch(dbPath, [query("old", old, [hit("qmd://memory/older.md")])]);
+  new ResponseAuditStore(dbPath).close();
+  const options = { responseCohort: "current" };
+  const verdict = () => db.prepare("SELECT verdict FROM memory_outcomes").get()?.verdict;
+  assert.equal((await run(base, options)).status, "ok");
+  assert.equal(verdict(), "ignored");
+  db.prepare(`INSERT INTO response_results (cohort,id,session_id,input_hash,episode_at,active,status,assessed_at,result)
+    VALUES ('current','late','session','hash',?,1,'ok',?,?)`).run(old + 20, base + 1, auditPayload("success"));
+  assert.equal((await run(base + 60_000, options)).status, "ok");
+  assert.equal(verdict(), "ignored");
+  assert.equal((await run(base + 120_000, { ...options, lateEvidenceRescanMs: 0 })).status, "ok");
+  assert.equal(verdict(), "helped");
 });
 
 test("undelivered candidates are not scored, purge legacy rows and do not dilute whisperUsedRate", async t => {

@@ -6,8 +6,6 @@ import { responseOutcome } from "./response-outcome.js";
 import { WorkFenceLostError } from "./work-store.js";
 export const OUTCOME_LEDGER_KIND = "outcome_ledger";
 const DAY_MS = 86_400_000;
-/** Steady-state sweeps re-score this much history behind the watermark to pick up late audit/Inside Out evidence. */
-const LATE_EVIDENCE_RESCAN_MS = 2 * DAY_MS;
 /** Wall-clock slice after which the scoring loop yields to the event loop. */
 const YIELD_SLICE_MS = 15;
 const SCHEMA = `
@@ -127,7 +125,7 @@ function decodeExposure(row) {
     return {
         at: Number(row.at), kind: row.kind, evidence: String(row.evidence), subject: String(row.subject),
         sourceId: Number(row.source_id), session: stringOrNull(row.session), sessionKey: stringOrNull(row.session_key),
-        run: stringOrNull(row.run), recipe: stringOrNull(row.recipe), delivered: row.delivered === 1,
+        run: stringOrNull(row.run), recipe: typeof row.recipe === "string" ? row.recipe : null, delivered: row.delivered === 1,
         provider: stringOrNull(row.provider), account: stringOrNull(row.account), sender: stringOrNull(row.sender),
     };
 }
@@ -281,13 +279,15 @@ export async function runOutcomeLedgerPass(options) {
     const { agentId, owner, workStore, signal, now = Date.now } = options;
     const intervalMs = (options.intervalMinutes ?? 60) * 60_000;
     const lookbackMs = options.lookbackMs ?? 7 * DAY_MS;
+    const rescanMs = options.lateEvidenceRescanMs ?? Math.min(lookbackMs, 2 * DAY_MS);
     const maxRows = options.maxRowsPerPass ?? 0;
     const windowMs = options.matchWindowMs ?? 30 * 60_000;
     const retentionMs = (options.retentionDays ?? 0) * DAY_MS;
     const leaseMs = options.leaseMs ?? DEFAULTS.steward.leaseMs;
     const heartbeatMs = options.heartbeatMs ?? Math.max(1, Math.floor(leaseMs / 3));
     for (const [field, value, minimum] of [
-        ["intervalMinutes", intervalMs, 1], ["lookbackMs", lookbackMs, 1], ["maxRowsPerPass", maxRows, 0],
+        ["intervalMinutes", intervalMs, 1], ["lookbackMs", lookbackMs, 1], ["lateEvidenceRescanMs", rescanMs, 0],
+        ["maxRowsPerPass", maxRows, 0],
         ["matchWindowMs", windowMs, 1], ["retentionDays", retentionMs, 0], ["leaseMs", leaseMs, 1],
         ["heartbeatMs", heartbeatMs, 1], ["baselineMinInteractions", options.baselineMinInteractions ?? 1, 1],
     ]) {
@@ -315,7 +315,7 @@ export async function runOutcomeLedgerPass(options) {
         // Inside Out grades can be backfilled asynchronously.
         const through = startedAt - windowMs;
         const sweep = watermark.sweep ?? { through, from: watermark.lastMeasuredAtMs
-                ? Math.min(through, watermark.lastMeasuredAtMs - Math.min(lookbackMs, LATE_EVIDENCE_RESCAN_MS))
+                ? Math.min(through, watermark.lastMeasuredAtMs - (rescanMs || lookbackMs))
                 : through - lookbackMs };
         let heartbeatAt = performance.now();
         let yieldAt = heartbeatAt;
@@ -339,7 +339,7 @@ export async function runOutcomeLedgerPass(options) {
             }
             const exposure = last = decodeExposure(row);
             const evidence = evaluate(exposure, startedAt);
-            const recipe = exposure.recipe ?? recipeHash;
+            const recipe = exposure.kind === "person_whisper" ? exposure.recipe || recipeHash : exposure.recipe ?? "default";
             const id = digest([agentId, exposure.kind, exposure.subject, exposure.evidence, recipe]);
             // Drop rows earlier versions scored for candidates that were never shown to the model.
             if (evidence)

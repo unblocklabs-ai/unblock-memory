@@ -1,18 +1,21 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
+import test, { type TestContext } from "node:test";
 import type {
   OpenClawConfig,
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
-import { createHash } from "node:crypto";
-import { DeepThoughtStore } from "../src/deep-thought-store.js";
+import { deepThoughtAudienceKey, DeepThoughtStore } from "../src/deep-thought-store.js";
+import { runOutcomeLedgerPass } from "../src/outcome-ledger.js";
 import { registerUnblockMemory, resolveFlushPlan } from "../src/plugin.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
+import { runExpectationsPass } from "../src/steward-expectations.js";
+import { WorkStore } from "../src/work-store.js";
 
 test("cold plugin loading does not start the QMD backend", () => {
   const entry = new URL("../index.ts", import.meta.url).href;
@@ -154,9 +157,13 @@ test("registers exactly the clean memory tool contract and validates every tool 
       ),
     ),
   );
-  // A default install has no skills corpus, so no whisperer may ask the host for
-  // conversation access (non-bundled plugins would log a blocked-hook warning).
-  assert.equal(hooks.includes("before_prompt_build"), false);
+  // A default install has no skills corpus and Memory Whisperer is opt-in; the only conversation-access hook is the
+  // default-on, read-only Expectations Whisperer (non-bundled plugins need hooks.allowConversationAccess=true for it).
+  assert.equal(hooks.filter(name => name === "before_prompt_build").length, 1);
+  const quiet: string[] = [];
+  registerUnblockMemory({ ...api, pluginConfig: { expectationsWhisperer: { enabled: false } }, registerTool() {},
+    on(name: string) { quiet.push(name); } } as unknown as OpenClawPluginApi);
+  assert.equal(quiet.includes("before_prompt_build"), false, "disabling Expectations leaves no conversation-access hook");
 
   const context = {
     agentId: "bill",
@@ -465,10 +472,11 @@ test("session sync tools accept and report status without awaiting cold initiali
 
 test("an explicit Skill Whisperer enable without a skills corpus warns instead of failing silently", () => {
   // Host-applied manifest defaults carry no `enabled`, so only an operator's true can warn.
+  const quiet = { expectationsWhisperer: { enabled: false } };
   const cases: [Record<string, unknown>, boolean][] = [
-    [{ skillWhisperer: { enabled: true } }, true],
-    [{}, false],
-    [{ skillWhisperer: { historyMessages: 5, minScore: 0.5, cooldownTurns: 10 } }, false],
+    [{ ...quiet, skillWhisperer: { enabled: true } }, true],
+    [quiet, false],
+    [{ ...quiet, skillWhisperer: { historyMessages: 5, minScore: 0.5, cooldownTurns: 10 } }, false],
   ];
   for (const [pluginConfig, warned] of cases) {
     const warnings: string[] = [], hooks: string[] = [];
@@ -509,10 +517,15 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
   assert.equal(metadata.hooks.length, 0, "cli-metadata never starts background work");
   const shadowHooks = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }).hooks;
   const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
+    outcomeLedger: { enabled: false }, expectations: { enabled: false } } }).hooks;
+  const ledgerOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
+    expectations: { enabled: false } } }).hooks;
+  const expectationsOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
     outcomeLedger: { enabled: false } } }).hooks;
-  const ledgerOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false } } }).hooks;
   assert.equal(ledgerOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
     "the default-on Outcome Ledger alone still starts the background Steward loop");
+  assert.equal(expectationsOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
+    "the default-on Expectations pass alone still starts the background Steward loop (no runner needed)");
   assert.equal(shadowHooks.filter(name => name === "gateway_start").length, quietHooks.filter(name => name === "gateway_start").length + 1,
     "the background Steward loop adds exactly one gateway_start hook");
 });
@@ -545,9 +558,11 @@ test("deep_thought gets a per-agent durable store and live QMD generations; gate
       return { "memory-collection": generation };
     } } }),
   });
+  // A DM session's cache audience needs the verified requester (fail closed without one).
   const context = { agentId: "bill", config: {}, sessionKey: "agent:bill:slack:direct:u1", messageChannel: "slack",
-    agentAccountId: "workspace" } as OpenClawPluginToolContext;
-  const audienceKey = `caller:${createHash("sha256").update(JSON.stringify(["bill", context.sessionKey, "slack", "workspace", ""])).digest("hex")}`;
+    agentAccountId: "workspace", requesterSenderId: "U1" } as OpenClawPluginToolContext;
+  const audienceKey = deepThoughtAudienceKey({ agentId: "bill", sessionKey: context.sessionKey, provider: "slack", accountId: "workspace",
+    senderId: "U1" })!;
   const seed = new DeepThoughtStore(runtime!.memoryDatabasePath("bill"));
   seed.saveDerivedObservation({ agentId: "bill", question: "Who owns the launch?", audienceKey, corpora: ["memory"],
     collectionGenerations: { "memory-collection": 3 }, answer: "Mira owns it.", confidence: "high", citations: [] });
@@ -573,4 +588,215 @@ test("deep_thought gets a per-agent durable store and live QMD generations; gate
       corpora: ["memory"], currentGenerations: { "memory-collection": 4 } }), undefined);
     assert.equal(check.listDerivedObservations({ agentId: "bill" })[0]!.status, "stale");
   } finally { check.close(); }
+});
+
+/* ───────────── Option A integration: Expectations, derived observations, recipe stamping ───────────── */
+
+/** Minimal commander stand-in for `memory-steward` subcommands. */
+class FakeCommand {
+  readonly commands = new Map<string, FakeCommand>();
+  readonly defaults: Record<string, unknown> = {};
+  handler?: (opts: Record<string, unknown>) => unknown;
+  command(name: string) { const child = new FakeCommand(); this.commands.set(name, child); return child; }
+  description() { return this; }
+  option(flags: string, _description?: string, fallback?: unknown) {
+    if (fallback !== undefined) this.defaults[cliKey(flags)] = fallback;
+    return this;
+  }
+  requiredOption(flags: string, description?: string, fallback?: unknown) { return this.option(flags, description, fallback); }
+  action(handler: (opts: Record<string, unknown>) => unknown) { this.handler = handler; return this; }
+}
+const cliKey = (flags: string) => flags.split(/[ ,]/u)[0]!.replace(/^--/u, "").replace(/-(\w)/gu, (_, c: string) => c.toUpperCase());
+type Hook = (event: unknown, context: unknown) => unknown;
+
+/** The real plugin over a temp state dir; host registration and the QMD manager are the only fakes. */
+async function integrationPlugin(t: TestContext, pluginConfig: Record<string, unknown>) {
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const stateDir = await mkdtemp(join(tmpdir(), "unblock-memory-option-a-"));
+  process.env.OPENCLAW_STATE_DIR = stateDir;
+  const hooks = new Map<string, Hook[]>();
+  const tools = new Map<string, (ctx: OpenClawPluginToolContext) => Tool | null>();
+  const clis: ((ctx: { program: FakeCommand; config: unknown }) => void)[] = [];
+  let runtime: QmdMemoryRuntime | undefined;
+  const cfg = { agents: { list: [{ id: "bill" }] } };
+  const api = {
+    pluginConfig, config: cfg, registrationMode: "full",
+    on(name: string, handler: Hook) { hooks.set(name, [...(hooks.get(name) ?? []), handler]); },
+    registerCli(register: (ctx: { program: FakeCommand; config: unknown }) => void) { clis.push(register); },
+    registerService() {}, registerGatewayMethod() {},
+    registerMemoryCapability(capability: { runtime: QmdMemoryRuntime }) { runtime = capability.runtime; },
+    registerTool(factory: (ctx: OpenClawPluginToolContext) => Tool | null, options: { names: string[] }) {
+      for (const name of options.names) tools.set(name, factory);
+    },
+    logger: { warn() {}, info() {}, debug() {}, error() {} },
+  } as unknown as OpenClawPluginApi;
+  registerUnblockMemory(api);
+  let stopped = false;
+  const stop = async () => {
+    if (stopped) return;
+    stopped = true;
+    for (const handler of hooks.get("gateway_stop") ?? []) await handler({}, {});
+  };
+  t.after(async () => {
+    await stop();
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await rm(stateDir, { recursive: true, force: true });
+  });
+  const prompt = async (event: unknown, context: unknown) => {
+    const handlers = hooks.get("before_prompt_build") ?? [];
+    assert.equal(handlers.length, 1, "one composed whisperer contribution");
+    return await handlers[0]!(event, context) as { appendContext: string } | undefined;
+  };
+  const cli = async (...argv: string[]) => {
+    const program = new FakeCommand();
+    for (const register of clis) register({ program, config: cfg });
+    const [name, ...rest] = argv;
+    const command = program.commands.get("memory-steward")!.commands.get(name!)!;
+    const opts: Record<string, unknown> = { ...command.defaults };
+    for (let i = 0; i < rest.length; i += 2) opts[cliKey(rest[i]!)] = rest[i + 1];
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (line: unknown) => { lines.push(String(line)); };
+    try { await command.handler!(opts); } finally { console.log = log; }
+    return JSON.parse(lines.join("\n")) as Record<string, unknown>;
+  };
+  return { runtime: runtime!, prompt, tools, cli, stop, dbPath: runtime!.memoryDatabasePath("bill") };
+}
+
+const CHANNEL_SESSION = "agent:bill:slack:channel:c0launch";
+/** A host-shaped `before_prompt_build` context for a Slack channel turn (see buildAgentHookContextChannelFields). */
+const channelTurn = (runId: string, senderId = "U-bob") => ({
+  trigger: "user", agentId: "bill", sessionKey: CHANNEL_SESSION, sessionId: "s-launch", runId,
+  messageProvider: "slack", channel: "slack", accountId: "workspace", chatId: "c0launch", channelId: "c0launch", senderId,
+});
+
+test("integration: a Captain's Log [BLOCKED] entry is ingested by the Expectations pass and whispered on a matching turn", async t => {
+  const plugin = await integrationPlugin(t, { decisionModel: { enabled: false } });
+  // The WorkStore opens (and marks) the plugin memory database, exactly as the Steward tick does.
+  const store = new WorkStore(plugin.dbPath);
+  try {
+    store.db.exec(`CREATE TABLE captains_log_entries (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, day TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, section_hash TEXT NOT NULL,
+      ordinal INTEGER NOT NULL, topic TEXT NOT NULL, summary TEXT NOT NULL, blocked INTEGER NOT NULL CHECK(blocked IN (0, 1)),
+      resolved_at_ms INTEGER, resolution_note TEXT, channels_json TEXT NOT NULL CHECK(json_valid(channels_json)),
+      session_refs_json TEXT NOT NULL CHECK(json_valid(session_refs_json))) STRICT`);
+    store.db.prepare("INSERT INTO captains_log_entries VALUES ('cl-1', 'bill', '2026-11-27', ?, 'h', 0, 'Shopify API quota', ?, 1, NULL, NULL, ?, '[]')")
+      .run(Date.now() - 60_000, "Acme catalog sync is blocked on the Shopify API quota", JSON.stringify(["#c0launch"]));
+
+    const turn = { prompt: "Any update on the Acme sync?", messages: [] };
+    assert.equal(await plugin.prompt(turn, channelTurn("before-pass")), undefined, "nothing is whispered before ingestion");
+    // No runner: deterministic ingestion only, zero model cost.
+    const pass = await runExpectationsPass({ agentId: "bill", workStore: store, owner: "integration" });
+    assert.equal(pass.status, "deterministic_only", JSON.stringify(pass));
+    assert.equal(pass.deterministic?.captainsLog.upserted, 1);
+  } finally { store.close(); }
+
+  const turn = { prompt: "Any update on the Acme sync?", messages: [] };
+  const result = await plugin.prompt(turn, channelTurn("after-pass"));
+  const block = result?.appendContext.match(/^<unblock_memory>\n<expectations>\n[^\n]+\n\[([^]*)\]\n<\/expectations>\n<\/unblock_memory>$/u);
+  assert.ok(block, result?.appendContext);
+  const [hint] = JSON.parse(`[${block[1]}]`) as Record<string, unknown>[];
+  assert.equal(hint!.kind, "blocker");
+  assert.equal(hint!.summary, "Shopify API quota");
+  assert.equal(hint!.expectedState, "Acme catalog sync is blocked on the Shopify API quota");
+  assert.deepEqual(hint!.matchedBy, ["channel_match", "active_blocker"]);
+  // Workspace blockers are shared by design: a DM turn sees them too, but only as an active blocker (no channel match).
+  const dm = await plugin.prompt(turn, { trigger: "user", agentId: "bill", sessionKey: "agent:bill:slack:direct:u-bob",
+    sessionId: "s-dm", runId: "dm-1", messageProvider: "slack", accountId: "workspace", senderId: "U-bob" });
+  assert.match(dm?.appendContext ?? "", /"matchedBy":\["active_blocker"\]/u);
+
+  const listed = await plugin.cli("expectations", "--agent", "bill");
+  assert.equal((listed.summary as { byStatus: { open: number } }).byStatus.open, 1);
+  assert.deepEqual((listed.expectations as { sourceKind: string }[]).map(item => item.sourceKind), ["captains_log"]);
+});
+
+test("integration: a saved deep_thought synthesis is whispered by the Memory Whisperer until its QMD generation advances", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ model: "liquid/d1.2-ultra-20261116", answers: {} }));
+  const plugin = await integrationPlugin(t, {
+    corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }],
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
+    memoryWhisperer: { enabled: true, corpora: ["memory"], recipeHash: "mem-b" },
+    expectationsWhisperer: { enabled: false },
+  });
+  let generation = 3;
+  Object.defineProperty(plugin.runtime, "getMemorySearchManager", {
+    value: async () => ({ manager: {
+      async searchCandidates() { return []; },
+      async getCollectionGenerations() { return { "memory-collection": generation }; },
+    } }),
+  });
+  // Saved under the key deep_thought derives from a host-shaped TOOL context in this channel (see deep-thought.ts):
+  // the tool sees the native-case channel id and the asker; the hook below sees neither.
+  const toolIdentity = { agentId: "bill", sessionKey: CHANNEL_SESSION, provider: "slack", accountId: "workspace", senderId: "U-alice" };
+  const store = new DeepThoughtStore(plugin.dbPath);
+  const saved = store.saveDerivedObservation({ agentId: "bill", question: "Who owns the Acme launch checklist?",
+    audienceKey: deepThoughtAudienceKey(toolIdentity)!, corpora: ["memory"], collectionGenerations: { "memory-collection": 3 },
+    answer: "Mira owns the Acme launch checklist.", confidence: "high", citations: [{ source: "qmd://memory/launch.md", quote: "Mira" }] });
+  store.close();
+
+  const turn = { prompt: "Remind me who owns the Acme launch checklist?", messages: [] };
+  const result = await plugin.prompt(turn, channelTurn("dt-1"));
+  const payload = result?.appendContext.match(/^<unblock_memory>\n<memory>\n([^]*)\n<\/memory>\n<\/unblock_memory>$/u)?.[1];
+  assert.ok(payload, result?.appendContext);
+  const entries = JSON.parse(payload) as Record<string, unknown>[];
+  assert.deepEqual(entries.map(entry => [entry.source, entry.answer]),
+    [[`derived_observation:${saved.id}`, "Mira owns the Acme launch checklist."]]);
+
+  // A DM session for the same account never sees the channel's synthesis.
+  assert.equal(await plugin.prompt(turn, { ...channelTurn("dt-dm"), sessionKey: "agent:bill:main", sessionId: "s-main",
+    chatId: "user:u-bob", channelId: "user:u-bob" }), undefined);
+  // The instant the searched collection advances, the synthesis is retired (fresh session: no cooldown in play).
+  generation = 4;
+  assert.equal(await plugin.prompt(turn, { ...channelTurn("dt-2"), sessionId: "s-launch-2" }), undefined);
+  assert.ok(fetch.mock.calls.every(call => String(call.arguments[0]).startsWith("https://codex.unblocklabs.ai/")),
+    "only the (mocked) decision endpoint is called: derived matching itself is local");
+});
+
+test("integration: recipeHash stamped on memory_search and skill exposures flows into memory-steward outcomes byRecipe", async t => {
+  const plugin = await integrationPlugin(t, {
+    corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "skills", kind: "skills", paths: ["skills/**/SKILL.md"] }],
+    decisionModel: { enabled: false },
+    recallLedger: { enabled: true },
+    memoryWhisperer: { recipeHash: " mem-b " },
+    skillWhisperer: { recipeHash: "skill-b", minScore: 0.1 },
+    expectationsWhisperer: { enabled: false },
+  });
+  const skill = { name: "deploy", description: "Use deploy for release workflows.", path: "/skills/deploy/SKILL.md" };
+  Object.defineProperty(plugin.runtime, "getMemorySearchManager", {
+    value: async () => ({ manager: {
+      async searchCandidates() {
+        return [{ path: "qmd://memory/release.md", startLine: 1, endLine: 2, score: 0.4, snippet: "Release steps", source: "memory",
+          corpus: "memory", citation: "memory/release.md#L1-L2" }];
+      },
+      async searchSkills() { return [{ ...skill, score: 0.9 }]; },
+      async listSkills() { return [skill]; },
+    } }),
+  });
+  Object.defineProperty(plugin.runtime, "resolveSkillPath", { value: (_params: unknown, path: string) => path });
+
+  const context = { agentId: "bill", config: {}, sessionKey: "agent:bill:main", sessionId: "s-1", runId: "run-1" } as OpenClawPluginToolContext;
+  const search = parseJsonResult(await plugin.tools.get("memory_search")!(context)!.execute("call-1",
+    { bm25Query: "release", vectorQuery: "How do we release?" }));
+  assert.equal((search.results as unknown[]).length, 1);
+  const whispered = await plugin.prompt({ prompt: "Deploy this release", messages: [] },
+    { trigger: "user", agentId: "bill", sessionKey: "agent:bill:main", sessionId: "s-1", runId: "run-2" });
+  assert.match(whispered?.appendContext ?? "", /name="deploy"/u);
+  await plugin.stop(); // Flushes the recall-ledger writer.
+
+  const db = new DatabaseSync(plugin.dbPath, { readOnly: true });
+  try {
+    assert.deepEqual(db.prepare("SELECT source, recipe_hash FROM recall_queries").all().map(row => ({ ...row })),
+      [{ source: "tool", recipe_hash: "mem-b" }]);
+    assert.deepEqual(db.prepare("SELECT recipe_hash FROM skill_routing_events").all().map(row => row.recipe_hash), ["skill-b"]);
+  } finally { db.close(); }
+
+  const store = new WorkStore(plugin.dbPath);
+  try {
+    const pass = await runOutcomeLedgerPass({ agentId: "bill", owner: "integration", workStore: store, now: () => Date.now() + 3_600_000 });
+    assert.equal(pass.status, "ok", JSON.stringify(pass));
+  } finally { store.close(); }
+  const outcomes = await plugin.cli("outcomes", "--agent", "bill");
+  assert.deepEqual(Object.keys(outcomes.byRecipe as object).sort(), ["mem-b", "skill-b"]);
+  assert.equal((await plugin.cli("outcomes", "--agent", "bill", "--recipe", "skill-b")).totalOutcomes, 1);
 });

@@ -196,6 +196,7 @@ test("enables skill whispering by default only once a skills corpus exists and v
     historyMessages: 5,
     minScore: 0.5,
     cooldownTurns: 10,
+    recipeHash: "default",
   });
   const corpora = [
     { name: "memory", kind: "files", paths: ["MEMORY.md"] },
@@ -211,6 +212,7 @@ test("enables skill whispering by default only once a skills corpus exists and v
       historyMessages: 0,
       minScore: 0.7,
       cooldownTurns: 0,
+      recipeHash: "default",
     },
   );
   assert.deepEqual(resolveConfig({ corpora }).corpora[1], {
@@ -449,6 +451,10 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     assert.equal(steward.peopleShadow.includeResponseAudit, true);
     assert.deepEqual(steward.outcomeLedger, {
       enabled: true, intervalMinutes: 60, lookbackMs: 604_800_000, maxRowsPerPass: 0, matchWindowMs: 1_800_000, retentionDays: 0,
+    }, "lateEvidenceRescanMs stays unset: the ledger's own two-day default applies");
+    assert.deepEqual(steward.expectations, {
+      enabled: true, intervalMinutes: 60, lookbackMinutes: 70, dueLeadMinutes: 60, sweepAfterMinutes: 1440, maxSessionsPerRun: 0,
+      maxCharsPerSession: 0, maxSweepItems: 0, timeoutMs: 0, excludeChatTypes: ["direct"], extract: true, sweep: true, blockerAutoExpireMinutes: 4320,
     });
     assert.deepEqual(resolveConfig(fleet).steward, steward);
   }
@@ -472,6 +478,12 @@ test("steward is optional and enabled by default; host manifest and runtime reso
       },
       outcomeLedger: {
         enabled: false, intervalMinutes: 30, lookbackMs: 86_400_000, maxRowsPerPass: 5_000, matchWindowMs: 600_000, retentionDays: 90,
+        lateEvidenceRescanMs: 0,
+      },
+      expectations: {
+        enabled: false, intervalMinutes: 30, lookbackMinutes: 40, dueLeadMinutes: 0, sweepAfterMinutes: 0, maxSessionsPerRun: 10,
+        maxCharsPerSession: 4_000, maxSweepItems: 25, timeoutMs: 45_000, excludeChatTypes: ["direct" as const, "group" as const],
+        extract: false, sweep: false, blockerAutoExpireMinutes: 0,
       },
     },
   };
@@ -482,8 +494,28 @@ test("steward is optional and enabled by default; host manifest and runtime reso
   assert.deepEqual(steward.deepThought, enabled.steward.deepThought);
   assert.deepEqual(steward.peopleShadow, enabled.steward.peopleShadow);
   assert.deepEqual(steward.captainsLog, enabled.steward.captainsLog);
-  assert.deepEqual(steward.outcomeLedger, enabled.steward.outcomeLedger);
+  assert.deepEqual(steward.outcomeLedger, enabled.steward.outcomeLedger, "an explicit 0 rescan (= full lookback) is preserved");
+  assert.deepEqual(steward.expectations, enabled.steward.expectations);
   for (const invalid of [
+    { steward: { outcomeLedger: { lateEvidenceRescanMs: -1 } } },
+    { steward: { outcomeLedger: { lateEvidenceRescanMs: 1.5 } } },
+    { steward: { outcomeLedger: { lateEvidenceRescanMs: "0" } } },
+    { steward: { expectations: { extra: true } } },
+    { steward: { expectations: { enabled: "true" } } },
+    { steward: { expectations: { intervalMinutes: 0 } } },
+    { steward: { expectations: { lookbackMinutes: 0 } } },
+    { steward: { expectations: { dueLeadMinutes: -1 } } },
+    { steward: { expectations: { sweepAfterMinutes: -1 } } },
+    { steward: { expectations: { maxSessionsPerRun: -1 } } },
+    { steward: { expectations: { blockerAutoExpireMinutes: -1 } } },
+    { steward: { expectations: { blockerAutoExpireMinutes: 1.5 } } },
+    { steward: { expectations: { maxCharsPerSession: 1.5 } } },
+    { steward: { expectations: { maxSweepItems: -1 } } },
+    { steward: { expectations: { timeoutMs: -1 } } },
+    { steward: { expectations: { excludeChatTypes: ["dm"] } } },
+    { steward: { expectations: { excludeChatTypes: "direct" } } },
+    { steward: { expectations: { extract: 1 } } },
+    { steward: { expectations: { sweep: "yes" } } },
     { steward: { extra: true } },
     { steward: { deepThought: { extra: 1 } } },
     { steward: { deepThought: { maxTurns: -1 } } },
@@ -511,5 +543,69 @@ test("steward is optional and enabled by default; host manifest and runtime reso
   ]) {
     assert.equal(validate(invalid).ok, false, JSON.stringify(invalid));
     assert.throws(() => resolveConfig(invalid), /steward/, JSON.stringify(invalid));
+  }
+});
+
+test("expectationsWhisperer is on by default, preserves explicit 0 = unlimited, and host and runtime reject bad shapes", async () => {
+  const validate = await manifestValidator("unblock-memory:test:expectations-whisperer");
+  const defaults = { enabled: true, maxHints: 5, cooldownTurns: 10, dueLeadMs: 86_400_000, maxPayloadChars: 0, includeWorkspaceBlockers: true };
+  assert.deepEqual(resolveConfig({}).expectationsWhisperer, defaults);
+  const host = validate({});
+  assert.equal(host.ok, true);
+  assert.deepEqual(host.value?.expectationsWhisperer, { enabled: true });
+  assert.deepEqual(resolveConfig(host.value).expectationsWhisperer, defaults);
+  const zeros = { enabled: false, maxHints: 0, cooldownTurns: 0, dueLeadMs: 0, maxPayloadChars: 0, includeWorkspaceBlockers: false };
+  assert.equal(validate({ expectationsWhisperer: zeros }).ok, true);
+  assert.deepEqual(resolveConfig({ expectationsWhisperer: zeros }).expectationsWhisperer, zeros, "0 is never replaced by a default");
+  assert.deepEqual(resolveConfig({ expectationsWhisperer: { maxHints: 2, maxPayloadChars: 4_000 } }).expectationsWhisperer,
+    { ...defaults, maxHints: 2, maxPayloadChars: 4_000 });
+  for (const expectationsWhisperer of [null, [], "on", { extra: 1 }, { enabled: "yes" }, { includeWorkspaceBlockers: 1 },
+    { maxHints: -1 }, { cooldownTurns: 1.5 }, { dueLeadMs: "1" }, { maxPayloadChars: -5 }]) {
+    assert.equal(validate({ expectationsWhisperer }).ok, false, JSON.stringify(expectationsWhisperer));
+    assert.throws(() => resolveConfig({ expectationsWhisperer }), /expectationsWhisperer/u, JSON.stringify(expectationsWhisperer));
+  }
+  assert.throws(() => resolveConfig({ expectationsWhisperer: { maxHints: Number.MAX_SAFE_INTEGER + 1 } }), /expectationsWhisperer\.maxHints/u);
+  // The whisperer participates in trigger allowlists, ordered just before safety.
+  const triggers = { cron: ["safety", "expectations"], heartbeat: ["expectations"] };
+  assert.equal(validate({ whispererTriggers: triggers }).ok, true);
+  assert.deepEqual(resolveConfig({ whispererTriggers: triggers }).whispererTriggers,
+    { cron: ["safety", "expectations"], subagent: [], heartbeat: ["expectations"] });
+});
+
+test("recipeHash defaults to \"default\", is trimmed, and derivedObservations defaults on for the Memory Whisperer", async () => {
+  const validate = await manifestValidator("unblock-memory:test:recipe-hash");
+  const corpora = [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "skills", kind: "skills", paths: ["skills/**/SKILL.md"] }];
+  assert.equal(resolveConfig({}).memoryWhisperer.recipeHash, "default");
+  assert.equal(resolveConfig({}).memoryWhisperer.derivedObservations, true);
+  assert.equal(resolveConfig({ corpora }).skillWhisperer.recipeHash, "default");
+  const configured = { corpora, memoryWhisperer: { recipeHash: " rr-b ", derivedObservations: false }, skillWhisperer: { recipeHash: "skills-b" } };
+  const host = validate(configured);
+  assert.equal(host.ok, true, JSON.stringify(host.errors));
+  const resolved = resolveConfig(host.value);
+  assert.equal(resolved.memoryWhisperer.recipeHash, "rr-b");
+  assert.equal(resolved.memoryWhisperer.derivedObservations, false);
+  assert.equal(resolved.skillWhisperer.recipeHash, "skills-b");
+  assert.equal(resolveConfig(validate({}).value).memoryWhisperer.derivedObservations, true, "host defaults keep it on");
+  for (const [section, value] of [["memoryWhisperer", { recipeHash: " " }], ["memoryWhisperer", { recipeHash: 7 }],
+    ["memoryWhisperer", { recipeHash: "" }], ["memoryWhisperer", { derivedObservations: "yes" }],
+    ["skillWhisperer", { recipeHash: "" }], ["skillWhisperer", { recipeHash: null }]] as const) {
+    assert.equal(validate({ [section]: value }).ok, false, JSON.stringify({ [section]: value }));
+    assert.throws(() => resolveConfig({ corpora, [section]: value }), new RegExp(section, "u"), JSON.stringify(value));
+  }
+});
+
+test("memoryWhisperer derived-observation caps and thresholds are configurable through the manifest", async () => {
+  const validate = await manifestValidator("unblock-memory:test:derived");
+  const configured = { memoryWhisperer: { derivedMaxHints: 0, derivedMinTokenOverlap: 0.6, derivedMinSharedTokens: 3 } };
+  const host = validate(configured);
+  assert.equal(host.ok, true, JSON.stringify(host.errors));
+  const resolved = resolveConfig(host.value).memoryWhisperer;
+  assert.deepEqual([resolved.derivedMaxHints, resolved.derivedMinTokenOverlap, resolved.derivedMinSharedTokens], [0, 0.6, 3]);
+  const defaults = resolveConfig({}).memoryWhisperer;
+  assert.deepEqual([defaults.derivedMaxHints, defaults.derivedMinTokenOverlap, defaults.derivedMinSharedTokens], [2, 0.45, 2]);
+  for (const invalid of [{ derivedMaxHints: -1 }, { derivedMaxHints: 1.5 }, { derivedMinTokenOverlap: 1.5 },
+    { derivedMinTokenOverlap: -0.1 }, { derivedMinSharedTokens: 0 }, { derivedMinSharedTokens: "2" }]) {
+    assert.equal(validate({ memoryWhisperer: invalid }).ok, false, JSON.stringify(invalid));
+    assert.throws(() => resolveConfig({ memoryWhisperer: invalid }), /derived/u, JSON.stringify(invalid));
   }
 });

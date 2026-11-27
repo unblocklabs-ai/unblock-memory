@@ -140,6 +140,43 @@ test("openRecallLedger migrates a populated v1 database without losing hits and 
   }
 });
 
+test("the writer upgrades unstamped v1 exposure tables and preserves historical recipes on reopen", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "recall-ledger-recipes-"));
+  const dbPath = join(directory.path, MEMORY_DATABASE);
+  const now = Date.now();
+  const events = (eventKey: string, recipeHash?: string) => [
+    { kind: "query", record: sampleQuery({ eventKey, createdAtMs: now, recipeHash }) },
+    { kind: "skill_routing", record: { eventKey, createdAtMs: now, agentId: "bill", mode: "direct",
+      candidateCount: 1, emitted: ["/skills/a/SKILL.md"], scores: [], outcome: "emitted", recipeHash } },
+  ] as const;
+  const tables = ["recall_queries", "skill_routing_events"];
+  writeRecallBatch(dbPath, events("legacy"));
+  const legacy = new DatabaseSync(dbPath);
+  try {
+    const hasRecipe = legacy.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name='recipe_hash'");
+    for (const table of tables) {
+      if (hasRecipe.get(table)) legacy.exec(`ALTER TABLE ${table} DROP COLUMN recipe_hash`);
+    }
+  } finally { legacy.close(); }
+
+  const writer = new RecallLedgerWriter();
+  for (const event of [...events("a", "recipe-a"), ...events("b", "recipe-b"), ...events("blank", " \t ")]) {
+    writer.enqueue(dbPath, event);
+  }
+  await writer.close();
+
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    for (const table of tables) {
+      const rows = db.prepare(`SELECT event_key, recipe_hash FROM ${table} ORDER BY id`).all();
+      assert.deepEqual(rows.map(row => [row.event_key, row.recipe_hash]),
+        [["legacy", "default"], ["a", "recipe-a"], ["b", "recipe-b"], ["blank", "default"]]);
+    }
+    assert.equal(db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'").get()?.version, 1);
+  } finally { db.close(); }
+  openRecallLedger(dbPath).close();
+});
+
 test("writeRecallBatch is idempotent on event_key, surfaces CHECK violations, and prunes expired parents cleanly", async () => {
   const root = await tempDir();
   try {

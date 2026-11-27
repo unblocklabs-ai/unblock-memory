@@ -8,12 +8,14 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig, type UnblockMemoryConfig } from "../src/config.js";
 import { DEFAULTS } from "../src/defaults.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
+import { runOutcomeLedgerPass, summarizeOutcomeMetrics } from "../src/outcome-ledger.js";
 import { QmdMemoryRuntime } from "../src/runtime.js";
 import { openRecallLedger, RecallLedgerWriter } from "../src/recall-ledger.js";
 import { openMemoryDatabase } from "../src/memory-database.js";
 import { SkillSessionStore } from "../src/skill-session-store.js";
-import { registerSkillWhisperer } from "../src/skill-whisperer.js";
+import { registerSkillWhisperer, skillRecipeHash } from "../src/skill-whisperer.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
+import { WorkStore } from "../src/work-store.js";
 
 type Runtime = Parameters<typeof registerSkillWhisperer>[1];
 type DecisionModel = UnblockMemoryConfig["decisionModel"];
@@ -175,6 +177,7 @@ test("400 skills route directly in five parallel batches with a 3-second request
   try {
     const [route] = db.prepare("SELECT * FROM skill_routing_events").all();
     assert.equal(route.mode, "direct");
+    assert.equal(route.recipe_hash, "default");
     assert.equal(route.surface, "user");
     assert.equal(route.outcome, "emitted");
     assert.ok(Number(route.elapsed_ms) >= 0);
@@ -185,6 +188,61 @@ test("400 skills route directly in five parallel batches with a 3-second request
     assert.deepEqual(JSON.parse(String(route.emitted_json)), [candidates[399].path]);
     assert.deepEqual([route.input_tokens, route.output_tokens], [52, 8]);
   } finally { db.close(); h.stop(); }
+});
+
+test("skill recipe hashes are stable across config key order and change with routing settings", () => {
+  const { enabled: isEnabled, historyMessages, minScore, cooldownTurns } = enabled;
+  const recipe = skillRecipeHash(enabled);
+  assert.equal(skillRecipeHash({ minScore, historyMessages, enabled: isEnabled, cooldownTurns }), recipe);
+  assert.notEqual(skillRecipeHash({ ...enabled, minScore: minScore + 0.1 }), recipe);
+});
+
+test("outcomes keep the recipe of each recall and skill exposure across experiment arms", async t => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-recipes-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const writer = new RecallLedgerWriter();
+  const skill = hit("deploy");
+  const runtime = catalogRuntime([skill], async () => [skill]);
+  const sourcePath = "qmd://memory/deploy.md";
+  const createdAtMs = Date.now();
+  t.mock.method(Date, "now", () => createdAtMs);
+  try {
+    for (const recipeHash of ["recipe-a", "recipe-b"]) {
+      const context = ctx(recipeHash, recipeHash);
+      const { agentId, sessionId, runId } = context;
+      const ledger = { writer, dbPathForAgent: () => dbPath, recipeHash };
+      const h = harness(runtime, local, {}, enabled, undefined, ledger);
+      try {
+        assert.match((await h.prompt(prompt(), context))?.appendContext ?? "", /name="deploy"/);
+        writer.enqueue(dbPath, { kind: "query", record: {
+          agentId, sessionId, runId, eventKey: recipeHash, createdAtMs, source: "whisperer", recipeHash,
+          queryFallback: false, corpora: ["memory"], rankingMode: "retrieval", outcome: "emitted",
+          hits: [{ rawLeafId: "leaf", passageId: "passage", corpus: "memory", sourcePath, startLine: 1, endLine: 1,
+            observedAtBasis: "unknown", retrievalRank: 1, disposition: "emitted" }],
+        } });
+        if (recipeHash === "recipe-a") {
+          await h.after(read(skill.path), context);
+          writer.enqueue(dbPath, { kind: "read", record: {
+            agentId, sessionId, runId, eventKey: "read-a", readAtMs: createdAtMs, sourcePath, status: "ok",
+          } });
+        }
+      } finally { h.stop(); }
+    }
+  } finally { await writer.close(); }
+
+  const workStore = new WorkStore(dbPath);
+  try {
+    const pass = await runOutcomeLedgerPass({
+      agentId: "main", owner: "test", workStore, recipeHash: "scoring-recipe",
+      matchWindowMs: 100, now: () => createdAtMs + 1_000,
+    });
+    assert.equal(pass.status, "ok", JSON.stringify(pass));
+    const { byRecipe } = summarizeOutcomeMetrics(workStore.db, { agentId: "main" });
+    assert.deepEqual(Object.keys(byRecipe).sort().map(recipe => {
+      const { totalOutcomes, whisperUsedRate, skillOpenRate } = byRecipe[recipe];
+      return [recipe, totalOutcomes, whisperUsedRate, skillOpenRate];
+    }), [["recipe-a", 2, 1, 1], ["recipe-b", 2, 0, 0]]);
+  } finally { workStore.close(); }
 });
 
 test("opening a legacy whispered skill preserves its provenance; an independent read is not attributed to routing", async () => {
@@ -202,7 +260,7 @@ test("opening a legacy whispered skill preserves its provenance; an independent 
       "thread", entries[0].path, "routed", "original", "whisperer", 0.9, 1, now, now);
     const writer = new RecallLedgerWriter();
     const runtime = { ...catalogRuntime(entries, async () => []), memoryDatabasePath: () => dbPath };
-    const h = harness(runtime, local, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+    const h = harness(runtime, local, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath, recipeHash: " \t " });
     try {
       const context = ctx("one");
       await h.prompt(prompt(), context);
@@ -221,8 +279,8 @@ test("opening a legacy whispered skill preserves its provenance; an independent 
     assert.deepEqual(opens.map(row => [row.skill_path, row.tool_name, row.was_whispered, row.was_pinned]), [
       [entries[0].path, "skills_read", 1, 1], [entries[1].path, "read", 0, 0], [entries[1].path, "read", 0, 1],
     ]);
-    const route = db.prepare("SELECT mode, input_tokens, output_tokens FROM skill_routing_events").get();
-    assert.deepEqual({ ...route }, { mode: "fallback", input_tokens: null, output_tokens: null });
+    const route = db.prepare("SELECT mode, input_tokens, output_tokens, recipe_hash FROM skill_routing_events").get();
+    assert.deepEqual({ ...route }, { mode: "fallback", input_tokens: null, output_tokens: null, recipe_hash: "default" });
   } finally { db.close(); }
 });
 

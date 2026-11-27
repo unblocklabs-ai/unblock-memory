@@ -100,9 +100,17 @@ function renderSkills(entries, emitted) {
     }
     return block === header ? undefined : block + footer;
 }
+/** Fingerprint the effective routing settings; the legacy cooldown no longer affects routing.
+ * @public For callers assigning experiment recipes.
+ */
+export function skillRecipeHash(config) {
+    const { enabled, historyMessages, minScore } = config;
+    return createHash("sha256").update(JSON.stringify(["skill_whisperer", enabled, historyMessages, minScore])).digest("hex");
+}
 export function registerSkillWhisperer(api, runtime, config, decisionModel, diagnostics, recallLedger) {
     if (!config.enabled)
         return;
+    const recipeHash = nonBlank(recallLedger?.recipeHash) ?? "default";
     const sessions = new Map();
     const ended = new Map();
     const stores = new Map();
@@ -246,7 +254,8 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
             agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
             // A missing run id must never collapse distinct routing events onto one key.
             eventKey: JSON.stringify([agentId, scope, nonBlank(runId) ?? randomUUID()]), createdAtMs: Date.now(),
-            surface: surface ?? whispererSurface(context), mode: "fallback", candidateCount: 0, scores: [], emitted, outcome: "no_candidates",
+            recipeHash, surface: surface ?? whispererSurface(context), mode: "fallback",
+            candidateCount: 0, scores: [], emitted, outcome: "no_candidates",
         };
         const emit = (entries, added = false) => {
             const rendered = [];

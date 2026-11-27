@@ -17,6 +17,7 @@ settings; a rotated credential file is reread without a restart.
 | Skill Whisperer | `skillWhisperer.enabled`, skills corpus, host hooks | Local vector matches meeting `minScore` | Keep active skills and matches from successful batches; no vector-only fallback |
 | Memory Whisperer | `memoryWhisperer.enabled`, explicit approved corpora, host hooks | No hints | Exclude failed candidates; deadline failures still suppress the turn; v2 recall-gate failures search every approved corpus, and topic-extraction (or legacy query-API) failures fall back to deterministic local queries before decision model judging |
 | Complementary hints | Enabled Memory Whisperer + `complementaryHints` | No additional judgment; base hints also require a key | Keep baseline hints unless the total deadline expires |
+| Expectations Whisperer | `expectationsWhisperer.enabled` (default on), host hooks (conversation access and prompt injection) | Unchanged: local read-only lookup, no model call | Unchanged; a missing database or table whispers nothing |
 | Safety Whisperer | `safetyWhisperer.enabled`, at least one scenario, host hooks (conversation access and prompt injection) | Could not check: the turn proceeds without safety prompts (fails open) | Fails open; recorded as could-not-check, never as no match |
 | People store/tools | `people.enabled` | Available; automatic save review needs primer/key or verified manual alternative | Storage/inspection still available |
 | People Whisperer | People + `people.whisperer.enabled`, host hooks, eligible person/dossier, no prior thread receipt | Unchanged local lookup | Unchanged local lookup |
@@ -28,9 +29,14 @@ settings; a rotated credential file is reread without a restart.
 | Clustering | Configured local `analysis.executable` | Unchanged | Unchanged; worker failures do not disable ordinary search |
 | `deep_thought` | `steward.enabled` + `steward.deepThought.enabled`; a Steward credential | Tool returns `unavailable`; inner searches use local retrieval ranking | `failed`/`timed_out` with partial usage; no answer is invented |
 | People shadow | `steward.enabled` + `steward.peopleShadow.enabled`; People Learning manifests | Pass stops early; no strikes, nothing published | Item retried next pass without a strike; rejected proposals strike toward quarantine |
+| Expectations pass | `steward.enabled` + `steward.expectations.enabled` | Captain's Log blockers and people todos are still mirrored (no model); session extraction and sweeps are skipped | Deterministic rows stay committed; the model stage retries within 15 minutes |
 
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
-one it registers no hook and reports inactive.
+one it registers no hook and reports inactive. Expectations Whisperer is on by
+default; it is the only whisperer a default install registers, so a non-bundled
+install needs `plugins.entries.unblock-memory.hooks.allowConversationAccess=true`
+for it to run (otherwise the host logs one blocked-hook diagnostic and nothing is
+whispered). Set `expectationsWhisperer.enabled: false` to register no prompt hook.
 My Turn, Memory/People Whisperers, people storage, the primer and audits default off.
 `decisionModel.enabled` defaults true but does not enable those opt-in features;
 `sentimentEnabled` defaults true only **within an enabled
@@ -54,7 +60,7 @@ containing `:subagent:` takes precedence over the reported trigger.
 }
 ```
 
-Allowed names: `memory`, `skill`, `people`, `myTurn`, `safety`. Duplicates
+Allowed names: `memory`, `skill`, `people`, `myTurn`, `expectations`, `safety`. Duplicates
 are ignored. The lists do not enable features or bypass other checks. People
 Whisperer still requires verified Slack identity and My Turn still requires a
 verified human message in a group or channel. Skill context on cron and heartbeat
@@ -271,6 +277,7 @@ contract; these tables explain their effects.
 | `skillWhisperer.historyMessages` | `5` | Nonnegative integer; prior visible messages used for routing |
 | `skillWhisperer.minScore` | `0.5` | 0–1, **local vector fallback only**, ignored for decision model shortlist admission |
 | `skillWhisperer.cooldownTurns` | `10` | Legacy nonnegative integer, accepted for compatibility; no longer used |
+| `skillWhisperer.recipeHash` | `"default"` | Non-empty label (trimmed) stamped on every skill routing exposure for A/B experiments; reported per arm by `memory-steward outcomes` (`byRecipe`, `--recipe`) |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, decision model key and host hooks |
 | `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
 | `memoryWhisperer.mode` | `"v2"` | `"v2"`: decision-model recall gate + corpus router and grounded topic extraction (up to three topics), run in parallel within `min(2 s, timeoutMs / 2)`; never calls a query-model API. `"legacy"`: opt-in rollback to one query pair per turn from `api` (or deterministic local queries). See [Memory Whisperer](retrieval.md#memory-whisperer) |
@@ -282,6 +289,17 @@ contract; these tables explain their effects.
 | `memoryWhisperer.cooldownTurns` | `10` | 0–1,000; recently injected evidence |
 | `memoryWhisperer.timeoutMs` | `5000` | 1–10,000 total whisper deadline, not just the provider timeout. v2 planning (gate + extraction) uses at most half of it |
 | `memoryWhisperer.complementaryHints` | `false` | Optional extra redundancy judgment; does not expand retrieval or enable the feature |
+| `memoryWhisperer.derivedObservations` | `true` | Within an enabled Memory Whisperer, also whisper fresh, citation-verified `deep_thought` syntheses (`verified_synthesis` entries, listed first in the same `<memory>` block) whose question matches the turn. Matching is local (no model call), limited to the turn's `deep_thought` audience and approved corpora, and a synthesis is retired as soon as any QMD collection it searched changes. A multiplexed (non group/channel) session without a verified sender has no audience, so `deep_thought` neither reads nor writes its cache there |
+| `memoryWhisperer.derivedMaxHints` | `2` | `>= 0` verified syntheses whispered per turn (`0` = unlimited) |
+| `memoryWhisperer.derivedMinTokenOverlap` | `0.45` | `0..1` minimum share of a stored question's meaningful tokens the turn must cover |
+| `memoryWhisperer.derivedMinSharedTokens` | `2` | `>= 1` minimum shared meaningful tokens for a non-exact question match |
+| `memoryWhisperer.recipeHash` | `"default"` | Non-empty label (trimmed) stamped on Memory Whisperer and `memory_search` recall-ledger exposures for A/B experiments; reported per arm by `memory-steward outcomes` |
+| `expectationsWhisperer.enabled` | `true` | Appends an `<expectations>` block of open commitments, predictions, blockers, decision outcomes and todos that match the turn (channel, person, keywords, or a due/overdue date). Read-only on the agent's memory database; no model call. Workspace items (Captain's Log blockers, active people todos) are visible on every eligible turn; a channel or group item only inside that exact conversation (`provider` + account + native channel id), and a direct-message item only to that exact provider + account + sender. People-derived items surface only for an `active`, injection-enabled person. Surfaces beyond user turns follow `whispererTriggers` |
+| `expectationsWhisperer.maxHints` | `5` | `>= 0` expectations per turn (`0` = unlimited); overdue first, then active blockers, due soon, person and channel matches |
+| `expectationsWhisperer.cooldownTurns` | `10` | `>= 0` turns an expectation stays suppressed in a session after it is shown (`0` = no cooldown); one that becomes overdue resurfaces early |
+| `expectationsWhisperer.dueLeadMs` | `86400000` | `>= 0` ms before its due time an expectation counts as `due_soon` (`0` = only overdue). Per-row `dueLeadMs` written by the Steward takes precedence |
+| `expectationsWhisperer.maxPayloadChars` | `0` | `>= 0` characters for the whole block; entries are skipped, never sliced (`0` = unlimited) |
+| `expectationsWhisperer.includeWorkspaceBlockers` | `true` | Surface every open workspace-audience blocker on each eligible turn, not only on turns whose channel matches it. Never widens a channel or group blocker beyond its own conversation |
 | `safetyWhisperer.enabled` | `false` | Requires at least one scenario, decision-model credentials and host hooks; see [Safety Whisperer](#safety-whisperer) |
 | `safetyWhisperer.historyMessages` | `6` | 0–20 earlier visible messages, whole messages only, for resolving follow-ups |
 | `safetyWhisperer.timeoutMs` | `3000` | 1–10,000 total deadline (credential and request); the host hook timeout must exceed the slowest enabled whisperer |
@@ -908,7 +926,7 @@ baseline. Soft-deleting a person in PeopleSQL does not remove Inside Out data.
 ## Steward
 
 The Steward is an embedded sub-agent with independent features (`deep_thought`,
-People Learning, Captain's Log and the Outcome Ledger), all **enabled by default**.
+People Learning, Captain's Log, the Outcome Ledger and Expectations), all **enabled by default**.
 Fleet configs without a `steward` section load cleanly and automatically get every
 feature; set `steward.enabled: false` (or disable any sub-feature individually) to opt out.
 
@@ -935,20 +953,25 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   channel). A complete answer with at least one verified citation, none dropped,
   and no `lookup_person` call (People dossiers can change without a collection
   generation change) is stored as a derived observation keyed by question,
-  corpora and caller audience (agent + session key + channel + account + native
-  channel, so a private session's answer is never served elsewhere) and stamped
+  corpora and caller audience (agent + session key + provider + account, plus the
+  requesting sender in any session that is not a shared group/channel conversation,
+  so a DM answer is never served to another person even when `dmScope=main` shares
+  one session key) and stamped
   with the QMD generation of every searched collection. A repeat question returns it
   instantly with `cached: true` until any of those collections changes; pass
   `fresh: true` to re-investigate. Reading those generations (which may wait on a
   cold index) counts against `syncWaitMs`, so a slow index still hands off a `jobId`
-  on time.
+  on time. The same audience key is computed from the `before_prompt_build` hook
+  context, so with `memoryWhisperer.derivedObservations` the Memory Whisperer can
+  surface the synthesis on a later matching turn in that conversation. (v0.20.0
+  changed the key: answers cached by earlier versions are simply re-investigated.)
 - **People shadow**: a background, proposal-only reviewer of People Learning
   manifests. Verified proposals are stored only in `work_items`; dossiers, learning
   runs and cron jobs are never touched. Compare with the cron using
   `openclaw memory-steward shadow-report --agent main`; `memory-steward status`
   lists backlog and quarantined items, and `memory-steward requeue --scope <scope>`
-  re-drives one item (`--kind people_interactions`, `captains_log` or
-  `outcome_ledger` for other work kinds). Leases are renewed during model calls; a
+  re-drives one item (`--kind people_interactions`, `captains_log`,
+  `outcome_ledger` or `expectations` for other work kinds). Leases are renewed during model calls; a
   Gateway stop releases them without strikes. On nightly manifests, interaction
   learning (`people_interactions`) also proposes net-new dossier claims; it is on by
   default in `publish` mode and off in `shadow` mode unless
@@ -970,11 +993,41 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   over delivered hits. Response Audit evidence is attached only when Response Audit
   is enabled, and only from its configured cohort. The first sweep covers
   `lookbackMs`; later sweeps resume from the watermark and re-score at most the
-  previous two days (bounded by `lookbackMs`) to pick up late audit results and
-  Inside Out grades.
+  previous two days (bounded by `lookbackMs`; tune with `lateEvidenceRescanMs`) to
+  pick up late audit results and Inside Out grades. Every memory hit and skill route
+  carries the `recipeHash` its whisperer was configured with (`"default"` unless set).
   `openclaw memory-steward outcomes --agent main [--since-hours <n>] [--recipe <hash>]`
   prints `whisperUsedRate`, `skillOpenRate`, `shortfallsPer100Turns` and per-recipe
   breakdowns.
+- **Expectations** (the 6th primitive, memory of the future): an hourly pass that
+  keeps one `expectations` row per open commitment, prediction, blocker,
+  decision-outcome hypothesis or todo. It always mirrors open Captain's Log
+  `[BLOCKED]` entries (recurring captures of one normalized topic collapse into one
+  row that tracks every linked entry, and auto-expire after
+  `blockerAutoExpireMinutes` without a fresh capture) and open, user-facing people
+  todos (administrative todos such as `soft_delete_review` / `needs_enrichment`, and
+  todos about a soft-deleted or injection-disabled person, are skipped), and resolves
+  them as `kept` when their source resolves. This step needs no model and runs even
+  without a Steward credential. With a credential it also extracts explicit
+  commitments, predictions, blockers and decision outcomes from new sessions
+  (excluding `excludeChatTypes`). Every conversation is its own audience — a channel
+  or group as `channel|group:<provider>:<account>:<nativeChannelId>`, an opted-in DM
+  as `direct:<provider>:<account>:<sender>` — and a session missing any of those
+  parts is skipped, never pooled into `workspace`. Message timestamps go to the model
+  so relative deadlines anchor to when they were said. A pass capped by
+  `maxSessionsPerRun` resumes the unread sessions next time. It then sweeps open
+  items that are overdue, due soon or older than `sweepAfterMinutes` against
+  evidence from their own audience (workspace items: channel conversations only)
+  recorded since the item opened or was last swept, recording
+  `kept`/`broken`/`right`/`wrong`/`expired` with a surprise score (a clock-only
+  `expired` requires a due date that has passed). A swept Captain's Log blocker
+  resolved `kept` or `expired` also closes its ledger entries. Open pre-0.20
+  Steward rows whose audience cannot be proven (group/channel sessions pooled into
+  `workspace`, DMs keyed without a provider) are retired as `dismissed`. `openclaw memory-steward expectations --agent main [--status <status>] [--limit <n>]`
+  prints `{ agentId, summary, expectations }` read-only (an absent database is never
+  created or migrated); add `--run` to run one pass for that agent now and print its
+  result. A pass that is not due reports `not_due`; `memory-steward requeue --kind
+  expectations --scope <agent>` makes it due immediately.
 
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
@@ -1028,10 +1081,26 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.outcomeLedger.maxRowsPerPass` | `0` | `>= 0` exposures scored per pass; a capped pass resumes from its cursor (`0` = unlimited) |
 | `steward.outcomeLedger.matchWindowMs` | `1800000` | `>= 1` ms after an exposure during which use and outcome evidence may arrive |
 | `steward.outcomeLedger.retentionDays` | `0` | `>= 0` days `memory_outcomes` rows are kept (`0` = unlimited) |
+| `steward.outcomeLedger.lateEvidenceRescanMs` | Unset | `>= 0` ms re-scored behind the watermark each sweep for late Response Audit / Inside Out evidence (`0` = the full `lookbackMs`; unset = `min(lookbackMs, 2 days)`) |
+| `steward.expectations.enabled` | `true` | Starts the Expectations loop on Gateway start; deterministic ingestion needs no Steward credential |
+| `steward.expectations.intervalMinutes` | `60` | `>= 1` minutes between passes (a transient model failure retries after at most 15 minutes) |
+| `steward.expectations.lookbackMinutes` | `70` | `>= 1` minutes of session activity read per pass, extended back to the last capture after downtime (deduplicated via watermark) |
+| `steward.expectations.dueLeadMinutes` | `60` | `>= 0` minutes ahead of its due time an open expectation is swept (overdue ones always are) |
+| `steward.expectations.sweepAfterMinutes` | `1440` | `>= 0` minutes after which an open expectation is swept even without a due date |
+| `steward.expectations.maxSessionsPerRun` | `0` | `>= 0` eligible sessions read for extraction per pass (`0` = unlimited); unread sessions are picked up by the next pass |
+| `steward.expectations.maxCharsPerSession` | `0` | `>= 0` transcript characters per session (`0` = unlimited) |
+| `steward.expectations.maxSweepItems` | `0` | `>= 0` open expectations judged per pass (`0` = unlimited) |
+| `steward.expectations.timeoutMs` | `0` | `>= 0` ms per model call (`0` = unlimited) |
+| `steward.expectations.excludeChatTypes` | `["direct"]` | Chat types (`"channel"`, `"group"`, `"direct"`) excluded from session extraction |
+| `steward.expectations.extract` | `true` | Model-backed extraction from sessions; `false` keeps deterministic ingestion and sweeps only |
+| `steward.expectations.sweep` | `true` | Model-backed due/resolution sweep; `false` never resolves rows by model |
+| `steward.expectations.blockerAutoExpireMinutes` | `4320` | `>= 0` minutes a mirrored Captain's Log blocker stays open without a fresh capture of its topic before it auto-expires (closing its ledger entries); `0` = never auto-expire |
 
 **Enabling `deep_thought` approves sending the question plus the memory excerpts it
 opens to the Steward endpoint. Enabling the People shadow approves sending one
-dossier assertion and up to 16 approved, account-fenced excerpts per item.** Both
+dossier assertion and up to 16 approved, account-fenced excerpts per item. Enabling
+Expectations extraction or sweeps approves sending eligible session excerpts (one
+audience per request) and the open expectations of that audience.** Both
 features call `steward.endpoint` directly (`stream: false`, `store: false`) with
 OpenAI strict JSON schemas; the host LLM runtime is not used, because it denies
 plugin model overrides by default and would ignore the Steward endpoint and key.

@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 /**
- * Stays 1: skill event tables and nullable token columns are purely additive, so a rollback to v0.16.0
+ * Stays 1: skill event tables, token columns, and recipe stamps are purely additive, so a rollback to v0.16.0
  * (which rejects any other version) still opens the ledger. Opens self-heal missing additive objects.
  */
 export declare const RECALL_LEDGER_SCHEMA_VERSION = 1;
@@ -72,6 +72,7 @@ export type RecallQueryRecord = {
     parentQueryId?: number;
     inputTokens?: number;
     outputTokens?: number;
+    recipeHash?: string;
     hits: readonly RecallHitRecord[];
 };
 type RecallReadRecord = {
@@ -94,6 +95,7 @@ type SkillEventContext = {
 };
 export type SkillRoutingRecord = SkillEventContext & {
     eventKey: string;
+    recipeHash?: string;
     surface?: string;
     catalogRevision?: string;
     mode: "direct" | "search" | "fallback";

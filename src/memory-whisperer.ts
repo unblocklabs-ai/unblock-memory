@@ -16,6 +16,16 @@ import type { RecallHitDisposition, RecallHitRecord, RecallLedgerWriter, RecallQ
 import type { WhispererPrompt } from "./whisperer-prompt.js";
 import { WhispererAdmissionTracker } from "./whisperer-admission.js";
 import { planRecall, type RecallPlan } from "./memory-query-v2.js";
+import {
+  canonicalCorpora,
+  DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS,
+  DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP,
+  deepThoughtAudienceKey,
+  derivedObservationGenerationsFresh,
+  readDerivedObservationCandidates,
+  type DeepThoughtAudienceIdentity,
+  type DerivedObservationMatch,
+} from "./deep-thought-store.js";
 
 const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
 const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
@@ -23,8 +33,121 @@ const MAX_PAYLOAD_CHARS = DEFAULTS.memoryWhisperer.maxInjectedChars;
 const MAX_SESSIONS = DEFAULTS.memoryWhisperer.maxTrackedSessions;
 const MAX_SEEN_RUNS = DEFAULTS.memoryWhisperer.maxRunsPerSession;
 
-function encodeHints(items: { source: string; lines: string; body: string }[]): string {
+type MemoryHint = { source: string; lines: string; body: string };
+/** A verified `deep_thought` synthesis whispered verbatim; `source` is always `derived_observation:<id>`. */
+type DerivedHint = {
+  source: string; kind: "verified_synthesis"; question: string; answer: string; confidence: string; citations: string[];
+  verifiedAt: string;
+};
+
+function encodeHints(items: readonly (MemoryHint | DerivedHint)[]): string {
   return JSON.stringify(items).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
+}
+
+/** Optional: whisper fresh, generation-verified `deep_thought` syntheses (`derived_observations`) matching the turn. */
+type DerivedObservationWhisperOptions = {
+  /** The agent's memory database holding `derived_observations` (opened read-only; missing = nothing to whisper). */
+  dbPathForAgent: (agentId: string) => string;
+  /** Current QMD collection generations covering exactly `corpora` (same contract as `deep_thought`). */
+  getCollectionGenerations: (agentId: string, corpora: readonly string[]) => Promise<Record<string, number>> | Record<string, number>;
+  /**
+   * Must produce the exact key `deep_thought` saved under. Default: `deepThoughtAudienceKey` over the hook context
+   * (agent + session key + provider + account, plus sender outside group/channel sessions). A blank result disables
+   * the whisper for that turn.
+   */
+  audienceKey?: (ctx: DeepThoughtAudienceIdentity) => string | undefined;
+  /** Syntheses whispered per turn (default 2; `0` = unlimited). */
+  maxHints?: number;
+  /** Minimum share of a stored question's meaningful tokens the turn must cover (default 0.45). */
+  minTokenOverlap?: number;
+  /** Minimum shared meaningful tokens for a non-exact match (default 2). */
+  minSharedTokens?: number;
+  /** Payload budget for the derived entries (default `memoryWhisperer.maxInjectedChars`; `0` = unlimited). Entries are never sliced. */
+  maxPayloadChars?: number;
+  /** Turns a whispered synthesis stays suppressed in a session (default `memoryWhisperer.cooldownTurns`). */
+  cooldownTurns?: number;
+};
+
+export type MemoryWhispererOptions = {
+  derivedObservations?: DerivedObservationWhisperOptions;
+  /** Active retrieval recipe fingerprint; forwarded on recall-ledger query records and the completed log line. */
+  recipeHash?: string;
+};
+
+/**
+ * Hook-side twin of `deep_thought`'s tool-side mapping; both read the same host run parameters (see the field table on
+ * `DeepThoughtAudienceIdentity`). The hook never receives the tool's `nativeChannelId`, so it is not part of the key.
+ */
+function derivedAudienceContext(context: Record<string, unknown>, agentId: string, sessionKey?: string): DeepThoughtAudienceIdentity {
+  const text = (value: unknown) => typeof value === "string" && value.trim() ? value : undefined;
+  const provider = text(context.messageProvider) ?? text(context.channel);
+  const accountId = text(context.accountId);
+  const senderId = text(context.senderId);
+  return {
+    agentId,
+    ...(sessionKey ? { sessionKey } : {}),
+    ...(provider ? { provider } : {}),
+    ...(accountId ? { accountId } : {}),
+    ...(senderId ? { senderId } : {}),
+  };
+}
+
+function derivedHint(match: DerivedObservationMatch): DerivedHint {
+  const found = match.observation;
+  return {
+    source: `derived_observation:${found.id}`, kind: "verified_synthesis", question: found.question, answer: found.answer,
+    confidence: found.confidence, citations: [...new Set(found.citations.map(citation => citation.source).filter(Boolean))],
+    verifiedAt: new Date(found.createdAt).toISOString(),
+  };
+}
+
+const DEFAULT_DERIVED_MAX_HINTS = 2;
+
+/**
+ * Never throws. Matching is local + deterministic (zero model calls); generations are fetched once per distinct
+ * corpora set among candidates and each row is verified against the exact snapshot for its own corpora.
+ */
+async function lookupDerivedObservations(params: {
+  options: DerivedObservationWhisperOptions;
+  agentId: string;
+  queryText: string;
+  audienceKey: string;
+  allowedCorpora: readonly string[];
+  isCoolingDown: (id: string) => boolean;
+}): Promise<DerivedObservationMatch[]> {
+  const { options, agentId, queryText, audienceKey, allowedCorpora } = params;
+  const candidates = readDerivedObservationCandidates(options.dbPathForAgent(agentId), {
+    agentId, queryText, audienceKey, allowedCorpora,
+    minTokenOverlap: options.minTokenOverlap ?? DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP,
+    minSharedTokens: options.minSharedTokens ?? DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS,
+  }).filter(match => !params.isCoolingDown(match.observation.id));
+  if (!candidates.length) return [];
+  const sets = new Map<string, string[]>();
+  for (const match of candidates) {
+    const corpora = canonicalCorpora(match.observation.corpora);
+    sets.set(JSON.stringify(corpora), corpora);
+  }
+  const snapshots = new Map<string, Record<string, number> | undefined>(await Promise.all([...sets].map(async ([key, corpora]) => {
+    try { return [key, await options.getCollectionGenerations(agentId, corpora)] as const; }
+    catch { return [key, undefined] as const; }
+  })));
+  const verified = candidates.filter(match => derivedObservationGenerationsFresh(match.observation.collectionGenerations,
+    snapshots.get(JSON.stringify(canonicalCorpora(match.observation.corpora)))));
+  const maxHints = options.maxHints ?? DEFAULT_DERIVED_MAX_HINTS;
+  return maxHints > 0 ? verified.slice(0, maxHints) : verified;
+}
+
+/** Bound the derived entries without slicing any answer; `0` = unlimited. */
+function boundDerivedHints(matches: readonly DerivedObservationMatch[], maxChars: number): { emitted: DerivedObservationMatch[]; hints: DerivedHint[] } {
+  const emitted: DerivedObservationMatch[] = [];
+  const hints: DerivedHint[] = [];
+  for (const match of matches) {
+    const next = derivedHint(match);
+    if (maxChars > 0 && encodeHints([...hints, next]).length > maxChars) continue;
+    emitted.push(match);
+    hints.push(next);
+  }
+  return { emitted, hints };
 }
 
 function failureFields(error: unknown) {
@@ -183,10 +306,10 @@ async function selectComplementaryHints(params: {
   }
 }
 
-function renderBoundedHints(selected: readonly RankedHint[]): { emitted: RankedHint[]; rendered: string } {
+function renderBoundedHints(selected: readonly RankedHint[]): { emitted: RankedHint[]; rendered: string; hints: MemoryHint[] } {
   // Bound the complete injected payload without slicing individual excerpts into misleading prefixes.
   const emitted: RankedHint[] = [];
-  const hints: { source: string; lines: string; body: string }[] = [];
+  const hints: MemoryHint[] = [];
   let rendered = "";
   for (const candidate of selected) {
     const nextHint = {
@@ -200,7 +323,7 @@ function renderBoundedHints(selected: readonly RankedHint[]): { emitted: RankedH
     hints.push(nextHint);
     rendered = nextRendered;
   }
-  return { emitted, rendered };
+  return { emitted, rendered, hints };
 }
 
 type RecallLedgerSink = {
@@ -298,8 +421,10 @@ export function registerMemoryWhisperer(
   decisionModel: UnblockMemoryConfig["decisionModel"],
   diagnostics?: WhispererDiagnostics,
   recallLedger?: RecallLedgerSink,
+  options: MemoryWhispererOptions = {},
 ): WhispererPrompt | undefined {
   if (!config.enabled || !decisionModel.enabled) return;
+  const { derivedObservations, recipeHash } = options;
   const mode = config.mode ?? DEFAULTS.memoryWhisperer.mode;
   const legacy = mode === "legacy";
   const sessions = new WhispererAdmissionTracker<SessionData, WhisperResult>({
@@ -345,7 +470,7 @@ export function registerMemoryWhisperer(
     });
     const { recent } = state.state;
     for (const [id, recordedTurn] of recent) {
-      if (state.turn - recordedTurn > config.cooldownTurns) recent.delete(id);
+      if (!id.startsWith("derived:") && state.turn - recordedTurn > config.cooldownTurns) recent.delete(id);
     }
     const { signal } = state;
     const clearDeadline = sessions.deadline(state, config.timeoutMs, "Memory deadline");
@@ -380,6 +505,7 @@ export function registerMemoryWhisperer(
           ...origin,
           lexQuery: generatedQueries?.map(pair => pair.lex).join("\n"),
           vecQuery: generatedQueries?.map(pair => pair.vec).join("\n"),
+          ...(recipeHash ? { recipeHash } : {}),
           queryFallback: turn.queryFallback,
           corpora: searchedCorpora,
           rankingMode,
@@ -391,6 +517,31 @@ export function registerMemoryWhisperer(
         },
       });
     };
+    // Fresh verified deep_thought syntheses: started up front, in parallel, off the retrieval critical path.
+    const derivedCooldownTurns = derivedObservations?.cooldownTurns ?? config.cooldownTurns;
+    for (const [id, recordedTurn] of recent) {
+      if (id.startsWith("derived:") && state.turn - recordedTurn > derivedCooldownTurns) recent.delete(id);
+    }
+    let derivedSettled = false;
+    let derivedMatches: DerivedObservationMatch[] = [];
+    const derivedReady: Promise<void> = derivedObservations ? (async () => {
+      try {
+        await Promise.resolve(); // Let normal retrieval start first; the local read is synchronous.
+        const audience = derivedAudienceContext(context as Record<string, unknown>, agentId, sessionKey);
+        const audienceKey = nonBlank((derivedObservations.audienceKey ?? deepThoughtAudienceKey)(audience));
+        if (!audienceKey) return;
+        const queryText = visibleQueryConversation(event.prompt, event.messages, currentUserMessage).currentRequest;
+        derivedMatches = await lookupDerivedObservations({
+          options: derivedObservations, agentId, queryText, audienceKey, allowedCorpora: corpora,
+          isCoolingDown: id => recent.has(`derived:${id}`),
+        });
+      } catch (error) {
+        if (!signal.aborted) log("warn", "derived_unavailable", failureFields(error));
+      } finally {
+        derivedSettled = true;
+      }
+    })() : Promise.resolve();
+    let memoryHints: MemoryHint[] = [];
     const run = async () => {
       const visible = visibleQueryConversation(event.prompt, event.messages, currentUserMessage);
       const judgeConversation = selectJudgeConversation(visible);
@@ -510,7 +661,7 @@ export function registerMemoryWhisperer(
       });
       if (signal.aborted || !sessions.isCurrent(state)) return;
       turn.stage = "render";
-      const { emitted, rendered } = renderBoundedHints(selected);
+      const { emitted, rendered, hints } = renderBoundedHints(selected);
       const selectedIds = new Set(selected.map(candidate => candidate.id));
       const emittedRanks = new Map(emitted.map((candidate, index) => [candidate.id, index + 1]));
       if (!emitted.length) {
@@ -520,6 +671,7 @@ export function registerMemoryWhisperer(
         return;
       }
       for (const candidate of emitted) recent.set(candidate.id, state.turn);
+      memoryHints = hints;
       diagnostics?.record(agentId, "memory", "emitted");
       const appendContext = `<memory>\n${rendered}\n</memory>`;
       turn.measurement.outcome = "ok";
@@ -529,10 +681,42 @@ export function registerMemoryWhisperer(
       recordLedger("emitted", search.rankingMode, emittedRanks, selectedIds, redundantIds);
       return { appendContext };
     };
+    let derivedEmitted = 0;
+    let derivedWaitAborted = false;
+    /** Folds verified syntheses (first) into the same `<memory>` block; without any, the normal result is returned as-is. */
+    const withDerived = async (normal: WhisperResult | undefined): Promise<WhisperResult | undefined> => {
+      if (!derivedObservations || signal.aborted) return normal;
+      if (!derivedSettled) {
+        // Waits at most until the turn deadline; an abort here never discards the normal result.
+        await new Promise<void>(resolve => {
+          if (signal.aborted) return resolve();
+          const onAbort = () => resolve();
+          signal.addEventListener("abort", onAbort, { once: true });
+          void derivedReady.finally(() => { signal.removeEventListener("abort", onAbort); resolve(); });
+        });
+        if (signal.aborted) { derivedWaitAborted = true; return normal; }
+      }
+      if (!derivedMatches.length || !sessions.isCurrent(state)) return normal;
+      const maxChars = derivedObservations.maxPayloadChars ?? MAX_PAYLOAD_CHARS;
+      const { emitted, hints } = boundDerivedHints(derivedMatches, maxChars);
+      if (!emitted.length) return normal;
+      for (const match of emitted) recent.set(`derived:${match.observation.id}`, state.turn);
+      derivedEmitted = emitted.length;
+      if (!normal) {
+        diagnostics?.record(agentId, "memory", "emitted");
+        turn.reason = "derived_emitted";
+      }
+      const appendContext = `<memory>\n${encodeHints([...hints, ...memoryHints])}\n</memory>`;
+      turn.measurement.outcome = "ok";
+      turn.measurement.results = memoryHints.length + emitted.length;
+      turn.measurement.contextChars = appendContext.length;
+      return { appendContext };
+    };
     // Prompt rebuilds need the same context, not another retrieval or an empty hook result.
     state.result = (async () => {
       try {
-        return await abortable(run(), signal);
+        const normal = await abortable(run(), signal);
+        return await withDerived(normal);
       } catch (error) {
         if (signal.aborted) return;
         if (error instanceof QueryInputBudgetError) {
@@ -551,7 +735,7 @@ export function registerMemoryWhisperer(
       } finally {
         turn.measurement.elapsedMs = performance.now() - started;
         const timedOut = abortedByTimeout(signal);
-        if (signal.aborted) {
+        if (signal.aborted && !derivedWaitAborted) {
           turn.measurement.outcome = timedOut ? "timed_out" : "cancelled";
           turn.reason = timedOut ? "deadline" : "cancelled";
           if (sessions.isCurrent(state)) recordLedger(timedOut ? "timed_out" : "cancelled");
@@ -571,8 +755,10 @@ export function registerMemoryWhisperer(
           partial: turn.requestsSucceeded > 0 && turn.requestsFailed > 0,
           timeoutMs: config.timeoutMs,
           requestTimeoutMs: decisionModel.timeoutMs,
+          ...(derivedObservations ? { derivedEmitted } : {}),
+          ...(recipeHash ? { recipeHash } : {}),
         });
-        if (signal.aborted) diagnostics?.record(agentId, "memory", timedOut ? "timed_out" : "cancelled");
+        if (signal.aborted && !derivedWaitAborted) diagnostics?.record(agentId, "memory", timedOut ? "timed_out" : "cancelled");
         clearDeadline();
         // Stop sibling provider/worker work after an error or an empty early result too.
         state.controller.abort();

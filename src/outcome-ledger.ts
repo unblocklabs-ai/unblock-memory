@@ -8,8 +8,6 @@ import { WorkFenceLostError, type WorkStore } from "./work-store.js";
 
 export const OUTCOME_LEDGER_KIND = "outcome_ledger";
 const DAY_MS = 86_400_000;
-/** Steady-state sweeps re-score this much history behind the watermark to pick up late audit/Inside Out evidence. */
-const LATE_EVIDENCE_RESCAN_MS = 2 * DAY_MS;
 /** Wall-clock slice after which the scoring loop yields to the event loop. */
 const YIELD_SLICE_MS = 15;
 const SCHEMA = `
@@ -76,13 +74,15 @@ export type OutcomeLedgerPassOptions = {
   workStore: WorkStore;
   intervalMinutes?: number;
   lookbackMs?: number;
+  /** History to re-score behind the watermark. 0 uses the full lookback; omitted uses up to two days. */
+  lateEvidenceRescanMs?: number;
   maxRowsPerPass?: number;
   matchWindowMs?: number;
   retentionDays?: number;
   leaseMs?: number;
   heartbeatMs?: number;
   baselineMinInteractions?: number;
-  /** Fallback tag for sources without a recipe column. Use only on homogeneous telemetry. */
+  /** Work recipe and fallback for unstamped People receipts. Recall and skill exposures keep their own tags. */
   recipeHash?: string;
   /** When supplied, only consider episodes from the configured Response Audit cohort. */
   responseCohort?: string;
@@ -159,7 +159,7 @@ function decodeExposure(row: Row): Exposure {
   return {
     at: Number(row.at), kind: row.kind as OutcomeSubjectKind, evidence: String(row.evidence), subject: String(row.subject),
     sourceId: Number(row.source_id), session: stringOrNull(row.session), sessionKey: stringOrNull(row.session_key),
-    run: stringOrNull(row.run), recipe: stringOrNull(row.recipe), delivered: row.delivered === 1,
+    run: stringOrNull(row.run), recipe: typeof row.recipe === "string" ? row.recipe : null, delivered: row.delivered === 1,
     provider: stringOrNull(row.provider), account: stringOrNull(row.account), sender: stringOrNull(row.sender),
   };
 }
@@ -311,13 +311,15 @@ export async function runOutcomeLedgerPass(options: OutcomeLedgerPassOptions): P
   const { agentId, owner, workStore, signal, now = Date.now } = options;
   const intervalMs = (options.intervalMinutes ?? 60) * 60_000;
   const lookbackMs = options.lookbackMs ?? 7 * DAY_MS;
+  const rescanMs = options.lateEvidenceRescanMs ?? Math.min(lookbackMs, 2 * DAY_MS);
   const maxRows = options.maxRowsPerPass ?? 0;
   const windowMs = options.matchWindowMs ?? 30 * 60_000;
   const retentionMs = (options.retentionDays ?? 0) * DAY_MS;
   const leaseMs = options.leaseMs ?? DEFAULTS.steward.leaseMs;
   const heartbeatMs = options.heartbeatMs ?? Math.max(1, Math.floor(leaseMs / 3));
   for (const [field, value, minimum] of [
-    ["intervalMinutes", intervalMs, 1], ["lookbackMs", lookbackMs, 1], ["maxRowsPerPass", maxRows, 0],
+    ["intervalMinutes", intervalMs, 1], ["lookbackMs", lookbackMs, 1], ["lateEvidenceRescanMs", rescanMs, 0],
+    ["maxRowsPerPass", maxRows, 0],
     ["matchWindowMs", windowMs, 1], ["retentionDays", retentionMs, 0], ["leaseMs", leaseMs, 1],
     ["heartbeatMs", heartbeatMs, 1], ["baselineMinInteractions", options.baselineMinInteractions ?? 1, 1],
   ] as const) {
@@ -341,7 +343,7 @@ export async function runOutcomeLedgerPass(options: OutcomeLedgerPassOptions): P
     // Inside Out grades can be backfilled asynchronously.
     const through = startedAt - windowMs;
     const sweep = watermark.sweep ?? { through, from: watermark.lastMeasuredAtMs
-      ? Math.min(through, watermark.lastMeasuredAtMs - Math.min(lookbackMs, LATE_EVIDENCE_RESCAN_MS))
+      ? Math.min(through, watermark.lastMeasuredAtMs - (rescanMs || lookbackMs))
       : through - lookbackMs };
     let heartbeatAt = performance.now();
     let yieldAt = heartbeatAt;
@@ -364,7 +366,7 @@ export async function runOutcomeLedgerPass(options: OutcomeLedgerPassOptions): P
       }
       const exposure = last = decodeExposure(row);
       const evidence = evaluate(exposure, startedAt);
-      const recipe = exposure.recipe ?? recipeHash;
+      const recipe = exposure.kind === "person_whisper" ? exposure.recipe || recipeHash : exposure.recipe ?? "default";
       const id = digest([agentId, exposure.kind, exposure.subject, exposure.evidence, recipe]);
       // Drop rows earlier versions scored for candidates that were never shown to the model.
       if (evidence) outcomes.push({ ...evidence, id, recipe, exposure }); else unexposed.push(id);

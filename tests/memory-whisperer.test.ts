@@ -4,7 +4,11 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "../src/config.js";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "../src/contracts.js";
-import { registerMemoryWhisperer } from "../src/memory-whisperer.js";
+import { registerMemoryWhisperer, type MemoryWhispererOptions } from "../src/memory-whisperer.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { deepThoughtAudienceKey, DeepThoughtStore, type SaveDerivedObservationInput } from "../src/deep-thought-store.js";
 import { expandSessionSearchHit } from "../src/manager.js";
 import type { QueryPair } from "../src/query-contract.js";
 import { WhispererDiagnostics } from "../src/diagnostics.js";
@@ -533,6 +537,7 @@ function harness(
   options: { config?: Partial<ReturnType<typeof resolveConfig>["memoryWhisperer"]>; decisionModel?: ReturnType<typeof resolveConfig>["decisionModel"];
     search?: () => Promise<CorpusMemorySearchResult[]>;
     recallLedger?: Parameters<typeof registerMemoryWhisperer>[5];
+    whisperer?: MemoryWhispererOptions;
     hybrid?: (queries: QueryPair, opts: Pick<CorpusSearchOptions, "corpora" | "signal" | "maxSnippetChars">) => Promise<CorpusMemorySearchResult[]> } = {},
 ) {
   const hooks = new Map<string, (...args: never[]) => unknown>();
@@ -553,7 +558,8 @@ function harness(
         return options.search ? options.search() : hits;
       }) } };
     },
-  }, { ...config, ...options.config }, options.decisionModel ?? decisionModel, diagnostics, options.recallLedger);
+  }, { ...config, ...options.config }, options.decisionModel ?? decisionModel, diagnostics, options.recallLedger,
+  ...(options.whisperer ? [options.whisperer] : []));
   return { hooks, warnings, logs, searches, diagnostics, lookups: () => lookups,
     before: before as Before,
     end: hooks.get("session_end") as unknown as End,
@@ -586,7 +592,8 @@ test("selected memory keeps delimiter-like source text inside the combined promp
 test("memory whisperer requires explicit, known non-skill corpora and bounded controls", () => {
   assert.deepEqual(resolveConfig(undefined).memoryWhisperer, {
     enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5, maxHints: 3, cooldownTurns: 10, timeoutMs: 5000,
-    mode: "v2", api: { endpoint: "" },
+    mode: "v2", api: { endpoint: "" }, recipeHash: "default", derivedObservations: true,
+    derivedMaxHints: 2, derivedMinTokenOverlap: 0.45, derivedMinSharedTokens: 2,
   });
   assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.5);
   assert.equal(resolveConfig({ memoryWhisperer: { minUsefulness: 0.9, maxHints: 3 } }).memoryWhisperer.minUsefulness, 0.9);
@@ -1194,4 +1201,184 @@ test("v2: superseding a run during the gate cancels it without emitting or recor
   assert.equal(h.searches.length, 0);
   assert.deepEqual(records.map(entry => entry.record.outcome), ["skipped"]);
   assert.equal(h.diagnostics.snapshot("bill").memory.cancelled, 1);
+});
+
+
+/* ───────────── Derived observations: whispering fresh verified deep_thought syntheses ───────────── */
+
+const LAUNCH_OBS: SaveDerivedObservationInput = {
+  agentId: "bill", question: "When did the launch move?", audienceKey: deepThoughtAudienceKey({ agentId: "bill", sessionKey: "key", senderId: "U-me" })!,
+  corpora: ["memory"], collectionGenerations: { "memory-main": 3 }, answer: "The launch moved to Friday because QA slipped.",
+  confidence: "high", openQuestions: [], nowMs: Date.parse("2026-11-20T12:00:00Z"),
+  citations: [{ source: "qmd://memory/launch.md", quote: "moved to Friday" }, { source: "qmd://memory/launch.md", quote: "QA" },
+    { source: "qmd://sessions/s1.jsonl", quote: "qa slipped" }],
+};
+
+function derivedFixture(t: { after(fn: () => void): void }) {
+  const dir = mkdtempSync(join(tmpdir(), "whisper-derived-"));
+  const path = join(dir, "unblock-memory.sqlite");
+  const store = new DeepThoughtStore(path);
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
+  const generations: Record<string, number> = { "memory-main": 3, "sessions-main": 7 };
+  const calls: { agentId: string; corpora: readonly string[] }[] = [];
+  const derivedObservations: NonNullable<MemoryWhispererOptions["derivedObservations"]> = {
+    dbPathForAgent: agentId => { assert.equal(agentId, "bill"); return path; },
+    getCollectionGenerations: async (agentId, corpora) => {
+      calls.push({ agentId, corpora });
+      return Object.fromEntries(Object.entries(generations).filter(([name]) => corpora.some(corpus => name.startsWith(`${corpus}-`))));
+    },
+  };
+  return { path, store, generations, calls, derivedObservations };
+}
+
+function derivedEntries(result: { appendContext: string } | void) {
+  assert.ok(result, "a whisper is emitted");
+  const payload = result.appendContext.match(/^<memory>\n([^]*)\n<\/memory>$/u)?.[1];
+  assert.ok(payload);
+  return JSON.parse(payload) as Record<string, unknown>[];
+}
+
+// A non-group/channel session needs a verified sender for any deep_thought audience (fail closed otherwise).
+const turnCtx = (n: number, extra: Context & { senderId?: string } = {}) =>
+  ({ ...context, senderId: "U-me", runId: `derived-run-${n}`, ...extra });
+
+test("derived: a matching verified synthesis is whispered with zero QMD hits, cools down per session, and stops on a generation bump", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => response(0.95));
+  const fx = derivedFixture(t);
+  const saved = fx.store.saveDerivedObservation(LAUNCH_OBS);
+  const h = harness([], { whisperer: { derivedObservations: fx.derivedObservations, recipeHash: "recipe-1" } });
+  t.after(() => h.stop());
+  const ask = (n: number, extra: Context = {}) => h.before({ prompt: "Remind me, why did the launch move to Friday?", messages: [] }, turnCtx(n, extra));
+
+  const first = await ask(1);
+  assert.deepEqual(derivedEntries(first), [{
+    source: `derived_observation:${saved.id}`, kind: "verified_synthesis", question: "When did the launch move?",
+    answer: "The launch moved to Friday because QA slipped.", confidence: "high",
+    citations: ["qmd://memory/launch.md", "qmd://sessions/s1.jsonl"], verifiedAt: "2026-11-20T12:00:00.000Z",
+  }]);
+  assert.deepEqual(fx.calls.at(-1), { agentId: "bill", corpora: ["memory"] }, "generations are fetched for the row's own corpora");
+  assert.equal(fetch.mock.callCount(), 0, "zero model calls: matching is local and QMD returned nothing to judge");
+  const summary = JSON.parse(h.logs.at(-1)!.slice(logPrefix.length));
+  assert.equal(summary.reason, "derived_emitted");
+  assert.equal(summary.derivedEmitted, 1);
+  assert.equal(summary.recipeHash, "recipe-1");
+  assert.equal(summary.outcome, "ok");
+  assert.equal(h.diagnostics.snapshot("bill").memory.emitted, 1);
+  assert.equal(fx.store.getDerivedObservation(saved.id)!.hitCount, 0, "a whisper is not a served deep_thought hit");
+
+  // Cooldown (config.cooldownTurns = 2): suppressed on the next two turns, back on the third.
+  assert.equal(await ask(2), undefined);
+  assert.equal(await ask(3), undefined);
+  assert.equal(derivedEntries(await ask(4)).length, 1);
+
+  // The instant a searched collection advances, the synthesis is never whispered again (new session = no cooldown).
+  fx.generations["memory-main"] = 4;
+  assert.equal(await ask(5, { sessionId: "fresh-session" }), undefined);
+  assert.equal(fx.store.getDerivedObservation(saved.id)!.status, "fresh", "the whisperer reads read-only; deep_thought stales it later");
+});
+
+test("derived: syntheses ride alongside normal QMD hints in one <memory> block; a missing or throwing store never breaks retrieval", async t => {
+  t.mock.method(globalThis, "fetch", async () => response(0.95));
+  const fx = derivedFixture(t);
+  const saved = fx.store.saveDerivedObservation(LAUNCH_OBS);
+  const prompt = { prompt: "When did the launch move?", messages: [] };
+
+  const both = harness([hit("Launch notes: QA sign-off pending")], { whisperer: { derivedObservations: fx.derivedObservations } });
+  t.after(() => both.stop());
+  const entries = derivedEntries(await both.before(prompt, turnCtx(1)));
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0]!.source, `derived_observation:${saved.id}`, "verified synthesis first");
+  assert.deepEqual(entries[1], { source: "qmd://memory/Launch notes: QA sign-off pending.md", lines: "1-3", body: "Launch notes: QA sign-off pending" });
+  assert.equal(JSON.parse(both.logs.at(-1)!.slice(logPrefix.length)).reason, "emitted");
+
+  const baseline = harness([hit("Launch notes: QA sign-off pending")]);
+  t.after(() => baseline.stop());
+  const expected = await baseline.before(prompt, turnCtx(1));
+  assert.ok(expected);
+
+  const broken: NonNullable<MemoryWhispererOptions["derivedObservations"]>[] = [
+    { ...fx.derivedObservations, dbPathForAgent: () => join(tmpdir(), "does-not-exist", "nope.sqlite") },
+    { ...fx.derivedObservations, dbPathForAgent: () => { throw new Error("no path"); } },
+    { ...fx.derivedObservations, getCollectionGenerations: () => { throw new Error("cold index"); } },
+    { ...fx.derivedObservations, getCollectionGenerations: async () => ({}) },
+    { ...fx.derivedObservations, audienceKey: () => { throw new Error("resolver"); } },
+  ];
+  for (const [index, derivedObservations] of broken.entries()) {
+    const h = harness([hit("Launch notes: QA sign-off pending")], { whisperer: { derivedObservations } });
+    t.after(() => h.stop());
+    assert.deepEqual(await h.before(prompt, turnCtx(1)), expected, `broken derived store #${index} leaves normal retrieval intact`);
+  }
+  // No QMD hits either: a broken store simply emits nothing.
+  const empty = harness([], { whisperer: { derivedObservations: broken[0]! } });
+  t.after(() => empty.stop());
+  assert.equal(await empty.before(prompt, turnCtx(1)), undefined);
+});
+
+test("derived: strict audience and corpora ACL; custom audienceKey resolver; maxHints, payload budget and thresholds are configurable", async t => {
+  t.mock.method(globalThis, "fetch", async () => response(0.95));
+  const fx = derivedFixture(t);
+  const mine = fx.store.saveDerivedObservation(LAUNCH_OBS);
+  fx.store.saveDerivedObservation({ ...LAUNCH_OBS, audienceKey: deepThoughtAudienceKey({ agentId: "bill", sessionKey: "other-dm", senderId: "U-me" })!,
+    answer: "Other DM's private answer" });
+  fx.store.saveDerivedObservation({ ...LAUNCH_OBS, corpora: ["memory", "people"], answer: "Searched a corpus this turn cannot see",
+    collectionGenerations: { "memory-main": 3, "people-main": 1 } });
+  fx.generations["people-main"] = 1;
+  const prompt = { prompt: "When did the launch move?", messages: [] };
+
+  const h = harness([], { whisperer: { derivedObservations: fx.derivedObservations } });
+  t.after(() => h.stop());
+  assert.deepEqual(derivedEntries(await h.before(prompt, turnCtx(1))).map(entry => entry.source), [`derived_observation:${mine.id}`]);
+  // Another session key (another DM) gets nothing from this audience.
+  assert.equal(await h.before(prompt, turnCtx(1, { sessionId: "s-dm2", sessionKey: "third-dm" })), undefined);
+  // The default key follows deep_thought's shape over the hook's provider/account/sender fields (host-shaped context:
+  // the hook's chatId is the lowercased session-key id and never part of the key).
+  const channelled = { ...context, sessionId: "s-ch", runId: "r-ch", messageProvider: "slack", accountId: "acct-a", chatId: "c9",
+    senderId: "U-alice" } as Context;
+  fx.store.saveDerivedObservation({ ...LAUNCH_OBS, answer: "channel answer", audienceKey: deepThoughtAudienceKey({ agentId: "bill",
+    sessionKey: "key", provider: "slack", accountId: "acct-a", senderId: "U-alice" })! });
+  assert.deepEqual(derivedEntries(await h.before(prompt, channelled)).map(entry => entry.answer), ["channel answer"]);
+  // A non-group/channel session (e.g. dmScope=main) never serves one DM peer's answer to another.
+  assert.equal(await h.before(prompt, { ...channelled, sessionId: "s-bob", runId: "r-bob", senderId: "U-bob" } as Context), undefined);
+
+  // A custom resolver can share answers deliberately (e.g. a team audience); a blank key disables the whisper.
+  fx.store.saveDerivedObservation({ ...LAUNCH_OBS, audienceKey: "team:acct-a", answer: "team answer", nowMs: 1 });
+  fx.store.saveDerivedObservation({ ...LAUNCH_OBS, question: "Why did the launch move?", audienceKey: "team:acct-a",
+    answer: "team why", nowMs: 2 });
+  const team = harness([], { whisperer: { derivedObservations: { ...fx.derivedObservations, audienceKey: ctx => {
+    assert.equal(ctx.agentId, "bill");
+    return "team:acct-a";
+  } } } });
+  t.after(() => team.stop());
+  assert.deepEqual(derivedEntries(await team.before(prompt, turnCtx(1))).map(entry => entry.answer), ["team answer", "team why"]);
+  const capped = harness([], { whisperer: { derivedObservations: { ...fx.derivedObservations, audienceKey: () => "team:acct-a", maxHints: 1 } } });
+  t.after(() => capped.stop());
+  assert.deepEqual(derivedEntries(await capped.before(prompt, turnCtx(1))).map(entry => entry.answer), ["team answer"]);
+  const budget = harness([], { whisperer: { derivedObservations: { ...fx.derivedObservations, audienceKey: () => "team:acct-a",
+    maxPayloadChars: 10 } } });
+  t.after(() => budget.stop());
+  assert.equal(await budget.before(prompt, turnCtx(1)), undefined, "entries are never sliced to fit");
+  const blank = harness([], { whisperer: { derivedObservations: { ...fx.derivedObservations, audienceKey: () => " " } } });
+  t.after(() => blank.stop());
+  assert.equal(await blank.before(prompt, turnCtx(1)), undefined);
+  const strict = harness([], { whisperer: { derivedObservations: { ...fx.derivedObservations, minTokenOverlap: 1 } } });
+  t.after(() => strict.stop());
+  assert.equal(derivedEntries(await strict.before(prompt, turnCtx(1))).length, 1, "exact matches still pass the strictest overlap");
+  assert.equal(await strict.before({ prompt: "Why did the launch move to Friday?", messages: [] }, turnCtx(2)), undefined);
+
+  // Generic one-word overlaps never fire.
+  assert.equal(await h.before({ prompt: "Launch the deploy please", messages: [] }, turnCtx(1, { sessionId: "s-generic" })), undefined);
+});
+
+test("derived: a multiplexed session (agent:main:main) without a verified sender never reads the derived cache", async t => {
+  t.mock.method(globalThis, "fetch", async () => response(0.95));
+  const fx = derivedFixture(t);
+  fx.store.saveDerivedObservation(LAUNCH_OBS);
+  let opened = 0;
+  const h = harness([], { whisperer: { derivedObservations: { ...fx.derivedObservations,
+    dbPathForAgent: agentId => { opened++; return fx.derivedObservations.dbPathForAgent(agentId); } } } });
+  t.after(() => h.stop());
+  const prompt = { prompt: "When did the launch move?", messages: [] };
+  assert.equal(await h.before(prompt, { ...context, sessionKey: "agent:main:main", runId: "mux-1" }), undefined);
+  assert.equal(await h.before(prompt, { ...context, sessionKey: "agent:main:main", runId: "mux-2", senderId: "  " } as Context), undefined);
+  assert.equal(opened, 0, "no audience → the derived store is never opened");
 });

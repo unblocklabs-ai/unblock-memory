@@ -269,7 +269,8 @@ function baseRequest(req: Prompt, config: StewardConfig) {
     ...(effort === "off" ? {} : { reasoning: { effort } }) };
 }
 function redactSecrets(text: string, token?: string) {
-  return (token ? text.replaceAll(token, "[redacted]") : text).replace(/\bBearer\s+[^\s"',;\]}]+|\b(?:sk-|xox[baprs]-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}/gi, "[redacted]");
+  return (token ? text.replaceAll(token, "[redacted]") : text)
+    .replace(/https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]+/giu, "[redacted]").replace(/\bBearer\s+[^\s"',;\]}]+|\b(?:sk-|xox[baprs]-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}/gi, "[redacted]");
 }
 function toolText(value: unknown, token: string, max: number) {
   const text = redactSecrets(typeof value === "string" ? value : JSON.stringify(value) ?? "null", token);

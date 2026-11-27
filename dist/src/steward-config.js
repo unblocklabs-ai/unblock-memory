@@ -59,6 +59,21 @@ const DEFAULT_STEWARD_CONFIG = {
         matchWindowMs: 1_800_000,
         retentionDays: 0,
     },
+    expectations: {
+        enabled: true,
+        intervalMinutes: 60,
+        lookbackMinutes: 70,
+        dueLeadMinutes: 60,
+        sweepAfterMinutes: 1440,
+        maxSessionsPerRun: 0,
+        maxCharsPerSession: 0,
+        maxSweepItems: 0,
+        timeoutMs: 0,
+        excludeChatTypes: ["direct"],
+        extract: true,
+        sweep: true,
+        blockerAutoExpireMinutes: 4320,
+    },
 };
 function section(value = {}, defaults, label, optional = []) {
     if (!isRecord(value))
@@ -129,7 +144,8 @@ export function resolveStewardConfig(value) {
     const d = section(c.deepThought, defaults.deepThought, "steward.deepThought", ["reasoning"]);
     const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow", ["includeInteractionLearning"]);
     const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
-    const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger");
+    const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger", ["lateEvidenceRescanMs"]);
+    const e = section(c.expectations, defaults.expectations, "steward.expectations");
     const reasoning = efforts.find(e => e === c.reasoning);
     if (!reasoning)
         throw new Error("Invalid steward.reasoning");
@@ -203,6 +219,23 @@ export function resolveStewardConfig(value) {
             maxRowsPerPass: integer(o.maxRowsPerPass, 0, "outcomeLedger.maxRowsPerPass"),
             matchWindowMs: integer(o.matchWindowMs, 1, "outcomeLedger.matchWindowMs"),
             retentionDays: integer(o.retentionDays, 0, "outcomeLedger.retentionDays"),
+            ...(o.lateEvidenceRescanMs === undefined ? {}
+                : { lateEvidenceRescanMs: integer(o.lateEvidenceRescanMs, 0, "outcomeLedger.lateEvidenceRescanMs") }),
+        },
+        expectations: {
+            enabled: enabled(e.enabled, "steward.expectations"),
+            intervalMinutes: integer(e.intervalMinutes, 1, "expectations.intervalMinutes"),
+            lookbackMinutes: integer(e.lookbackMinutes, 1, "expectations.lookbackMinutes"),
+            dueLeadMinutes: integer(e.dueLeadMinutes, 0, "expectations.dueLeadMinutes"),
+            sweepAfterMinutes: integer(e.sweepAfterMinutes, 0, "expectations.sweepAfterMinutes"),
+            maxSessionsPerRun: integer(e.maxSessionsPerRun, 0, "expectations.maxSessionsPerRun"),
+            maxCharsPerSession: integer(e.maxCharsPerSession, 0, "expectations.maxCharsPerSession"),
+            maxSweepItems: integer(e.maxSweepItems, 0, "expectations.maxSweepItems"),
+            timeoutMs: integer(e.timeoutMs, 0, "expectations.timeoutMs"),
+            excludeChatTypes: chatTypeList(e.excludeChatTypes, "expectations.excludeChatTypes"),
+            extract: boolean(e.extract, "steward.expectations.extract"),
+            sweep: boolean(e.sweep, "steward.expectations.sweep"),
+            blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
         },
     };
 }

@@ -90,6 +90,37 @@ type StewardOutcomeLedgerConfig = {
     matchWindowMs: number;
     /** Days `memory_outcomes` rows are kept (`0` = unlimited). */
     retentionDays: number;
+    /** History re-scored behind the watermark for late audit/Inside Out evidence, in ms (`0` = full `lookbackMs`; unset = up to 2 days). */
+    lateEvidenceRescanMs?: number;
+};
+/**
+ * The Expectations pass (6th primitive). Deterministic Captain's Log blocker + people todo ingestion always runs, with
+ * no model; session extraction and the due/resolution sweep additionally need the Steward runner.
+ */
+type StewardExpectationsConfig = {
+    enabled: boolean;
+    intervalMinutes: number;
+    lookbackMinutes: number;
+    /** Sweep open expectations due within this many minutes (overdue ones always qualify). */
+    dueLeadMinutes: number;
+    /** Sweep open expectations older than this, due date or not. */
+    sweepAfterMinutes: number;
+    /** Maximum eligible sessions read per run (`0` = unlimited). */
+    maxSessionsPerRun: number;
+    /** Character budget per session transcript excerpt (`0` = unlimited). */
+    maxCharsPerSession: number;
+    /** Open expectations judged per sweep (`0` = unlimited). */
+    maxSweepItems: number;
+    /** Per model call timeout in ms (`0` = unlimited). */
+    timeoutMs: number;
+    /** Chat types excluded from session extraction (default: `["direct"]`). Opted-in DMs stay in strict per-person audiences. */
+    excludeChatTypes: ChatType[];
+    /** Model-backed extraction of commitments/predictions/blockers/decision outcomes from sessions. */
+    extract: boolean;
+    /** Model-backed due/resolution sweep of open expectations. */
+    sweep: boolean;
+    /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
+    blockerAutoExpireMinutes: number;
 };
 export type StewardConfig = {
     enabled: boolean;
@@ -103,6 +134,7 @@ export type StewardConfig = {
     peopleShadow: StewardPeopleShadowConfig;
     captainsLog: StewardCaptainsLogConfig;
     outcomeLedger: StewardOutcomeLedgerConfig;
+    expectations: StewardExpectationsConfig;
 };
 export declare function resolveStewardConfig(value: unknown): StewardConfig;
 /** Bind the runner's resolveApiKey callback to its destination. Never inherit another origin's key. */

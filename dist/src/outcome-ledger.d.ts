@@ -18,13 +18,15 @@ export type OutcomeLedgerPassOptions = {
     workStore: WorkStore;
     intervalMinutes?: number;
     lookbackMs?: number;
+    /** History to re-score behind the watermark. 0 uses the full lookback; omitted uses up to two days. */
+    lateEvidenceRescanMs?: number;
     maxRowsPerPass?: number;
     matchWindowMs?: number;
     retentionDays?: number;
     leaseMs?: number;
     heartbeatMs?: number;
     baselineMinInteractions?: number;
-    /** Fallback tag for sources without a recipe column. Use only on homogeneous telemetry. */
+    /** Work recipe and fallback for unstamped People receipts. Recall and skill exposures keep their own tags. */
     recipeHash?: string;
     /** When supplied, only consider episodes from the configured Response Audit cohort. */
     responseCohort?: string;

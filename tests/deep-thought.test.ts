@@ -694,7 +694,9 @@ test("derived observations: repeat asks are served cached in 0 hops; generation 
     generationCalls.push([...corpora]);
     return Object.fromEntries(corpora.map(name => [name, generations[name]!]));
   };
-  const tool = (ctx = toolContext(), extra: Partial<DeepThoughtDeps> = {}) =>
+  // A DM session's cache audience needs the verified requester.
+  const asker = (overrides: Partial<OpenClawPluginToolContext> = {}) => toolContext({ requesterSenderId: "U1", ...overrides });
+  const tool = (ctx = asker(), extra: Partial<DeepThoughtDeps> = {}) =>
     createDeepThoughtTool(ctx, deps(runtime, runner, { store, getCollectionGenerations, ...extra }));
 
   const first = await execute(tool(), { question: "When did the launch move?" });
@@ -721,7 +723,7 @@ test("derived observations: repeat asks are served cached in 0 hops; generation 
   assert.deepEqual(generationCalls.at(-1), ["memory", "sessions"], "generations are requested for the approved corpora");
 
   // ACL: another session's audience and a different corpora set never see this answer.
-  const otherSession = await execute(tool(toolContext({ sessionKey: "agent:main:slack:direct:u2" })), { question: "When did the launch move?" });
+  const otherSession = await execute(tool(asker({ sessionKey: "agent:main:slack:direct:u2" })), { question: "When did the launch move?" });
   assert.equal(otherSession.cached, undefined);
   assert.equal(requests.length, 2);
   const narrowed = await execute(tool(), { question: "When did the launch move?", corpora: ["memory"] });
@@ -749,7 +751,7 @@ test("derived observations: repeat asks are served cached in 0 hops; generation 
   assert.equal(store.getDerivedObservation(forced.derivedObservationId!)!.status, "fresh");
 
   // bypassCache dep never serves (but still saves).
-  const bypassed = await execute(tool(toolContext(), { bypassCache: true }), { question: "When did the launch move?" });
+  const bypassed = await execute(tool(asker(), { bypassCache: true }), { question: "When did the launch move?" });
   assert.equal(bypassed.cached, undefined);
   assert.equal(requests.length, 7);
 
@@ -764,6 +766,16 @@ test("derived observations: repeat asks are served cached in 0 hops; generation 
   assert.ok(fresh.every(row => Object.keys(row.collectionGenerations).length > 0));
   assert.equal(new Set(fresh.map(row => `${row.questionHash}|${row.audienceKey}|${row.corpora.join(",")}`)).size, fresh.length,
     "one fresh row per exact key");
+
+  // No verified requester on a non-shared session (e.g. dmScope=main `agent:main:main`): the cache is skipped both ways.
+  const saved = store.listDerivedObservations({ agentId: "main", limit: 0 }).length;
+  for (const sessionKey of ["agent:main:main", "agent:main:slack:direct:u1"]) {
+    const anonymous = await execute(tool(toolContext({ sessionKey })), { question: "When did the launch move?" });
+    assert.equal(anonymous.status, "complete");
+    assert.equal(anonymous.cached, undefined, `${sessionKey}: never served another caller's answer`);
+    assert.equal(anonymous.derivedObservationId, undefined, `${sessionKey}: never saved under a pooled key`);
+  }
+  assert.equal(store.listDerivedObservations({ agentId: "main", limit: 0 }).length, saved);
 });
 
 test("derived observations are never saved or served without generations, and never for fabricated-citation answers", async t => {
@@ -884,7 +896,8 @@ test("a slow cold generations snapshot still hands off a jobId within syncWaitMs
   let release!: (value: Record<string, number>) => void;
   const cold = new Promise<Record<string, number>>(resolve => { release = resolve; });
   const config: DeepThoughtConfig = { ...CONFIG, timeoutMs: 0, syncWaitMs: 30, jobRetentionMs: 60_000 };
-  const tool = createDeepThoughtTool(toolContext(), deps(runtime, runner, { config, store, getCollectionGenerations: () => cold }));
+  const tool = createDeepThoughtTool(toolContext({ requesterSenderId: "U1" }),
+    deps(runtime, runner, { config, store, getCollectionGenerations: () => cold }));
   const startedAt = performance.now();
   const running = await execute(tool, { question: "Cold index?" });
   assert.ok(performance.now() - startedAt < 500, "the caller is not blocked by cold indexing");

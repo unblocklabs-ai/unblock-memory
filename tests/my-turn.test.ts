@@ -13,14 +13,14 @@ const credentials = { apiKey: "fake-secret", timeoutMs: 1500 };
 // Exercise the real plugin registration, config resolver, shared prompt composition, and HTTP client.
 // Only the host registration surface and external transport are replaced.
 function harness(myTurn: unknown = { enabled: true }, decisionModel: unknown = credentials, safetyWhisperer?: unknown,
-  whispererTriggers?: unknown) {
+  whispererTriggers?: unknown, expectationsWhisperer?: unknown) {
   const hooks = new Map<string, ((...args: never[]) => unknown)[]>();
   const warnings: string[] = [];
   const api = {
     config: { agents: { entries: { bill: { identity: { name: "Bill" } } } },
       messages: { queue: { mode: "followup" } },
       plugins: { entries: { "unblock-memory": { hooks: { allowConversationAccess: true } } } } },
-    pluginConfig: { myTurn, decisionModel, safetyWhisperer, whispererTriggers },
+    pluginConfig: { myTurn, decisionModel, safetyWhisperer, whispererTriggers, expectationsWhisperer },
     logger: { warn(message: string) { warnings.push(message); } },
     on(name: string, handler: (...args: never[]) => unknown) { hooks.set(name, [...hooks.get(name) ?? [], handler]); },
     registerCli() {}, registerService() {}, registerGatewayMethod() {}, registerMemoryCapability() {}, registerTool() {},
@@ -61,7 +61,8 @@ function transport(t: TestContext, respond: (body: RequestBody, init?: RequestIn
 
 test("My Turn defaults off and validates its public configuration", () => {
   assert.deepEqual(resolveConfig({}).myTurn, { enabled: false, historyMessages: 10, channels: {} });
-  assert.equal(harness({}).hooks.has("before_prompt_build"), false);
+  // Expectations Whisperer is default-on; with it off, a disabled My Turn registers no prompt hook.
+  assert.equal(harness({}, credentials, undefined, undefined, { enabled: false }).hooks.has("before_prompt_build"), false);
   assert.deepEqual(resolveConfig({ myTurn: { enabled: true, channels: { slack: {}, imessage: { enabled: false } } } }).myTurn,
     { enabled: true, historyMessages: 10, channels: { slack: { enabled: true }, imessage: { enabled: false } } });
   for (const myTurn of [false, [], { enabled: "yes" }, { historyMessages: 0 }, { historyMessages: 51 },

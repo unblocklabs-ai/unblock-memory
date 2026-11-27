@@ -501,3 +501,24 @@ test("appends ordered, queryable entries with sanitized channel context and reso
   assert.deepEqual(listCaptainsLogEntries(db, { agentId: "main", blockedOnly: true }),
     [{ ...quota, resolvedAtMs, resolutionNote: "Raised the quota." }, signIn]);
 });
+
+test("0.19 ledgers gain native_channels_json in place; native ids are recorded but never rendered or prompted", async t => {
+  const f = fixture(t);
+  f.store.db.exec(`CREATE TABLE IF NOT EXISTS memory_schema (component TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT;
+    INSERT OR IGNORE INTO memory_schema VALUES ('captains_log', 1);
+    CREATE TABLE captains_log_entries (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, day TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, section_hash TEXT NOT NULL,
+      ordinal INTEGER NOT NULL, topic TEXT NOT NULL, summary TEXT NOT NULL, blocked INTEGER NOT NULL CHECK(blocked IN (0, 1)),
+      resolved_at_ms INTEGER, resolution_note TEXT, channels_json TEXT NOT NULL CHECK(json_valid(channels_json)),
+      session_refs_json TEXT NOT NULL CHECK(json_valid(session_refs_json))) STRICT;
+    INSERT INTO captains_log_entries VALUES ('old', 'main', '2026-11-25', 1, 'h', 0, 'Old', 'Old entry', 0, NULL, NULL, '[]', '[]');`);
+  f.seed("public", "Approved the Friday release. Alerts: https://hooks.slack.com/services/T0AAA/B0BBB/hookSECRET42");
+  const result = await f.run();
+  assert.equal(result.status, "appended");
+  const entries = listCaptainsLogEntries(f.store.db, { agentId: "main" });
+  assert.deepEqual(entries.map(entry => [entry.id === "old" ? "old" : "new", entry.nativeChannels]),
+    [["new", ["native-public"]], ["old", []]], "the upgrade keeps old rows and records native ids on new ones");
+  assert.ok(result.status === "appended" && !result.markdown.includes("native-public"));
+  assert.ok(!JSON.stringify(f.prompts).includes("native-public"), "native ids never reach the model");
+  assert.ok(!JSON.stringify(f.prompts).includes("hookSECRET42"), "Slack incoming webhook URLs are redacted");
+});

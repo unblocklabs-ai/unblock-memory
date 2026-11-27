@@ -7,6 +7,7 @@ import { type SafetyWhispererConfig } from "./safety-config.js";
 import { type MyTurnConfig } from "./my-turn.js";
 import { type RecallLedgerConfig } from "./recall-ledger.js";
 import { type StewardConfig } from "./steward-config.js";
+import { type ExpectationsWhispererConfig } from "./expectations-whisperer.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -36,7 +37,7 @@ export type DecisionModelPluginConfig = {
     apiKeyFile?: string;
     timeoutMs: number;
 };
-export declare const WHISPERER_NAMES: readonly ["memory", "skill", "people", "myTurn", "safety"];
+export declare const WHISPERER_NAMES: readonly ["memory", "skill", "people", "myTurn", "expectations", "safety"];
 export type WhispererName = (typeof WHISPERER_NAMES)[number];
 export type WhispererTriggersConfig = {
     cron: readonly WhispererName[];
@@ -81,6 +82,8 @@ export type UnblockMemoryConfig = {
         minScore: number;
         /** Legacy fleet setting; active skills no longer cool down. */
         cooldownTurns: number;
+        /** Retrieval recipe label stamped on skill routing exposures (A/B experiments). Resolved default: `"default"`. */
+        recipeHash?: string;
     };
     memoryWhisperer: {
         enabled: boolean;
@@ -100,8 +103,20 @@ export type UnblockMemoryConfig = {
             endpoint: string;
             apiKeyFile?: string;
         };
+        /** Retrieval recipe label stamped on memory exposures (whisperer + `memory_search`). Resolved default: `"default"`. */
+        recipeHash?: string;
+        /** Whisper fresh, generation-verified `deep_thought` syntheses matching the turn. Resolved default: `true`. */
+        derivedObservations?: boolean;
+        /** Verified syntheses whispered per turn. Resolved default: `2`; `0` = unlimited. */
+        derivedMaxHints?: number;
+        /** Minimum share (0..1) of a stored question's meaningful tokens the turn must cover. Resolved default: `0.45`. */
+        derivedMinTokenOverlap?: number;
+        /** Minimum shared meaningful tokens for a non-exact question match. Resolved default: `2`. */
+        derivedMinSharedTokens?: number;
     };
     safetyWhisperer: SafetyWhispererConfig;
+    /** On by default: open commitments, blockers and todos from the `expectations` table (read-only, zero model cost). */
+    expectationsWhisperer: ExpectationsWhispererConfig;
     whispererTriggers: WhispererTriggersConfig;
     recallLedger: RecallLedgerConfig;
     /** Off unless configured: `deep_thought` curator and People shadow adjudication. */

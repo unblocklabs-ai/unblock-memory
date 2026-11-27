@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -240,6 +240,10 @@
     "steward.apiKeyFile": {
       "label": "Steward API Key File",
       "help": "Absolute path to a plaintext API key or dotenv file for the Steward endpoint. When unset, the decision credential is used only for the same origin."
+    },
+    "expectationsWhisperer.enabled": {
+      "label": "Expectations Whisperer",
+      "help": "Append open commitments, blockers and todos (from Captain's Log, people todos and Steward session extraction) that match the turn's channel, person, keywords or due window. Read-only local lookup, no model call. Enabled by default."
     }
   },
   "configSchema": {
@@ -864,6 +868,35 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 10000
+          },
+          "recipeHash": {
+            "type": "string",
+            "pattern": "\\S",
+            "description": "Retrieval recipe label stamped on memory exposures (Memory Whisperer and memory_search) for A/B experiments; surfaces in memory-steward outcomes byRecipe. Trimmed; defaults to \"default\"."
+          },
+          "derivedObservations": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whisper fresh, generation-verified deep_thought syntheses that match the turn in the same <memory> block. Local and deterministic (no model call); a synthesis stops being whispered as soon as a searched QMD collection changes."
+          },
+          "derivedMaxHints": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 2,
+            "description": "Verified deep_thought syntheses whispered per turn. 0 = unlimited."
+          },
+          "derivedMinTokenOverlap": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.45,
+            "description": "Minimum share of a stored question's meaningful tokens the turn must cover for a derived-observation whisper."
+          },
+          "derivedMinSharedTokens": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 2,
+            "description": "Minimum shared meaningful tokens for a non-exact derived-observation question match."
           }
         },
         "default": {
@@ -920,6 +953,7 @@
                 "skill",
                 "people",
                 "myTurn",
+                "expectations",
                 "safety"
               ]
             },
@@ -934,6 +968,7 @@
                 "skill",
                 "people",
                 "myTurn",
+                "expectations",
                 "safety"
               ]
             },
@@ -948,6 +983,7 @@
                 "skill",
                 "people",
                 "myTurn",
+                "expectations",
                 "safety"
               ]
             },
@@ -976,6 +1012,11 @@
             "type": "integer",
             "minimum": 0,
             "description": "Accepted for compatibility; active skills no longer cool down."
+          },
+          "recipeHash": {
+            "type": "string",
+            "pattern": "\\S",
+            "description": "Retrieval recipe label stamped on skill routing exposures for A/B experiments; surfaces in memory-steward outcomes byRecipe. Trimmed; defaults to \"default\"."
           }
         }
       },
@@ -1161,6 +1202,44 @@
           "enabled": false,
           "excludedChannels": [],
           "scenarios": []
+        }
+      },
+      "expectationsWhisperer": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Appends open commitments, predictions, blockers, decision outcomes and todos from the expectations table when a turn matches their channel, person, keywords or due window. Read-only and local (no model call). Enabled by default.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "maxHints": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Expectations per turn (0 = unlimited). Default 5."
+          },
+          "cooldownTurns": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Turns an expectation stays suppressed in a session after it is shown; it resurfaces early once it becomes overdue (0 = no cooldown). Default 10."
+          },
+          "dueLeadMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "An expectation due within this many ms is due_soon (0 = only overdue). Default 86400000 (24h)."
+          },
+          "maxPayloadChars": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Character budget for the <expectations> block; entries are never sliced (0 = unlimited). Default 0."
+          },
+          "includeWorkspaceBlockers": {
+            "type": "boolean",
+            "description": "Surface every open workspace-wide blocker on any eligible user turn, not only on turns whose channel matches it. Default true."
+          }
+        },
+        "default": {
+          "enabled": true
         }
       },
       "recallLedger": {
@@ -1439,6 +1518,81 @@
               "retentionDays": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "lateEvidenceRescanMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "History re-scored behind the watermark to pick up late Response Audit / Inside Out evidence, in ms. 0 = the full lookbackMs; unset = up to two days."
+              }
+            }
+          },
+          "expectations": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Expectations pass (6th primitive). Captain's Log [BLOCKED] entries and open people todos are mirrored deterministically with no model call, even without a Steward runner; session extraction and the due/resolution sweep use the Steward model. Enabled by default.",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "intervalMinutes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "lookbackMinutes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "dueLeadMinutes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Sweep open expectations due within this many minutes; overdue ones always qualify."
+              },
+              "sweepAfterMinutes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Sweep open expectations older than this, due date or not."
+              },
+              "maxSessionsPerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "0 = unlimited."
+              },
+              "maxCharsPerSession": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "0 = unlimited."
+              },
+              "maxSweepItems": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "0 = unlimited."
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Per model call; 0 = unlimited."
+              },
+              "excludeChatTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "channel",
+                    "group",
+                    "direct"
+                  ]
+                }
+              },
+              "extract": {
+                "type": "boolean"
+              },
+              "sweep": {
+                "type": "boolean"
+              },
+              "blockerAutoExpireMinutes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Auto-expire a mirrored Captain's Log blocker (and close its ledger entries) when its topic has not been re-captured within this many minutes. Default 4320 (72h); 0 = never auto-expire."
               }
             }
           }

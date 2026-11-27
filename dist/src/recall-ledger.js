@@ -5,7 +5,7 @@ import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-
 // Loaded by the background writer worker with plain Node resolution:
 // this module and its imports must stay free of `openclaw`.
 /**
- * Stays 1: skill event tables and nullable token columns are purely additive, so a rollback to v0.16.0
+ * Stays 1: skill event tables, token columns, and recipe stamps are purely additive, so a rollback to v0.16.0
  * (which rejects any other version) still opens the ledger. Opens self-heal missing additive objects.
  */
 export const RECALL_LEDGER_SCHEMA_VERSION = 1;
@@ -51,6 +51,7 @@ export function resolveRecallLedger(value) {
     }
     return { enabled, retentionDays };
 }
+const RECIPE_HASH_TYPE = "TEXT NOT NULL DEFAULT 'default'";
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS recall_queries (
   id                  INTEGER PRIMARY KEY,
@@ -80,7 +81,8 @@ CREATE TABLE IF NOT EXISTS recall_queries (
     'emitted', 'rejected', 'empty', 'tool_ok', 'degraded', 'partial',
     'missing_key', 'unavailable', 'timed_out', 'cancelled', 'skipped', 'failed'
   )),
-  parent_query_id     INTEGER REFERENCES recall_queries(id) ON DELETE SET NULL
+  parent_query_id     INTEGER REFERENCES recall_queries(id) ON DELETE SET NULL,
+  recipe_hash         ${RECIPE_HASH_TYPE}
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS recall_hits (
@@ -156,7 +158,8 @@ CREATE TABLE IF NOT EXISTS skill_routing_events (
   input_tokens INTEGER,
   output_tokens INTEGER,
   elapsed_ms REAL,
-  outcome TEXT NOT NULL
+  outcome TEXT NOT NULL,
+  recipe_hash ${RECIPE_HASH_TYPE}
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_skill_routing_agent_time ON skill_routing_events (agent_id, created_at_ms);
 
@@ -175,13 +178,20 @@ CREATE TABLE IF NOT EXISTS skill_open_events (
 CREATE INDEX IF NOT EXISTS idx_skill_open_agent_time ON skill_open_events (agent_id, created_at_ms);
 `;
 const ADDITIVE_TABLES = ["recall_queries", "recall_hits", "recall_reads", "skill_routing_events", "skill_open_events"];
-const ADDITIVE_QUERY_COLUMNS = ["input_tokens", "output_tokens"];
+const ADDITIVE_COLUMNS = {
+    recall_queries: { input_tokens: "INTEGER", output_tokens: "INTEGER", recipe_hash: RECIPE_HASH_TYPE },
+    skill_routing_events: { recipe_hash: RECIPE_HASH_TYPE },
+};
 /** Pre-release Phase B builds stamped 2 for the same additive layout; heal those back to 1 for rollback safety. */
 const PRE_RELEASE_VERSION = 2;
 function ensureRecallLedgerSchema(db) {
     const version = db.prepare("SELECT version FROM memory_schema WHERE component = 'recall_ledger'");
+    const pendingColumns = () => Object.entries(ADDITIVE_COLUMNS).flatMap(([table, definitions]) => {
+        const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+        return Object.entries(definitions).flatMap(([name, type]) => columns.has(name) ? [] : [`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`]);
+    });
     const complete = () => ADDITIVE_TABLES.every(table => tableExists(db, table)) &&
-        ADDITIVE_QUERY_COLUMNS.every(column => db.prepare("PRAGMA table_info(recall_queries)").all().some(row => row.name === column));
+        pendingColumns().length === 0;
     // Fast path avoids the write lock on every open.
     if (version.get()?.version === RECALL_LEDGER_SCHEMA_VERSION && complete())
         return;
@@ -193,11 +203,8 @@ function ensureRecallLedgerSchema(db) {
         if (current === RECALL_LEDGER_SCHEMA_VERSION && complete())
             return;
         db.exec(SCHEMA_SQL);
-        const columns = db.prepare("PRAGMA table_info(recall_queries)").all();
-        for (const column of ADDITIVE_QUERY_COLUMNS) {
-            if (!columns.some(row => row.name === column))
-                db.exec(`ALTER TABLE recall_queries ADD COLUMN ${column} INTEGER`);
-        }
+        for (const alter of pendingColumns())
+            db.exec(alter);
         db.prepare(`INSERT INTO memory_schema (component, version) VALUES ('recall_ledger', ?)
       ON CONFLICT(component) DO UPDATE SET version = excluded.version`).run(RECALL_LEDGER_SCHEMA_VERSION);
     });
@@ -247,14 +254,14 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
       provider, account_id, sender_id, channel_id, thread_id, chat_type,
       lex_query, vec_query, query_fallback,
       corpora_json, session_filter_json, ranking_mode, fallback_reason, decision_model, min_usefulness,
-      outcome, parent_query_id, input_tokens, output_tokens
+      outcome, parent_query_id, input_tokens, output_tokens, recipe_hash
     ) VALUES (
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?
+      ?, ?, ?, ?, ?
     )
     ON CONFLICT(event_key) DO NOTHING
   `);
@@ -284,8 +291,8 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
   `);
     const insertRouting = db.prepare(`INSERT INTO skill_routing_events (
     event_key, created_at_ms, agent_id, session_id, session_key, run_id, surface, catalog_revision,
-    mode, candidate_count, emitted_json, scores_json, input_tokens, output_tokens, elapsed_ms, outcome
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING`);
+    mode, candidate_count, emitted_json, scores_json, input_tokens, output_tokens, elapsed_ms, outcome, recipe_hash
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING`);
     const insertOpen = db.prepare(`INSERT INTO skill_open_events (
     created_at_ms, agent_id, session_id, session_key, run_id, skill_path, tool_name, was_whispered, was_pinned
   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -297,7 +304,7 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
             if (event.kind === "query") {
                 const r = event.record;
                 const createdAtMs = requiredInt(r.createdAtMs, fallbackNow);
-                const result = insertQuery.run(r.eventKey, createdAtMs, r.agentId, r.source, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.provider ?? null, r.accountId ?? null, r.senderId ?? null, r.channelId ?? null, r.threadId ?? null, r.chatType ?? null, r.lexQuery ?? null, r.vecQuery ?? null, r.queryFallback ? 1 : 0, JSON.stringify(r.corpora), r.sessionFilterJson ?? null, r.rankingMode, r.fallbackReason ?? null, r.decisionModel ?? null, finiteOrNull(r.minUsefulness), r.outcome, positiveIntOrNull(r.parentQueryId), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens));
+                const result = insertQuery.run(r.eventKey, createdAtMs, r.agentId, r.source, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.provider ?? null, r.accountId ?? null, r.senderId ?? null, r.channelId ?? null, r.threadId ?? null, r.chatType ?? null, r.lexQuery ?? null, r.vecQuery ?? null, r.queryFallback ? 1 : 0, JSON.stringify(r.corpora), r.sessionFilterJson ?? null, r.rankingMode, r.fallbackReason ?? null, r.decisionModel ?? null, finiteOrNull(r.minUsefulness), r.outcome, positiveIntOrNull(r.parentQueryId), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), r.recipeHash?.trim() || "default");
                 if (Number(result.changes) > 0) {
                     written++;
                     const queryId = Number(result.lastInsertRowid);
@@ -316,7 +323,7 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
             }
             else if (event.kind === "skill_routing") {
                 const r = event.record;
-                written += Number(insertRouting.run(r.eventKey, r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.surface ?? null, r.catalogRevision ?? null, r.mode, r.candidateCount, JSON.stringify(r.emitted), JSON.stringify(r.scores), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), finiteOrNull(r.elapsedMs), r.outcome).changes);
+                written += Number(insertRouting.run(r.eventKey, r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.surface ?? null, r.catalogRevision ?? null, r.mode, r.candidateCount, JSON.stringify(r.emitted), JSON.stringify(r.scores), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), finiteOrNull(r.elapsedMs), r.outcome, r.recipeHash?.trim() || "default").changes);
             }
             else {
                 const r = event.record;

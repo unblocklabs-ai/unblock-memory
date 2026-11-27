@@ -12,6 +12,8 @@ import { resolveSafetyWhisperer, type SafetyWhispererConfig } from "./safety-con
 import { resolveMyTurn, type MyTurnConfig } from "./my-turn.js";
 import { resolveRecallLedger, type RecallLedgerConfig } from "./recall-ledger.js";
 import { resolveStewardConfig, type StewardConfig } from "./steward-config.js";
+import { EXPECTATIONS_WHISPERER_DEFAULTS, type ExpectationsWhispererConfig } from "./expectations-whisperer.js";
+import { DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS, DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP } from "./deep-thought-store.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -59,7 +61,7 @@ export type DecisionModelPluginConfig = {
   timeoutMs: number;
 };
 
-export const WHISPERER_NAMES = ["memory", "skill", "people", "myTurn", "safety"] as const;
+export const WHISPERER_NAMES = ["memory", "skill", "people", "myTurn", "expectations", "safety"] as const;
 export type WhispererName = (typeof WHISPERER_NAMES)[number];
 export type WhispererTriggersConfig = {
   cron: readonly WhispererName[];
@@ -91,6 +93,8 @@ export type UnblockMemoryConfig = {
     minScore: number;
     /** Legacy fleet setting; active skills no longer cool down. */
     cooldownTurns: number;
+    /** Retrieval recipe label stamped on skill routing exposures (A/B experiments). Resolved default: `"default"`. */
+    recipeHash?: string;
   };
   memoryWhisperer: {
     enabled: boolean;
@@ -107,8 +111,20 @@ export type UnblockMemoryConfig = {
     mode?: MemoryWhispererMode;
     /** Only used by `mode: "legacy"`; still accepted in `v2` so existing fleet configs keep loading. */
     api: { endpoint: string; apiKeyFile?: string };
+    /** Retrieval recipe label stamped on memory exposures (whisperer + `memory_search`). Resolved default: `"default"`. */
+    recipeHash?: string;
+    /** Whisper fresh, generation-verified `deep_thought` syntheses matching the turn. Resolved default: `true`. */
+    derivedObservations?: boolean;
+    /** Verified syntheses whispered per turn. Resolved default: `2`; `0` = unlimited. */
+    derivedMaxHints?: number;
+    /** Minimum share (0..1) of a stored question's meaningful tokens the turn must cover. Resolved default: `0.45`. */
+    derivedMinTokenOverlap?: number;
+    /** Minimum shared meaningful tokens for a non-exact question match. Resolved default: `2`. */
+    derivedMinSharedTokens?: number;
   };
   safetyWhisperer: SafetyWhispererConfig;
+  /** On by default: open commitments, blockers and todos from the `expectations` table (read-only, zero model cost). */
+  expectationsWhisperer: ExpectationsWhispererConfig;
   whispererTriggers: WhispererTriggersConfig;
   recallLedger: RecallLedgerConfig;
   /** Off unless configured: `deep_thought` curator and People shadow adjudication. */
@@ -186,11 +202,20 @@ function resolveDecisionModel(value: unknown): DecisionModelPluginConfig {
   };
 }
 
+const DEFAULT_RECIPE_HASH = "default";
+
+function recipeHash(value: unknown, label: string): string {
+  if (value === undefined) return DEFAULT_RECIPE_HASH;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`unblock-memory ${label}.recipeHash must be a non-empty string`);
+  return value.trim();
+}
+
 const DEFAULT_SKILL_WHISPERER: UnblockMemoryConfig["skillWhisperer"] = {
   enabled: true,
   historyMessages: DEFAULTS.skillWhisperer.defaultHistoryMessages,
   minScore: DEFAULTS.skillWhisperer.defaultMinScore,
   cooldownTurns: DEFAULTS.skillWhisperer.defaultCooldownTurns,
+  recipeHash: DEFAULT_RECIPE_HASH,
 };
 
 export type MemoryWhispererMode = "v2" | "legacy";
@@ -201,6 +226,9 @@ const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
   maxHints: DEFAULTS.memoryWhisperer.defaultMaxHints, cooldownTurns: DEFAULTS.memoryWhisperer.defaultCooldownTurns,
   timeoutMs: DEFAULTS.memoryWhisperer.defaultTimeoutMs, mode: DEFAULTS.memoryWhisperer.mode as MemoryWhispererMode,
   api: { endpoint: DEFAULTS.memoryWhisperer.defaultApiEndpoint },
+  recipeHash: DEFAULT_RECIPE_HASH, derivedObservations: true,
+  derivedMaxHints: 2, derivedMinTokenOverlap: DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP,
+  derivedMinSharedTokens: DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS,
 };
 
 function resolveQueryApi(value: unknown): UnblockMemoryConfig["memoryWhisperer"]["api"] {
@@ -259,6 +287,20 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   if (typeof minUsefulness !== "number" || !Number.isFinite(minUsefulness) || minUsefulness < 0 || minUsefulness > 1) {
     throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
   }
+  const derivedObservations = config.derivedObservations ?? true;
+  if (typeof derivedObservations !== "boolean") throw new Error("unblock-memory memoryWhisperer.derivedObservations must be a boolean");
+  const derivedMaxHints = config.derivedMaxHints ?? DEFAULT_MEMORY_WHISPERER.derivedMaxHints;
+  if (typeof derivedMaxHints !== "number" || !Number.isSafeInteger(derivedMaxHints) || derivedMaxHints < 0) {
+    throw new Error("unblock-memory memoryWhisperer.derivedMaxHints must be a non-negative integer (0 = unlimited)");
+  }
+  const derivedMinTokenOverlap = config.derivedMinTokenOverlap ?? DEFAULT_MEMORY_WHISPERER.derivedMinTokenOverlap;
+  if (typeof derivedMinTokenOverlap !== "number" || !Number.isFinite(derivedMinTokenOverlap) || derivedMinTokenOverlap < 0 || derivedMinTokenOverlap > 1) {
+    throw new Error("unblock-memory memoryWhisperer.derivedMinTokenOverlap must be between 0 and 1");
+  }
+  const derivedMinSharedTokens = config.derivedMinSharedTokens ?? DEFAULT_MEMORY_WHISPERER.derivedMinSharedTokens;
+  if (typeof derivedMinSharedTokens !== "number" || !Number.isSafeInteger(derivedMinSharedTokens) || derivedMinSharedTokens < 1) {
+    throw new Error("unblock-memory memoryWhisperer.derivedMinSharedTokens must be a positive integer");
+  }
   const mode = config.mode ?? DEFAULT_MEMORY_WHISPERER.mode;
   if (typeof mode !== "string" || !MEMORY_WHISPERER_MODES.includes(mode as MemoryWhispererMode)) {
     throw new Error('unblock-memory memoryWhisperer.mode must be "v2" or "legacy"');
@@ -269,6 +311,34 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     maxHints: positiveInteger(config.maxHints, DEFAULT_MEMORY_WHISPERER.maxHints, "memoryWhisperer.maxHints", 3),
     timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_MEMORY_WHISPERER.timeoutMs, "memoryWhisperer.timeoutMs", 10_000),
     api: resolveQueryApi(config.api),
+    recipeHash: recipeHash(config.recipeHash, "memoryWhisperer"),
+    derivedObservations, derivedMaxHints, derivedMinTokenOverlap, derivedMinSharedTokens,
+  };
+}
+
+function resolveExpectationsWhisperer(value: unknown): ExpectationsWhispererConfig {
+  if (value === undefined) return { ...EXPECTATIONS_WHISPERER_DEFAULTS };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("unblock-memory expectationsWhisperer must be an object");
+  }
+  const config = value as Record<string, unknown>;
+  assertOnlyKeys(config, Object.keys(EXPECTATIONS_WHISPERER_DEFAULTS), "expectationsWhisperer");
+  const flag = (key: "enabled" | "includeWorkspaceBlockers") => {
+    const resolved = config[key] ?? EXPECTATIONS_WHISPERER_DEFAULTS[key];
+    if (typeof resolved !== "boolean") throw new Error(`unblock-memory expectationsWhisperer.${key} must be a boolean`);
+    return resolved;
+  };
+  // `0` is meaningful and preserved: unlimited hints/payload, no cooldown, overdue-only due window.
+  const count = (key: "maxHints" | "cooldownTurns" | "dueLeadMs" | "maxPayloadChars") => {
+    const resolved = config[key] ?? EXPECTATIONS_WHISPERER_DEFAULTS[key];
+    if (typeof resolved !== "number" || !Number.isSafeInteger(resolved) || resolved < 0) {
+      throw new Error(`unblock-memory expectationsWhisperer.${key} must be a non-negative integer`);
+    }
+    return resolved;
+  };
+  return {
+    enabled: flag("enabled"), maxHints: count("maxHints"), cooldownTurns: count("cooldownTurns"), dueLeadMs: count("dueLeadMs"),
+    maxPayloadChars: count("maxPayloadChars"), includeWorkspaceBlockers: flag("includeWorkspaceBlockers"),
   };
 }
 
@@ -484,7 +554,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const config = value as Record<string, unknown>;
   assertOnlyKeys(
     config,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -535,7 +605,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     const value = config.skillWhisperer as Record<string, unknown>;
     assertOnlyKeys(
       value,
-      ["enabled", "historyMessages", "minScore", "cooldownTurns"],
+      ["enabled", "historyMessages", "minScore", "cooldownTurns", "recipeHash"],
       "skillWhisperer",
     );
     const enabled = value.enabled ?? DEFAULT_SKILL_WHISPERER.enabled;
@@ -568,7 +638,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     ) {
       throw new Error("unblock-memory skillWhisperer.cooldownTurns must be a non-negative integer");
     }
-    skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns };
+    skillWhisperer = { enabled, historyMessages, minScore, cooldownTurns, recipeHash: recipeHash(value.recipeHash, "skillWhisperer") };
   }
   // Default-on means "on once skills exist": without a skills corpus it could never
   // hint, so it registers no prompt hook and reports inactive. An explicit true is
@@ -585,6 +655,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
     insideOut: resolveInsideOut(config.insideOut),
     memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
     safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
+    expectationsWhisperer: resolveExpectationsWhisperer(config.expectationsWhisperer),
     whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),
     recallLedger: resolveRecallLedger(config.recallLedger),
     steward: resolveStewardConfig(config.steward),

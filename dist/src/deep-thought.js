@@ -1,10 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveDecisionCredential } from "./decision-client.js";
 import { nonBlank } from "./guards.js";
-import { canonicalCorpora, DEFAULT_DEEP_THOUGHT_JOB_RETENTION_MS } from "./deep-thought-store.js";
+import { canonicalCorpora, deepThoughtAudienceKey, DEFAULT_DEEP_THOUGHT_JOB_RETENTION_MS } from "./deep-thought-store.js";
 import { searchMemory } from "./memory-search.js";
 import { prepareQueryConversation } from "./query-contract.js";
 import { selectJudgeConversation } from "./judge-context.js";
@@ -158,11 +158,13 @@ function storedJobOutcome(record) {
         note: "Investigation is owned by another Gateway process and is still running there; poll this jobId again later.",
     };
 }
+/** Shared with the Memory Whisperer's derived-observation lookup (see `DeepThoughtAudienceIdentity`). */
 function defaultAudienceKey(active) {
     const request = active.requestContext;
-    const identity = [active.agentId, request.sessionKey ?? "", request.messageChannel ?? "", request.agentAccountId ?? "",
-        request.nativeChannelId ?? ""];
-    return `caller:${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+    return deepThoughtAudienceKey({
+        agentId: active.agentId, sessionKey: request.sessionKey, provider: request.messageChannel,
+        accountId: request.agentAccountId, senderId: active.requesterSenderId,
+    });
 }
 function resolveAudienceKey(active, deps) {
     const configured = typeof deps.audienceKey === "function"

@@ -3,6 +3,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import { type OutcomeLedgerPassResult } from "./outcome-ledger.js";
 import { type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
+import { type ExpectationsPassResult } from "./steward-expectations.js";
 import { type PeopleShadowPassResult } from "./steward-people-shadow.js";
 import type { StewardRunner } from "./steward-runner.js";
 import { WorkStore } from "./work-store.js";
@@ -13,7 +14,10 @@ type StewardRuntimeOptions = {
     config: StewardConfig;
     /** Full plugin config (needed by publish-mode People Learning inventory and Captain's Log). */
     pluginConfig?: UnblockMemoryConfig;
-    /** Lazily built on the first background tick; undefined skips model-backed work (the Outcome Ledger still runs). */
+    /**
+     * Lazily built on the first background tick; undefined skips model-backed work (the Outcome Ledger and the
+     * deterministic Expectations ingestion still run).
+     */
     createRunner(): Pick<StewardRunner, "complete"> | undefined;
     /** Test seam; defaults to a dedicated `WorkStore` connection on the agent's memory database. */
     openWorkStore?(dbPath: string): WorkStore;
@@ -30,6 +34,7 @@ export declare function registerStewardRuntime(api: OpenClawPluginApi, options: 
     lastResults: () => Map<string, PeopleShadowPassResult>;
     lastCaptainsLogResults: () => Map<string, CaptainsLogPassResult>;
     lastOutcomeLedgerResults: () => Map<string, OutcomeLedgerPassResult>;
+    lastExpectationsResults: () => Map<string, ExpectationsPassResult>;
     enabled: boolean;
 };
 export {};
