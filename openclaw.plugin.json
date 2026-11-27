@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.20.1",
+  "version": "0.20.2",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -1596,7 +1596,21 @@
               },
               "captainsLogDecisionResolve": {
                 "type": "boolean",
-                "description": "After each Captain's Log append, close open workspace/channel expectations the new entries explicitly resolve or break, with one batched d1.2 choice call (requires decisionModel.enabled). DM and group expectations are never sent. Default true."
+                "description": "After each Captain's Log append, close open expectations (filtered by captainsLogResolveChatTypes) the new entries explicitly resolve or break, with batched d1.2 choice calls (requires decisionModel.enabled). Default true."
+              },
+              "captainsLogResolveChatTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "workspace",
+                    "channel",
+                    "group",
+                    "direct"
+                  ]
+                },
+                "uniqueItems": true,
+                "description": "Expectation chat types eligible for the post-Captain's-Log d1.2 check. Default [\"workspace\", \"channel\"]; add \"group\" or \"direct\" to opt in."
               },
               "captainsLogResolveMinConfidence": {
                 "type": "number",

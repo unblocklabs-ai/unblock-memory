@@ -6,6 +6,7 @@ const searchRankings = ["retrieval", "decision"];
 const peopleModes = ["publish", "shadow"];
 const confidences = ["high", "medium", "low"];
 const chatTypes = ["channel", "group", "direct"];
+const expectationChatTypes = ["workspace", "channel", "group", "direct"];
 const DEFAULT_STEWARD_CONFIG = {
     enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
     maxActiveBackground: 1,
@@ -74,6 +75,7 @@ const DEFAULT_STEWARD_CONFIG = {
         sweep: true,
         blockerAutoExpireMinutes: 4320,
         captainsLogDecisionResolve: true,
+        captainsLogResolveChatTypes: ["workspace", "channel"],
         captainsLogResolveMinConfidence: 0.85,
         captainsLogResolveTimeoutMs: 15_000,
     },
@@ -113,6 +115,19 @@ function chatTypeList(value, key) {
     const out = [];
     for (const entry of value) {
         const matched = chatTypes.find(t => t === entry);
+        if (!matched)
+            throw new Error(`Invalid steward.${key} entry`);
+        if (!out.includes(matched))
+            out.push(matched);
+    }
+    return out;
+}
+function expectationChatTypeList(value, key) {
+    if (!Array.isArray(value))
+        throw new Error(`steward.${key} must be an array`);
+    const out = [];
+    for (const entry of value) {
+        const matched = expectationChatTypes.find(t => t === entry);
         if (!matched)
             throw new Error(`Invalid steward.${key} entry`);
         if (!out.includes(matched))
@@ -240,6 +255,7 @@ export function resolveStewardConfig(value) {
             sweep: boolean(e.sweep, "steward.expectations.sweep"),
             blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
             captainsLogDecisionResolve: boolean(e.captainsLogDecisionResolve, "steward.expectations.captainsLogDecisionResolve"),
+            captainsLogResolveChatTypes: expectationChatTypeList(e.captainsLogResolveChatTypes, "expectations.captainsLogResolveChatTypes"),
             captainsLogResolveMinConfidence: unitInterval(e.captainsLogResolveMinConfidence, "expectations.captainsLogResolveMinConfidence"),
             captainsLogResolveTimeoutMs: integer(e.captainsLogResolveTimeoutMs, 0, "expectations.captainsLogResolveTimeoutMs"),
         },

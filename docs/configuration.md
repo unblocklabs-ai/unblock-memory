@@ -1109,7 +1109,8 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.expectations.extract` | `true` | Model-backed extraction from sessions; `false` keeps deterministic ingestion and sweeps only |
 | `steward.expectations.sweep` | `true` | Model-backed due/resolution sweep; `false` never resolves rows by model |
 | `steward.expectations.blockerAutoExpireMinutes` | `4320` | `>= 0` minutes a mirrored Captain's Log blocker stays open without a fresh capture of its topic before it auto-expires (closing its ledger entries); `0` = never auto-expire |
-| `steward.expectations.captainsLogDecisionResolve` | `true` | After each Captain's Log append, close open workspace/channel expectations its new entries explicitly resolve or break (one batched d1.2 call; needs `decisionModel.enabled`) |
+| `steward.expectations.captainsLogDecisionResolve` | `true` | After each Captain's Log append, close open expectations (matching `captainsLogResolveChatTypes`) its new entries explicitly resolve or break (batched d1.2 calls; needs `decisionModel.enabled`) |
+| `steward.expectations.captainsLogResolveChatTypes` | `["workspace", "channel"]` | Expectation chat types (`"workspace"`, `"channel"`, `"group"`, `"direct"`) evaluated by the post-Captain's-Log d1.2 check; add `"group"` or `"direct"` to opt in |
 | `steward.expectations.captainsLogResolveMinConfidence` | `0.85` | `0`–`1` minimum probability of the chosen `resolved`/`broken` option before the post-Captain's-Log check applies it |
 | `steward.expectations.captainsLogResolveTimeoutMs` | `15000` | `>= 0` ms for the post-Captain's-Log d1.2 request (`0` = no plugin-side limit; the decisions SDK still caps one request at 60 s, and larger values are clamped to it) |
 

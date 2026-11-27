@@ -99,6 +99,7 @@ async function afterCaptainsLogAppend(options: StewardRuntimeOptions, params: {
       followUp.resolution = await resolveExpectationsFromCaptainsLog({
         db: store.db, agentId, decisionModel,
         newEntries: result.entries.map(entry => ({ ...entry, capturedAtMs: result.capturedAtMs })),
+        chatTypes: expectations.captainsLogResolveChatTypes,
         minConfidence: expectations.captainsLogResolveMinConfidence,
         timeoutMs: expectations.captainsLogResolveTimeoutMs,
         ...(signal ? { signal } : {}),

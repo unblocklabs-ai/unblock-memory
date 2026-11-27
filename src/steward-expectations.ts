@@ -12,7 +12,7 @@ import { DEFAULTS } from "./defaults.js";
 import {
   CAPTAINS_LOG_DECISION_SOURCE, conversationAudienceKey, directAudienceKey, ensureExpectationsSchema, listExpectations,
   normalizeBlockerTopic, redactSecrets, resolveExpectation, syncDeterministicExpectations, upsertExpectation, WORKSPACE_AUDIENCE,
-  type DeterministicSyncResult, type Expectation, type ExpectationKind, type ResolvedExpectationStatus,
+  type DeterministicSyncResult, type Expectation, type ExpectationChatType, type ExpectationKind, type ResolvedExpectationStatus,
 } from "./expectations-store.js";
 import { isRecord, record } from "./guards.js";
 import { immediateTransaction } from "./memory-database.js";
@@ -662,6 +662,8 @@ export type ResolveFromCaptainsLogOptions = {
   minConfidence?: number;
   /** d1.2 request deadline in ms (default 15000). `0` = no plugin-side limit; the decisions SDK still caps one request at 60 s. */
   timeoutMs?: number;
+  /** Expectation chat types eligible for post-Captain's-Log d1.2 resolution (default `["workspace", "channel"]`). */
+  chatTypes?: readonly ExpectationChatType[];
   /** Maximum open expectations judged per pass (default `0` = unlimited, batched in chunks of 24 per d1.2 call). */
   maxCandidates?: number;
   signal?: AbortSignal;
@@ -670,7 +672,13 @@ export type ResolveFromCaptainsLogOptions = {
 };
 export type ResolveFromCaptainsLogResult = { checked: number; resolved: number; skipped?: "disabled" | "no_credential" };
 
-const CAPTAINS_LOG_RESOLVE_DEFAULTS = { minConfidence: 0.85, timeoutMs: 15_000, maxCandidates: 0, batchSize: 24 } as const;
+const CAPTAINS_LOG_RESOLVE_DEFAULTS = {
+  minConfidence: 0.85,
+  timeoutMs: 15_000,
+  maxCandidates: 0,
+  batchSize: 24,
+  chatTypes: ["workspace", "channel"] as readonly ExpectationChatType[],
+} as const;
 
 function captainsLogQuestion(ref: string): ChoiceQuestion<CaptainsLogVerdict> {
   return choice({
@@ -725,8 +733,10 @@ export async function resolveExpectationsFromCaptainsLog(options: ResolveFromCap
     const key = entry.blocked ? normalizeBlockerTopic(entry.topic) || normalizeBlockerTopic(entry.summary) : "";
     return key ? [key] : [];
   }));
+  const allowedChatTypes = new Set<ExpectationChatType>(options.chatTypes ?? CAPTAINS_LOG_RESOLVE_DEFAULTS.chatTypes);
+  if (!allowedChatTypes.size) return none;
   const eligible = listExpectations(db, { agentId, status: "open" }).filter(item =>
-    (item.chatType === "workspace" || item.chatType === "channel") && item.createdAtMs <= newestCapture &&
+    allowedChatTypes.has(item.chatType) && item.createdAtMs <= newestCapture &&
     !(item.sourceKind === "captains_log" && (linkedCaptainsLogEntries(item).some(id => newIds.has(id)) ||
       captainsLogTopicKeys(item).some(key => stillBlocked.has(key)))));
   const candidates = maxCandidates > 0 ? eligible.slice(0, maxCandidates) : eligible;

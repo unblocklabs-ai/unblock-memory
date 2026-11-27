@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import { type ChoiceAnswer, type ChoiceQuestion } from "@unblocklabs/decisions";
 import type { ChatType, UnblockMemoryConfig } from "./config.js";
-import { type DeterministicSyncResult, type ExpectationKind } from "./expectations-store.js";
+import { type DeterministicSyncResult, type ExpectationChatType, type ExpectationKind } from "./expectations-store.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
 import { type WorkStore } from "./work-store.js";
 /**
@@ -158,6 +158,8 @@ export type ResolveFromCaptainsLogOptions = {
     minConfidence?: number;
     /** d1.2 request deadline in ms (default 15000). `0` = no plugin-side limit; the decisions SDK still caps one request at 60 s. */
     timeoutMs?: number;
+    /** Expectation chat types eligible for post-Captain's-Log d1.2 resolution (default `["workspace", "channel"]`). */
+    chatTypes?: readonly ExpectationChatType[];
     /** Maximum open expectations judged per pass (default `0` = unlimited, batched in chunks of 24 per d1.2 call). */
     maxCandidates?: number;
     signal?: AbortSignal;

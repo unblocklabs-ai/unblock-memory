@@ -578,7 +578,13 @@ const CAPTAINS_LOG_VERDICTS = {
     resolved: { definition: "The entries explicitly state that this obligation, blocker or action was completed, approved, fixed or satisfied (for a prediction or decision outcome: that it came true)." },
     broken: { definition: "The entries explicitly show that this commitment or prediction failed, was cancelled or rejected, or proved false." },
 };
-const CAPTAINS_LOG_RESOLVE_DEFAULTS = { minConfidence: 0.85, timeoutMs: 15_000, maxCandidates: 0, batchSize: 24 };
+const CAPTAINS_LOG_RESOLVE_DEFAULTS = {
+    minConfidence: 0.85,
+    timeoutMs: 15_000,
+    maxCandidates: 0,
+    batchSize: 24,
+    chatTypes: ["workspace", "channel"],
+};
 function captainsLogQuestion(ref) {
     return choice({
         question: `Do \`newCaptainsLogEntries\` show that the open expectation \`openExpectations.${ref}\` was resolved, was broken, or is still open?`,
@@ -631,7 +637,10 @@ export async function resolveExpectationsFromCaptainsLog(options) {
         const key = entry.blocked ? normalizeBlockerTopic(entry.topic) || normalizeBlockerTopic(entry.summary) : "";
         return key ? [key] : [];
     }));
-    const eligible = listExpectations(db, { agentId, status: "open" }).filter(item => (item.chatType === "workspace" || item.chatType === "channel") && item.createdAtMs <= newestCapture &&
+    const allowedChatTypes = new Set(options.chatTypes ?? CAPTAINS_LOG_RESOLVE_DEFAULTS.chatTypes);
+    if (!allowedChatTypes.size)
+        return none;
+    const eligible = listExpectations(db, { agentId, status: "open" }).filter(item => allowedChatTypes.has(item.chatType) && item.createdAtMs <= newestCapture &&
         !(item.sourceKind === "captains_log" && (linkedCaptainsLogEntries(item).some(id => newIds.has(id)) ||
             captainsLogTopicKeys(item).some(key => stillBlocked.has(key)))));
     const candidates = maxCandidates > 0 ? eligible.slice(0, maxCandidates) : eligible;

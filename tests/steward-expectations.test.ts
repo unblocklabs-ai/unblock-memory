@@ -527,7 +527,7 @@ test("a low-confidence d1.2 choice (< minConfidence) leaves the expectation open
   await assert.rejects(() => resolveWith(f, decide, { timeoutMs: -1 }), /timeoutMs/u);
 });
 
-test("private group (MPDM) and direct (DM) expectations are never sent to or closed by the Captain's Log check", async t => {
+test("private group (MPDM) and direct (DM) expectations are excluded by default and resolved when explicitly opted in via chatTypes", async t => {
   const f = fixture(t);
   const group = f.expect({ dedupKey: "group", summary: "GROUP_MARKER Greg approves Fred's order", audienceKey: "group:slack:workspace:native-mpdm",
     chatType: "group" });
@@ -535,14 +535,20 @@ test("private group (MPDM) and direct (DM) expectations are never sent to or clo
     chatType: "direct" });
   const everything = decider(() => ["resolved", 0.99]);
   assert.deepEqual(await resolveWith(f, everything.decide), { checked: 0, resolved: 0 });
-  assert.equal(everything.calls.length, 0, "no eligible expectations → no network call");
+  assert.equal(everything.calls.length, 0, "no eligible expectations under default [workspace, channel] → no network call");
 
   const channel = f.expect({ dedupKey: "channel", summary: "Greg approves Fred's order", audienceKey: "channel:slack:workspace:native-fipl",
     chatType: "channel", channel: "#fipl-customer-alerts" });
   assert.deepEqual(await resolveWith(f, everything.decide), { checked: 1, resolved: 1 });
-  assert.ok(!/GROUP_MARKER|DM_MARKER/u.test(JSON.stringify(everything.calls)), "private expectations never leave the process");
-  const byId = new Map(f.rows().map(row => [row.id, row.status]));
+  assert.ok(!/GROUP_MARKER|DM_MARKER/u.test(JSON.stringify(everything.calls)), "private expectations stay excluded by default");
+  let byId = new Map(f.rows().map(row => [row.id, row.status]));
   assert.deepEqual([byId.get(group.id), byId.get(dm.id), byId.get(channel.id)], ["open", "open", "kept"]);
+
+  // Explicit opt-in via chatTypes resolves group and direct expectations too.
+  assert.deepEqual(await resolveWith(f, everything.decide, { chatTypes: ["workspace", "channel", "group", "direct"] }),
+    { checked: 2, resolved: 2 });
+  byId = new Map(f.rows().map(row => [row.id, row.status]));
+  assert.deepEqual([byId.get(group.id), byId.get(dm.id), byId.get(channel.id)], ["kept", "kept", "kept"]);
 });
 
 test("a re-captured [BLOCKED] entry, the entries' own blockers and later items are never judged; no entries means no call", async t => {

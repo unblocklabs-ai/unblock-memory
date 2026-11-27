@@ -1,4 +1,5 @@
 import type { ChatType, DecisionModelPluginConfig } from "./config.js";
+import type { ExpectationChatType } from "./expectations-store.js";
 declare const efforts: readonly ["off", "minimal", "low", "medium", "high", "xhigh"];
 declare const peopleModes: readonly ["publish", "shadow"];
 declare const confidences: readonly ["high", "medium", "low"];
@@ -122,10 +123,12 @@ type StewardExpectationsConfig = {
     /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
     blockerAutoExpireMinutes: number;
     /**
-     * After each Captain's Log append, close open workspace/channel expectations the new entries explicitly resolve or
-     * break with one batched d1.2 `choice` call (needs `decisionModel.enabled`). DM and group expectations are never sent.
+     * After each Captain's Log append, close open expectations (filtered by `captainsLogResolveChatTypes`) that the new
+     * entries explicitly resolve or break, with batched d1.2 `choice` calls (needs `decisionModel.enabled`).
      */
     captainsLogDecisionResolve: boolean;
+    /** Expectation chat types checked after Captain's Log (default: `["workspace", "channel"]`; add `"group"` / `"direct"` to opt in). */
+    captainsLogResolveChatTypes: ExpectationChatType[];
     /** Minimum probability of the chosen `resolved` / `broken` option before it is applied (`0..1`). */
     captainsLogResolveMinConfidence: number;
     /** d1.2 request timeout in ms (`0` = no plugin-side limit; the decisions SDK still caps a request at 60 s). */

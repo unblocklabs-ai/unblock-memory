@@ -1,5 +1,6 @@
 import type { ChatType, DecisionModelPluginConfig } from "./config.js";
 import { resolveDecisionCredential } from "./decision-client.js";
+import type { ExpectationChatType } from "./expectations-store.js";
 import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
 
@@ -8,6 +9,7 @@ const searchRankings = ["retrieval", "decision"] as const;
 const peopleModes = ["publish", "shadow"] as const;
 const confidences = ["high", "medium", "low"] as const;
 const chatTypes = ["channel", "group", "direct"] as const;
+const expectationChatTypes = ["workspace", "channel", "group", "direct"] as const;
 
 type StewardDeepThoughtConfig = {
   enabled: boolean;
@@ -129,10 +131,12 @@ type StewardExpectationsConfig = {
   /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
   blockerAutoExpireMinutes: number;
   /**
-   * After each Captain's Log append, close open workspace/channel expectations the new entries explicitly resolve or
-   * break with one batched d1.2 `choice` call (needs `decisionModel.enabled`). DM and group expectations are never sent.
+   * After each Captain's Log append, close open expectations (filtered by `captainsLogResolveChatTypes`) that the new
+   * entries explicitly resolve or break, with batched d1.2 `choice` calls (needs `decisionModel.enabled`).
    */
   captainsLogDecisionResolve: boolean;
+  /** Expectation chat types checked after Captain's Log (default: `["workspace", "channel"]`; add `"group"` / `"direct"` to opt in). */
+  captainsLogResolveChatTypes: ExpectationChatType[];
   /** Minimum probability of the chosen `resolved` / `broken` option before it is applied (`0..1`). */
   captainsLogResolveMinConfidence: number;
   /** d1.2 request timeout in ms (`0` = no plugin-side limit; the decisions SDK still caps a request at 60 s). */
@@ -214,6 +218,7 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     sweep: true,
     blockerAutoExpireMinutes: 4320,
     captainsLogDecisionResolve: true,
+    captainsLogResolveChatTypes: ["workspace", "channel"],
     captainsLogResolveMinConfidence: 0.85,
     captainsLogResolveTimeoutMs: 15_000,
   },
@@ -251,6 +256,16 @@ function chatTypeList(value: unknown, key: string): ChatType[] {
   const out: ChatType[] = [];
   for (const entry of value) {
     const matched = chatTypes.find(t => t === entry);
+    if (!matched) throw new Error(`Invalid steward.${key} entry`);
+    if (!out.includes(matched)) out.push(matched);
+  }
+  return out;
+}
+function expectationChatTypeList(value: unknown, key: string): ExpectationChatType[] {
+  if (!Array.isArray(value)) throw new Error(`steward.${key} must be an array`);
+  const out: ExpectationChatType[] = [];
+  for (const entry of value) {
+    const matched = expectationChatTypes.find(t => t === entry);
     if (!matched) throw new Error(`Invalid steward.${key} entry`);
     if (!out.includes(matched)) out.push(matched);
   }
@@ -369,6 +384,7 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       sweep: boolean(e.sweep, "steward.expectations.sweep"),
       blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
       captainsLogDecisionResolve: boolean(e.captainsLogDecisionResolve, "steward.expectations.captainsLogDecisionResolve"),
+      captainsLogResolveChatTypes: expectationChatTypeList(e.captainsLogResolveChatTypes, "expectations.captainsLogResolveChatTypes"),
       captainsLogResolveMinConfidence: unitInterval(e.captainsLogResolveMinConfidence, "expectations.captainsLogResolveMinConfidence"),
       captainsLogResolveTimeoutMs: integer(e.captainsLogResolveTimeoutMs, 0, "expectations.captainsLogResolveTimeoutMs"),
     },
