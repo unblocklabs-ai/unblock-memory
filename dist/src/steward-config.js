@@ -3,6 +3,9 @@ import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const searchRankings = ["retrieval", "decision"];
+const peopleModes = ["publish", "shadow"];
+const confidences = ["high", "medium", "low"];
+const chatTypes = ["channel", "group", "direct"];
 const DEFAULT_STEWARD_CONFIG = {
     enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
     maxActiveBackground: 1,
@@ -24,7 +27,27 @@ const DEFAULT_STEWARD_CONFIG = {
         maxQuoteChars: 0,
         maxPeopleMatches: 0,
     },
-    peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
+    peopleShadow: {
+        enabled: true,
+        mode: "publish",
+        intervalMinutes: 60,
+        maxItemsPerRun: 0,
+        timeoutMs: 0,
+        minConfidence: "medium",
+        maxHandles: 0,
+        maxExcerptChars: 0,
+        maxExportBytes: 0,
+    },
+    captainsLog: {
+        enabled: true,
+        intervalMinutes: 180,
+        lookbackMinutes: 190,
+        maxSessionsPerRun: 0,
+        maxCharsPerSession: 0,
+        maxExistingLogChars: 0,
+        timeoutMs: 0,
+        excludeChatTypes: ["direct"],
+    },
 };
 function section(value = {}, defaults, label, optional = []) {
     if (!isRecord(value))
@@ -52,6 +75,19 @@ function enabled(value, label) {
         throw new Error(`${label}.enabled must be a boolean`);
     return value;
 }
+function chatTypeList(value, key) {
+    if (!Array.isArray(value))
+        throw new Error(`steward.${key} must be an array`);
+    const out = [];
+    for (const entry of value) {
+        const matched = chatTypes.find(t => t === entry);
+        if (!matched)
+            throw new Error(`Invalid steward.${key} entry`);
+        if (!out.includes(matched))
+            out.push(matched);
+    }
+    return out;
+}
 function text(value, key) {
     if (typeof value !== "string" || !value.trim())
         throw new Error(`steward.${key} must be a non-empty string`);
@@ -78,6 +114,7 @@ export function resolveStewardConfig(value) {
     const c = section(value, defaults, "steward", ["apiKey", "apiKeyFile"]);
     const d = section(c.deepThought, defaults.deepThought, "steward.deepThought", ["reasoning"]);
     const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow");
+    const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
     const reasoning = efforts.find(e => e === c.reasoning);
     if (!reasoning)
         throw new Error("Invalid steward.reasoning");
@@ -87,6 +124,12 @@ export function resolveStewardConfig(value) {
     const searchRanking = searchRankings.find(mode => mode === d.searchRanking);
     if (!searchRanking)
         throw new Error("Invalid steward.deepThought.searchRanking");
+    const peopleMode = peopleModes.find(mode => mode === p.mode);
+    if (!peopleMode)
+        throw new Error("Invalid steward.peopleShadow.mode");
+    const minConfidence = confidences.find(level => level === p.minConfidence);
+    if (!minConfidence)
+        throw new Error("Invalid steward.peopleShadow.minConfidence");
     const apiKey = c.apiKey === undefined ? undefined : text(c.apiKey, "apiKey");
     if (apiKey && /\s/u.test(apiKey))
         throw new Error("steward.apiKey must not contain whitespace");
@@ -114,9 +157,24 @@ export function resolveStewardConfig(value) {
         },
         peopleShadow: {
             enabled: enabled(p.enabled, "steward.peopleShadow"),
+            mode: peopleMode,
             intervalMinutes: integer(p.intervalMinutes, 1, "peopleShadow.intervalMinutes"),
-            maxItemsPerRun: integer(p.maxItemsPerRun, 1, "peopleShadow.maxItemsPerRun"),
+            maxItemsPerRun: integer(p.maxItemsPerRun, 0, "peopleShadow.maxItemsPerRun"),
             timeoutMs: integer(p.timeoutMs, 0, "peopleShadow.timeoutMs"),
+            minConfidence,
+            maxHandles: integer(p.maxHandles, 0, "peopleShadow.maxHandles"),
+            maxExcerptChars: integer(p.maxExcerptChars, 0, "peopleShadow.maxExcerptChars"),
+            maxExportBytes: integer(p.maxExportBytes, 0, "peopleShadow.maxExportBytes"),
+        },
+        captainsLog: {
+            enabled: enabled(cl.enabled, "steward.captainsLog"),
+            intervalMinutes: integer(cl.intervalMinutes, 1, "captainsLog.intervalMinutes"),
+            lookbackMinutes: integer(cl.lookbackMinutes, 1, "captainsLog.lookbackMinutes"),
+            maxSessionsPerRun: integer(cl.maxSessionsPerRun, 0, "captainsLog.maxSessionsPerRun"),
+            maxCharsPerSession: integer(cl.maxCharsPerSession, 0, "captainsLog.maxCharsPerSession"),
+            maxExistingLogChars: integer(cl.maxExistingLogChars, 0, "captainsLog.maxExistingLogChars"),
+            timeoutMs: integer(cl.timeoutMs, 0, "captainsLog.timeoutMs"),
+            excludeChatTypes: chatTypeList(cl.excludeChatTypes, "captainsLog.excludeChatTypes"),
         },
     };
 }

@@ -1,4 +1,6 @@
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import type { UnblockMemoryConfig } from "./config.js";
+import { type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
 import { type PeopleShadowPassResult } from "./steward-people-shadow.js";
 import type { StewardRunner } from "./steward-runner.js";
@@ -8,11 +10,15 @@ export declare function tryAcquireBackgroundSlot(maxActive: number): (() => void
 export declare function activeBackgroundStewards(): number;
 type StewardRuntimeOptions = {
     config: StewardConfig;
+    /** Full plugin config (needed by publish-mode People Learning inventory and Captain's Log). */
+    pluginConfig?: UnblockMemoryConfig;
     /** Lazily built on the first background tick; undefined skips background work without error. */
     createRunner(): Pick<StewardRunner, "complete"> | undefined;
     /** Test seam; defaults to a dedicated `WorkStore` connection on the agent's memory database. */
     openWorkStore?(dbPath: string): WorkStore;
     dbPathForAgent?(agentId: string): string;
+    transcriptDbForAgent?(cfg: OpenClawConfig, agentId: string): string;
+    workspaceDirForAgent?(cfg: OpenClawConfig, agentId: string): string;
     listAgents?(cfg: OpenClawConfig): string[];
     shutdownGraceMs?: number;
 };
@@ -21,6 +27,7 @@ export declare function registerStewardRuntime(api: OpenClawPluginApi, options: 
     tick: () => Promise<void>;
     stop: () => Promise<void>;
     lastResults: () => Map<string, PeopleShadowPassResult>;
+    lastCaptainsLogResults: () => Map<string, CaptainsLogPassResult>;
     enabled: boolean;
 };
 export {};

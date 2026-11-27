@@ -38,7 +38,7 @@ const DEFAULT_LEASE_MS = DEFAULTS.steward.leaseMs;
 /** The People store's own audit-reason column limit (`people-store.ts` dossierReason). */
 const DOSSIER_REASON_CHARS = 1_000;
 
-export type PeopleLearningMode = "publish" | "shadow";
+type PeopleLearningMode = "publish" | "shadow";
 type Confidence = "low" | "medium" | "high";
 const CONFIDENCE_RANK: Record<Confidence, number> = { low: 0, medium: 1, high: 2 };
 
@@ -86,7 +86,7 @@ type ShadowEvidence = {
 };
 
 /** What a publish-mode commit did to the dossier, recorded on the work row in the same transaction. */
-export type PeoplePublication = {
+type PeoplePublication = {
   /** applied: dossier revision written; recorded: verified without a dossier write; skipped: not applied (stale, inactive,
    *  below confidence, rule violation); unresolved: the proposal itself was unresolved. */
   status: "applied" | "recorded" | "skipped" | "unresolved";
@@ -165,7 +165,7 @@ export type PeopleShadowPassOptions = {
 type PeopleShadowItemOutcome =
   | "staged" | "completed" | "resumed" | "rejected" | "skipped" | "busy" | "failed" | "interrupted" | "host_unresolved";
 
-export type PeopleCheckpointResult = {
+type PeopleCheckpointResult = {
   manifestId: string;
   manifestRevision: string;
   status: "complete" | "partial" | "invalid" | "stale" | "error";

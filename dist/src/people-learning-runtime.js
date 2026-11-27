@@ -20,7 +20,7 @@ import { ResponseAuditStore } from "./response-store.js";
 import { getContext } from "./tool-context.js";
 import { record } from "./guards.js";
 import { jsonHash } from "./json-hash.js";
-import { reviewWindow } from "./people-learning-time.js";
+import { reviewWindow, shiftDate } from "./people-learning-time.js";
 import { DEFAULTS } from "./defaults.js";
 const LEARNING_PARAMETERS = Type.Union([
     Type.Object({ action: Type.Literal("inventory"), kind: Type.Enum(["nightly", "weekly"]) }, { additionalProperties: false }),
@@ -54,6 +54,10 @@ function isLearningEnabled(config, agentId, kind) {
 }
 function isLearningAuthorized(cfg, config, job) {
     return listAgentIds(cfg).includes(job.agentId) && isLearningEnabled(config, job.agentId, job.kind);
+}
+/** Whether automatic external analysis is approved for People Learning receipts (else receipts record `not_approved`). */
+export function isPeopleLearningAnalysisApproved(config) {
+    return isAnalysisApproved(config);
 }
 function isAnalysisApproved(config) {
     return config.responseAudit.enabled && config.decisionModel.enabled && config.responseAudit.intervalMinutes > 0;
@@ -359,10 +363,67 @@ function handleCheckpointAction(options) {
         return jsonResult(coverage);
     });
 }
+/** A nightly manifest is fresh for the latest completed local day; a weekly one for any of the last 7 completed days. */
+function freshRun(ledger, kind, timezone, now) {
+    const latest = reviewWindow(now, timezone, kind).localDay;
+    const days = kind === "nightly" ? 1 : 7;
+    for (let offset = 0; offset < days; offset++) {
+        const run = ledger.get(`${kind}:${shiftDate(latest, -offset)}`);
+        if (run && !run.manifest.inventoryPending)
+            return run;
+    }
+    return undefined;
+}
+/**
+ * Self-sufficient Steward publishing: create the immutable nightly/weekly People Learning manifest for the current
+ * review window through the same `inventoryPeople` pipeline the cron's `inventory` action uses, but only when no fresh
+ * manifest exists. Honors `people.learning` opt-outs exactly like the cron. Never touches cron jobs.
+ */
+export function ensurePeopleLearningManifests(options) {
+    const { cfg, config, agentId } = options;
+    const stateRoot = options.stateRoot ?? resolveStateDir();
+    const kinds = options.kinds ?? ["nightly", "weekly"];
+    const results = [];
+    if (!listAgentIds(cfg).includes(agentId)) {
+        return kinds.map(kind => ({ kind, status: "error", error: "Unknown people-learning agent" }));
+    }
+    const stores = options.stores ?? new PeopleStores({ stateRoot, maxOpenTodos: config.people.todos.maxOpen,
+        maxBlurbChars: config.people.whisperer.maxChars });
+    try {
+        const settings = learningForAgent(config.people.learning, agentId);
+        const timezone = settings.timezone ?? resolveTimezone(cfg.agents?.defaults?.userTimezone);
+        for (const kind of kinds) {
+            if (!isLearningEnabled(config, agentId, kind)) {
+                results.push({ kind, status: "disabled" });
+                continue;
+            }
+            try {
+                const paths = reviewPaths(cfg, config, agentId, stateRoot);
+                const fresh = withLearningStore(paths.storePath, agentId, ledger => freshRun(ledger, kind, timezone, Date.now()));
+                if (fresh) {
+                    results.push({ kind, runId: fresh.manifest.id, manifestRevision: fresh.manifestRevision, status: "fresh" });
+                    continue;
+                }
+                const created = beginReview(cfg, config, stores, agentId, kind, stateRoot);
+                results.push({ kind, runId: created.manifest.id, manifestRevision: created.manifestRevision, status: "created" });
+            }
+            catch (error) {
+                results.push({ kind, status: "error", error: String(error) });
+            }
+        }
+    }
+    finally {
+        if (!options.stores)
+            stores.closeAll();
+    }
+    return results;
+}
 function isStartupPrepError(error) {
     return /not completed startup inspection and preparation/i.test(String(error));
 }
-export function registerPeopleLearning(api, initial, stores) {
+export function registerPeopleLearning(api, initial, stores, options = {}) {
+    const stewardOwnsPublishing = (current) => typeof options.stewardOwnsPublishing === "function"
+        ? options.stewardOwnsPublishing(current) === true : options.stewardOwnsPublishing === true;
     let cfg = api.config, config = initial, stateRoot = resolveStateDir(), live = false;
     // Separate durable cron declaration recognition from current authorization:
     // recognizedJobs persists across transient reconcile/reload failures so private-session
@@ -419,6 +480,7 @@ export function registerPeopleLearning(api, initial, stores) {
                 enabled: false,
                 agents: Object.fromEntries(Object.entries(config.people.learning.agents ?? {}).map(([id, agent]) => [id, { ...agent, enabled: false }])),
             };
+        const stewardManaged = stewardOwnsPublishing(config);
         reconciliation = Promise.resolve()
             .then(async () => {
             const cron = getCron?.();
@@ -433,7 +495,7 @@ export function registerPeopleLearning(api, initial, stores) {
             await reconcilePeopleLearning(cron, cfg, learning, () => live && version === generation, (discovered, replace) => {
                 if (live && version === generation)
                     mergeRecognized(discovered, replace);
-            });
+            }, { stewardOwnsPublishing: stewardManaged });
             if (live && version === generation) {
                 startupRetries = 0;
                 clearRetry();

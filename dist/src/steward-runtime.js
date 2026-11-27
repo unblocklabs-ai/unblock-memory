@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
-import { agentStateDir } from "./agent-paths.js";
+import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import { DEFAULTS } from "./defaults.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
-import { buildPeopleShadowReport, runPeopleShadowPass, PEOPLE_SHADOW_KIND } from "./steward-people-shadow.js";
+import { resolveTimezone } from "./session-projector.js";
+import { runCaptainsLogPass } from "./steward-captains-log.js";
+import { buildPeopleShadowReport, runPeopleShadowPass, PEOPLE_SHADOW_KIND, } from "./steward-people-shadow.js";
 import { WorkStore } from "./work-store.js";
 /* ═════════════════════════ Background semaphore ═════════════════════════ */
 const BACKGROUND_SLOTS = Symbol.for("unblock-memory.steward.backgroundSlots");
@@ -36,15 +39,18 @@ class StewardShutdownError extends Error {
 }
 export function registerStewardRuntime(api, options) {
     const dbPathForAgent = options.dbPathForAgent ?? ((agentId) => join(agentStateDir(agentId), MEMORY_DATABASE));
+    const transcriptDbForAgent = options.transcriptDbForAgent ?? agentTranscriptDatabase;
+    const workspaceDirForAgent = options.workspaceDirForAgent ?? resolveAgentWorkspaceDir;
     const listAgents = options.listAgents ?? listAgentIds;
     const openWorkStore = options.openWorkStore ?? ((dbPath) => new WorkStore(dbPath));
-    registerStewardCli(api, options, dbPathForAgent, openWorkStore);
+    registerStewardCli(api, options, dbPathForAgent, openWorkStore, transcriptDbForAgent, workspaceDirForAgent);
     const owner = `steward:${process.pid}:${randomUUID()}`;
     const openStores = new Set();
     let lifetime = new AbortController();
     let timer;
     let running;
     const lastResults = new Map();
+    const lastCaptainsLogResults = new Map();
     const tick = () => {
         if (running)
             return running;
@@ -67,6 +73,10 @@ export function registerStewardRuntime(api, options) {
                     api.logger.warn(`unblock-memory steward: ${String(error)}`);
                 return;
             }
+            const inventoryContext = options.pluginConfig
+                ? { cfg: api.config, config: options.pluginConfig }
+                : undefined;
+            const timezone = resolveTimezone(api.config?.agents?.defaults?.userTimezone?.trim());
             for (const agentId of agents) {
                 if (signal.aborted)
                     break;
@@ -77,8 +87,36 @@ export function registerStewardRuntime(api, options) {
                     openStores.add(store);
                     if (options.config.peopleShadow.enabled && runner) {
                         lastResults.set(agentId, await runPeopleShadowPass({
+                            mode: options.config.peopleShadow.mode,
+                            ...(inventoryContext ? { inventoryContext } : {}),
+                            minConfidence: options.config.peopleShadow.minConfidence,
+                            maxHandles: options.config.peopleShadow.maxHandles,
+                            maxExcerptChars: options.config.peopleShadow.maxExcerptChars,
+                            maxExportBytes: options.config.peopleShadow.maxExportBytes,
                             dbPath, agentId, workStore: store, runner, owner, signal,
                             maxItems: options.config.peopleShadow.maxItemsPerRun, timeoutMs: options.config.peopleShadow.timeoutMs,
+                        }));
+                    }
+                    if (options.config.captainsLog.enabled && runner && !signal.aborted) {
+                        const cl = options.config.captainsLog;
+                        const workspaceDir = workspaceDirForAgent(api.config, agentId);
+                        const databasePath = transcriptDbForAgent(api.config, agentId);
+                        lastCaptainsLogResults.set(agentId, await runCaptainsLogPass({
+                            agentId,
+                            databasePath,
+                            workspaceDir,
+                            workStore: store,
+                            runner,
+                            owner,
+                            timezone,
+                            intervalMinutes: cl.intervalMinutes,
+                            lookbackMinutes: cl.lookbackMinutes,
+                            maxSessionsPerRun: cl.maxSessionsPerRun,
+                            maxCharsPerSession: cl.maxCharsPerSession,
+                            maxExistingLogChars: cl.maxExistingLogChars,
+                            timeoutMs: cl.timeoutMs,
+                            excludeChatTypes: cl.excludeChatTypes,
+                            signal,
                         }));
                     }
                 }
@@ -124,21 +162,34 @@ export function registerStewardRuntime(api, options) {
         if (graceTimer)
             clearTimeout(graceTimer);
     };
-    const enabled = api.registrationMode !== "cli-metadata" && options.config.enabled && options.config.peopleShadow.enabled;
+    const enabled = api.registrationMode !== "cli-metadata" && options.config.enabled &&
+        (options.config.peopleShadow.enabled || options.config.captainsLog.enabled);
     if (enabled) {
         api.on("gateway_start", () => {
             if (timer)
                 clearInterval(timer);
             if (lifetime.signal.aborted)
                 lifetime = new AbortController();
-            const intervalMs = options.config.peopleShadow.intervalMinutes * 60_000;
+            const intervals = [];
+            if (options.config.peopleShadow.enabled)
+                intervals.push(options.config.peopleShadow.intervalMinutes);
+            if (options.config.captainsLog.enabled)
+                intervals.push(options.config.captainsLog.intervalMinutes);
+            const intervalMs = Math.max(1, Math.min(...intervals)) * 60_000;
             timer = setInterval(() => { void tick(); }, intervalMs);
             timer.unref();
             void tick();
         });
         api.on("gateway_stop", stop);
     }
-    return { owner, tick, stop, lastResults: () => new Map(lastResults), enabled };
+    return {
+        owner,
+        tick,
+        stop,
+        lastResults: () => new Map(lastResults),
+        lastCaptainsLogResults: () => new Map(lastCaptainsLogResults),
+        enabled,
+    };
 }
 /* ═════════════════════════ CLI ═════════════════════════ */
 function summarize(items) {
@@ -149,7 +200,7 @@ function summarize(items) {
     }
     return byKind;
 }
-function registerStewardCli(api, options, dbPathForAgent, openWorkStore) {
+function registerStewardCli(api, options, dbPathForAgent, openWorkStore, transcriptDbForAgent, workspaceDirForAgent) {
     const knownAgent = (cfg, agentId) => {
         if (!(options.listAgents ?? listAgentIds)(cfg).includes(agentId))
             throw new Error("Unknown steward agent");
@@ -165,7 +216,7 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore) {
         }
     };
     api.registerCli(({ program, config: cfg }) => {
-        const root = program.command("memory-steward").description("Steward background work: status, People shadow report, re-drive");
+        const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, re-drive");
         root.command("status").description("Work item counts by kind/status plus the quarantined backlog")
             .option("--agent <id>", "Agent id", "main").option("--kind <kind>", "Filter one work kind")
             .action((opts) => {
@@ -176,16 +227,54 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore) {
                     agentId: opts.agent,
                     enabled: options.config.enabled,
                     peopleShadow: options.config.peopleShadow.enabled,
+                    peopleMode: options.config.peopleShadow.mode,
+                    captainsLog: options.config.captainsLog.enabled,
                     counts: summarize(items),
                     quarantined: items.filter(item => item.status === "quarantined")
                         .map(({ kind, scope, strikes, lastError }) => ({ kind, scope, strikes, lastError })),
                 }, null, 2));
             });
         });
-        root.command("shadow-report").description("Side-by-side People shadow proposals vs cron receipts (read-only)")
+        root.command("shadow-report").description("Side-by-side People Steward proposals/publications vs cron receipts (read-only)")
             .option("--agent <id>", "Agent id", "main").option("--manifest <id>", "One people-learning run id, e.g. nightly:2026-11-25")
             .action((opts) => {
             console.log(JSON.stringify(buildPeopleShadowReport(knownAgent(cfg, opts.agent), opts.manifest), null, 2));
+        });
+        root.command("captains-log").description("Run or preview Steward Captain's Log distillation for one agent")
+            .option("--agent <id>", "Agent id", "main").option("--dry-run", "Preview entries without writing or moving watermarks", false)
+            .action(async (opts) => {
+            const dbPath = knownAgent(cfg, opts.agent);
+            const runner = options.createRunner();
+            if (!runner) {
+                console.log(JSON.stringify({ status: "disabled" }));
+                process.exitCode = 1;
+                return;
+            }
+            const store = openWorkStore(dbPath);
+            try {
+                const cl = options.config.captainsLog;
+                const result = await runCaptainsLogPass({
+                    agentId: opts.agent,
+                    databasePath: transcriptDbForAgent(cfg, opts.agent),
+                    workspaceDir: workspaceDirForAgent(cfg, opts.agent),
+                    workStore: store,
+                    runner,
+                    owner: `steward-cli:${process.pid}:${randomUUID()}`,
+                    timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
+                    intervalMinutes: cl.intervalMinutes,
+                    lookbackMinutes: cl.lookbackMinutes,
+                    maxSessionsPerRun: cl.maxSessionsPerRun,
+                    maxCharsPerSession: cl.maxCharsPerSession,
+                    maxExistingLogChars: cl.maxExistingLogChars,
+                    timeoutMs: cl.timeoutMs,
+                    excludeChatTypes: cl.excludeChatTypes,
+                    dryRun: Boolean(opts.dryRun),
+                });
+                console.log(JSON.stringify(result, null, 2));
+            }
+            finally {
+                store.close();
+            }
         });
         root.command("requeue").description("Explicitly re-drive one quarantined or completed work item")
             .requiredOption("--scope <scope>", "Exact work scope").option("--kind <kind>", "Work kind", PEOPLE_SHADOW_KIND)
@@ -206,5 +295,5 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore) {
                 console.log(JSON.stringify({ status: "requeued", item: store.get(opts.kind, opts.scope) }, null, 2));
             });
         });
-    }, { descriptors: [{ name: "memory-steward", description: "Steward background work status and People shadow report", hasSubcommands: true }] });
+    }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report and Captain's Log", hasSubcommands: true }] });
 }

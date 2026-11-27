@@ -1,4 +1,7 @@
-import type { DecisionModelPluginConfig } from "./config.js";
+import type { ChatType, DecisionModelPluginConfig } from "./config.js";
+declare const efforts: readonly ["off", "minimal", "low", "medium", "high", "xhigh"];
+declare const peopleModes: readonly ["publish", "shadow"];
+declare const confidences: readonly ["high", "medium", "low"];
 type StewardDeepThoughtConfig = {
     enabled: boolean;
     /** Maximum investigation turns (`0` = unlimited). */
@@ -36,11 +39,37 @@ type StewardDeepThoughtConfig = {
 };
 type StewardPeopleShadowConfig = {
     enabled: boolean;
+    /** `"publish"` (default) applies verified dossier updates and retires legacy people-learning crons; `"shadow"` is proposal-only. */
+    mode: typeof peopleModes[number];
     intervalMinutes: number;
+    /** Maximum items per pass (`0` = unlimited). */
     maxItemsPerRun: number;
+    /** Per-item model timeout in ms (`0` = unlimited). */
     timeoutMs: number;
+    /** Lowest proposal confidence that may mutate/verify a dossier in publish mode. */
+    minConfidence: typeof confidences[number];
+    /** Evidence handles per packet (`0` = unlimited). */
+    maxHandles: number;
+    /** Characters per evidence excerpt (`0` = unlimited). */
+    maxExcerptChars: number;
+    /** Largest export file read in bytes (`0` = unlimited). */
+    maxExportBytes: number;
 };
-declare const efforts: readonly ["off", "minimal", "low", "medium", "high", "xhigh"];
+type StewardCaptainsLogConfig = {
+    enabled: boolean;
+    intervalMinutes: number;
+    lookbackMinutes: number;
+    /** Maximum eligible sessions distilled per run (`0` = unlimited). */
+    maxSessionsPerRun: number;
+    /** Character budget per session transcript excerpt (`0` = unlimited). */
+    maxCharsPerSession: number;
+    /** Character budget for existing daily log tail (`0` = unlimited). */
+    maxExistingLogChars: number;
+    /** Model timeout in ms (`0` = unlimited). */
+    timeoutMs: number;
+    /** Chat types excluded from workspace `memory/YYYY-MM-DD.md` distillation (default: `["direct"]`). */
+    excludeChatTypes: ChatType[];
+};
 export type StewardConfig = {
     enabled: boolean;
     model: string;
@@ -51,6 +80,7 @@ export type StewardConfig = {
     maxActiveBackground: number;
     deepThought: StewardDeepThoughtConfig;
     peopleShadow: StewardPeopleShadowConfig;
+    captainsLog: StewardCaptainsLogConfig;
 };
 export declare function resolveStewardConfig(value: unknown): StewardConfig;
 /** Bind the runner's resolveApiKey callback to its destination. Never inherit another origin's key. */

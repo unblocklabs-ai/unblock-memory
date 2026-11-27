@@ -6,6 +6,20 @@ import { learningForAgent } from "./people-learning-config.js";
 import { resolveTimezone } from "./session-projector.js";
 import { peopleLearningPrompt } from "./people-learning-prompt.js";
 const PREFIX = "unblock-memory:people-learning:";
+/**
+ * Marks a People Learning cron that was disabled because Steward publishes People Learning directly.
+ * The job (and its run history) is preserved so switching Steward back to shadow mode re-enables it.
+ */
+export const STEWARD_MANAGED_MARKER = "[steward-managed]";
+const MIGRATION_PAUSED_MARKER = "[migration-paused]";
+function stewardManaged(job) {
+    return typeof job.description === "string" && job.description.includes(STEWARD_MANAGED_MARKER);
+}
+function withoutStewardMarker(description) {
+    if (typeof description !== "string")
+        return undefined;
+    return description.split(STEWARD_MANAGED_MARKER).join("").replace(/\s+$/u, "");
+}
 const legacyNames = {
     nightly: "People Whisperer — nightly dreaming and interaction learning",
     weekly: "People Whisperer — full weekly statement validation",
@@ -43,7 +57,8 @@ export const LEARNING_TOOLS = ["read", "memory_people_learning", "memory_people_
 /** Service-owned cron, not bundled-only scheduleSessionTurn.
  * Stable declarations make a lost add response/reload safe. Legacy history stays on disabled originals.
  */
-export async function reconcilePeopleLearning(cron, cfg, config, active = () => true, onRecognize) {
+export async function reconcilePeopleLearning(cron, cfg, config, active = () => true, onRecognize, reconcileOptions = {}) {
+    const stewardOwned = reconcileOptions.stewardOwnsPublishing === true;
     const all = await cron.list({ includeDisabled: true });
     if (!Array.isArray(all))
         throw new Error("Unsupported service cron.list response");
@@ -82,14 +97,31 @@ export async function reconcilePeopleLearning(cron, cfg, config, active = () => 
     for (const { agentId, kind, options, key, matches } of planned) {
         const primary = matches.find(job => job.declarationKey === key);
         const legacy = matches.filter(job => job.declarationKey !== key);
+        // Legacy originals that Steward (not the operator) disabled are not an operator pause.
         const migrationPaused = config.agents?.[agentId]?.enabled !== true &&
-            (primary ? String(primary.description).includes("[migration-paused]") : legacy.length > 0 && legacy.every(job => job.enabled === false));
-        const enabled = options.enabled && options[kind] && !migrationPaused;
+            (primary ? String(primary.description).includes(MIGRATION_PAUSED_MARKER)
+                : legacy.length > 0 && legacy.every(job => job.enabled === false && !stewardManaged(job)));
+        if (stewardOwned && !primary) {
+            // Never create a declaration while Steward publishes. Pause exact legacy originals, keeping their history.
+            for (const job of legacy) {
+                if (!active())
+                    return result;
+                if (job.enabled === false && stewardManaged(job))
+                    continue;
+                if (job.enabled === false)
+                    continue; // An operator pause stays exactly as the operator left it.
+                await cron.update(String(job.id), { enabled: false,
+                    description: `${withoutStewardMarker(job.description) ?? ""} ${STEWARD_MANAGED_MARKER}`.trim() });
+            }
+            continue;
+        }
+        const enabled = !stewardOwned && options.enabled && options[kind] && !migrationPaused;
         if (!primary && !legacy.length && !enabled)
             continue;
         const desired = {
             declarationKey: key, agentId, name: key,
-            description: "Plugin-owned private People Whisperer review; opt out in people.learning." + (migrationPaused ? " [migration-paused]" : ""),
+            description: "Plugin-owned private People Whisperer review; opt out in people.learning." +
+                (migrationPaused ? ` ${MIGRATION_PAUSED_MARKER}` : "") + (stewardOwned ? ` ${STEWARD_MANAGED_MARKER}` : ""),
             enabled, schedule: {
                 kind: "cron", expr: options[`${kind}Schedule`],
                 tz: options.timezone ?? resolveTimezone(cfg.agents?.defaults?.userTimezone), staggerMs: 0,
