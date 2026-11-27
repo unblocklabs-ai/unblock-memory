@@ -1,7 +1,7 @@
 import { DEFAULTS } from "./defaults.js";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import { EXTRACTED_COLLECTION, EXTRACTED_PREFIX, extractedRecords, extractedPath, extractedHit, extractedUri, syncExtractedIndex } from "./extraction-index.js";
 import chokidar from "chokidar";
@@ -9,7 +9,9 @@ import picomatch from "picomatch";
 import { isScalar, parseDocument } from "yaml";
 import { ensureMemoryAnalysisSchema, latestAnalysisCollections, latestAnalysisRunId, markMemoryAnalysisStale, readAnalysisSummary, readCluster, readClusters, runAnalysisWorker, } from "./analysis.js";
 import { CurationStore, chunkFingerprint, } from "./curation.js";
-import { projectionHash, readSessionManifest, sessionMetadataByPath, syncSessionProjections, PROJECTOR_VERSION, } from "./session-sync.js";
+import { projectionHash, sessionMetadataByPath, syncSessionProjections, PROJECTOR_VERSION, } from "./session-sync.js";
+import { SessionSyncState } from "./session-sync-state.js";
+import { openMemoryDatabase } from "./memory-database.js";
 import { parseSessionMessageSpans, sessionContextSpans, sessionSnippetMessages } from "./session-projector.js";
 import { parseSafeVirtualPath, resolveConfiguredSkillPath, sourceMatchesPath } from "./sources.js";
 import { auditQualityPage } from "./quality-audit.js";
@@ -290,7 +292,9 @@ export class QmdMemoryManager {
     #dirty = true;
     #sessionMetadata = new Map();
     #sessionManifest;
-    #sessionManifestMtimeNs;
+    #sessionManifestRevision;
+    #sessionStateDb;
+    #sessionState;
     #skillCatalog;
     #skillIndex;
     #qualityAuditRunning = false;
@@ -309,7 +313,7 @@ export class QmdMemoryManager {
             await this.#operationChain;
             const store = await this.#getStore();
             const status = await store.getStatus();
-            const manifest = this.#sessions ? await readSessionManifest(this.#sessions.manifestPath) : undefined;
+            const manifest = this.#sessions ? this.#getSessionState().readManifest() : undefined;
             return {
                 projectorVersion: PROJECTOR_VERSION,
                 semanticChunkingVersion: "semanticChunkingVersion" in status ? status.semanticChunkingVersion : null,
@@ -349,32 +353,39 @@ export class QmdMemoryManager {
         await this.sync({ reason: "first-use" });
         await this.#watchReady;
     }
-    async #manifestMtimeNs(path) {
-        try {
-            return (await stat(path, { bigint: true })).mtimeNs;
+    #getSessionState() {
+        this.#assertOpen();
+        const sessions = this.#sessions;
+        if (!sessions)
+            throw new Error('memory session sync requires a configured "sessions" corpus');
+        if (!this.#sessionState) {
+            const db = openMemoryDatabase(sessions.statePath);
+            try {
+                this.#sessionState = new SessionSyncState(db, sessions.agentId, sessions.legacyStateDir);
+            }
+            catch (error) {
+                db.close();
+                throw error;
+            }
+            this.#sessionStateDb = db;
         }
-        catch (error) {
-            if (error.code === "ENOENT")
-                return undefined;
-            throw error;
-        }
+        return this.#sessionState;
     }
     async #reloadSessionMetadata() {
-        const sessions = this.#sessions;
-        if (!sessions)
+        if (!this.#sessions)
             return;
-        const mtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
-        const manifest = await readSessionManifest(sessions.manifestPath);
+        const state = this.#getSessionState();
+        // Revision first: a concurrent write then only causes one extra reload, never a missed one.
+        const revision = state.revision();
+        const manifest = state.readManifest();
         this.#sessionMetadata = sessionMetadataByPath(manifest);
         this.#sessionManifest = manifest;
-        this.#sessionManifestMtimeNs = mtimeNs;
+        this.#sessionManifestRevision = revision;
     }
     async #refreshSessionMetadata() {
-        const sessions = this.#sessions;
-        if (!sessions)
+        if (!this.#sessions)
             return false;
-        const mtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
-        if (mtimeNs === this.#sessionManifestMtimeNs)
+        if (this.#getSessionState().revision() === this.#sessionManifestRevision)
             return false;
         await this.#reloadSessionMetadata();
         return true;
@@ -494,11 +505,13 @@ export class QmdMemoryManager {
             dbPath: this.#dbPath,
             keepModelsWarm: this.#keepModelsWarm,
             config: {
-                collections: Object.fromEntries([...this.#indexSources.map((source) => [
+                collections: Object.fromEntries(
+                // Sessions and extracted facts are QMD projected collections: written through the store, never globbed.
+                [...this.#indexSources.map((source) => [
                         source.collection,
-                        { path: source.root, pattern: source.pattern },
+                        source.kind === "sessions" ? { projected: true } : { path: source.root, pattern: source.pattern },
                     ]), ...(this.#publishedExtraction
-                        ? [[EXTRACTED_COLLECTION, { path: dirname(this.#dbPath), pattern: ".no-extracted-files", includeByDefault: false }]] : [])]),
+                        ? [[EXTRACTED_COLLECTION, { projected: true, includeByDefault: false }]] : [])]),
             },
         });
         try {
@@ -593,7 +606,7 @@ export class QmdMemoryManager {
             : allowed;
     }
     async #updateAndEmbed(store, collections, force) {
-        // Extracted facts are DB projections, not files: never run filesystem sync on them.
+        // Sessions and extracted facts are QMD projected collections: `update()` never globs them.
         const analysisStore = store;
         let changedDocuments = 0;
         try {
@@ -655,32 +668,70 @@ export class QmdMemoryManager {
             }
         });
     }
-    syncSessions(force = false, onPhase) {
+    syncSessions(force = false, onPhase, options = {}) {
         return this.#enqueue(async () => {
             const sessions = this.#sessions;
             if (!sessions)
                 throw new Error('memory session sync requires a configured "sessions" corpus');
             onPhase?.("projecting");
+            const state = this.#getSessionState();
+            const store = await this.#getStore();
             const synced = await syncSessionProjections({
-                ...sessions,
+                databasePath: sessions.databasePath,
+                agentId: sessions.agentId,
+                agentName: sessions.agentName,
+                timezone: sessions.timezone,
+                chatTypes: sessions.chatTypes,
                 force,
-                indexPath: this.#dbPath,
-                indexReady: async () => (await (await this.#getStore()).getStatus()).needsEmbedding === 0,
-                index: async () => {
-                    onPhase?.("indexing");
-                    const store = await this.#getStore();
-                    return this.#updateAndEmbed(store, [sessions.collection]);
-                },
+                signal: options.signal,
+                state: { read: () => state.readManifest(), write: options.persist ?? (manifest => state.writeManifest(manifest)) },
+                index: this.#sessionIndex(store, sessions.collection),
+                onIndexing: () => onPhase?.("indexing"),
             });
             this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
             this.#sessionManifest = synced.manifest;
-            this.#sessionManifestMtimeNs = await this.#manifestMtimeNs(sessions.manifestPath);
+            this.#sessionManifestRevision = state.revision();
             if (synced.result.skipReason)
                 return synced.result;
-            const store = await this.#getStore();
             await this.#refreshIndexStatus(store);
             return synced.result;
         });
+    }
+    /** QMD projected-collection adapter: session transcripts go straight into the index, never to disk. */
+    #sessionIndex(store, collection) {
+        const analysis = store;
+        let removed = 0;
+        const changed = (count) => {
+            if (count > 0 && analysis.internal)
+                markMemoryAnalysisStale(analysis.internal.db);
+            return count;
+        };
+        return {
+            path: this.#dbPath,
+            generation: () => store.getCollectionGeneration(collection),
+            upsert: async ({ path, content, createdAt, modifiedAt }) => changed(Number((await store.upsertDocument(collection, path, content, { createdAt, modifiedAt })).changed)) > 0,
+            retract: async (path) => {
+                const { deactivated } = await store.retractDocument(collection, path);
+                if (deactivated)
+                    removed += changed(1);
+                return deactivated;
+            },
+            replace: async (documents) => {
+                const result = await store.syncProjectedCollection(collection, documents, { cleanup: true });
+                removed += result.retracted;
+                return changed(result.upserted + result.retracted);
+            },
+            embed: async () => {
+                // Securely purge retracted transcript plaintext and vectors once per run, before embedding.
+                if (removed > 0)
+                    this.#cleanupRemovedDocuments?.(removed);
+                removed = 0;
+                const result = await store.embed({ collection, chunkStrategy: "semantic" });
+                this.#recordEmbedding(result);
+                return changed(completedEmbeddingCount(result));
+            },
+            ready: async () => (await store.getStatus()).needsEmbedding === 0,
+        };
     }
     recluster(options, signal) {
         return this.#enqueue(async () => {
@@ -1329,5 +1380,8 @@ export class QmdMemoryManager {
         this.#storePromise = undefined;
         this.#curation?.close();
         this.#curation = undefined;
+        this.#sessionStateDb?.close();
+        this.#sessionStateDb = undefined;
+        this.#sessionState = undefined;
     }
 }

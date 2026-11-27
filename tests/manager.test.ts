@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, mkdtempDisposable, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import chokidar from "chokidar";
@@ -17,10 +18,12 @@ import {
 import { clusterReference, ensureMemoryAnalysisSchema } from "../src/analysis.js";
 import { DEFAULTS } from "../src/defaults.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSource, resolveSources } from "../src/sources.js";
-import { createAgentDatabase } from "./helpers/session-database.js";
+import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 import { reviewFixture } from "./helpers/review-store.js";
+import { listFiles, sqliteSessionState } from "./helpers/session-index.js";
 import { projectSessionDocument } from "../src/session-projector.js";
-import { readSessionManifest } from "../src/session-sync.js";
+import { MEMORY_DATABASE } from "../src/memory-database.js";
+import type { SessionManifest } from "../src/session-sync-state.js";
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -45,6 +48,25 @@ async function assertMarkerAbsent(dbPath: string, marker: string): Promise<void>
 
 type ManagerStoreOverrides = Partial<ManagerStore> & Partial<Pick<QMDStore, "internal">>;
 
+/** No-op projected-collection API for fake stores (sessions/extracted are QMD projected collections). */
+const projectedStoreDefaults = {
+  async upsertDocument() { return { changed: false, hash: "", docid: "", generation: 0 }; },
+  async retractDocument() { return { deactivated: false, generation: 0 }; },
+  async syncProjectedCollection() { return { upserted: 0, unchanged: 0, retracted: 0, embedded: 0, generation: 0 }; },
+  async getCollectionGeneration() { return 0; },
+} satisfies Pick<ManagerStore, "upsertDocument" | "retractDocument" | "syncProjectedCollection" | "getCollectionGeneration">;
+
+/** Session manifests live in `unblock-memory.sqlite` (no `sessions-manifest.json`). */
+function writeSessionManifest(statePath: string, manifest: unknown): void {
+  const sqlite = sqliteSessionState(statePath);
+  try { sqlite.state.writeManifest(manifest as SessionManifest); } finally { sqlite.close(); }
+}
+
+function readSessionManifest(statePath: string): SessionManifest {
+  const sqlite = sqliteSessionState(statePath);
+  try { return sqlite.state.readManifest(); } finally { sqlite.close(); }
+}
+
 function createManagerStore(
   overrides: ManagerStoreOverrides = {},
 ): ManagerStore & Partial<Pick<QMDStore, "internal">> {
@@ -62,6 +84,7 @@ function createManagerStore(
     async vsearch() { return []; },
     async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
     async close() {},
+    ...projectedStoreDefaults,
     ...overrides,
   };
 }
@@ -362,6 +385,7 @@ test("watches modified and new Markdown, retries failed refreshes, and stops on 
     async vsearch() { return []; },
     async get(query: string) { return { error: "not_found" as const, query, similarFiles: [] }; },
     async close() {},
+    ...projectedStoreDefaults,
   } satisfies ManagerStore;
 
   const manager = new QmdMemoryManager({
@@ -1111,12 +1135,9 @@ test("session search retains matched evidence within hint budgets without changi
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-search-sessions-"));
   const sessionsDir = join(root, "sessions");
   const documentPath = "slack/channel/workspace/C123/2026-08-25T14-00-00Z--session-1.md";
-  const document = join(sessionsDir, documentPath);
-  await mkdir(join(document, ".."), { recursive: true });
-  await writeFile(document, "session body\n");
   const source = resolveSessionSource(sessionsDir, ["channel", "group"]);
-  const manifestPath = join(root, "sessions-manifest.json");
-  await writeFile(manifestPath, JSON.stringify({
+  const statePath = join(root, MEMORY_DATABASE);
+  writeSessionManifest(statePath, {
     version: 1,
     sessions: {
       "session-1": {
@@ -1135,7 +1156,7 @@ test("session search retains matched evidence within hint budgets without changi
         projectorVersion: 1,
       },
     },
-  }));
+  });
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   assert.ok(backing.internal.llm);
   t.mock.method(backing.internal.llm, "countTokens", async (text: string) => text.split(/\s+/u).length);
@@ -1174,8 +1195,7 @@ test("session search retains matched evidence within hint budgets without changi
       maxExpandedTokens: 500,
       collection: source.collection,
       databasePath: join(root, "openclaw-agent.sqlite"),
-      manifestPath,
-      outputDir: sessionsDir,
+      statePath,
       timezone: "UTC",
     },
   });
@@ -1227,10 +1247,10 @@ test("session search retains matched evidence within hint budgets without changi
       }] })!;
     body = projection.content;
     bestChunk = fact;
-    const manifest = await readSessionManifest(manifestPath);
+    const manifest = readSessionManifest(statePath);
     manifest.sessions["session-1"]!.messages = projection.messages;
     manifest.sessions["session-1"]!.projectionHash = createHash("sha256").update(body).digest("hex");
-    await writeFile(manifestPath, JSON.stringify(manifest));
+    writeSessionManifest(statePath, manifest);
     const [structured] = await manager.search("approval");
     assert.deepEqual(structured.sessionMessages, [{ type: "assistant", name: "Agent",
       timestamp: "2026-09-22 12:00:00 UTC", body: literal }]);
@@ -1260,7 +1280,7 @@ test("filters session paths without restricting file corpora", async () => {
   const firstPath = "slack/channel/workspace/C123/first.md";
   const secondPath = "discord/group/team/G456/second.md";
   const startedAt = Date.parse("2026-08-25T12:00:00Z");
-  const manifestPath = join(root, "sessions-manifest.json");
+  const statePath = join(root, MEMORY_DATABASE);
   const manifest = {
     version: 1,
     sessions: {
@@ -1284,7 +1304,7 @@ test("filters session paths without restricting file corpora", async () => {
       },
     },
   };
-  await writeFile(manifestPath, JSON.stringify(manifest));
+  writeSessionManifest(statePath, manifest);
   const hits = [
     { file: `qmd://${memory.collection}/MEMORY.md`, body: "file memory" },
     { file: `qmd://${sessions.collection}/${firstPath}`, body: "first session" },
@@ -1328,8 +1348,7 @@ test("filters session paths without restricting file corpora", async () => {
       maxExpandedTokens: 500,
       collection: sessions.collection,
       databasePath: join(root, "openclaw-agent.sqlite"),
-      manifestPath,
-      outputDir: sessionsDir,
+      statePath,
       timezone: "UTC",
     },
   });
@@ -1355,7 +1374,7 @@ test("filters session paths without restricting file corpora", async () => {
     assert.deepEqual(receivedFilters[1], { [sessions.collection]: [] });
 
     manifest.sessions.first.provider = "teams";
-    await writeFile(manifestPath, JSON.stringify(manifest));
+    writeSessionManifest(statePath, manifest);
     await manager.search("decision", {
       corpora: ["sessions"],
       sessionFilter: { provider: "teams" },
@@ -1405,8 +1424,7 @@ test("keeps analysis fresh for a no-op manual session sync", async () => {
       maxExpandedTokens: 500,
       collection: source.collection,
       databasePath,
-      manifestPath: join(root, "sessions-manifest.json"),
-      outputDir: sessionsDir,
+      statePath: join(root, MEMORY_DATABASE),
       timezone: "UTC",
     },
   });
@@ -1948,25 +1966,30 @@ test("coalesces concurrent store opens, fences in-flight reads/skills against cl
   assert.equal(lateStoreClosed, true);
 });
 
-test("in-process syncSessions updates cached manifest mtime so the next search does not reload", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "unblock-memory-session-mtime-"));
+test("syncSessions writes projected sessions straight into QMD: memory_get reads them with zero files on disk", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-session-projected-"));
   const databasePath = join(root, "openclaw-agent.sqlite");
   const sessionsDir = join(root, "sessions");
-  const manifestPath = join(root, "sessions-manifest.json");
+  const statePath = join(root, MEMORY_DATABASE);
   const source = resolveSessionSource(sessionsDir, ["channel", "group"]);
-  createAgentDatabase(databasePath).close();
+  const agent = createAgentDatabase(databasePath);
+  insertSession(agent, { sessionId: "projected", chatType: "channel",
+    message: { type: "message", message: { role: "user", content: "Projected straight into QMD" } } });
+  agent.close();
   const backing = await createStore({
     dbPath: join(root, "index.sqlite"),
-    config: { collections: { [source.collection]: { path: source.root, pattern: source.pattern } } },
+    config: { collections: { [source.collection]: { projected: true } } },
   });
   backing.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
   t.mock.method(backing.internal, "searchVec", async () => []);
   t.mock.method(backing, "update", async () => ({
     collections: 1, indexed: 0, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0,
   }));
-  t.mock.method(backing, "embed", async () => ({
-    docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0,
-  }));
+  const embedded: unknown[] = [];
+  t.mock.method(backing, "embed", async (options: unknown) => {
+    embedded.push(options);
+    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+  });
   const manager = new QmdMemoryManager({
     dbPath: backing.dbPath,
     workspaceDir: root,
@@ -1979,20 +2002,37 @@ test("in-process syncSessions updates cached manifest mtime so the next search d
       maxExpandedTokens: 500,
       collection: source.collection,
       databasePath,
-      manifestPath,
-      outputDir: sessionsDir,
+      statePath,
       timezone: "UTC",
     },
   });
   try {
     await manager.start();
-    await manager.syncSessions();
+    const result = await manager.syncSessions();
+    assert.equal(result.updated, 1);
+    assert.ok(embedded.some(options => JSON.stringify(options) === JSON.stringify({ collection: source.collection, chunkStrategy: "semantic" })));
+    const manifest = readSessionManifest(statePath);
+    const documentPath = manifest.sessions.projected!.documentPath;
+    assert.equal(manifest.generation, await backing.getCollectionGeneration(source.collection));
+    const read = await manager.readFile({ relPath: `qmd://${source.collection}/${documentPath}` });
+    assert.equal(read.status, "ok");
+    assert.match(read.text, /Projected straight into QMD/);
+    assert.equal(listFiles(root).some(file => file.endsWith(".md")), false, "no Markdown transport on disk");
+    assert.deepEqual(listFiles(root).filter(file => /sessions|manifest|session-sync|\.json$/u.test(file)), []);
+    // The cached manifest revision matches, so the next search does not reload metadata.
     const timings: { metadataReloads?: number } = {};
     await manager.searchCandidates({ lex: "anything", vec: "anything" }, {
       corpora: ["sessions"],
       timings,
     });
     assert.equal(timings.metadataReloads, 0);
+
+    // A vanished session is retracted from QMD (and memory_get no longer finds it).
+    const removed = new DatabaseSync(databasePath);
+    removed.prepare("DELETE FROM session_windows WHERE session_id = 'projected'").run();
+    removed.close();
+    assert.equal((await manager.syncSessions()).removed, 1);
+    assert.equal((await manager.readFile({ relPath: `qmd://${source.collection}/${documentPath}` })).status, "not_found");
   } finally {
     await manager.close();
   }

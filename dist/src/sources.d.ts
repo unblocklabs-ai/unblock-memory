@@ -10,6 +10,10 @@ export type ResolvedSource = {
     chatTypes?: readonly ChatType[];
 };
 export declare function resolveSource(workspaceDir: string, configuredPath: string, corpus?: string): ResolvedSource;
+/**
+ * Sessions are a QMD projected collection: documents live only in the index, never on disk. The legacy
+ * projection directory still names the collection so upgraded indexes keep their document identities.
+ */
 export declare function resolveSessionSource(sessionsDir: string, chatTypes: readonly ChatType[]): ResolvedSource;
 export declare function resolveSources(workspaceDir: string, corpora: readonly (FileCorpusConfig | SkillCorpusConfig)[]): ResolvedSource[];
 export declare function resolveConfiguredSkillPath(workspaceDir: string, inputPath: string, sources: readonly ResolvedSource[]): string | undefined;

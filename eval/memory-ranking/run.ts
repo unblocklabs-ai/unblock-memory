@@ -12,7 +12,8 @@ import { resolveSources, resolveSessionSource } from "../../src/sources.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "../../src/decision-ranking.js";
 import { resolveDecisionCredential, DecisionRequestError } from "../../src/decision-client.js";
 import { collectSearches, hash, record, searchQueries, type SearchCase } from "./cases.js";
-import type { SessionManifest } from "../../src/session-sync.js";
+import { readSessionManifestSnapshot, type SessionManifest } from "../../src/session-sync-state.js";
+import { MEMORY_DATABASE } from "../../src/memory-database.js";
 import { blindCase, retrieve, type Judgment, type Retrieval } from "./ranking.js";
 
 const usage = "run.ts --database AGENT.sqlite --state-dir MEMORY_DIR --config OPENCLAW.json --out NEW_DIR [--n 10] [--cases FROZEN.jsonl] [--agent main] [--workspace PATH] [--resume]";
@@ -89,9 +90,8 @@ async function main() {
     };
     const db = new Database(join(stateDir, "index.sqlite"), { readonly: true, fileMustExist: true });
     try { await db.backup(snapshot); } finally { db.close(); }
-    const sessionManifestPath = join(stateDir, "sessions-manifest.json");
-    save("sessions-manifest.json", existsSync(sessionManifestPath)
-      ? JSON.parse(readFileSync(sessionManifestPath, "utf8")) : { version: 1, sessions: {} });
+    // The plugin keeps this in unblock-memory.sqlite now; the eval output keeps its snapshot file name.
+    save("sessions-manifest.json", readSessionManifestSnapshot(join(stateDir, MEMORY_DATABASE), values.agent!, stateDir));
     const qmdPackage = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.resolve("@unblocklabs/qmd"))), "../package.json"), "utf8"));
     save("manifest.json", { createdAt: new Date().toISOString(), requestedSearches: count, searches: cases.length,
       turns: new Set(cases.map(c => `${c.sessionId}:${c.userEventSeq}`)).size, sessions: new Set(cases.map(c => c.sessionId)).size,

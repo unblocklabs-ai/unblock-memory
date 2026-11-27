@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { setImmediate } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,9 @@ import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { QmdMemoryManager } from "../src/manager.js";
 import { resolveSource, resolveSessionSource } from "../src/sources.js";
 import { memoryPassageId, searchMemory } from "../src/memory-search.js";
+import { MEMORY_DATABASE } from "../src/memory-database.js";
+import type { SessionManifest } from "../src/session-sync-state.js";
+import { sqliteSessionState } from "./helpers/session-index.js";
 
 test("fallback ranks a real vector-only top match above a full lexical candidate lane", async t => {
   const root = await mkdtemp(join(tmpdir(), "memory-fallback-order-"));
@@ -85,7 +88,7 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   const files = resolveSource(root, "*.md", "memory");
   const sessions = resolveSessionSource(join(root, "sessions"), ["channel", "direct"]);
   const qmd = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: Object.fromEntries(
-    [files, sessions].map(source => [source.collection, { path: source.root, pattern: source.pattern }]),
+    [[files.collection, { path: files.root, pattern: files.pattern }], [sessions.collection, { projected: true }]],
   ) } });
   const docs = [
     { collection: files.collection, path: "keyword.md", text: "Exactneedle rollout was approved by Bek.", vector: [0, 1] },
@@ -96,9 +99,9 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
   ];
   qmd.internal.ensureVecTable(2);
   const model = qmd.internal.llm!.embedModelName;
-  await mkdir(sessions.root, { recursive: true });
   for (const [index, doc] of docs.entries()) {
-    await writeFile(join(doc.collection === files.collection ? files.root : sessions.root, doc.path), doc.text);
+    // Sessions are projected: only file memory exists on disk.
+    if (doc.collection === files.collection) await writeFile(join(files.root, doc.path), doc.text);
     const hash = `search-e2e-${index}`;
     qmd.internal.insertContent(hash, doc.text, "2026-10-10");
     qmd.internal.insertDocument(doc.collection, doc.path, "Evidence", hash, "2026-10-10", "2026-10-10");
@@ -109,13 +112,15 @@ test("explicit two-query search retrieves, scopes, deduplicates and judges real 
     embeddings.push(query);
     return { embedding: [1, 0], model };
   });
-  const manifestPath = join(root, "sessions-manifest.json");
-  await writeFile(manifestPath, JSON.stringify({ version: 1, sessions: Object.fromEntries(["channel", "direct"].map(chatType =>
-    [chatType, { sessionId: chatType, provider: "slack", chatType, startedAt: 0, documentPath: `${chatType}.md` }])) }));
+  const statePath = join(root, MEMORY_DATABASE);
+  const sqlite = sqliteSessionState(statePath, "bill");
+  sqlite.state.writeManifest({ version: 1, sessions: Object.fromEntries(["channel", "direct"].map(chatType =>
+    [chatType, { sessionId: chatType, provider: "slack", chatType, startedAt: 0, documentPath: `${chatType}.md` }])) } as unknown as SessionManifest);
+  sqlite.close();
   const manager = new QmdMemoryManager({ dbPath: qmd.dbPath, workspaceDir: root, sources: [files, sessions],
     storeFactory: async () => qmd, sessions: { agentId: "bill", agentName: "Bill", chatTypes: ["channel", "direct"],
-      collection: sessions.collection, databasePath: join(root, "unused.sqlite"), manifestPath,
-      outputDir: sessions.root, timezone: "UTC", maxExpandedTokens: 500 } });
+      collection: sessions.collection, databasePath: join(root, "unused.sqlite"), statePath,
+      timezone: "UTC", maxExpandedTokens: 500 } });
   t.after(() => manager.close());
   type Tool = { execute(id: string, input: unknown, signal?: AbortSignal): Promise<unknown> };
   let factory: ((context: OpenClawPluginToolContext) => Tool | null) | undefined;

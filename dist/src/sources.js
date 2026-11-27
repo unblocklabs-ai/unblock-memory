@@ -60,11 +60,20 @@ export function resolveSource(workspaceDir, configuredPath, corpus = "memory") {
 function resolveFileSource(workspaceDir, configuredPath, corpus) {
     return { ...resolveSource(workspaceDir, configuredPath, corpus.name), kind: corpus.kind };
 }
+/**
+ * Sessions are a QMD projected collection: documents live only in the index, never on disk. The legacy
+ * projection directory still names the collection so upgraded indexes keep their document identities.
+ */
 export function resolveSessionSource(sessionsDir, chatTypes) {
+    const root = resolve(sessionsDir);
     return {
-        ...resolveSource(sessionsDir, sessionsDir, "sessions"),
+        collection: collectionName(root),
+        corpus: "sessions",
         configuredPath: sessionsDir,
         kind: "sessions",
+        root,
+        pattern: "**/*.md",
+        watchPath: root,
         chatTypes,
     };
 }
@@ -123,6 +132,13 @@ export function parseSafeVirtualPath(virtualPath, sources) {
     const portableRelativePath = relativePath.split(sep).join("/");
     if (!picomatch.isMatch(portableRelativePath, source.pattern, { dot: true }))
         return undefined;
+    if (source.kind === "sessions") {
+        // Projected documents exist only in QMD: validate the collection-relative path, never the filesystem.
+        if (relativePath.includes("\\") || relativePath.split("/").some(part => !part || part === "." || part === "..") ||
+            !relativePath.toLowerCase().endsWith(".md"))
+            return undefined;
+        return { source, relativePath, normalized: `qmd://${source.collection}/${relativePath}` };
+    }
     const target = resolve(source.root, relativePath);
     if (escapes(relative(source.root, target)))
         return undefined;

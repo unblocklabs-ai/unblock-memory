@@ -1,35 +1,34 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { readSessionManifest, syncSessionProjections, unchangedSessionSync } from "../src/session-sync.js";
+import { syncSessionProjections, unchangedSessionSync } from "../src/session-sync.js";
+import { MEMORY_DATABASE } from "../src/memory-database.js";
 import { QmdMemoryRuntime } from "../src/runtime.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
+import { fakeSessionIndex, sqliteSessionState } from "./helpers/session-index.js";
 
-async function fixture() {
+async function fixture(t: test.TestContext) {
   const root = await mkdtemp(join(tmpdir(), "session-change-check-"));
   const state = join(root, "agents", "main", "unblock-memory");
   await mkdir(state, { recursive: true });
+  const indexPath = join(state, "index.sqlite");
+  const sqlite = sqliteSessionState(join(state, MEMORY_DATABASE), "main", state);
+  t.after(sqlite.close);
+  const fake = fakeSessionIndex({ path: indexPath });
   const params = {
-    databasePath: join(root, "openclaw-agent.sqlite"),
-    outputDir: join(state, "sessions"), manifestPath: join(state, "sessions-manifest.json"),
-    indexPath: join(state, "index.sqlite"), agentId: "main", agentName: "main",
-    timezone: "UTC", chatTypes: ["channel", "group"] as const,
+    databasePath: join(root, "openclaw-agent.sqlite"), state: sqlite.store,
+    agentId: "main", agentName: "main", timezone: "UTC", chatTypes: ["channel", "group"] as const,
   };
   const db = createAgentDatabase(params.databasePath);
   insertSession(db, { sessionId: "conversation", chatType: "channel",
     message: { type: "message", message: { role: "user", content: "Keep this decision." } } });
   insertSession(db, { sessionId: "empty", chatType: "group" });
   db.close();
-  let indexCalls = 0;
-  const index = async () => {
-    await writeFile(params.indexPath, `index-${++indexCalls}`);
-    return 1;
-  };
   const run = (overrides: Partial<Parameters<typeof syncSessionProjections>[0]> = {}) =>
-    syncSessionProjections({ ...params, index, indexReady: async () => true, ...overrides });
+    syncSessionProjections({ ...params, index: fake.index, ...overrides });
   const append = (role: string, content: string, chat = "conversation") => {
     const db = new DatabaseSync(params.databasePath);
     try {
@@ -40,14 +39,14 @@ async function fixture() {
       db.prepare("INSERT INTO session_transcript_active_events VALUES (?, ?, ?, ?)").run(chat, seq - 1, seq, seq - 1);
     } finally { db.close(); }
   };
-  return { root, params, run, append, calls: () => indexCalls };
+  return { root, indexPath, params, sqlite, fake, run, append, calls: () => fake.stats.embeds };
 }
 
-test("quiet checks avoid manager initialization, persist empty sessions, and respect force", async () => {
-  const f = await fixture();
+test("quiet checks avoid manager initialization, persist empty sessions, and respect force", async (t) => {
+  const f = await fixture(t);
   const first = await f.run();
   assert.ok(first.manifest.ignoredSessions?.empty);
-  const quiet = await unchangedSessionSync(f.params, f.params.indexPath);
+  const quiet = await unchangedSessionSync(f.params, f.indexPath);
   assert.equal(quiet?.skipReason, "no_changes");
   assert.equal(quiet?.lastIndexedAt, first.result.lastIndexedAt);
   assert.equal((await f.run()).result.embedded, 0);
@@ -55,6 +54,7 @@ test("quiet checks avoid manager initialization, persist empty sessions, and res
   const cfg = { agents: { defaults: { userTimezone: "UTC" }, entries: { main: { agentDir: f.root, workspace: f.root } } } };
   const runtime = new QmdMemoryRuntime([{ name: "sessions", kind: "sessions", chatTypes: ["channel", "group"],
     maxExpandedTokens: 500, syncIntervalMinutes: 60 }], { stateRoot: f.root });
+  t.after(() => runtime.close());
   let managerCalls = 0;
   Object.defineProperty(runtime, "getMemorySearchManager", { value: async () => {
     managerCalls++;
@@ -78,90 +78,115 @@ test("quiet checks avoid manager initialization, persist empty sessions, and res
   assert.equal(managerCalls, 1);
 });
 
-test("assistant-only additions index; filtered events only advance the source checkpoint", async () => {
-  const f = await fixture();
+test("assistant-only additions index; filtered events only advance the source checkpoint", async (t) => {
+  const f = await fixture(t);
   const first = await f.run();
   f.append("toolResult", "tool output must not be indexed");
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
   const filtered = await f.run();
   assert.equal(filtered.result.skipReason, "no_indexable_changes");
   assert.equal(filtered.result.lastIndexedAt, first.result.lastIndexedAt);
   assert.equal(f.calls(), 1);
-  assert.equal((await unchangedSessionSync(f.params, f.params.indexPath))?.skipReason, "no_changes");
+  assert.equal((await unchangedSessionSync(f.params, f.indexPath))?.skipReason, "no_changes");
   f.append("assistant", "The final answer arrived after the human message.");
   const answer = await f.run();
   assert.equal(answer.result.updated, 1);
   assert.equal(f.calls(), 2);
-  assert.match(await readFile(join(f.params.outputDir, answer.manifest.sessions.conversation!.documentPath), "utf8"), /final answer/);
+  assert.match(f.fake.content(answer.manifest.sessions.conversation!.documentPath)!, /final answer/);
 });
 
-test("rewrites, removals, config changes and missing projections invalidate skipping", async () => {
-  const f = await fixture();
+test("rewrites, removals, config changes and missing projections invalidate skipping", async (t) => {
+  const f = await fixture(t);
   const first = await f.run();
-  assert.equal(await unchangedSessionSync({ ...f.params, timezone: "America/New_York" }, f.params.indexPath), undefined);
-  await unlink(join(f.params.outputDir, first.manifest.sessions.conversation!.documentPath));
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
-  assert.equal((await f.run()).result.updated, 1);
+  assert.equal(await unchangedSessionSync({ ...f.params, timezone: "America/New_York" }, f.indexPath), undefined);
+  // A projected document vanishing from QMD bumps the collection generation and rewrites the index file.
+  f.fake.documents.clear();
+  f.fake.externalChange();
+  await writeFile(f.indexPath, "external index mutation");
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
+  const replacesBefore = f.fake.stats.replaces;
+  await f.run();
+  assert.equal(f.fake.stats.replaces, replacesBefore + 1, "a generation mismatch reconciles");
+  assert.match(f.fake.content(first.manifest.sessions.conversation!.documentPath)!, /Keep this decision/);
   const db = new DatabaseSync(f.params.databasePath);
   db.prepare("UPDATE transcript_rewrite_watermarks SET generation = 'rewritten' WHERE session_id = 'conversation'").run();
   db.prepare("UPDATE transcript_events SET event_json = ? WHERE session_id = 'conversation'")
     .run(JSON.stringify({ type: "message", message: { role: "user", content: "Corrected decision." } }));
   db.close();
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
   assert.equal((await f.run()).result.updated, 1);
   const removed = new DatabaseSync(f.params.databasePath);
   removed.prepare("DELETE FROM session_windows WHERE session_id = 'conversation'").run();
   removed.close();
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
   assert.equal((await f.run()).result.removed, 1);
-  await unlink(f.params.indexPath);
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  await unlink(f.indexPath);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
   assert.equal((await f.run()).result.embedded, 1);
 });
 
-test("failed/incomplete indexing cannot certify a skip; arrivals during indexing remain pending", async () => {
-  const f = await fixture();
+test("failed/incomplete indexing cannot certify a skip; arrivals during indexing remain pending", async (t) => {
+  const f = await fixture(t);
   await f.run();
   f.append("user", "New question");
-  const before = await readFile(f.params.manifestPath, "utf8");
-  await assert.rejects(f.run({ index: async () => { throw Error("embedding failed"); } }), /embedding failed/);
-  assert.equal(await readFile(f.params.manifestPath, "utf8"), before);
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
-  await f.run({ indexReady: async () => false });
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
-  await f.run({ index: async () => { f.append("assistant", "Concurrent answer"); return 1; } });
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  const before = JSON.stringify(f.sqlite.state.readManifest());
+  f.fake.hooks.embed = () => { throw Error("embedding failed"); };
+  await assert.rejects(f.run(), /embedding failed/);
+  delete f.fake.hooks.embed;
+  assert.equal(JSON.stringify(f.sqlite.state.readManifest()), before);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
+  f.fake.hooks.ready = () => false;
   await f.run();
-  assert.equal((await unchangedSessionSync(f.params, f.params.indexPath))?.skipReason, "no_changes");
-  await writeFile(`${f.params.indexPath}-wal`, "external index mutation");
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
-  await f.run({ indexReady: async () => {
-    await writeFile(`${f.params.indexPath}-wal`, "mutation during readiness validation");
+  delete f.fake.hooks.ready;
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
+  f.fake.hooks.embed = () => { f.append("assistant", "Concurrent answer"); return 1; };
+  await f.run();
+  delete f.fake.hooks.embed;
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
+  await f.run();
+  assert.equal((await unchangedSessionSync(f.params, f.indexPath))?.skipReason, "no_changes");
+  await writeFile(`${f.indexPath}-wal`, "external index mutation");
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
+  f.fake.hooks.ready = async () => {
+    await writeFile(`${f.indexPath}-wal`, "mutation during readiness validation");
     return true;
-  } });
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  };
   await f.run();
-  assert.equal((await unchangedSessionSync(f.params, f.params.indexPath))?.skipReason, "no_changes");
+  delete f.fake.hooks.ready;
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
+  await f.run();
+  assert.equal((await unchangedSessionSync(f.params, f.indexPath))?.skipReason, "no_changes");
 });
 
-test("excluded DMs do not trigger work and first eligible conversations do", async () => {
-  const f = await fixture();
+test("excluded DMs do not trigger work and first eligible conversations do", async (t) => {
+  const f = await fixture(t);
   await f.run();
   const db = new DatabaseSync(f.params.databasePath);
   insertSession(db, { sessionId: "private", chatType: "direct",
     message: { type: "message", message: { role: "user", content: "Private" } } });
   db.close();
-  assert.equal((await unchangedSessionSync(f.params, f.params.indexPath))?.skipReason, "no_changes");
+  assert.equal((await unchangedSessionSync(f.params, f.indexPath))?.skipReason, "no_changes");
   const next = new DatabaseSync(f.params.databasePath);
   insertSession(next, { sessionId: "new", chatType: "channel",
     message: { type: "message", message: { role: "user", content: "New conversation" } } });
   next.close();
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
   assert.equal((await f.run()).result.updated, 1);
 });
 
-test("initial sync with failures records failedSessions, leaves lastSuccessfulSyncAt unset, never certifies skip, and clears once healthy", async () => {
-  const f = await fixture();
+test("a legacy manifest never certifies the quiet check before the projected pipeline reconciles", async (t) => {
+  const f = await fixture(t);
+  const synced = await f.run();
+  const legacy = structuredClone(synced.manifest);
+  delete legacy.generation;
+  f.sqlite.state.writeManifest(legacy);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
+  await f.run();
+  assert.equal((await unchangedSessionSync(f.params, f.indexPath))?.skipReason, "no_changes");
+});
+
+test("initial sync with failures records failedSessions, leaves lastSuccessfulSyncAt unset, never certifies skip, and clears once healthy", async (t) => {
+  const f = await fixture(t);
   const db = new DatabaseSync(f.params.databasePath);
   db.prepare("UPDATE transcript_events SET event_json = '{broken' WHERE session_id = 'conversation'").run();
   db.close();
@@ -173,11 +198,8 @@ test("initial sync with failures records failedSessions, leaves lastSuccessfulSy
   assert.equal(failedFirst.manifest.indexSignature, undefined);
   assert.equal(failedFirst.manifest.sessions.conversation, undefined);
   assert.equal(typeof failedFirst.manifest.failedSessions?.conversation, "string");
-  assert.deepEqual(
-    (await readSessionManifest(f.params.manifestPath)).failedSessions,
-    failedFirst.manifest.failedSessions,
-  );
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  assert.deepEqual(f.sqlite.state.readManifest().failedSessions, failedFirst.manifest.failedSessions);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
 
   const repairedDb = new DatabaseSync(f.params.databasePath);
   repairedDb.prepare("UPDATE transcript_events SET event_json = ? WHERE session_id = 'conversation'")
@@ -188,12 +210,12 @@ test("initial sync with failures records failedSessions, leaves lastSuccessfulSy
   assert.equal(repaired.result.failed, 0);
   assert.equal(repaired.result.updated, 1);
   assert.equal(repaired.manifest.failedSessions, undefined);
-  assert.equal((await readSessionManifest(f.params.manifestPath)).failedSessions, undefined);
-  assert.equal((await unchangedSessionSync(f.params, f.params.indexPath))?.skipReason, "no_changes");
+  assert.equal(f.sqlite.state.readManifest().failedSessions, undefined);
+  assert.equal((await unchangedSessionSync(f.params, f.indexPath))?.skipReason, "no_changes");
 
   // Even with a valid indexSignature and lastSuccessfulSyncAt, non-empty failedSessions must invalidate skip.
   const tampered = structuredClone(repaired.manifest);
   tampered.failedSessions = { conversation: "stale-failed-fingerprint" };
-  await writeFile(f.params.manifestPath, JSON.stringify(tampered));
-  assert.equal(await unchangedSessionSync(f.params, f.params.indexPath), undefined);
+  f.sqlite.state.writeManifest(tampered);
+  assert.equal(await unchangedSessionSync(f.params, f.indexPath), undefined);
 });

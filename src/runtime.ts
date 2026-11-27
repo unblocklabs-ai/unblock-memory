@@ -1,10 +1,8 @@
 import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fchmodSync, lstatSync, openSync, readFileSync } from "node:fs";
-import fs from "node:fs/promises";
+import { lstatSync } from "node:fs";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import {
   resolveAgentWorkspaceDir,
   resolveStateDir,
@@ -17,9 +15,11 @@ import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager, type ManagerSessionConfig, type SkillCatalogEntry } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
 import { unchangedSessionSync, type SessionSyncResult } from "./session-sync.js";
+import { SessionSyncState, removeLegacySessionSyncArtifacts, type SessionSyncReceipt } from "./session-sync-state.js";
 import { resolveConfiguredSkillPath, resolveSessionSource, resolveSources } from "./sources.js";
 import { classifyWorkspaceMemoryPaths } from "./workspace-path-classifier.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
+import { WorkFenceLostError, WorkStore, startWorkHeartbeat, type WorkClaim, type WorkItem } from "./work-store.js";
 
 export type SessionSyncStatus =
   | { status: "idle" }
@@ -32,348 +32,26 @@ export type SessionSyncStartResult =
   | { status: "already_running"; startedAt: string }
   | { status: "unavailable"; error: string };
 
-type StoredSessionSyncStatus = Exclude<SessionSyncStatus, { status: "idle" }>;
-type StoredRunningSessionSync = Extract<StoredSessionSyncStatus, { status: "running" }> & {
-  pid: number;
-};
-type SessionSyncState = StoredRunningSessionSync |
-  Exclude<StoredSessionSyncStatus, { status: "running" }>;
-type SessionSyncLock = {
-  pid: number;
-  token: string;
-  startedAt: string;
-};
-type LockReadResult = { exists: false } | { exists: true; lock?: SessionSyncLock };
-type LockAcquisition =
-  | { acquired: true; lock: SessionSyncLock; lockPath: string }
-  | { acquired: false; owner: SessionSyncLock };
+/** One fenced `mode='run'` WorkStore row per agent (`scope = agentId`) serializes syncs across processes. */
+const SESSION_SYNC_WORK_KIND = "session_sync";
 
-const SESSION_SYNC_LOCK_FILE = "session-sync.lock.sqlite";
-const LEGACY_SESSION_SYNC_LOCK_FILE = "session-sync.lock";
-const SESSION_SYNC_STATUS_FILE = "session-sync-status.json";
-const LEASE_BUSY_TIMEOUT_MS = DEFAULTS.sqlite.mainBusyTimeoutMs;
-const MAX_LEASE_BUSY_RETRIES = 6;
-const heldSessionSyncLeaseTokens = new Set<string>();
-const LEASE_SCHEMA_SQL = `
-  CREATE TABLE IF NOT EXISTS session_sync_lease (
-    id INTEGER PRIMARY KEY CHECK(id = 1),
-    pid INTEGER NOT NULL,
-    token TEXT NOT NULL,
-    started_at TEXT NOT NULL
-  )
-`;
+type SessionSyncRun = { work: WorkStore; state: SessionSyncState; claim: WorkClaim; startedAt: string; directory: string };
 
-function heldLeaseKey(lockPath: string, token: string): string {
-  return `${lockPath}\0${token}`;
+function publicStatus(receipt: SessionSyncReceipt): SessionSyncStatus {
+  if (receipt.status !== "running") return receipt;
+  const { attempt: _attempt, ...running } = receipt;
+  return running;
 }
 
-function isLeaseHeldInProcess(lockPath: string, token: string): boolean {
-  return heldSessionSyncLeaseTokens.has(heldLeaseKey(lockPath, token));
+function runningStatus(row: WorkItem, receipt: SessionSyncReceipt | undefined): Extract<SessionSyncStatus, { status: "running" }> {
+  // Between claim and the owner's first receipt write, only the lease itself is visible.
+  return receipt?.status === "running" && receipt.attempt === row.attempt
+    ? { status: "running", phase: receipt.phase, startedAt: receipt.startedAt }
+    : { status: "running", phase: "queued", startedAt: new Date(row.updatedAt).toISOString() };
 }
 
-function isLeaseActive(lockPath: string, lease: SessionSyncLock): boolean {
-  if (!isProcessAlive(lease.pid)) return false;
-  if (lease.pid === process.pid && !isLeaseHeldInProcess(lockPath, lease.token)) {
-    return false;
-  }
-  return true;
-}
-
-function parseLegacySessionSyncLock(value: unknown): SessionSyncLock | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const { pid, token, startedAt } = value as Partial<SessionSyncLock>;
-  if (
-    typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 ||
-    typeof token !== "string" || token.length === 0 ||
-    typeof startedAt !== "string" || startedAt.length === 0
-  ) {
-    return undefined;
-  }
-  return { pid, token, startedAt };
-}
-
-function readLiveLegacySessionSyncLock(directory: string): SessionSyncLock | undefined {
-  const legacyPath = join(directory, LEGACY_SESSION_SYNC_LOCK_FILE);
-  try {
-    const stat = lstatSync(legacyPath, { throwIfNoEntry: false });
-    if (!stat || !stat.isFile()) return undefined;
-    const parsed = parseLegacySessionSyncLock(JSON.parse(readFileSync(legacyPath, "utf8")));
-    if (!parsed || !isProcessAlive(parsed.pid)) return undefined;
-    return parsed;
-  } catch {
-    // Missing, unreadable, or invalid legacy lock file does not block SQLite lease acquisition.
-    return undefined;
-  }
-}
-
-async function readJson<T>(path: string): Promise<T | undefined> {
-  try {
-    return JSON.parse(await fs.readFile(path, "utf8")) as T;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-async function removeIfPresent(path: string): Promise<void> {
-  try {
-    await fs.unlink(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-}
-
-async function atomicWriteJson(path: string, value: unknown): Promise<void> {
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    await fs.chmod(temporary, 0o600);
-    await fs.rename(temporary, path);
-  } finally {
-    await removeIfPresent(temporary);
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EPERM") return true;
-    if (code === "ESRCH") return false;
-    throw error;
-  }
-}
-
-type LeaseRow = {
-  pid: number;
-  token: string;
-  started_at: string;
-};
-
-function parseLeaseRow(value: unknown): SessionSyncLock | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const { pid, token, started_at: startedAt } = value as Partial<LeaseRow>;
-  if (
-    typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 ||
-    typeof token !== "string" || token.length === 0 ||
-    typeof startedAt !== "string" || startedAt.length === 0
-  ) {
-    return undefined;
-  }
-  return { pid, token, startedAt };
-}
-
-function isSqliteBusy(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const errcode = "errcode" in error && typeof error.errcode === "number" ? error.errcode : undefined;
-  return errcode !== undefined && (errcode & 0xff) === 5;
-}
-
-async function withLeaseBusyRetry<T>(operation: () => T): Promise<T> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return operation();
-    } catch (error) {
-      if (!isSqliteBusy(error) || attempt >= MAX_LEASE_BUSY_RETRIES) throw error;
-      const backoffMs = Math.min(200, 20 * (attempt + 1));
-      await new Promise((resolve) => setTimeout(resolve, backoffMs));
-    }
-  }
-}
-
-function ensurePrivateLeaseFile(lockPath: string): void {
-  const existing = lstatSync(lockPath, { throwIfNoEntry: false });
-  if (existing && !existing.isFile()) {
-    throw new Error("Session sync lock database must be a regular file, not a symlink");
-  }
-  const descriptor = openSync(
-    lockPath,
-    constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    fchmodSync(descriptor, 0o600);
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
-async function withImmediateLeaseTransaction<T>(
-  lockPath: string,
-  fn: (db: DatabaseSync) => { commit: boolean; value: T; onCommit?: () => void },
-): Promise<T> {
-  return await withLeaseBusyRetry(() => {
-    ensurePrivateLeaseFile(lockPath);
-    const db = new DatabaseSync(lockPath);
-    let inTransaction = false;
-    try {
-      db.exec(`PRAGMA busy_timeout = ${LEASE_BUSY_TIMEOUT_MS}; PRAGMA trusted_schema = OFF;`);
-      db.exec("BEGIN IMMEDIATE");
-      inTransaction = true;
-      db.exec(LEASE_SCHEMA_SQL);
-      const { commit, value, onCommit } = fn(db);
-      db.exec(commit ? "COMMIT" : "ROLLBACK");
-      inTransaction = false;
-      if (commit) onCommit?.();
-      return value;
-    } catch (error) {
-      if (inTransaction) {
-        try {
-          db.exec("ROLLBACK");
-        } catch {
-          // Transaction may already be rolled back by SQLite.
-        }
-      }
-      throw error;
-    } finally {
-      db.close();
-    }
-  });
-}
-
-async function readSessionSyncLock(lockPath: string): Promise<LockReadResult> {
-  const stat = lstatSync(lockPath, { throwIfNoEntry: false });
-  if (!stat) return { exists: false };
-  if (!stat.isFile()) {
-    throw new Error("Session sync lock database must be a regular file, not a symlink");
-  }
-  return await withLeaseBusyRetry(() => {
-    const db = new DatabaseSync(lockPath, { readOnly: true });
-    try {
-      db.exec(`PRAGMA busy_timeout = ${LEASE_BUSY_TIMEOUT_MS}; PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;`);
-      const table = db.prepare(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_sync_lease'",
-      ).get();
-      if (!table) return { exists: false };
-      const row = db.prepare(
-        "SELECT pid, token, started_at FROM session_sync_lease WHERE id = 1",
-      ).get();
-      if (!row) return { exists: false };
-      return { exists: true, lock: parseLeaseRow(row) };
-    } finally {
-      db.close();
-    }
-  });
-}
-
-async function releaseSessionSyncLock(lockPath: string, token: string): Promise<void> {
-  heldSessionSyncLeaseTokens.delete(heldLeaseKey(lockPath, token));
-  const existing = lstatSync(lockPath, { throwIfNoEntry: false });
-  if (!existing) return;
-  await withImmediateLeaseTransaction(lockPath, (db) => {
-    db.prepare("DELETE FROM session_sync_lease WHERE id = 1 AND token = ?").run(token);
-    return { commit: true, value: undefined };
-  });
-}
-
-async function releaseSessionSyncLockSafely(
-  lockPath: string,
-  token: string,
-  onError?: (error: unknown) => void,
-): Promise<void> {
-  try {
-    await releaseSessionSyncLock(lockPath, token);
-  } catch (error) {
-    if (onError) onError(error);
-    else console.warn(`unblock-memory failed to release session sync lease (${lockPath}): ${String(error)}`);
-  }
-}
-
-async function clearStaleSessionSyncLease(lockPath: string): Promise<SessionSyncLock | undefined> {
-  const existing = lstatSync(lockPath, { throwIfNoEntry: false });
-  if (!existing) return undefined;
-  return await withImmediateLeaseTransaction<SessionSyncLock | undefined>(lockPath, (db) => {
-    const row = db.prepare(
-      "SELECT pid, token, started_at FROM session_sync_lease WHERE id = 1",
-    ).get();
-    if (!row) return { commit: false, value: undefined };
-    const current = parseLeaseRow(row);
-    if (current && isLeaseActive(lockPath, current)) {
-      return { commit: false, value: current };
-    }
-    db.prepare("DELETE FROM session_sync_lease WHERE id = 1").run();
-    return { commit: true, value: undefined };
-  });
-}
-
-async function acquireSessionSyncLock(
-  directory: string,
-  startedAt: string,
-): Promise<LockAcquisition> {
-  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  const liveLegacyBefore = readLiveLegacySessionSyncLock(directory);
-  if (liveLegacyBefore) {
-    return { acquired: false, owner: liveLegacyBefore };
-  }
-  const lockPath = join(directory, SESSION_SYNC_LOCK_FILE);
-  const candidate: SessionSyncLock = {
-    pid: process.pid,
-    token: randomUUID(),
-    startedAt,
-  };
-  return await withImmediateLeaseTransaction<LockAcquisition>(lockPath, (db) => {
-    const row = db.prepare(
-      "SELECT pid, token, started_at FROM session_sync_lease WHERE id = 1",
-    ).get();
-    const existing = parseLeaseRow(row);
-    if (existing && isLeaseActive(lockPath, existing)) {
-      return { commit: false, value: { acquired: false, owner: existing } };
-    }
-    const liveLegacy = readLiveLegacySessionSyncLock(directory);
-    if (liveLegacy) {
-      return { commit: false, value: { acquired: false, owner: liveLegacy } };
-    }
-    db.prepare(
-      "INSERT OR REPLACE INTO session_sync_lease (id, pid, token, started_at) VALUES (1, ?, ?, ?)",
-    ).run(candidate.pid, candidate.token, candidate.startedAt);
-    return {
-      commit: true,
-      value: { acquired: true, lock: candidate, lockPath },
-      onCommit: () => {
-        heldSessionSyncLeaseTokens.add(heldLeaseKey(lockPath, candidate.token));
-      },
-    };
-  });
-}
-
-function runningStatusFromReceipt(
-  status: SessionSyncState | undefined,
-  startedAt: string,
-): Extract<SessionSyncStatus, { status: "running" }> {
-  return status?.status === "running" && status.startedAt === startedAt
-    ? { status: "running", phase: status.phase, startedAt }
-    : { status: "running", phase: "queued", startedAt };
-}
-
-export async function recoverInterruptedSessionSync(
-  directory: string,
-  statusPath: string,
-  stale: StoredRunningSessionSync,
-  onError?: (error: unknown) => void,
-): Promise<SessionSyncStatus> {
-  const acquired = await acquireSessionSyncLock(directory, stale.startedAt);
-  if (!acquired.acquired) {
-    const current = await readJson<SessionSyncState>(statusPath);
-    return runningStatusFromReceipt(current, acquired.owner.startedAt);
-  }
-  try {
-    const current = await readJson<SessionSyncState>(statusPath);
-    if (!current) return { status: "idle" };
-    if (current.status !== "running") return current;
-    const failed = {
-      status: "failed" as const,
-      startedAt: current.startedAt,
-      completedAt: new Date().toISOString(),
-      error: "session sync interrupted by Gateway restart",
-    };
-    await atomicWriteJson(statusPath, failed);
-    return failed;
-  } finally {
-    await releaseSessionSyncLockSafely(acquired.lockPath, acquired.lock.token, onError);
-  }
+function liveRun(row: WorkItem | undefined, now = Date.now()): row is WorkItem {
+  return row?.status === "running" && row.leaseUntil > now;
 }
 
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
@@ -388,6 +66,9 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #closingManagers = new Map<string, Promise<void>>();
   readonly #activeSessionSyncs = new Map<string, Promise<void>>();
   readonly #pendingSessionSyncStarts = new Set<Promise<unknown>>();
+  /** Lease owner for this runtime's session syncs; `close()` (gateway_stop) releases it with 0 strikes. */
+  readonly #workOwner = `session-sync:${process.pid}:${randomUUID()}`;
+  readonly #runningSyncs = new Set<{ work: WorkStore; abort: AbortController }>();
   #closing = false;
   #closed = false;
   #reloadFences = 0;
@@ -453,8 +134,17 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     return undefined;
   }
 
-  async #releaseLease(lockPath: string, token: string): Promise<void> {
-    await releaseSessionSyncLockSafely(lockPath, token, this.#onError ?? this.#schedule?.onError);
+  #reportError(error: unknown): void {
+    const onError = this.#onError ?? this.#schedule?.onError;
+    if (onError) onError(error);
+    else console.warn(`unblock-memory session sync: ${String(error)}`);
+  }
+
+  #openSessionWork(agentId: string): { work: WorkStore; state: SessionSyncState; directory: string } {
+    const directory = this.#stateDir(agentId);
+    const work = new WorkStore(join(directory, MEMORY_DATABASE));
+    try { return { work, state: new SessionSyncState(work.db, agentId, directory), directory }; }
+    catch (error) { work.close(); throw error; }
   }
 
   constructor(
@@ -567,147 +257,130 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     params: { cfg: OpenClawConfig; agentId: string },
     force: boolean,
   ): Promise<SessionSyncStartResult> {
-    const directory = this.#stateDir(params.agentId);
-    const statusPath = join(directory, SESSION_SYNC_STATUS_FILE);
     const startedAt = new Date().toISOString();
-    const acquired = await acquireSessionSyncLock(directory, startedAt);
-    if (!acquired.acquired) {
-      return { status: "already_running", startedAt: acquired.owner.startedAt };
-    }
-    const blockedAfterAcquire = this.#admissionBlockedReason();
-    if (blockedAfterAcquire) {
-      await this.#releaseLease(acquired.lockPath, acquired.lock.token);
-      return { status: "unavailable", error: blockedAfterAcquire };
-    }
+    const { work, state, directory } = this.#openSessionWork(params.agentId);
+    let handedOff = false;
     try {
-      await atomicWriteJson(statusPath, {
-        status: "running",
-        phase: "queued",
-        pid: process.pid,
-        startedAt,
-      });
-    } catch (error) {
-      await this.#releaseLease(acquired.lockPath, acquired.lock.token);
-      throw error;
-    }
-    const blockedAfterWrite = this.#admissionBlockedReason();
-    if (blockedAfterWrite) {
-      try {
-        await atomicWriteJson(statusPath, {
-          status: "failed",
-          startedAt,
-          completedAt: new Date().toISOString(),
-          error: blockedAfterWrite,
-        });
-      } catch {
-        // Best effort: the next status read recovers any remaining running receipt.
+      const key = { kind: SESSION_SYNC_WORK_KIND, scope: params.agentId };
+      const claimRun = () => work.claim({ ...key, mode: "run", owner: this.#workOwner,
+        leaseMs: DEFAULTS.sessionSync.leaseMs, ignoreDueAt: true });
+      work.enqueue({ ...key, mode: "run" });
+      let claim = claimRun();
+      // Re-arm a row some other path left settled; `requeue` never steals a live lease.
+      if (!claim && !liveRun(work.get(key.kind, key.scope)) && work.requeue(key.kind, key.scope, 0)) claim = claimRun();
+      if (!claim) {
+        const row = work.get(key.kind, key.scope);
+        return { status: "already_running", startedAt: row ? runningStatus(row, state.readReceipt()).startedAt : startedAt };
       }
-      await this.#releaseLease(acquired.lockPath, acquired.lock.token);
-      return { status: "unavailable", error: blockedAfterWrite };
-    }
-    const run = this.#runSessionSync(params, force, {
-      directory,
-      statusPath,
-      lockPath: acquired.lockPath,
-      token: acquired.lock.token,
-      startedAt,
-    });
-    this.#activeSessionSyncs.set(directory, run);
-    const cleanupRun = () => {
-      if (this.#activeSessionSyncs.get(directory) === run) {
-        this.#activeSessionSyncs.delete(directory);
+      const blocked = this.#admissionBlockedReason();
+      if (blocked) {
+        work.fail(claim, { error: blocked, retryAt: 0 });
+        return { status: "unavailable", error: blocked };
       }
-    };
-    run.then(cleanupRun, cleanupRun);
-    return { status: "started", startedAt };
+      const held = claim;
+      work.withFence(held, () => state.writeReceipt({ status: "running", phase: "queued", startedAt, attempt: held.attempt }));
+      const run = this.#runSessionSync(params, force, { work, state, claim: held, startedAt, directory });
+      handedOff = true;
+      this.#activeSessionSyncs.set(directory, run);
+      const cleanupRun = () => {
+        if (this.#activeSessionSyncs.get(directory) === run) {
+          this.#activeSessionSyncs.delete(directory);
+        }
+      };
+      run.then(cleanupRun, cleanupRun);
+      return { status: "started", startedAt };
+    } finally {
+      if (!handedOff) work.close();
+    }
   }
 
   async #runSessionSync(
     params: { cfg: OpenClawConfig; agentId: string },
     force: boolean,
-    run: {
-      directory: string;
-      statusPath: string;
-      lockPath: string;
-      token: string;
-      startedAt: string;
-    },
+    run: SessionSyncRun,
   ): Promise<void> {
-    let statusWrites = Promise.resolve();
+    const { work, state, claim, startedAt } = run;
+    const abort = new AbortController();
+    const tracked = { work, abort };
+    this.#runningSyncs.add(tracked);
+    const heartbeat = startWorkHeartbeat(work, claim, {
+      intervalMs: DEFAULTS.sessionSync.heartbeatMs,
+      leaseMs: DEFAULTS.sessionSync.leaseMs,
+      onFenceLost: (error) => abort.abort(error),
+      onError: (error) => this.#reportError(error),
+    });
     const writePhase = (phase: "projecting" | "indexing") => {
-      statusWrites = statusWrites.then(() => atomicWriteJson(run.statusPath, {
-        status: "running",
-        phase,
-        pid: process.pid,
-        startedAt: run.startedAt,
-      }));
+      try { work.withFence(claim, () => state.writeReceipt({ status: "running", phase, startedAt, attempt: claim.attempt })); }
+      catch (error) { if (error instanceof WorkFenceLostError) abort.abort(error); /* A busy phase write is cosmetic. */ }
     };
     try {
       const sessions = this.#sessionConfig(params.cfg, params.agentId);
       let result = !force && sessions
-        ? await unchangedSessionSync(sessions, join(run.directory, "index.sqlite"))
+        ? await unchangedSessionSync({ ...sessions, state: { read: () => state.readManifest() } },
+          join(run.directory, "index.sqlite"))
         : undefined;
       if (!result) {
+        abort.signal.throwIfAborted();
         const { manager, error } = await this.getMemorySearchManager(params);
         if (!manager) throw new Error(error ?? "memory unavailable");
-        result = await manager.syncSessions(force, writePhase);
-      }
-      await statusWrites;
-      await atomicWriteJson(run.statusPath, {
-        status: "completed",
-        startedAt: run.startedAt,
-        completedAt: new Date().toISOString(),
-        ...result,
-      });
-    } catch (error) {
-      await statusWrites.catch(() => {});
-      try {
-        await atomicWriteJson(run.statusPath, {
-          status: "failed",
-          startedAt: run.startedAt,
-          completedAt: new Date().toISOString(),
-          error: error instanceof Error ? error.message : String(error),
+        result = await manager.syncSessions(force, writePhase, {
+          signal: abort.signal,
+          // A fenced-out (reclaimed or interrupted) attempt can never publish its manifest.
+          persist: (manifest) => work.withFence(claim, () => state.writeManifest(manifest)),
         });
+      }
+      const completed: SessionSyncReceipt = { status: "completed", startedAt, completedAt: new Date().toISOString(), ...result };
+      work.commitWithDomain(claim, { nextDueAt: 0 }, () => state.writeReceipt(completed));
+      // SQLite now owns the manifest: retire the Markdown-transport sidecars and plaintext projections.
+      if (result.failed === 0 && state.revision() > 0) removeLegacySessionSyncArtifacts(run.directory);
+    } catch (error) {
+      // Released by gateway_stop or reclaimed elsewhere: the lease is gone, so record nothing here.
+      if (error instanceof WorkFenceLostError || abort.signal.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        work.withFence(claim, () => state.writeReceipt({ status: "failed", startedAt, completedAt: new Date().toISOString(), error: message }));
+        work.fail(claim, { error: message, retryAt: 0 });
       } catch {
-        // The next status read converts the persisted running state to interrupted.
+        // Fence lost while failing: the next status read reports the interruption.
       }
     } finally {
-      await this.#releaseLease(run.lockPath, run.token);
+      heartbeat.stop();
+      this.#runningSyncs.delete(tracked);
+      work.close();
     }
   }
 
   async sessionSyncStatus(agentId: string): Promise<SessionSyncStatus> {
     const directory = this.#stateDir(agentId);
-    const lockPath = join(directory, SESSION_SYNC_LOCK_FILE);
-    const statusPath = join(directory, SESSION_SYNC_STATUS_FILE);
-    const onError = this.#onError ?? this.#schedule?.onError;
-    const lockState = await readSessionSyncLock(lockPath);
-    if (lockState.exists && lockState.lock && isLeaseActive(lockPath, lockState.lock)) {
-      const status = await readJson<SessionSyncState>(statusPath);
-      return runningStatusFromReceipt(status, lockState.lock.startedAt);
+    if (!lstatSync(join(directory, MEMORY_DATABASE), { throwIfNoEntry: false }) &&
+      !lstatSync(join(directory, "session-sync-status.json"), { throwIfNoEntry: false })) {
+      return { status: "idle" };
     }
-    const legacyOwner = readLiveLegacySessionSyncLock(directory);
-    if (legacyOwner) {
-      const status = await readJson<SessionSyncState>(statusPath);
-      return runningStatusFromReceipt(status, legacyOwner.startedAt);
-    }
-    const status = await readJson<SessionSyncState>(statusPath);
-    if (status?.status === "running") {
-      return await recoverInterruptedSessionSync(directory, statusPath, status, onError);
-    }
-    if (lockState.exists) {
-      const liveOwner = await clearStaleSessionSyncLease(lockPath);
-      if (liveOwner) {
-        const refreshedStatus = await readJson<SessionSyncState>(statusPath);
-        return runningStatusFromReceipt(refreshedStatus, liveOwner.startedAt);
+    const { work, state } = this.#openSessionWork(agentId);
+    try {
+      const row = work.get(SESSION_SYNC_WORK_KIND, agentId);
+      const receipt = state.readReceipt();
+      if (liveRun(row)) return runningStatus(row, receipt);
+      if (receipt?.status === "running") {
+        // Its lease expired or gateway_stop released it: that attempt can never finish.
+        const current = state.interruptReceipt(receipt.attempt, new Date().toISOString());
+        const refreshed = work.get(SESSION_SYNC_WORK_KIND, agentId);
+        if (liveRun(refreshed)) return runningStatus(refreshed, current);
+        return current ? publicStatus(current) : { status: "idle" };
       }
-      const refreshedStatus = await readJson<SessionSyncState>(statusPath);
-      if (refreshedStatus?.status === "running") {
-        return await recoverInterruptedSessionSync(directory, statusPath, refreshedStatus, onError);
-      }
-      return refreshedStatus ?? { status: "idle" };
+      return receipt ? publicStatus(receipt) : { status: "idle" };
+    } finally {
+      work.close();
     }
-    return status ?? { status: "idle" };
+  }
+
+  /** Synchronous graceful release for gateway_stop: free the lease (0 strikes), then stop in-flight syncs. */
+  #interruptSessionSyncs(): void {
+    for (const { work } of this.#runningSyncs) {
+      try { work.interruptOwner(this.#workOwner); }
+      catch { /* A busy store keeps its lease; it expires and the abort below still stops the run. */ }
+    }
+    for (const { abort } of this.#runningSyncs) abort.abort(new Error("memory runtime is closing"));
   }
 
   async #drainSessionSyncs(): Promise<void> {
@@ -859,6 +532,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     this.#closing = true;
+    this.#interruptSessionSyncs();
     const closing = (async () => {
       try {
         await this.closeAllMemorySearchManagers();
@@ -906,10 +580,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     const fileCorpora = this.#corpora.filter((corpus) => corpus.kind === "files" || corpus.kind === "skills");
     const sessions = this.#sessionConfig(cfg, agentId);
     const sources = resolveSources(workspaceDir, fileCorpora);
-    const sessionSource = sessions
-      ? resolveSessionSource(sessions.outputDir, sessions.chatTypes)
-      : undefined;
-    if (sessionSource) sources.push(sessionSource);
+    if (sessions) sources.push(this.#sessionSource(agentId, sessions.chatTypes));
     return new QmdMemoryManager({
       workspaceDir,
       dbPath: join(stateDir, "index.sqlite"),
@@ -937,15 +608,20 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     const corpus = this.#corpora.find(corpus => corpus.kind === "sessions");
     if (!corpus) return;
     const stateDir = this.#stateDir(agentId);
-    const source = resolveSessionSource(join(stateDir, "sessions"), corpus.chatTypes);
     return {
       agentId, agentName: resolveAgentIdentity(cfg, agentId)?.name?.trim() || agentId,
       chatTypes: corpus.chatTypes, maxExpandedTokens: corpus.maxExpandedTokens,
-      collection: source.collection, outputDir: source.root,
+      collection: this.#sessionSource(agentId, corpus.chatTypes).collection,
       databasePath: agentTranscriptDatabase(cfg, agentId),
-      manifestPath: join(stateDir, "sessions-manifest.json"),
+      statePath: join(stateDir, MEMORY_DATABASE),
+      legacyStateDir: stateDir,
       timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
     };
+  }
+
+  /** Projected (no files): the retired projection directory only keeps the collection identity stable. */
+  #sessionSource(agentId: string, chatTypes: ManagerSessionConfig["chatTypes"]) {
+    return resolveSessionSource(join(this.#stateDir(agentId), "sessions"), chatTypes);
   }
 
   #stateDir(agentId: string): string {

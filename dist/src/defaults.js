@@ -82,6 +82,7 @@ const ranges = {
     "recallLedger.shutdownTimeoutMs": [100, 10000],
     "steward.leaseMs": [30_000, 3_600_000],
     "steward.shutdownGraceMs": [100, 30_000],
+    "sessionSync.leaseMs": [30_000, 3_600_000],
 };
 function record(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -170,6 +171,9 @@ export function loadOperationalDefaults(overridePath = process.env.UNBLOCK_MEMOR
     }
     if (extraction.heartbeatMs >= extraction.leaseMs) {
         throw new Error("Invalid operational defaults: extraction heartbeat must be shorter than its lease");
+    }
+    if (result.sessionSync.heartbeatMs >= result.sessionSync.leaseMs) {
+        throw new Error("Invalid operational defaults: session sync heartbeat must be shorter than its lease");
     }
     if (quality.triageEvidenceLow > quality.triageEvidenceHigh || responseAudit.scoreLow > responseAudit.scoreHigh) {
         throw new Error("Invalid operational defaults: low score threshold exceeds high score threshold");

@@ -208,16 +208,16 @@ history is cold, oversized, or unreadable. Cold history is deferred until restor
 by OpenClaw; the plugin never restores or migrates the source database. The public
 full-transcript SDK reader currently permits restoration, while its read-only
 catalog redacts and truncates text, so neither supplies this full-fidelity read-only
-contract. Extraction retains its supported host cursor API. Projections are private derived Markdown under the
-agent's `unblock-memory/sessions` state directory and can be rebuilt from
-OpenClaw at any time. Their embedded text contains only `# Transcript` and
+contract. Extraction retains its supported host cursor API. Projections are private derived Markdown documents
+written straight into QMD's projected sessions collection (never to disk) and can
+be rebuilt from OpenClaw at any time. Their embedded text contains only `# Transcript` and
 role-labeled, timestamped speaker messages; filtering metadata remains in the
-session manifest. Projection v8 retains message metadata and exact character
+session manifest in `unblock-memory.sqlite`. Projection v8 retains message metadata and exact character
 boundaries there, without duplicating message bodies. Readers use those boundaries
 only when the projection hash matches the indexed document. Older/mismatched snapshots
 use a conservative heading parser that skips code fences and blockquotes; an unfenced
 literal heading can still be ambiguous until the next session refresh rebuilds the
-metadata. The projected file modification time matches the session
+metadata. The projected document's modification time matches the session
 start time for meaningful chronological cluster reads. Session results include
 provider, chat type, conversation identity, and start time as an ISO 8601 timestamp. They
 participate in the same search and clustering index as file memory. The plugin
@@ -240,11 +240,19 @@ before initializing the memory manager. Unchanged sessions skip QMD updates and
 embedding. New assistant answers count too, not just human messages. Changed
 transcripts are projected and content-hashed; tool-only or filtered additions
 that leave the indexed text unchanged also skip indexing. Empty/filtered sessions
-are remembered. Index changes, missing projections, changed projection settings,
+are remembered. Index changes, a changed sessions-collection generation, changed projection settings,
 QMD upgrades and incomplete runs invalidate the skip checkpoint; `force: true`
 bypasses both gates. `memory_sync_status` reports `lastCheckedAt`, `lastIndexedAt`
 and `skipReason` (`no_changes` or `no_indexable_changes`) separately. Existing
 explicit intervals remain unchanged on upgrade; set them to `5` for five-minute checks.
+
+Each agent's syncs are serialized across processes by one fenced WorkStore lease in
+`unblock-memory.sqlite`; a fenced-out attempt can never publish its manifest. A Gateway
+stop releases the lease immediately (no strike); a crashed owner's lease lapses after
+`sessionSync.leaseMs`. Upgrading from 0.17 or earlier imports `sessions-manifest.json`
+once and reconciles the collection; after the first successful sync the retired
+`sessions/**/*.md`, `sessions-manifest.json`, `session-sync-status.json` and
+`session-sync.lock*` files are deleted.
 
 Indexes live at `~/.openclaw/agents/<agentId>/unblock-memory/index.sqlite` (or the
 equivalent configured OpenClaw state directory). Durable agent-supplied event

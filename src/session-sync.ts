@@ -1,8 +1,6 @@
 import { DEFAULTS } from "./defaults.js";
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, unlink, utimes, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader, agentTranscriptSchemaVersion, assertAgentTranscriptIdentity } from "./agent-transcript.js";
 import type { ChatType } from "./config.js";
@@ -11,10 +9,9 @@ import {
   sessionDocumentPath,
   type SessionMetadata,
   type SessionProjectionInput,
-  type SessionMessageSpan,
 } from "./session-projector.js";
+import type { IndexedSession, SessionManifest } from "./session-sync-state.js";
 
-const MANIFEST_VERSION = 1;
 export const PROJECTOR_VERSION = 8;
 // Source lives in src/, published code in dist/src/. Read our own pinned dependency
 // metadata, not QMD internals (which may also be substituted by runtime inspectors).
@@ -37,30 +34,6 @@ const REQUIRED_COLUMNS = {
   session_transcript_active_events: ["session_id", "active_position", "event_seq", "message_position"],
   transcript_rewrite_watermarks: ["session_id", "generation"],
 } as const;
-
-type IndexedSession = SessionMetadata & {
-  sourceGeneration: string;
-  maxSeq: number;
-  activeEventCount: number;
-  sizeBytes: number;
-  projectionHash: string;
-  documentPath: string;
-  projectorVersion: number;
-  projectionKey?: string;
-  sourceFingerprint?: string;
-  messages?: SessionMessageSpan[];
-};
-
-export type SessionManifest = {
-  version: number;
-  lastSuccessfulSyncAt?: number;
-  lastIndexedAt?: number;
-  projectionKey?: string;
-  indexSignature?: string;
-  ignoredSessions?: Record<string, string>;
-  failedSessions?: Record<string, string>;
-  sessions: Record<string, IndexedSession>;
-};
 
 export type SessionSyncResult = {
   scanned: number;
@@ -106,13 +79,32 @@ type EventRows = SessionProjectionInput["events"];
 
 type ProjectionOptions = {
   databasePath: string;
-  outputDir: string;
-  manifestPath: string;
   agentId: string;
   agentName: string;
   timezone: string;
   chatTypes: readonly ChatType[];
 };
+
+/** A projected session document: QMD stores it directly; nothing is written to disk. */
+type SessionDocument = { path: string; content: string; createdAt: string; modifiedAt: string };
+
+/** QMD projected-collection adapter for the sessions collection. */
+export type SessionIndex = {
+  /** Latest committed collection generation (QMD bumps it on every document change). */
+  generation(): Promise<number>;
+  upsert(document: SessionDocument): Promise<boolean>;
+  retract(path: string): Promise<boolean>;
+  /** Reconcile the complete desired set atomically; returns the number of changed documents. */
+  replace(documents: readonly SessionDocument[]): Promise<number>;
+  /** Embed pending chunks; returns the number of chunks embedded. */
+  embed(): Promise<number>;
+  ready(): Promise<boolean>;
+  /** Index file whose stat fingerprint certifies the no-store quiet check. */
+  path?: string;
+};
+
+/** Durable manifest storage (SQLite); `write` may be fenced by the caller's WorkStore claim. */
+export type SessionManifestStore = { read(): SessionManifest; write(manifest: SessionManifest): void };
 
 function projectionKey(params: ProjectionOptions): string {
   return JSON.stringify([PROJECTOR_VERSION, params.databasePath, params.agentId,
@@ -120,7 +112,7 @@ function projectionKey(params: ProjectionOptions): string {
 }
 
 // Conservative proof: any index/WAL write, replacement or QMD upgrade invalidates it.
-// This avoids depending on QMD's private embedding schema or opening/loading its store.
+// This lets the quiet check skip opening QMD (and loading models) entirely.
 function sessionIndexSignature(databasePath: string): string | undefined {
   try {
     const fingerprint = (path: string) => {
@@ -134,25 +126,13 @@ function sessionIndexSignature(databasePath: string): string | undefined {
   } catch { return undefined; }
 }
 
-function projectionPath(outputDir: string, documentPath: string): string {
-  const root = resolve(outputDir);
-  const target = resolve(root, documentPath);
-  const pathFromRoot = relative(root, target);
-  if (!pathFromRoot || pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) {
+/** QMD's projected-path rule: nonempty collection-relative slash-separated segments, no traversal. */
+function assertDocumentPath(documentPath: string): string {
+  if (typeof documentPath !== "string" || documentPath.includes("\0") || documentPath.includes("\\") ||
+    /^[a-z]:/iu.test(documentPath) || documentPath.split("/").some(part => !part || part === "." || part === "..")) {
     throw new Error(`invalid unblock-memory session document path: ${documentPath}`);
   }
-  let current = root;
-  for (const component of ["", ...pathFromRoot.split(sep)]) {
-    current = component ? join(current, component) : current;
-    try {
-      if (lstatSync(current).isSymbolicLink()) {
-        throw new Error(`invalid unblock-memory session document path: ${documentPath}`);
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-  return target;
+  return documentPath;
 }
 
 function assertSchema(db: DatabaseSync, expectedAgentId: string): void {
@@ -171,7 +151,6 @@ function readSnapshot(params: {
   agentId: string;
   chatTypes: readonly ChatType[];
   force: boolean;
-  outputDir: string;
   previousManifest: SessionManifest;
   currentProjectionKey: string;
   metadataOnly?: boolean;
@@ -230,8 +209,7 @@ function readSnapshot(params: {
           ? entryProjectionKey === params.currentProjectionKey &&
             previous.sourceFingerprint === sourceFingerprint &&
             previous.projectorVersion === PROJECTOR_VERSION &&
-            previous.documentPath === documentPath &&
-            existsSync(projectionPath(params.outputDir, documentPath))
+            previous.documentPath === documentPath
           : params.previousManifest.projectionKey === params.currentProjectionKey &&
             params.previousManifest.ignoredSessions?.[window.sessionId] === sourceFingerprint);
       if (!unchanged) {
@@ -255,13 +233,17 @@ function readSnapshot(params: {
   }
 }
 
+/**
+ * Quiet check without opening QMD: proves nothing changed since the last certified sync. Requires a manifest
+ * produced by the projected-collection pipeline (a legacy import always reconciles first).
+ */
 export async function unchangedSessionSync(
-  params: ProjectionOptions,
+  params: ProjectionOptions & { state: Pick<SessionManifestStore, "read"> },
   indexPath: string,
 ): Promise<SessionSyncResult | undefined> {
-  const manifest = await readSessionManifest(params.manifestPath);
+  const manifest = params.state.read();
   const currentProjectionKey = projectionKey(params);
-  if (!manifest.lastSuccessfulSyncAt || manifest.projectionKey !== currentProjectionKey ||
+  if (!manifest.lastSuccessfulSyncAt || manifest.generation === undefined || manifest.projectionKey !== currentProjectionKey ||
     !manifest.indexSignature || manifest.indexSignature !== sessionIndexSignature(indexPath) ||
     Object.keys(manifest.failedSessions ?? {}).length > 0) return;
   const snapshot = readSnapshot({
@@ -277,70 +259,6 @@ export async function unchangedSessionSync(
   return { scanned: ids.size, unchanged: ids.size, updated: 0, removed: 0,
     skipped: 0, failed: 0, embedded: 0, lastSuccessfulSyncAt: manifest.lastSuccessfulSyncAt,
     lastCheckedAt: Date.now(), lastIndexedAt: manifest.lastIndexedAt, skipReason: "no_changes" };
-}
-
-function emptyManifest(): SessionManifest {
-  return { version: MANIFEST_VERSION, sessions: {} };
-}
-
-export async function readSessionManifest(path: string): Promise<SessionManifest> {
-  if (!existsSync(path)) return emptyManifest();
-  let value: unknown;
-  try {
-    value = JSON.parse(await readFile(path, "utf8"));
-  } catch {
-    throw new Error(`invalid unblock-memory session manifest: ${path}`);
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`invalid unblock-memory session manifest: ${path}`);
-  }
-  const manifest = value as Partial<SessionManifest>;
-  if (manifest.version !== MANIFEST_VERSION || !manifest.sessions ||
-    typeof manifest.sessions !== "object" || Array.isArray(manifest.sessions)) {
-    throw new Error(`unsupported unblock-memory session manifest: ${path}`);
-  }
-  const parsed: SessionManifest = { ...(manifest as SessionManifest) };
-  if (manifest.failedSessions !== undefined) {
-    if (!manifest.failedSessions || typeof manifest.failedSessions !== "object" || Array.isArray(manifest.failedSessions)) {
-      delete parsed.failedSessions;
-    } else {
-      const validFailed: Record<string, string> = {};
-      for (const [sessionId, fingerprint] of Object.entries(manifest.failedSessions)) {
-        if (sessionId.length > 0 && typeof fingerprint === "string") {
-          validFailed[sessionId] = fingerprint;
-        }
-      }
-      if (Object.keys(validFailed).length > 0) {
-        parsed.failedSessions = validFailed;
-      } else {
-        delete parsed.failedSessions;
-      }
-    }
-  }
-  return parsed;
-}
-
-async function atomicWrite(path: string, content: string, mode: number): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporary, content, { encoding: "utf8", mode });
-    await rename(temporary, path);
-    await chmod(path, mode);
-  } catch (error) {
-    await unlink(temporary).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function remove(path: string): Promise<boolean> {
-  try {
-    await unlink(path);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
 }
 
 export function projectionHash(content: string): string {
@@ -360,9 +278,9 @@ export function sessionMetadataByPath(manifest: SessionManifest): Map<string, Se
 
 type WindowSyncOutcome =
   | { kind: "failed"; session?: IndexedSession }
-  | { kind: "unchanged"; session?: IndexedSession; ignoredFingerprint?: string }
-  | { kind: "skipped"; ignoredFingerprint: string; removedPrevious: boolean }
-  | { kind: "updated"; session: IndexedSession };
+  | { kind: "unchanged"; session?: IndexedSession; ignoredFingerprint?: string; document?: SessionDocument }
+  | { kind: "skipped"; ignoredFingerprint: string; retract?: string }
+  | { kind: "updated"; session: IndexedSession; document: SessionDocument; retract?: string };
 
 function retainPreviousSession(
   previous: IndexedSession | undefined,
@@ -375,23 +293,22 @@ function retainPreviousSession(
   return { ...previous, projectionKey: previousManifestProjectionKey };
 }
 
-async function syncWindow(params: {
+function syncWindow(params: {
   window: WindowRow;
   sourceFingerprint: string;
   previous?: IndexedSession;
   events?: EventRows;
   unavailable: boolean;
   force: boolean;
-  outputDir: string;
   agentName: string;
   timezone: string;
   currentProjectionKey: string;
   previousManifestProjectionKey?: string;
   diagnostics: NonNullable<SessionProjectionInput["diagnostics"]>;
-}): Promise<WindowSyncOutcome> {
+}): WindowSyncOutcome {
   const { window, sourceFingerprint, previous, events } = params;
   const metadata = windowMetadata(window);
-  const documentPath = sessionDocumentPath(metadata);
+  const documentPath = assertDocumentPath(sessionDocumentPath(metadata));
   const fail = (): WindowSyncOutcome => ({
     kind: "failed",
     session: retainPreviousSession(previous, params.previousManifestProjectionKey),
@@ -422,28 +339,16 @@ async function syncWindow(params: {
     return fail();
   }
   if (!projection) {
-    if (previous) {
-      await remove(projectionPath(params.outputDir, previous.documentPath));
-    }
-    return {
-      kind: "skipped",
-      ignoredFingerprint: sourceFingerprint,
-      removedPrevious: Boolean(previous),
-    };
+    return { kind: "skipped", ignoredFingerprint: sourceFingerprint, retract: previous?.documentPath };
   }
 
   const { content, messages } = projection;
-  const target = projectionPath(params.outputDir, documentPath);
   const hash = projectionHash(content);
   const contentChanged = params.force || previous?.projectorVersion !== PROJECTOR_VERSION ||
-    previous.projectionHash !== hash || previous.documentPath !== documentPath || !existsSync(target);
-  if (contentChanged) {
-    await atomicWrite(target, content, 0o600);
-    await utimes(target, new Date(), new Date(metadata.startedAt));
-  }
-  if (previous?.documentPath && previous.documentPath !== documentPath) {
-    await remove(projectionPath(params.outputDir, previous.documentPath));
-  }
+    previous.projectionHash !== hash || previous.documentPath !== documentPath;
+  // The file-era transport stamped mtime with the session start; QMD keeps the same chronology.
+  const startedAt = new Date(metadata.startedAt).toISOString();
+  const document: SessionDocument = { path: documentPath, content, createdAt: startedAt, modifiedAt: startedAt };
   const session: IndexedSession = {
     ...metadata,
     sourceGeneration: window.sourceGeneration!,
@@ -457,42 +362,43 @@ async function syncWindow(params: {
     sourceFingerprint,
     messages,
   };
-  return contentChanged ? { kind: "updated", session } : { kind: "unchanged", session };
+  const retract = previous?.documentPath && previous.documentPath !== documentPath ? previous.documentPath : undefined;
+  return contentChanged ? { kind: "updated", session, document, retract } : { kind: "unchanged", session, document };
 }
 
-async function resolveIndexSignature(params: {
-  failed: number;
-  needsIndex: boolean;
-  indexed: boolean;
-  indexPath?: string;
-  previousIndexSignature?: string;
-  indexReady?: () => Promise<boolean>;
-}): Promise<string | undefined> {
-  // Never certify an index mutation that happened during a failed, skipped, or readiness check.
-  if (params.failed > 0) return undefined;
-  if (!params.needsIndex) return params.previousIndexSignature;
-  if (!params.indexed || !params.indexPath) return undefined;
-  // Timing point 2: capture index signature after indexing, before readiness check.
-  const signatureBeforeReadiness = sessionIndexSignature(params.indexPath);
-  if (!signatureBeforeReadiness) return undefined;
-  const ready = await params.indexReady?.() ?? false;
-  if (!ready) return undefined;
-  // Timing point 3: verify index did not mutate during readiness validation.
-  if (signatureBeforeReadiness !== sessionIndexSignature(params.indexPath)) return undefined;
-  return signatureBeforeReadiness;
+async function certifyIndex(index: SessionIndex): Promise<string | undefined> {
+  if (!index.path) return undefined;
+  // Capture the signature after indexing, before the readiness check, and require it unchanged after.
+  const before = sessionIndexSignature(index.path);
+  if (!before || !await index.ready()) return undefined;
+  return before === sessionIndexSignature(index.path) ? before : undefined;
 }
 
+/**
+ * Project changed sessions in memory and write them straight into QMD's projected sessions collection.
+ *
+ * - Incremental (manifest generation equals QMD's): upsert changed documents, retract removed ones.
+ * - Reconcile (force, legacy import, or anyone else changed the collection): re-read every window and, when all
+ *   succeed, atomically replace the collection's complete document set (`syncProjectedCollection`).
+ * The manifest is persisted only after QMD accepted the writes; a crash in between reconciles next time.
+ */
 export async function syncSessionProjections(params: ProjectionOptions & {
+  state: SessionManifestStore;
+  index: SessionIndex;
   force?: boolean;
-  indexPath?: string;
-  indexReady?: () => Promise<boolean>;
-  index?: () => Promise<number>;
+  signal?: AbortSignal;
+  onIndexing?: () => void;
 }): Promise<{ result: SessionSyncResult; manifest: SessionManifest }> {
-  const previousManifest = await readSessionManifest(params.manifestPath);
+  const { index, signal } = params;
+  signal?.throwIfAborted();
+  const previousManifest = params.state.read();
+  for (const session of Object.values(previousManifest.sessions)) assertDocumentPath(session.documentPath);
   const currentProjectionKey = projectionKey(params);
+  const generationBefore = await index.generation();
+  const reconcile = params.force === true || previousManifest.generation !== generationBefore;
   const snapshot = readSnapshot({
     ...params,
-    force: params.force === true,
+    force: reconcile,
     previousManifest,
     currentProjectionKey,
   });
@@ -501,18 +407,19 @@ export async function syncSessionProjections(params: ProjectionOptions & {
   const failedSessions: Record<string, string> = {};
   const counts = { unchanged: 0, updated: 0, removed: 0, skipped: 0, failed: 0 };
   const diagnostics = { internalMessagesCleaned: 0, attachmentsCleaned: 0, attachmentBudgetSkipped: 0 };
-  await mkdir(params.outputDir, { recursive: true, mode: 0o700 });
-  await chmod(params.outputDir, 0o700);
+  const documents: SessionDocument[] = [];
+  const upserts: SessionDocument[] = [];
+  const retractions = new Set<string>();
 
   for (const window of snapshot.windows) {
-    const outcome = await syncWindow({
+    signal?.throwIfAborted();
+    const outcome = syncWindow({
       window,
       sourceFingerprint: snapshot.fingerprints.get(window.sessionId)!,
       previous: previousManifest.sessions[window.sessionId],
       events: snapshot.events.get(window.sessionId),
       unavailable: snapshot.unavailable.has(window.sessionId),
       force: params.force === true,
-      outputDir: params.outputDir,
       agentName: params.agentName,
       timezone: params.timezone,
       currentProjectionKey,
@@ -529,55 +436,78 @@ export async function syncSessionProjections(params: ProjectionOptions & {
       else if (outcome.ignoredFingerprint !== undefined) {
         ignoredSessions[window.sessionId] = outcome.ignoredFingerprint;
       }
+      if (outcome.document) {
+        documents.push(outcome.document);
+        // Reconciling cannot trust QMD to hold even content-identical documents.
+        if (reconcile) upserts.push(outcome.document);
+      }
     } else if (outcome.kind === "skipped") {
       counts.skipped += 1;
       ignoredSessions[window.sessionId] = outcome.ignoredFingerprint;
-      if (outcome.removedPrevious) counts.removed += 1;
+      if (outcome.retract) { retractions.add(outcome.retract); counts.removed += 1; }
     } else {
       counts.updated += 1;
       sessions[window.sessionId] = outcome.session;
+      documents.push(outcome.document);
+      upserts.push(outcome.document);
+      if (outcome.retract) retractions.add(outcome.retract);
     }
   }
 
   const liveIds = new Set(snapshot.windows.map(window => window.sessionId));
   for (const [sessionId, session] of Object.entries(previousManifest.sessions)) {
     if (sessions[sessionId] || liveIds.has(sessionId)) continue;
-    await remove(projectionPath(params.outputDir, session.documentPath));
+    retractions.add(session.documentPath);
     counts.removed += 1;
   }
+  const kept = new Set(Object.values(sessions).map(session => session.documentPath));
+  for (const path of kept) retractions.delete(path);
 
-  // Timing point 1: verify index signature before running QMD index/embed.
-  const needsIndex = params.force === true || counts.updated > 0 || counts.removed > 0 ||
-    previousManifest.projectionKey !== currentProjectionKey ||
-    !previousManifest.indexSignature || !params.indexPath ||
-    previousManifest.indexSignature !== sessionIndexSignature(params.indexPath);
-  const embedded = needsIndex ? await params.index?.() ?? 0 : 0;
+  signal?.throwIfAborted();
+  // Every snapshot window was read, so the desired set is complete: let QMD sweep anything else.
+  const replaceAll = reconcile && counts.failed === 0;
+  const writes = replaceAll || upserts.length > 0 || retractions.size > 0;
+  if (writes) params.onIndexing?.();
+  let changedDocuments = 0;
+  if (replaceAll) {
+    changedDocuments = await index.replace(documents);
+  } else {
+    for (const document of upserts) {
+      signal?.throwIfAborted();
+      if (await index.upsert(document)) changedDocuments += 1;
+    }
+    for (const path of retractions) if (await index.retract(path)) changedDocuments += 1;
+  }
+  // The index changed since the last certification (or never was): embedding is incremental, so re-check it.
+  const needsIndex = reconcile || changedDocuments > 0 || !previousManifest.indexSignature || !index.path ||
+    previousManifest.indexSignature !== sessionIndexSignature(index.path) ||
+    previousManifest.projectionKey !== currentProjectionKey;
+  if (needsIndex && !writes) params.onIndexing?.();
+  signal?.throwIfAborted();
+  const embedded = needsIndex ? await index.embed() : 0;
+  const generationAfter = await index.generation();
   const checkedAt = Date.now();
-  const indexed = needsIndex && params.index !== undefined;
-  const indexSignature = await resolveIndexSignature({
-    failed: counts.failed,
-    needsIndex,
-    indexed,
-    indexPath: params.indexPath,
-    previousIndexSignature: previousManifest.indexSignature,
-    indexReady: params.indexReady,
-  });
+  // Never certify an index mutation that happened during a failed run or a readiness check.
+  const indexSignature = counts.failed > 0 ? undefined : await certifyIndex(index);
   const lastSuccessfulSyncAt = counts.failed === 0 ? checkedAt : previousManifest.lastSuccessfulSyncAt;
-  const lastIndexedAt = indexed ? checkedAt : previousManifest.lastIndexedAt;
+  const lastIndexedAt = needsIndex ? checkedAt : previousManifest.lastIndexedAt;
   const manifestProjectionKey = counts.failed === 0
     ? currentProjectionKey
     : previousManifest.projectionKey;
+  // A partial reconcile could not sweep strays, so the next run must reconcile again.
+  const generation = reconcile && counts.failed > 0 ? undefined : generationAfter;
   const manifest: SessionManifest = {
-    version: MANIFEST_VERSION,
+    version: previousManifest.version,
     lastSuccessfulSyncAt,
     lastIndexedAt,
     projectionKey: manifestProjectionKey,
-    indexSignature,
+    ...(indexSignature !== undefined ? { indexSignature } : {}),
+    ...(generation !== undefined ? { generation } : {}),
     ignoredSessions,
     ...(Object.keys(failedSessions).length ? { failedSessions } : {}),
     sessions,
   };
-  await atomicWrite(params.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
+  params.state.write(manifest);
   return {
     result: {
       scanned: snapshot.windows.length,

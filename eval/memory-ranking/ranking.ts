@@ -1,7 +1,7 @@
 import { createHash, randomInt } from "node:crypto";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { discoverLaneCandidates } from "../../src/memory-candidates.js";
-import type { SessionManifest } from "../../src/session-sync.js";
+import type { SessionManifest } from "../../src/session-sync-state.js";
 import { hash, type SearchCase } from "./cases.js";
 
 type Ranked = { file: string; displayPath: string; title: string; body: string; score: number };

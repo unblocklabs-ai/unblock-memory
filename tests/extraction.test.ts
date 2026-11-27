@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { createStore } from "@unblocklabs/qmd";
+import { createStore, type QMDStore } from "@unblocklabs/qmd";
 import { ErrorCodes } from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveConfig } from "../src/config.js";
 import { DEFAULTS } from "../src/defaults.js";
@@ -36,6 +36,12 @@ const acceptAll = async ({ proposals, thresholds }: ValidationParams) => proposa
 }));
 const validateOne = async ({ proposal, ...params }: Omit<ValidationParams, "proposals"> & { proposal: MemoryProposal }) =>
   (await validateExtractedMemories({ ...params, proposals: [proposal] }))[0]!;
+/** QMD's real projected reconcile, minus inline embedding (no model downloads in tests). */
+function withoutEmbedding(qmd: QMDStore): Pick<QMDStore, "syncProjectedCollection"> {
+  return { syncProjectedCollection: (collection, documents, options) =>
+    qmd.syncProjectedCollection(collection, documents, { ...options, embed: false }) };
+}
+
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "extracted-memory-test-"));
   return { dir, storePath: join(dir, "unblock-memory.sqlite") };
@@ -337,11 +343,11 @@ test("QMD projection and authoritative reads reject withdrawn versions without a
   const f = await fixture(), store = new ExtractionStore(f.storePath), owner = store.claim(false, 0)!;
   store.checkpoint(session, owner);
   store.commit({ session, expected: null, cursor: "c1", context: messages, accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
-  const qmd = await createStore({ dbPath: join(f.dir, "index.sqlite"), config: { collections: { [EXTRACTED_COLLECTION]: { path: f.dir, pattern: ".no-files" } } } });
+  const qmd = await createStore({ dbPath: join(f.dir, "index.sqlite"), config: { collections: { [EXTRACTED_COLLECTION]: { projected: true } } } });
   const manager = new QmdMemoryManager({ dbPath: qmd.dbPath, curationPath: f.storePath, workspaceDir: f.dir,
     sources: [resolveSource(f.dir, "memory", "memory")], extraction: { ...config().extraction, publish: true }, storeFactory: async () => qmd });
   try {
-    await syncExtractedIndex({ internal: qmd.internal, embed: async () => ({ docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }) }, store.records());
+    await syncExtractedIndex(withoutEmbedding(qmd), store.records());
     const hash = createHash("sha256").update(proposal.text).digest("hex");
     const model = qmd.internal.llm!.embedModelName;
     qmd.internal.ensureVecTable(2);
@@ -355,8 +361,14 @@ test("QMD projection and authoritative reads reject withdrawn versions without a
     store.reset(session.sessionId, null, owner);
     assert.equal((await manager.readFile({ relPath: path })).status, "not_found");
     assert.deepEqual(await manager.search("red", { corpora: ["extracted"] }), []);
-    await assert.rejects(syncExtractedIndex({ internal: qmd.internal,
-      embed: async () => ({ docsProcessed: 1, chunksEmbedded: 0, errors: 1, durationMs: 0 }) }, []), /failed to embed/);
+    await assert.rejects(syncExtractedIndex({ syncProjectedCollection: async () => {
+      throw new Error(`Projected collection '${EXTRACTED_COLLECTION}' has 1 failed embedding chunks`);
+    } }, []), /failed embedding chunks/);
+    // Retraction goes through QMD's projected API and purges the withdrawn plaintext.
+    const retracted = await syncExtractedIndex(withoutEmbedding(qmd), store.records());
+    assert.equal(retracted.retracted, 1);
+    assert.equal(qmd.internal.db.prepare("SELECT 1 FROM content WHERE hash=?").get(hash), undefined);
+    assert.equal(qmd.internal.db.prepare("SELECT 1 FROM documents WHERE collection=?").get(EXTRACTED_COLLECTION), undefined);
   } finally { store.close(); await manager.close(); }
 });
 
@@ -365,8 +377,8 @@ test("extracted facts survive manager startup and ordinary file sync", async () 
   const dbPath = join(f.dir, "index.sqlite");
   store.checkpoint(session, owner);
   store.commit({ session, expected: null, cursor: "c1", context: [], accepted: [{ proposal, observedAt: 1000, judgment: {} }], owner, version: "test" });
-  const qmd = await createStore({ dbPath, config: { collections: { [EXTRACTED_COLLECTION]: { path: f.dir, pattern: ".no-extracted-files", includeByDefault: false } } } });
-  await syncExtractedIndex({ internal: qmd.internal, embed: async () => ({ docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 }) }, store.records());
+  const qmd = await createStore({ dbPath, config: { collections: { [EXTRACTED_COLLECTION]: { projected: true, includeByDefault: false } } } });
+  await syncExtractedIndex(withoutEmbedding(qmd), store.records());
   // Avoid downloading a model: this regression is about document lifecycle, not embeddings.
   qmd.internal.db.prepare("INSERT OR REPLACE INTO store_config(key,value) VALUES('embedding_chunk_strategy','semantic')").run();
   await qmd.close();

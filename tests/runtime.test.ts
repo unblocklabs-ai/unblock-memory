@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import fs, { mkdir, mkdtemp, readFile, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { lstatSync } from "node:fs";
+import { mkdir, mkdtemp, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,45 +10,46 @@ import test from "node:test";
 import { FSWatcher } from "chokidar";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { QmdMemoryManager } from "../src/manager.js";
-import { QmdMemoryRuntime, recoverInterruptedSessionSync } from "../src/runtime.js";
+import { QmdMemoryRuntime } from "../src/runtime.js";
+import { MEMORY_DATABASE } from "../src/memory-database.js";
+import { SessionSyncState } from "../src/session-sync-state.js";
+import { WorkFenceLostError, WorkStore } from "../src/work-store.js";
+import { listFiles } from "./helpers/session-index.js";
 
-function seedSessionSyncLease(
-  lockPath: string,
-  lease: { pid: number; token: string; startedAt: string },
-): void {
-  const db = new DatabaseSync(lockPath);
-  try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS session_sync_lease (
-        id INTEGER PRIMARY KEY CHECK(id = 1),
-        pid INTEGER NOT NULL,
-        token TEXT NOT NULL,
-        started_at TEXT NOT NULL
-      )
-    `);
-    db.prepare(
-      "INSERT OR REPLACE INTO session_sync_lease (id, pid, token, started_at) VALUES (1, ?, ?, ?)",
-    ).run(lease.pid, lease.token, lease.startedAt);
-  } finally {
-    db.close();
-  }
+const SESSION_SYNC_KIND = "session_sync";
+
+function stateDirFor(stateRoot: string): string {
+  return join(stateRoot, "agents", "main", "unblock-memory");
 }
 
-function readSessionSyncLeaseRows(
-  lockPath: string,
-): Array<{ id: number; pid: number; token: string; started_at: string }> {
-  const db = new DatabaseSync(lockPath, { readOnly: true });
-  try {
-    return db.prepare("SELECT id, pid, token, started_at FROM session_sync_lease").all() as Array<{
-      id: number;
-      pid: number;
-      token: string;
-      started_at: string;
-    }>;
-  } finally {
-    db.close();
-  }
+function withWork<T>(stateDir: string, fn: (work: WorkStore, state: SessionSyncState) => T): T {
+  const work = new WorkStore(join(stateDir, MEMORY_DATABASE));
+  try { return fn(work, new SessionSyncState(work.db, "main")); } finally { work.close(); }
 }
+
+/** Another process's session sync: claimed lease (optionally already expired) plus its running receipt. */
+function seedForeignRun(stateDir: string, options: {
+  owner: string; startedAt: string; phase: "queued" | "projecting" | "indexing"; expired?: boolean;
+}) {
+  return withWork(stateDir, (work, state) => {
+    work.enqueue({ kind: SESSION_SYNC_KIND, scope: "main", mode: "run" });
+    const claim = work.claim({ kind: SESSION_SYNC_KIND, scope: "main", mode: "run", owner: options.owner,
+      leaseMs: 60_000, ignoreDueAt: true });
+    assert.ok(claim, "seeded claim");
+    // A crashed owner: the lease lapsed without any graceful release.
+    if (options.expired) work.db.prepare("UPDATE work_items SET lease_until=1 WHERE kind=? AND scope='main'").run(SESSION_SYNC_KIND);
+    state.writeReceipt({ status: "running", phase: options.phase, startedAt: options.startedAt, attempt: claim.attempt });
+    return claim;
+  });
+}
+
+function sessionSyncRow(stateDir: string) {
+  return withWork(stateDir, work => work.get(SESSION_SYNC_KIND, "main"));
+}
+
+const emptyResult = () => ({
+  scanned: 0, unchanged: 0, updated: 0, removed: 0, skipped: 0, failed: 0, embedded: 0, lastSuccessfulSyncAt: Date.now(),
+});
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -355,14 +357,12 @@ test("shares failed session sync status and allows a retry from a new runtime", 
     "retried session sync completion",
   );
 });
-
-test("marks persisted running status interrupted after a Gateway restart", async () => {
+test("marks a legacy running status interrupted after a Gateway restart", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-stale-"));
-  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
-  const statusPath = join(stateDir, "session-sync-status.json");
+  const stateDir = stateDirFor(stateRoot);
   const startedAt = "2026-08-26T12:00:00.000Z";
   await mkdir(stateDir, { recursive: true });
-  await writeFile(statusPath, JSON.stringify({
+  await writeFile(join(stateDir, "session-sync-status.json"), JSON.stringify({
     status: "running",
     phase: "indexing",
     pid: 99_999_999,
@@ -372,34 +372,68 @@ test("marks persisted running status interrupted after a Gateway restart", async
 
   const failed = await runtime.sessionSyncStatus(active.agentId);
   assert.equal(failed.status, "failed");
-  if (failed.status === "failed") assert.equal(failed.error, "session sync interrupted by Gateway restart");
+  if (failed.status === "failed") {
+    assert.equal(failed.startedAt, startedAt);
+    assert.equal(failed.error, "session sync interrupted by Gateway restart");
+  }
 });
 
-test("restart recovery preserves completion after its first status read", async () => {
-  const root = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-recovery-race-"));
-  const statusPath = join(root, "session-sync-status.json");
-  const startedAt = "2026-08-26T12:00:00.000Z";
-  const completed = {
-    status: "completed" as const,
-    startedAt,
-    completedAt: "2026-08-26T12:01:00.000Z",
-    scanned: 1,
-    unchanged: 0,
-    updated: 1,
-    removed: 0,
-    skipped: 0,
-    failed: 0,
-    embedded: 1,
-    lastSuccessfulSyncAt: Date.now(),
-  };
-  await writeFile(statusPath, JSON.stringify(completed));
+test("imports a legacy completed status receipt with the same public shape", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-legacy-status-"));
+  const stateDir = stateDirFor(stateRoot);
+  await mkdir(stateDir, { recursive: true });
+  const completed = { status: "completed" as const, startedAt: "2026-08-26T12:00:00.000Z",
+    completedAt: "2026-08-26T12:01:00.000Z", ...emptyResult() };
+  await writeFile(join(stateDir, "session-sync-status.json"), JSON.stringify({ ...completed, pid: 42 }));
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  assert.deepEqual(await runtime.sessionSyncStatus(active.agentId), completed);
+});
 
-  assert.deepEqual(await recoverInterruptedSessionSync(root, statusPath, {
-    status: "running",
-    phase: "indexing",
-    pid: 99_999_999,
-    startedAt,
-  }), completed);
+test("an expired WorkStore lease reports its attempt interrupted once and persists the receipt", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-expired-"));
+  const stateDir = stateDirFor(stateRoot);
+  const startedAt = "2026-11-24T12:00:00.000Z";
+  seedForeignRun(stateDir, { owner: "session-sync:dead:owner", startedAt, phase: "indexing", expired: true });
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  const failed = await runtime.sessionSyncStatus(active.agentId);
+  assert.equal(failed.status, "failed");
+  if (failed.status !== "failed") return;
+  assert.equal(failed.startedAt, startedAt);
+  assert.equal(failed.error, "session sync interrupted by Gateway restart");
+  assert.deepEqual(await runtime.sessionSyncStatus(active.agentId), failed, "stable across reads");
+  assert.deepEqual(withWork(stateDir, (_work, state) => state.readReceipt()), failed);
+});
+
+test("interrupting a dead attempt never clobbers a receipt that superseded it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-recovery-race-"));
+  const completed = { status: "completed" as const, startedAt: "2026-08-26T12:00:00.000Z",
+    completedAt: "2026-08-26T12:01:00.000Z", ...emptyResult() };
+  withWork(root, (_work, state) => {
+    state.writeReceipt({ status: "running", phase: "indexing", startedAt: completed.startedAt, attempt: 1 });
+    // The owner completed between a reader's first look and its recovery write.
+    state.writeReceipt(completed);
+    assert.deepEqual(state.interruptReceipt(1, new Date().toISOString()), completed);
+    // A newer live attempt is not the dead one either.
+    state.writeReceipt({ status: "running", phase: "queued", startedAt: "later", attempt: 2 });
+    assert.equal(state.interruptReceipt(1, new Date().toISOString())?.status, "running");
+  });
+});
+
+test("a crashed later attempt is recovered with that attempt's start time", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-second-crash-"));
+  const stateDir = stateDirFor(stateRoot);
+  seedForeignRun(stateDir, { owner: "first", startedAt: "2026-11-24T12:00:00.000Z", phase: "projecting", expired: true });
+  // A second process reclaimed the expired lease, then crashed too.
+  const secondStartedAt = "2026-11-24T12:05:00.000Z";
+  const second = seedForeignRun(stateDir, { owner: "second", startedAt: secondStartedAt, phase: "indexing", expired: true });
+  assert.equal(second.attempt, 2);
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  const recovered = await runtime.sessionSyncStatus(active.agentId);
+  assert.equal(recovered.status, "failed");
+  if (recovered.status === "failed") {
+    assert.equal(recovered.startedAt, secondStartedAt);
+    assert.equal(recovered.error, "session sync interrupted by Gateway restart");
+  }
 });
 
 test("clears the active registry when the initial status write fails", async () => {
@@ -412,22 +446,7 @@ test("clears the active registry when the initial status write fails", async () 
   await unlink(stateRoot);
   await mkdir(stateRoot);
   Object.defineProperty(runtime, "getMemorySearchManager", {
-    value: async () => ({
-      manager: {
-        async syncSessions() {
-          return {
-            scanned: 0,
-            unchanged: 0,
-            updated: 0,
-            removed: 0,
-            skipped: 0,
-            failed: 0,
-            embedded: 0,
-            lastSuccessfulSyncAt: Date.now(),
-          };
-        },
-      },
-    }),
+    value: async () => ({ manager: { async syncSessions() { return emptyResult(); } } }),
   });
   assert.equal((await runtime.startSessionSync(active)).status, "started");
   await waitFor(
@@ -436,147 +455,53 @@ test("clears the active registry when the initial status write fails", async () 
   );
 });
 
-test("cross-process SQLite lease protects a live sync from clobbering or duplication and reclaims dead-PID leases", async (t) => {
-  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-xproc-lock-"));
-  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
-  const lockPath = join(stateDir, "session-sync.lock.sqlite");
-  const statusPath = join(stateDir, "session-sync-status.json");
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 10_000)"], { stdio: "ignore" });
-  t.after(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-  });
-  assert.ok(child.pid);
-
+test("a live WorkStore lease blocks duplicates across processes; a crashed owner's lease is reclaimed", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-xproc-lease-"));
+  const stateDir = stateDirFor(stateRoot);
   const startedAt = "2026-11-24T12:00:00.000Z";
-  seedSessionSyncLease(lockPath, {
-    pid: child.pid,
-    token: "process-a-token",
-    startedAt,
-  });
-  const runningReceipt = {
-    status: "running" as const,
-    phase: "indexing" as const,
-    pid: child.pid,
-    startedAt,
-  };
-  await writeFile(statusPath, JSON.stringify(runningReceipt), { mode: 0o600 });
+  seedForeignRun(stateDir, { owner: "session-sync:other-process", startedAt, phase: "indexing" });
 
   const processB = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   t.after(() => processB.close());
+  assert.deepEqual(await processB.sessionSyncStatus(active.agentId), { status: "running", phase: "indexing", startedAt });
+  assert.deepEqual(await processB.startSessionSync(active), { status: "already_running", startedAt });
+  assert.equal(sessionSyncRow(stateDir)?.owner, "session-sync:other-process", "a live lease is never stolen");
 
-  assert.deepEqual(await processB.sessionSyncStatus(active.agentId), {
-    status: "running",
-    phase: "indexing",
-    startedAt,
-  });
-  assert.deepEqual(await processB.startSessionSync(active), {
-    status: "already_running",
-    startedAt,
-  });
-  assert.deepEqual(await recoverInterruptedSessionSync(stateDir, statusPath, runningReceipt), {
-    status: "running",
-    phase: "indexing",
-    startedAt,
-  });
-  assert.equal(JSON.parse(await readFile(statusPath, "utf8")).status, "running");
-
-  // EPERM from process.kill(pid, 0) must also be treated as alive.
-  const killMock = t.mock.method(process, "kill", (pid: number, signal?: string | number) => {
-    if (pid === 424_242 && signal === 0) {
-      const error = new Error("operation not permitted") as NodeJS.ErrnoException;
-      error.code = "EPERM";
-      throw error;
-    }
-    return true;
-  });
-  seedSessionSyncLease(lockPath, {
-    pid: 424_242,
-    token: "eperm-owner",
-    startedAt,
-  });
-  assert.deepEqual(await processB.startSessionSync(active), {
-    status: "already_running",
-    startedAt,
-  });
-  killMock.mock.restore();
-
-  // Restore the real child lease, kill the child, and confirm dead-PID reclamation.
-  seedSessionSyncLease(lockPath, {
-    pid: child.pid,
-    token: "process-a-token",
-    startedAt,
-  });
-  child.kill("SIGKILL");
-  await once(child, "exit");
-
+  // Process A crashes: its lease lapses without a graceful release.
+  withWork(stateDir, work => work.db.prepare("UPDATE work_items SET lease_until=1 WHERE kind=?").run(SESSION_SYNC_KIND));
   const recovered = await processB.sessionSyncStatus(active.agentId);
   assert.equal(recovered.status, "failed");
-  if (recovered.status === "failed") {
-    assert.equal(recovered.error, "session sync interrupted by Gateway restart");
-  }
-  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
+  if (recovered.status === "failed") assert.equal(recovered.error, "session sync interrupted by Gateway restart");
 
-  let lockModeDuringRun: number | undefined;
-  let leasePidDuringRun: number | undefined;
+  let rowDuringRun: ReturnType<typeof sessionSyncRow>;
   Object.defineProperty(processB, "getMemorySearchManager", {
     value: async () => ({
       manager: {
         async syncSessions() {
-          lockModeDuringRun = (await stat(lockPath)).mode & 0o777;
-          const rows = readSessionSyncLeaseRows(lockPath);
-          leasePidDuringRun = rows[0]?.pid;
-          return {
-            scanned: 0,
-            unchanged: 0,
-            updated: 0,
-            removed: 0,
-            skipped: 0,
-            failed: 0,
-            embedded: 0,
-            lastSuccessfulSyncAt: Date.now(),
-          };
+          rowDuringRun = sessionSyncRow(stateDir);
+          return emptyResult();
         },
       },
     }),
   });
-
-  const restarted = await processB.startSessionSync(active);
-  assert.equal(restarted.status, "started");
+  assert.equal((await processB.startSessionSync(active)).status, "started");
   await waitFor(
     async () => (await processB.sessionSyncStatus(active.agentId)).status === "completed",
     "reclaimed session sync completion",
   );
-  assert.equal(lockModeDuringRun, 0o600);
-  assert.equal(leasePidDuringRun, process.pid);
-  assert.equal((await stat(lockPath)).mode & 0o777, 0o600);
-  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
+  assert.equal(rowDuringRun?.status, "running");
+  assert.match(rowDuringRun?.owner ?? "", new RegExp(`^session-sync:${process.pid}:`));
+  assert.ok((rowDuringRun?.leaseUntil ?? 0) > Date.now());
+  const settled = sessionSyncRow(stateDir);
+  assert.deepEqual({ status: settled?.status, owner: settled?.owner, strikes: settled?.strikes, mode: settled?.mode },
+    { status: "pending", owner: null, strikes: 0, mode: "run" });
+  assert.equal(lstatSync(join(stateDir, "session-sync.lock.sqlite"), { throwIfNoEntry: false }), undefined);
 });
 
-test("concurrent contenders recovering from a dead-PID SQLite lease admit strictly one owner", async (t) => {
+test("concurrent contenders reclaiming an expired WorkStore lease admit strictly one owner", async (t) => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-lease-race-"));
-  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
-  const lockPath = join(stateDir, "session-sync.lock.sqlite");
-  const statusPath = join(stateDir, "session-sync-status.json");
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-
-  const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
-  assert.ok(deadChild.pid);
-  await once(deadChild, "exit");
-
-  const staleStartedAt = "2026-11-24T12:00:00.000Z";
-  seedSessionSyncLease(lockPath, {
-    pid: deadChild.pid,
-    token: "stale-dead-owner",
-    startedAt: staleStartedAt,
-  });
-  await writeFile(statusPath, JSON.stringify({
-    status: "running",
-    phase: "indexing",
-    pid: deadChild.pid,
-    startedAt: staleStartedAt,
-  }), { mode: 0o600 });
+  const stateDir = stateDirFor(stateRoot);
+  seedForeignRun(stateDir, { owner: "session-sync:dead", startedAt: "2026-11-24T12:00:00.000Z", phase: "indexing", expired: true });
 
   const runtimeModuleUrl = new URL("../src/runtime.ts", import.meta.url).href;
   const contenderScript = `
@@ -596,16 +521,8 @@ test("concurrent contenders recovering from a dead-PID SQLite lease admit strict
         manager: {
           async syncSessions() {
             await syncGate;
-            return {
-              scanned: 1,
-              unchanged: 0,
-              updated: 1,
-              removed: 0,
-              skipped: 0,
-              failed: 0,
-              embedded: 0,
-              lastSuccessfulSyncAt: Date.now(),
-            };
+            return { scanned: 1, unchanged: 0, updated: 1, removed: 0, skipped: 0, failed: 0, embedded: 0,
+              lastSuccessfulSyncAt: Date.now() };
           },
         },
       }),
@@ -623,6 +540,7 @@ test("concurrent contenders recovering from a dead-PID SQLite lease admit strict
     process.stdout.write(JSON.stringify({ pid: process.pid, result }) + "\\n");
     if (result.status === "started") {
       await syncGate;
+      while ((await runtime.sessionSyncStatus("main")).status === "running") await new Promise(r => setTimeout(r, 5));
       await runtime.close();
     }
     rl.close();
@@ -685,11 +603,9 @@ test("concurrent contenders recovering from a dead-PID SQLite lease admit strict
   assert.equal(winners.length, 1, `expected strictly 1 started contender, got ${JSON.stringify(outcomes)}`);
   assert.equal(losers.length, 1, `expected strictly 1 already_running contender, got ${JSON.stringify(outcomes)}`);
   assert.equal(losers[0]!.result.startedAt, winners[0]!.result.startedAt);
-
-  const activeLease = readSessionSyncLeaseRows(lockPath);
-  assert.equal(activeLease.length, 1);
-  assert.equal(activeLease[0]!.pid, winners[0]!.pid);
-  assert.equal((await stat(lockPath)).mode & 0o777, 0o600);
+  const activeLease = sessionSyncRow(stateDir);
+  assert.equal(activeLease?.status, "running");
+  assert.match(activeLease?.owner ?? "", new RegExp(`^session-sync:${winners[0]!.pid}:`));
 
   contenderA.child.stdin.write("RELEASE\n");
   contenderB.child.stdin.write("RELEASE\n");
@@ -700,129 +616,36 @@ test("concurrent contenders recovering from a dead-PID SQLite lease admit strict
   assert.equal(exitA[0], 0, contenderA.getStderr());
   assert.equal(exitB[0], 0, contenderB.getStderr());
 
-  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
+  assert.equal(sessionSyncRow(stateDir)?.owner, null);
   const observer = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   t.after(() => observer.close());
   assert.equal((await observer.sessionSyncStatus(active.agentId)).status, "completed");
 });
 
-test("recoverInterruptedSessionSync immediately recovers a crashed second running receipt", async () => {
-  const root = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-second-crash-"));
-  const statusPath = join(root, "session-sync-status.json");
-  const firstStartedAt = "2026-11-24T12:00:00.000Z";
-  const secondStartedAt = "2026-11-24T12:05:00.000Z";
-  await writeFile(statusPath, JSON.stringify({
-    status: "running",
-    phase: "indexing",
-    pid: 99_999_998,
-    startedAt: secondStartedAt,
-  }), { mode: 0o600 });
-
-  const recovered = await recoverInterruptedSessionSync(root, statusPath, {
-    status: "running",
-    phase: "projecting",
-    pid: 99_999_999,
-    startedAt: firstStartedAt,
-  });
-  assert.equal(recovered.status, "failed");
-  if (recovered.status === "failed") {
-    assert.equal(recovered.startedAt, secondStartedAt);
-    assert.equal(recovered.error, "session sync interrupted by Gateway restart");
-  }
-  const persisted = JSON.parse(await readFile(statusPath, "utf8")) as { status: string; startedAt: string };
-  assert.equal(persisted.status, "failed");
-  assert.equal(persisted.startedAt, secondStartedAt);
-  assert.deepEqual(readSessionSyncLeaseRows(join(root, "session-sync.lock.sqlite")), []);
-});
-
-test("runtime.close fences an in-flight startSessionSync mid-startup and prevents manager creation after close", async (t) => {
-  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-close-fence-"));
-  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
-  const lockPath = join(stateDir, "session-sync.lock.sqlite");
-  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
-
-  let managerStarts = 0;
-  t.mock.method(QmdMemoryManager.prototype, "start", async () => {
-    managerStarts += 1;
-  });
-  t.mock.method(QmdMemoryManager.prototype, "close", async () => {});
-
-  let writeEntered!: () => void;
-  const queuedWriteStarted = new Promise<void>((resolve) => { writeEntered = resolve; });
-  let releaseWrite!: () => void;
-  const queuedWriteGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
-
-  const originalWriteFile = fs.writeFile.bind(fs);
-  let pausedOnce = false;
-  t.mock.method(fs, "writeFile", async (...args: Parameters<typeof fs.writeFile>) => {
-    const [target] = args;
-    if (!pausedOnce && typeof target === "string" && target.includes("session-sync-status.json")) {
-      pausedOnce = true;
-      writeEntered();
-      await queuedWriteGate;
-    }
-    return originalWriteFile(...args);
-  });
-
-  const startPromise = runtime.startSessionSync(active, true);
-  await queuedWriteStarted;
-  // Lock is already held by the in-flight startSessionSync before #activeSessionSyncs registration.
-  assert.equal(readSessionSyncLeaseRows(lockPath).length, 1);
-
-  let closeDone = false;
-  const closePromise = runtime.close().then(() => { closeDone = true; });
-  await delay(20);
-  assert.equal(closeDone, false, "runtime.close() must wait for in-flight startSessionSync");
-
-  releaseWrite();
-  const [startResult] = await Promise.all([startPromise, closePromise]);
-  assert.equal(closeDone, true);
-  assert.deepEqual(startResult, {
-    status: "unavailable",
-    error: "memory runtime is closing",
-  });
-  assert.equal(managerStarts, 0, "no QmdMemoryManager may spawn during or after close");
-  assert.deepEqual(readSessionSyncLeaseRows(lockPath), []);
-
-  assert.deepEqual(await runtime.getMemorySearchManager(active), {
-    manager: null,
-    error: "memory runtime is closing",
-  });
-  assert.deepEqual(await runtime.startSessionSync(active), {
-    status: "unavailable",
-    error: "memory runtime is closing",
-  });
-  assert.equal(managerStarts, 0);
-});
-
-test("runtime.close drains owned active session syncs before closing managers", async () => {
+test("gateway_stop releases the session-sync lease at once with 0 strikes and fences the drained run", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-drain-"));
+  const stateDir = stateDirFor(stateRoot);
   const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   const events: string[] = [];
   let releaseSync!: () => void;
   const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
   let syncStarted!: () => void;
   const syncEntered = new Promise<void>((resolve) => { syncStarted = resolve; });
+  let persistError: unknown;
+  let signalAborted: boolean | undefined;
 
   const originalCreate = QmdMemoryManager.prototype.start;
   const originalSync = QmdMemoryManager.prototype.syncSessions;
   const originalClose = QmdMemoryManager.prototype.close;
   QmdMemoryManager.prototype.start = async () => {};
-  QmdMemoryManager.prototype.syncSessions = async () => {
+  QmdMemoryManager.prototype.syncSessions = async (_force, _onPhase, options) => {
     events.push("sync:start");
     syncStarted();
     await syncGate;
+    signalAborted = options?.signal?.aborted;
+    try { options?.persist?.({ version: 1, sessions: {} }); } catch (error) { persistError = error; }
     events.push("sync:end");
-    return {
-      scanned: 1,
-      unchanged: 1,
-      updated: 0,
-      removed: 0,
-      skipped: 0,
-      failed: 0,
-      embedded: 0,
-      lastSuccessfulSyncAt: Date.now(),
-    };
+    return emptyResult();
   };
   QmdMemoryManager.prototype.close = async () => {
     events.push("manager:close");
@@ -831,22 +654,45 @@ test("runtime.close drains owned active session syncs before closing managers", 
     const started = await runtime.startSessionSync(active, true);
     assert.equal(started.status, "started");
     await syncEntered;
+    assert.equal(sessionSyncRow(stateDir)?.status, "running");
 
     let closeDone = false;
     const closing = runtime.close().then(() => { closeDone = true; });
+    // Released synchronously inside close(), before the in-flight run drains: no strike, no lease.
+    const released = sessionSyncRow(stateDir);
+    assert.deepEqual({ status: released?.status, owner: released?.owner, leaseUntil: released?.leaseUntil, strikes: released?.strikes },
+      { status: "pending", owner: null, leaseUntil: 0, strikes: 0 });
     await delay(20);
-    assert.equal(closeDone, false, "runtime.close() must drain owned active session sync");
+    assert.equal(closeDone, false, "runtime.close() still drains the owned session sync");
     assert.deepEqual(events, ["sync:start"]);
 
     releaseSync();
     await closing;
     assert.deepEqual(events, ["sync:start", "sync:end", "manager:close"]);
-    assert.equal((await runtime.sessionSyncStatus(active.agentId)).status, "completed");
+    assert.equal(signalAborted, true);
+    assert.ok(persistError instanceof WorkFenceLostError, "a released attempt can never publish its manifest");
+    const status = await runtime.sessionSyncStatus(active.agentId);
+    assert.equal(status.status, "failed");
+    if (status.status === "failed") assert.equal(status.error, "session sync interrupted by Gateway restart");
+    assert.equal(withWork(stateDir, (_work, state) => state.revision()), 0);
+
+    assert.deepEqual(await runtime.getMemorySearchManager(active), { manager: null, error: "memory runtime is closing" });
+    assert.deepEqual(await runtime.startSessionSync(active), { status: "unavailable", error: "memory runtime is closing" });
   } finally {
     QmdMemoryManager.prototype.start = originalCreate;
     QmdMemoryManager.prototype.syncSessions = originalSync;
     QmdMemoryManager.prototype.close = originalClose;
   }
+
+  // A restarted Gateway picks the released row straight back up (no lease expiry wait).
+  const restarted = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
+  Object.defineProperty(restarted, "getMemorySearchManager", {
+    value: async () => ({ manager: { async syncSessions() { return emptyResult(); } } }),
+  });
+  try {
+    assert.equal((await restarted.startSessionSync(active)).status, "started");
+    await waitFor(async () => (await restarted.sessionSyncStatus(active.agentId)).status === "completed", "restart sync");
+  } finally { await restarted.close(); }
 });
 
 test("concurrent closeMemorySearchManager and getMemorySearchManager serialize cleanly", async (t) => {
@@ -891,145 +737,76 @@ test("concurrent closeMemorySearchManager and getMemorySearchManager serialize c
   assert.equal((await runtime.getMemorySearchManager(active)).manager, second.manager);
 });
 
-test("transient lease-release failure surfaces error and recovers on next sync without restart", async (t) => {
-  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-release-fail-"));
-  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
-  const lockPath = join(stateDir, "session-sync.lock.sqlite");
-  const errors: unknown[] = [];
-  const runtime = new QmdMemoryRuntime(sessionCorpora, {
-    stateRoot,
-    onError: (error) => errors.push(error),
-  });
+test("a fenced-out attempt (lease taken over) never publishes and the next sync recovers without restart", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-fence-lost-"));
+  const stateDir = stateDirFor(stateRoot);
+  const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   t.after(() => runtime.close());
-
-  let syncRuns = 0;
+  let releaseSync!: () => void;
+  const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
+  let persistError: unknown;
+  let runs = 0;
   Object.defineProperty(runtime, "getMemorySearchManager", {
     value: async () => ({
       manager: {
-        async syncSessions() {
-          syncRuns += 1;
-          return {
-            scanned: 1,
-            unchanged: 0,
-            updated: 1,
-            removed: 0,
-            skipped: 0,
-            failed: 0,
-            embedded: 0,
-            lastSuccessfulSyncAt: Date.now(),
-          };
+        async syncSessions(_force: boolean, _onPhase: unknown, options: { persist(manifest: unknown): void }) {
+          runs += 1;
+          if (runs === 1) {
+            await syncGate;
+            try { options.persist({ version: 1, sessions: {} }); } catch (error) { persistError = error; throw error; }
+          } else {
+            options.persist({ version: 1, sessions: {}, generation: 0 });
+          }
+          return emptyResult();
         },
       },
     }),
   });
 
-  // Fail the DELETE inside releaseSessionSyncLock once to leave a relinquished same-PID row behind.
-  const originalPrepare = DatabaseSync.prototype.prepare;
-  let failedDelete = false;
-  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
-    if (!failedDelete && sql.includes("DELETE FROM session_sync_lease")) {
-      failedDelete = true;
-      throw new Error("transient lease release disk error");
-    }
-    return originalPrepare.call(this, sql);
-  });
+  assert.equal((await runtime.startSessionSync(active, true)).status, "started");
+  await waitFor(() => runs === 1, "first run entered");
+  // Another process interrupts and supersedes this attempt (bumps the fencing attempt).
+  const owner = sessionSyncRow(stateDir)!.owner!;
+  withWork(stateDir, work => work.interruptOwner(owner));
+  releaseSync();
+  await waitFor(async () => (await runtime.sessionSyncStatus(active.agentId)).status === "failed", "fenced run");
+  assert.ok(persistError instanceof WorkFenceLostError);
+  assert.equal(withWork(stateDir, (_work, state) => state.revision()), 0, "no manifest from the fenced attempt");
 
-  const first = await runtime.startSessionSync(active, true);
-  assert.equal(first.status, "started");
-  await waitFor(() => errors.length === 1, "release failure callback");
-  assert.match(String(errors[0]), /transient lease release disk error/);
-  assert.equal(syncRuns, 1);
-
-  // Lease row with our live process.pid is still in SQLite, but it was relinquished in-process.
-  const stranded = readSessionSyncLeaseRows(lockPath);
-  assert.equal(stranded.length, 1);
-  assert.equal(stranded[0]!.pid, process.pid);
-
-  // Next startSessionSync reclaims the relinquished same-PID lease atomically without restart.
-  const second = await runtime.startSessionSync(active, true);
-  assert.equal(second.status, "started");
-  await waitFor(() => syncRuns === 2 && readSessionSyncLeaseRows(lockPath).length === 0, "second sync after recovery");
-  assert.equal((await runtime.sessionSyncStatus(active.agentId)).status, "completed");
-
-  // Directly seeded orphaned same-PID row (not in held token set) is also reclaimed cleanly.
-  seedSessionSyncLease(lockPath, {
-    pid: process.pid,
-    token: "orphaned-same-pid-token",
-    startedAt: "2026-11-24T12:00:00.000Z",
-  });
-  const third = await runtime.startSessionSync(active, true);
-  assert.equal(third.status, "started");
-  await waitFor(() => syncRuns === 3 && readSessionSyncLeaseRows(lockPath).length === 0, "third sync after orphaned same-pid row");
+  assert.equal((await runtime.startSessionSync(active, true)).status, "started");
+  await waitFor(async () => (await runtime.sessionSyncStatus(active.agentId)).status === "completed", "recovered run");
+  assert.equal(withWork(stateDir, (_work, state) => state.revision()), 1);
 });
 
-test("respects live legacy session-sync.lock without unlinking it and ignores dead-PID legacy locks", async (t) => {
-  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-legacy-lock-"));
-  const stateDir = join(stateRoot, "agents", active.agentId, "unblock-memory");
-  const legacyLockPath = join(stateDir, "session-sync.lock");
-  const statusPath = join(stateDir, "session-sync-status.json");
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 10_000)"], { stdio: "ignore" });
-  t.after(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-  });
-  assert.ok(child.pid);
-
-  const startedAt = "2026-11-24T12:30:00.000Z";
-  const legacyPayload = JSON.stringify({ pid: child.pid, token: "legacy-token", startedAt });
-  await writeFile(legacyLockPath, legacyPayload, { mode: 0o600 });
-  await writeFile(statusPath, JSON.stringify({
-    status: "running",
-    phase: "projecting",
-    pid: child.pid,
-    startedAt,
-  }), { mode: 0o600 });
+test("retires legacy Markdown, manifest, lock and status sidecars after the first SQLite-backed sync", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "unblock-memory-runtime-legacy-retire-"));
+  const stateDir = stateDirFor(stateRoot);
+  await mkdir(join(stateDir, "sessions", "slack", "channel"), { recursive: true });
+  await writeFile(join(stateDir, "sessions", "slack", "channel", "old.md"), "# Transcript\n\nplaintext\n");
+  await writeFile(join(stateDir, "sessions-manifest.json"), JSON.stringify({ version: 1, sessions: {} }));
+  await writeFile(join(stateDir, "session-sync-status.json"), JSON.stringify({ status: "completed",
+    startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:00:01.000Z", ...emptyResult() }));
+  await writeFile(join(stateDir, "session-sync.lock"), JSON.stringify({ pid: 1, token: "t", startedAt: "x" }));
+  const legacyLock = new DatabaseSync(join(stateDir, "session-sync.lock.sqlite"));
+  legacyLock.exec("CREATE TABLE session_sync_lease (id INTEGER PRIMARY KEY, pid INTEGER, token TEXT, started_at TEXT)");
+  legacyLock.close();
 
   const runtime = new QmdMemoryRuntime(sessionCorpora, { stateRoot });
   t.after(() => runtime.close());
+  assert.equal((await runtime.sessionSyncStatus(active.agentId)).status, "completed", "legacy receipt visible before upgrade");
   Object.defineProperty(runtime, "getMemorySearchManager", {
     value: async () => ({
       manager: {
-        async syncSessions() {
-          return {
-            scanned: 1,
-            unchanged: 1,
-            updated: 0,
-            removed: 0,
-            skipped: 0,
-            failed: 0,
-            embedded: 0,
-            lastSuccessfulSyncAt: Date.now(),
-          };
+        async syncSessions(_force: boolean, _onPhase: unknown, options: { persist(manifest: unknown): void }) {
+          options.persist({ version: 1, sessions: {}, generation: 0 });
+          return emptyResult();
         },
       },
     }),
   });
-
-  // Live legacy lock blocks concurrent SQLite lease acquisition and is never unlinked.
-  assert.deepEqual(await runtime.startSessionSync(active, true), {
-    status: "already_running",
-    startedAt,
-  });
-  assert.deepEqual(await runtime.sessionSyncStatus(active.agentId), {
-    status: "running",
-    phase: "projecting",
-    startedAt,
-  });
-  assert.equal(await readFile(legacyLockPath, "utf8"), legacyPayload);
-
-  // Once the legacy process exits, the dead-PID legacy lock no longer blocks acquisition or recovery.
-  child.kill("SIGKILL");
-  await once(child, "exit");
-
-  const recovered = await runtime.sessionSyncStatus(active.agentId);
-  assert.equal(recovered.status, "failed");
-  const started = await runtime.startSessionSync(active, true);
-  assert.equal(started.status, "started");
-  await waitFor(
-    async () => (await runtime.sessionSyncStatus(active.agentId)).status === "completed",
-    "sync after dead legacy lock",
-  );
+  assert.equal((await runtime.startSessionSync(active, true)).status, "started");
+  await waitFor(async () => (await runtime.sessionSyncStatus(active.agentId)).status === "completed", "upgrade sync");
+  assert.deepEqual(listFiles(stateDir).filter(file => !file.startsWith(MEMORY_DATABASE)), []);
 });
 
 test("prepareReload fences admissions, drains managers/syncs with error reporting, and resumes only if retained", async (t) => {

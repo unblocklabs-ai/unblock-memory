@@ -56,7 +56,8 @@ The candidate adapter and decision model usefulness rubric are production code.
 - `blind/`: shuffled, score-free passages plus grading instructions. Give only
   this directory to a fresh reviewer with no inherited score/history context.
 - `index.sqlite`: private current-index snapshot; do not publish it.
-- `sessions-manifest.json`: snapshotted exact projection boundaries. Dates are
+- `sessions-manifest.json`: exact projection boundaries, snapshotted read-only from the
+  session manifest in `unblock-memory.sqlite` (or a pre-0.18 sidecar). Dates are
   used only when the projection hash matches the indexed document. Otherwise
   chronology is unverified; Markdown heading/fence parsing is not temporal proof.
 

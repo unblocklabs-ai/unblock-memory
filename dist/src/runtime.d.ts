@@ -30,15 +30,6 @@ export type SessionSyncStartResult = {
     status: "unavailable";
     error: string;
 };
-type StoredSessionSyncStatus = Exclude<SessionSyncStatus, {
-    status: "idle";
-}>;
-type StoredRunningSessionSync = Extract<StoredSessionSyncStatus, {
-    status: "running";
-}> & {
-    pid: number;
-};
-export declare function recoverInterruptedSessionSync(directory: string, statusPath: string, stale: StoredRunningSessionSync, onError?: (error: unknown) => void): Promise<SessionSyncStatus>;
 export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     #private;
     startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void;
@@ -91,4 +82,3 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         agentId: string;
     }, path: string): string | undefined;
 }
-export {};

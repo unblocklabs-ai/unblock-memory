@@ -5,6 +5,7 @@ import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProb
 import type { ChatType } from "./config.js";
 import { type MaintenanceStatus, type MaintenanceTask, type TemporalBasis } from "./curation.js";
 import { type SessionSyncResult } from "./session-sync.js";
+import { type SessionManifest } from "./session-sync-state.js";
 import { type ResolvedSource } from "./sources.js";
 import { type QualityCursor } from "./quality-audit.js";
 import { qualityTaskPresence } from "./quality-triage.js";
@@ -19,7 +20,7 @@ type MemoryReadParams = {
     cursor?: MemoryReadCursor;
     requestContext?: MemoryRequestContext;
 };
-export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "vsearch" | "get" | "close">;
+export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "vsearch" | "get" | "close" | "upsertDocument" | "retractDocument" | "syncProjectedCollection" | "getCollectionGeneration">;
 export type ManagerSessionConfig = {
     agentId: string;
     agentName: string;
@@ -27,8 +28,10 @@ export type ManagerSessionConfig = {
     maxExpandedTokens: number;
     collection: string;
     databasePath: string;
-    manifestPath: string;
-    outputDir: string;
+    /** `unblock-memory.sqlite`: holds the session manifest (QMD holds the projected documents). */
+    statePath: string;
+    /** Pre-0.18 state directory whose `sessions-manifest.json` is imported once on upgrade. */
+    legacyStateDir?: string;
     timezone: string;
 };
 export type SkillCatalogEntry = {
@@ -137,7 +140,10 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
     start(): Promise<void>;
     syncExtracted(): Promise<void>;
     sync(params?: MemorySyncParams): Promise<void>;
-    syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void): Promise<SessionSyncResult>;
+    syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void, options?: {
+        persist?: (manifest: SessionManifest) => void;
+        signal?: AbortSignal;
+    }): Promise<SessionSyncResult>;
     recluster(options?: MemoryReclusterOptions, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
     listClusters(limit?: number): Promise<MemoryClusterList>;
     reviewClaim(params: Omit<Parameters<typeof reviewIndexedClaim>[0], "db" | "sources" | "read"> & {
