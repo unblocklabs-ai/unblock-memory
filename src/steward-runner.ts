@@ -24,7 +24,18 @@ type Failure = { ok: false; code: StewardErrorCode; error: string; retryable: bo
 export type StewardCompleteResult<T> = Failure | { ok: true; data: T; usage: StewardUsage; model?: string;
   backend: "host_llm" | "responses_api" };
 export type StewardRunRequest<T> = Prompt & { tools: readonly StewardToolDef[]; submitSchema: Schema; submitDescription?: string;
-  maxTurns: number; maxToolCalls: number; maxInputTokens?: number; maxToolResultChars?: number; wallTimeoutMs: number;
+  /** Maximum investigation turns (`0` = unlimited). */
+  maxTurns: number;
+  /** Maximum tool calls (`0` = unlimited). */
+  maxToolCalls: number;
+  /** Maximum client-side input tokens per request (`0` = unlimited). */
+  maxInputTokens?: number;
+  /** Maximum characters per tool result (`0` = unlimited). */
+  maxToolResultChars?: number;
+  /** Wall-clock timeout in ms (`0` = unlimited; caller `signal` still aborts). */
+  wallTimeoutMs: number;
+  /** When `wallTimeoutMs > 0`, reserve this many ms to force a final wrap-up submission (`0` = disabled). */
+  wrapUpReserveMs?: number;
   onToolCall?: (event: { name: string; ok: boolean; elapsedMs: number }) => void };
 type Status = "complete" | "incomplete" | "needs_decision";
 type Counts = { turns: number; toolCalls: number };
@@ -131,15 +142,16 @@ export function stripOptionalNulls(value: unknown, schema: Schema): unknown {
   return out;
 }
 
-/** One deadline and accounting ledger across retries, tools and correction turns. */
+/** One deadline and accounting ledger across retries, tools and correction turns. `timeoutMs === 0` means unlimited. */
 function attempt(timeoutMs: number, caller?: AbortSignal) {
   const controller = new AbortController();
   const signal = caller ? AbortSignal.any([caller, controller.signal]) : controller.signal;
-  const deadline = performance.now() + timeoutMs;
+  const bounded = timeoutMs > 0;
+  const deadline = bounded ? performance.now() + timeoutMs : Number.POSITIVE_INFINITY;
   const expire = () => controller.abort(new DOMException("Steward deadline", "TimeoutError"));
-  const timer = setTimeout(expire, timeoutMs);
+  const timer = bounded ? setTimeout(expire, timeoutMs) : undefined;
   const check = () => {
-    if (performance.now() >= deadline) expire();
+    if (bounded && performance.now() >= deadline) expire();
     signal.throwIfAborted();
   };
   const usage: StewardUsage = { requests: 0 };
@@ -156,13 +168,13 @@ function attempt(timeoutMs: number, caller?: AbortSignal) {
     return reportedCosts && reportedCosts === usage.requests ? { ...usage, costUsd: totalCost } : { ...usage };
   }
   function failure(error: unknown): Failure {
-    const fault = signal.aborted || performance.now() >= deadline
+    const fault = signal.aborted || (bounded && performance.now() >= deadline)
       ? (abortedByTimeout(signal) || !signal.aborted ? new Fault("timeout", "Steward deadline elapsed") : new Fault("aborted", "Steward aborted"))
       : error instanceof Fault ? error : new Fault("provider_error", "Steward request failed");
     return { ok: false, code: fault.code, error: fault.message, retryable: ["lifecycle_reload", "timeout", "transient_provider"].includes(fault.code),
       usage: receipt() };
   }
-  return { signal, deadline, check, usage, account, receipt, failure, close: () => clearTimeout(timer) };
+  return { signal, deadline, check, usage, account, receipt, failure, close: () => { if (timer !== undefined) clearTimeout(timer); } };
 }
 type Attempt = ReturnType<typeof attempt>;
 
@@ -185,7 +197,7 @@ async function envelope(response: Response, signal: AbortSignal) {
       const { done, value } = await abortable(reader.read(), signal);
       if (done) break;
       bytes += value.byteLength;
-      if (bytes > 2 * 1024 * 1024) throw invalid("Provider response exceeds byte limit");
+      if (bytes > 16 * 1024 * 1024) throw invalid("Provider response exceeds byte limit");
       chunks.push(value);
     }
   } finally {
@@ -261,7 +273,7 @@ function redactSecrets(text: string, token?: string) {
 }
 function toolText(value: unknown, token: string, max: number) {
   const text = redactSecrets(typeof value === "string" ? value : JSON.stringify(value) ?? "null", token);
-  return text.length <= max ? text : text.slice(0, max).replace(/[\uD800-\uDBFF]$/u, "");
+  return max <= 0 || text.length <= max ? text : text.slice(0, max).replace(/[\uD800-\uDBFF]$/u, "");
 }
 
 export function createStewardRunner(deps: Deps): StewardRunner {
@@ -344,9 +356,11 @@ async function run<T>(deps: Deps, req: StewardRunRequest<T>): Promise<StewardRun
     a.check();
     const maxInput = req.maxInputTokens ?? deps.config.deepThought.maxInputTokens;
     const maxChars = req.maxToolResultChars ?? deps.config.deepThought.maxToolResultChars;
+    const wrapUpReserveMs = req.wrapUpReserveMs ??
+      (req.wallTimeoutMs > deps.config.deepThought.wrapUpReserveMs ? deps.config.deepThought.wrapUpReserveMs : 0);
     for (const [name, value] of Object.entries({ maxTurns: req.maxTurns, maxToolCalls: req.maxToolCalls,
-      maxInputTokens: maxInput, maxToolResultChars: maxChars, wallTimeoutMs: req.wallTimeoutMs })) {
-      if (!Number.isSafeInteger(value) || value < 1) throw budget(name);
+      maxInputTokens: maxInput, maxToolResultChars: maxChars, wallTimeoutMs: req.wallTimeoutMs, wrapUpReserveMs })) {
+      if (!Number.isSafeInteger(value) || value < 0) throw budget(name);
     }
     const submit = submissionSchema(req.submitSchema);
     const byName = new Map(req.tools.map(tool => [tool.name, tool]));
@@ -360,12 +374,12 @@ async function run<T>(deps: Deps, req: StewardRunRequest<T>): Promise<StewardRun
     const seen = new Set<string>();
     let model: string | undefined;
 
-    /** One model turn. `maxInputTokens` bounds each request body; transient retries resend it uncharged. */
+    /** One model turn. When `maxInputTokens > 0`, it bounds each request body; transient retries resend it uncharged. */
     const send = async (options: { forced: boolean; only?: JsonObject[] }) => {
       a.check();
       const body = JSON.stringify({ ...baseRequest(req, deps.config), tools: options.only ?? tools, input,
         include: ["reasoning.encrypted_content"], ...(options.forced ? { tool_choice: { type: "function", name: SUBMIT } } : {}) });
-      if (o200kTokenCount(body) > maxInput) throw budget("maxInputTokens");
+      if (maxInput > 0 && o200kTokenCount(body) > maxInput) throw budget("maxInputTokens");
       let dispatched = false;
       const reply = await post(deps, a, token, body, TRANSIENT_RETRIES, () => { if (!dispatched) { dispatched = true; turns++; } });
       model = reply.model ?? model;
@@ -379,8 +393,8 @@ async function run<T>(deps: Deps, req: StewardRunRequest<T>): Promise<StewardRun
         return { name: item.name, id: item.call_id, args: parse(item.arguments) };
       });
     };
-    const report = (name: string, ok: boolean, start: number) =>
-      req.onToolCall?.({ name: redactSecrets(name, token).slice(0, 128), ok, elapsedMs: performance.now() - start });
+    const report = (name: string, ok: boolean, elapsedMs: number) =>
+      req.onToolCall?.({ name: redactSecrets(name, token).slice(0, 128), ok, elapsedMs });
     /** Decode a strict-mode submission (optional keys arrive as null) and validate it against the caller's schema. */
     const accept = (args: unknown) => {
       const decoded = stripOptionalNulls(args, submit);
@@ -392,56 +406,73 @@ async function run<T>(deps: Deps, req: StewardRunRequest<T>): Promise<StewardRun
       return { ok: true as const, status, data, summary, turns, toolCalls, model, usage: a.receipt() };
     };
 
-    let correcting = false, exhausted: "maxTurns" | "maxToolCalls" | undefined;
+    let correcting = false, exhausted: "maxTurns" | "maxToolCalls" | "wallTimeoutMs" | undefined;
     for (;;) {
-      if (turns >= req.maxTurns) { exhausted = "maxTurns"; break; }
+      if (req.maxTurns > 0 && turns >= req.maxTurns) { exhausted = "maxTurns"; break; }
+      // When a finite wall clock is configured, reserve time for one forced wrap-up turn instead of discarding research.
+      if (turns > 0 && Number.isFinite(a.deadline) && wrapUpReserveMs > 0 && a.deadline - performance.now() <= wrapUpReserveMs) {
+        exhausted = "wallTimeoutMs";
+        break;
+      }
       const calls = await send({ forced: correcting });
       if (calls.some(c => c.name === SUBMIT) && calls.length !== 1) throw invalid("Ambiguous final submission");
       if (correcting && (calls.length !== 1 || calls[0]?.name !== SUBMIT)) throw invalid("Missing corrected submit_result");
-      // submit_result never counts against maxToolCalls. A batch that would overrun the budget executes nothing.
-      if (calls.filter(c => c.name !== SUBMIT).length > req.maxToolCalls - toolCalls) {
+      // submit_result never counts against maxToolCalls. A batch that would overrun a finite budget executes nothing.
+      const nonSubmitCount = calls.filter(c => c.name !== SUBMIT).length;
+      if (req.maxToolCalls > 0 && nonSubmitCount > req.maxToolCalls - toolCalls) {
         for (const { id } of calls) input.push({ type: "function_call_output", call_id: id, output: "Error: tool call budget exhausted; not executed." });
         exhausted = "maxToolCalls";
         break;
       }
       let needsCorrection = calls.length === 0;
-      for (const { name, id, args } of calls) {
+      if (calls.length === 1 && calls[0]!.name === SUBMIT) {
+        const { name, id, args } = calls[0]!;
         a.check();
         const start = performance.now();
-        let ok = false;
-        try {
+        const accepted = accept(args);
+        if (accepted) {
+          report(name, true, performance.now() - start);
+          return accepted;
+        }
+        report(name, false, performance.now() - start);
+        input.push({ type: "function_call_output", call_id: id, output: "Error: final submission did not match the schema." });
+        needsCorrection = true;
+      } else if (calls.length > 0) {
+        // Fan out all tool calls in this turn concurrently; replay outputs and telemetry in deterministic call order.
+        toolCalls += calls.length;
+        const settled = await Promise.all(calls.map(async ({ name, id, args }) => {
+          a.check();
+          const start = performance.now();
+          let ok = false;
           let output: string;
-          if (name === SUBMIT) {
-            const accepted = accept(args);
-            if (accepted) { ok = true; return accepted; }
-            output = "Error: final submission did not match the schema.";
-            needsCorrection = true;
-          } else {
-            toolCalls++;
-            const tool = byName.get(name);
-            const decoded = tool && stripOptionalNulls(args, tool.parameters);
-            if (!tool) output = "Error: unknown tool.";
-            else if (!isRecord(decoded) || !conforms(tool.parameters, decoded)) output = "Error: invalid tool arguments.";
-            else {
-              try {
-                const result = await abortable(tool.execute(decoded, a.signal), a.signal);
-                output = toolText(result, token, maxChars);
-                ok = true;
-              } catch {
-                a.check();
-                output = "Error: tool execution failed.";
-              }
+          const tool = byName.get(name);
+          const decoded = tool && stripOptionalNulls(args, tool.parameters);
+          if (!tool) output = "Error: unknown tool.";
+          else if (!isRecord(decoded) || !conforms(tool.parameters, decoded)) output = "Error: invalid tool arguments.";
+          else {
+            try {
+              const result = await abortable(tool.execute(decoded, a.signal), a.signal);
+              output = toolText(result, token, maxChars);
+              ok = true;
+            } catch {
+              a.check();
+              output = "Error: tool execution failed.";
             }
           }
-          input.push({ type: "function_call_output", call_id: id, output: output.slice(0, maxChars) });
-        } finally { report(name, ok, start); }
+          return { name, id, ok, elapsedMs: performance.now() - start, output: maxChars > 0 ? output.slice(0, maxChars) : output };
+        }));
+        a.check();
+        for (const item of settled) {
+          report(item.name, item.ok, item.elapsedMs);
+          input.push({ type: "function_call_output", call_id: item.id, output: item.output });
+        }
       }
       if (needsCorrection) {
         if (correcting) throw invalid("Invalid corrected submit_result");
         correcting = true;
         input.push({ role: "user", content: "Call submit_result once with a result matching its schema." });
       }
-      if (toolCalls >= req.maxToolCalls) { exhausted = "maxToolCalls"; break; }
+      if (req.maxToolCalls > 0 && toolCalls >= req.maxToolCalls) { exhausted = "maxToolCalls"; break; }
     }
     // Budget reached without a submission: one forced, submit-only wrap-up turn keeps the research instead of discarding it.
     input.push({ role: "user", content: WRAP_UP });
@@ -449,7 +480,7 @@ async function run<T>(deps: Deps, req: StewardRunRequest<T>): Promise<StewardRun
     const final = calls.length === 1 && calls[0]!.name === SUBMIT ? calls[0]! : undefined;
     const start = performance.now();
     const accepted = final && accept(final.args);
-    if (final) report(final.name, !!accepted, start);
+    if (final) report(final.name, !!accepted, performance.now() - start);
     if (accepted) return accepted;
     throw budget(exhausted);
   } catch (error) { return { ...a.failure(error), turns, toolCalls }; }

@@ -91,12 +91,32 @@ type DeepThoughtPeopleSource = {
 };
 export type DeepThoughtConfig = {
     enabled: boolean;
+    /** Maximum investigation turns (`0` = unlimited). */
     maxTurns: number;
+    /** Maximum tool calls per investigation (`0` = unlimited). */
     maxToolCalls: number;
+    /** Wall-clock timeout in ms (`0` = unlimited). */
     timeoutMs: number;
+    /** Reserve ms for forced wrap-up when `timeoutMs > 0` (`0` = disabled). */
+    wrapUpReserveMs?: number;
+    /** Maximum concurrent deep_thought calls (`0` = unlimited). */
     maxConcurrent?: number;
+    /** Maximum client-side input tokens per model turn (`0` = unlimited). */
     maxInputTokens?: number;
+    /** Maximum characters returned per tool result (`0` = unlimited). */
     maxToolResultChars?: number;
+    /** Search ranking inside deep_thought: local hybrid retrieval (`"retrieval"`) or decision model (`"decision"`). */
+    searchRanking?: "retrieval" | "decision";
+    /** Minimum decision-model usefulness (0..1) when `searchRanking === "decision"`. */
+    searchMinUsefulness?: number;
+    /** Default results per `search_memory` call when the curator omits `maxResults`. */
+    defaultSearchResults?: number;
+    /** Maximum characters per `search_memory` snippet (`0` = unlimited). */
+    maxSnippetChars?: number;
+    /** Maximum characters per citation quote (`0` = unlimited). */
+    maxQuoteChars?: number;
+    /** Maximum people returned by `lookup_person` (`0` = unlimited). */
+    maxPeopleMatches?: number;
     model?: string;
     reasoning?: StewardConfig["reasoning"];
 };

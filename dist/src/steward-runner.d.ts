@@ -50,11 +50,18 @@ export type StewardRunRequest<T> = Prompt & {
     tools: readonly StewardToolDef[];
     submitSchema: Schema;
     submitDescription?: string;
+    /** Maximum investigation turns (`0` = unlimited). */
     maxTurns: number;
+    /** Maximum tool calls (`0` = unlimited). */
     maxToolCalls: number;
+    /** Maximum client-side input tokens per request (`0` = unlimited). */
     maxInputTokens?: number;
+    /** Maximum characters per tool result (`0` = unlimited). */
     maxToolResultChars?: number;
+    /** Wall-clock timeout in ms (`0` = unlimited; caller `signal` still aborts). */
     wallTimeoutMs: number;
+    /** When `wallTimeoutMs > 0`, reserve this many ms to force a final wrap-up submission (`0` = disabled). */
+    wrapUpReserveMs?: number;
     onToolCall?: (event: {
         name: string;
         ok: boolean;

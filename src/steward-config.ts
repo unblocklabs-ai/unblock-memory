@@ -4,13 +4,39 @@ import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
 
 type StewardDeepThoughtConfig = {
-  enabled: boolean; maxTurns: number; maxToolCalls: number; maxConcurrent: number;
-  timeoutMs: number; maxToolResultChars: number; maxInputTokens: number;
+  enabled: boolean;
+  /** Maximum investigation turns (`0` = unlimited). */
+  maxTurns: number;
+  /** Maximum tool calls per investigation (`0` = unlimited). */
+  maxToolCalls: number;
+  /** Maximum concurrent deep_thought investigations (`0` = unlimited). */
+  maxConcurrent: number;
+  /** Wall-clock timeout in milliseconds (`0` = unlimited). */
+  timeoutMs: number;
+  /** When `timeoutMs > 0`, reserve this many ms to force a final wrap-up submission (`0` = disabled). */
+  wrapUpReserveMs: number;
+  /** Maximum characters returned per tool result (`0` = unlimited). */
+  maxToolResultChars: number;
+  /** Maximum client-side input tokens per model turn (`0` = unlimited). */
+  maxInputTokens: number;
+  /** Search ranking inside deep_thought: local hybrid retrieval (`"retrieval"`) or decision model (`"decision"`). */
+  searchRanking: "retrieval" | "decision";
+  /** Minimum usefulness threshold (0..1) when `searchRanking` is `"decision"`. */
+  searchMinUsefulness: number;
+  /** Default results returned per `search_memory` call when the curator omits `maxResults`. */
+  defaultSearchResults: number;
+  /** Maximum characters per `search_memory` snippet (`0` = unlimited). */
+  maxSnippetChars: number;
+  /** Maximum characters per citation quote (`0` = unlimited). */
+  maxQuoteChars: number;
+  /** Maximum people returned by `lookup_person` (`0` = unlimited). */
+  maxPeopleMatches: number;
 };
 type StewardPeopleShadowConfig = {
   enabled: boolean; intervalMinutes: number; maxItemsPerRun: number; timeoutMs: number;
 };
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const searchRankings = ["retrieval", "decision"] as const;
 export type StewardConfig = {
   enabled: boolean; model: string; reasoning: typeof efforts[number]; endpoint: string;
   apiKey?: string; apiKeyFile?: string; maxActiveBackground: number;
@@ -20,8 +46,22 @@ export type StewardConfig = {
 const DEFAULT_STEWARD_CONFIG: StewardConfig = {
   enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
   maxActiveBackground: 1,
-  deepThought: { enabled: true, maxTurns: 6, maxToolCalls: 16, maxConcurrent: 2, timeoutMs: 60_000,
-    maxToolResultChars: 8000, maxInputTokens: 48_000 },
+  deepThought: {
+    enabled: true,
+    maxTurns: 0,
+    maxToolCalls: 0,
+    maxConcurrent: 0,
+    timeoutMs: 0,
+    wrapUpReserveMs: 20_000,
+    maxToolResultChars: 0,
+    maxInputTokens: 0,
+    searchRanking: "retrieval",
+    searchMinUsefulness: 0,
+    defaultSearchResults: 10,
+    maxSnippetChars: 0,
+    maxQuoteChars: 0,
+    maxPeopleMatches: 0,
+  },
   peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
 };
 
@@ -33,9 +73,15 @@ function section(value: unknown = {}, defaults: object, label: string, optional:
   return { ...defaults, ...value };
 }
 
-function integer(value: unknown, min: number, max: number, key: string) {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
-    throw new Error(`steward.${key} must be an integer between ${min} and ${max}`);
+function integer(value: unknown, min: number, key: string) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min) {
+    throw new Error(`steward.${key} must be an integer >= ${min}`);
+  }
+  return value;
+}
+function unitInterval(value: unknown, key: string) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`steward.${key} must be a number between 0 and 1`);
   }
   return value;
 }
@@ -70,19 +116,35 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
   const p = section(c.peopleShadow, defaults.peopleShadow, "steward.peopleShadow");
   const reasoning = efforts.find(e => e === c.reasoning);
   if (!reasoning) throw new Error("Invalid steward.reasoning");
+  const searchRanking = searchRankings.find(mode => mode === d.searchRanking);
+  if (!searchRanking) throw new Error("Invalid steward.deepThought.searchRanking");
   const apiKey = c.apiKey === undefined ? undefined : text(c.apiKey, "apiKey");
   if (apiKey && /\s/u.test(apiKey)) throw new Error("steward.apiKey must not contain whitespace");
   return { enabled: enabled(c.enabled, "steward"), model: text(c.model, "model"), reasoning, endpoint: endpoint(c.endpoint),
     ...(apiKey ? { apiKey } : {}), ...(c.apiKeyFile === undefined ? {} : { apiKeyFile: absolutePath(c.apiKeyFile) }),
-    maxActiveBackground: integer(c.maxActiveBackground, 1, 4, "maxActiveBackground"),
-    deepThought: { enabled: enabled(d.enabled, "steward.deepThought"), maxTurns: integer(d.maxTurns, 1, 12, "deepThought.maxTurns"),
-      maxToolCalls: integer(d.maxToolCalls, 1, 32, "deepThought.maxToolCalls"), maxConcurrent: integer(d.maxConcurrent, 1, 4, "deepThought.maxConcurrent"),
-      timeoutMs: integer(d.timeoutMs, 5000, 180_000, "deepThought.timeoutMs"),
-      maxToolResultChars: integer(d.maxToolResultChars, 500, 32_000, "deepThought.maxToolResultChars"),
-      maxInputTokens: integer(d.maxInputTokens, 2000, 128_000, "deepThought.maxInputTokens") },
-    peopleShadow: { enabled: enabled(p.enabled, "steward.peopleShadow"), intervalMinutes: integer(p.intervalMinutes, 5, 1440, "peopleShadow.intervalMinutes"),
-      maxItemsPerRun: integer(p.maxItemsPerRun, 1, 50, "peopleShadow.maxItemsPerRun"),
-      timeoutMs: integer(p.timeoutMs, 5000, 180_000, "peopleShadow.timeoutMs") },
+    maxActiveBackground: integer(c.maxActiveBackground, 1, "maxActiveBackground"),
+    deepThought: {
+      enabled: enabled(d.enabled, "steward.deepThought"),
+      maxTurns: integer(d.maxTurns, 0, "deepThought.maxTurns"),
+      maxToolCalls: integer(d.maxToolCalls, 0, "deepThought.maxToolCalls"),
+      maxConcurrent: integer(d.maxConcurrent, 0, "deepThought.maxConcurrent"),
+      timeoutMs: integer(d.timeoutMs, 0, "deepThought.timeoutMs"),
+      wrapUpReserveMs: integer(d.wrapUpReserveMs, 0, "deepThought.wrapUpReserveMs"),
+      maxToolResultChars: integer(d.maxToolResultChars, 0, "deepThought.maxToolResultChars"),
+      maxInputTokens: integer(d.maxInputTokens, 0, "deepThought.maxInputTokens"),
+      searchRanking,
+      searchMinUsefulness: unitInterval(d.searchMinUsefulness, "deepThought.searchMinUsefulness"),
+      defaultSearchResults: integer(d.defaultSearchResults, 1, "deepThought.defaultSearchResults"),
+      maxSnippetChars: integer(d.maxSnippetChars, 0, "deepThought.maxSnippetChars"),
+      maxQuoteChars: integer(d.maxQuoteChars, 0, "deepThought.maxQuoteChars"),
+      maxPeopleMatches: integer(d.maxPeopleMatches, 0, "deepThought.maxPeopleMatches"),
+    },
+    peopleShadow: {
+      enabled: enabled(p.enabled, "steward.peopleShadow"),
+      intervalMinutes: integer(p.intervalMinutes, 1, "peopleShadow.intervalMinutes"),
+      maxItemsPerRun: integer(p.maxItemsPerRun, 1, "peopleShadow.maxItemsPerRun"),
+      timeoutMs: integer(p.timeoutMs, 0, "peopleShadow.timeoutMs"),
+    },
   };
 }
 

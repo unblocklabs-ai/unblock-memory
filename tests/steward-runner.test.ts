@@ -39,19 +39,34 @@ function scripted(...responses: Response[]) {
 }
 
 test("config defaults, nested overrides and strict boundaries", () => {
-  assert.deepEqual(config, { enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
-    maxActiveBackground: 1, deepThought: { enabled: true, maxTurns: 6, maxToolCalls: 16, maxConcurrent: 2, timeoutMs: 60000,
-      maxToolResultChars: 8000, maxInputTokens: 48000 }, peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45000 } });
-  const overridden = resolveStewardConfig({ reasoning: "off", endpoint: "http://localhost:123/v1/responses/", deepThought: { maxTurns: 12 } });
+  assert.deepEqual(config, {
+    enabled: true, model: "gpt-6.2-sol", reasoning: "medium", endpoint: "https://codex.unblocklabs.ai/v1/responses",
+    maxActiveBackground: 1,
+    deepThought: {
+      enabled: true, maxTurns: 0, maxToolCalls: 0, maxConcurrent: 0, timeoutMs: 0, wrapUpReserveMs: 20_000,
+      maxToolResultChars: 0, maxInputTokens: 0, searchRanking: "retrieval", searchMinUsefulness: 0,
+      defaultSearchResults: 10, maxSnippetChars: 0, maxQuoteChars: 0, maxPeopleMatches: 0,
+    },
+    peopleShadow: { enabled: true, intervalMinutes: 60, maxItemsPerRun: 10, timeoutMs: 45_000 },
+  });
+  const overridden = resolveStewardConfig({
+    reasoning: "off", endpoint: "http://localhost:123/v1/responses/",
+    deepThought: { maxTurns: 40, timeoutMs: 600_000, searchRanking: "decision", searchMinUsefulness: 0.4 },
+  });
   assert.equal(overridden.endpoint, "http://localhost:123/v1/responses");
-  assert.equal(overridden.deepThought.maxTurns, 12);
-  assert.equal(overridden.deepThought.maxConcurrent, 2);
+  assert.equal(overridden.deepThought.maxTurns, 40);
+  assert.equal(overridden.deepThought.timeoutMs, 600_000);
+  assert.equal(overridden.deepThought.searchRanking, "decision");
+  assert.equal(overridden.deepThought.searchMinUsefulness, 0.4);
   for (const bad of [null, [], { extra: false }, { deepThought: { extra: 0 } }, { peopleShadow: { other: true } },
     { enabled: null }, { peopleShadow: { enabled: 1 } }, { deepThought: [] }, { model: " " }, { reasoning: "adaptive" },
-    { apiKey: "bad key" }, { apiKeyFile: 2 }, { apiKeyFile: "relative/secret.env" }, { apiKeyFile: "./secret.env" }, { maxActiveBackground: 5 }, { deepThought: { maxTurns: 0 } },
-    { deepThought: { maxToolCalls: 33 } }, { deepThought: { maxConcurrent: 1.5 } }, { deepThought: { timeoutMs: 4999 } },
-    { deepThought: { maxToolResultChars: 32001 } }, { deepThought: { maxInputTokens: 1999 } },
-    { peopleShadow: { intervalMinutes: 1441 } }, { peopleShadow: { maxItemsPerRun: 0 } }, { peopleShadow: { timeoutMs: 180001 } }]) {
+    { apiKey: "bad key" }, { apiKeyFile: 2 }, { apiKeyFile: "relative/secret.env" }, { apiKeyFile: "./secret.env" }, { maxActiveBackground: 0 },
+    { deepThought: { maxTurns: -1 } }, { deepThought: { maxToolCalls: -1 } }, { deepThought: { maxConcurrent: 1.5 } },
+    { deepThought: { timeoutMs: -1 } }, { deepThought: { wrapUpReserveMs: -1 } }, { deepThought: { maxToolResultChars: -1 } },
+    { deepThought: { maxInputTokens: -1 } }, { deepThought: { searchRanking: "other" } }, { deepThought: { searchMinUsefulness: 1.1 } },
+    { deepThought: { defaultSearchResults: 0 } }, { deepThought: { maxSnippetChars: -1 } }, { deepThought: { maxQuoteChars: -1 } },
+    { deepThought: { maxPeopleMatches: -1 } }, { peopleShadow: { intervalMinutes: 0 } }, { peopleShadow: { maxItemsPerRun: 0 } },
+    { peopleShadow: { timeoutMs: -1 } }]) {
     assert.throws(() => resolveStewardConfig(bad));
   }
   for (const endpoint of ["not a URL", "file:///private", "https://u:p@x.test", "https://x.test/?", "https://x.test/#fragment",
@@ -381,7 +396,7 @@ test("strict wire schemas: closed objects, every key required, optional keys nul
   assert.deepEqual((shadow.properties as any).disposition, { type: "string", enum: ["revalidated", "corrected", "retired", "unresolved"] },
     "bare enums gain a type");
   // The original schemas keep their local validation keywords.
-  assert.equal((DEEP_THOUGHT_RESULT_SCHEMA.properties.answer as { maxLength?: number }).maxLength, 8_000);
+  assert.equal((DEEP_THOUGHT_RESULT_SCHEMA.properties.citations.items.properties.source as { pattern?: string }).pattern, "\\S");
   // Decoding drops the forced nulls on optional keys only.
   const decoded = stripOptionalNulls({ answer: "a", confidence: "low", openQuestions: null,
     citations: [{ source: "s", quote: "q", lines: null, date: "2026" }] }, DEEP_THOUGHT_RESULT_SCHEMA);
@@ -471,4 +486,54 @@ test("outbound user prompts are redacted for complete() and run()", async () => 
     assert.doesNotMatch(text, /private-test-credential|abc\.def|sk-live|xoxb-/u);
     assert.match(text, /\[redacted\]/u);
   }
+});
+
+test("parallel tool fan-out runs concurrently in one turn and preserves call order", async () => {
+  let inFlight = 0, peak = 0;
+  let releaseBoth!: () => void;
+  const bothStarted = new Promise<void>(resolve => { releaseBoth = resolve; });
+  const tools = [{
+    name: "probe",
+    description: "probe",
+    parameters: schema,
+    execute: async (args: Record<string, unknown>) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      if (inFlight === 2) releaseBoth();
+      await bothStarted;
+      inFlight -= 1;
+      return `res:${args.answer}`;
+    },
+  }];
+  const { runner, sent } = scripted(
+    collected(call("probe", "c1", { answer: "first" }), call("probe", "c2", { answer: "second" })),
+    collected(submit),
+  );
+  const result = await runner.run({ ...req, maxTurns: 0, maxToolCalls: 0, wallTimeoutMs: 0, maxInputTokens: 0, maxToolResultChars: 0, tools });
+  assert.ok(result.ok);
+  assert.equal(peak, 2, "both tool calls ran concurrently");
+  const outputs = sent[1]!.input.filter(i => i.type === "function_call_output");
+  assert.deepEqual(outputs.map(i => [i.call_id, i.output]), [["c1", "res:first"], ["c2", "res:second"]]);
+});
+
+test("wrapUpReserveMs forces submit_result before a finite wall timeout discards gathered research", async () => {
+  const tools = [{
+    name: "slow_read",
+    description: "slow read",
+    parameters: schema,
+    execute: async () => {
+      await new Promise(resolve => setTimeout(resolve, 35));
+      return "important evidence";
+    },
+  }];
+  const { runner, sent } = scripted(
+    collected(call("slow_read", "s1", { answer: "q" })),
+    collected(call("submit_result", "wrap", { answer: "preserved before deadline", status: "incomplete" })),
+  );
+  const result = await runner.run({ ...req, wallTimeoutMs: 250, wrapUpReserveMs: 225, tools });
+  assert.ok(result.ok, "soft deadline reserve triggers wrap-up instead of throwing away work");
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual(result.data, { answer: "preserved before deadline" });
+  assert.deepEqual(sent[1]!.tools.map(t => t.name), ["submit_result"]);
+  assert.deepEqual(sent[1]!.tool_choice, { type: "function", name: "submit_result" });
 });

@@ -82,7 +82,7 @@ function scriptedRunner(script: ScriptStep[]) {
       let turns = 0, toolCalls = 0;
       for (const step of script) {
         request.signal?.throwIfAborted();
-        if (turns >= request.maxTurns) {
+        if (request.maxTurns > 0 && turns >= request.maxTurns) {
           return budgetExhausted(turns, toolCalls, { requests: turns, inputTokens: 10 * turns, outputTokens: 5 * turns });
         }
         turns += 1;
@@ -391,10 +391,10 @@ test("disabled config or missing agent context registers no tool; parameters are
   assert.equal(tool.name, "deep_thought");
   assert.equal(tool.label, "Deep Thought");
   assert.match(tool.description, /memory_search/u);
-  for (const bad of [{ question: "   " }, { question: "q", extra: 1 }, { question: "q", maxHops: 9 }, { question: "x".repeat(2001) }]) {
+  for (const bad of [{ question: "   " }, { question: "q", extra: 1 }, { question: "q", maxHops: 0 }]) {
     assert.equal(Value.Check(tool.parameters, bad), false, JSON.stringify(bad).slice(0, 60));
   }
-  assert.equal(Value.Check(tool.parameters, { question: "q", focus: "f", corpora: ["all"], maxHops: 8 }), true);
+  assert.equal(Value.Check(tool.parameters, { question: "x".repeat(2500), focus: "f", corpora: ["all"], maxHops: 25 }), true);
 });
 
 test("end-to-end through the real StewardRunner: tool calls, submit_result and usage cross the B2/B3 seam", async t => {
@@ -488,7 +488,32 @@ test("through the real runner, an exhausted tool budget still returns the forced
   assert.equal(outcome.answer, "Probably Friday.");
   assert.deepEqual(outcome.citations, [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }],
     "strict-mode nulls are decoded away before validation");
-  assert.deepEqual(outcome.openQuestions, []);
+  assert.equal(outcome.openQuestions.length, 0);
   assert.deepEqual(sent[1]!.tools.map(tool => tool.name), ["submit_result"]);
   assert.deepEqual(sent[1]!.tool_choice, { type: "function", name: "submit_result" });
+});
+
+test("default unlimited config fans out freely with retrieval ranking and zero arbitrary caps", async t => {
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("no network in tests"); });
+  const { runtime } = fakeRuntime();
+  let decisionCredentialLookups = 0;
+  const unlimited = resolveStewardConfig(undefined).deepThought;
+  const { runner, requests } = scriptedRunner([
+    [{ call: "search_memory", args: { bm25Query: "launch", vectorQuery: "launch", maxResults: 25 } }],
+    { submit: outputs => {
+      const search = outputs[0] as { rankingMode: string; results: unknown[] };
+      assert.equal(search.rankingMode, "retrieval", "retrieval ranking skips decision-model filtering by default");
+      assert.equal(search.results.length, 2);
+      return { answer: "All clear.", confidence: "high", citations: [{ source: "qmd://memory/launch.md", quote: "the launch moved to Friday" }] };
+    } },
+  ]);
+  const outcome = await execute(createDeepThoughtTool(toolContext(), deps(runtime, runner, {
+    config: unlimited,
+    resolveCredential: async () => { decisionCredentialLookups += 1; return "decision-key"; },
+  })), { question: "What happened?" });
+  assert.equal(outcome.status, "complete");
+  assert.equal(decisionCredentialLookups, 0, "default retrieval ranking does not look up or call the decision model");
+  assert.equal(requests[0]!.maxTurns, 0);
+  assert.equal(requests[0]!.maxToolCalls, 0);
+  assert.equal(requests[0]!.wallTimeoutMs, 0);
 });

@@ -450,8 +450,12 @@ test("steward is optional and enabled by default; host manifest and runtime reso
   const enabled = {
     steward: {
       enabled: true, model: "gpt-6.2-sol", reasoning: "low", endpoint: "http://127.0.0.1:8787/v1/responses",
-      apiKeyFile: "/run/secrets/steward", maxActiveBackground: 2,
-      deepThought: { enabled: true, maxTurns: 8, maxToolCalls: 20, maxConcurrent: 1, timeoutMs: 90_000, maxToolResultChars: 4000, maxInputTokens: 64_000 },
+      apiKeyFile: "/run/secrets/steward", maxActiveBackground: 6,
+      deepThought: {
+        enabled: true, maxTurns: 25, maxToolCalls: 100, maxConcurrent: 8, timeoutMs: 300_000, wrapUpReserveMs: 15_000,
+        maxToolResultChars: 64_000, maxInputTokens: 200_000, searchRanking: "decision" as const, searchMinUsefulness: 0.25,
+        defaultSearchResults: 15, maxSnippetChars: 4_000, maxQuoteChars: 1_200, maxPeopleMatches: 20,
+      },
       peopleShadow: { enabled: true, intervalMinutes: 120, maxItemsPerRun: 5, timeoutMs: 30_000 },
     },
   };
@@ -464,12 +468,17 @@ test("steward is optional and enabled by default; host manifest and runtime reso
   for (const invalid of [
     { steward: { extra: true } },
     { steward: { deepThought: { extra: 1 } } },
-    { steward: { peopleShadow: { intervalMinutes: 1 } } },
+    { steward: { deepThought: { maxTurns: -1 } } },
+    { steward: { deepThought: { timeoutMs: -1 } } },
+    { steward: { deepThought: { searchRanking: "hybrid" } } },
+    { steward: { deepThought: { searchMinUsefulness: 1.5 } } },
+    { steward: { deepThought: { defaultSearchResults: 0 } } },
+    { steward: { peopleShadow: { intervalMinutes: 0 } } },
     { steward: { reasoning: "adaptive" } },
     { steward: { endpoint: "http://remote.example/v1/responses" } },
     { steward: { endpoint: "https://user:pass@remote.example/v1/responses" } },
     { steward: { apiKey: "two words" } },
-    { steward: { maxActiveBackground: 5 } },
+    { steward: { maxActiveBackground: 0 } },
   ]) {
     assert.equal(validate(invalid).ok, false, JSON.stringify(invalid));
     assert.throws(() => resolveConfig(invalid), /steward/, JSON.stringify(invalid));

@@ -1217,8 +1217,7 @@
           },
           "maxActiveBackground": {
             "type": "integer",
-            "minimum": 1,
-            "maximum": 4
+            "minimum": 1
           },
           "deepThought": {
             "type": "object",
@@ -1229,33 +1228,59 @@
               },
               "maxTurns": {
                 "type": "integer",
-                "minimum": 1,
-                "maximum": 12
+                "minimum": 0
               },
               "maxToolCalls": {
                 "type": "integer",
-                "minimum": 1,
-                "maximum": 32
+                "minimum": 0
               },
               "maxConcurrent": {
                 "type": "integer",
-                "minimum": 1,
-                "maximum": 4
+                "minimum": 0
               },
               "timeoutMs": {
                 "type": "integer",
-                "minimum": 5000,
-                "maximum": 180000
+                "minimum": 0
+              },
+              "wrapUpReserveMs": {
+                "type": "integer",
+                "minimum": 0
               },
               "maxToolResultChars": {
                 "type": "integer",
-                "minimum": 500,
-                "maximum": 32000
+                "minimum": 0
               },
               "maxInputTokens": {
                 "type": "integer",
-                "minimum": 2000,
-                "maximum": 128000
+                "minimum": 0
+              },
+              "searchRanking": {
+                "type": "string",
+                "enum": [
+                  "retrieval",
+                  "decision"
+                ]
+              },
+              "searchMinUsefulness": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "defaultSearchResults": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "maxSnippetChars": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxQuoteChars": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxPeopleMatches": {
+                "type": "integer",
+                "minimum": 0
               }
             }
           },
@@ -1268,18 +1293,15 @@
               },
               "intervalMinutes": {
                 "type": "integer",
-                "minimum": 5,
-                "maximum": 1440
+                "minimum": 1
               },
               "maxItemsPerRun": {
                 "type": "integer",
-                "minimum": 1,
-                "maximum": 50
+                "minimum": 1
               },
               "timeoutMs": {
                 "type": "integer",
-                "minimum": 5000,
-                "maximum": 180000
+                "minimum": 0
               }
             }
           }
