@@ -121,6 +121,15 @@ type StewardExpectationsConfig = {
     sweep: boolean;
     /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
     blockerAutoExpireMinutes: number;
+    /**
+     * After each Captain's Log append, close open workspace/channel expectations the new entries explicitly resolve or
+     * break with one batched d1.2 `choice` call (needs `decisionModel.enabled`). DM and group expectations are never sent.
+     */
+    captainsLogDecisionResolve: boolean;
+    /** Minimum probability of the chosen `resolved` / `broken` option before it is applied (`0..1`). */
+    captainsLogResolveMinConfidence: number;
+    /** d1.2 request timeout in ms (`0` = no plugin-side limit; the decisions SDK still caps a request at 60 s). */
+    captainsLogResolveTimeoutMs: number;
 };
 export type StewardConfig = {
     enabled: boolean;

@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { resolveConfig } from "../src/config.js";
+import { listExpectations } from "../src/expectations-store.js";
 import { OUTCOME_LEDGER_KIND } from "../src/outcome-ledger.js";
 import { writeRecallBatch, type RecallLedgerEvent } from "../src/recall-ledger.js";
 import { resolveStewardConfig } from "../src/steward-config.js";
+import { type CaptainsLogDecide } from "../src/steward-expectations.js";
+import { createStewardRunner } from "../src/steward-runner.js";
 import { registerStewardRuntime } from "../src/steward-runtime.js";
 import { WorkStore } from "../src/work-store.js";
+import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
 const HOUR = 3_600_000;
 
@@ -30,8 +35,10 @@ class FakeCommand {
 const optionKey = (flags: string) => flags.split(/[ ,]/u)[0]!.replace(/^--/u, "").replace(/-(\w)/gu, (_, c: string) => c.toUpperCase());
 type CliRegistrar = (ctx: { program: FakeCommand; config: unknown }) => void;
 
-function harness(t: TestContext, steward: unknown = {}) {
-  const root = mkdtempSync(join(tmpdir(), "steward-runtime-"));
+type RuntimeOptions = Parameters<typeof registerStewardRuntime>[1];
+
+function harness(t: TestContext, steward: unknown = {}, overrides: (root: string) => Partial<RuntimeOptions> = () => ({})) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "steward-runtime-")));
   const dbPath = join(root, "unblock-memory.sqlite");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
@@ -51,6 +58,7 @@ function harness(t: TestContext, steward: unknown = {}) {
     createRunner: () => { runnerRequests += 1; return undefined; },
     dbPathForAgent: () => dbPath,
     listAgents: () => ["main"],
+    ...overrides(root),
   });
   const run = async (...argv: string[]) => {
     const program = new FakeCommand();
@@ -66,7 +74,7 @@ function harness(t: TestContext, steward: unknown = {}) {
     finally { console.log = log; }
     return JSON.parse(lines.join("\n")) as Record<string, unknown>;
   };
-  return { dbPath, runtime, handlers, warnings, run, runnerRequests: () => runnerRequests };
+  return { root, dbPath, runtime, handlers, warnings, run, runnerRequests: () => runnerRequests };
 }
 
 function deliveredMemory(at: number, runId: string): RecallLedgerEvent[] {
@@ -150,7 +158,7 @@ test("outcomes and blockers are read-only: a missing database is never created a
   assert.deepEqual(check.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(row => row.name), ["unrelated"]);
 });
 
-function seedBlocker(dbPath: string, id = "cl-1") {
+function seedBlocker(dbPath: string, id = "cl-1", topic = "Shopify quota") {
   const store = new WorkStore(dbPath); // opens and marks the plugin memory database
   try {
     store.db.exec(`CREATE TABLE IF NOT EXISTS captains_log_entries (
@@ -158,8 +166,8 @@ function seedBlocker(dbPath: string, id = "cl-1") {
       ordinal INTEGER NOT NULL, topic TEXT NOT NULL, summary TEXT NOT NULL, blocked INTEGER NOT NULL CHECK(blocked IN (0, 1)),
       resolved_at_ms INTEGER, resolution_note TEXT, channels_json TEXT NOT NULL CHECK(json_valid(channels_json)),
       session_refs_json TEXT NOT NULL CHECK(json_valid(session_refs_json))) STRICT`);
-    store.db.prepare("INSERT INTO captains_log_entries VALUES (?, 'main', '2026-11-27', ?, 'h', 0, 'Shopify quota', 'Acme sync blocked', 1, NULL, NULL, '[\"#acme\"]', '[]')")
-      .run(id, Date.now() - HOUR);
+    store.db.prepare("INSERT INTO captains_log_entries VALUES (?, 'main', '2026-11-27', ?, ?, 0, ?, 'Acme sync blocked', 1, NULL, NULL, '[\"#acme\"]', '[]')")
+      .run(id, Date.now() - HOUR, `h-${id}`, topic);
   } finally { store.close(); }
 }
 
@@ -231,4 +239,107 @@ test("recipe hashes stamped on recall and skill exposures flow through the backg
   const outcomes = await h.run("outcomes", "--agent", "main");
   assert.deepEqual(Object.keys(outcomes.byRecipe as object).sort(), ["mem-b", "skill-b"]);
   assert.equal((await h.run("outcomes", "--recipe", "mem-b")).whisperUsedRate, 1);
+});
+
+/* ═════════════════════════ Post-Captain's-Log d1.2 check ═════════════════════════ */
+
+type ClEntry = { topic: string; summary: string; blocked?: boolean; sessionRefs: string[] };
+
+/**
+ * A live-shaped agent: #fipl-customer-alerts carries Greg's approval, the memory database holds Fred's open [BLOCKED]
+ * entry, and the Steward runner answers Captain's Log with `entries` (extraction / sweep calls return nothing).
+ */
+function closeLoopHarness(t: TestContext, entries: ClEntry[], decide: CaptainsLogDecide, steward: Record<string, unknown> = {}) {
+  const h = harness(t, { peopleShadow: { enabled: false }, outcomeLedger: { enabled: false }, ...steward }, root => {
+    const workspaceDir = join(root, "workspace");
+    mkdirSync(workspaceDir);
+    const agentPath = join(root, "openclaw-agent.sqlite");
+    const agent = createAgentDatabase(agentPath);
+    try {
+      insertSession(agent, { sessionId: "fipl", chatType: "channel" });
+      agent.prepare("UPDATE conversations SET label='#fipl-customer-alerts' WHERE conversation_id='conversation-fipl'").run();
+      const event = { type: "message", message: { role: "user", content: [{ type: "text", text: "Greg: approved Fred's order, ship it." }] } };
+      agent.prepare("INSERT INTO transcript_events VALUES ('fipl', 1, ?, ?)").run(JSON.stringify(event), Date.now() - 60_000);
+      agent.prepare("INSERT INTO session_transcript_active_events VALUES ('fipl', 0, 1, 0)").run();
+    } finally { agent.close(); }
+    const config = resolveStewardConfig(undefined);
+    const runner = createStewardRunner({ config, resolveApiKey: async () => "test-provider-credential", fetch: async (_url, init) => {
+      const request: { input: [{ content: string }] } = JSON.parse(String(init?.body));
+      const prompt = JSON.parse(request.input[0].content) as Record<string, unknown>;
+      const value = "existingDailyLog" in prompt ? { shouldAppend: true, entries }
+        : "expectations" in prompt ? { judgments: [] } : { expectations: [] };
+      return Response.json({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify(value) }] }] });
+    } });
+    return {
+      createRunner: () => runner,
+      pluginConfig: resolveConfig({}),
+      transcriptDbForAgent: () => agentPath,
+      workspaceDirForAgent: () => workspaceDir,
+      captainsLogDecide: decide,
+    };
+  });
+  seedBlocker(h.dbPath, "fred-1", "Fred order approval");
+  const rows = () => {
+    const store = new WorkStore(h.dbPath);
+    try { return listExpectations(store.db, { agentId: "main" }); } finally { store.close(); }
+  };
+  return { ...h, rows };
+}
+
+const APPROVAL: ClEntry = { topic: "Fred order approved", summary: "Greg approved Fred's FIPL order in #fipl-customer-alerts.", sessionRefs: ["s1"] };
+
+test("tick(): right after Captain's Log appends, d1.2 closes the resolved blocker, then the new blockers are mirrored", async t => {
+  const calls: string[][] = [];
+  const decide: CaptainsLogDecide = async (state, questions) => {
+    calls.push(Object.values(state.openExpectations).map(item => item.summary));
+    return { answers: Object.fromEntries(Object.keys(questions).map(ref => {
+      const fred = state.openExpectations[ref]!.summary === "Fred order approval";
+      const choice = fred ? "resolved" as const : "still_open" as const;
+      return [ref, { type: "choice" as const, choice, confidence: 0.95,
+        probabilities: { still_open: fred ? 0.03 : 0.95, resolved: fred ? 0.95 : 0.03, broken: 0.02 } }];
+    })) };
+  };
+  const h = closeLoopHarness(t, [APPROVAL, { topic: "Acme quota", summary: "Acme sync blocked on the Shopify quota", blocked: true, sessionRefs: ["s1"] }], decide);
+  await h.runtime.tick();
+  assert.deepEqual(h.warnings, []);
+  const appended = h.runtime.lastCaptainsLogResults().get("main");
+  assert.equal(appended?.status, "appended", JSON.stringify(appended));
+  assert.ok(appended?.status === "appended" && appended.entries.every(entry => /^[a-f0-9]{64}$/u.test(entry.id)));
+  assert.ok(readFileSync(appended.filePath, "utf8").includes("Fred order approved"));
+  assert.deepEqual(h.runtime.lastCaptainsLogResolutions().get("main"), { checked: 1, resolved: 1 });
+  assert.deepEqual(calls, [["Fred order approval"]], "the fresh Acme blocker is not judged against its own capture");
+  const byKey = new Map(h.rows().map(row => [row.dedupKey, row]));
+  assert.equal(byKey.get("captains_log_topic:fred order approval")?.status, "kept");
+  assert.equal(byKey.get("captains_log_topic:acme quota")?.status, "open", "the new blocker is mirrored right after the append");
+  const blockers = await h.run("blockers");
+  assert.deepEqual((blockers.blockers as { topic: string }[]).map(entry => entry.topic), ["Acme quota"], "Fred's ledger entry closed");
+});
+
+test("a d1.2 failure only warns; Captain's Log still appends and mirrors, and disabled settings or a dry run never call d1.2", async t => {
+  let calls = 0;
+  const failing: CaptainsLogDecide = async () => { calls++; throw new Error("d1.2 unavailable"); };
+  const h = closeLoopHarness(t, [APPROVAL, { topic: "Acme quota", summary: "Acme sync blocked", blocked: true, sessionRefs: ["s1"] }], failing);
+  const warn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (line: unknown) => { warnings.push(String(line)); };
+  try {
+    const preview = await h.run("captains-log", "--dry-run", "true");
+    assert.equal(preview.status, "preview");
+    assert.equal(calls, 0, "a dry run never appends, resolves or mirrors");
+    assert.equal((await h.run("expectations", "--run", "true")).status, "completed", "mirrors Fred's blocker first");
+    const result = await h.run("captains-log");
+    assert.equal(result.status, "appended", JSON.stringify(result));
+    assert.equal(result.expectationsResolution, undefined);
+  } finally { console.warn = warn; }
+  assert.equal(calls, 1);
+  assert.ok(warnings.some(line => /captains-log expectations check \(main\): Error: d1\.2 unavailable/u.test(line)), JSON.stringify(warnings));
+  const byKey = new Map(h.rows().map(row => [row.dedupKey, row.status]));
+  assert.equal(byKey.get("captains_log_topic:fred order approval"), "open", "nothing was closed");
+  assert.equal(byKey.get("captains_log_topic:acme quota"), "open", "new blockers are still mirrored");
+
+  const off = closeLoopHarness(t, [APPROVAL], failing, { expectations: { captainsLogDecisionResolve: false } });
+  await off.runtime.tick();
+  assert.equal(off.runtime.lastCaptainsLogResults().get("main")?.status, "appended");
+  assert.equal(calls, 1, "captainsLogDecisionResolve=false never calls d1.2");
+  assert.deepEqual(off.warnings, []);
 });

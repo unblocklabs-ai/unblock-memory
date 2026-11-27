@@ -8,14 +8,17 @@ import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-e
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import { DEFAULTS } from "./defaults.js";
-import { EXPECTATION_STATUSES, ExpectationsStore } from "./expectations-store.js";
+import { EXPECTATION_STATUSES, ExpectationsStore, syncDeterministicExpectations } from "./expectations-store.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { runOutcomeLedgerPass, summarizeOutcomeMetrics, type OutcomeLedgerPassResult } from "./outcome-ledger.js";
 import { responseCohort } from "./response-audit.js";
 import { resolveTimezone } from "./session-projector.js";
 import { listOpenBlockers, runCaptainsLogPass, type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
-import { runExpectationsPass, type ExpectationsPassOptions, type ExpectationsPassResult } from "./steward-expectations.js";
+import {
+  resolveExpectationsFromCaptainsLog, runExpectationsPass, type CaptainsLogDecide, type ExpectationsPassOptions, type ExpectationsPassResult,
+  type ResolveFromCaptainsLogResult,
+} from "./steward-expectations.js";
 import {
   buildPeopleShadowReport,
   runPeopleShadowPass,
@@ -72,7 +75,47 @@ type StewardRuntimeOptions = {
   workspaceDirForAgent?(cfg: OpenClawConfig, agentId: string): string;
   listAgents?(cfg: OpenClawConfig): string[];
   shutdownGraceMs?: number;
+  /** Test seam for the post-Captain's-Log d1.2 expectation check (defaults to `@unblocklabs/decisions`). */
+  captainsLogDecide?: CaptainsLogDecide;
 };
+
+type CaptainsLogFollowUp = { resolution?: ResolveFromCaptainsLogResult };
+
+/**
+ * After a Captain's Log append: close the workspace/channel expectations its new entries settle (one d1.2 call), then
+ * mirror the new blockers. Judging first means fresh blockers are never evaluated against their own capture. Each step
+ * is isolated, so a d1.2 hiccup never fails Captain's Log.
+ */
+async function afterCaptainsLogAppend(options: StewardRuntimeOptions, params: {
+  store: WorkStore; agentId: string; result: CaptainsLogPassResult; signal?: AbortSignal; warn(message: string): void;
+}): Promise<CaptainsLogFollowUp | undefined> {
+  const { store, agentId, result, signal, warn } = params;
+  const expectations = options.config.expectations;
+  if (result.status !== "appended" || !expectations.enabled) return undefined;
+  const followUp: CaptainsLogFollowUp = {};
+  const decisionModel = options.pluginConfig?.decisionModel;
+  if (expectations.captainsLogDecisionResolve && decisionModel?.enabled && !signal?.aborted) {
+    try {
+      followUp.resolution = await resolveExpectationsFromCaptainsLog({
+        db: store.db, agentId, decisionModel,
+        newEntries: result.entries.map(entry => ({ ...entry, capturedAtMs: result.capturedAtMs })),
+        minConfidence: expectations.captainsLogResolveMinConfidence,
+        timeoutMs: expectations.captainsLogResolveTimeoutMs,
+        ...(signal ? { signal } : {}),
+        ...(options.captainsLogDecide ? { decide: options.captainsLogDecide } : {}),
+      });
+    } catch (error) {
+      if (!signal?.aborted) warn(`unblock-memory steward captains-log expectations check (${agentId}): ${String(error)}`);
+    }
+  }
+  if (signal?.aborted) return followUp;
+  try {
+    syncDeterministicExpectations(store.db, agentId, Date.now(), { blockerAutoExpireMinutes: expectations.blockerAutoExpireMinutes });
+  } catch (error) {
+    warn(`unblock-memory steward captains-log expectations sync (${agentId}): ${String(error)}`);
+  }
+  return followUp;
+}
 
 /** One Expectations pass, shared by the background tick and `memory-steward expectations --run`. */
 function expectationsPassOptions(
@@ -122,6 +165,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
   const lastCaptainsLogResults = new Map<string, CaptainsLogPassResult>();
   const lastOutcomeLedgerResults = new Map<string, OutcomeLedgerPassResult>();
   const lastExpectationsResults = new Map<string, ExpectationsPassResult>();
+  const lastCaptainsLogResolutions = new Map<string, ResolveFromCaptainsLogResult>();
   const outcomeLedger = options.config.outcomeLedger;
   const expectations = options.config.expectations;
   // Same cohort Response Audit writes, so outcomes never mix verdicts from another judge configuration.
@@ -213,7 +257,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
             const cl = options.config.captainsLog;
             const workspaceDir = workspaceDirForAgent(api.config, agentId);
             const databasePath = transcriptDbForAgent(api.config, agentId);
-            lastCaptainsLogResults.set(agentId, await runCaptainsLogPass({
+            const captainsLog = await runCaptainsLogPass({
               agentId,
               databasePath,
               workspaceDir,
@@ -229,7 +273,11 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
               timeoutMs: cl.timeoutMs,
               excludeChatTypes: cl.excludeChatTypes,
               signal,
-            }));
+            });
+            lastCaptainsLogResults.set(agentId, captainsLog);
+            const followUp = await afterCaptainsLogAppend(options, { store, agentId, result: captainsLog, signal,
+              warn: message => api.logger.warn(message) });
+            if (followUp?.resolution) lastCaptainsLogResolutions.set(agentId, followUp.resolution);
           }
         } catch (error) {
           if (!signal.aborted) api.logger.warn(`unblock-memory steward (${agentId}): ${String(error)}`);
@@ -283,6 +331,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
     lastCaptainsLogResults: () => new Map(lastCaptainsLogResults),
     lastOutcomeLedgerResults: () => new Map(lastOutcomeLedgerResults),
     lastExpectationsResults: () => new Map(lastExpectationsResults),
+    lastCaptainsLogResolutions: () => new Map(lastCaptainsLogResolutions),
     enabled,
   };
 }
@@ -378,7 +427,10 @@ function registerStewardCli(
             excludeChatTypes: cl.excludeChatTypes,
             dryRun: Boolean(opts.dryRun),
           });
-          console.log(JSON.stringify(result, null, 2));
+          // A dry run never appends, so it never resolves or mirrors anything either.
+          const followUp = await afterCaptainsLogAppend(options, { store, agentId: opts.agent, result,
+            warn: message => console.warn(message) });
+          console.log(JSON.stringify(followUp?.resolution ? { ...result, expectationsResolution: followUp.resolution } : result, null, 2));
         } finally { store.close(); }
       });
     root.command("outcomes").description("Outcome Ledger KPIs: whisper use, skill opens, shortfalls, by recipe (read-only)")

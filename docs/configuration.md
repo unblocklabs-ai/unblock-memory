@@ -30,6 +30,7 @@ settings; a rotated credential file is reread without a restart.
 | `deep_thought` | `steward.enabled` + `steward.deepThought.enabled`; a Steward credential | Tool returns `unavailable`; inner searches use local retrieval ranking | `failed`/`timed_out` with partial usage; no answer is invented |
 | People shadow | `steward.enabled` + `steward.peopleShadow.enabled`; People Learning manifests | Pass stops early; no strikes, nothing published | Item retried next pass without a strike; rejected proposals strike toward quarantine |
 | Expectations pass | `steward.enabled` + `steward.expectations.enabled` | Captain's Log blockers and people todos are still mirrored (no model); session extraction and sweeps are skipped | Deterministic rows stay committed; the model stage retries within 15 minutes |
+| Post-Captain's-Log expectations check | Expectations pass + `captainsLogDecisionResolve` + `decisionModel.enabled`; a decision-model credential | Skipped; new blockers are still mirrored right after the append | Warning only; Captain's Log stays appended and items stay open for the regular sweep |
 
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
 one it registers no hook and reports inactive. Expectations Whisperer is on by
@@ -1016,12 +1017,25 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   parts is skipped, never pooled into `workspace`. Message timestamps go to the model
   so relative deadlines anchor to when they were said. A pass capped by
   `maxSessionsPerRun` resumes the unread sessions next time. It then sweeps open
-  items that are overdue, due soon or older than `sweepAfterMinutes` against
+  items that are overdue, due soon, older than `sweepAfterMinutes`, or whose own
+  channel/group/DM conversation has new messages in this pass (activity-triggered:
+  a reply in that conversation sweeps its items immediately; quiet conversations
+  add no model call) against
   evidence from their own audience (workspace items: channel conversations only)
   recorded since the item opened or was last swept, recording
   `kept`/`broken`/`right`/`wrong`/`expired` with a surprise score (a clock-only
   `expired` requires a due date that has passed). A swept Captain's Log blocker
-  resolved `kept` or `expired` also closes its ledger entries. Open pre-0.20
+  resolved `kept` or `expired` also closes its ledger entries. Right after each
+  Captain's Log append (background or `memory-steward captains-log`, never a dry
+  run), with `captainsLogDecisionResolve` and `decisionModel.enabled`, one batched
+  d1.2 `choice` call checks every open `workspace`/`channel` expectation against the
+  new entries (`still_open`/`resolved`/`broken`) and applies only explicit
+  `resolved` (→ `kept`/`right`, surprise 0.1) or `broken` (→ `broken`/`wrong`,
+  surprise 0.85) answers at `>= captainsLogResolveMinConfidence`, closing a mirrored
+  blocker's ledger entries too. Group and DM expectations are never sent; a blocker
+  whose topic the same pass re-captured as `[BLOCKED]` is never judged; no new
+  entries or no candidates means no call; a failed check only logs a warning. The
+  new blockers are then mirrored immediately. Open pre-0.20
   Steward rows whose audience cannot be proven (group/channel sessions pooled into
   `workspace`, DMs keyed without a provider) are retired as `dismissed`. `openclaw memory-steward expectations --agent main [--status <status>] [--limit <n>]`
   prints `{ agentId, summary, expectations }` read-only (an absent database is never
@@ -1095,12 +1109,18 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.expectations.extract` | `true` | Model-backed extraction from sessions; `false` keeps deterministic ingestion and sweeps only |
 | `steward.expectations.sweep` | `true` | Model-backed due/resolution sweep; `false` never resolves rows by model |
 | `steward.expectations.blockerAutoExpireMinutes` | `4320` | `>= 0` minutes a mirrored Captain's Log blocker stays open without a fresh capture of its topic before it auto-expires (closing its ledger entries); `0` = never auto-expire |
+| `steward.expectations.captainsLogDecisionResolve` | `true` | After each Captain's Log append, close open workspace/channel expectations its new entries explicitly resolve or break (one batched d1.2 call; needs `decisionModel.enabled`) |
+| `steward.expectations.captainsLogResolveMinConfidence` | `0.85` | `0`–`1` minimum probability of the chosen `resolved`/`broken` option before the post-Captain's-Log check applies it |
+| `steward.expectations.captainsLogResolveTimeoutMs` | `15000` | `>= 0` ms for the post-Captain's-Log d1.2 request (`0` = no plugin-side limit; the decisions SDK still caps one request at 60 s, and larger values are clamped to it) |
 
 **Enabling `deep_thought` approves sending the question plus the memory excerpts it
 opens to the Steward endpoint. Enabling the People shadow approves sending one
 dossier assertion and up to 16 approved, account-fenced excerpts per item. Enabling
 Expectations extraction or sweeps approves sending eligible session excerpts (one
-audience per request) and the open expectations of that audience.** Both
+audience per request) and the open expectations of that audience. Leaving
+`captainsLogDecisionResolve` on approves sending each new Captain's Log section's
+entries plus the open workspace/channel expectations (never group or DM ones) to the
+`decisionModel` endpoint.** Both
 features call `steward.endpoint` directly (`stream: false`, `store: false`) with
 OpenAI strict JSON schemas; the host LLM runtime is not used, because it denies
 plugin model overrides by default and would ignore the Steward endpoint and key.

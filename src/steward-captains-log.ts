@@ -162,10 +162,18 @@ export type CaptainsLogPassOptions = {
   now?: () => number;
 };
 
+/** A Captain's Log entry as just appended, with its durable ledger id. */
+type AppendedCaptainsLogEntry = CapturedEntry & { id: string };
+
 type PassOutcome =
   | { status: "empty" | "not_due" | "already_running" | "aborted" }
   | { status: "no_append"; skipReason?: string }
-  | { status: "appended" | "preview"; filePath: string; markdown: string }
+  | { status: "preview"; filePath: string; markdown: string }
+  | {
+    status: "appended"; filePath: string; markdown: string;
+    /** Fingerprint of the appended section; `entries[].id` are the `captains_log_entries` rows it committed. */
+    sectionHash: string; capturedAtMs: number; entries: AppendedCaptainsLogEntry[];
+  }
   | { status: "failed"; reason: string };
 export type CaptainsLogPassResult = { sessions: number; nextDueAt?: number; usage?: StewardUsage } & PassOutcome;
 
@@ -377,6 +385,9 @@ function captureEntries(entries: Static<typeof CAPTAINS_LOG_SCHEMA>["entries"], 
   return captured.sort((a, b) => Number(b.blocked) - Number(a.blocked));
 }
 
+const entryId = (agentId: string, receipt: Pick<PendingAppend, "day" | "hash">, ordinal: number) =>
+  hash(JSON.stringify([agentId, receipt.day, receipt.hash, ordinal]));
+
 function persistEntries(db: DatabaseSync, agentId: string, receipt: PendingAppend): void {
   if (!receipt.entries?.length) return;
   const insert = db.prepare(`INSERT INTO captains_log_entries
@@ -384,7 +395,7 @@ function persistEntries(db: DatabaseSync, agentId: string, receipt: PendingAppen
      native_channels_json)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`);
   for (const [ordinal, entry] of receipt.entries.entries()) {
-    const id = hash(JSON.stringify([agentId, receipt.day, receipt.hash, ordinal]));
+    const id = entryId(agentId, receipt, ordinal);
     insert.run(id, agentId, receipt.day, receipt.capturedAtMs, receipt.hash, ordinal, entry.topic, entry.summary,
       Number(entry.blocked), JSON.stringify(entry.channels), JSON.stringify(entry.sessionRefs), JSON.stringify(entry.nativeChannels ?? []));
   }
@@ -543,7 +554,8 @@ export async function runCaptainsLogPass(options: CaptainsLogPassOptions): Promi
       persistEntries(db, agentId, receipt);
       appendDaily(workspaceDir, stamp.day, filePath, markdown);
     });
-    return result({ status: "appended", filePath, markdown });
+    return result({ status: "appended", filePath, markdown, sectionHash: digest, capturedAtMs: startedAt,
+      entries: entries.map((entry, ordinal) => ({ ...entry, id: entryId(agentId, receipt, ordinal) })) });
   } catch (error) {
     return options.signal?.aborted ? release("aborted") : release("failed", error instanceof WorkFenceLostError || fence.signal.reason instanceof WorkFenceLostError
       ? "fence_lost" : redactSecrets(error instanceof Error ? error.message : String(error)));

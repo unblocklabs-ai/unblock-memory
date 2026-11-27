@@ -6,13 +6,13 @@ import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import { DEFAULTS } from "./defaults.js";
-import { EXPECTATION_STATUSES, ExpectationsStore } from "./expectations-store.js";
+import { EXPECTATION_STATUSES, ExpectationsStore, syncDeterministicExpectations } from "./expectations-store.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { runOutcomeLedgerPass, summarizeOutcomeMetrics } from "./outcome-ledger.js";
 import { responseCohort } from "./response-audit.js";
 import { resolveTimezone } from "./session-projector.js";
 import { listOpenBlockers, runCaptainsLogPass } from "./steward-captains-log.js";
-import { runExpectationsPass } from "./steward-expectations.js";
+import { resolveExpectationsFromCaptainsLog, runExpectationsPass, } from "./steward-expectations.js";
 import { buildPeopleShadowReport, runPeopleShadowPass, PEOPLE_SHADOW_KIND, } from "./steward-people-shadow.js";
 import { WorkStore } from "./work-store.js";
 /* ═════════════════════════ Background semaphore ═════════════════════════ */
@@ -38,6 +38,44 @@ export function tryAcquireBackgroundSlot(maxActive) {
 }
 export function activeBackgroundStewards() {
     return slots().active;
+}
+/**
+ * After a Captain's Log append: close the workspace/channel expectations its new entries settle (one d1.2 call), then
+ * mirror the new blockers. Judging first means fresh blockers are never evaluated against their own capture. Each step
+ * is isolated, so a d1.2 hiccup never fails Captain's Log.
+ */
+async function afterCaptainsLogAppend(options, params) {
+    const { store, agentId, result, signal, warn } = params;
+    const expectations = options.config.expectations;
+    if (result.status !== "appended" || !expectations.enabled)
+        return undefined;
+    const followUp = {};
+    const decisionModel = options.pluginConfig?.decisionModel;
+    if (expectations.captainsLogDecisionResolve && decisionModel?.enabled && !signal?.aborted) {
+        try {
+            followUp.resolution = await resolveExpectationsFromCaptainsLog({
+                db: store.db, agentId, decisionModel,
+                newEntries: result.entries.map(entry => ({ ...entry, capturedAtMs: result.capturedAtMs })),
+                minConfidence: expectations.captainsLogResolveMinConfidence,
+                timeoutMs: expectations.captainsLogResolveTimeoutMs,
+                ...(signal ? { signal } : {}),
+                ...(options.captainsLogDecide ? { decide: options.captainsLogDecide } : {}),
+            });
+        }
+        catch (error) {
+            if (!signal?.aborted)
+                warn(`unblock-memory steward captains-log expectations check (${agentId}): ${String(error)}`);
+        }
+    }
+    if (signal?.aborted)
+        return followUp;
+    try {
+        syncDeterministicExpectations(store.db, agentId, Date.now(), { blockerAutoExpireMinutes: expectations.blockerAutoExpireMinutes });
+    }
+    catch (error) {
+        warn(`unblock-memory steward captains-log expectations sync (${agentId}): ${String(error)}`);
+    }
+    return followUp;
 }
 /** One Expectations pass, shared by the background tick and `memory-steward expectations --run`. */
 function expectationsPassOptions(config, base, runner, databasePath) {
@@ -79,6 +117,7 @@ export function registerStewardRuntime(api, options) {
     const lastCaptainsLogResults = new Map();
     const lastOutcomeLedgerResults = new Map();
     const lastExpectationsResults = new Map();
+    const lastCaptainsLogResolutions = new Map();
     const outcomeLedger = options.config.outcomeLedger;
     const expectations = options.config.expectations;
     // Same cohort Response Audit writes, so outcomes never mix verdicts from another judge configuration.
@@ -178,7 +217,7 @@ export function registerStewardRuntime(api, options) {
                         const cl = options.config.captainsLog;
                         const workspaceDir = workspaceDirForAgent(api.config, agentId);
                         const databasePath = transcriptDbForAgent(api.config, agentId);
-                        lastCaptainsLogResults.set(agentId, await runCaptainsLogPass({
+                        const captainsLog = await runCaptainsLogPass({
                             agentId,
                             databasePath,
                             workspaceDir,
@@ -194,7 +233,12 @@ export function registerStewardRuntime(api, options) {
                             timeoutMs: cl.timeoutMs,
                             excludeChatTypes: cl.excludeChatTypes,
                             signal,
-                        }));
+                        });
+                        lastCaptainsLogResults.set(agentId, captainsLog);
+                        const followUp = await afterCaptainsLogAppend(options, { store, agentId, result: captainsLog, signal,
+                            warn: message => api.logger.warn(message) });
+                        if (followUp?.resolution)
+                            lastCaptainsLogResolutions.set(agentId, followUp.resolution);
                     }
                 }
                 catch (error) {
@@ -271,6 +315,7 @@ export function registerStewardRuntime(api, options) {
         lastCaptainsLogResults: () => new Map(lastCaptainsLogResults),
         lastOutcomeLedgerResults: () => new Map(lastOutcomeLedgerResults),
         lastExpectationsResults: () => new Map(lastExpectationsResults),
+        lastCaptainsLogResolutions: () => new Map(lastCaptainsLogResolutions),
         enabled,
     };
 }
@@ -369,7 +414,10 @@ function registerStewardCli(api, options, dbPathForAgent, openWorkStore, transcr
                     excludeChatTypes: cl.excludeChatTypes,
                     dryRun: Boolean(opts.dryRun),
                 });
-                console.log(JSON.stringify(result, null, 2));
+                // A dry run never appends, so it never resolves or mirrors anything either.
+                const followUp = await afterCaptainsLogAppend(options, { store, agentId: opts.agent, result,
+                    warn: message => console.warn(message) });
+                console.log(JSON.stringify(followUp?.resolution ? { ...result, expectationsResolution: followUp.resolution } : result, null, 2));
             }
             finally {
                 store.close();

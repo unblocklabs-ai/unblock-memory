@@ -3,7 +3,7 @@ import type { UnblockMemoryConfig } from "./config.js";
 import { type OutcomeLedgerPassResult } from "./outcome-ledger.js";
 import { type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
-import { type ExpectationsPassResult } from "./steward-expectations.js";
+import { type CaptainsLogDecide, type ExpectationsPassResult, type ResolveFromCaptainsLogResult } from "./steward-expectations.js";
 import { type PeopleShadowPassResult } from "./steward-people-shadow.js";
 import type { StewardRunner } from "./steward-runner.js";
 import { WorkStore } from "./work-store.js";
@@ -26,6 +26,8 @@ type StewardRuntimeOptions = {
     workspaceDirForAgent?(cfg: OpenClawConfig, agentId: string): string;
     listAgents?(cfg: OpenClawConfig): string[];
     shutdownGraceMs?: number;
+    /** Test seam for the post-Captain's-Log d1.2 expectation check (defaults to `@unblocklabs/decisions`). */
+    captainsLogDecide?: CaptainsLogDecide;
 };
 export declare function registerStewardRuntime(api: OpenClawPluginApi, options: StewardRuntimeOptions): {
     owner: string;
@@ -35,6 +37,7 @@ export declare function registerStewardRuntime(api: OpenClawPluginApi, options: 
     lastCaptainsLogResults: () => Map<string, CaptainsLogPassResult>;
     lastOutcomeLedgerResults: () => Map<string, OutcomeLedgerPassResult>;
     lastExpectationsResults: () => Map<string, ExpectationsPassResult>;
+    lastCaptainsLogResolutions: () => Map<string, ResolveFromCaptainsLogResult>;
     enabled: boolean;
 };
 export {};

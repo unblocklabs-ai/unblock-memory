@@ -128,6 +128,15 @@ type StewardExpectationsConfig = {
   sweep: boolean;
   /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
   blockerAutoExpireMinutes: number;
+  /**
+   * After each Captain's Log append, close open workspace/channel expectations the new entries explicitly resolve or
+   * break with one batched d1.2 `choice` call (needs `decisionModel.enabled`). DM and group expectations are never sent.
+   */
+  captainsLogDecisionResolve: boolean;
+  /** Minimum probability of the chosen `resolved` / `broken` option before it is applied (`0..1`). */
+  captainsLogResolveMinConfidence: number;
+  /** d1.2 request timeout in ms (`0` = no plugin-side limit; the decisions SDK still caps a request at 60 s). */
+  captainsLogResolveTimeoutMs: number;
 };
 export type StewardConfig = {
   enabled: boolean; model: string; reasoning: typeof efforts[number]; endpoint: string;
@@ -204,6 +213,9 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     extract: true,
     sweep: true,
     blockerAutoExpireMinutes: 4320,
+    captainsLogDecisionResolve: true,
+    captainsLogResolveMinConfidence: 0.85,
+    captainsLogResolveTimeoutMs: 15_000,
   },
 };
 
@@ -356,6 +368,9 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       extract: boolean(e.extract, "steward.expectations.extract"),
       sweep: boolean(e.sweep, "steward.expectations.sweep"),
       blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
+      captainsLogDecisionResolve: boolean(e.captainsLogDecisionResolve, "steward.expectations.captainsLogDecisionResolve"),
+      captainsLogResolveMinConfidence: unitInterval(e.captainsLogResolveMinConfidence, "expectations.captainsLogResolveMinConfidence"),
+      captainsLogResolveTimeoutMs: integer(e.captainsLogResolveTimeoutMs, 0, "expectations.captainsLogResolveTimeoutMs"),
     },
   };
 }

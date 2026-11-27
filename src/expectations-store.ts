@@ -456,8 +456,10 @@ const CAPTAINS_LOG_TOPIC_PREFIX = "captains_log_topic:";
 const LEGACY_CAPTAINS_LOG_PREFIX = "captains_log:";
 const CAPTAINS_LOG_RESOLVED = "captains_log_resolved";
 const CAPTAINS_LOG_EXPIRED = "captains_log_auto_expired";
+/** `resolutionEvidence.source` of a post-Captain's-Log d1.2 resolution. */
+export const CAPTAINS_LOG_DECISION_SOURCE = "captains_log_decision";
 /** Resolutions that a fresh capture of the same topic may reopen (never an operator's dismissal). */
-const CAPTAINS_LOG_REOPENABLE = new Set([CAPTAINS_LOG_RESOLVED, CAPTAINS_LOG_EXPIRED, "steward_sweep"]);
+const CAPTAINS_LOG_REOPENABLE = new Set([CAPTAINS_LOG_RESOLVED, CAPTAINS_LOG_EXPIRED, "steward_sweep", CAPTAINS_LOG_DECISION_SOURCE]);
 const PEOPLE_TODO_PREFIX = "people_todo:";
 const PEOPLE_TODO_RESOLVED = "people_todo_resolved";
 const PEOPLE_TODO_SUPPRESSED = "people_todo_suppressed";

@@ -7,7 +7,9 @@ import test, { type TestContext } from "node:test";
 import { ExpectationsStore, listExpectations, type ExpectationInput } from "../src/expectations-store.js";
 import { resolveStewardConfig } from "../src/steward-config.js";
 import {
-  EXPECTATIONS_KIND, runExpectationsPass, type ExpectationExtraction, type ExpectationSweep, type ExpectationsPassOptions,
+  EXPECTATIONS_KIND, resolveExpectationsFromCaptainsLog, runExpectationsPass, type CaptainsLogDecide, type CaptainsLogDecisionState,
+  type CaptainsLogResolveEntry, type ExpectationExtraction, type ExpectationSweep, type ExpectationsPassOptions,
+  type ResolveFromCaptainsLogOptions,
 } from "../src/steward-expectations.js";
 import { createStewardRunner } from "../src/steward-runner.js";
 import { WorkStore } from "../src/work-store.js";
@@ -170,7 +172,8 @@ test("extracts grounded commitments and predictions, dropping hallucinated refs,
   f.seed("public", "Follow-up: still on track for the Acme fix.", "channel", START + INTERVAL - MINUTE, 2);
   f.advance(INTERVAL);
   assert.equal((await f.run()).status, "completed");
-  const second = f.prompts.at(-1);
+  assert.equal(f.prompts.at(-1)?.kind, "sweep", "the follow-up in its own channel sweeps the commitment right away");
+  const second = f.prompts.filter(p => p.kind === "extract").at(-1);
   assert.equal(second?.kind, "extract");
   assert.deepEqual(second?.kind === "extract" && second.prompt.sessions.map(s => s.messages.map(m => m.text)),
     [["Follow-up: still on track for the Acme fix."]]);
@@ -424,4 +427,185 @@ test("maxSweepItems counts only items with new evidence; evidence-less items are
   f.advance(INTERVAL);
   assert.equal((await f.run({ maxSweepItems: 1 })).status, "empty");
   assert.equal(JSON.parse(f.item()!.artifactJson!).sweptAtMs[dm.id], START + INTERVAL, "an empty pass still records the check");
+});
+
+/* ═════════════════════════ Post-Captain's-Log d1.2 resolver ═════════════════════════ */
+
+type Verdict = "still_open" | "resolved" | "broken";
+const DECISION_MODEL = { enabled: true, endpoint: "https://decisions.invalid/v1/decisions", model: "liquid/d1.2-ultra" };
+
+/** Deterministic d1.2 stand-in: `pick` answers each `e<n>` ref with a verdict and the chosen option's probability. */
+function decider(pick: (summary: string, state: CaptainsLogDecisionState) => [Verdict, number] | undefined = () => undefined) {
+  const calls: { state: CaptainsLogDecisionState; refs: string[]; timeoutMs: number; criteria: string[][] }[] = [];
+  const decide: CaptainsLogDecide = async (state, questions, { timeoutMs }) => {
+    const refs = Object.keys(questions);
+    calls.push({ state, refs, timeoutMs, criteria: refs.map(ref => Object.keys(questions[ref]!.criteria)) });
+    return { answers: Object.fromEntries(refs.map(ref => {
+      const [choice, p] = pick(state.openExpectations[ref]!.summary, state) ?? ["still_open", 0.95];
+      const rest = (1 - p) / 2;
+      return [ref, { type: "choice" as const, choice, confidence: p,
+        probabilities: { still_open: rest, resolved: rest, broken: rest, [choice]: p } as Record<Verdict, number> }];
+    })) };
+  };
+  return { decide, calls };
+}
+
+function insertEntry(db: DatabaseSync, entry: { id: string; topic: string; summary: string; blocked: boolean; at: number; channels?: string[] }) {
+  db.prepare("INSERT INTO captains_log_entries VALUES (?, 'main', '2026-11-27', ?, ?, 0, ?, ?, ?, NULL, NULL, ?, '[]')")
+    .run(entry.id, entry.at, `h-${entry.id}`, entry.topic, entry.summary, Number(entry.blocked), JSON.stringify(entry.channels ?? []));
+}
+
+/** Greg must approve Fred's order: a [BLOCKED] Captain's Log entry from #fipl-customer-alerts, mirrored as a workspace blocker. */
+async function fredBlocker(f: ReturnType<typeof fixture>) {
+  addCaptainsLogBlocker(f.workStore.db, "shopify-1");
+  insertEntry(f.workStore.db, { id: "fred-1", topic: "Fred order approval", summary: "Fred's FIPL order is waiting on Greg's approval",
+    blocked: true, at: START - 30 * MINUTE, channels: ["#fipl-customer-alerts"] });
+  assert.equal((await f.run({ runner: undefined })).status, "deterministic_only");
+  const blocker = f.rows().find(row => row.dedupKey === "captains_log_topic:fred order approval")!;
+  assert.equal(blocker.status, "open");
+  return blocker;
+}
+
+const APPROVED: CaptainsLogResolveEntry = { id: "cl-approved", topic: "Fred order approved", summary: "Greg approved Fred's FIPL order in #fipl-customer-alerts; it ships today.",
+  blocked: false, channels: ["#fipl-customer-alerts"], capturedAtMs: START + 3 * INTERVAL };
+
+function resolveWith(f: ReturnType<typeof fixture>, decide: CaptainsLogDecide, overrides: Partial<ResolveFromCaptainsLogOptions> = {}) {
+  return resolveExpectationsFromCaptainsLog({ db: f.workStore.db, agentId: "main", newEntries: [APPROVED], decisionModel: DECISION_MODEL,
+    nowMs: START + 3 * INTERVAL, decide, ...overrides });
+}
+
+test("d1.2 Captain's Log check closes the #fipl-customer-alerts blocker on Greg's approval and writes back to its ledger entries", async t => {
+  const f = fixture(t);
+  const blocker = await fredBlocker(f);
+  const prediction = f.expect({ dedupKey: "prediction", kind: "prediction", summary: "Acme renews before Friday", expectedState: "Acme signs the renewal",
+    audienceKey: "channel:slack:workspace:native-acme", chatType: "channel", channel: "#acme" });
+  const { decide, calls } = decider(summary => summary === "Fred order approval" ? ["resolved", 0.93]
+    : summary === "Acme renews before Friday" ? ["broken", 0.9] : undefined);
+
+  const result = await resolveWith(f, decide);
+  assert.deepEqual(result, { checked: 4, resolved: 2 });
+  assert.equal(calls.length, 1, "one batched call");
+  assert.equal(calls[0]!.timeoutMs, 15_000);
+  assert.deepEqual(calls[0]!.criteria[0], ["still_open", "resolved", "broken"]);
+  assert.deepEqual(calls[0]!.state.newCaptainsLogEntries, [{ topic: APPROVED.topic, summary: APPROVED.summary, blocked: false,
+    channels: ["#fipl-customer-alerts"] }]);
+  assert.deepEqual(Object.values(calls[0]!.state.openExpectations).find(item => item.summary === "Fred order approval"),
+    { kind: "blocker", channel: "#fipl-customer-alerts", summary: "Fred order approval", expectedState: "Fred's FIPL order is waiting on Greg's approval" });
+
+  const byId = new Map(f.rows().map(row => [row.id, row]));
+  const closed = byId.get(blocker.id)!;
+  assert.deepEqual([closed.status, closed.surpriseScore, closed.resolutionNote], ["kept", 0.1, "d1.2 Captain's Log check: resolved (p=0.93)"]);
+  assert.deepEqual(closed.resolutionEvidence, { source: "captains_log_decision", verdict: "resolved", probability: 0.93,
+    captainsLogEntryIds: ["cl-approved"] });
+  assert.deepEqual([byId.get(prediction.id)?.status, byId.get(prediction.id)?.surpriseScore], ["wrong", 0.85], "predictions map to right/wrong");
+  assert.equal(f.rows().find(row => row.dedupKey === "captains_log_topic:shopify quota")?.status, "open", "still_open answers change nothing");
+  const ledger = f.workStore.db.prepare("SELECT resolved_at_ms, resolution_note FROM captains_log_entries WHERE id='fred-1'").get();
+  assert.deepEqual({ ...ledger }, { resolved_at_ms: START + 3 * INTERVAL, resolution_note: "d1.2 Captain's Log check: resolved (p=0.93)" });
+
+  // The next deterministic sync keeps it closed; a later [BLOCKED] re-capture of the topic reopens it.
+  f.advance(INTERVAL);
+  await f.run({ runner: undefined });
+  assert.equal(f.rows().find(row => row.id === blocker.id)?.status, "kept");
+  insertEntry(f.workStore.db, { id: "fred-2", topic: "Fred order approval", summary: "Greg revoked the approval", blocked: true, at: START + 5 * INTERVAL });
+  f.advance(5 * INTERVAL);
+  await f.run({ runner: undefined });
+  assert.equal(f.rows().find(row => row.id === blocker.id)?.status, "open", "a d1.2 resolution is reopenable by a fresh capture");
+});
+
+test("a low-confidence d1.2 choice (< minConfidence) leaves the expectation open", async t => {
+  const f = fixture(t);
+  const blocker = await fredBlocker(f);
+  const { decide, calls } = decider(summary => summary === "Fred order approval" ? ["resolved", 0.84] : undefined);
+  assert.deepEqual(await resolveWith(f, decide), { checked: 3, resolved: 0 }, "Fred's blocker, the Shopify blocker and a people todo");
+  assert.equal(calls.length, 1);
+  assert.equal(f.rows().find(row => row.id === blocker.id)?.status, "open");
+  assert.equal(f.workStore.db.prepare("SELECT resolved_at_ms FROM captains_log_entries WHERE id='fred-1'").get()?.resolved_at_ms, null);
+  // An explicit lower bar applies the same answer.
+  assert.deepEqual(await resolveWith(f, decide, { minConfidence: 0.8 }), { checked: 3, resolved: 1 });
+  assert.equal(f.rows().find(row => row.id === blocker.id)?.status, "kept");
+  await assert.rejects(() => resolveWith(f, decide, { minConfidence: 1.5 }), /minConfidence/u);
+  await assert.rejects(() => resolveWith(f, decide, { timeoutMs: -1 }), /timeoutMs/u);
+});
+
+test("private group (MPDM) and direct (DM) expectations are never sent to or closed by the Captain's Log check", async t => {
+  const f = fixture(t);
+  const group = f.expect({ dedupKey: "group", summary: "GROUP_MARKER Greg approves Fred's order", audienceKey: "group:slack:workspace:native-mpdm",
+    chatType: "group" });
+  const dm = f.expect({ dedupKey: "dm", summary: "DM_MARKER Greg approves Fred's order", audienceKey: "direct:slack:workspace:peer-greg",
+    chatType: "direct" });
+  const everything = decider(() => ["resolved", 0.99]);
+  assert.deepEqual(await resolveWith(f, everything.decide), { checked: 0, resolved: 0 });
+  assert.equal(everything.calls.length, 0, "no eligible expectations → no network call");
+
+  const channel = f.expect({ dedupKey: "channel", summary: "Greg approves Fred's order", audienceKey: "channel:slack:workspace:native-fipl",
+    chatType: "channel", channel: "#fipl-customer-alerts" });
+  assert.deepEqual(await resolveWith(f, everything.decide), { checked: 1, resolved: 1 });
+  assert.ok(!/GROUP_MARKER|DM_MARKER/u.test(JSON.stringify(everything.calls)), "private expectations never leave the process");
+  const byId = new Map(f.rows().map(row => [row.id, row.status]));
+  assert.deepEqual([byId.get(group.id), byId.get(dm.id), byId.get(channel.id)], ["open", "open", "kept"]);
+});
+
+test("a re-captured [BLOCKED] entry, the entries' own blockers and later items are never judged; no entries means no call", async t => {
+  const f = fixture(t);
+  const blocker = await fredBlocker(f);
+  const all = decider(() => ["resolved", 0.99]);
+  // Same topic, still blocked in this very capture (case, punctuation and the [BLOCKED] prefix are ignored).
+  const recaptured: CaptainsLogResolveEntry = { id: "fred-recapture", topic: "[BLOCKED] Fred order approval!", summary: "Still waiting on Greg",
+    blocked: true, channels: [], capturedAtMs: START + INTERVAL };
+  // An expectation opened after the newest capture cannot be settled by it.
+  const later = f.expect({ dedupKey: "later", summary: "Opened after the capture", nowMs: START + 2 * INTERVAL });
+  const result = await resolveWith(f, all.decide, { newEntries: [recaptured] });
+  assert.deepEqual(result, { checked: 2, resolved: 2 });
+  assert.deepEqual(Object.values(all.calls[0]!.state.openExpectations).map(item => item.summary).sort(),
+    ["People todo: missing dossier (person person-1)", "Shopify quota"], "only the unrelated blocker and todo are offered");
+  assert.equal(f.rows().find(row => row.id === blocker.id)?.status, "open");
+  assert.equal(f.rows().find(row => row.id === later.id)?.status, "open");
+
+  // A blocker whose linked ledger entry is one of the new entries is its own capture.
+  const own = decider(() => ["resolved", 0.99]);
+  assert.deepEqual(await resolveWith(f, own.decide, { newEntries: [{ ...APPROVED, id: "fred-1", capturedAtMs: START + INTERVAL }] }),
+    { checked: 0, resolved: 0 });
+  assert.equal(own.calls.length, 0);
+  assert.deepEqual(await resolveWith(f, own.decide, { newEntries: [] }), { checked: 0, resolved: 0 });
+  assert.deepEqual(await resolveWith(f, own.decide, { decisionModel: { ...DECISION_MODEL, enabled: false } }),
+    { checked: 0, resolved: 0, skipped: "disabled" });
+  assert.equal(own.calls.length, 0, "zero network calls");
+});
+
+test("the d1.2 deadline: 0 takes the SDK maximum, larger values are clamped to it", async t => {
+  const f = fixture(t);
+  await fredBlocker(f);
+  const { decide, calls } = decider();
+  await resolveWith(f, decide, { timeoutMs: 0 });
+  await resolveWith(f, decide, { timeoutMs: 120_000 });
+  await resolveWith(f, decide, { timeoutMs: 2_500 });
+  assert.deepEqual(calls.map(call => call.timeoutMs), [60_000, 60_000, 2_500]);
+});
+
+test("activity-triggered sweep: a 10-minute-old undated item is swept as soon as its own channel or group gets a new message", async t => {
+  const f = fixture(t, { sweep: prompt => ({ judgments: prompt.expectations.filter(e => e.summary.startsWith("Greg")).map(e =>
+    ({ ref: e.ref, verdict: "kept" as const, surpriseScore: 0.1, resolutionNote: "Greg approved it.", sessionRefs: ["s1"] })) }) });
+  const channel = f.expect({ dedupKey: "fipl", summary: "Greg approves Fred's order", audienceKey: "channel:slack:workspace:native-public",
+    chatType: "channel", nowMs: START - 10 * MINUTE });
+  const group = f.expect({ dedupKey: "mpdm", summary: "Greg confirms the MPDM shipping date", audienceKey: "group:slack:workspace:native-mpdm",
+    chatType: "group", nowMs: START - 10 * MINUTE });
+  const quiet = f.expect({ dedupKey: "quiet", summary: "Quiet channel item", audienceKey: "channel:slack:workspace:native-quiet",
+    chatType: "channel", nowMs: START - 10 * MINUTE });
+  const workspace = f.expect({ dedupKey: "ws", summary: "Young workspace item", nowMs: START - 10 * MINUTE });
+  f.seed("public", "Greg: approved Fred's order, ship it.", "channel", START - 2 * MINUTE);
+  f.seed("mpdm", "Greg: confirmed, we ship Tuesday.", "group", START - 2 * MINUTE);
+
+  const result = await f.run();
+  assert.equal(result.status, "completed");
+  assert.equal(result.swept, 2, "only the two active conversations' items, well under sweepAfterMinutes");
+  const sweeps = f.prompts.flatMap(p => p.kind === "sweep" ? [p.prompt.expectations.map(e => e.summary)] : []);
+  assert.deepEqual(sweeps.sort(), [[group.summary], [channel.summary]].sort(), "one call per audience");
+  const byId = new Map(f.rows().map(row => [row.id, row.status]));
+  assert.deepEqual([byId.get(channel.id), byId.get(group.id), byId.get(quiet.id), byId.get(workspace.id)], ["kept", "kept", "open", "open"]);
+
+  // No new activity anywhere: zero sweep calls.
+  f.advance(INTERVAL);
+  const calls = f.prompts.length;
+  assert.equal((await f.run()).status, "empty");
+  assert.equal(f.prompts.length, calls);
 });

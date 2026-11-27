@@ -98,15 +98,27 @@ export type CaptainsLogPassOptions = {
     heartbeatMs?: number;
     now?: () => number;
 };
+/** A Captain's Log entry as just appended, with its durable ledger id. */
+type AppendedCaptainsLogEntry = CapturedEntry & {
+    id: string;
+};
 type PassOutcome = {
     status: "empty" | "not_due" | "already_running" | "aborted";
 } | {
     status: "no_append";
     skipReason?: string;
 } | {
-    status: "appended" | "preview";
+    status: "preview";
     filePath: string;
     markdown: string;
+} | {
+    status: "appended";
+    filePath: string;
+    markdown: string;
+    /** Fingerprint of the appended section; `entries[].id` are the `captains_log_entries` rows it committed. */
+    sectionHash: string;
+    capturedAtMs: number;
+    entries: AppendedCaptainsLogEntry[];
 } | {
     status: "failed";
     reason: string;

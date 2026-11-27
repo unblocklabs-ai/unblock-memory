@@ -190,6 +190,8 @@ export type DeterministicSyncResult = {
     /** Open pre-0.20 Steward rows retired because their audience cannot be proven (pooled group/channel, provider-less DM). */
     retired: number;
 };
+/** `resolutionEvidence.source` of a post-Captain's-Log d1.2 resolution. */
+export declare const CAPTAINS_LOG_DECISION_SOURCE = "captains_log_decision";
 export declare function isAdministrativePeopleTodo(kind: string): boolean;
 /** Recurring captures of one blocker collapse onto this key (case, punctuation and `[BLOCKED]` prefixes ignored). */
 export declare function normalizeBlockerTopic(topic: string): string;

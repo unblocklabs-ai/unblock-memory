@@ -73,6 +73,9 @@ const DEFAULT_STEWARD_CONFIG = {
         extract: true,
         sweep: true,
         blockerAutoExpireMinutes: 4320,
+        captainsLogDecisionResolve: true,
+        captainsLogResolveMinConfidence: 0.85,
+        captainsLogResolveTimeoutMs: 15_000,
     },
 };
 function section(value = {}, defaults, label, optional = []) {
@@ -236,6 +239,9 @@ export function resolveStewardConfig(value) {
             extract: boolean(e.extract, "steward.expectations.extract"),
             sweep: boolean(e.sweep, "steward.expectations.sweep"),
             blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
+            captainsLogDecisionResolve: boolean(e.captainsLogDecisionResolve, "steward.expectations.captainsLogDecisionResolve"),
+            captainsLogResolveMinConfidence: unitInterval(e.captainsLogResolveMinConfidence, "expectations.captainsLogResolveMinConfidence"),
+            captainsLogResolveTimeoutMs: integer(e.captainsLogResolveTimeoutMs, 0, "expectations.captainsLogResolveTimeoutMs"),
         },
     };
 }

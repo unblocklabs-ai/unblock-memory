@@ -353,6 +353,7 @@ function captureEntries(entries, excerpts) {
     });
     return captured.sort((a, b) => Number(b.blocked) - Number(a.blocked));
 }
+const entryId = (agentId, receipt, ordinal) => hash(JSON.stringify([agentId, receipt.day, receipt.hash, ordinal]));
 function persistEntries(db, agentId, receipt) {
     if (!receipt.entries?.length)
         return;
@@ -361,7 +362,7 @@ function persistEntries(db, agentId, receipt) {
      native_channels_json)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`);
     for (const [ordinal, entry] of receipt.entries.entries()) {
-        const id = hash(JSON.stringify([agentId, receipt.day, receipt.hash, ordinal]));
+        const id = entryId(agentId, receipt, ordinal);
         insert.run(id, agentId, receipt.day, receipt.capturedAtMs, receipt.hash, ordinal, entry.topic, entry.summary, Number(entry.blocked), JSON.stringify(entry.channels), JSON.stringify(entry.sessionRefs), JSON.stringify(entry.nativeChannels ?? []));
     }
 }
@@ -518,7 +519,8 @@ export async function runCaptainsLogPass(options) {
             persistEntries(db, agentId, receipt);
             appendDaily(workspaceDir, stamp.day, filePath, markdown);
         });
-        return result({ status: "appended", filePath, markdown });
+        return result({ status: "appended", filePath, markdown, sectionHash: digest, capturedAtMs: startedAt,
+            entries: entries.map((entry, ordinal) => ({ ...entry, id: entryId(agentId, receipt, ordinal) })) });
     }
     catch (error) {
         return options.signal?.aborted ? release("aborted") : release("failed", error instanceof WorkFenceLostError || fence.signal.reason instanceof WorkFenceLostError

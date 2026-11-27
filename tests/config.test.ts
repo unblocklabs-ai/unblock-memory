@@ -455,6 +455,7 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     assert.deepEqual(steward.expectations, {
       enabled: true, intervalMinutes: 60, lookbackMinutes: 70, dueLeadMinutes: 60, sweepAfterMinutes: 1440, maxSessionsPerRun: 0,
       maxCharsPerSession: 0, maxSweepItems: 0, timeoutMs: 0, excludeChatTypes: ["direct"], extract: true, sweep: true, blockerAutoExpireMinutes: 4320,
+      captainsLogDecisionResolve: true, captainsLogResolveMinConfidence: 0.85, captainsLogResolveTimeoutMs: 15_000,
     });
     assert.deepEqual(resolveConfig(fleet).steward, steward);
   }
@@ -484,6 +485,7 @@ test("steward is optional and enabled by default; host manifest and runtime reso
         enabled: false, intervalMinutes: 30, lookbackMinutes: 40, dueLeadMinutes: 0, sweepAfterMinutes: 0, maxSessionsPerRun: 10,
         maxCharsPerSession: 4_000, maxSweepItems: 25, timeoutMs: 45_000, excludeChatTypes: ["direct" as const, "group" as const],
         extract: false, sweep: false, blockerAutoExpireMinutes: 0,
+        captainsLogDecisionResolve: false, captainsLogResolveMinConfidence: 0.9, captainsLogResolveTimeoutMs: 0,
       },
     },
   };
@@ -516,6 +518,11 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     { steward: { expectations: { excludeChatTypes: "direct" } } },
     { steward: { expectations: { extract: 1 } } },
     { steward: { expectations: { sweep: "yes" } } },
+    { steward: { expectations: { captainsLogDecisionResolve: "true" } } },
+    { steward: { expectations: { captainsLogResolveMinConfidence: 1.5 } } },
+    { steward: { expectations: { captainsLogResolveMinConfidence: -0.1 } } },
+    { steward: { expectations: { captainsLogResolveTimeoutMs: -1 } } },
+    { steward: { expectations: { captainsLogResolveTimeoutMs: 1.5 } } },
     { steward: { extra: true } },
     { steward: { deepThought: { extra: 1 } } },
     { steward: { deepThought: { maxTurns: -1 } } },
