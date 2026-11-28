@@ -160,7 +160,12 @@ CREATE TABLE IF NOT EXISTS skill_routing_events (
   output_tokens INTEGER,
   elapsed_ms REAL,
   outcome TEXT NOT NULL,
-  recipe_hash ${RECIPE_HASH_TYPE}
+  recipe_hash ${RECIPE_HASH_TYPE},
+  request_text TEXT,
+  chat_type TEXT,
+  provider TEXT,
+  account_id TEXT,
+  sender_id TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_skill_routing_agent_time ON skill_routing_events (agent_id, created_at_ms);
 
@@ -181,7 +186,8 @@ CREATE INDEX IF NOT EXISTS idx_skill_open_agent_time ON skill_open_events (agent
 const ADDITIVE_TABLES = ["recall_queries", "recall_hits", "recall_reads", "skill_routing_events", "skill_open_events"];
 const ADDITIVE_COLUMNS = {
     recall_queries: { input_tokens: "INTEGER", output_tokens: "INTEGER", recipe_hash: RECIPE_HASH_TYPE, input_family: "TEXT" },
-    skill_routing_events: { recipe_hash: RECIPE_HASH_TYPE },
+    skill_routing_events: { recipe_hash: RECIPE_HASH_TYPE, request_text: "TEXT", chat_type: "TEXT", provider: "TEXT", account_id: "TEXT",
+        sender_id: "TEXT" },
 };
 /** Indexes added after v1 shipped: an existing v1 database gains them on its next open (all `IF NOT EXISTS`). */
 const ADDITIVE_INDEXES = ["recall_queries_agent_run"];
@@ -360,8 +366,9 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
   `);
     const insertRouting = db.prepare(`INSERT INTO skill_routing_events (
     event_key, created_at_ms, agent_id, session_id, session_key, run_id, surface, catalog_revision,
-    mode, candidate_count, emitted_json, scores_json, input_tokens, output_tokens, elapsed_ms, outcome, recipe_hash
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING`);
+    mode, candidate_count, emitted_json, scores_json, input_tokens, output_tokens, elapsed_ms, outcome, recipe_hash,
+    request_text, chat_type, provider, account_id, sender_id
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING`);
     const insertOpen = db.prepare(`INSERT INTO skill_open_events (
     created_at_ms, agent_id, session_id, session_key, run_id, skill_path, tool_name, was_whispered, was_pinned
   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -383,7 +390,9 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
                 }
                 case "skill_routing": {
                     const r = event.record;
-                    written += Number(insertRouting.run(r.eventKey, r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.surface ?? null, r.catalogRevision ?? null, r.mode, r.candidateCount, JSON.stringify(r.emitted), JSON.stringify(r.scores), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), finiteOrNull(r.elapsedMs), r.outcome, r.recipeHash?.trim() || "default").changes);
+                    written += Number(insertRouting.run(r.eventKey, r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.surface ?? null, r.catalogRevision ?? null, r.mode, r.candidateCount, JSON.stringify(r.emitted), JSON.stringify(r.scores), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), finiteOrNull(r.elapsedMs), r.outcome, r.recipeHash?.trim() || "default", r.requestText?.trim() ? r.requestText : null, r.chatType?.trim() ? r.chatType.trim().toLowerCase() : null, 
+                    // Normalized like the erasure keys (`recallPersonKeys`): provider and account lowercased, sender verbatim.
+                    r.provider?.trim() ? r.provider.trim().toLowerCase() : null, r.accountId?.trim() ? r.accountId.trim().toLowerCase() : null, r.senderId?.trim() ? r.senderId.trim() : null).changes);
                     break;
                 }
                 case "skill_open":
@@ -426,26 +435,102 @@ function recallPersonKeys(identity, includeAccount) {
     return { provider, senderId, accountId };
 }
 function purgeRecallPersonInDb(db, { provider, senderId, accountId }) {
-    if (!tableExists(db, "recall_queries"))
+    const hasQueries = tableExists(db, "recall_queries"), hasRouting = tableExists(db, "skill_routing_events");
+    if (!hasQueries && !hasRouting)
         return { queries: 0, skillEvents: 0 };
     let queries = 0, skillEvents = 0;
     immediateTransaction(db, () => {
         const match = accountId ? "provider = ? AND account_id = ? AND sender_id = ?" : "provider = ? AND sender_id = ?";
         const args = accountId ? [provider, accountId, senderId] : [provider, senderId];
-        // Skill routing/open events carry no sender: erase every event bound to one of the person's sessions or runs.
-        const scopes = db.prepare(`SELECT DISTINCT agent_id, session_id, session_key, run_id FROM recall_queries WHERE ${match}`).all(...args);
-        for (const table of ["skill_routing_events", "skill_open_events"]) {
-            if (!tableExists(db, table))
-                continue;
-            const remove = db.prepare(`DELETE FROM ${table} WHERE agent_id = :agent AND (
-        (:session IS NOT NULL AND session_id = :session) OR (:sessionKey IS NOT NULL AND session_key = :sessionKey) OR
-        (:run IS NOT NULL AND run_id = :run))`);
-            for (const scope of scopes) {
-                skillEvents += Number(remove.run({ agent: scope.agent_id, session: scope.session_id ?? null,
-                    sessionKey: scope.session_key ?? null, run: scope.run_id ?? null }).changes);
+        // Routing rows recorded with the sender are erased directly, even when no recall query exists for the session (e.g.
+        // Skill Whisperer on, Memory Whisperer off). Attributed rows are matched by identity ONLY: a shared session (e.g.
+        // `agent:main:main`) or session id never reaches another sender's rows.
+        const routingIdentity = hasRouting && ["provider", "account_id", "sender_id"].every(column => db.prepare("SELECT 1 FROM pragma_table_info('skill_routing_events') WHERE name = ?").get(column) !== undefined);
+        const scopes = [
+            ...hasQueries ? db.prepare(`SELECT DISTINCT agent_id, session_id, session_key, run_id FROM recall_queries WHERE ${match}`).all(...args) : [],
+            ...routingIdentity
+                ? db.prepare(`SELECT DISTINCT agent_id, session_id, session_key, run_id FROM skill_routing_events WHERE ${match}`).all(...args) : [],
+        ];
+        if (routingIdentity)
+            skillEvents += Number(db.prepare(`DELETE FROM skill_routing_events WHERE ${match}`).run(...args).changes);
+        // The person's runs, per agent: run-bound open events are linked to a person strictly through identity-matched runs
+        // (never via another sender's shared session or unattributed foreign runs).
+        const runs = new Map();
+        const addRun = (agent, run) => {
+            if (typeof run === "string" && run)
+                (runs.get(agent) ?? runs.set(agent, new Set()).get(agent)).add(run);
+        };
+        for (const scope of scopes)
+            addRun(scope.agent_id, scope.run_id);
+        const hasOpen = tableExists(db, "skill_open_events");
+        if (hasRouting) {
+            // Pass 1a (by own run): erase sender-less legacy routing rows AND account-less rows for this exact
+            // `(provider, senderId)` on the person's own runs before checking whether any foreign run remains in the session.
+            const runOwned = routingIdentity
+                ? "(sender_id IS NULL OR (provider = :provider AND account_id IS NULL AND sender_id = :sender))"
+                : "1 = 1";
+            const removeByRun = db.prepare(`DELETE FROM skill_routing_events WHERE agent_id = :agent AND run_id = :run AND ${runOwned}`);
+            for (const [agent, agentRuns] of runs) {
+                for (const run of agentRuns) {
+                    const runParams = routingIdentity ? { agent, run, provider, sender: senderId } : { agent, run };
+                    skillEvents += Number(removeByRun.run(runParams).changes);
+                }
             }
         }
-        queries = Number(db.prepare(`DELETE FROM recall_queries WHERE ${match}`).run(...args).changes);
+        if (hasOpen) {
+            // Pass 1b (by own run): erase run-bound open events for the person's own runs before scanning for foreign runs.
+            const byRun = db.prepare("DELETE FROM skill_open_events WHERE agent_id = ? AND run_id = ?");
+            for (const [agent, agentRuns] of runs)
+                for (const run of agentRuns)
+                    skillEvents += Number(byRun.run(agent, run).changes);
+        }
+        const inSession = "((:session IS NOT NULL AND session_id = :session) OR (:sessionKey IS NOT NULL AND session_key = :sessionKey))";
+        const person = accountId ? "provider = :provider AND account_id = :account AND sender_id = :sender"
+            : "provider = :provider AND sender_id = :sender";
+        const other = `sender_id IS NOT NULL AND COALESCE((${person}), 0) = 0`;
+        const otherSenders = [
+            ...hasQueries ? [db.prepare(`SELECT 1 FROM recall_queries WHERE agent_id = :agent AND ${inSession} AND ${other} LIMIT 1`)] : [],
+            ...routingIdentity
+                ? [db.prepare(`SELECT 1 FROM skill_routing_events WHERE agent_id = :agent AND ${inSession} AND ${other} LIMIT 1`)] : [],
+        ];
+        // Any remaining run-bound routing or open row (not erased in Pass 1 for this person's own runs) may belong to
+        // another sender in a shared session (e.g. `agent:main:main`), so never treat that session as solo.
+        const foreignRuns = [
+            ...hasRouting ? [db.prepare(`SELECT 1 FROM skill_routing_events WHERE agent_id = :agent AND ${inSession} AND ${routingIdentity ? "sender_id IS NULL AND " : ""}run_id IS NOT NULL LIMIT 1`)] : [],
+            ...hasOpen ? [db.prepare(`SELECT 1 FROM skill_open_events WHERE agent_id = :agent AND ${inSession} AND run_id IS NOT NULL LIMIT 1`)] : [],
+        ];
+        const identity = { provider, sender: senderId, ...accountId ? { account: accountId } : {} };
+        const isSharedWithOther = (agent, session, sessionKey) => {
+            const params = { agent, session, sessionKey };
+            return otherSenders.some(statement => statement.get({ ...params, ...identity }))
+                || foreignRuns.some(statement => statement.get(params));
+        };
+        // Pass 2 (run-less legacy rows only): check BOTH the triggering scope and each candidate row's own
+        // `(session_id, session_key)` for foreign evidence before deleting it. Never adopt foreign `run_id`s.
+        const deleteRunlessIfUnshared = (table, extra) => {
+            const select = db.prepare(`SELECT id, session_id, session_key FROM ${table} WHERE agent_id = :agent AND ${extra} AND run_id IS NULL AND ${inSession}`);
+            const remove = db.prepare(`DELETE FROM ${table} WHERE id = ?`);
+            const seen = new Set();
+            for (const scope of scopes) {
+                if (isSharedWithOther(scope.agent_id, scope.session_id ?? null, scope.session_key ?? null))
+                    continue;
+                const params = { agent: scope.agent_id, session: scope.session_id ?? null, sessionKey: scope.session_key ?? null };
+                for (const row of select.all(params)) {
+                    if (seen.has(row.id))
+                        continue;
+                    seen.add(row.id);
+                    if (isSharedWithOther(scope.agent_id, row.session_id ?? null, row.session_key ?? null))
+                        continue;
+                    skillEvents += Number(remove.run(row.id).changes);
+                }
+            }
+        };
+        if (hasRouting)
+            deleteRunlessIfUnshared("skill_routing_events", routingIdentity ? "sender_id IS NULL" : "1 = 1");
+        if (hasOpen)
+            deleteRunlessIfUnshared("skill_open_events", "1 = 1");
+        if (hasQueries)
+            queries = Number(db.prepare(`DELETE FROM recall_queries WHERE ${match}`).run(...args).changes);
     });
     return { queries, skillEvents };
 }

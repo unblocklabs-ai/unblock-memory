@@ -841,3 +841,29 @@ test("fleet-telemetry / fleet-brief export --agent-alias (default \"default\"), 
   assert.deepEqual(stored.briefs.map(({ nodeId, agentId }) => [nodeId, agentId]), [["charizard", "ops-a"]]);
   assert.equal(existsSync(h.dbPath), false, "pushing never creates the local database");
 });
+
+test("a 30-day skills interval never reaches setInterval as-is (32-bit overflow would fire every 1 ms)", async t => {
+  const delays: number[] = [];
+  t.mock.method(globalThis, "setInterval", ((_handler: () => void, delay?: number) => {
+    delays.push(Number(delay));
+    return { unref() { return this; }, ref() { return this; }, hasRef: () => false, refresh() { return this; },
+      [Symbol.toPrimitive]: () => 0 } as unknown as NodeJS.Timeout;
+  }) as typeof setInterval);
+  t.mock.method(globalThis, "clearInterval", () => undefined);
+  const thirtyDays = 30 * 24 * 60;
+  const h = harness(t, { ...OTHER_PASSES_OFF, skills: { enabled: true, intervalMinutes: thirtyDays } });
+  t.after(() => h.runtime.stop());
+  h.handlers.get("gateway_start")!();
+  await h.runtime.tick();
+  assert.equal(delays.length, 1);
+  assert.ok(thirtyDays * 60_000 > 2 ** 31 - 1, "the configured interval itself would overflow a Node timer");
+  assert.ok(delays[0]! >= 1 && delays[0]! <= 2 ** 31 - 1, `wake delay ${delays[0]} fits a 32-bit timer`);
+  assert.equal(delays[0], 60 * 60_000, "the scheduler wakes hourly; workDue gates the actual pass");
+
+  // Short intervals are untouched.
+  const short = harness(t, { ...OTHER_PASSES_OFF, skills: { enabled: true, intervalMinutes: 5 } });
+  t.after(() => short.runtime.stop());
+  short.handlers.get("gateway_start")!();
+  await short.runtime.tick();
+  assert.equal(delays.at(-1), 5 * 60_000);
+});

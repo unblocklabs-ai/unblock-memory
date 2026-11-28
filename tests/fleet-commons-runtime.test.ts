@@ -3,14 +3,20 @@ import { mkdtempDisposable, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawConfig, OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import { resolveConfig } from "../src/config.js";
+import type { CorpusMemorySearchResult } from "../src/contracts.js";
+import { cancelAllDeepThoughtJobs, createDeepThoughtTool } from "../src/deep-thought.js";
 import { DeepThoughtStore, findMatchingDerivedObservationsReadOnly, readDerivedObservationCandidates } from "../src/deep-thought-store.js";
 import {
-  FLEET_COMMONS_COLLECTION, resolveFleetCommonsConfig, syncFleetCommons, type FleetCommonsEntry, type FleetCommonsSyncResult,
+  FLEET_COMMONS_COLLECTION, fleetCommonsHit, resolveFleetCommonsConfig, syncFleetCommons, type FleetCommonsEntry, type FleetCommonsSyncResult,
 } from "../src/fleet-commons.js";
 import { QmdMemoryManager, type ManagerStore } from "../src/manager.js";
+import { searchMemory } from "../src/memory-search.js";
+import { registerMemoryWhisperer } from "../src/memory-whisperer.js";
 import { QmdMemoryRuntime } from "../src/runtime.js";
 import { resolveSource } from "../src/sources.js";
+import { registerWhispererPrompt, type WhispererPrompt } from "../src/whisperer-prompt.js";
 
 const endpoint = "https://fleet.example.test/api/v1/commons";
 const entry: FleetCommonsEntry = {
@@ -18,6 +24,11 @@ const entry: FleetCommonsEntry = {
   body: "Retry transient deploy failures with backoff.", tags: ["deployment"], updatedAt: Date.now() - 60_000,
 };
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
 async function waitFor(check: () => boolean, label: string): Promise<void> {
   const deadline = Date.now() + 2_000;
   while (!check()) {
@@ -167,28 +178,71 @@ test("the runtime syncs a manager when it opens and then only already-open manag
   assert.deepEqual(errors, []);
 });
 
-test("the gateway abort signal reaches scheduled syncs and stops the schedule", async t => {
+test("gateway abort cancels the current sync and does not start the next manager in that sweep", async t => {
   await using dir = await mkdtempDisposable(join(tmpdir(), "fleet-runtime-abort-"));
-  const signals: Array<AbortSignal | undefined> = [];
+  const signals = new Map<QmdMemoryManager, Array<AbortSignal | undefined>>();
+  const fetching = deferred<void>(), release = deferred<void>();
+  let first: QmdMemoryManager | undefined;
   t.mock.method(QmdMemoryManager.prototype, "start", async () => {});
   t.mock.method(QmdMemoryManager.prototype, "close", async () => {});
-  t.mock.method(QmdMemoryManager.prototype, "syncFleetCommons", async (signal?: AbortSignal): Promise<FleetCommonsSyncResult> => {
-    signals.push(signal);
+  t.mock.method(QmdMemoryManager.prototype, "syncFleetCommons", async function (
+    this: QmdMemoryManager, signal?: AbortSignal,
+  ): Promise<FleetCommonsSyncResult> {
+    first ??= this;
+    const seen = signals.get(this) ?? [];
+    signals.set(this, seen);
+    seen.push(signal);
+    if (this === first && seen.length === 2) { fetching.resolve(); await release.promise; }
     return { status: "not_modified", count: 0, changed: false, rejected: [] };
   });
   const runtime = fleetRuntime(t, dir.path);
   const gateway = new AbortController();
   const errors: unknown[] = [];
+  const cfg = { agents: { defaults: { workspace: dir.path }, list: [{ id: "main" }, { id: "other" }] } };
   runtime.startFleetCommonsSchedule(error => errors.push(error), { signal: gateway.signal });
-  await runtime.getMemorySearchManager({ cfg: { agents: { defaults: { workspace: dir.path } } }, agentId: "main" });
-  await waitFor(() => signals.length >= 2, "initial and scheduled sync");
-  assert.ok(signals.every(signal => signal && !signal.aborted));
+  const { manager: main } = await runtime.getMemorySearchManager({ cfg, agentId: "main" });
+  const { manager: other } = await runtime.getMemorySearchManager({ cfg, agentId: "other" });
+  assert.ok(main && other);
+  await waitFor(() => signals.get(main)?.length === 2, "scheduled sync");
+  await fetching.promise;
   gateway.abort();
-  assert.ok(signals.every(signal => signal?.aborted), "every sync signal follows the gateway signal");
-  const seen = signals.length;
+  release.resolve();
+  assert.ok([...signals.values()].flat().every(signal => signal?.aborted));
   await delay(100);
-  assert.equal(signals.length, seen, "no ticks after the gateway aborts");
+  assert.equal(signals.get(main)?.length, 2);
+  assert.equal(signals.get(other)?.length, 1, "the aborted sweep cannot start an uncancelled sync for the next agent");
   assert.deepEqual(errors, []);
+});
+
+test("a starting manager cannot stall ready managers or sync after gateway abort", async t => {
+  await using dir = await mkdtempDisposable(join(tmpdir(), "fleet-runtime-starting-"));
+  const startup = deferred<void>();
+  const started: QmdMemoryManager[] = [], synced: QmdMemoryManager[] = [];
+  t.mock.method(QmdMemoryManager.prototype, "start", async function (this: QmdMemoryManager) {
+    started.push(this);
+    if (started.length === 1) await startup.promise;
+  });
+  t.mock.method(QmdMemoryManager.prototype, "close", async () => {});
+  t.mock.method(QmdMemoryManager.prototype, "syncFleetCommons", async function (this: QmdMemoryManager): Promise<FleetCommonsSyncResult> {
+    synced.push(this);
+    return { status: "not_modified", count: 0, changed: false, rejected: [] };
+  });
+  const runtime = fleetRuntime(t, dir.path);
+  const cfg = { agents: { defaults: { workspace: dir.path }, list: [{ id: "main" }, { id: "other" }] } };
+  const gateway = new AbortController();
+  runtime.startFleetCommonsSchedule(error => assert.fail(String(error)), { signal: gateway.signal });
+  const opening = runtime.getMemorySearchManager({ cfg, agentId: "main" });
+  try {
+    const { manager } = await runtime.getMemorySearchManager({ cfg, agentId: "other" });
+    assert.ok(manager);
+    await waitFor(() => synced.length >= 2, "ready manager's initial and scheduled syncs");
+    assert.ok(synced.every(candidate => candidate === manager));
+  } finally {
+    gateway.abort();
+    startup.resolve();
+    await opening;
+  }
+  assert.ok(!synced.includes(started[0]!));
 });
 
 test("a cached derived observation citing an expired or retired Fleet entry is stale", async t => {
@@ -230,4 +284,235 @@ test("a cached derived observation citing an expired or retired Fleet entry is s
   await sync();
   assert.deepEqual(store.findMatchingDerivedObservations({ ...match, queryText: deployQuestion, currentGenerations: generations }), []);
   assert.equal(store.listDerivedObservations({ agentId: "main", status: "fresh" }).length, 0);
+});
+
+function fleetWhisperer(dbPath: string, allowExpired: boolean, searchCandidates: () => Promise<CorpusMemorySearchResult[]> = async () => []) {
+  const config = resolveConfig({
+    fleetCommons: { enabled: true, endpoint, allowExpired },
+    memoryWhisperer: { enabled: true, mode: "legacy", corpora: ["fleet"], timeoutMs: 5000 },
+    decisionModel: { apiKey: "dummy-test-key" },
+  });
+  const runtime = new QmdMemoryRuntime(config.corpora, { fleetCommons: config.fleetCommons });
+  const api = { config: {}, on() {}, logger: { warn() {}, info() {} } } as unknown as OpenClawPluginApi;
+  const whisper = registerMemoryWhisperer(api, {
+    fleetCommonsAllowExpired: runtime.fleetCommonsAllowExpired,
+    async getMemorySearchManager() { return { manager: { searchCandidates } }; },
+  }, config.memoryWhisperer, config.decisionModel, undefined, undefined, { derivedObservations: {
+    dbPathForAgent: () => dbPath, audienceKey: () => "aud",
+    getCollectionGenerations: async () => ({ [FLEET_COMMONS_COLLECTION]: 1 }),
+  } });
+  assert.ok(whisper);
+  return (runId: string) => whisper({ prompt: "How should deploy retries back off?", messages: [] },
+    { trigger: "user", agentId: "main", sessionKey: "agent:main:main", runId });
+}
+
+async function derivedFleetFixture(t: test.TestContext) {
+  const dir = await mkdtempDisposable(join(tmpdir(), "fleet-whisper-delivery-"));
+  const dbPath = join(dir.path, "cache.sqlite"), feedPath = join(dir.path, "feed.json");
+  const now = Date.now(), expiresAt = now + 60_000;
+  const sync = async (entries: FleetCommonsEntry[], allowExpired: boolean) => {
+    await writeFile(feedPath, JSON.stringify(entries));
+    await syncFleetCommons({ storePath: dbPath, config: resolveFleetCommonsConfig({ enabled: true, feedPath, allowExpired }),
+      store: { syncProjectedCollection: async () => ({ upserted: 0, unchanged: 0, retracted: 0, embedded: 0, generation: 0 }) } });
+  };
+  const store = new DeepThoughtStore(dbPath);
+  t.after(async () => { store.close(); await dir[Symbol.asyncDispose](); });
+  store.saveDerivedObservation({
+    agentId: "main", audienceKey: "aud", corpora: ["fleet"], collectionGenerations: { [FLEET_COMMONS_COLLECTION]: 1 },
+    question: "How should deploy retries back off?", answer: "Wait a minute before retrying.", confidence: "high",
+    citations: [{ source: "fleet:task-run@r1", quote: "backoff" }], nowMs: now,
+  });
+  return { dbPath, sync, now, expiresAt };
+}
+
+test("whisper delivery uses active allowExpired regardless of the last sync's policy", async t => {
+  const { dbPath, sync, now, expiresAt } = await derivedFleetFixture(t);
+  let clock = now;
+  t.mock.method(Date, "now", () => clock);
+  await sync([{ ...entry, expiresAt }], false);
+  clock = expiresAt;
+  assert.match((await fleetWhisperer(dbPath, true)("serves-expired"))?.appendContext ?? "", /Wait a minute/u);
+  await sync([{ ...entry, expiresAt }], true);
+  assert.equal(await fleetWhisperer(dbPath, false)("refuses-expired"), undefined);
+});
+
+test("whisper delivery and same-run replay drop a derived synthesis whose Fleet citation was retired", async t => {
+  const { dbPath, sync } = await derivedFleetFixture(t);
+  await sync([entry], false);
+  const rawStarted = deferred<void>(), release = deferred<CorpusMemorySearchResult[]>();
+  const pendingWhisper = fleetWhisperer(dbPath, false, () => { rawStarted.resolve(); return release.promise; });
+  const replayWhisper = fleetWhisperer(dbPath, false);
+  assert.match((await replayWhisper("rebuild"))?.appendContext ?? "", /Wait a minute/u);
+  const pending = pendingWhisper("in-flight");
+  await rawStarted.promise;
+  await sync([], false);
+  release.resolve([]);
+  assert.equal(await pending, undefined, "the synthesis selected before retirement is not injected");
+  assert.equal(await replayWhisper("rebuild"), undefined, "a prompt rebuild cannot replay a retired citation");
+});
+
+test("a raw Fleet hit retired while async judging ran is dropped at delivery and never replayed", async t => {
+  const feedDir = await mkdtempDisposable(join(tmpdir(), "fleet-raw-retire-"));
+  t.after(() => feedDir[Symbol.asyncDispose]());
+  const feedPath = join(feedDir.path, "feed.json");
+  await writeFile(feedPath, JSON.stringify([entry]));
+  const { manager } = await fleetManager(t, resolveFleetCommonsConfig({ enabled: true, feedPath }));
+  await manager.syncFleetCommons();
+  let gate: Promise<void> | undefined;
+  const judging = deferred<void>();
+  t.mock.method(globalThis, "fetch", async () => {
+    judging.resolve();
+    await gate;
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul: 0.95 } } });
+  });
+  const config = resolveConfig({
+    fleetCommons: { enabled: true, feedPath }, decisionModel: { apiKey: "dummy-test-key" },
+    memoryWhisperer: { enabled: true, mode: "legacy", corpora: ["fleet"], timeoutMs: 5000 },
+  });
+  const api = { config: {}, on() {}, logger: { warn() {}, info() {} } } as unknown as OpenClawPluginApi;
+  // Discovery is canned (the fake store has no QMD lanes); the delivery recheck is the real manager's live Fleet cache.
+  const raw = { searchCandidates: async () => [fleetCommonsHit(entry, 0.9)],
+    activeFleetHits: <T extends { path: string }>(hits: readonly T[]) => manager.activeFleetHits(hits) };
+  const whisper = registerMemoryWhisperer(api, { async getMemorySearchManager() { return { manager: raw }; } },
+    config.memoryWhisperer, config.decisionModel);
+  assert.ok(whisper);
+  const ask = (runId: string, sessionKey = "agent:main:main") => whisper({ prompt: "How should deploy retries back off?", messages: [] },
+    { trigger: "user", agentId: "main", sessionKey, runId });
+
+  // Delivered while live; a same-run rebuild replays it.
+  const live = await ask("live", "agent:main:live");
+  assert.match(live?.appendContext ?? "", /task-run\/1/u);
+  assert.match((await ask("live", "agent:main:live"))?.appendContext ?? "", /task-run\/1/u);
+
+  // Retired while the judge is in flight: the selected hit is not injected.
+  let release!: () => void;
+  gate = new Promise<void>(resolve => { release = resolve; });
+  const pending = ask("in-flight");
+  await judging.promise;
+  await writeFile(feedPath, JSON.stringify([]));
+  await manager.syncFleetCommons();
+  release();
+  assert.equal(await pending, undefined, "a raw Fleet hit retired during judging is never rendered");
+  assert.equal(await ask("live", "agent:main:live"), undefined, "a prompt rebuild cannot replay a retired raw Fleet hit");
+});
+
+/** A live Fleet feed + manager, and a canned-discovery manager whose delivery recheck is the real live Fleet cache. */
+async function retirableFleet(t: test.TestContext, extra: CorpusMemorySearchResult[] = []) {
+  const feedDir = await mkdtempDisposable(join(tmpdir(), "fleet-boundary-"));
+  t.after(() => feedDir[Symbol.asyncDispose]());
+  const feedPath = join(feedDir.path, "feed.json");
+  await writeFile(feedPath, JSON.stringify([entry]));
+  const { manager } = await fleetManager(t, resolveFleetCommonsConfig({ enabled: true, feedPath }));
+  await manager.syncFleetCommons();
+  const raw = { searchCandidates: async () => [fleetCommonsHit(entry, 0.9), ...extra],
+    activeFleetHits: <T extends { path: string }>(hits: readonly T[]) => manager.activeFleetHits(hits) };
+  const retire = async () => { await writeFile(feedPath, JSON.stringify([])); await manager.syncFleetCommons(); };
+  return { feedPath, raw, retire };
+}
+
+test("memory_search / deep_thought: a Fleet hit retired during async judging is dropped before searchMemory returns", async t => {
+  const local: CorpusMemorySearchResult = { path: "qmd://memory/MEMORY.md", startLine: 1, endLine: 1, snippet: "Local retry memo",
+    source: "memory", corpus: "memory", score: 0.5 };
+  const { raw, retire } = await retirableFleet(t, [local]);
+  let gate: Promise<void> | undefined;
+  let judging = deferred<void>();
+  t.mock.method(globalThis, "fetch", async () => {
+    judging.resolve();
+    await gate;
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul: 0.95 } } });
+  });
+  const queries = { lex: "deploy retries", vec: "How should deploy retries back off?" };
+  // Exactly the options shape memory_search and deep_thought's search_memory pass (explicit search, fallback allowed).
+  const search = () => searchMemory(raw, queries, { corpora: ["fleet", "memory"], apiKey: "dummy-test-key", timeoutMs: 5_000,
+    conversation: { history: [], currentRequest: queries.vec }, allowRetrievalFallback: true, maxResults: 5 });
+  assert.deepEqual((await search()).results.map(hit => hit.path).sort(), [fleetCommonsHit(entry, 0.9).path, local.path].sort(),
+    "both are returned while the Fleet entry is live");
+
+  let release!: () => void;
+  gate = new Promise<void>(resolve => { release = resolve; });
+  judging = deferred<void>();
+  const pending = search();
+  await judging.promise;
+  await retire();
+  release();
+  const result = await pending;
+  assert.equal(result.rankingMode, "decision");
+  assert.deepEqual(result.results.map(hit => hit.path), [local.path], "the retired Fleet hit is dropped; local evidence stays");
+});
+
+test("a Fleet hit retired while a sibling whisperer is still finishing is dropped from the combined prompt", async t => {
+  const { feedPath, raw, retire } = await retirableFleet(t);
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul: 0.95 } } }));
+  const config = resolveConfig({
+    fleetCommons: { enabled: true, feedPath }, decisionModel: { apiKey: "dummy-test-key" },
+    memoryWhisperer: { enabled: true, mode: "legacy", corpora: ["fleet"], timeoutMs: 5000 },
+  });
+  let hook: ((event: unknown, ctx: unknown) => Promise<{ appendContext: string } | undefined>) | undefined;
+  const api = { config: {}, logger: { warn() {}, info() {} },
+    on(name: string, handler: typeof hook) { if (name === "before_prompt_build") hook = handler; } } as unknown as OpenClawPluginApi;
+  const whisper = registerMemoryWhisperer(api, { async getMemorySearchManager() { return { manager: raw }; } },
+    config.memoryWhisperer, config.decisionModel);
+  assert.ok(whisper);
+  let memoryDone = deferred<void>();
+  let siblingGate: Promise<void> = Promise.resolve();
+  const memory: WhispererPrompt = async (...args) => {
+    const result = await whisper(...args);
+    memoryDone.resolve();
+    return result;
+  };
+  const skill: WhispererPrompt = async () => { await siblingGate; return { appendContext: "<skills>sibling skill</skills>" }; };
+  registerWhispererPrompt(api, { memory, skill }, config.whispererTriggers);
+  assert.ok(hook);
+  const ask = (runId: string) => hook!({ prompt: "How should deploy retries back off?", messages: [] },
+    { trigger: "user", agentId: "main", sessionKey: `agent:main:${runId}`, runId });
+
+  const live = (await ask("live"))?.appendContext ?? "";
+  assert.match(live, /task-run\/1/u, "delivered while live");
+  assert.match(live, /sibling skill/u);
+
+  let release!: () => void;
+  siblingGate = new Promise<void>(resolve => { release = resolve; });
+  memoryDone = deferred<void>();
+  const pending = ask("slow-sibling");
+  await memoryDone.promise; // the memory whisperer has already rendered the Fleet hit
+  await retire();
+  release();
+  const combined = (await pending)?.appendContext ?? "";
+  assert.doesNotMatch(combined, /task-run\/1/u, "the retired Fleet hit never reaches the delivered prompt");
+  assert.match(combined, /sibling skill/u, "the sibling's contribution is still delivered");
+});
+
+test("deep_thought's direct cache hit honors the running allowExpired, not the last sync's persisted flag", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const { dbPath, sync, now, expiresAt } = await derivedFleetFixture(t);
+  let clock = now;
+  t.mock.method(Date, "now", () => clock);
+  await sync([{ ...entry, expiresAt }], false); // persisted allow_expired = 0
+  clock = expiresAt + 1;
+  const store = new DeepThoughtStore(dbPath);
+  t.after(() => store.close());
+  const ask = async (fleetCommonsAllowExpired: boolean, runId: string) => {
+    const ctx = { config: {}, agentId: "main", sessionKey: "agent:main:slack:channel:c1", sessionId: "s1", runId } as unknown as OpenClawPluginToolContext;
+    const tool = createDeepThoughtTool(ctx, {
+      runtime: { searchableCorpora: () => ["fleet"], fleetCommonsAllowExpired, async getMemorySearchManager() { return { manager: null }; } },
+      runner: { async run() { throw new Error("the investigation is not under test"); } },
+      store, audienceKey: "aud", getCollectionGenerations: () => ({ [FLEET_COMMONS_COLLECTION]: 1 }), resolveCredential: async () => undefined,
+      config: { enabled: true, maxTurns: 2, maxToolCalls: 2, timeoutMs: 5_000, maxConcurrent: 0 },
+      decisionModel: { enabled: true, endpoint: "https://decisions.invalid/v1", model: "test", timeoutMs: 50 },
+    })!;
+    return (await tool.execute(runId, { question: "How should deploy retries back off?", corpora: ["fleet"] })).details as
+      { status: string; cached?: boolean; answer?: string };
+  };
+  // Running opt-in serves the cached answer even though the last sync persisted allow_expired = 0.
+  const served = await ask(true, "opted-in");
+  assert.equal(served.cached, true, JSON.stringify(served));
+  assert.equal(served.answer, "Wait a minute before retrying.");
+  // Flipping allowExpired off takes effect at once, even though the last sync persisted allow_expired = 1.
+  await sync([{ ...entry, expiresAt }], true);
+  const refused = await ask(false, "opted-out");
+  assert.notEqual(refused.cached, true, JSON.stringify(refused));
+  assert.equal(refused.status, "unavailable", "the cache missed, so the (unavailable) investigation path ran");
+  assert.deepEqual(store.listDerivedObservations({ agentId: "main", status: "stale" }).map(found => found.answer),
+    ["Wait a minute before retrying."], "the synthesis citing the expired entry is invalidated");
 });

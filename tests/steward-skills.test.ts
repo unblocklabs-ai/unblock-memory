@@ -19,6 +19,7 @@ import { WorkStore } from "../src/work-store.js";
 const AGENT = "main";
 const START = Date.parse("2026-11-27T19:00:00Z");
 const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
 const GATES = { minRecallGainPp: SKILLS_DEFAULTS.minRecallGainPp, maxFalseActivationPp: SKILLS_DEFAULTS.maxFalseActivationPp,
   maxCriticalRegressions: SKILLS_DEFAULTS.maxCriticalRegressions, minPositivesEvaluated: SKILLS_DEFAULTS.minPositivesEvaluated,
   minNegativesEvaluated: SKILLS_DEFAULTS.minNegativesEvaluated, minSamplesEvaluated: SKILLS_DEFAULTS.minSamplesPerSkill,
@@ -198,7 +199,7 @@ test("description optimizer proposes a replay-validated description as pending a
   assert.equal(readSkillDescription(proposal!.proposedContent), "Ship a release to production and verify the canary");
   assert.deepEqual(proposal?.replayMetrics, { baselineRecall: 0, candidateRecall: 1, recallGainPp: 100, baselineFalseActivation: 0,
     candidateFalseActivation: 0, falseActivationDeltaPp: 0, criticalRegressions: 0, samplesEvaluated: 10, positives: 6, negatives: 4,
-    examplesFailed: 0 });
+    examplesFailed: 0, replayBasis: "query_proxy", routedExamples: 0, proxyExamples: 10 });
   assert.deepEqual(f.live(), before, "the live SKILL.md is never modified by the pass");
 
   // Same evidence on the next pass: no repeat model call, no duplicate proposal.
@@ -293,11 +294,11 @@ test("pitfall patches wait for minPitfallEvidence", async t => {
 /* ───────────────────────────── Phase 3 ───────────────────────────── */
 
 const RELEASE_DRAFT = (req: StewardCompleteRequest<unknown>) => {
-  const { members } = JSON.parse(req.userPrompt) as { members: Array<{ sourcePath: string }> };
+  const { members } = JSON.parse(req.userPrompt) as { members: Array<{ handle: string }> };
   return { shouldDraft: true, name: "invoice-reconciliation", title: "Invoice reconciliation", rationale: "Recurring month-end procedure",
     description: "Reconcile vendor invoices against the ledger at month end", whenToUse: "At month end before closing the books",
     steps: ["Export open invoices", "Match each invoice to a ledger entry", "Flag mismatches to finance"], pitfalls: [],
-    citedSources: [members[0]!.sourcePath, "qmd://memory/invented.md"] };
+    citedSources: [members[0]!.handle, "m99", "qmd://memory/invented.md"] };
 };
 
 test("new skills are mined from procedural crystals whose corpora are all allowed (sessions excluded by default)", async t => {
@@ -530,7 +531,11 @@ test("each pass loads replay prompts with ONE grouped recall_queries query (no p
   const { runner } = fakeRunner({ description: decline, pitfall: () => ({ shouldPatch: false, rationale: "r", pitfalls: [] }) });
   const result = await runStewardSkillsPass(f.options({ runner, scoreCatalog: keywordScorer, enableDescriptionOptimizer: true, enablePitfallPatches: true }));
   assert.equal(result.modelCalls, 2);
-  assert.equal(executions.length, 1, executions.join("\n---\n"));
+  // One grouped read per ledger: the recall_queries pass, plus the routing pass whose candidate-run subquery names
+  // recall_queries too. Each runs exactly once, never once per run.
+  assert.equal(executions.length, 2, executions.join("\n---\n"));
+  assert.equal(new Set(executions).size, 2, "no statement is re-executed per run");
+  assert.equal(executions.filter(sql => /FROM skill_routing_events WHERE agent_id=:agent AND run_id IN/u.test(sql)).length, 1);
 });
 
 test("rows without a chat_type infer it from the session key; untyped keys stay unknown (excluded by default)", async t => {
@@ -606,4 +611,191 @@ test("pitfall evidence carries the failing turn's bounded, redacted query contex
   assert.equal(byId["outcome:o2"]?.request, undefined, "a DM turn is never quoted under the default allowedChatTypes");
   assert.doesNotMatch(JSON.stringify(evidence), /sk-billingsecret|letmein|private dm/u);
   assert.ok(evidence.every(item => item.text.length <= 401));
+});
+
+/* ───────────────────────────── Round 1 review fixes ───────────────────────────── */
+
+const SHIP = "Ship a release to production and verify the canary";
+const shipDraft = () => ({ shouldPropose: true, description: SHIP, rationale: "Missed release requests" });
+/** A scorer seam that records every request and description it judged. */
+function recordingScorer(inner: SkillCatalogScorer = keywordScorer) {
+  const seen: Array<{ request: string; description: string }> = [];
+  const scorer: SkillCatalogScorer = async params => {
+    seen.push({ request: params.currentRequest, description: params.candidates[0]!.description });
+    return inner(params);
+  };
+  return { scorer, seen };
+}
+
+test("a textless recall row in a disallowed chat type (a skipped whisperer gate) still blocks its whole run", async t => {
+  const f = fixture(t);
+  seedMissedActivations(f);
+  // The whisperer skipped these DM turns (no query text), but the same runs also carry channel-tagged rows.
+  for (const runId of ["miss-0"]) {
+    f.db.prepare(`INSERT INTO recall_queries (event_key,created_at_ms,agent_id,source,run_id,session_id,chat_type,corpora_json,ranking_mode,outcome)
+      VALUES (?,?,?,'whisperer',?,?,'direct','["memory"]','decision','skipped')`).run(`skip-${runId}`, START - 59 * MINUTE, AGENT, runId, `s-${runId}`);
+  }
+  const { runner, calls } = fakeRunner({ description: shipDraft });
+  const { scorer, seen } = recordingScorer();
+  const result = await runStewardSkillsPass(f.options({ runner, scoreCatalog: scorer, enableDescriptionOptimizer: true }));
+  assert.equal(calls.length, 1, JSON.stringify(result));
+  const prompt = JSON.parse(calls[0]!.userPrompt) as { missedRequests: string[] };
+  assert.deepEqual(prompt.missedRequests.filter(text => /release 0 /u.test(text)), [], "a blocked run never reaches the drafter");
+  assert.equal(prompt.missedRequests.length, 5);
+  assert.ok(seen.length && seen.every(({ request }) => !/release 0 /u.test(request)), "nor the replay scorer");
+});
+
+test("replay prefers the routed request recorded on skill_routing_events and labels its basis", async t => {
+  const f = fixture(t);
+  seedMissedActivations(f);
+  let seq = 0;
+  const routed = (runId: string, text: string, chatType: string | null = null) => f.db.prepare(`INSERT INTO skill_routing_events
+    (event_key,created_at_ms,agent_id,session_id,run_id,mode,candidate_count,emitted_json,scores_json,outcome,request_text,chat_type)
+    VALUES (?,?,?,?,?,'direct',1,'[]','[]','rejected',?,?)`).run(`routed-${++seq}`, START - 58 * MINUTE, AGENT, `s-${runId}`, runId, text, chatType);
+  for (let i = 0; i < 6; i++) routed(`miss-${i}`, `please ship release ${i} to prod, routed text`);
+  for (let i = 0; i < 4; i++) routed(`other-${i}`, `weather digest ${i}, routed text`);
+  // A routing row tagged with a disallowed chat type blocks its run even though its recall rows say "channel".
+  routed("miss-5", "duplicate routed row from a DM", "direct");
+  const { runner, calls } = fakeRunner({ description: shipDraft });
+  const { scorer, seen } = recordingScorer();
+  const result = await runStewardSkillsPass(f.options({ runner, scoreCatalog: scorer, enableDescriptionOptimizer: true }));
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  const prompt = JSON.parse(calls[0]!.userPrompt) as { missedRequests: string[] };
+  assert.ok(prompt.missedRequests.length === 5 && prompt.missedRequests.every(text => text.endsWith("routed text")), JSON.stringify(prompt));
+  assert.ok(seen.length && seen.every(({ request }) => request.endsWith("routed text")), "the scorer replays exactly what routing saw");
+  assert.ok(seen.every(({ request }) => !request.includes("release 5")));
+  const [proposal] = listSkillProposals(f.db, { agentId: AGENT });
+  assert.equal(proposal?.replayMetrics?.replayBasis, "routed_request");
+  assert.equal(proposal?.replayMetrics?.routedExamples, 9);
+  assert.equal(proposal?.replayMetrics?.proxyExamples, 0);
+});
+
+test("a textless DM-tagged routing row (no recorded request) still vetoes its whole run", async t => {
+  const f = fixture(t);
+  seedMissedActivations(f);
+  // The run's recall row says "channel", but routing saw a DM turn whose request text was never recorded.
+  f.db.prepare(`INSERT INTO skill_routing_events
+    (event_key,created_at_ms,agent_id,session_id,run_id,mode,candidate_count,emitted_json,scores_json,outcome,request_text,chat_type)
+    VALUES ('textless-dm',?,?,'s-miss-0','miss-0','direct',1,'[]','[]','rejected',NULL,'direct')`).run(START - 58 * MINUTE, AGENT);
+  const { runner, calls } = fakeRunner({ description: shipDraft });
+  const { scorer, seen } = recordingScorer();
+  const result = await runStewardSkillsPass(f.options({ runner, scoreCatalog: scorer, enableDescriptionOptimizer: true }));
+  assert.equal(calls.length, 1, JSON.stringify(result));
+  const prompt = JSON.parse(calls[0]!.userPrompt) as { missedRequests: string[] };
+  assert.deepEqual(prompt.missedRequests.filter(text => /release 0 /u.test(text)), [], "the vetoed run never reaches the drafter");
+  assert.equal(prompt.missedRequests.length, 5);
+  assert.ok(seen.length && seen.every(({ request }) => !/release 0 /u.test(request)), "nor the replay scorer");
+});
+
+test("a textless DM routing row just BEFORE the lookback cutoff still vetoes its run's in-window channel rows", async t => {
+  const f = fixture(t);
+  seedMissedActivations(f);
+  // miss-0 also issued a channel tool query inside the window, but the same run's routing saw a DM turn one minute before
+  // the cutoff: the run is a candidate (it has in-window rows), so EVERY retained row of it counts toward the veto.
+  f.db.prepare(`INSERT INTO recall_queries (event_key,created_at_ms,agent_id,source,run_id,session_id,chat_type,vec_query,corpora_json,ranking_mode,outcome)
+    VALUES ('tool-miss-0',?,?,'tool','miss-0','s-miss-0','channel','ship release 0 tool lookup','["memory"]','decision','emitted')`)
+    .run(START - 59 * MINUTE, AGENT);
+  f.db.prepare(`INSERT INTO skill_routing_events
+    (event_key,created_at_ms,agent_id,session_id,run_id,mode,candidate_count,emitted_json,scores_json,outcome,request_text,chat_type)
+    VALUES ('pre-cutoff-dm',?,?,'s-miss-0','miss-0','direct',1,'[]','[]','rejected',NULL,'direct')`).run(START - DAY - MINUTE, AGENT);
+  const { runner, calls } = fakeRunner({ description: shipDraft });
+  const { scorer, seen } = recordingScorer();
+  const result = await runStewardSkillsPass(f.options({ runner, scoreCatalog: scorer, enableDescriptionOptimizer: true, lookbackDays: 1 }));
+  assert.equal(calls.length, 1, JSON.stringify(result));
+  const prompt = JSON.parse(calls[0]!.userPrompt) as { missedRequests: string[] };
+  assert.deepEqual(prompt.missedRequests.filter(text => /release 0 /u.test(text)), [], "the vetoed run never reaches the drafter");
+  assert.equal(prompt.missedRequests.length, 5);
+  assert.ok(seen.length && seen.every(({ request }) => !/release 0 /u.test(request)), "nor the replay scorer");
+});
+
+test("replayBasis follows the selected exposure's own source, never a prompt-text match against another run", async t => {
+  const f = fixture(t);
+  seedMissedActivations(f);
+  // An OLDER run routed the exact text that miss-0 only issued as a recall query: the newest exposure (miss-0, a query
+  // proxy) is the one selected, so its example must be labelled `query_proxy`, not `routed_request`.
+  f.db.prepare(`INSERT INTO skill_routing_events
+    (event_key,created_at_ms,agent_id,session_id,run_id,mode,candidate_count,emitted_json,scores_json,outcome,request_text,chat_type)
+    VALUES ('older-routed',?,?,'s-older','older','direct',1,'[]','[]','rejected',?,'channel')`)
+    .run(START - 70 * MINUTE, AGENT, "how do I ship release 0 to production");
+  f.open("older", f.skillPath, false, START - 65 * MINUTE);
+  const { runner } = fakeRunner({ description: shipDraft });
+  const result = await runStewardSkillsPass(f.options({ runner, scoreCatalog: keywordScorer, enableDescriptionOptimizer: true }));
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  const [proposal] = listSkillProposals(f.db, { agentId: AGENT });
+  assert.equal(proposal?.replayMetrics?.replayBasis, "query_proxy");
+  assert.equal(proposal?.replayMetrics?.routedExamples, 0);
+  assert.equal(proposal?.replayMetrics?.proxyExamples, 10);
+});
+
+test("too few replay examples is detected before any model spend and is not watermarked, so it re-evaluates later", async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 6; i++) {
+    f.query(`miss-${i}`, `how do I ship release ${i} to production`);
+    f.open(`miss-${i}`, f.skillPath, false);
+  }
+  const { runner, calls } = fakeRunner({ description: shipDraft });
+  const first = await runStewardSkillsPass(f.options({ runner, scoreCatalog: keywordScorer, enableDescriptionOptimizer: true }));
+  assert.equal(first.status, "ok");
+  assert.equal(calls.length, 0, "no negatives: the draft call is never made");
+  assert.equal(first.replayJudgments, 0);
+  assert.deepEqual(first.rejected.map(entry => entry.reason), ["indeterminate:insufficient_negatives"]);
+  // Negatives arrive later; the skill's own evidence (and so its digest) is unchanged, yet it is evaluated now.
+  for (let i = 0; i < 4; i++) {
+    f.query(`other-${i}`, `summarize the weather report ${i}`);
+    f.open(`other-${i}`, "/elsewhere/weather/SKILL.md", true);
+  }
+  const second = await runStewardSkillsPass(f.options({ runner, scoreCatalog: keywordScorer, enableDescriptionOptimizer: true }));
+  assert.equal(second.status, "ok", JSON.stringify(second));
+  assert.equal(calls.length, 1);
+  assert.equal(second.descriptionUpdates, 1);
+});
+
+test("replayConcurrency bounds individual scoreCatalog judgments (1 = strictly one in flight)", async () => {
+  const set = examples(range("p", 0, 6), range("n", 0, 6));
+  for (const [concurrency, peakAllowed] of [[1, 1], [3, 3], [0, set.length * 2]] as const) {
+    let active = 0, peak = 0;
+    const scorer: SkillCatalogScorer = async () => {
+      peak = Math.max(peak, ++active);
+      await new Promise(resolve => setTimeout(resolve, 2));
+      active--;
+      return [];
+    };
+    const outcome = await replaySkillDescription({ skillName: "deploy", baselineDescription: "base", candidateDescription: "cand",
+      examples: set, scoreCatalog: scorer, decision: DECISION, timeoutMs: 1000, minUsefulness: 0.7, concurrency });
+    assert.equal(outcome.judgments, set.length * 2);
+    assert.equal(peak, peakAllowed, `concurrency ${concurrency}`);
+  }
+});
+
+test("descriptions and crystal summaries are redacted and bounded before any model; crystal members are opaque handles", async t => {
+  const f = fixture(t);
+  seedMissedActivations(f);
+  const secretDescription = "Deploy services to staging with api_key=sk-supersecret123456 and then verify every canary carefully";
+  const catalog = [{ ...f.catalog[0]!, description: secretDescription }];
+  f.crystal("c-proc", { title: "Invoice reconciliation", corpora: ["memory"],
+    summary: `Month-end reconcile invoices; password=hunter2hunter2 ${"long detail ".repeat(50)}` });
+  const { runner, calls } = fakeRunner({ description: shipDraft, new_skill: RELEASE_DRAFT });
+  const { scorer, seen } = recordingScorer();
+  const result = await runStewardSkillsPass(f.options({ runner, catalog, scoreCatalog: scorer, enableDescriptionOptimizer: true,
+    enableNewSkills: true, maxDescriptionChars: 60, maxEvidenceChars: 80 }));
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  const description = calls.find(call => call.purpose.endsWith(":description"))!;
+  const drafted = JSON.parse(description.userPrompt) as { skill: { currentDescription: string } };
+  assert.doesNotMatch(drafted.skill.currentDescription, /sk-supersecret/u);
+  assert.ok(drafted.skill.currentDescription.length <= 61, drafted.skill.currentDescription);
+  const baselines = seen.filter(({ description: text }) => text !== SHIP);
+  assert.ok(baselines.length && baselines.every(({ description: text }) => !text.includes("sk-supersecret") && text.length <= 61),
+    "the replay baseline is redacted and bounded too");
+
+  const mined = calls.find(call => call.purpose.endsWith(":new_skill"))!;
+  const payload = JSON.parse(mined.userPrompt) as { crystal: { summary: string }; members: Array<Record<string, unknown>>;
+    existingSkills: Array<{ description: string }> };
+  assert.doesNotMatch(payload.crystal.summary, /hunter2/u);
+  assert.ok(payload.crystal.summary.length <= 81, `summary bounded: ${payload.crystal.summary.length}`);
+  assert.deepEqual(payload.members, [{ handle: "m1", corpus: "memory" }]);
+  assert.doesNotMatch(mined.userPrompt, /qmd:\/\//u, "raw member paths never reach the model");
+  assert.ok(payload.existingSkills.every(skill => !skill.description.includes("sk-supersecret")));
+  const [proposal] = listSkillProposals(f.db, { agentId: AGENT, kind: "new_skill" });
+  assert.match(proposal!.proposedContent, /## Sources\n\n- `qmd:\/\/memory\/c-proc-0\.md`\n$/u, "the cited handle resolves locally");
+  assert.deepEqual(proposal!.evidence.citedSources, ["qmd://memory/c-proc-0.md"]);
 });

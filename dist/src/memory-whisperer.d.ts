@@ -63,6 +63,7 @@ export type MemoryWhispererOptions = {
     recipeHash?: string;
 };
 type MemoryWhispererRuntime = {
+    readonly fleetCommonsAllowExpired?: boolean;
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;
         agentId: string;

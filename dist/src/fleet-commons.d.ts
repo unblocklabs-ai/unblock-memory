@@ -30,12 +30,16 @@ export type FleetCommonsConfig = {
     maxEntries: number;
     /** Feed bytes read before JSON parsing; a larger feed fails the sync and keeps the last good cache. `0` = unlimited. */
     maxFeedBytes: number;
+    maxTitleChars?: number;
+    maxBodyChars?: number;
     allowExpired: boolean;
 };
 export declare function resolveFleetCommonsConfig(value?: unknown): FleetCommonsConfig;
 /** The publisher must sanitize its feed. Local patterns cannot recognize arbitrary names in prose. */
 export type FleetCommonsHygieneOptions = {
     forbiddenTerms?: readonly string[];
+    maxTitleChars?: number;
+    maxBodyChars?: number;
 };
 export type FleetCommonsValidation = {
     ok: true;
@@ -80,9 +84,11 @@ export declare class FleetCommonsReader {
  * Whether every Fleet Commons entry cited in `sources` is still cached at that revision and unexpired at `nowMs` (unless
  * the last sync ran with `allowExpired`). Expiry never moves a collection generation, so cached syntheses check this too.
  */
-export declare function fleetCitationsActive(db: DatabaseSync, sources: readonly string[], nowMs: number): boolean;
-type FleetCommonsProjectionStore = Pick<QMDStore, "syncProjectedCollection"> & Partial<Pick<QMDStore, "listCollections">>;
-export type FleetCommonsSyncOptions = FleetCommonsHygieneOptions & {
+export declare function fleetCitationsActive(db: DatabaseSync, sources: readonly string[], nowMs: number, allowExpired?: boolean): boolean;
+/** Recheck selected syntheses at delivery, using the running plugin's policy rather than the previous sync's. */
+export declare function filterActiveFleetCitations<T>(path: string, items: readonly T[], sources: (item: T) => readonly string[], allowExpired?: boolean): T[];
+type FleetCommonsProjectionStore = Pick<QMDStore, "syncProjectedCollection"> & Partial<Pick<QMDStore, "listCollections" | "addCollection">>;
+export type FleetCommonsSyncOptions = Pick<FleetCommonsHygieneOptions, "forbiddenTerms"> & {
     config: FleetCommonsConfig;
     storePath: string;
     fetchImpl?: typeof fetch;

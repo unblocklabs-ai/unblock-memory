@@ -141,6 +141,19 @@ function richDb(t: TestContext) {
   return { path, personId };
 }
 
+test("snapshot creation rejects aliases shaped like phone numbers, tokens or Slack IDs", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    const snapshot = buildNodeTelemetrySnapshot(db, { ...IDS, nodeId: "node-2026", agentId: "build.main:2" });
+    assert.equal(snapshot.nodeId, "node-2026");
+    for (const alias of ["2025550123", "202-555-0123", "1.202.555.0123", "sk-fakekey",
+      "xoxb-fake-token", "ghp_fakekey", "c0ak9plcpqf", "u0aav2lb402", "d0aav2lb402"]) {
+      assert.throws(() => buildNodeTelemetrySnapshot(db, { ...IDS, nodeId: alias }), /fleet node and agent aliases/u, alias);
+      assert.throws(() => buildNodeTelemetrySnapshot(db, { ...IDS, agentId: alias }), /fleet node and agent aliases/u, alias);
+    }
+  } finally { db.close(); }
+});
+
 test("telemetry exports only anonymous aggregates from a rich read-only DB", t => {
   const { path, personId } = richDb(t);
   const db = new DatabaseSync(path, { readOnly: true });

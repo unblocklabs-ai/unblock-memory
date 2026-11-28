@@ -1,10 +1,11 @@
 import type { QMDStore } from "@unblocklabs/qmd";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { Readable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import { abortable } from "./abortable.js";
 import type { CorpusMemorySearchResult } from "./contracts.js";
 import { isRecord, nonBlank } from "./guards.js";
@@ -42,14 +43,19 @@ export type FleetCommonsConfig = {
   maxEntries: number;
   /** Feed bytes read before JSON parsing; a larger feed fails the sync and keeps the last good cache. `0` = unlimited. */
   maxFeedBytes: number;
+  maxTitleChars?: number;
+  maxBodyChars?: number;
   allowExpired: boolean;
 };
 
+const DEFAULT_TITLE_CHARS = 1024;
+const DEFAULT_BODY_CHARS = 65_536;
 const DEFAULT_FLEET_COMMONS_CONFIG: Readonly<FleetCommonsConfig> = Object.freeze({
   enabled: false, syncIntervalMinutes: 15, timeoutMs: 10_000, maxEntries: 0, maxFeedBytes: 5 * 1024 * 1024, allowExpired: false,
 });
 
-const configKeys = new Set([...Object.keys(DEFAULT_FLEET_COMMONS_CONFIG), "endpoint", "feedPath", "apiKey", "apiKeyFile"]);
+const configKeys = new Set([...Object.keys(DEFAULT_FLEET_COMMONS_CONFIG),
+  "endpoint", "feedPath", "apiKey", "apiKeyFile", "maxTitleChars", "maxBodyChars"]);
 
 export function resolveFleetCommonsConfig(value: unknown = undefined): FleetCommonsConfig {
   if (value === undefined) return { ...DEFAULT_FLEET_COMMONS_CONFIG };
@@ -57,7 +63,8 @@ export function resolveFleetCommonsConfig(value: unknown = undefined): FleetComm
     throw new Error("fleetCommons must be an object");
   }
   if (Object.keys(value).some(key => !configKeys.has(key))) throw new Error("Unknown fleetCommons config key");
-  const { enabled, syncIntervalMinutes, timeoutMs, maxEntries, maxFeedBytes, allowExpired } = { ...DEFAULT_FLEET_COMMONS_CONFIG, ...value };
+  const { enabled, syncIntervalMinutes, timeoutMs, maxEntries, maxFeedBytes, maxTitleChars, maxBodyChars, allowExpired } =
+    { ...DEFAULT_FLEET_COMMONS_CONFIG, ...value };
   if (typeof enabled !== "boolean") throw new Error("fleetCommons.enabled must be a boolean");
   if (typeof allowExpired !== "boolean") throw new Error("fleetCommons.allowExpired must be a boolean");
   if (typeof syncIntervalMinutes !== "number" || !Number.isFinite(syncIntervalMinutes) || syncIntervalMinutes <= 0) {
@@ -73,12 +80,16 @@ export function resolveFleetCommonsConfig(value: unknown = undefined): FleetComm
   if (typeof maxFeedBytes !== "number" || !Number.isSafeInteger(maxFeedBytes) || maxFeedBytes < 0) {
     throw new Error("fleetCommons.maxFeedBytes must be a non-negative integer");
   }
+  if (maxTitleChars !== undefined && !validLimit(maxTitleChars)) throw new Error("fleetCommons.maxTitleChars must be a non-negative safe integer");
+  if (maxBodyChars !== undefined && !validLimit(maxBodyChars)) throw new Error("fleetCommons.maxBodyChars must be a non-negative safe integer");
   const endpoint = nonBlank(value.endpoint);
   if (value.endpoint !== undefined) {
     // Mirrors the manifest pattern: `@` may appear in the path, never in the authority (embedded credentials).
-    const url = endpoint && !/\s/u.test(endpoint) && URL.parse(endpoint);
-    if (!url || !["http:", "https:"].includes(url.protocol) || url.username || url.password) {
-      throw new Error("fleetCommons.endpoint must be an HTTP(S) URL without embedded credentials");
+    const url = endpoint && /^(?:https:\/\/[^\s\\@/?#]+|http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?)(?:[/?#][^\s\\]*)?$/iu.test(endpoint)
+      && URL.parse(endpoint);
+    if (!url || url.username || url.password ||
+        (url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) {
+      throw new Error("fleetCommons.endpoint must be an HTTPS (or loopback HTTP) URL without embedded credentials");
     }
   }
   const feedPath = nonBlank(value.feedPath), apiKeyFile = nonBlank(value.apiKeyFile), apiKey = nonBlank(value.apiKey);
@@ -93,37 +104,60 @@ export function resolveFleetCommonsConfig(value: unknown = undefined): FleetComm
   }
   if (enabled && !endpoint && !feedPath) throw new Error("Enabled fleetCommons requires endpoint or feedPath");
   return { enabled, syncIntervalMinutes, timeoutMs, maxEntries, maxFeedBytes, allowExpired,
+    ...(maxTitleChars !== undefined ? { maxTitleChars } : {}), ...(maxBodyChars !== undefined ? { maxBodyChars } : {}),
     ...(endpoint ? { endpoint } : {}), ...(feedPath ? { feedPath } : {}),
     ...(apiKey ? { apiKey } : {}), ...(apiKeyFile ? { apiKeyFile } : {}) };
 }
 
 /** The publisher must sanitize its feed. Local patterns cannot recognize arbitrary names in prose. */
-export type FleetCommonsHygieneOptions = { forbiddenTerms?: readonly string[] };
+export type FleetCommonsHygieneOptions = { forbiddenTerms?: readonly string[]; maxTitleChars?: number; maxBodyChars?: number };
 export type FleetCommonsValidation = { ok: true; entry: FleetCommonsEntry } | { ok: false; reasons: string[] };
 
 const entryKeys = new Set(["id", "revision", "category", "title", "body", "tags", "severity", "updatedAt", "expiresAt", "source"]);
 const safeSlug = (value: unknown): value is string => typeof value === "string" &&
   /^[a-z0-9._-]+$/u.test(value) && value !== "." && value !== "..";
 const finiteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const validLimit = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const categoryValue = (value: unknown): value is FleetCommonsCategory => FLEET_COMMONS_CATEGORIES.some(category => category === value);
 const severityValue = (value: unknown): value is FleetCommonsSeverity => FLEET_COMMONS_SEVERITIES.some(severity => severity === value);
 
 // A credential value: a token-alphabet run holding a digit, a long opaque run, or a quoted literal. Prose ("token: must be
 // refreshed") and placeholders ("Bearer <token>", "${TOKEN}") are not credentials.
-const credentialValue = String.raw`(?:["'][^\s"'<>]{8,}["']|(?=[^\s"'<>]*\d)[^\s"'<>]{6,}|[A-Za-z0-9+/=_]{24,})`;
-const bearerValue = String.raw`(?:(?=[\w.~+/-]*\d)[\w.~+/-]{8,}|[\w.~+/-]{24,})`;
+const credentialValue = String.raw`(?:["'][^\s"'<>]{8,}["']|(?=[^\s"'<>]{0,255}\d)[^\s"'<>]{6}|[A-Za-z0-9+/=_]{24})`;
+/**
+ * Provider `sk-` keys: Anthropic (`sk-ant-api03-…`, setup `sk-ant-oat01-…`, admin `sk-ant-admin01-…`), OpenAI admin /
+ * project / service-account / `sk-None-` / OpenRouter keys, a legacy opaque 20+ alphanumeric run, or any 20+ key-alphabet
+ * run holding a digit. A short or all-letter word name (`sk-utilities`, `sk-learn-style-helpers`) is not a key.
+ */
+const providerKey = String.raw`sk-(?:ant-[a-z]+\d{2}-[a-z0-9_-]{20,}|(?:admin|proj|svcacct|none|or-v\d+)-[a-z0-9_-]{20,}|[a-z0-9]{20,}|` +
+  String.raw`(?=[a-z_-]{0,255}\d)[a-z0-9_-]{20,})`;
+const bearerValue = String.raw`(?:(?=[\w.~+/-]{0,255}\d)[\w.~+/-]{8}|[\w.~+/-]{24})`;
 const hygieneRules: ReadonlyArray<readonly [string, RegExp]> = [
-  ["secret or credential", new RegExp(String.raw`(?<![a-z0-9])(?:sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[baprs]-)[a-z0-9_-]+|\bBearer\s+${bearerValue}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\beyJ[\w-]+\.[\w-]+\.[\w-]+|\b(?:api[_ -]?key|(?:access[_ -]?)?token|password|(?:client[_ -]?)?secret)\s*[:=]\s*${credentialValue}`, "iu")],
+  ["secret or credential", new RegExp(String.raw`(?<![a-z0-9])(?:${providerKey}|(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[baprs]-)[a-z0-9_-]+)|\bhooks\.slack\.com/services/\S|` +
+    String.raw`\bBearer\s+${bearerValue}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?<![\w-])eyJ[\w-]+\.[\w-]+\.[\w-]+|\b(?:api[_ -]?key|(?:access[_ -]?)?token|password|(?:client[_ -]?)?secret)\s*[:=]\s*${credentialValue}|\b(?:api[_ -]?key|password|(?:client[_ -]?)?secret)\s*=\s*[^\s"'<>$\x60]`, "iu")],
   ["AWS credential", /(?<![a-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![a-z0-9])/iu],
-  ["email address", /[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}\-]+(?:\.[\p{L}\p{N}\-]+)+/u],
   // International (`+` and 8-15 digits) or North American grouped (3-3-4) numbers; status-code lists, dates, versions and
   // bare epoch timestamps are not phone numbers.
   ["phone number", /(?<![\p{L}\p{N}+.])(?:\+(?:[\p{Zs}().-]*\d){8,15}|(?:\(\d{3}\)[\p{Zs}.-]?|\d{3}[\p{Zs}.-])\d{3}[\p{Zs}.-]\d{4})(?![\p{L}\p{N}]|[.-]\d)/u],
-  // Slack IDs always carry a digit; all-caps words (UNAVAILABLE, CONNECTION_RESET) and pure-hex digests are not IDs.
-  ["Slack ID", /(?<![A-Za-z0-9])(?![\da-f]+(?![A-Za-z0-9]))(?![\dA-F]+(?![A-Za-z0-9]))(?:[CUDGWB](?=[A-Z]*\d)[A-Z0-9]{8,}|[cudgwb]0[a-z0-9]{7,})(?![A-Za-z0-9])/u],
-  ["local filesystem path", /\/(?:Users|home|root|Volumes|mnt|workspaces?|(?:private\/)?tmp|(?:private\/)?var\/folders)\/|(?<![a-zA-Z0-9])[a-zA-Z]:[\\/]|~[\\/]|\.openclaw[\\/]workspace|file:\/\//u],
+  // Slack IDs have a digit immediately after the type prefix; pure-hex digests are not IDs.
+  ["Slack ID", /(?<![A-Za-z0-9])(?![\da-fA-F]+(?![A-Za-z0-9]))(?:[CUDGWB]\d[A-Z0-9]{7,}|[cudgwb]0[a-z0-9]{7,})(?![A-Za-z0-9])/u],
   ["client or personal identifier", /\b(?:client|customer|patient|employee)[ _-]+(?:name|id)\s*[:=]\s*\S/iu],
 ];
+
+function hasEmail(text: string): boolean {
+  // Start at actual @ signs. One local-part character suffices; a DNS name is at most 253 characters.
+  for (let at = text.indexOf("@"); at !== -1; at = text.indexOf("@", at + 1)) {
+    if (/[\p{L}\p{N}._%+-]$/u.test(text.slice(Math.max(0, at - 2), at)) &&
+        /^[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+/u.test(text.slice(at + 1, at + 254))) return true;
+  }
+  return false;
+}
+
+function hasLocalPath(text: string): boolean {
+  const prose = text.replace(/\bhttps?:\/\/[^\s<>"']+/giu, "");
+  return /\/(?:Users|home|root|Volumes|mnt|workspaces?|(?:private\/)?tmp|(?:private\/)?var\/folders)\//u.test(prose) ||
+    /(?<![a-zA-Z0-9])[a-zA-Z]:[\\/]|~[\\/]|\.openclaw[\\/]workspace|file:\/\//u.test(text);
+}
 
 function normalizedText(value: string): string {
   return value.normalize("NFKC").replace(/\p{Default_Ignorable_Code_Point}/gu, "");
@@ -143,6 +177,8 @@ function hygieneReasons(value: string, terms: readonly string[]): string[] {
     try { return decodeURIComponent(run); } catch { return run; }
   }));
   const reasons = hygieneRules.filter(([, pattern]) => pattern.test(text) || pattern.test(decoded)).map(([reason]) => reason);
+  if (hasEmail(text) || hasEmail(decoded)) reasons.push("email address");
+  if (hasLocalPath(text) || hasLocalPath(decoded)) reasons.push("local filesystem path");
   if (terms.length) {
     const rawTerms = termText(text), decodedTerms = termText(decoded);
     if (terms.some(term => rawTerms.includes(term) || decodedTerms.includes(term))) reasons.push("forbidden term");
@@ -151,10 +187,12 @@ function hygieneReasons(value: string, terms: readonly string[]): string[] {
 }
 
 export function validateFleetCommonsEntry(value: unknown, options?: FleetCommonsHygieneOptions): FleetCommonsValidation {
-  return validateEntry(value, forbiddenTerms(options));
+  return validateEntry(value, forbiddenTerms(options), options);
 }
 
-function validateEntry(value: unknown, terms: readonly string[]): FleetCommonsValidation {
+function validateEntry(value: unknown, terms: readonly string[], {
+  maxTitleChars = DEFAULT_TITLE_CHARS, maxBodyChars = DEFAULT_BODY_CHARS,
+}: FleetCommonsHygieneOptions = {}): FleetCommonsValidation {
   if (!isRecord(value)) return { ok: false, reasons: ["entry must be an object"] };
   if (Object.keys(value).some(key => !entryKeys.has(key))) return { ok: false, reasons: ["unknown entry field"] };
   const { id, revision, category, title, body, tags, severity, updatedAt, expiresAt, source } = value;
@@ -162,8 +200,12 @@ function validateEntry(value: unknown, terms: readonly string[]): FleetCommonsVa
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) return { ok: false, reasons: ["invalid revision"] };
   if (!categoryValue(category)) return { ok: false, reasons: ["invalid category"] };
   if (!severityValue(severity)) return { ok: false, reasons: ["invalid severity"] };
-  if (typeof title !== "string" || !title.trim()) return { ok: false, reasons: ["invalid title"] };
-  if (typeof body !== "string" || !body.trim()) return { ok: false, reasons: ["invalid body"] };
+  if (typeof title !== "string" || (maxTitleChars && title.length > maxTitleChars) || /[\r\n]/u.test(title) || !title.trim()) {
+    return { ok: false, reasons: ["invalid title: expected one nonblank line within maxTitleChars"] };
+  }
+  if (typeof body !== "string" || (maxBodyChars && body.length > maxBodyChars) || !body.trim()) {
+    return { ok: false, reasons: ["invalid body: expected nonblank text within maxBodyChars"] };
+  }
   if (!Array.isArray(tags) || !tags.every((tag): tag is string => typeof tag === "string")) return { ok: false, reasons: ["invalid tags"] };
   if (!finiteNumber(updatedAt) || !Number.isFinite(new Date(updatedAt).getTime())) return { ok: false, reasons: ["invalid updatedAt"] };
   if (expiresAt !== undefined && expiresAt !== null && !finiteNumber(expiresAt)) return { ok: false, reasons: ["invalid expiresAt"] };
@@ -339,11 +381,11 @@ function citedFleetEntry(source: string): { id: string; revision: number } | und
  * Whether every Fleet Commons entry cited in `sources` is still cached at that revision and unexpired at `nowMs` (unless
  * the last sync ran with `allowExpired`). Expiry never moves a collection generation, so cached syntheses check this too.
  */
-export function fleetCitationsActive(db: DatabaseSync, sources: readonly string[], nowMs: number): boolean {
+export function fleetCitationsActive(db: DatabaseSync, sources: readonly string[], nowMs: number, allowExpired?: boolean): boolean {
   const cited = sources.flatMap(source => citedFleetEntry(source) ?? []);
   if (!cited.length) return true;
   if (!tableExists(db, "fleet_commons_entries")) return false;
-  const allowExpired = tableExists(db, "fleet_commons_meta") && readMeta(db, "allow_expired") === "1";
+  allowExpired ??= tableExists(db, "fleet_commons_meta") && readMeta(db, "allow_expired") === "1";
   const lookup = db.prepare("SELECT expires_at_ms FROM fleet_commons_entries WHERE id=? AND revision=?");
   return cited.every(({ id, revision }) => {
     const row = lookup.get(id, revision);
@@ -351,9 +393,25 @@ export function fleetCitationsActive(db: DatabaseSync, sources: readonly string[
   });
 }
 
-type FleetCommonsProjectionStore = Pick<QMDStore, "syncProjectedCollection"> & Partial<Pick<QMDStore, "listCollections">>;
+/** Recheck selected syntheses at delivery, using the running plugin's policy rather than the previous sync's. */
+export function filterActiveFleetCitations<T>(path: string, items: readonly T[], sources: (item: T) => readonly string[],
+  allowExpired?: boolean): T[] {
+  const candidates = items.map(item => ({ item, sources: sources(item) }));
+  const nonFleet = () => candidates.filter(candidate => !candidate.sources.some(citedFleetEntry)).map(({ item }) => item);
+  if (!candidates.some(candidate => candidate.sources.some(citedFleetEntry))) return [...items];
+  const now = Date.now();
+  try {
+    return withReadDb(path, nonFleet(), db => candidates.filter(candidate =>
+      fleetCitationsActive(db, candidate.sources, now, allowExpired)).map(({ item }) => item));
+  } catch {
+    // A cache that cannot be verified must not suppress unrelated syntheses.
+    return nonFleet();
+  }
+}
 
-export type FleetCommonsSyncOptions = FleetCommonsHygieneOptions & {
+type FleetCommonsProjectionStore = Pick<QMDStore, "syncProjectedCollection"> & Partial<Pick<QMDStore, "listCollections" | "addCollection">>;
+
+export type FleetCommonsSyncOptions = Pick<FleetCommonsHygieneOptions, "forbiddenTerms"> & {
   config: FleetCommonsConfig;
   storePath: string;
   fetchImpl?: typeof fetch;
@@ -424,7 +482,8 @@ async function readFeed({ config, fetchImpl = fetch, signal: callerSignal }: Fle
     catch { signal.throwIfAborted(); throw new Error("Fleet Commons credential file could not be read"); }
   }
   if (token !== undefined && (!token || /[^\x21-\x7e]/u.test(token))) throw new Error("Invalid Fleet Commons credential");
-  const scope = jsonHash([config.endpoint, token, config.allowExpired, config.maxEntries, blocked]);
+  const scope = jsonHash([config.endpoint, token, config.allowExpired, config.maxEntries,
+    config.maxTitleChars ?? DEFAULT_TITLE_CHARS, config.maxBodyChars ?? DEFAULT_BODY_CHARS, blocked]);
   const terms = token ? [...blocked, termText(normalizedText(token))] : blocked;
   // If a bounded snapshot lost a row to expiry, a fresh feed can fill the vacated slot.
   const needsRefill = config.maxEntries > 0 && !config.allowExpired && Boolean(db.prepare(
@@ -486,7 +545,7 @@ async function prepareSync(options: FleetCommonsSyncOptions, db: DatabaseSync): 
   const rejected: Array<{ id: string; reasons: string[] }> = [];
   const incoming = feed.status === "not_modified" ? entriesFrom(db) : feed.entries;
   for (const [index, candidate] of incoming.entries()) {
-    const checked = validateEntry(candidate, feed.terms);
+    const checked = validateEntry(candidate, feed.terms, options.config);
     if (!checked.ok) {
       const id = isRecord(candidate) ? candidate.id : undefined;
       rejected.push({ id: safeSlug(id) && !hygieneReasons(id, feed.terms).length ? id : `#${index + 1}`, reasons: checked.reasons });
@@ -503,34 +562,53 @@ async function prepareSync(options: FleetCommonsSyncOptions, db: DatabaseSync): 
     ...(feed.status === "synced" ? { etag: { value: feed.etag, scope: feed.scope } } : {}) };
 }
 
-/** A projection that lost documents (missing collection, wiped or partially rebuilt index) is rewritten from the cache. */
-async function projectionIncomplete(store: FleetCommonsProjectionStore, count: number): Promise<boolean> {
-  if (!store.listCollections) return false;
-  const collection = (await store.listCollections()).find(candidate => candidate.name === FLEET_COMMONS_COLLECTION);
-  return (collection?.active_count ?? 0) !== count;
+/** Serialize the cache + QMD write phase across processes without locking unrelated curation writes during embedding. */
+async function withProjectionLock<T>(path: string, signal: AbortSignal | undefined, apply: () => Promise<T>): Promise<T> {
+  const lock = new DatabaseSync(path + ".fleet-projection-lock");
+  try {
+    for (;;) {
+      signal?.throwIfAborted();
+      try { lock.exec("BEGIN IMMEDIATE"); break; }
+      catch (error) {
+        if (!(error instanceof Error) || !("errcode" in error) || error.errcode !== 5) throw error;
+        await delay(25, undefined, { signal });
+      }
+    }
+    return await apply();
+  } finally { lock.close(); }
 }
 
 async function commitSync(options: FleetCommonsSyncOptions, db: DatabaseSync, prepared: PreparedSync,
-  store: FleetCommonsProjectionStore): Promise<FleetCommonsSyncResult> {
+  store: FleetCommonsProjectionStore, generation: string | undefined): Promise<FleetCommonsSyncResult> {
   options.signal?.throwIfAborted();
   const { entries, now } = prepared;
   const digest = jsonHash(entries.map(entry => ({ ...entry, expiresAt: entry.expiresAt ?? null })));
-  const changed = digest !== readMeta(db, "feed_digest");
-  const project = changed || await projectionIncomplete(store, entries.length);
-  immediateTransaction(db, () => {
-    if (changed) {
-      replaceEntries(db, entries, now);
-      // SQLite is authoritative. Invalidate the QMD acknowledgement before replacing its projection.
-      writeMeta(db, "feed_digest", undefined);
+  const collection = (await store.listCollections?.())?.find(candidate => candidate.name === FLEET_COMMONS_COLLECTION);
+  const register = Boolean(store.addCollection) && !collection?.projected;
+  options.signal?.throwIfAborted();
+  const commit = immediateTransaction(db, () => {
+    // Our fetch took place before acquiring the lock. Never overwrite a cache committed in that interval.
+    if (readMeta(db, "sync_generation") !== generation) {
+      const count = Number(db.prepare("SELECT count(*) AS count FROM fleet_commons_entries").get()?.count);
+      return { fenced: true, count } as const;
     }
+    const changed = digest !== readMeta(db, "feed_digest");
+    const project = changed || register || (Boolean(store.listCollections) && collection?.active_count !== entries.length);
+    if (changed) replaceEntries(db, entries, now);
+    // Invalidate the acknowledgement even for a same-digest repair: QMD commits rows before embedding.
+    if (project) writeMeta(db, "feed_digest", undefined);
+    writeMeta(db, "sync_generation", randomUUID());
     if (prepared.etag) {
       writeMeta(db, "etag", prepared.etag.value);
       writeMeta(db, "etag_scope", prepared.etag.value ? prepared.etag.scope : undefined);
     }
     // Cached syntheses citing an expired entry stay servable only while expired entries are (`fleetCitationsActive`).
     writeMeta(db, "allow_expired", options.config.allowExpired ? "1" : "0");
+    return { fenced: false, project } as const;
   });
-  if (project) {
+  if (commit.fenced) return { status: "not_modified", count: commit.count, changed: false, rejected: [] };
+  if (commit.project) {
+    if (register) await store.addCollection?.(FLEET_COMMONS_COLLECTION, { projected: true, includeByDefault: false });
     const documents = entries.map(entry => {
       const date = new Date(entry.updatedAt).toISOString();
       return { path: fleetCommonsPath(entry), title: entry.title, content: entry.body, createdAt: date, modifiedAt: date };
@@ -538,19 +616,22 @@ async function commitSync(options: FleetCommonsSyncOptions, db: DatabaseSync, pr
     await store.syncProjectedCollection(FLEET_COMMONS_COLLECTION, documents, {
       embed: true, chunkStrategy: "semantic", cleanup: true, ...(options.signal ? { signal: options.signal } : {}),
     });
+    options.signal?.throwIfAborted();
   }
   immediateTransaction(db, () => {
-    if (changed) writeMeta(db, "feed_digest", digest);
+    if (commit.project) writeMeta(db, "feed_digest", digest);
     writeMeta(db, "last_sync_at_ms", String(now));
   });
-  return { status: prepared.status, count: entries.length, changed: project, rejected: prepared.rejected };
+  return { status: prepared.status, count: entries.length, changed: commit.project, rejected: prepared.rejected };
 }
 
 async function syncOnce(options: FleetCommonsSyncOptions, path: string): Promise<FleetCommonsSyncResult> {
   const cache = new FleetCommonsStore(path);
   try {
+    const generation = readMeta(cache.db, "sync_generation");
     const prepared = await prepareSync(options, cache.db);
-    const apply = (store: FleetCommonsProjectionStore) => commitSync(options, cache.db, prepared, store);
+    const apply = (store: FleetCommonsProjectionStore) => withProjectionLock(path, options.signal,
+      () => commitSync(options, cache.db, prepared, store, generation));
     return await ("commit" in options ? options.commit(apply) : apply(options.store));
   } finally { cache.close(); }
 }

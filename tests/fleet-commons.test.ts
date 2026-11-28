@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtempDisposable, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { promisify } from "node:util";
 import { createStore, type QMDStore } from "@unblocklabs/qmd";
+import manifest from "../openclaw.plugin.json" with { type: "json" };
 import {
   FleetCommonsReader, fleetCitationsActive, fleetCommonsDocument, fleetCommonsHit, fleetCommonsPath, fleetCommonsUri,
   getFleetCommonsEntry, readFleetCommonsEntries,
@@ -29,6 +32,11 @@ const outage: FleetCommonsEntry = {
 const endpoint = "https://fleet.example.test/commons";
 const fixture = () => mkdtempDisposable(join(tmpdir(), "fleet-commons-test-"));
 const projectionResult = { upserted: 0, unchanged: 0, retracted: 0, embedded: 0, generation: 0 };
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
 
 test("accepts clean operational entries in all supported categories", () => {
   for (const candidate of [entry, workaround, outage, { ...entry, category: "procedure", expiresAt: null }]) {
@@ -40,7 +48,7 @@ test("rejects client identifiers, contact information, credentials, and paths ac
   const options = { forbiddenTerms: ["example tenant"] };
   for (const [candidate, reason] of [
     [{ body: "xoxb-fake-sample" }, /credential/],
-    [{ title: "sk-fakeSample" }, /credential/],
+    [{ title: "sk-fakeProviderKey0123456789" }, /credential/],
     [{ source: "ghp_fakeSample" }, /credential/],
     [{ body: "AKIAIOSFODNN7EXAMPLE" }, /credential/],
     [{ body: "Authorization: Bearer abc123def456ghi789" }, /credential/],
@@ -72,7 +80,8 @@ test("rejects malformed entry schema and path traversal slugs", () => {
   for (const [candidate, reason] of [
     [{ id: "../escape" }, /id/], [{ id: ".." }, /id/], [{ id: "escape\n" }, /id/],
     [{ revision: 0 }, /revision/], [{ revision: 1.5 }, /revision/], [{ category: "client_note" }, /category/],
-    [{ severity: "urgent" }, /severity/], [{ title: " " }, /title/], [{ body: "" }, /body/],
+    [{ severity: "urgent" }, /severity/], [{ title: " " }, /title/], [{ title: "Retry\nnow" }, /title/],
+    [{ title: "Retry\rnow" }, /title/], [{ body: "" }, /body/],
     [{ tags: [3] }, /tags/], [{ updatedAt: Infinity }, /updatedAt/], [{ expiresAt: "tomorrow" }, /expiresAt/],
     [{ source: {} }, /source/], [{ privateMetadata: "ignored?" }, /unknown/],
   ] as const) {
@@ -87,8 +96,9 @@ test("config defaults off and validates source, policy, and scheduling fields", 
     enabled: false, syncIntervalMinutes: 15, timeoutMs: 10_000, maxEntries: 0, maxFeedBytes: 5 * 1024 * 1024, allowExpired: false,
   });
   assert.deepEqual(resolveFleetCommonsConfig({ enabled: true, endpoint, allowExpired: true, maxEntries: 100_000,
-    syncIntervalMinutes: 2, timeoutMs: 120_000, maxFeedBytes: 0 }), {
+    syncIntervalMinutes: 2, timeoutMs: 120_000, maxFeedBytes: 0, maxTitleChars: 1024, maxBodyChars: 0 }), {
     enabled: true, endpoint, allowExpired: true, maxEntries: 100_000, syncIntervalMinutes: 2, timeoutMs: 120_000, maxFeedBytes: 0,
+    maxTitleChars: 1024, maxBodyChars: 0,
   });
   // `@` may appear in the path; only the authority is credential-free.
   assert.equal(resolveFleetCommonsConfig({ endpoint: "https://fleet.example.test/@team/commons" }).endpoint,
@@ -103,6 +113,28 @@ test("config defaults off and validates source, policy, and scheduling fields", 
     [{ syncIntervalMinutes: Infinity }, /syncIntervalMinutes/], [{ allowExpired: "true" }, /allowExpired/],
     [{ unexpected: true }, /Unknown/],
   ] as const) assert.throws(() => resolveFleetCommonsConfig(candidate), reason);
+});
+
+test("the host schema and runtime require credential-free HTTPS or literal loopback HTTP", async () => {
+  const { validateJsonSchemaValue } = await import(import.meta.resolve("openclaw/plugin-sdk/json-schema-runtime")) as {
+    validateJsonSchemaValue: (options: { schema: Record<string, unknown>; cacheKey: string; value: unknown }) => { ok: boolean };
+  };
+  const validate = (value: unknown) => validateJsonSchemaValue({
+    schema: manifest.configSchema, cacheKey: "fleet-commons-test", value,
+  }).ok;
+  for (const endpoint of ["https://fleet.test/@team/feed", "HTTP://LOCALHOST:12/feed", "http://127.0.0.1:8787/", "http://[::1]/feed"]) {
+    assert.equal(validate({ fleetCommons: { endpoint } }), true, endpoint);
+    assert.equal(resolveFleetCommonsConfig({ endpoint }).endpoint, endpoint);
+  }
+  for (const endpoint of ["http://fleet.test/", "http://localhost.fleet.test/", "http://127.0.0.2/", "http://127.1/",
+    "http://localhost@fleet.test/", "https://@fleet.test/"]) {
+    assert.equal(validate({ fleetCommons: { endpoint } }), false, endpoint);
+    assert.throws(() => resolveFleetCommonsConfig({ endpoint }), /loopback HTTP/u, endpoint);
+  }
+  assert.equal(validate({ fleetCommons: { maxEntries: Number.MAX_SAFE_INTEGER } }), true);
+  assert.equal(validate({ fleetCommons: { maxEntries: Number.MAX_SAFE_INTEGER + 1 } }), false);
+  assert.throws(() => resolveFleetCommonsConfig({ maxEntries: Number.MAX_SAFE_INTEGER + 1 }), /maxEntries/u);
+  assert.equal(validate({ memoryWhisperer: { corpora: ["fleet", "fleet"] } }), false);
 });
 
 test("lookups do not initialize a missing or unrelated memory database", async () => {
@@ -259,9 +291,18 @@ test("hygiene passes operational prose that only looks like identifiers, and sti
     "Upstream returned UNAVAILABLE.", "Sockets fail with CONNECTION_RESET when idle.", "WORKSPACE scoped retries.",
     "Pinned to commit b0a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9.", "Digest DEADBEEF00112233 matched.", "Build c0ffee1234 is bad.",
     "Recorded at 1800000000000 ms.", "On 2026-11-27 the queue stalled.", "Install @types/node first.",
+    "Import @example/sk-utilities/dist and retry.", "Use sk-utilities or sk-learn-style-helpers.", "BASE64ENCODE and GPT4TURBO are supported.",
+    "Read https://docs.example.test/home/start/tmp/next/root/page/workspace/index first.",
+    "Read api_key=<placeholder> and secret=$SECRET from your environment.",
   ]) assert.deepEqual(validateFleetCommonsEntry({ ...entry, body }), { ok: true, entry: { ...entry, body } }, body);
   for (const [body, reason] of [
-    ["xoxb-1234-abcd", /credential/], ["sk-proj-abc123", /credential/], ["Call +1-555-123-4567", /phone number/],
+    ["xoxb-1234-abcd", /credential/], ["sk-proj-fakeProviderKey0123456789", /credential/], ["Call +1-555-123-4567", /phone number/],
+    // Anthropic API / setup / admin keys and OpenAI admin / sk-None / hyphenated legacy keys (all fake).
+    ["Use sk-ant-api03-Fake_Key-0123456789abcdefGHIJ", /credential/], ["Setup token sk-ant-oat01-FakeSetup_Token-abcdefghijklmn", /credential/],
+    ["sk-ant-admin01-FakeAdmin-Key_abcdefghijklmnop", /credential/], ["sk-admin-FakeAdminKey_abcdefghijklmnop", /credential/],
+    ["sk-None-FakeNoneProjectKey_abcdefghijk", /credential/], ["sk-fake_key-with-1-digit-abcdefgh", /credential/],
+    ["https://hooks.slack.com/services/TTEST/BTEST/fake", /credential/],
+    ["password=hunter", /credential/], ["secret=🔑opaque", /credential/], ["api_key=simple", /credential/],
     ["Mail ops@example.test", /email address/], ["See /Users/someone/notes", /local filesystem path/],
     ["Ping C0AK9PLCPQF", /Slack ID/], ["Ping U0AAV2LB402", /Slack ID/],
   ] as const) {
@@ -269,6 +310,15 @@ test("hygiene passes operational prose that only looks like identifiers, and sti
     assert.equal(result.ok, false, body);
     if (!result.ok) assert.match(result.reasons.join(" "), reason);
   }
+});
+
+test("entry limits reject oversized fields, can be disabled, and long text still detects a trailing email", { timeout: 3000 }, () => {
+  assert.match(JSON.stringify(validateFleetCommonsEntry(entry, { maxTitleChars: 4 })), /maxTitleChars/u);
+  assert.match(JSON.stringify(validateFleetCommonsEntry(entry, { maxBodyChars: 4 })), /maxBodyChars/u);
+  const title = "A".repeat(1025), body = "a".repeat(280_000);
+  assert.equal(validateFleetCommonsEntry({ ...entry, body }).ok, false);
+  assert.equal(validateFleetCommonsEntry({ ...entry, title, body }, { maxTitleChars: 0, maxBodyChars: 0 }).ok, true);
+  assert.match(JSON.stringify(validateFleetCommonsEntry({ ...entry, body: body + " ops@example.test" }, { maxBodyChars: 0 })), /email address/u);
 });
 
 test("maxFeedBytes rejects an oversized HTTP or file feed while streaming and keeps the last good cache; 0 is unlimited", async t => {
@@ -321,21 +371,35 @@ test("maxEntries keeps the most severe, then newest entries regardless of feed o
 test("a missing or emptied unblock-fleet projection is re-projected on 304 and on an unchanged feed", async t => {
   await using dir = await fixture();
   const storePath = join(dir.path, "cache.sqlite"), feedPath = join(dir.path, "feed.json");
-  const qmd = await createStore({ dbPath: join(dir.path, "index.sqlite"), config: { collections: { "unblock-fleet": { projected: true } } } });
+  let qmd = await createStore({ dbPath: join(dir.path, "index.sqlite"), config: { collections: { "unblock-fleet": { projected: true } } } });
   try {
-    const sync = t.mock.fn<QMDStore["syncProjectedCollection"]>((name, docs, options) =>
-      qmd.syncProjectedCollection(name, docs, { ...options, embed: false }));
-    const store = { syncProjectedCollection: sync, listCollections: () => qmd.listCollections() };
+    let failEmbedding = false;
+    const sync = t.mock.fn<QMDStore["syncProjectedCollection"]>(async (name, docs, options) => {
+      assert.equal(options?.embed, true);
+      const projected = await qmd.syncProjectedCollection(name, docs, { ...options, embed: false });
+      if (failEmbedding) throw new Error("embedding failed after documents committed");
+      return projected;
+    });
+    const store = { syncProjectedCollection: sync, listCollections: () => qmd.listCollections(),
+      addCollection: (name: string, opts: Parameters<QMDStore["addCollection"]>[1]) => qmd.addCollection(name, opts) };
     await writeFile(feedPath, JSON.stringify([entry, workaround]));
     const options = { storePath, store, config: resolveFleetCommonsConfig({ enabled: true, feedPath }) };
     await syncFleetCommons(options);
     assert.partialDeepStrictEqual(await syncFleetCommons(options), { changed: false });
     assert.equal(sync.mock.callCount(), 1);
-    // The index lost the projection (e.g. rebuilt index.sqlite); the cache and feed digest are unchanged.
-    await qmd.syncProjectedCollection("unblock-fleet", [], { cleanup: true, embed: false });
+    // A rebuilt index has no collection registration and the cache still acknowledges the original projection.
+    const original = qmd;
+    qmd = await createStore({ dbPath: join(dir.path, "rebuilt.sqlite"), config: { collections: {} } });
+    await original.close();
+    assert.equal((await qmd.listCollections()).some(item => item.name === "unblock-fleet"), false);
     assert.equal(await qmd.getDocumentBody("qmd://unblock-fleet/task-run/1"), null);
-    assert.deepEqual(await syncFleetCommons(options), { status: "synced", changed: true, count: 2, rejected: [] });
+    failEmbedding = true;
+    await assert.rejects(syncFleetCommons(options), /embedding failed/u);
     assert.equal(await qmd.getDocumentBody("qmd://unblock-fleet/task-run/1"), entry.body);
+    assert.equal(summarizeFleetCommons(storePath).feedDigest, undefined);
+    failEmbedding = false;
+    assert.deepEqual(await syncFleetCommons(options), { status: "synced", changed: true, count: 2, rejected: [] });
+    assert.ok(summarizeFleetCommons(storePath).feedDigest);
   } finally { await qmd.close(); }
 
   // Same on a 304: the cached rows are re-projected without a new feed body.
@@ -355,6 +419,40 @@ test("a missing or emptied unblock-fleet projection is re-projected on 304 and o
   active = 0;
   assert.deepEqual(await syncFleetCommons(http), { status: "not_modified", changed: true, count: 1, rejected: [] });
   assert.equal(projected.mock.callCount(), 2);
+});
+
+test("a stale in-flight fetch cannot overwrite a newer sync committed by another process", { timeout: 10_000 }, async () => {
+  await using dir = await fixture();
+  const storePath = join(dir.path, "cache.sqlite"), indexPath = join(dir.path, "index.sqlite"), feedPath = join(dir.path, "feed.json");
+  const qmd = await createStore({ dbPath: indexPath, config: { collections: { "unblock-fleet": { projected: true } } } });
+  try {
+    const newer = { ...entry, revision: 2, body: "Leave the worker running." };
+    await writeFile(feedPath, JSON.stringify([newer]));
+    const requested = deferred<void>(), fetched = deferred<Response>();
+    const syncing = syncFleetCommons({ storePath, config: resolveFleetCommonsConfig({ enabled: true, endpoint }),
+      fetchImpl: () => { requested.resolve(); return fetched.promise; },
+      store: { syncProjectedCollection: (name, docs, options) => qmd.syncProjectedCollection(name, docs, { ...options, embed: false }) },
+    });
+    try {
+      await requested.promise;
+      await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+        import { createStore } from "@unblocklabs/qmd";
+        import { resolveFleetCommonsConfig, syncFleetCommons } from "./src/fleet-commons.ts";
+        const [storePath, indexPath, feedPath] = process.argv.slice(1);
+        const qmd = await createStore({ dbPath: indexPath, config: { collections: { "unblock-fleet": { projected: true } } } });
+        try {
+          await syncFleetCommons({ storePath, config: resolveFleetCommonsConfig({ enabled: true, feedPath }),
+            store: { syncProjectedCollection: (name, docs, options) => qmd.syncProjectedCollection(name, docs, { ...options, embed: false }) } });
+        } finally { await qmd.close(); }
+      `, storePath, indexPath, feedPath], { cwd: join(import.meta.dirname, ".."), timeout: 8000 });
+    } finally {
+      fetched.resolve(Response.json([entry]));
+      await syncing;
+    }
+    assert.deepEqual(readFleetCommonsEntries(storePath), [newer]);
+    assert.equal(await qmd.getDocumentBody("qmd://unblock-fleet/task-run/1"), null);
+    assert.equal(await qmd.getDocumentBody("qmd://unblock-fleet/task-run/2"), newer.body);
+  } finally { await qmd.close(); }
 });
 
 test("commit runs only after the feed is fetched and validated", async () => {

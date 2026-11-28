@@ -120,7 +120,7 @@ function etagMatches(header: string | undefined, tag: string): boolean {
   }) ?? false;
 }
 
-type HubOptions = {
+type HubOptions = FleetCommonsHygieneOptions & {
   dbPath: string;
   /** All-roles fallback: used only for a role (read, ingest, operator) given no role-specific credential. */
   token?: string;
@@ -140,11 +140,9 @@ type HubOptions = {
   publicMetrics?: boolean;
   /** 0 disables the request body limit. */
   maxBodyBytes?: number;
-  /** Extra Commons hygiene terms (client names, codenames) rejected on POST, as in `validateFleetCommonsEntry`. */
-  forbiddenTerms?: readonly string[];
   /** Snapshots collected further than this in the future are rejected (default 5 minutes; 0 = no check). */
   maxClockSkewMs?: number;
-  /** Telemetry older than this leaves /metrics and the leaderboards (default 48 hours; 0 = never). */
+  /** Snapshots older than this leave metrics, leaderboards and briefs (default 48 hours; 0 = never). */
   snapshotTtlMs?: number;
   /** Longest accepted node/agent alias (default 64; 0 = unlimited). */
   maxAliasLength?: number;
@@ -162,6 +160,7 @@ function secret(value: string | undefined, file: string | undefined, name: strin
   if (value === undefined && file === undefined) return undefined;
   const resolved = (value ?? readFileSync(file!, "utf8")).trim();
   if (!resolved) throw new Error(`Empty fleet hub ${name}`);
+  if (/[^\x21-\x7e]/u.test(resolved)) throw new Error(`Invalid fleet hub ${name}: expected a single bearer token`);
   return resolved;
 }
 
@@ -184,7 +183,11 @@ export function createFleetOrganismHub(options: HubOptions) {
   const snapshotTtlMs = nonNegativeInteger(options.snapshotTtlMs, 48 * 3_600_000, "snapshotTtlMs");
   const maxAliasLength = nonNegativeInteger(options.maxAliasLength, 64, "maxAliasLength");
   const now = options.now ?? Date.now;
-  const hygiene: FleetCommonsHygieneOptions = options.forbiddenTerms ? { forbiddenTerms: options.forbiddenTerms } : {};
+  const hygiene: FleetCommonsHygieneOptions = {
+    forbiddenTerms: options.forbiddenTerms,
+    maxTitleChars: options.maxTitleChars === undefined ? undefined : nonNegativeInteger(options.maxTitleChars, 0, "maxTitleChars"),
+    maxBodyChars: options.maxBodyChars === undefined ? undefined : nonNegativeInteger(options.maxBodyChars, 0, "maxBodyChars"),
+  };
   const digest = (data: string) => createHash("sha256").update(data).digest();
   const credential = (token: string | undefined, nodeId?: string): Credential[] =>
     token ? [{ digest: digest(token), ...(nodeId === undefined ? {} : { nodeId }) }] : [];
@@ -197,9 +200,12 @@ export function createFleetOrganismHub(options: HubOptions) {
   const ingestShared = secret(options.ingestToken, options.ingestTokenFile, "ingest token");
   const roles = {
     read: credential(secret(options.readToken, options.readTokenFile, "read token") ?? fallback),
-    ingest: [...credential(ingestShared ?? (options.ingestTokens ? undefined : fallback)), ...perNode],
+    ingest: [...credential(ingestShared ?? (perNode.length ? undefined : fallback)), ...perNode],
     operator: credential(secret(options.operatorToken, options.operatorTokenFile, "operator token") ?? fallback),
   };
+  if (options.ingestTokens !== undefined && !roles.ingest.length) throw new Error("Empty fleet hub ingestTokens without an ingest token");
+  if (options.publicMetrics === false && !roles.read.length) throw new Error("Private fleet hub metrics require a read token");
+  const loopbackOnly = Object.values(roles).some(role => !role.length);
   /** A role with no credential is open (loopback development); otherwise the bearer's matching credentials. */
   const open: Credential[] = [{ digest: Buffer.alloc(0) }];
   const authorize = (role: keyof typeof roles, header?: string): Credential[] | undefined => {
@@ -249,7 +255,8 @@ export function createFleetOrganismHub(options: HubOptions) {
     }
     const telemetryStore = snapshotTable("hub_telemetry", telemetry);
     const briefStore = snapshotTable("hub_briefs", brief);
-    const liveTelemetry = () => telemetryStore.list(snapshotTtlMs ? now() - snapshotTtlMs : undefined);
+    const snapshotCutoff = () => snapshotTtlMs ? now() - snapshotTtlMs : undefined;
+    const liveTelemetry = () => telemetryStore.list(snapshotCutoff());
     const readCommons = db.prepare("SELECT revision,status,entry FROM hub_commons_entries WHERE id=?");
     const writeCommons = db.prepare(`INSERT INTO hub_commons_entries VALUES (?, ?, ?, ?) ON CONFLICT(id)
       DO UPDATE SET revision=excluded.revision,status=excluded.status,entry=excluded.entry`);
@@ -304,6 +311,10 @@ export function createFleetOrganismHub(options: HubOptions) {
     };
 
     async function route(request: IncomingMessage, response: ServerResponse) {
+      const hosts = request.headersDistinct.host;
+      if (loopbackOnly && (hosts?.length !== 1 || !/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/iu.test(hosts[0] ?? ""))) {
+        return json(response, 403, { error: "Loopback Host required when any role has no token" });
+      }
       const url = new URL(request.url ?? "/", "http://localhost");
       const { pathname } = url;
       if (request.method === "GET" && pathname === "/healthz") {
@@ -338,12 +349,17 @@ export function createFleetOrganismHub(options: HubOptions) {
         case "/api/v1/brief": {
           const format = url.searchParams.get("format") ?? "json";
           if (format !== "json" && format !== "markdown") return json(response, 400, { error: "Invalid brief format" });
-          const briefs = briefStore.list(), telemetry = liveTelemetry();
+          const cutoff = snapshotCutoff();
+          const briefs = briefStore.list(cutoff), telemetry = telemetryStore.list(cutoff);
           if (format === "markdown") return send(response, 200, renderFleetMorningBrief(briefs, telemetry), "text/markdown; charset=utf-8");
           return json(response, 200, { operatorOnly: true, briefs, leaderboard: aggregateAbLeaderboard(telemetry) });
         }
         default: {
-          const body = `{"entries":[${activeCommons.all().map(row => String(row.entry)).join(",")}]}`;
+          const entries = activeCommons.all().flatMap(row => {
+            const checked = validateFleetCommonsEntry(JSON.parse(String(row.entry)), hygiene);
+            return checked.ok ? [checked.entry] : [];
+          });
+          const body = JSON.stringify({ entries });
           const tag = `"${digest(body).toString("hex")}"`;
           response.setHeader("ETag", tag);
           response.setHeader("Cache-Control", "private, no-cache");
@@ -356,11 +372,12 @@ export function createFleetOrganismHub(options: HubOptions) {
       }
     }
 
-    const server = createServer((request, response) => {
+    const server = createServer({ requireHostHeader: !loopbackOnly }, (request, response) => {
       void route(request, response).catch(error => {
         if (response.destroyed) return;
         if (response.headersSent) { response.destroy(); return; }
         if (error instanceof InvalidBody) {
+          if (error.status === 413) response.setHeader("Connection", "close");
           json(response, error.status, { error: error.status === 413 ? "Request body too large" : "Invalid JSON" });
         } else {
           json(response, 500, { error: "Internal server error" });

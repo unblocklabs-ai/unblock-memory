@@ -16,6 +16,11 @@ export type MemoryCandidateManager = {
    */
   searchCandidateTopics?(topics: readonly QueryPair[], options: CorpusSearchOptions):
     Promise<PromiseSettledResult<CorpusMemorySearchResult[]>[]>;
+  /**
+   * Optional: `hits` minus any Fleet Commons hit no longer servable from the live cache under the running `allowExpired`
+   * policy (retired, superseded or expired since retrieval). Non-Fleet hits always pass through unchanged.
+   */
+  activeFleetHits?<T extends Pick<CorpusMemorySearchResult, "path">>(hits: readonly T[]): T[];
 };
 
 export function memoryPassageId(text: string): string {
@@ -339,9 +344,18 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   } finally { endCandidatePrep(); }
   observation.eligible = candidates.length;
   options.onCandidates?.(observation);
+  /**
+   * Final delivery boundary: judging is async, so a Fleet Commons hit retired, superseded or expired since retrieval is
+   * dropped right before results are returned (to `memory_search`, `deep_thought` and the whisperer alike).
+   */
+  const stillActive = <T>(entries: T[], hitOf: (entry: T) => CorpusMemorySearchResult): T[] => {
+    if (!manager.activeFleetHits || !entries.length) return entries;
+    const active = new Set(manager.activeFleetHits(entries.map(hitOf)));
+    return entries.filter(entry => active.has(hitOf(entry)));
+  };
   const fallback = (reason: NonNullable<MemoryRanking["fallbackReason"]>) => {
     // Retrieval scores are not decision model usefulness probabilities.
-    const ranked = rankHits([...candidates], entry => entry.hit, options.brightness).map(entry => entry.hit);
+    const ranked = rankHits(stillActive([...candidates], entry => entry.hit), entry => entry.hit, options.brightness).map(entry => entry.hit);
     const limit = options.maxResults ?? 5;
     const results = ranked.slice(0, limit);
     if (trackTrace) {
@@ -421,7 +435,8 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   observation.judgeMs = timings.judgeMs ?? 0;
   if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
     return fallback("all_judgments_failed");
-  const ranked = rankHits(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result, options.brightness);
+  const ranked = rankHits(stillActive(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result),
+    entry => entry.result, options.brightness);
   const maxResults = options.maxResults ?? 5;
   const passed = topicCount
     ? reserveTopicFinalists(ranked, topicCount, maxResults)

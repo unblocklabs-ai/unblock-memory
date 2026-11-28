@@ -159,7 +159,7 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
         };
         sentiment: {
             type: "choice";
-            choice: "satisfied" | "dissatisfied" | "mixed" | "neutral" | "unrelated" | "unclear";
+            choice: "mixed" | "satisfied" | "dissatisfied" | "neutral" | "unrelated" | "unclear";
             confidence: number;
             probabilities: {
                 [x: string]: number;

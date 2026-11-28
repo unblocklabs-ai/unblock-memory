@@ -103,7 +103,7 @@ export type ManagerStore = Pick<
   | "retractDocument"
   | "syncProjectedCollection"
   | "getCollectionGeneration"
->;
+> & Partial<Pick<QMDStore, "addCollection">>;
 
 export type ManagerSessionConfig = {
   agentId: string;
@@ -859,6 +859,22 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     return this.#fleetReader.current(config.allowExpired);
   }
 
+  #freshFleetHits<T extends Pick<CorpusMemorySearchResult, "path">>(hits: readonly T[]): T[] {
+    if (!hits.some(hit => hit.path.startsWith(FLEET_COMMONS_PREFIX))) return [...hits];
+    const current = new Set(this.#currentFleet().map(fleetCommonsUri));
+    return hits.filter(hit => !hit.path.startsWith(FLEET_COMMONS_PREFIX) || current.has(hit.path));
+  }
+
+  /**
+   * Delivery-time recheck of already-selected hits (a raw Fleet entry can be retired or expire while a caller judges it):
+   * Fleet hits not in the live cache under the running `allowExpired` policy are dropped. A cache that cannot be read
+   * fails closed for Fleet hits only.
+   */
+  activeFleetHits<T extends Pick<CorpusMemorySearchResult, "path">>(hits: readonly T[]): T[] {
+    try { return this.#freshFleetHits(hits); }
+    catch { return hits.filter(hit => !hit.path.startsWith(FLEET_COMMONS_PREFIX)); }
+  }
+
   #currentExtracted(paths?: readonly string[], filter?: SessionSearchFilter) {
     const extraction = this.#publishedExtraction;
     if (!extraction) return [];
@@ -1369,7 +1385,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
     const operation = "vector";
     let results: CorpusMemorySearchResult[];
     try {
-      results = await this.#search(query, opts);
+      results = this.#freshFleetHits(await this.#search(query, opts));
     } catch (error) {
       this.#retrievalTelemetry.record(operation, { elapsedMs: performance.now() - started,
         outcome: opts?.signal?.aborted ? "cancelled" : "failed" });
@@ -1412,7 +1428,7 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
   async searchCandidates(queries: QueryPair, opts: CorpusSearchOptions): Promise<CorpusMemorySearchResult[]> {
     const [result] = await this.#searchCandidateJob([queries], opts, true);
     if (result!.status === "rejected") throw result!.reason;
-    return result!.value;
+    return this.#freshFleetHits(result!.value);
   }
 
   /**
@@ -1421,7 +1437,8 @@ export class QmdMemoryManager implements MemorySearchManagerContract {
    */
   async searchCandidateTopics(topics: readonly QueryPair[], opts: CorpusSearchOptions):
     Promise<PromiseSettledResult<CorpusMemorySearchResult[]>[]> {
-    return this.#searchCandidateJob(topics, opts, false);
+    return (await this.#searchCandidateJob(topics, opts, false)).map(result =>
+      result.status === "fulfilled" ? { status: "fulfilled", value: this.#freshFleetHits(result.value) } : result);
   }
 
   async #searchCandidateJob(topics: readonly QueryPair[], opts: CorpusSearchOptions, rethrow: boolean):

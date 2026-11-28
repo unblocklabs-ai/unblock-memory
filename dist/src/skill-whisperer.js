@@ -8,25 +8,48 @@ import { isDecisionTimeout, resolveDecisionCredential, DecisionRequestError } fr
 import { buildSkillWhispererQuery, MAX_SKILL_QUERY_CHARS, recentSkillMessages } from "./whisperer-context.js";
 import { SkillSessionStore } from "./skill-session-store.js";
 import { abortable } from "./abortable.js";
+import { redactSecrets } from "./expectations-store.js";
 import { isRecord, nonBlank } from "./guards.js";
-import { whispererSurface } from "./whisperer-prompt.js";
+import { chatTypeFromSessionKey } from "./session-chat-type.js";
+import { trustedWhispererOrigin, whispererSurface } from "./whisperer-prompt.js";
 const settings = DEFAULTS.skillWhisperer;
 const MAX_SESSIONS = 1_000;
 const MAX_SEEN_RUNS = 64;
 const DAY_MS = 86_400_000;
 const RETENTION_MS = settings.sessionRetentionDays * DAY_MS;
 export const SKILL_WHISPERER_TIMEOUT_MS = settings.timeoutMs;
+/** Inputs up to this size are redacted whole (`redactSecrets` is linear-time); larger inputs are omitted fail-closed. */
+const MAX_WHOLE_REDACTION_CHARS = 512_000;
+/**
+ * Secret-redacted trailing `max` characters of `text`. Redaction ALWAYS happens before the bound is applied, so a slice
+ * can never cut a secret (or its `password=` key) away from the text that identifies it. Inputs exceeding
+ * `MAX_WHOLE_REDACTION_CHARS` are omitted fail-closed rather than sliced before redaction.
+ */
+function redactedTail(text, max) {
+    if (max <= 0 || text.length > MAX_WHOLE_REDACTION_CHARS)
+        return "";
+    return redactSecrets(text).slice(-max);
+}
+/** What the live skill router sees: the redacted current request plus as much redacted visible history as fits. */
 function decisionConversation(prompt, messages) {
-    const currentRequest = prompt.trim().slice(-MAX_SKILL_QUERY_CHARS);
+    const currentRequest = redactedTail(prompt.trim(), MAX_SKILL_QUERY_CHARS);
     let remaining = MAX_SKILL_QUERY_CHARS - currentRequest.length;
     const history = [];
     for (let i = messages.length - 1; i >= 0 && remaining > 0; i--) {
         const message = messages[i];
-        const content = message.text.slice(-remaining);
+        const content = redactedTail(message.text, remaining);
         history.unshift({ role: message.role, content });
         remaining -= content.length;
     }
     return { currentRequest, history };
+}
+/**
+ * The request the router judges, as recorded for offline replay: exactly the redacted, bounded `currentRequest` the scorer
+ * receives (see {@link decisionConversation}). Blank = not recorded.
+ */
+function routedRequestText(prompt) {
+    const text = redactedTail(prompt.trim(), MAX_SKILL_QUERY_CHARS).trim();
+    return text || undefined;
 }
 function readPath(params) {
     for (const value of [params.path, params.file_path, params.filePath]) {
@@ -262,8 +285,18 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         const diagnose = (outcome) => diagnostics?.record(agentId, "skill", outcome);
         const started = performance.now();
         const emitted = [];
+        const hostContext = context;
+        const chatType = nonBlank(hostContext.chatType)?.toLowerCase() ?? chatTypeFromSessionKey(context.sessionKey);
+        // The sender identity lets person erasure reach this row directly (no recall query need exist for the run). A turn
+        // without one could never be erased by person, so its request text is recorded only in a KNOWN shared scope
+        // (channel/group); a direct or unknown-scope turn (e.g. a custom `session.mainKey` like `agent:main:inbox`) is not.
+        const { provider, accountId, senderId } = trustedWhispererOrigin(hostContext);
+        const requestText = recallLedger && typeof event.prompt === "string" && ((provider && senderId) || chatType === "channel" || chatType === "group")
+            ? routedRequestText(event.prompt) : undefined;
         const route = recallLedger && {
             agentId, sessionId: context.sessionId, sessionKey: context.sessionKey, runId,
+            ...(provider ? { provider } : {}), ...(accountId ? { accountId } : {}), ...(senderId ? { senderId } : {}),
+            ...(requestText ? { requestText } : {}), ...(chatType ? { chatType } : {}),
             // A missing run id must never collapse distinct routing events onto one key.
             eventKey: JSON.stringify([agentId, scope, nonBlank(runId) ?? randomUUID()]), createdAtMs: Date.now(),
             recipeHash, surface: surface ?? whispererSurface(context), mode: "fallback",

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import fs, { existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
@@ -373,6 +375,13 @@ test("open-proposal dedup includes skill_path and base_sha256, so a stale-base t
   const rejected = upsertSkillProposal(db, descriptionInput(skillPath, "Rejected idea"));
   reviewSkillProposal(db, { id: rejected.proposal.id, agentId: AGENT, decision: "rejected" });
   assert.equal(upsertSkillProposal(db, descriptionInput(skillPath, "Rejected idea", { baseSha256: sha256("edited") })).action, "previously_reviewed");
+  // ...but only for that file: the same rejected/applied content for a different SKILL.md is a fresh proposal.
+  assert.equal(upsertSkillProposal(db, descriptionInput(other, "Rejected idea")).action, "inserted", "a rejection is scoped to its file");
+  const appliedHere = upsertSkillProposal(db, descriptionInput(skillPath, "Applied idea"));
+  reviewSkillProposal(db, { id: appliedHere.proposal.id, agentId: AGENT, decision: "approved" });
+  markSkillProposalApplied(db, { id: appliedHere.proposal.id, agentId: AGENT, appliedPath: skillPath });
+  assert.equal(upsertSkillProposal(db, descriptionInput(skillPath, "Applied idea")).action, "previously_reviewed");
+  assert.equal(upsertSkillProposal(db, descriptionInput(other, "Applied idea")).action, "inserted", "an apply is scoped to its file");
 });
 
 test("skill-apply targets must match a configured source pattern and stay inside its real root", t => {
@@ -397,4 +406,315 @@ test("skill-apply targets must match a configured source pattern and stay inside
   reviewSkillProposal(db, { id: escaped.proposal.id, agentId: AGENT, decision: "approved" });
   assert.throws(() => applyApprovedProposal(db, { id: escaped.proposal.id, agentId: AGENT, allowedSources: shallow }), code("path_outside_root"));
   assert.equal(readFileSync(join(outside, "SKILL.md"), "utf8"), SKILL);
+});
+
+/* ───────────────────────────── Round 1 review fixes (apply fence, YAML, CommonMark) ───────────────────────────── */
+
+const LOCK = ".SKILL.md.apply.lock";
+const approvedDescription = (db: DatabaseSync, skillPath: string, description = "Ship releases to production") => {
+  const { proposal } = upsertSkillProposal(db, descriptionInput(skillPath, description));
+  reviewSkillProposal(db, { id: proposal.id, agentId: AGENT, decision: "approved" });
+  return proposal;
+};
+/** Swap one `node:fs` function for the duration of a test (named ESM imports in the store see it via syncBuiltinESMExports). */
+type AnyFn = (...args: any[]) => any;
+function mockFs(t: TestContext, name: "writeSync" | "fsyncSync", impl: (original: AnyFn, ...args: any[]) => unknown) {
+  const original = (fs[name] as AnyFn).bind(fs);
+  const mock = t.mock.method(fs, name, ((...args: unknown[]) => impl(original, ...args)) as never);
+  syncBuiltinESMExports();
+  t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+}
+
+test("apply writes every byte through short writes, and fsyncs the directory before the applied receipt", t => {
+  const { db, skillsDir, skillPath } = fixture(t);
+  const proposal = approvedDescription(db, skillPath);
+  const events: string[] = [];
+  db.function("note_applied", () => { events.push("applied"); return null; });
+  db.exec(`CREATE TRIGGER note_applied AFTER UPDATE OF status ON skill_proposals WHEN new.status='applied' BEGIN SELECT note_applied(); END`);
+  mockFs(t, "writeSync", (original, fd, buffer, offset, length) => original(fd, buffer, offset, Math.min(Number(length), 3)));
+  mockFs(t, "fsyncSync", (original, fd) => { events.push(fstatSync(fd).isDirectory() ? "dir" : "file"); return original(fd); });
+  const applied = applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir) });
+  const expected = replaceSkillDescription(SKILL, "Ship releases to production");
+  assert.equal(readFileSync(skillPath, "utf8"), expected, "3-byte writes still land the whole file");
+  assert.equal(applied.bytesWritten, Buffer.byteLength(expected));
+  assert.ok(events.indexOf("dir") >= 0 && events.indexOf("dir") < events.indexOf("applied"), `directory fsync precedes the receipt: ${events}`);
+  assert.deepEqual(readdirSync(join(skillsDir, "deploy")).sort(), ["SKILL.md"], "no temp or lock file is left behind");
+});
+
+test("a failed or zero-byte write unlinks the temp file and leaves the live file and the approval untouched", t => {
+  for (const failure of ["throw", "zero"] as const) {
+    const { db, skillsDir, skillPath } = fixture(t);
+    const proposal = approvedDescription(db, skillPath);
+    let calls = 0;
+    const original = fs.writeSync.bind(fs) as (...a: unknown[]) => number;
+    const restore = t.mock.method(fs, "writeSync", ((...args: unknown[]) => {
+      // The first write is the lock file; fail the temp file's write.
+      if (++calls === 1) return original(...args);
+      if (failure === "throw") throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      return 0;
+    }) as typeof fs.writeSync);
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir) }),
+        failure === "throw" ? /disk full/u : /Short write/u);
+    } finally { restore.mock.restore(); syncBuiltinESMExports(); }
+    assert.equal(readFileSync(skillPath, "utf8"), SKILL);
+    assert.deepEqual(readdirSync(join(skillsDir, "deploy")), ["SKILL.md"], `${failure}: temp and lock files are removed`);
+    assert.equal(getSkillProposal(db, proposal.id, AGENT)?.status, "approved");
+  }
+});
+
+test("apply waits on another live holder's lock and fails `locked` without touching the file", t => {
+  const { db, skillsDir, skillPath } = fixture(t);
+  const proposal = approvedDescription(db, skillPath);
+  const lock = join(skillsDir, "deploy", LOCK);
+  const held = JSON.stringify({ token: "other", pid: process.pid, host: hostname(), acquiredAtMs: Date.now() });
+  writeFileSync(lock, held);
+  const started = Date.now();
+  assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 60 }), code("locked"));
+  assert.ok(Date.now() - started >= 50, "it waited before giving up");
+  assert.equal(readFileSync(skillPath, "utf8"), SKILL);
+  assert.equal(readFileSync(lock, "utf8"), held, "a live holder's lock is never broken");
+  assert.equal(getSkillProposal(db, proposal.id, AGENT)?.status, "approved");
+  // A live same-host owner is never evicted by age, whatever lockStaleMs says.
+  const old = new Date(Date.now() - 3_600_000);
+  utimesSync(lock, old, old);
+  for (const lockStaleMs of [0, 1, undefined]) {
+    assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 20,
+      ...(lockStaleMs === undefined ? {} : { lockStaleMs }) }), code("locked"), `lockStaleMs=${lockStaleMs}`);
+    assert.equal(readFileSync(lock, "utf8"), held, "an hour-old live lock is still intact");
+  }
+  assert.equal(readFileSync(skillPath, "utf8"), SKILL);
+});
+
+test("a lock this host cannot check (another host, or no readable owner) is broken only once older than lockStaleMs", t => {
+  for (const held of [JSON.stringify({ token: "remote", pid: 1, host: `not-${hostname()}`, acquiredAtMs: Date.now() }), "{partial"]) {
+    const { db, skillsDir, skillPath } = fixture(t);
+    const proposal = approvedDescription(db, skillPath);
+    const lock = join(skillsDir, "deploy", LOCK);
+    writeFileSync(lock, held);
+    assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 20 }),
+      code("locked"), "a fresh uncheckable lock is respected");
+    const old = new Date(Date.now() - 3_600_000);
+    utimesSync(lock, old, old);
+    assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 20,
+      lockStaleMs: 0 }), code("locked"), "lockStaleMs 0 never breaks by age");
+    assert.equal(applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir) }).proposal.status, "applied");
+    assert.deepEqual(readdirSync(join(skillsDir, "deploy")), ["SKILL.md"], "lock and break guard are both gone");
+  }
+});
+
+test("only one breaker at a time: a live `.break` guard keeps even a dead owner's lock in place, verified before unlink", t => {
+  const { db, skillsDir, skillPath } = fixture(t);
+  const proposal = approvedDescription(db, skillPath);
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
+  const lock = join(skillsDir, "deploy", LOCK), guard = `${lock}.break`;
+  const stale = JSON.stringify({ token: "crashed", pid: dead, host: hostname(), acquiredAtMs: Date.now() });
+  writeFileSync(lock, stale);
+  writeFileSync(guard, JSON.stringify({ token: "breaker", pid: process.pid, host: hostname(), acquiredAtMs: Date.now() }));
+  assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 30 }),
+    code("locked"));
+  assert.equal(readFileSync(lock, "utf8"), stale, "never unlinked or renamed aside without holding the guard");
+  // A guard left by a dead breaker is freed, then the dead owner's lock is broken.
+  writeFileSync(guard, JSON.stringify({ token: "breaker", pid: dead, host: hostname(), acquiredAtMs: Date.now() }));
+  assert.equal(applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 1_000 }).proposal.status, "applied");
+  assert.deepEqual(readdirSync(join(skillsDir, "deploy")), ["SKILL.md"]);
+});
+
+test("one BEGIN IMMEDIATE spans the approval re-check, the file write and the applied receipt", t => {
+  const { db, skillsDir, skillPath } = fixture(t);
+  const proposal = approvedDescription(db, skillPath);
+  const writes: boolean[] = [];
+  mockFs(t, "writeSync", (original, ...args) => { writes.push(db.isTransaction); return original(...args); });
+  applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir) });
+  assert.deepEqual(writes, [false, true], "the lock file is written before the transaction, the skill file inside it");
+  assert.equal(db.isTransaction, false);
+  assert.equal(getSkillProposal(db, proposal.id, AGENT)?.status, "applied");
+});
+
+test("a filesystem that cannot fsync directories (EINVAL / ENOTSUP / EPERM) never strands an applied proposal", t => {
+  for (const failure of ["EINVAL", "ENOTSUP", "EPERM"]) {
+    const { db, skillsDir, skillPath } = fixture(t);
+    const proposal = approvedDescription(db, skillPath);
+    const restore = t.mock.method(fs, "fsyncSync", ((fd: number) => {
+      if (fstatSync(fd).isDirectory()) throw Object.assign(new Error(`fsync ${failure}`), { code: failure });
+    }) as typeof fs.fsyncSync);
+    syncBuiltinESMExports();
+    try {
+      assert.equal(applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir) }).proposal.status,
+        "applied", failure);
+    } finally { restore.mock.restore(); syncBuiltinESMExports(); }
+    assert.equal(readFileSync(skillPath, "utf8"), replaceSkillDescription(SKILL, "Ship releases to production"));
+  }
+  const { db, skillsDir, skillPath } = fixture(t);
+  const proposal = approvedDescription(db, skillPath);
+  const restore = t.mock.method(fs, "fsyncSync", ((fd: number) => {
+    if (fstatSync(fd).isDirectory()) throw Object.assign(new Error("fsync EIO"), { code: "EIO" });
+  }) as typeof fs.fsyncSync);
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir) }), /EIO/u,
+      "a real I/O error still fails the apply");
+  } finally { restore.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(getSkillProposal(db, proposal.id, AGENT)?.status, "approved", "rolled back with the transaction");
+});
+
+test("a lock left by a dead process on this host is broken at once", t => {
+  const { db, skillsDir, skillPath } = fixture(t);
+  const proposal = approvedDescription(db, skillPath);
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
+  const lock = join(skillsDir, "deploy", LOCK);
+  writeFileSync(lock, JSON.stringify({ token: "crashed", pid: dead, host: hostname(), acquiredAtMs: Date.now() }));
+  const applied = applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 1, lockStaleMs: 0 });
+  assert.equal(applied.proposal.status, "applied");
+  assert.equal(existsSync(lock), false);
+  assert.deepEqual(readdirSync(join(skillsDir, "deploy")), ["SKILL.md"], "the stale lock was not left aside");
+});
+
+test("approval and base bytes are revalidated under the cross-process fence, before any write", async t => {
+  const { root, skillsDir, skillPath } = fixture(t);
+  const dbPath = join(root, "memory.sqlite");
+  const db = new DatabaseSync(dbPath);
+  t.after(() => db.close());
+  const proposal = approvedDescription(db, skillPath);
+  const lock = join(skillsDir, "deploy", LOCK);
+  // Another process takes the apply lock, supersedes this approval in SQLite while holding it, then releases.
+  const child = spawn(process.execPath, ["-e", `
+    const fs = require("node:fs"), os = require("node:os"), { DatabaseSync } = require("node:sqlite");
+    const [lock, dbPath, id] = process.argv.slice(1);
+    fs.writeFileSync(lock, JSON.stringify({ token: "child", pid: process.pid, host: os.hostname(), acquiredAtMs: Date.now() }), { flag: "wx" });
+    console.log("locked");
+    setTimeout(() => {
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE skill_proposals SET status='superseded' WHERE id=?").run(id);
+      db.close();
+      fs.unlinkSync(lock);
+    }, 300);`, lock, dbPath, proposal.id], { stdio: ["ignore", "pipe", "inherit"] });
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  await new Promise<void>(resolve => child.stdout!.on("data", (chunk: Buffer) => { if (chunk.toString().includes("locked")) resolve(); }));
+  assert.throws(() => applyApprovedProposal(db, { id: proposal.id, agentId: AGENT, allowedSources: sources(skillsDir), lockWaitMs: 10_000 }),
+    code("invalid_state"));
+  await exited;
+  assert.equal(readFileSync(skillPath, "utf8"), SKILL, "the superseded proposal never wrote the file");
+  assert.equal(getSkillProposal(db, proposal.id, AGENT)?.status, "superseded");
+});
+
+test("pending competition is scoped to one target file, and applied supersedes only siblings of the displaced bytes", t => {
+  const { db, root, skillsDir, skillPath } = fixture(t);
+  // Two different files that happen to share a skill name never supersede each other.
+  const twin = join(root, "other-root", "deploy", "SKILL.md");
+  mkdirSync(join(root, "other-root", "deploy"), { recursive: true });
+  writeFileSync(twin, SKILL);
+  const mine = upsertSkillProposal(db, descriptionInput(skillPath, "Ship releases to production"));
+  const theirs = upsertSkillProposal(db, descriptionInput(twin, "Deploy the other service"));
+  assert.deepEqual(theirs.superseded, []);
+  assert.equal(getSkillProposal(db, mine.proposal.id, AGENT)?.status, "pending");
+  // Lexically different spellings of one file are one target.
+  const respelled = upsertSkillProposal(db, descriptionInput(join(skillsDir, "deploy", ".", "..", "deploy", "SKILL.md"), "Ship releases to production"));
+  assert.equal(respelled.action, "unchanged");
+
+  reviewSkillProposal(db, { id: mine.proposal.id, agentId: AGENT, decision: "approved" });
+  const installed = replaceSkillDescription(SKILL, "Ship releases to production");
+  const stale = upsertSkillProposal(db, { agentId: AGENT, kind: "pitfall_patch", skillName: "deploy", skillPath, title: "p", rationale: "r",
+    proposedContent: appendSkillPitfalls(SKILL, ["Old base"]), baseSha256: sha256(SKILL) });
+  // A fresh draft already based on the bytes this apply installs (e.g. drafted by a pass right after a crash-recovery).
+  const fresh = upsertSkillProposal(db, { agentId: AGENT, kind: "pitfall_patch", skillName: "deploy", skillPath: twin, title: "p", rationale: "r",
+    proposedContent: appendSkillPitfalls(SKILL, ["Twin"]), baseSha256: sha256(SKILL) });
+  const rebased = upsertSkillProposal(db, { agentId: AGENT, kind: "description_update", skillName: "deploy", skillPath, title: "d",
+    rationale: "r", proposedDescription: "Next", proposedContent: replaceSkillDescription(installed, "Next"), baseSha256: sha256(installed) });
+  applyApprovedProposal(db, { id: mine.proposal.id, agentId: AGENT, allowedSources: sources(skillsDir) });
+  assert.equal(getSkillProposal(db, stale.proposal.id, AGENT)?.status, "superseded", "derived from the displaced bytes");
+  assert.equal(getSkillProposal(db, rebased.proposal.id, AGENT)?.status, "pending", "based on the newly installed bytes");
+  assert.equal(getSkillProposal(db, fresh.proposal.id, AGENT)?.status, "pending", "another file entirely");
+  assert.equal(getSkillProposal(db, theirs.proposal.id, AGENT)?.status, "pending");
+});
+
+test("a first new_skill under a configured root that does not exist yet is created; an escaping ancestor is refused before mkdir", t => {
+  const { db, root, skillsDir } = fixture(t);
+  const content = "---\nname: \"fresh\"\ndescription: \"Fresh\"\n---\n";
+  const newSkill = (name: string) => {
+    const { proposal } = upsertSkillProposal(db, { agentId: AGENT, kind: "new_skill", skillName: name, skillPath: `${name}/SKILL.md`,
+      title: "New", rationale: "r", proposedContent: content });
+    reviewSkillProposal(db, { id: proposal.id, agentId: AGENT, decision: "approved" });
+    return proposal;
+  };
+  const freshRoot = join(root, "workspace", "skills-drafts");
+  const created = applyApprovedProposal(db, { id: newSkill("fresh").id, agentId: AGENT, allowedSources: sources(freshRoot),
+    targetDirForNewSkills: freshRoot });
+  assert.equal(created.targetPath, join(freshRoot, "fresh", "SKILL.md"));
+  assert.equal(readFileSync(created.targetPath, "utf8"), content);
+  assert.deepEqual(readdirSync(join(freshRoot, "fresh")), ["SKILL.md"]);
+
+  // The nearest existing ancestor is a symlink out of the root: nothing is created outside.
+  const outside = join(root, "outside");
+  mkdirSync(outside);
+  symlinkSync(outside, join(skillsDir, "escape"));
+  assert.throws(() => applyApprovedProposal(db, { id: newSkill("evil").id, agentId: AGENT, allowedSources: sources(skillsDir),
+    targetDirForNewSkills: join(skillsDir, "escape", "nested") }), code("path_outside_root"));
+  assert.deepEqual(readdirSync(outside), [], "no directory was created through the symlink");
+});
+
+test("replaceSkillDescription round-trips through the YAML AST: quoted keys, indented and flow maps, comments, BOM + CRLF", () => {
+  const cases: Array<[string, string]> = [
+    ["---\n\"description\": Before\nname: x\n---\nBody\n", "---\n\"description\": \"After\"\nname: x\n---\nBody\n"],
+    ["---\n'description': 'Before'\n---\n", "---\n'description': \"After\"\n---\n"],
+    ["---\n  name: x\n  description: Before\n---\n", "---\n  name: x\n  description: \"After\"\n---\n"],
+    ["---\n{name: x, description: Before}\n---\n", "---\n{name: x, description: \"After\"}\n---\n"],
+    ["---\nname: x\ndescription: Before # routing text\nlicense: MIT\n---\n", "---\nname: x\ndescription: \"After\" # routing text\nlicense: MIT\n---\n"],
+    ["﻿---\r\n\"description\": |\r\n  a\r\n\r\n  b\r\nname: x\r\n---\r\nBody\r\n", "﻿---\r\n\"description\": \"After\"\r\nname: x\r\n---\r\nBody\r\n"],
+    ["---\ndescription:\nname: x\n---\n", "---\ndescription: \"After\"\nname: x\n---\n"],
+    ["---\n---\nBody\n", "---\ndescription: \"After\"\n---\nBody\n"],
+    // Legacy frontmatter that is not valid YAML (unquoted `: `) is repaired by quoting the description.
+    ["---\nname: x\ndescription: Use when: deploying\n---\n", "---\nname: x\ndescription: \"After\"\n---\n"],
+  ];
+  for (const [input, expected] of cases) {
+    const out = replaceSkillDescription(input, "After");
+    assert.equal(out, expected, JSON.stringify(input));
+    assert.equal(readSkillDescription(out), "After");
+  }
+  assert.equal(readSkillDescription("---\n\"description\": Before\n---\n"), "Before");
+  assert.equal(readSkillDescription("---\n{name: x, description: 'It''s here'}\n---\n"), "It's here");
+  assert.equal(readSkillDescription("---\nname: x\ndescription: Use when: deploying\n---\n"), "Use when: deploying", "same fallback as the catalog");
+  // A flow map without a description gains one through the AST.
+  assert.equal(readSkillDescription(replaceSkillDescription("---\n{name: x}\n---\n", "After")), "After");
+});
+
+test("replaceSkillDescription rejects results with YAML errors (DUPLICATE_KEY, broken siblings) or a wrong read-back", () => {
+  // Duplicate keys stay duplicate after a rewrite: refuse instead of letting the parser pick one.
+  assert.throws(() => replaceSkillDescription("---\ndescription: a\ndescription: b\n---\n", "After"), code("invalid_input"));
+  assert.throws(() => replaceSkillDescription("---\nname: x\nname: y\ndescription: a\n---\n", "After"), code("invalid_input"));
+  // Another key that is not valid YAML is not ours to fix.
+  assert.throws(() => replaceSkillDescription("---\nname: a: b\ndescription: c\n---\n", "After"), code("invalid_input"));
+  assert.throws(() => replaceSkillDescription("---\n- a\n- b\n---\n", "After"), code("invalid_input"), "a sequence is not frontmatter");
+});
+
+test("appendSkillPitfalls follows CommonMark headings: ≤3-space indent, closing #s, setext headings and boundaries", () => {
+  // Four spaces is an indented code block, not a heading: a real section is created.
+  assert.equal(appendSkillPitfalls("# S\n\n    ## Pitfalls\n", ["A"]), "# S\n\n    ## Pitfalls\n\n## Pitfalls\n\n- A\n");
+  assert.equal(appendSkillPitfalls("   ## Pitfalls ##\n\n- Old\n", ["A"]), "   ## Pitfalls ##\n\n- Old\n- A\n");
+  assert.equal(appendSkillPitfalls("## Pitfalls\n\n- Old\n\n## \n\nx\n", ["A"]), "## Pitfalls\n\n- Old\n- A\n\n## \n\nx\n", "an empty ## ends it");
+  // Setext headings end the section (=== h1, --- h2 under paragraph text).
+  assert.equal(appendSkillPitfalls("## Pitfalls\n\n- Old\n\nNext\n====\n\nx\n", ["A"]), "## Pitfalls\n\n- Old\n- A\n\nNext\n====\n\nx\n");
+  assert.equal(appendSkillPitfalls("## Pitfalls\n\n- Old\n\nNext\n---\n", ["A"]), "## Pitfalls\n\n- Old\n- A\n\nNext\n---\n");
+  // A thematic break (after a blank line or a list item) is not a heading.
+  assert.equal(appendSkillPitfalls("## Pitfalls\n\n- Old\n\n---\n\n- More\n", ["A"]), "## Pitfalls\n\n- Old\n\n---\n\n- More\n- A\n");
+  assert.equal(appendSkillPitfalls("## Pitfalls\n\n- Old\n---\n", ["A"]), "## Pitfalls\n\n- Old\n---\n- A\n");
+  // A setext `Pitfalls` heading is the section.
+  assert.equal(appendSkillPitfalls("Pitfalls\n--------\n\n- Old\n\n## Next\n", ["A"]), "Pitfalls\n--------\n\n- Old\n- A\n\n## Next\n");
+  // `### Pitfalls` is a subsection, never the section; `#` inside fences still ignored.
+  assert.equal(appendSkillPitfalls("### Pitfalls\n", ["A"]), "### Pitfalls\n\n## Pitfalls\n\n- A\n");
+  assert.equal(appendSkillPitfalls("## Pitfalls\n\n```\nNext\n===\n```\n\n## End\n", ["A"]), "## Pitfalls\n\n```\nNext\n===\n```\n- A\n\n## End\n");
+});
+
+test("appendSkillPitfalls scans for headings only after the frontmatter's closing ---", () => {
+  // A YAML `# comment` that looks like `## Pitfalls`, and a ``` inside a block scalar, are frontmatter, never Markdown.
+  const withComment = "---\nname: deploy\n## Pitfalls\ndescription: |\n  ```\n  x\n---\n\n# Deploy\n\nRun it.\n";
+  assert.equal(appendSkillPitfalls(withComment, ["A"]), `${withComment}\n## Pitfalls\n\n- A\n`);
+  assert.equal(readSkillDescription(appendSkillPitfalls(withComment, ["A"])), readSkillDescription(withComment), "frontmatter untouched");
+  // A YAML line `Pitfalls` right above the closing `---` is not a setext heading either.
+  const setextLike = "---\nPitfalls\n---\n\n# Deploy\n";
+  assert.equal(appendSkillPitfalls(setextLike, ["A"]), `${setextLike}\n## Pitfalls\n\n- A\n`);
+  // The real section after the frontmatter is still found (CRLF + BOM kept).
+  const real = "\uFEFF---\r\nname: x\r\n# Pitfalls\r\n---\r\n\r\n## Pitfalls\r\n\r\n- Old\r\n";
+  assert.equal(appendSkillPitfalls(real, ["A"]), "\uFEFF---\r\nname: x\r\n# Pitfalls\r\n---\r\n\r\n## Pitfalls\r\n\r\n- Old\r\n- A\r\n");
 });

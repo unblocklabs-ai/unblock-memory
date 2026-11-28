@@ -7,6 +7,13 @@ type PromptHook = Parameters<typeof apiTypes.on<"before_prompt_build">>[1];
 export type WhispererSurface = "user" | keyof WhispererTriggersConfig;
 export type WhispererPrompt = (...args: [...Parameters<PromptHook>, surface?: WhispererSurface]) => ReturnType<PromptHook>;
 
+/**
+ * One whisperer's contribution. `finalize` is an optional, synchronous re-render invoked once every admitted whisperer has
+ * settled, right before the combined prompt is emitted: it returns the contribution as it may be delivered NOW (e.g.
+ * without a Fleet Commons hit retired while slower siblings were still finishing), or `undefined` to drop it.
+ */
+export type WhispererContribution = { appendContext: string; finalize?: () => { appendContext: string } | undefined };
+
 /** Direct calls lack a dispatcher surface, so only the host's user trigger admits them. */
 export function hasWhispererTrigger(trigger: Parameters<PromptHook>[1]["trigger"], surface?: WhispererSurface): boolean {
   return Boolean(surface) || trigger === "user";
@@ -50,15 +57,24 @@ export function registerWhispererPrompt(
     const surface = whispererSurface(context);
     if (!surface) return;
     const admitted = surface === "user" ? ordered : ordered.filter(({ name }) => triggers[surface].includes(name));
-    const results = await Promise.all(admitted.map(async ({ name, handler }) => {
+    const settled = await Promise.all(admitted.map(async ({ name, handler }) => {
       try {
-        return (await handler(event, context, surface))?.appendContext;
+        return { name, result: await handler(event, context, surface) as WhispererContribution | undefined | void };
       } catch {
         // One unavailable whisperer must not discard the others' context. Safety records its own failures first.
         api.logger.warn(`unblock-memory ${name} whisperer contribution failed`);
         return undefined;
       }
     }));
+    // Final delivery boundary: every contribution is re-rendered as of NOW, after the slowest sibling settled.
+    const results = settled.map(entry => {
+      if (!entry?.result?.finalize) return entry?.result?.appendContext;
+      try { return entry.result.finalize()?.appendContext; }
+      catch {
+        api.logger.warn(`unblock-memory ${entry.name} whisperer contribution failed`);
+        return undefined;
+      }
+    });
     const content = results.filter(Boolean).join("\n");
     if (content) return { appendContext: `<unblock_memory>\n${content}\n</unblock_memory>` };
   });

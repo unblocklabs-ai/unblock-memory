@@ -148,13 +148,16 @@ export type ExpectationsSummary = {
   resolvedWithSurprise: number;
 };
 
-// Keep in step with steward-captains-log.ts's redactor (it is module-private there).
+// Keep in step with steward-captains-log.ts's redactor (it is module-private there). Linear in the input: the credential
+// key is matched from its keyword (the identifier text before it is kept verbatim, exactly as an unbounded `[\w-]*` prefix
+// did), its identifier tail is bounded and atomic (`(?=(…))\2`), and the URL scheme is bounded, so a long hyphen- or
+// dot-joined run can never trigger an O(n²) rescan from every word boundary.
 export function redactSecrets(text: string): string {
   return text.replace(/https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]+/giu, "[redacted]")
     .replace(/-----BEGIN [\w ]*PRIVATE KEY-----[\s\S]*?(?:-----END [\w ]*PRIVATE KEY-----|$)/gu, "[redacted]")
     .replace(/\b(?:Bearer|Authorization\s*:\s*Basic)\s+[^\s"',;\]}]+|\b(?:sk-|xox[baprs]-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}/giu, "[redacted]")
-    .replace(/\b([\w-]*(?:api[_ -]?key|token|credential|password|passwd|secret)[\w-]*["'`]?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|`(?:\\.|[^`\\\r\n])*`|[^\s,;]+)/giu, "$1[redacted]")
-    .replace(/(\b[a-z][\w+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/giu, "$1[redacted]@");
+    .replace(/((?:api[_ -]?key|token|credential|password|passwd|secret)(?=([\w-]{0,64}))\2["'`]?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|`(?:\\.|[^`\\\r\n])*`|[^\s,;]+)/giu, "$1[redacted]")
+    .replace(/(\b[a-z][\w+.-]{0,32}:\/\/)[^\s/@:]+:[^\s/@]+@/giu, "$1[redacted]@");
 }
 
 const oneLine = (text: string) => redactSecrets(text).replace(/\s+/gu, " ").trim();

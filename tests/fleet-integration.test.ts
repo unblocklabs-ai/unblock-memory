@@ -3,6 +3,7 @@ import { mkdtempDisposable, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createStore } from "@unblocklabs/qmd";
 import { resolveConfig } from "../src/config.js";
 import { FLEET_COMMONS_COLLECTION, resolveFleetCommonsConfig, type FleetCommonsEntry } from "../src/fleet-commons.js";
 import { QmdMemoryManager, type ManagerStore } from "../src/manager.js";
@@ -113,6 +114,36 @@ test("integration: a disabled fleetCommons exposes no fleet corpus, collection, 
   assert.equal(manager.corpusForCollection(FLEET_COMMONS_COLLECTION), undefined);
   assert.equal((await manager.readFile({ relPath: `qmd://${FLEET_COMMONS_COLLECTION}/task-run/1` })).status, "not_found");
   assert.deepEqual(fake.projected, []);
+});
+
+test("Fleet hits selected by an early topic are revalidated when the whole search returns", async t => {
+  const dir = await mkdtempDisposable(join(tmpdir(), "fleet-search-delivery-"));
+  t.after(() => dir[Symbol.asyncDispose]());
+  const dbPath = join(dir.path, "index.sqlite"), feedPath = join(dir.path, "feed.json");
+  await writeFile(feedPath, JSON.stringify([expiring]));
+  const qmd = await createStore({ dbPath, config: { collections: { [FLEET_COMMONS_COLLECTION]: { projected: true, includeByDefault: false } } } });
+  let clock = NOW;
+  t.mock.method(Date, "now", () => clock);
+  const manager = new QmdMemoryManager({
+    dbPath, curationPath: join(dir.path, "cache.sqlite"), workspaceDir: dir.path, sources: [],
+    storeFactory: async () => ({
+      ...qmd,
+      syncProjectedCollection: (collection, docs, options) => qmd.syncProjectedCollection(collection, docs, { ...options, embed: false }),
+      async discoverCandidates(options: Parameters<typeof qmd.discoverCandidates>[0]) {
+        if (options.query === "advance clock") { clock = expiring.expiresAt!; return []; }
+        return options.lane === "lex" ? qmd.discoverCandidates(options) : [];
+      },
+    }),
+    fleetCommons: resolveFleetCommonsConfig({ enabled: true, feedPath }),
+  });
+  t.after(() => manager.close());
+  await manager.syncFleetCommons();
+  const first = { lex: "queue retries", vec: "queue retries" }, later = { lex: "advance clock", vec: "advance clock" };
+  const options = { corpora: ["fleet"] };
+  assert.equal((await manager.searchCandidates(first, options))[0]?.citation, "fleet:queue-outage@r1");
+  assert.deepEqual(await manager.searchCandidateTopics([first, later], options), [
+    { status: "fulfilled", value: [] }, { status: "fulfilled", value: [] },
+  ]);
 });
 
 test("integration: the runtime adds \"fleet\" to searchable corpora exactly when fleetCommons is enabled", async () => {

@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.23.0",
+  "version": "0.23.1",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -383,8 +383,8 @@
           "endpoint": {
             "type": "string",
             "format": "uri",
-            "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^\\s@/?#]+(?:[/?#]\\S*)?$",
-            "description": "HTTP(S) feed URL (no embedded credentials; `@` is allowed in the path) returning {\"entries\": [...]}, e.g. the Fleet Organism hub's /api/v1/commons. ETag-cached."
+            "pattern": "^(?:[Hh][Tt][Tt][Pp][Ss]://[^\\s\\\\@/?#]+|[Hh][Tt][Tt][Pp]://(?:[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127\\.0\\.0\\.1|\\[::1\\])(?::[0-9]+)?)(?:[/?#][^\\s\\\\]*)?$",
+            "description": "HTTPS feed URL, or HTTP to localhost, 127.0.0.1 or [::1]. No embedded credentials. Returns {\"entries\": [...]} and supports ETags."
           },
           "feedPath": {
             "type": "string",
@@ -415,12 +415,26 @@
           "maxEntries": {
             "type": "integer",
             "minimum": 0,
+            "maximum": 9007199254740991,
             "description": "Entries kept after validation, most severe then most recently updated first. Default 0 = unlimited."
           },
           "maxFeedBytes": {
             "type": "integer",
             "minimum": 0,
+            "maximum": 9007199254740991,
             "description": "Feed bytes read (streamed) before JSON parsing; a larger feed fails the sync and keeps the last good cache. Default 5242880 (5 MiB); 0 = unlimited."
+          },
+          "maxTitleChars": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Maximum length of a single-line entry title. Default 1024; 0 = unlimited."
+          },
+          "maxBodyChars": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Maximum length of an entry body. Default 65536; 0 = unlimited."
           },
           "allowExpired": {
             "type": "boolean",
@@ -936,6 +950,7 @@
           },
           "corpora": {
             "type": "array",
+            "uniqueItems": true,
             "items": {
               "type": "string",
               "pattern": "\\S"

@@ -262,10 +262,12 @@ function scoreCandidates(db, query, nowMs, stale) {
     }
     return matches.sort((a, b) => b.score - a.score || b.observation.createdAt - a.observation.createdAt);
 }
-/** Fleet Commons expiry never moves a collection generation, so a synthesis citing a lapsed entry is checked directly. */
-function citedFleetActive(db, found, nowMs) {
-    return !Array.isArray(found.citations) ||
-        fleetCitationsActive(db, found.citations.flatMap(citation => typeof citation?.source === "string" ? [citation.source] : []), nowMs);
+/**
+ * Fleet Commons expiry never moves a collection generation, so a synthesis citing a lapsed entry is checked directly.
+ * `allowExpired` is the running plugin's policy; omitted, the last sync's persisted policy applies.
+ */
+function citedFleetActive(db, found, nowMs, allowExpired) {
+    return !Array.isArray(found.citations) || fleetCitationsActive(db, found.citations.flatMap(citation => typeof citation?.source === "string" ? [citation.source] : []), nowMs, allowExpired);
 }
 function limited(items, maxResults) {
     const limit = maxResults ?? 0;
@@ -494,6 +496,7 @@ export class DeepThoughtStore {
      * Exact-key lookup of the `fresh` observation. Hits (and counts the hit) only when `currentGenerations` records exactly
      * the same collections at exactly the same generations and every cited Fleet Commons entry is still active; otherwise the
      * row is marked `stale` and `undefined` is returned. An empty `currentGenerations` cannot verify anything: it misses without invalidating.
+     * Pass the running `fleetCommons.allowExpired` as `allowExpired` so a policy flip applies at once (not after the next sync).
      */
     findFreshDerivedObservation(input) {
         if (!Object.keys(input.currentGenerations).length)
@@ -508,7 +511,7 @@ export class DeepThoughtStore {
             if (!row)
                 return undefined;
             const found = observation(row);
-            if (!generationsMatch(found.collectionGenerations, input.currentGenerations) || !citedFleetActive(this.db, found, now)) {
+            if (!generationsMatch(found.collectionGenerations, input.currentGenerations) || !citedFleetActive(this.db, found, now, input.allowExpired)) {
                 this.db.prepare("UPDATE derived_observations SET status='stale', invalidated_at=? WHERE id=? AND status='fresh'").run(now, found.id);
                 return undefined;
             }

@@ -112,6 +112,17 @@ export type SkillRoutingRecord = SkillEventContext & {
     outputTokens?: number;
     elapsedMs?: number;
     outcome: string;
+    /**
+     * The exact request the router judged (secret-redacted and bounded by the whisperer), so the offline description
+     * optimizer replays what routing really saw. Absent on historical rows.
+     */
+    requestText?: string;
+    /** Host chat type of the routed turn (`direct` / `group` / `channel` / ...), for replay privacy filtering. */
+    chatType?: string;
+    /** Host-supplied sender identity of the routed turn, so person erasure reaches this row directly. */
+    provider?: string;
+    accountId?: string;
+    senderId?: string;
 };
 type SkillOpenRecord = SkillEventContext & {
     skillPath: string;

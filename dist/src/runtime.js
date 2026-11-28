@@ -57,8 +57,8 @@ export class QmdMemoryRuntime {
     #schedule;
     #fleetCommonsTimer;
     #fleetCommonsRun;
-    /** Callbacks and gateway signal from `startFleetCommonsSchedule`; initial syncs on open report through them too. */
-    #fleetCommonsHooks;
+    /** Retain the aborted schedule so a manager finishing startup cannot lose the gateway's cancellation. */
+    #fleetCommonsSchedule;
     /** Aborted by `close()`: stops in-flight Fleet Commons requests instead of waiting out their timeouts. */
     #fleetCommonsLifetime = new AbortController();
     /**
@@ -69,27 +69,27 @@ export class QmdMemoryRuntime {
     startFleetCommonsSchedule(onError, options = {}) {
         this.stopFleetCommonsSchedule();
         const fleetCommons = this.#fleetCommons;
-        if (this.#shutdownStarted || !fleetCommons?.enabled || options.signal?.aborted)
+        if (this.#shutdownStarted || !fleetCommons?.enabled)
             return;
-        const hooks = { ...options, onError };
-        this.#fleetCommonsHooks = hooks;
-        options.signal?.addEventListener("abort", () => {
-            if (this.#fleetCommonsHooks === hooks)
-                this.stopFleetCommonsSchedule();
-        }, { once: true });
+        const scheduleController = new AbortController();
+        const schedule = { controller: scheduleController, hooks: { ...options, onError } };
+        this.#fleetCommonsSchedule = schedule;
+        if (options.signal?.aborted) {
+            scheduleController.abort(options.signal.reason);
+            return;
+        }
+        options.signal?.addEventListener("abort", () => this.stopFleetCommonsSchedule(), { once: true, signal: scheduleController.signal });
         const intervalMs = Math.min(2 ** 31 - 1, Math.max(1, Math.round(fleetCommons.syncIntervalMinutes * 60_000)));
         this.#fleetCommonsTimer = setInterval(() => {
-            if (this.#shutdownStarted || this.#fleetCommonsRun)
+            if (scheduleController.signal.aborted || this.#shutdownStarted || this.#fleetCommonsRun)
                 return;
             this.#fleetCommonsRun = (async () => {
                 for (const [agentId, entry] of [...this.#managers]) {
-                    if (this.#shutdownStarted)
+                    if (scheduleController.signal.aborted || this.#shutdownStarted)
                         return;
-                    // Only managers that finished starting; a failed or in-progress start is not an open manager.
-                    if (!entry.ready || !await entry.ready.then(() => true, () => false))
-                        continue;
-                    if (this.#managers.get(agentId) === entry)
-                        await this.#syncFleetCommonsFor(agentId, entry.manager);
+                    if (entry.started && this.#managers.get(agentId) === entry) {
+                        await this.#syncFleetCommonsFor(agentId, entry.manager, schedule);
+                    }
                 }
             })().catch(onError).finally(() => { this.#fleetCommonsRun = undefined; });
         }, intervalMs);
@@ -99,7 +99,7 @@ export class QmdMemoryRuntime {
         if (this.#fleetCommonsTimer)
             clearInterval(this.#fleetCommonsTimer);
         this.#fleetCommonsTimer = undefined;
-        this.#fleetCommonsHooks = undefined;
+        this.#fleetCommonsSchedule?.controller.abort();
     }
     /** One Fleet Commons sync for one agent; `disabled` without touching the index when `fleetCommons.enabled` is false. */
     async syncFleetCommons(params, signal) {
@@ -111,16 +111,17 @@ export class QmdMemoryRuntime {
         return manager.syncFleetCommons(signal);
     }
     /** Background sync of one open manager: errors and rejected entries are reported, never thrown. */
-    async #syncFleetCommonsFor(agentId, manager) {
+    async #syncFleetCommonsFor(agentId, manager, schedule) {
         if (!this.#fleetCommons?.enabled)
             return;
-        const hooks = this.#fleetCommonsHooks;
-        const signal = hooks?.signal ? AbortSignal.any([this.#fleetCommonsLifetime.signal, hooks.signal]) : this.#fleetCommonsLifetime.signal;
+        const hooks = schedule?.hooks;
+        const lifetime = this.#fleetCommonsLifetime.signal;
+        const signal = schedule ? AbortSignal.any([lifetime, schedule.controller.signal]) : lifetime;
         if (signal.aborted || this.#shutdownStarted)
             return;
         try {
             const result = await manager.syncFleetCommons(signal);
-            if (result.status === "disabled" || !result.rejected.length)
+            if (signal.aborted || result.status === "disabled" || !result.rejected.length)
                 return;
             const message = `unblock-memory fleet commons rejected ${result.rejected.length} entr${result.rejected.length === 1 ? "y" : "ies"}` +
                 ` for agent ${agentId}: ${result.rejected.map(({ id, reasons }) => `${id} (${reasons.join(", ")})`).join("; ")}`;
@@ -221,6 +222,9 @@ export class QmdMemoryRuntime {
     memoryDatabasePath(agentId) {
         return curationDatabasePath(this.#stateDir(agentId));
     }
+    get fleetCommonsAllowExpired() {
+        return this.#fleetCommons?.enabled === true && this.#fleetCommons.allowExpired;
+    }
     searchableCorpora() {
         const names = this.#corpora.filter((corpus) => corpus.kind !== "skills").map((corpus) => corpus.name);
         if (this.#extraction?.enabled && this.#extraction.publish && !names.includes("extracted")) {
@@ -251,7 +255,7 @@ export class QmdMemoryRuntime {
                     this.#managers.set(params.agentId, entry);
                 }
                 if (startMemory) {
-                    entry.ready ??= this.#startManager(params.agentId, entry.manager);
+                    entry.ready ??= this.#startManager(params.agentId, entry);
                     await entry.ready;
                 }
                 const blockedAfter = this.#admissionBlockedReason();
@@ -635,7 +639,9 @@ export class QmdMemoryRuntime {
             trackRecallLocators: this.#recallLedgerEnabled,
         });
     }
-    async #startManager(agentId, manager) {
+    async #startManager(agentId, entry) {
+        const { manager } = entry;
+        const schedule = this.#fleetCommonsSchedule;
         try {
             await manager.start();
         }
@@ -644,8 +650,11 @@ export class QmdMemoryRuntime {
             await manager.close().catch(() => undefined);
             throw error;
         }
-        // Initial Fleet Commons sync on open, in the background: the fetch never holds the manager's write queue.
-        void this.#syncFleetCommonsFor(agentId, manager);
+        entry.started = true;
+        // A stopped schedule stays cancelled even if a replacement was installed during this startup.
+        if (this.#managers.get(agentId) === entry) {
+            void this.#syncFleetCommonsFor(agentId, manager, schedule ?? this.#fleetCommonsSchedule);
+        }
     }
     #sessionConfig(cfg, agentId) {
         const corpus = this.#corpora.find(corpus => corpus.kind === "sessions");

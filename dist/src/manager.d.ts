@@ -21,7 +21,7 @@ type MemoryReadParams = {
     cursor?: MemoryReadCursor;
     requestContext?: MemoryRequestContext;
 };
-export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "vsearch" | "get" | "close" | "upsertDocument" | "retractDocument" | "syncProjectedCollection" | "getCollectionGeneration">;
+export type ManagerStore = Pick<QMDStore, "update" | "embed" | "getStatus" | "listCollections" | "vsearch" | "get" | "close" | "upsertDocument" | "retractDocument" | "syncProjectedCollection" | "getCollectionGeneration"> & Partial<Pick<QMDStore, "addCollection">>;
 export type ManagerSessionConfig = {
     agentId: string;
     agentName: string;
@@ -154,6 +154,12 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
      * other write. `disabled` when `fleetCommons.enabled` is false.
      */
     syncFleetCommons(signal?: AbortSignal): Promise<FleetCommonsSyncResult>;
+    /**
+     * Delivery-time recheck of already-selected hits (a raw Fleet entry can be retired or expire while a caller judges it):
+     * Fleet hits not in the live cache under the running `allowExpired` policy are dropped. A cache that cannot be read
+     * fails closed for Fleet hits only.
+     */
+    activeFleetHits<T extends Pick<CorpusMemorySearchResult, "path">>(hits: readonly T[]): T[];
     sync(params?: MemorySyncParams): Promise<void>;
     syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void, options?: {
         persist?: (manifest: SessionManifest) => void;

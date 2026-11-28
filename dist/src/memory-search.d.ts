@@ -11,6 +11,11 @@ export type MemoryCandidateManager = {
      * queueing each topic separately behind background indexing. Settles per topic, in topic order.
      */
     searchCandidateTopics?(topics: readonly QueryPair[], options: CorpusSearchOptions): Promise<PromiseSettledResult<CorpusMemorySearchResult[]>[]>;
+    /**
+     * Optional: `hits` minus any Fleet Commons hit no longer servable from the live cache under the running `allowExpired`
+     * policy (retired, superseded or expired since retrieval). Non-Fleet hits always pass through unchanged.
+     */
+    activeFleetHits?<T extends Pick<CorpusMemorySearchResult, "path">>(hits: readonly T[]): T[];
 };
 export declare function memoryPassageId(text: string): string;
 export type MemorySearchObservation = RetrievalTimings & {

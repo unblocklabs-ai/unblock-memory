@@ -295,6 +295,14 @@ function overnightInvestigate(deps: DeepThoughtDeps, cfg: OpenClawConfig, agentI
   };
 }
 
+/**
+ * The longest the scheduler ever sleeps between ticks. Node timers are 32-bit signed milliseconds (~24.8 days): a longer
+ * `setInterval` delay silently overflows to 1 ms and busy-loops the gateway, so a 30-day `intervalMinutes` must never reach
+ * the timer as-is. A tick only wakes the passes; each pass's own due time (`workDue` / the work-store claim) decides
+ * whether it actually runs, so waking more often than a pass's interval never runs it early.
+ */
+const MAX_WAKE_INTERVAL_MS = 60 * 60_000;
+
 /** True when a scheduled run-mode item is claimable now: absent, due, or holding an expired lease. */
 function workDue(store: WorkStore, kind: string, scope: string, nowMs = Date.now()): boolean {
   const item = store.get(kind, scope);
@@ -625,7 +633,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
       if (crystals.enabled) intervals.push(crystals.intervalMinutes);
       if (overnight.enabled) intervals.push(overnight.intervalMinutes);
       if (skills.enabled) intervals.push(skills.intervalMinutes);
-      const intervalMs = Math.max(1, Math.min(...intervals)) * 60_000;
+      const intervalMs = Math.min(MAX_WAKE_INTERVAL_MS, Math.max(1, Math.min(...intervals)) * 60_000);
       timer = setInterval(() => { void tick(); }, intervalMs);
       timer.unref();
       void tick();

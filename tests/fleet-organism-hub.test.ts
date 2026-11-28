@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -42,7 +43,7 @@ function brief(nodeId = IDS.nodeId) {
 const ENTRY: FleetCommonsEntry = { id: "recall-practice", revision: 2, category: "procedure", title: "Recall practice",
   body: "Deduplicate before reranking.", tags: ["retrieval"], severity: "info", updatedAt: NOW };
 
-async function startHub(t: TestContext, options: Omit<Parameters<typeof createFleetOrganismHub>[0], "dbPath">) {
+async function startHub(t: TestContext, options: Partial<Parameters<typeof createFleetOrganismHub>[0]>) {
   const hub = createFleetOrganismHub({ dbPath: ":memory:", ...options });
   hub.listen(0, "127.0.0.1");
   await once(hub, "listening");
@@ -106,6 +107,62 @@ test("the single token is an all-roles fallback only for roles without their own
   assert.throws(() => createFleetOrganismHub({ dbPath: ":memory:", ingestTokens: { "/home/alice": "x" } }), /node alias/u);
   assert.throws(() => createFleetOrganismHub({ dbPath: ":memory:", ingestTokens: { charizard: " " } }), /Empty fleet hub ingest token/u);
   assert.throws(() => createFleetOrganismHub({ dbPath: ":memory:", operatorToken: "" }), /Empty fleet hub operator token/u);
+  assert.throws(() => createFleetOrganismHub({ dbPath: ":memory:", ingestTokens: {} }), /Empty fleet hub ingestTokens/u);
+  assert.throws(() => createFleetOrganismHub({ dbPath: ":memory:", publicMetrics: false }), /require a read token/u);
+  assert.throws(() => createFleetOrganismHub({ dbPath: ":memory:", publicMetrics: false, readToken: "two words" }), /single bearer token/u);
+  for (const options of [{ token: "ingest" }, { ingestToken: "ingest" }]) {
+    const emptyMap = await startHub(t, { ...options, ingestTokens: {}, now: () => NOW });
+    assert.equal((await emptyMap.post("/api/v1/telemetry", measured())).status, 401);
+    assert.equal((await emptyMap.post("/api/v1/telemetry", measured(), "ingest")).status, 200);
+  }
+});
+
+test("a hub with any anonymous role rejects non-loopback and missing Host headers", async t => {
+  const dev = await startHub(t, { readToken: "read" });
+  const locked = await startHub(t, { token: "read" });
+  const status = (base: string, host?: string) => new Promise<number | undefined>((resolve, reject) => {
+    const req = request(base + "/api/v1/commons", { setHost: false, headers: {
+      Authorization: "Bearer read", ...(host === undefined ? {} : { Host: host }),
+    } }, response => { response.resume(); resolve(response.statusCode); });
+    req.on("error", reject).end();
+  });
+  for (const host of ["fleet.example.test", "localhost.fleet.example.test", "localhost@fleet.example.test", undefined]) {
+    assert.equal(await status(dev.base, host), 403, host);
+  }
+  for (const host of ["localhost", "127.0.0.1:8787", "[::1]:8787"]) assert.equal(await status(dev.base, host), 200, host);
+  assert.equal(await status(locked.base, "fleet.example.test"), 200);
+});
+
+test("an oversized streaming POST gets 413 and closes instead of waiting for the rest of the body", { timeout: 3000 }, async t => {
+  const hub = await startHub(t, { maxBodyBytes: 16 });
+  const response = await new Promise<{ status?: number; connection?: string }>((resolve, reject) => {
+    const req = request(hub.base + "/api/v1/commons", { method: "POST", headers: {
+      "Content-Type": "application/json", "Content-Length": "100000", Connection: "keep-alive",
+    } }, reply => {
+      reply.resume();
+      reply.on("end", () => resolve({ status: reply.statusCode, connection: reply.headers.connection }));
+    });
+    t.after(() => { req.destroy(); });
+    req.on("error", reject).write("x".repeat(17)); // Do not finish sending the body.
+  });
+  assert.deepEqual(response, { status: 413, connection: "close" });
+});
+
+test("Commons GET reapplies current hygiene and invalidates the old feed ETag", async t => {
+  const root = mkdtempSync(join(tmpdir(), "fleet-hub-hygiene-"));
+  t.after(() => rmSync(root, { recursive: true }));
+  const dbPath = join(root, "hub.sqlite");
+  const initial = await startHub(t, { dbPath });
+  assert.equal((await initial.post("/api/v1/commons", ENTRY)).status, 200);
+  const original = await initial.get("/api/v1/commons");
+  const etag = original.headers.get("etag");
+  assert.ok(etag);
+  assert.deepEqual(await original.json(), { entries: [ENTRY] });
+  const tightened = await startHub(t, { dbPath, forbiddenTerms: ["reranking"] });
+  const response = await fetch(tightened.base + "/api/v1/commons", { headers: { "If-None-Match": etag } });
+  assert.equal(response.status, 200);
+  assert.notEqual(response.headers.get("etag"), etag);
+  assert.deepEqual(await response.json(), { entries: [] });
 });
 
 test("every POST requires Content-Type: application/json, even on a tokenless loopback hub", async t => {
@@ -179,7 +236,7 @@ test("snapshots: future collectedAtMs is 400, a stale overwrite is 409, aliases 
   }
 });
 
-test("telemetry past snapshotTtlMs leaves /metrics and the leaderboards; 0 keeps it forever", async t => {
+test("snapshots past snapshotTtlMs leave metrics, leaderboards and briefs; 0 keeps them forever", async t => {
   let now = NOW;
   const hub = await startHub(t, { now: () => now });
   const forever = await startHub(t, { now: () => now, snapshotTtlMs: 0 });
@@ -187,17 +244,29 @@ test("telemetry past snapshotTtlMs leaves /metrics and the leaderboards; 0 keeps
   now = NOW + 47 * HOUR;
   for (const target of [hub, forever]) {
     assert.equal((await target.post("/api/v1/telemetry", measured({ nodeId: "blastoise", nowMs: now }))).status, 200);
+    assert.equal((await target.post("/api/v1/brief", brief())).status, 200);
+    assert.equal((await target.post("/api/v1/brief", { ...brief("blastoise"), collectedAtMs: now })).status, 200);
   }
-  const view = async (target: typeof hub) => ({
-    metrics: [...(await (await target.get("/metrics")).text()).matchAll(/^unblock_memory_core_memories_total\{node="(\w+)"/gmu)].map(m => m[1]),
-    leaderboard: ((await (await target.get("/api/v1/ab-leaderboard")).json()) as Array<{ nodes: string[] }>).flatMap(row => row.nodes),
-    brief: ((await (await target.get("/api/v1/brief")).json()) as { leaderboard: Array<{ nodes: string[] }> }).leaderboard.flatMap(row => row.nodes),
-  });
-  assert.deepEqual(await view(hub), { metrics: ["blastoise", "charizard"], leaderboard: ["blastoise", "charizard"], brief: ["blastoise", "charizard"] });
+  const view = async (target: typeof hub) => {
+    const { briefs, leaderboard } = await (await target.get("/api/v1/brief")).json() as {
+      briefs: Array<{ nodeId: string }>; leaderboard: Array<{ nodes: string[] }>;
+    };
+    return {
+      metrics: [...(await (await target.get("/metrics")).text()).matchAll(/^unblock_memory_core_memories_total\{node="(\w+)"/gmu)].map(m => m[1]),
+      leaderboard: ((await (await target.get("/api/v1/ab-leaderboard")).json()) as Array<{ nodes: string[] }>).flatMap(row => row.nodes),
+      briefLeaderboard: leaderboard.flatMap(row => row.nodes), briefs: briefs.map(item => item.nodeId),
+    };
+  };
+  const both = { metrics: ["blastoise", "charizard"], leaderboard: ["blastoise", "charizard"],
+    briefLeaderboard: ["blastoise", "charizard"], briefs: ["blastoise", "charizard"] };
+  assert.deepEqual(await view(hub), both);
   now = NOW + 48 * HOUR + 1;
-  assert.deepEqual(await view(hub), { metrics: ["blastoise"], leaderboard: ["blastoise"], brief: ["blastoise"] }, "charizard expired after 48h");
-  assert.match(await (await hub.get("/api/v1/brief?format=markdown")).text(), /\| 24h \| actr\\_v1 \| 1 \| 1 \|/u);
-  assert.deepEqual(await view(forever), { metrics: ["blastoise", "charizard"], leaderboard: ["blastoise", "charizard"], brief: ["blastoise", "charizard"] });
+  assert.deepEqual(await view(hub), { metrics: ["blastoise"], leaderboard: ["blastoise"],
+    briefLeaderboard: ["blastoise"], briefs: ["blastoise"] }, "charizard expired after 48h");
+  const markdown = await (await hub.get("/api/v1/brief?format=markdown")).text();
+  assert.match(markdown, /1 node reporting/u);
+  assert.match(markdown, /\| 24h \| actr\\_v1 \| 1 \| 1 \|/u);
+  assert.deepEqual(await view(forever), both);
 });
 
 test("the A/B leaderboard groups by sinceHours window and reports coverage", () => {
@@ -235,12 +304,16 @@ test("hub CLI requires a credential for every role beyond loopback and validates
   t.after(() => rmSync(root, { recursive: true }));
   const token = join(root, "token");
   writeFileSync(token, "x\n");
+  const emptyMap = join(root, "empty.json");
+  writeFileSync(emptyMap, "{}");
   const script = join(import.meta.dirname, "..", "scripts", "fleet-organism-hub.mjs");
-  const run = (...args: string[]) => promisify(execFile)(process.execPath, [script, "--db", join(root, "hub.sqlite"), ...args]);
+  const run = (...args: string[]) => promisify(execFile)(process.execPath,
+    [script, "--db", join(root, "hub.sqlite"), "--port", "0", ...args], { timeout: 3000 });
   await assert.rejects(run("--host", "0.0.0.0"), /Every role needs a token/u);
-  await assert.rejects(run("--host", "0.0.0.0", "--read-token-file", token, "--ingest-tokens-file", token), /Every role needs a token/u);
+  await assert.rejects(run("--host", "0.0.0.0", "--read-token-file", token, "--operator-token-file", token,
+    "--ingest-tokens-file", emptyMap), /Every role needs a token/u);
   await assert.rejects(run("--private-metrics", "--operator-token-file", token), /--private-metrics requires/u);
-  for (const flag of ["--max-clock-skew-ms", "--snapshot-ttl-ms", "--max-alias-length", "--max-body-bytes"]) {
+  for (const flag of ["--max-clock-skew-ms", "--snapshot-ttl-ms", "--max-alias-length", "--max-body-bytes", "--max-title-chars", "--max-body-chars"]) {
     await assert.rejects(run(flag, "-5"), /Invalid|argument/u, flag);
     await assert.rejects(run(flag, "1.5"), new RegExp(`Invalid ${flag}`, "u"), flag);
   }

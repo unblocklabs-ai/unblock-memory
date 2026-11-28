@@ -40,9 +40,9 @@ export function registerWhispererPrompt(api, whisperers, triggers) {
         if (!surface)
             return;
         const admitted = surface === "user" ? ordered : ordered.filter(({ name }) => triggers[surface].includes(name));
-        const results = await Promise.all(admitted.map(async ({ name, handler }) => {
+        const settled = await Promise.all(admitted.map(async ({ name, handler }) => {
             try {
-                return (await handler(event, context, surface))?.appendContext;
+                return { name, result: await handler(event, context, surface) };
             }
             catch {
                 // One unavailable whisperer must not discard the others' context. Safety records its own failures first.
@@ -50,6 +50,18 @@ export function registerWhispererPrompt(api, whisperers, triggers) {
                 return undefined;
             }
         }));
+        // Final delivery boundary: every contribution is re-rendered as of NOW, after the slowest sibling settled.
+        const results = settled.map(entry => {
+            if (!entry?.result?.finalize)
+                return entry?.result?.appendContext;
+            try {
+                return entry.result.finalize()?.appendContext;
+            }
+            catch {
+                api.logger.warn(`unblock-memory ${entry.name} whisperer contribution failed`);
+                return undefined;
+            }
+        });
         const content = results.filter(Boolean).join("\n");
         if (content)
             return { appendContext: `<unblock_memory>\n${content}\n</unblock_memory>` };

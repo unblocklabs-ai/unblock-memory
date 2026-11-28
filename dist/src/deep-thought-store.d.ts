@@ -227,10 +227,12 @@ export declare class DeepThoughtStore {
      * Exact-key lookup of the `fresh` observation. Hits (and counts the hit) only when `currentGenerations` records exactly
      * the same collections at exactly the same generations and every cited Fleet Commons entry is still active; otherwise the
      * row is marked `stale` and `undefined` is returned. An empty `currentGenerations` cannot verify anything: it misses without invalidating.
+     * Pass the running `fleetCommons.allowExpired` as `allowExpired` so a policy flip applies at once (not after the next sync).
      */
     findFreshDerivedObservation(input: DerivedObservationKey & {
         currentGenerations: Readonly<Record<string, number>>;
         nowMs?: number;
+        allowExpired?: boolean;
     }): DerivedObservation | undefined;
     /**
      * Fresh, generation-verified observations whose question matches `queryText` (see `DerivedObservationMatchQuery`).

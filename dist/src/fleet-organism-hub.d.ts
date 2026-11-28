@@ -1,5 +1,6 @@
 import { type IncomingMessage, type ServerResponse } from "node:http";
-type HubOptions = {
+import { type FleetCommonsHygieneOptions } from "./fleet-commons.js";
+type HubOptions = FleetCommonsHygieneOptions & {
     dbPath: string;
     /** All-roles fallback: used only for a role (read, ingest, operator) given no role-specific credential. */
     token?: string;
@@ -19,11 +20,9 @@ type HubOptions = {
     publicMetrics?: boolean;
     /** 0 disables the request body limit. */
     maxBodyBytes?: number;
-    /** Extra Commons hygiene terms (client names, codenames) rejected on POST, as in `validateFleetCommonsEntry`. */
-    forbiddenTerms?: readonly string[];
     /** Snapshots collected further than this in the future are rejected (default 5 minutes; 0 = no check). */
     maxClockSkewMs?: number;
-    /** Telemetry older than this leaves /metrics and the leaderboards (default 48 hours; 0 = never). */
+    /** Snapshots older than this leave metrics, leaderboards and briefs (default 48 hours; 0 = never). */
     snapshotTtlMs?: number;
     /** Longest accepted node/agent alias (default 64; 0 = unlimited). */
     maxAliasLength?: number;

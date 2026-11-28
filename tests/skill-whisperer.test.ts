@@ -16,6 +16,7 @@ import { SkillSessionStore } from "../src/skill-session-store.js";
 import { registerSkillWhisperer, skillRecipeHash } from "../src/skill-whisperer.js";
 import { registerWhispererPrompt } from "../src/whisperer-prompt.js";
 import { WorkStore } from "../src/work-store.js";
+import { MAX_SKILL_QUERY_CHARS } from "../src/whisperer-context.js";
 
 type Runtime = Parameters<typeof registerSkillWhisperer>[1];
 type DecisionModel = UnblockMemoryConfig["decisionModel"];
@@ -572,5 +573,187 @@ test("wasWhispered is recorded only for whispered skills that were actually rend
     const opens = db.prepare("SELECT skill_path, was_whispered, was_pinned FROM skill_open_events ORDER BY id").all();
     assert.deepEqual(opens.map(row => [row.skill_path, row.was_whispered, row.was_pinned]),
       entries.map(entry => [entry.path, rendered.includes(entry.path) ? 1 : 0, 1]));
+  } finally { db.close(); }
+});
+
+test("routing events record the redacted, bounded routed request and chat type for offline replay", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-request-text-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const writer = new RecallLedgerWriter();
+  const entries = [hit("deploy")];
+  const runtime = { ...catalogRuntime(entries, async () => []), memoryDatabasePath: () => dbPath };
+  const h = harness(runtime, local, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+  const secret = "sk-live1234567890abcdef";
+  const long = `${"x".repeat(MAX_SKILL_QUERY_CHARS)} deploy with api_key=${secret} now`;
+  try {
+    await h.prompt(prompt(long), { ...ctx("group-run"), chatType: "Group" } as Context);
+    await h.prompt(prompt("   "), { ...ctx("blank-run"), sessionKey: "agent:main:slack:direct:u1" });
+  } finally { h.stop(); await writer.close(); }
+  const db = openRecallLedger(dbPath);
+  try {
+    const rows = db.prepare("SELECT run_id, request_text, chat_type FROM skill_routing_events ORDER BY run_id").all();
+    const byRun = new Map(rows.map(row => [String(row.run_id), row]));
+    const routed = String(byRun.get("group-run")?.request_text);
+    assert.ok(routed.length <= MAX_SKILL_QUERY_CHARS, "bounded like the scorer's currentRequest");
+    assert.match(routed, /deploy with api_key=\[redacted\] now$/u, "redacted before it is bounded");
+    assert.doesNotMatch(routed, /sk-live/u);
+    assert.equal(byRun.get("group-run")?.chat_type, "group");
+    assert.equal(byRun.get("blank-run")?.request_text, null, "an empty request is not recorded");
+    assert.equal(byRun.get("blank-run")?.chat_type, "direct", "inferred from the session key");
+  } finally { db.close(); }
+});
+
+test("the live skill router only ever sees redacted, pre-bounded request and history text", async t => {
+  const h = harness(catalogRuntime([hit("deploy")]));
+  t.after(() => h.stop());
+  const requests: DecisionState[] = [];
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const state = decisionState(init);
+    requests.push(state);
+    return scores(state, () => 0.1);
+  });
+  const secret = "sk-live1234567890abcdef";
+  await h.before({ prompt: `${"a-".repeat(60_000)} deploy with api_key=${secret} and Bearer ghp_abcdef123456 now`, messages: [
+    { role: "user", content: `earlier: password=${secret} please` },
+    { role: "assistant", content: "Use the token: xoxb-1234-abcd for Slack." },
+  ] }, ctx("redacted"));
+  assert.equal(requests.length, 1);
+  const body = JSON.stringify(requests[0]);
+  assert.doesNotMatch(body, /sk-live|ghp_|xoxb-/u, "no secret reaches the live router");
+  assert.match(requests[0]!.currentRequest, /deploy with api_key=\[redacted\] and \[redacted\] now$/u);
+  assert.ok(requests[0]!.currentRequest.length <= MAX_SKILL_QUERY_CHARS);
+  assert.deepEqual(requests[0]!.history.map(({ content }) => content), []);
+  await h.before({ prompt: "Deploy", messages: [
+    { role: "user", content: `earlier: password=${secret} please` },
+    { role: "assistant", content: "Use the token: xoxb-1234-abcd for Slack." },
+  ] }, ctx("history", "other-thread"));
+  assert.deepEqual(requests[1]!.history.map(({ content }) => content),
+    ["earlier: password=[redacted] please", "Use the token: [redacted] for Slack."]);
+});
+
+test("person erasure wipes a sender's routed request text with Skill Whisperer on and Memory Whisperer off", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-person-erasure-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const writer = new RecallLedgerWriter();
+  const entries = [hit("deploy")];
+  const runtime = { ...catalogRuntime(entries, async () => []), memoryDatabasePath: () => dbPath };
+  const h = harness(runtime, local, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+  const sender = (senderId: string) => ({ messageProvider: "Slack", accountId: "Default", senderId });
+  try {
+    await h.prompt(prompt("Deploy the private release for me"),
+      { ...ctx("person-run", "dm-thread"), sessionKey: "agent:main:slack:direct:u123", ...sender("U123") } as Context);
+    await h.prompt(prompt("Deploy the other release"),
+      { ...ctx("other-run", "dm-other"), sessionKey: "agent:main:slack:direct:u999", ...sender("U999") } as Context);
+    await h.prompt(prompt("Deploy without a sender"), { ...ctx("anonymous-dm", "dm-anon"), sessionKey: "agent:main:slack:direct:u0" });
+    await h.after(read(entries[0].path), ctx("person-run", "dm-thread"));
+    await writer.flush();
+  } finally { h.stop(); }
+  const routed = () => {
+    const db = openRecallLedger(dbPath);
+    try {
+      return new Map(db.prepare("SELECT run_id, request_text, provider, account_id, sender_id FROM skill_routing_events").all()
+        .map(row => [String(row.run_id), row]));
+    } finally { db.close(); }
+  };
+  const before = routed();
+  assert.equal(before.get("person-run")?.request_text, "Deploy the private release for me");
+  assert.deepEqual([before.get("person-run")?.provider, before.get("person-run")?.account_id, before.get("person-run")?.sender_id],
+    ["slack", "default", "U123"], "the routed row carries the normalized sender identity");
+  assert.equal(before.get("anonymous-dm")?.request_text, null, "a private turn without a sender records no request text");
+  const db = openRecallLedger(dbPath);
+  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM recall_queries").get()?.n, 0, "Memory Whisperer recorded nothing"); }
+  finally { db.close(); }
+
+  assert.deepEqual(await writer.purgePerson(dbPath, { provider: "slack", accountId: "default", senderId: "U123" }),
+    { queries: 0, skillEvents: 2 }, "the routing row and the run's open event are erased");
+  await writer.close();
+  const after = routed();
+  assert.equal(after.has("person-run"), false);
+  assert.equal(after.get("other-run")?.request_text, "Deploy the other release", "other people keep their rows");
+  const reopened = openRecallLedger(dbPath);
+  try { assert.equal(reopened.prepare("SELECT COUNT(*) n FROM skill_open_events").get()?.n, 0); }
+  finally { reopened.close(); }
+});
+
+test("a config paste's password never leaks past the redaction bound into currentRequest, history, or request_text", async t => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-straddle-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const writer = new RecallLedgerWriter();
+  const runtime = { ...catalogRuntime([hit("deploy")]), memoryDatabasePath: () => dbPath };
+  const h = harness(runtime, active, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+  const requests: DecisionState[] = [];
+  t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {
+    const state = decisionState(init);
+    requests.push(state);
+    return scores(state, () => 0.1);
+  });
+  const secret = "Sup3rS3cretPassw0rdValue";
+  // A ~20K config paste: the password, then >8K of `token_N=<long value>` assignments that each shrink once redacted.
+  // The text AFTER `password=` is exactly `bound + 8_192` characters, so a "redact a widened tail window, then slice"
+  // strategy would start its window on the bare secret (cut from its key) and, after the token values shrink, keep it.
+  const configPaste = (bound: number) => {
+    const assignments = Array.from({ length: 80 }, (_, i) => `token_${i}=${"v".repeat(200)}`).join("\n");
+    const afterKey = `${secret}\n${assignments}`;
+    const padding = bound + 8_192 - afterKey.length - 1;
+    assert.ok(padding > 0, "the fixture leaves room for the alignment padding");
+    return `# deploy config\nhost=example.internal\npassword=${afterKey}\n${"#".repeat(padding)}`;
+  };
+  const paste = configPaste(MAX_SKILL_QUERY_CHARS);
+  assert.ok(paste.length > 20_000);
+  try {
+    await h.prompt({ prompt: paste, messages: [] }, { ...ctx("paste-run", "paste"), chatType: "channel" } as Context);
+    const reply = "Deploy";
+    await h.prompt({ prompt: reply, messages: [{ role: "user", content: configPaste(MAX_SKILL_QUERY_CHARS - reply.length) }] },
+      { ...ctx("history-run", "paste-history"), chatType: "channel" } as Context);
+    await writer.flush();
+  } finally { h.stop(); await writer.close(); }
+  assert.equal(requests.length, 2);
+  for (const request of requests) assert.doesNotMatch(JSON.stringify(request), new RegExp(secret, "u"), "the live router never sees it");
+  assert.match(requests[0]!.currentRequest, /token_79=\[redacted\]/u);
+  assert.ok(requests[1]!.history.length > 0, "the pasted history message is routed (redacted)");
+  const db = openRecallLedger(dbPath);
+  try {
+    const rows = db.prepare("SELECT run_id, request_text FROM skill_routing_events").all();
+    assert.equal(rows.length, 2);
+    for (const row of rows) assert.doesNotMatch(String(row.request_text), new RegExp(secret, "u"), "request_text never stores it");
+  } finally { db.close(); }
+});
+
+test("a senderless turn records request text only in a known shared (channel/group) scope", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "skill-senderless-scope-"));
+  const dbPath = join(directory.path, "memory.sqlite");
+  const writer = new RecallLedgerWriter();
+  const runtime = { ...catalogRuntime([hit("deploy")], async () => []), memoryDatabasePath: () => dbPath };
+  const h = harness(runtime, local, {}, enabled, undefined, { writer, dbPathForAgent: () => dbPath });
+  try {
+    // A custom `session.mainKey: "inbox"` main session: no typed segment, so its chat type is unknown.
+    await h.prompt(prompt("Deploy from my inbox"), { ...ctx("inbox-run", "inbox"), sessionKey: "agent:main:inbox" });
+    await h.prompt(prompt("Deploy privately"), { ...ctx("direct-run", "direct"), chatType: "direct" } as Context);
+    await h.prompt(prompt("Deploy as agent group"), { ...ctx("agent-group-run", "ag"), sessionKey: "agent:group:main" });
+    await h.prompt(prompt("Deploy as agent channel"), { ...ctx("agent-channel-run", "ac"), sessionKey: "agent:channel:slack:direct:u1" });
+    await h.prompt(prompt("Deploy with sender but no provider"), { ...ctx("noprovider-run", "np"), senderId: "U1", chatType: "direct" } as Context);
+    await h.prompt(prompt("Deploy for the channel"), { ...ctx("channel-run", "channel"), sessionKey: "agent:main:slack:channel:c1" });
+    await h.prompt(prompt("Deploy for the group"), { ...ctx("group-run", "group"), chatType: "group" } as Context);
+    // An oversized (>512K) prompt is omitted fail-closed rather than sliced before redaction.
+    const oversized = `password=OversizedSecretValue\n${"x".repeat(512_001)}`;
+    await h.prompt(prompt(oversized), { ...ctx("oversized-run", "ov"), sessionKey: "agent:main:slack:channel:c1" });
+    await writer.flush();
+  } finally { h.stop(); await writer.close(); }
+  const db = openRecallLedger(dbPath);
+  try {
+    const byRun = new Map(db.prepare("SELECT run_id, request_text, chat_type FROM skill_routing_events").all()
+      .map(row => [String(row.run_id), row]));
+    assert.equal(byRun.size, 8, "every turn is still routed and recorded");
+    assert.equal(byRun.get("inbox-run")?.request_text, null, "unknown scope without a sender: no request text");
+    assert.equal(byRun.get("inbox-run")?.chat_type, null);
+    assert.equal(byRun.get("direct-run")?.request_text, null);
+    assert.equal(byRun.get("agent-group-run")?.request_text, null, "agent id 'group' is not a group chat");
+    assert.equal(byRun.get("agent-group-run")?.chat_type, "direct");
+    assert.equal(byRun.get("agent-channel-run")?.request_text, null, "agent id 'channel' is not a channel chat");
+    assert.equal(byRun.get("agent-channel-run")?.chat_type, "direct");
+    assert.equal(byRun.get("noprovider-run")?.request_text, null, "sender without provider cannot be erased directly");
+    assert.equal(byRun.get("channel-run")?.request_text, "Deploy for the channel");
+    assert.equal(byRun.get("group-run")?.request_text, "Deploy for the group");
+    assert.equal(byRun.get("oversized-run")?.request_text, null, "oversized >512K prompt is omitted fail-closed");
   } finally { db.close(); }
 });

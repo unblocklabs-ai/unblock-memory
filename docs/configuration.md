@@ -34,7 +34,7 @@ settings; a rotated credential file is reread without a restart.
 | Memory Crystals pass | `steward.enabled` + `steward.crystals.enabled`; a QMD index. Synthesis needs a Steward credential and analysis clusters; reclustering needs `analysis.executable` | STM decay and LTM promotion still run (no model); no new crystals | The pass releases its lease and retries next interval; existing crystals are untouched |
 | Overnight Thinking pass | `steward.enabled` + `steward.overnight.enabled`; a Steward credential. Voltaire Drift and pre-answering also need `steward.deepThought.enabled` and a QMD index | Skipped | Per-item failures are listed in `errors`; a failed pass publishes nothing and retries within 15 minutes |
 | Self-writing skills pass | `steward.enabled` + `steward.skills.enabled`; a Steward credential and a `skills` corpus. Description updates also need `decisionModel` for replay | Pitfall patches and new-skill drafts still run; description updates are skipped (`description_update:*:replay_unavailable`) | Isolated failures are listed in `errors`; nothing is proposed for a failed subject, and a live `SKILL.md` is never written |
-| Fleet Commons (`"fleet"` corpus) | `fleetCommons.enabled` + `endpoint` or `feedPath`; a QMD index | Unchanged: search over the cached entries needs no model | A failed sync keeps the last good cache and projection; invalid entries are rejected one by one |
+| Fleet Commons (`"fleet"` corpus) | `fleetCommons.enabled` + `endpoint` or `feedPath`; a QMD index | Unchanged: search over the cached entries needs no model | A failed feed read keeps the previous cache. Invalid entries are rejected individually; failed projections are retried. |
 
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
 one it registers no hook and reports inactive. Expectations Whisperer is on by
@@ -308,10 +308,10 @@ unknown fields, secrets and credentials, email addresses, phone numbers, Slack I
 local filesystem paths and client/personal identifiers reject that entry only, and
 the newest revision per id wins. Expired entries drop out at the next sync (and stop
 being served immediately) unless `allowExpired` is true. The feed is either
-`endpoint` (HTTP(S), `Authorization: Bearer` from `apiKey`/`apiKeyFile`, ETag-cached,
+`endpoint` (HTTPS or loopback HTTP, `Authorization: Bearer` from `apiKey`/`apiKeyFile`, ETag-cached,
 redirects refused) or a local `feedPath`; both return `{ "entries": [...] }`. The
 Fleet Organism hub (`scripts/fleet-organism-hub.mjs`) serves exactly that shape at
-`/api/v1/commons` and applies the same validation when entries are POSTed. Enabling
+`/api/v1/commons` and applies the same validation when entries are posted or served. Enabling
 also adds `"fleet"` to the corpora `memory_search` and `deep_thought` may select, and
 allows `"fleet"` in `memoryWhisperer.corpora`. A configured corpus named `fleet` is
 then rejected. Each agent syncs once when its memory manager opens, then while the
@@ -320,8 +320,8 @@ are never started just to sync). The feed request and validation run outside the
 manager's write queue, so a slow feed never delays search or indexing; only the SQLite
 replace and QMD projection are queued. Gateway shutdown aborts in-flight requests, and
 rejected entries are logged with their sanitized id and reasons. If the projected
-`unblock-fleet` collection lost documents (for example a rebuilt `index.sqlite`), the
-next sync re-projects the cache even when the feed is unchanged or answers `304`.
+`unblock-fleet` collection is missing, lost documents, or could not finish embedding,
+the next sync repairs the projection even when the feed is unchanged or answers `304`.
 Entries longer than a caller's snippet budget return their matched passage, bounded to
 that budget, with line numbers into the `memory_get` document (title, blank line, body,
 provenance). A cached `deep_thought` synthesis that cites a Fleet entry which has since
@@ -329,7 +329,8 @@ expired or been retired is treated as stale. Hygiene is tuned against operationa
 status-code lists (`500 502 503`), versions, dates, epoch timestamps, all-caps error
 codes (`UNAVAILABLE`), hex digests and placeholders (`Authorization: Bearer <token>`,
 `token: must be refreshed`) pass, while real tokens, `+`-prefixed or 3-3-4 phone
-numbers, emails, digit-bearing Slack IDs and local paths are rejected.
+numbers, emails, Slack IDs, and local paths outside web URLs are rejected. Titles
+must be single-line; entries that exceed the configured title or body limit are rejected.
 `openclaw memory-steward fleet-commons --agent main [--sync]` prints the cached
 entries read-only, or syncs now.
 
@@ -347,13 +348,15 @@ entries read-only, or syncs now.
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
 | `fleetCommons.enabled` | `false` | Sync and search the Fleet Commons feed; requires `endpoint` or `feedPath` |
-| `fleetCommons.endpoint` | Unset | HTTP(S) feed URL without embedded credentials (`@` is allowed in the path, never before the host) |
+| `fleetCommons.endpoint` | Unset | HTTPS feed URL, or HTTP to `localhost`, `127.0.0.1` or `[::1]`. No embedded credentials. |
 | `fleetCommons.feedPath` | Unset | Absolute path to a local JSON feed file (takes precedence over `endpoint`) |
 | `fleetCommons.apiKey` / `apiKeyFile` | Unset | Bearer token for `endpoint`, inline or from an absolute file path; never sent to a local feed |
 | `fleetCommons.syncIntervalMinutes` | `15` | `> 0` minutes between background syncs |
 | `fleetCommons.timeoutMs` | `10000` | `1..2147483647` ms per feed read or request |
-| `fleetCommons.maxEntries` | `0` | `>= 0` entries kept after validation, most severe then most recently updated first (`0` = unlimited) |
+| `fleetCommons.maxEntries` | `0` | Non-negative safe integer. Entries kept after validation, most severe then most recently updated first (`0` = unlimited). |
 | `fleetCommons.maxFeedBytes` | `5242880` | `>= 0` feed bytes streamed before JSON parsing; a larger feed fails the sync and keeps the last good cache (`0` = unlimited) |
+| `fleetCommons.maxTitleChars` | `1024` | Maximum single-line title length in UTF-16 code units (`0` = unlimited) |
+| `fleetCommons.maxBodyChars` | `65536` | Maximum body length in UTF-16 code units (`0` = unlimited) |
 | `fleetCommons.allowExpired` | `false` | Keep and serve entries past `expiresAt` |
 
 ### Fleet Organism telemetry and Morning Brief
@@ -376,7 +379,7 @@ JSON snapshot to that exact hub endpoint (`/api/v1/telemetry` or `/api/v1/brief`
 with `Authorization: Bearer` from `--token-file`, refuses redirects, and requires
 `https://` unless the host is loopback; `--push-timeout-ms` defaults to `10000`
 (`0` = none). The optional hub,
-`node scripts/fleet-organism-hub.mjs [--host 127.0.0.1] [--port 8787] [--db <path>] [--token-file <path>] [--read-token-file <path>] [--ingest-token-file <path>] [--ingest-tokens-file <path>] [--operator-token-file <path>] [--private-metrics] [--max-body-bytes <n>] [--max-clock-skew-ms <n>] [--snapshot-ttl-ms <n>] [--max-alias-length <n>] [--forbidden-terms-file <path>]`
+`node scripts/fleet-organism-hub.mjs [--host 127.0.0.1] [--port 8787] [--db <path>] [--token-file <path>] [--read-token-file <path>] [--ingest-token-file <path>] [--ingest-tokens-file <path>] [--operator-token-file <path>] [--private-metrics] [--max-body-bytes <n>] [--max-clock-skew-ms <n>] [--snapshot-ttl-ms <n>] [--max-alias-length <n>] [--max-title-chars <n>] [--max-body-chars <n>] [--forbidden-terms-file <path>]`
 (run `npm run build` first in a source checkout), stores the latest snapshot per
 node/agent. It serves `/metrics` (Prometheus; public unless `--private-metrics`),
 `/api/v1/ab-leaderboard`, `/api/v1/brief[?format=markdown]` and the Commons feed.
@@ -388,16 +391,18 @@ node, while `--ingest-tokens-file` (a JSON object of node alias to token) binds 
 token to snapshots carrying its own `nodeId` (`403` otherwise); the **operator** token
 (`--operator-token-file`) may `POST /api/v1/commons`, `GET /api/v1/brief` and
 `GET /api/v1/ab-leaderboard`. `--token-file` is an all-roles fallback used only for
-roles given no token of their own. A role with no token is open, which the hub allows
-only on loopback: binding beyond loopback needs a token for every role. Every POST
+roles given no token of their own. An empty per-node map needs a shared ingest
+token or the fallback. Private metrics need a read token. If any role has no
+token, the CLI binds only to loopback and the hub rejects requests without a
+loopback `Host` header. Every POST
 must send `Content-Type: application/json` (`415` otherwise), so a browser page cannot
 post to a tokenless loopback hub with a simple form.
 
 The hub rejects snapshots collected more than `--max-clock-skew-ms` in the future
 (default `300000`, `0` = no check) with `400`, and answers `409` instead of silently
-dropping a snapshot older than the stored one. Telemetry older than
-`--snapshot-ttl-ms` (default `172800000`, 48 hours; `0` = never) leaves `/metrics` and
-both leaderboards. `--max-alias-length` caps node/agent aliases (default `64`, `0` =
+dropping a snapshot older than the stored one. Snapshots older than
+`--snapshot-ttl-ms` (default `172800000`, 48 hours; `0` = never) leave metrics,
+leaderboards and briefs. `--max-alias-length` caps node/agent aliases (default `64`, `0` =
 unlimited). The A/B leaderboard keeps snapshots with different `sinceHours` windows in
 separate rows, each with `coverageFromMs` (`null` = all history) and `coverageToMs`.
 Commons revisions are immutable: re-posting an identical revision returns `200`,

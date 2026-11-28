@@ -696,6 +696,25 @@ export class QmdMemoryManager {
         this.#fleetReader ??= new FleetCommonsReader(this.#curationPath);
         return this.#fleetReader.current(config.allowExpired);
     }
+    #freshFleetHits(hits) {
+        if (!hits.some(hit => hit.path.startsWith(FLEET_COMMONS_PREFIX)))
+            return [...hits];
+        const current = new Set(this.#currentFleet().map(fleetCommonsUri));
+        return hits.filter(hit => !hit.path.startsWith(FLEET_COMMONS_PREFIX) || current.has(hit.path));
+    }
+    /**
+     * Delivery-time recheck of already-selected hits (a raw Fleet entry can be retired or expire while a caller judges it):
+     * Fleet hits not in the live cache under the running `allowExpired` policy are dropped. A cache that cannot be read
+     * fails closed for Fleet hits only.
+     */
+    activeFleetHits(hits) {
+        try {
+            return this.#freshFleetHits(hits);
+        }
+        catch {
+            return hits.filter(hit => !hit.path.startsWith(FLEET_COMMONS_PREFIX));
+        }
+    }
     #currentExtracted(paths, filter) {
         const extraction = this.#publishedExtraction;
         if (!extraction)
@@ -1155,7 +1174,7 @@ export class QmdMemoryManager {
         const operation = "vector";
         let results;
         try {
-            results = await this.#search(query, opts);
+            results = this.#freshFleetHits(await this.#search(query, opts));
         }
         catch (error) {
             this.#retrievalTelemetry.record(operation, { elapsedMs: performance.now() - started,
@@ -1200,14 +1219,14 @@ export class QmdMemoryManager {
         const [result] = await this.#searchCandidateJob([queries], opts, true);
         if (result.status === "rejected")
             throw result.reason;
-        return result.value;
+        return this.#freshFleetHits(result.value);
     }
     /**
      * Multi-topic discovery in ONE serialized job: one queue slot behind background indexing, one metadata refresh
      * and store setup, then each topic's lanes in order. A failed topic settles alone; cancellation fails the job.
      */
     async searchCandidateTopics(topics, opts) {
-        return this.#searchCandidateJob(topics, opts, false);
+        return (await this.#searchCandidateJob(topics, opts, false)).map(result => result.status === "fulfilled" ? { status: "fulfilled", value: this.#freshFleetHits(result.value) } : result);
     }
     async #searchCandidateJob(topics, opts, rethrow) {
         const { timings, signal } = opts;

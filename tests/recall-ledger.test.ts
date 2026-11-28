@@ -862,6 +862,133 @@ test("purging a person also erases skill routing and open events bound to their 
   }
 });
 
+test("purging one sender in a shared session never erases another sender's routing or open events", async () => {
+  const root = await tempDir();
+  try {
+    const dbPath = join(root, MEMORY_DATABASE);
+    const now = Date.now();
+    // Memory Whisperer off: no recall_queries at all, only Skill Whisperer's attributed routing rows + open events.
+    const shared = { agentId: "main", sessionId: "main-session", sessionKey: "agent:main:main" };
+    const routing = (senderId: string, runId: string) => ({
+      kind: "skill_routing" as const, record: { ...shared, eventKey: `route-${senderId}`, createdAtMs: now, runId,
+        provider: "slack", accountId: "default", senderId, requestText: `request from ${senderId}`, chatType: "direct",
+        mode: "direct" as const, candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } });
+    const open = (runId: string | undefined) => ({
+      kind: "skill_open" as const, record: { ...shared, createdAtMs: now, runId, skillPath: "/skills/a/SKILL.md",
+        toolName: "read" as const, wasWhispered: true, wasPinned: true } });
+    writeRecallBatch(dbPath, [routing("UA", "run-a"), open("run-a"), routing("UB", "run-b"), open("run-b"), open(undefined)]);
+    assert.deepEqual(purgeRecallPerson(dbPath, { provider: "slack", accountId: "default", senderId: "UA" }),
+      { queries: 0, skillEvents: 2 }, "exactly sender A's routing row and open event");
+    const db = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(db.prepare("SELECT sender_id, request_text FROM skill_routing_events").all().map(r => ({ ...r })),
+        [{ sender_id: "UB", request_text: "request from UB" }], "sender B's routing row survives the shared session key");
+      assert.deepEqual(db.prepare("SELECT run_id FROM skill_open_events ORDER BY id").all().map(r => r.run_id), ["run-b", null],
+        "B's open event and the run-less event of a session B also uses both survive");
+    } finally { db.close(); }
+    assert.deepEqual(purgeRecallPerson(dbPath, { provider: "slack", accountId: "default", senderId: "UB" }),
+      { queries: 0, skillEvents: 3 }, "once no other sender shares the session, its run-less open event goes too");
+    // Shared session where B's recall query identifies B, but B's routing row is senderless (legacy):
+    // purging A must preserve B's query, B's senderless routing row, AND B's run-bound open event!
+    writeRecallBatch(dbPath, [
+      { kind: "query", record: { ...shared, eventKey: "q-b", createdAtMs: now, runId: "run-b2", source: "whisperer",
+        provider: "slack", accountId: "default", senderId: "UB", chatType: "direct", queryFallback: false,
+        corpora: ["memory"], rankingMode: "retrieval", outcome: "emitted", hits: [] } },
+      { kind: "skill_routing", record: { ...shared, eventKey: "route-b2-legacy", createdAtMs: now, runId: "run-b2",
+        mode: "direct", candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+      open("run-b2"),
+      routing("UA", "run-a2"),
+      open("run-a2"),
+    ]);
+    assert.deepEqual(purgeRecallPerson(dbPath, { provider: "slack", accountId: "default", senderId: "UA" }),
+      { queries: 0, skillEvents: 2 }, "purging A deletes only A's attributed routing + open event, never B's");
+    const db2 = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(db2.prepare("SELECT run_id FROM skill_open_events").all().map(r => r.run_id), ["run-b2"],
+        "B's run-bound open event survives even when B's routing row was senderless");
+      assert.deepEqual(db2.prepare("SELECT run_id FROM skill_routing_events").all().map(r => r.run_id), ["run-b2"],
+        "B's senderless routing row survives in a shared session");
+    } finally { db2.close(); }
+    // Shared session with Memory Whisperer OFF: B has ONLY a pre-upgrade senderless route + open event (no attributed
+    // row for B at all). Purging A must preserve B's senderless route, B's run-bound open event, AND run-less open!
+    writeRecallBatch(dbPath, [
+      { kind: "skill_routing", record: { ...shared, agentId: "solo-off", eventKey: "route-b3-legacy", createdAtMs: now,
+        runId: "run-b3", mode: "direct", candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+      { kind: "skill_open", record: { ...shared, agentId: "solo-off", createdAtMs: now, runId: "run-b3",
+        skillPath: "/skills/a/SKILL.md", toolName: "read", wasWhispered: true, wasPinned: true } },
+      { kind: "skill_open", record: { ...shared, agentId: "solo-off", createdAtMs: now,
+        skillPath: "/skills/a/SKILL.md", toolName: "read", wasWhispered: true, wasPinned: true } },
+      { kind: "skill_routing", record: { ...shared, agentId: "solo-off", eventKey: "route-a3", createdAtMs: now,
+        runId: "run-a3", provider: "slack", accountId: "default", senderId: "UA", requestText: "private A3",
+        chatType: "direct", mode: "direct", candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+      { kind: "skill_open", record: { ...shared, agentId: "solo-off", createdAtMs: now, runId: "run-a3",
+        skillPath: "/skills/a/SKILL.md", toolName: "read", wasWhispered: true, wasPinned: true } },
+    ]);
+    assert.deepEqual(purgeRecallPerson(dbPath, { provider: "slack", accountId: "default", senderId: "UA" }),
+      { queries: 0, skillEvents: 2 }, "purging A deletes only A's 2 events even when B has no attributed rows");
+    const db3 = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(db3.prepare("SELECT run_id FROM skill_routing_events WHERE agent_id = 'solo-off'").all().map(r => r.run_id),
+        ["run-b3"], "B's pre-upgrade senderless route survives");
+      assert.deepEqual(db3.prepare("SELECT run_id FROM skill_open_events WHERE agent_id = 'solo-off' ORDER BY id").all().map(r => r.run_id),
+        ["run-b3", null], "B's run-bound open event and shared run-less open event survive");
+    } finally { db3.close(); }
+    // Account-scoped purge erases an account-less direct route `(slack, NULL, UA)` tied to the same run as UA's query,
+    // without touching a route belonging to another account on any run.
+    writeRecallBatch(dbPath, [
+      { kind: "query", record: { ...shared, agentId: "acct", eventKey: "q-acct", createdAtMs: now, runId: "run-acct",
+        source: "whisperer", provider: "slack", accountId: "default", senderId: "UA", chatType: "direct",
+        queryFallback: false, corpora: ["memory"], rankingMode: "retrieval", outcome: "emitted", hits: [] } },
+      { kind: "skill_routing", record: { ...shared, agentId: "acct", eventKey: "route-acct-null", createdAtMs: now,
+        runId: "run-acct", provider: "slack", senderId: "UA", requestText: "private without account",
+        chatType: "direct", mode: "direct", candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+      { kind: "skill_routing", record: { ...shared, agentId: "acct", eventKey: "route-acct-other", createdAtMs: now,
+        runId: "run-other-acct", provider: "slack", accountId: "work", senderId: "UA", requestText: "work account",
+        chatType: "direct", mode: "direct", candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+    ]);
+    assert.deepEqual(purgeRecallPerson(dbPath, { provider: "slack", accountId: "default", senderId: "UA" }),
+      { queries: 1, skillEvents: 1 }, "account-scoped purge erases same-run account-less route for that sender");
+    const db4 = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(db4.prepare("SELECT event_key FROM skill_routing_events WHERE agent_id = 'acct'").all().map(r => r.event_key),
+        ["route-acct-other"], "other account's route survives");
+    } finally { db4.close(); }
+    // Candidate-level foreign check: A has `(session-a, shared key)`, B has legacy run-bound route `(session-b, no key)`
+    // plus run-less route and open event on `(session-b, shared key)`. Purging A must preserve ALL 3 of B's rows!
+    writeRecallBatch(dbPath, [
+      { kind: "skill_routing", record: { agentId: "split-sess", sessionId: "session-a", sessionKey: "agent:split-sess:main",
+        eventKey: "route-a4", createdAtMs: now, runId: "run-a4", provider: "slack", accountId: "default", senderId: "UA",
+        requestText: "private A4", chatType: "direct", mode: "direct", candidateCount: 1, emitted: ["/skills/a/SKILL.md"],
+        scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+      { kind: "skill_routing", record: { agentId: "split-sess", sessionId: "session-b",
+        eventKey: "route-b4-run", createdAtMs: now, runId: "run-b4", mode: "direct", candidateCount: 1,
+        emitted: ["/skills/a/SKILL.md"], scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+      { kind: "skill_routing", record: { agentId: "split-sess", sessionId: "session-b", sessionKey: "agent:split-sess:main",
+        eventKey: "route-b4-runless", createdAtMs: now, mode: "direct", candidateCount: 1,
+        emitted: ["/skills/a/SKILL.md"], scores: [{ path: "/skills/a/SKILL.md", name: "a", score: 0.9 }], outcome: "emitted" } },
+      { kind: "skill_open", record: { agentId: "split-sess", sessionId: "session-b", sessionKey: "agent:split-sess:main",
+        createdAtMs: now, skillPath: "/skills/a/SKILL.md", toolName: "read", wasWhispered: true, wasPinned: true } },
+    ]);
+    assert.deepEqual(purgeRecallPerson(dbPath, { provider: "slack", accountId: "default", senderId: "UA" }),
+      { queries: 0, skillEvents: 1 }, "purging A erases only A's route, never B's run-less events on another sessionId");
+    const db5 = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(db5.prepare("SELECT event_key FROM skill_routing_events WHERE agent_id = 'split-sess' ORDER BY event_key").all().map(r => r.event_key),
+        ["route-b4-run", "route-b4-runless"], "both B's run-bound and run-less routes survive");
+      assert.equal(Number(db5.prepare("SELECT count(*) AS n FROM skill_open_events WHERE agent_id = 'split-sess'").get()?.n),
+        1, "B's run-less open event survives");
+    } finally { db5.close(); }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("memory_search writes summed decision-judge token usage into recall_queries", async t => {
   await using directory = await mkdtempDisposable(join(tmpdir(), "recall-ledger-usage-"));
   const dbPath = join(directory.path, MEMORY_DATABASE);
@@ -909,5 +1036,27 @@ test("memory_search writes summed decision-judge token usage into recall_queries
   try {
     const row = db.prepare("SELECT source, ranking_mode, input_tokens, output_tokens FROM recall_queries").get();
     assert.deepEqual({ ...row }, { source: "tool", ranking_mode: "decision", input_tokens: 100, output_tokens: 10 });
+  } finally { db.close(); }
+});
+
+test("skill_routing_events gains additive request_text / chat_type columns and persists the routed request", async () => {
+  await using directory = await mkdtempDisposable(join(tmpdir(), "recall-ledger-request-text-"));
+  const dbPath = join(directory.path, MEMORY_DATABASE);
+  const now = Date.now();
+  const routing = (eventKey: string, patch: { requestText?: string; chatType?: string } = {}) => ({ kind: "skill_routing" as const,
+    record: { eventKey, createdAtMs: now, agentId: "bill", runId: eventKey, mode: "direct" as const, candidateCount: 1,
+      emitted: [], scores: [], outcome: "rejected", ...patch } });
+  writeRecallBatch(dbPath, [routing("legacy")]);
+  // A database from before the columns existed.
+  const legacy = new DatabaseSync(dbPath);
+  try {
+    for (const column of ["request_text", "chat_type"]) legacy.exec(`ALTER TABLE skill_routing_events DROP COLUMN ${column}`);
+  } finally { legacy.close(); }
+  writeRecallBatch(dbPath, [routing("routed", { requestText: "ship the release", chatType: " Channel " }), routing("blank", { requestText: "  " })]);
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const rows = db.prepare("SELECT event_key, request_text, chat_type FROM skill_routing_events ORDER BY id").all();
+    assert.deepEqual(rows.map(row => [row.event_key, row.request_text, row.chat_type]),
+      [["legacy", null, null], ["routed", "ship the release", "channel"], ["blank", null, null]]);
   } finally { db.close(); }
 });

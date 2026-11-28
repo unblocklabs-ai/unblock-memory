@@ -18,7 +18,8 @@ const SAFE_RECIPES = new Set([
 const PROPOSAL_KINDS: ReadonlySet<string> = new Set([...SKILL_PROPOSAL_KINDS, "other"]);
 
 const looksPrivate = (value: string) =>
-  /[\/@]|[a-zA-Z]:\\|^\\\\|\b[ABCDEGTUW](?=[A-Z0-9]*\d)[A-Z0-9]{8,}\b|\b[a-fA-F\d]{8}(?:-[a-fA-F\d]{4}){3}-[a-fA-F\d]{12}\b/u.test(value);
+  /[\/@]|[a-zA-Z]:\\|^\\\\|\b[ABCDEGTUW](?=[A-Z0-9]*\d)[A-Z0-9]{8,}\b|\b[a-fA-F\d]{8}(?:-[a-fA-F\d]{4}){3}-[a-fA-F\d]{12}\b/u.test(value) ||
+  /^(?:sk-|xox[baprs]-|gh[pousr]_|github_pat_)[a-z0-9]|^[cudgwb]0[a-z0-9]{7,}\b|^\+?(?:\d[.()-]?){7,14}\d$/iu.test(value);
 /** Prometheus label and hub row keys stay short; `maxLength` 0 = unlimited. */
 export const isFleetAlias = (value: unknown, maxLength = 64): value is string =>
   typeof value === "string" && (!maxLength || value.length <= maxLength) &&

@@ -100,6 +100,8 @@ type DeepThoughtManager = MemoryCandidateManager & {
 /** Structural subset of `QmdMemoryRuntime` the curator needs. */
 export type DeepThoughtRuntime = {
   searchableCorpora(): string[];
+  /** The running `fleetCommons.allowExpired` (enabled and opted in); cached answers citing Fleet entries honor it live. */
+  readonly fleetCommonsAllowExpired?: boolean;
   getMemorySearchManager(params: NonNullable<ReturnType<typeof getContext>>):
     Promise<{ manager: DeepThoughtManager | null; error?: string }>;
 };
@@ -815,7 +817,10 @@ async function runDeepThought(
   const generations = timely.settled ? timely.value : undefined;
   const cacheKey = keyFor(generations);
   if (store && cacheKey && generations && !params.fresh && !deps.bypassCache) {
-    const hit = safely(() => store.findFreshDerivedObservation({ ...cacheKey, currentGenerations: generations }));
+    // The running policy, never the last sync's persisted flag: flipping `allowExpired` off invalidates at once.
+    const allowExpired = deps.runtime.fleetCommonsAllowExpired;
+    const hit = safely(() => store.findFreshDerivedObservation({ ...cacheKey, currentGenerations: generations,
+      ...(allowExpired === undefined ? {} : { allowExpired }) }));
     if (hit && CONFIDENCE_LEVELS.includes(hit.confidence)) {
       return {
         status: "complete",

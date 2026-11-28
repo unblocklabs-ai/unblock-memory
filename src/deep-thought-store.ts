@@ -400,10 +400,13 @@ function scoreCandidates(db: DatabaseSync, query: DerivedObservationMatchQuery, 
   return matches.sort((a, b) => b.score - a.score || b.observation.createdAt - a.observation.createdAt);
 }
 
-/** Fleet Commons expiry never moves a collection generation, so a synthesis citing a lapsed entry is checked directly. */
-function citedFleetActive(db: DatabaseSync, found: DerivedObservation, nowMs: number): boolean {
-  return !Array.isArray(found.citations) ||
-    fleetCitationsActive(db, found.citations.flatMap(citation => typeof citation?.source === "string" ? [citation.source] : []), nowMs);
+/**
+ * Fleet Commons expiry never moves a collection generation, so a synthesis citing a lapsed entry is checked directly.
+ * `allowExpired` is the running plugin's policy; omitted, the last sync's persisted policy applies.
+ */
+function citedFleetActive(db: DatabaseSync, found: DerivedObservation, nowMs: number, allowExpired?: boolean): boolean {
+  return !Array.isArray(found.citations) || fleetCitationsActive(db,
+    found.citations.flatMap(citation => typeof citation?.source === "string" ? [citation.source] : []), nowMs, allowExpired);
 }
 
 function limited<T>(items: T[], maxResults: number | undefined): T[] {
@@ -645,9 +648,10 @@ export class DeepThoughtStore {
    * Exact-key lookup of the `fresh` observation. Hits (and counts the hit) only when `currentGenerations` records exactly
    * the same collections at exactly the same generations and every cited Fleet Commons entry is still active; otherwise the
    * row is marked `stale` and `undefined` is returned. An empty `currentGenerations` cannot verify anything: it misses without invalidating.
+   * Pass the running `fleetCommons.allowExpired` as `allowExpired` so a policy flip applies at once (not after the next sync).
    */
   findFreshDerivedObservation(input: DerivedObservationKey & {
-    currentGenerations: Readonly<Record<string, number>>; nowMs?: number;
+    currentGenerations: Readonly<Record<string, number>>; nowMs?: number; allowExpired?: boolean;
   }): DerivedObservation | undefined {
     if (!Object.keys(input.currentGenerations).length) return undefined;
     const now = input.nowMs ?? Date.now();
@@ -659,7 +663,7 @@ export class DeepThoughtStore {
         ORDER BY created_at DESC LIMIT 1`).get(input.agentId, questionHash, input.audienceKey, corpora);
       if (!row) return undefined;
       const found = observation(row);
-      if (!generationsMatch(found.collectionGenerations, input.currentGenerations) || !citedFleetActive(this.db, found, now)) {
+      if (!generationsMatch(found.collectionGenerations, input.currentGenerations) || !citedFleetActive(this.db, found, now, input.allowExpired)) {
         this.db.prepare("UPDATE derived_observations SET status='stale', invalidated_at=? WHERE id=? AND status='fresh'").run(now, found.id);
         return undefined;
       }

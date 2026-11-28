@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync, } from "node:fs";
+import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import picomatch from "picomatch";
+import { isMap, isNode, isScalar, parseDocument } from "yaml";
 import { ensureSchemaUnderWriteLock, immediateTransaction, tableExists } from "./memory-database.js";
 // Loaded by plain-Node workers and offline tools (`memory-steward skills`): keep this module free of `openclaw`.
 /**
@@ -152,17 +154,19 @@ function quality(metrics) {
 /* ───────────────────────────── Writes ───────────────────────────── */
 /**
  * Insert a `pending` proposal, deduplicated by `(agent_id, kind, skill_name, proposal_hash)` (open twins must also share
- * `skill_path` and `base_sha256`). A new proposal supersedes
- * older `pending` ones for the same `(agent_id, kind, skill_name)`, unless one of them targets the same live file revision
- * with strictly better replay metrics (then that one is kept). `approved` rows are never superseded here: an operator
- * decision outranks a background pass.
+ * `skill_path` and `base_sha256`). Competition is scoped to one target file, `(agent_id, kind, skill_name, skill_path)`:
+ * a new proposal supersedes older `pending` ones for that same file, unless one of them targets the same live file revision
+ * with strictly better replay metrics (then that one is kept). Two skills sharing a name in different roots never compete.
+ * `approved` rows are never superseded here: an operator decision outranks a background pass.
  */
 export function upsertSkillProposal(db, input) {
     ensureSkillProposalsSchema(db);
     const agentId = requireText(input.agentId, "agentId");
     const kind = requireEnum(input.kind, SKILL_PROPOSAL_KINDS, "kind");
     const skillName = requireText(input.skillName, "skillName");
-    const skillPath = requireText(input.skillPath, "skillPath");
+    const rawPath = requireText(input.skillPath, "skillPath");
+    // Absolute targets are normalized (`.`/`..` collapsed) so one file always has one dedup / supersession identity.
+    const skillPath = isAbsolute(rawPath) ? resolve(rawPath) : rawPath;
     const title = requireText(input.title, "title");
     const rationale = requireText(input.rationale, "rationale");
     if (typeof input.proposedContent !== "string" || !input.proposedContent.trim()) {
@@ -191,9 +195,10 @@ export function upsertSkillProposal(db, input) {
     const nowMs = requireNow(input.nowMs);
     return atomically(db, () => {
         // An open (pending/approved) twin only counts when it targets the same file revision: a stale-base twin can never
-        // apply, so it must not strand this fresh draft. An operator's reject/apply of the same content stays final.
+        // apply, so it must not strand this fresh draft. An operator's reject/apply of the same content stays final, but only
+        // for that same canonical file: a decision on one SKILL.md never suppresses a proposal for a different file.
         const same = db.prepare(`SELECT * FROM skill_proposals WHERE agent_id=? AND kind=? AND skill_name=? AND proposal_hash=?
-      AND (status IN ('rejected','applied') OR (status IN ('pending','approved') AND skill_path=? AND base_sha256 IS ?))
+      AND skill_path=? AND (status IN ('rejected','applied') OR (status IN ('pending','approved') AND base_sha256 IS ?))
       ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at_ms DESC LIMIT 1`)
             .get(agentId, kind, skillName, proposalHash, skillPath, baseSha256);
         if (same) {
@@ -201,8 +206,8 @@ export function upsertSkillProposal(db, input) {
             return { action: existing.status === "pending" || existing.status === "approved" ? "unchanged" : "previously_reviewed",
                 proposal: existing, superseded: [] };
         }
-        const pending = db.prepare(`SELECT * FROM skill_proposals WHERE agent_id=? AND kind=? AND skill_name=? AND status='pending'
-      ORDER BY created_at_ms`).all(agentId, kind, skillName).map(proposal);
+        const pending = db.prepare(`SELECT * FROM skill_proposals WHERE agent_id=? AND kind=? AND skill_name=? AND skill_path=?
+      AND status='pending' ORDER BY created_at_ms`).all(agentId, kind, skillName, skillPath).map(proposal);
         const incoming = quality(input.replayMetrics);
         const better = pending.find(old => old.baseSha256 === baseSha256 && incoming !== undefined &&
             (quality(old.replayMetrics) ?? -Infinity) > incoming);
@@ -242,7 +247,11 @@ export function reviewSkillProposal(db, input) {
         return requireProposal(db, input.id, input.agentId);
     });
 }
-/** `approved -> applied`, recording where the file landed. Supersedes other open proposals for that file (their base is gone). */
+/**
+ * `approved -> applied`, recording where the file landed. For an edit, every other open proposal for the same file that was
+ * derived from the bytes just displaced (`base_sha256` = this proposal's base) is superseded: its base is gone. Drafts
+ * already based on the newly installed bytes (or any other revision) are left alone.
+ */
 export function markSkillProposalApplied(db, input) {
     const appliedPath = requireText(input.appliedPath, "appliedPath");
     const nowMs = requireNow(input.nowMs);
@@ -254,11 +263,10 @@ export function markSkillProposalApplied(db, input) {
             throw new SkillProposalError("invalid_state", `Skill proposal ${input.id} is ${current.status}, not approved`);
         db.prepare(`UPDATE skill_proposals SET status='applied', applied_at_ms=?, applied_path=?, updated_at_ms=?
       WHERE id=? AND agent_id=? AND status='approved'`).run(nowMs, appliedPath, nowMs, input.id, input.agentId);
-        if (current.kind !== "new_skill") {
-            // Every other open proposal for this file was derived from the bytes just replaced.
+        if (current.kind !== "new_skill" && current.baseSha256) {
             db.prepare(`UPDATE skill_proposals SET status='superseded', updated_at_ms=?
-        WHERE agent_id=? AND id!=? AND skill_path=? AND kind!='new_skill' AND status IN ('pending','approved')`)
-                .run(nowMs, input.agentId, input.id, current.skillPath);
+        WHERE agent_id=? AND id!=? AND skill_path=? AND kind!='new_skill' AND base_sha256=? AND status IN ('pending','approved')`)
+                .run(nowMs, input.agentId, input.id, current.skillPath, current.baseSha256);
         }
         return requireProposal(db, input.id, input.agentId);
     });
@@ -267,30 +275,30 @@ function isInside(root, target) {
     const rel = relative(root, target);
     return rel !== "" && !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
 }
+const errorCode = (error) => error?.code;
+/** The deepest ancestor of `path` (or `path` itself) that exists on disk. */
+function nearestExisting(path) {
+    let current = path;
+    while (!lstatSync(current, { throwIfNoEntry: false })) {
+        const parent = dirname(current);
+        if (parent === current)
+            return current;
+        current = parent;
+    }
+    return current;
+}
 /** Where `path` really lands: the deepest existing ancestor resolved through symlinks, plus the not-yet-created tail. */
 function realLocation(path) {
-    let current = path;
-    const tail = [];
-    for (;;) {
-        try {
-            return join(realpathSync(current), ...tail.reverse());
-        }
-        catch (error) {
-            if (error.code !== "ENOENT")
-                throw error;
-            const parent = dirname(current);
-            if (parent === current)
-                throw error;
-            tail.push(basename(current));
-            current = parent;
-        }
-    }
+    const existing = nearestExisting(path);
+    return join(realpathSync(existing), relative(existing, path));
 }
 /** Same matching as the skills catalog: strictly under `root`, and the portable relative path matches the corpus glob. */
 const matchesSource = (source, root, path) => isInside(root, path) && picomatch.isMatch(relative(root, path).split(sep).join("/"), source.pattern, { dot: false });
+const validSource = (source) => typeof source.root === "string" && !!source.root.trim() && typeof source.pattern === "string" && !!source.pattern;
 /**
  * The skills-corpus admission check shared by `skill-apply` and the Skills pass: `path` is a `SKILL.md` matching one
  * configured source's glob, both lexically (against the configured or canonical root) and after resolving every symlink.
+ * A configured root that does not exist yet is located through its nearest existing ancestor.
  */
 export function isAdmittedSkillPath(path, sources) {
     const lexical = resolve(path);
@@ -304,12 +312,12 @@ export function isAdmittedSkillPath(path, sources) {
         return false;
     }
     return sources.some(source => {
-        if (typeof source.root !== "string" || !source.root.trim() || typeof source.pattern !== "string" || !source.pattern)
+        if (!validSource(source))
             return false;
         const root = resolve(source.root);
         let realRoot;
         try {
-            realRoot = realpathSync(root);
+            realRoot = realLocation(root);
         }
         catch {
             return false;
@@ -331,6 +339,35 @@ function confinedTarget(target, sources) {
         throw new SkillProposalError("path_outside_root", `Refusing to write ${lexical}: outside every configured skills source`);
     }
     return lexical;
+}
+/**
+ * Before creating any directory for a first `new_skill`: the nearest EXISTING ancestor of the target's directory must be a
+ * real directory whose resolved location keeps the whole target inside a configured source root (that root may not exist
+ * yet). Returns the directories `mkdir` will create, outermost first, so each new entry can be made durable.
+ */
+function creatableDirectories(target, sources) {
+    const dir = dirname(target);
+    const ancestor = nearestExisting(dir);
+    const stat = statSync(ancestor, { throwIfNoEntry: false });
+    if (!stat?.isDirectory())
+        throw new SkillProposalError("path_outside_root", `Refusing to create ${dir}: ${ancestor} is not a directory`);
+    const realTarget = join(realpathSync(ancestor), relative(ancestor, target));
+    const inside = sources.some(source => {
+        if (!validSource(source))
+            return false;
+        try {
+            return matchesSource(source, realLocation(resolve(source.root)), realTarget);
+        }
+        catch {
+            return false;
+        }
+    });
+    if (!inside)
+        throw new SkillProposalError("path_outside_root", `Refusing to create ${dir}: ${ancestor} resolves outside every configured skills source`);
+    const created = [];
+    for (let current = dir; current !== ancestor; current = dirname(current))
+        created.unshift(current);
+    return created;
 }
 /** Minimal line diff (common prefix/suffix trimmed) for operator previews. */
 function lineDiff(before, after, context = 2) {
@@ -357,22 +394,62 @@ function lineDiff(before, after, context = 2) {
         lines.push(` ${a[i]}`);
     return lines.join("\n");
 }
-/** Fully written + fsynced sibling temp file; the caller links or renames it into place. */
-function writeTemp(target, content, mode) {
-    const temp = join(dirname(target), `.${SKILL_FILE_NAME}.${randomUUID()}.tmp`);
-    const descriptor = openSync(temp, "wx", mode);
+/** `write(2)` may write fewer bytes than asked: loop until every byte landed (a zero-byte write is an error, never a spin). */
+function writeAll(descriptor, bytes) {
+    for (let offset = 0; offset < bytes.length;) {
+        const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+        if (!Number.isSafeInteger(written) || written <= 0)
+            throw new Error(`Short write: ${offset} of ${bytes.length} bytes`);
+        offset += written;
+    }
+}
+/** Filesystems that cannot fsync a directory (some network, FUSE and container mounts) report one of these. */
+const DIR_FSYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM"]);
+/**
+ * Make a directory entry change (rename / link / mkdir / unlink) durable. Best-effort where the filesystem cannot fsync a
+ * directory at all: the entry change itself already happened, so failing here would only strand an applied proposal.
+ */
+function fsyncDirectory(dir) {
+    if (process.platform === "win32")
+        return; // Windows cannot open a directory for fsync; NTFS journals the entry itself.
+    const descriptor = openSync(dir, "r");
     try {
-        writeSync(descriptor, content);
         fsyncSync(descriptor);
+    }
+    catch (error) {
+        if (!DIR_FSYNC_UNSUPPORTED.has(errorCode(error) ?? ""))
+            throw error;
     }
     finally {
         closeSync(descriptor);
     }
+}
+/** Fully written + fsynced sibling temp file; the caller links or renames it into place. Never leaves a partial temp. */
+function writeTemp(target, content, mode) {
+    const temp = join(dirname(target), `.${SKILL_FILE_NAME}.${randomUUID()}.tmp`);
+    const descriptor = openSync(temp, "wx", mode);
+    try {
+        writeAll(descriptor, Buffer.from(content, "utf8"));
+        fsyncSync(descriptor);
+    }
+    catch (error) {
+        try {
+            closeSync(descriptor);
+        }
+        catch { /* already closed */ }
+        try {
+            unlinkSync(temp);
+        }
+        catch { /* already gone */ }
+        throw error;
+    }
+    closeSync(descriptor);
     return temp;
 }
 /**
  * Atomic no-clobber create: the complete file appears at `target` via `link(2)`, which fails with `EEXIST` instead of
  * replacing anything, so two concurrent creates can never overwrite each other (or an operator's hand-written file).
+ * The directory entry is fsynced before returning.
  */
 export function createFileExclusively(target, content, mode = 0o644) {
     const temp = writeTemp(target, content, mode);
@@ -380,7 +457,7 @@ export function createFileExclusively(target, content, mode = 0o644) {
         linkSync(temp, target);
     }
     catch (error) {
-        if (error.code === "EEXIST")
+        if (errorCode(error) === "EEXIST")
             throw new SkillProposalError("target_exists", `${target} already exists`);
         throw error;
     }
@@ -390,12 +467,13 @@ export function createFileExclusively(target, content, mode = 0o644) {
         }
         catch { /* already gone */ }
     }
+    fsyncDirectory(dirname(target));
 }
-/** Replace `target` only while it still hashes to `expectedSha`, via temp file + rename. */
+/** Replace `target` only while it still hashes to `expectedSha`, via temp file + rename + directory fsync. */
 function replaceAtomically(target, content, mode, expectedSha) {
     const temp = writeTemp(target, content, mode);
     try {
-        // Re-check right before the rename: the window for a concurrent edit is only this one syscall.
+        // Re-check right before the rename: the window for a non-cooperating editor is only this one syscall.
         const live = lstatSync(target, { throwIfNoEntry: false });
         if (!live?.isFile() || sha256(readFileSync(target)) !== expectedSha)
             throw new SkillProposalError("conflict", `${target} changed during apply`);
@@ -408,6 +486,153 @@ function replaceAtomically(target, content, mode, expectedSha) {
         catch { /* already renamed or gone */ }
         throw error;
     }
+    fsyncDirectory(dirname(target));
+}
+/* ── Cross-process apply lock ── */
+/** One lock per target directory: every proposal for one `SKILL.md` (any kind, any process) serializes on it. */
+const APPLY_LOCK_NAME = `.${SKILL_FILE_NAME}.apply.lock`;
+/** How long an apply waits for a busy lock (`0` = wait indefinitely). */
+const DEFAULT_LOCK_WAIT_MS = 30_000;
+/**
+ * Age after which a lock whose owner CANNOT be checked (another host, or an unreadable/partial owner record) is broken;
+ * `0` = never. A same-host owner is only ever judged by its pid: a live process's lock is never broken by age.
+ */
+const DEFAULT_LOCK_STALE_MS = 10 * 60_000;
+const sleepSync = (ms) => { if (ms > 0)
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+function lockOwner(raw) {
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Stale = a same-host owner whose pid is gone (`ESRCH`). An owner this host cannot check (another host, or no readable
+ * `{token,pid,host}`) is stale only past `staleMs` (`0` = never). A live same-host pid is NEVER stale, however old.
+ */
+function lockIsStale(raw, ageMs, staleMs) {
+    const owner = lockOwner(raw);
+    const checkable = owner?.host === hostname() && typeof owner.token === "string" && Number.isSafeInteger(owner.pid) && owner.pid > 0;
+    if (!checkable)
+        return staleMs > 0 && ageMs > staleMs;
+    try {
+        process.kill(owner.pid, 0);
+        return false;
+    }
+    catch (error) {
+        return errorCode(error) === "ESRCH";
+    }
+}
+/** Write `owner` into a freshly `O_EXCL`-created file at `path`; `false` when the file already exists. */
+function createOwnerFile(path, owner) {
+    let descriptor;
+    try {
+        descriptor = openSync(path, "wx", 0o600);
+    }
+    catch (error) {
+        if (errorCode(error) === "EEXIST")
+            return false;
+        throw error;
+    }
+    try {
+        writeAll(descriptor, Buffer.from(JSON.stringify(owner)));
+        fsyncSync(descriptor);
+    }
+    catch (error) {
+        try {
+            closeSync(descriptor);
+        }
+        catch { /* already closed */ }
+        try {
+            unlinkSync(path);
+        }
+        catch { /* already gone */ }
+        throw error;
+    }
+    closeSync(descriptor);
+    return true;
+}
+/** Unlink `path` only while it still holds exactly `raw` (the record judged stale / owned); `true` when it is gone. */
+function unlinkIfUnchanged(path, raw) {
+    let current;
+    try {
+        current = readFileSync(path, "utf8");
+    }
+    catch (error) {
+        if (errorCode(error) === "ENOENT")
+            return true;
+        throw error;
+    }
+    if (current !== raw)
+        return false;
+    try {
+        unlinkSync(path);
+    }
+    catch (error) {
+        if (errorCode(error) !== "ENOENT")
+            throw error;
+    }
+    return true;
+}
+/**
+ * Break a stale lock; `true` when the lock is gone (broken here or released meanwhile), so the caller retries at once.
+ * Never renames a lock aside: under an exclusive `<lock>.break` guard (one breaker at a time), the lock is re-read and
+ * unlinked only if it is still the exact stale record judged — so a fresh lock taken meanwhile can never be removed.
+ */
+function breakStaleLock(path, staleMs, owner) {
+    const read = (target) => {
+        try {
+            return { raw: readFileSync(target, "utf8"), ageMs: Date.now() - lstatSync(target).mtimeMs };
+        }
+        catch (error) {
+            if (errorCode(error) === "ENOENT")
+                return undefined;
+            throw error;
+        }
+    };
+    const judged = read(path);
+    if (!judged)
+        return true;
+    if (!lockIsStale(judged.raw, judged.ageMs, staleMs))
+        return false;
+    const guard = `${path}.break`;
+    if (!createOwnerFile(guard, owner)) {
+        // Another breaker is at work. Its guard is itself freed only once its owner is provably dead (or uncheckable + old).
+        const held = read(guard);
+        if (held && lockIsStale(held.raw, held.ageMs, staleMs))
+            unlinkIfUnchanged(guard, held.raw);
+        return false;
+    }
+    try {
+        return unlinkIfUnchanged(path, judged.raw);
+    }
+    finally {
+        unlinkIfUnchanged(guard, JSON.stringify(owner));
+    }
+}
+/** Acquire the per-target apply lock (an `O_EXCL` lock file holding `{token,pid,host}`); returns its release function. */
+function acquireApplyLock(dir, waitMs, staleMs) {
+    const path = join(dir, APPLY_LOCK_NAME);
+    const owner = { token: randomUUID(), pid: process.pid, host: hostname(), acquiredAtMs: Date.now() };
+    const deadline = waitMs > 0 ? Date.now() + waitMs : Infinity;
+    for (let delay = 5;; delay = Math.min(delay * 2, 100)) {
+        if (createOwnerFile(path, owner)) {
+            // Token-verified release: a lock that is no longer ours (never expected: live owners are never broken) is left alone.
+            return () => { try {
+                unlinkIfUnchanged(path, JSON.stringify(owner));
+            }
+            catch { /* nothing of ours to remove */ } };
+        }
+        if (breakStaleLock(path, staleMs, owner))
+            continue;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0)
+            throw new SkillProposalError("locked", `Another skill apply holds ${path}`);
+        sleepSync(Math.min(delay, remaining));
+    }
 }
 /** A `description_update` must carry exactly the description its content declares, or the reviewed text is not what lands. */
 function assertDescriptionRoundTrip(proposal) {
@@ -417,63 +642,100 @@ function assertDescriptionRoundTrip(proposal) {
         throw new SkillProposalError("invalid_input", `Skill proposal ${proposal.id}: proposedContent does not declare proposedDescription`);
     }
 }
-/**
- * Apply one operator-approved proposal: confine the target to the configured skills sources, verify the live file still
- * matches `base_sha256` (or, for `new_skill`, does not exist yet), write it (temp + rename, or an atomic no-clobber create
- * for `new_skill`), and mark it `applied`. Crash-safe: when the live file already holds exactly the proposed bytes (an
- * earlier apply wrote it but died before recording that), the row is marked `applied` without writing.
- * `dryRun` returns the preview diff without writing or changing state.
- */
-export function applyApprovedProposal(db, input) {
-    if (!hasTable(db))
-        throw new SkillProposalError("not_found", `Skill proposal ${input.id} not found`);
+function approvedProposal(db, input) {
     const current = requireProposal(db, input.id, input.agentId);
     if (current.status !== "approved")
         throw new SkillProposalError("invalid_state", `Skill proposal ${input.id} is ${current.status}, not approved`);
     assertDescriptionRoundTrip(current);
-    let target;
-    if (current.kind === "new_skill") {
-        if (!input.targetDirForNewSkills?.trim())
-            throw new SkillProposalError("invalid_input", "new_skill proposals require targetDirForNewSkills");
-        target = confinedTarget(join(resolve(input.targetDirForNewSkills), current.skillPath), input.allowedSources);
-    }
-    else {
-        target = confinedTarget(current.skillPath, input.allowedSources);
-    }
-    const proposedSha = sha256(current.proposedContent);
-    const mark = (bytesWritten, diff) => ({ status: "applied", targetPath: target, diff, bytesWritten,
-        proposal: markSkillProposalApplied(db, { id: current.id, agentId: current.agentId, appliedPath: target,
-            ...(input.nowMs === undefined ? {} : { nowMs: input.nowMs }) }) });
+    return current;
+}
+function targetOf(current, input) {
+    if (current.kind !== "new_skill")
+        return confinedTarget(current.skillPath, input.allowedSources);
+    if (!input.targetDirForNewSkills?.trim())
+        throw new SkillProposalError("invalid_input", "new_skill proposals require targetDirForNewSkills");
+    return confinedTarget(join(resolve(input.targetDirForNewSkills), current.skillPath), input.allowedSources);
+}
+/** What an apply would do to the live file right now; throws `conflict` / `target_exists` when it must not. */
+function planApply(current, target) {
     const live = statSync(target, { throwIfNoEntry: false });
     const bytes = live?.isFile() ? readFileSync(target) : undefined;
-    if (bytes && sha256(bytes) === proposedSha) {
-        return input.dryRun ? { status: "preview", proposal: current, targetPath: target, diff: "", bytesWritten: 0 } : mark(0, "");
-    }
-    let before = "", mode = 0o644;
+    // Crash recovery: an earlier apply wrote exactly these bytes but died before recording that.
+    if (bytes && sha256(bytes) === sha256(current.proposedContent))
+        return { alreadyApplied: true, diff: "", mode: 0o644 };
     if (current.kind === "new_skill") {
         if (live)
             throw new SkillProposalError("target_exists", `${target} already exists`);
+        return { alreadyApplied: false, diff: lineDiff("", current.proposedContent), mode: 0o644 };
     }
-    else {
-        if (!bytes || !live)
-            throw new SkillProposalError("conflict", `${target} no longer exists`);
-        if (sha256(bytes) !== current.baseSha256) {
-            throw new SkillProposalError("conflict", `${target} changed since the proposal was drafted (base SHA-256 mismatch)`);
+    if (!bytes || !live)
+        throw new SkillProposalError("conflict", `${target} no longer exists`);
+    if (sha256(bytes) !== current.baseSha256) {
+        throw new SkillProposalError("conflict", `${target} changed since the proposal was drafted (base SHA-256 mismatch)`);
+    }
+    return { alreadyApplied: false, diff: lineDiff(bytes.toString("utf8"), current.proposedContent), mode: live.mode & 0o777 };
+}
+/**
+ * Apply one operator-approved proposal: confine the target to the configured skills sources, then — under a cross-process
+ * lock on the target's directory held from the approval re-check through the `applied` receipt — re-read the approval,
+ * verify the live file still matches `base_sha256` (or, for `new_skill`, does not exist yet), write it completely (temp +
+ * fsync + rename, or an atomic no-clobber link for `new_skill`), fsync the directory, and only then mark it `applied`.
+ * Crash-safe: when the live file already holds exactly the proposed bytes (an earlier apply wrote it but died before
+ * recording that), the row is marked `applied` without writing. `dryRun` previews the diff without locking, writing or
+ * changing state.
+ */
+export function applyApprovedProposal(db, input) {
+    if (!hasTable(db))
+        throw new SkillProposalError("not_found", `Skill proposal ${input.id} not found`);
+    const lockWaitMs = input.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS, lockStaleMs = input.lockStaleMs ?? DEFAULT_LOCK_STALE_MS;
+    for (const [name, value] of [["lockWaitMs", lockWaitMs], ["lockStaleMs", lockStaleMs]]) {
+        if (!Number.isSafeInteger(value) || value < 0)
+            throw new SkillProposalError("invalid_input", `${name} must be a non-negative integer`);
+    }
+    const initial = approvedProposal(db, input);
+    let target = targetOf(initial, input);
+    if (input.dryRun) {
+        const plan = planApply(initial, target);
+        return { status: "preview", proposal: initial, targetPath: target, diff: plan.diff, bytesWritten: 0 };
+    }
+    if (initial.kind === "new_skill") {
+        const created = creatableDirectories(target, input.allowedSources);
+        if (created.length) {
+            mkdirSync(dirname(target), { recursive: true, mode: 0o755 });
+            for (const dir of created)
+                fsyncDirectory(dirname(dir));
+            // A symlink swapped in while the directories were created is caught here, before any file is written.
+            target = targetOf(initial, input);
         }
-        before = bytes.toString("utf8");
-        mode = live.mode & 0o777;
     }
-    const diff = lineDiff(before, current.proposedContent);
-    if (input.dryRun)
-        return { status: "preview", proposal: current, targetPath: target, diff, bytesWritten: 0 };
-    if (current.kind === "new_skill") {
-        mkdirSync(dirname(target), { recursive: true, mode: 0o755 });
-        createFileExclusively(target, current.proposedContent, mode);
+    // Lock order is always file lock, then SQLite write lock, so two appliers can never deadlock on each other.
+    const release = acquireApplyLock(dirname(target), lockWaitMs, lockStaleMs);
+    try {
+        // One `BEGIN IMMEDIATE` spans the approval re-check, the base-SHA check, the file write and the `applied` receipt: no
+        // other writer of this database can review, supersede or apply the row in between.
+        return atomically(db, () => {
+            // Under the fence: the approval, the target and the live bytes are re-read, never trusted from before the lock.
+            const current = approvedProposal(db, input);
+            if (targetOf(current, input) !== target)
+                throw new SkillProposalError("conflict", `Skill proposal ${input.id} target changed during apply`);
+            const plan = planApply(current, target);
+            let bytesWritten = 0;
+            if (plan.alreadyApplied)
+                fsyncDirectory(dirname(target)); // the earlier writer may have died before its fsync
+            else if (current.kind === "new_skill")
+                createFileExclusively(target, current.proposedContent, plan.mode);
+            else
+                replaceAtomically(target, current.proposedContent, plan.mode, current.baseSha256);
+            if (!plan.alreadyApplied)
+                bytesWritten = Buffer.byteLength(current.proposedContent);
+            const applied = markSkillProposalApplied(db, { id: current.id, agentId: current.agentId, appliedPath: target,
+                ...(input.nowMs === undefined ? {} : { nowMs: input.nowMs }) });
+            return { status: "applied", proposal: applied, targetPath: target, diff: plan.diff, bytesWritten };
+        });
     }
-    else {
-        replaceAtomically(target, current.proposedContent, mode, current.baseSha256);
+    finally {
+        release();
     }
-    return mark(Buffer.byteLength(current.proposedContent), diff);
 }
 /* ───────────────────────────── Reads ───────────────────────────── */
 const asList = (value) => value === undefined ? undefined : Array.isArray(value) ? value : [value];
@@ -541,17 +803,42 @@ export function withReadOnlySkillProposals(path, fallback, fn) {
     }
 }
 /* ───────────────────────────── SKILL.md text helpers ───────────────────────────── */
-const FRONTMATTER = /^(---\r?\n)([\s\S]*?\r?\n)(---[ \t]*(?:\r?\n|$))/u;
-const BOM = "\uFEFF";
-const BLOCK_SCALAR = /^[|>][1-9+-]*\s*$/u;
-const DESCRIPTION_KEY = /^description\s*:/u;
+/** Same frontmatter framing as the skills catalog (`manager.ts`): `---` line, YAML lines, `---` line. */
+const FRONTMATTER = /^(---[ \t]*\r?\n)((?:[^\n]*\n)*?)(---[ \t]*(?:\r?\n|$))/u;
+const BOM = "﻿";
+const DESCRIPTION_LINE = /^description[ \t]*:/u;
 /** `[bom, rest]`: a leading UTF-8 BOM is carried through every rewrite untouched. */
 const splitBom = (content) => content.startsWith(BOM) ? [BOM, content.slice(1)] : ["", content];
 const eolOf = (content) => content.includes("\r\n") ? "\r\n" : "\n";
+/** Parsed exactly like the skills catalog does (`failsafe`: every scalar is a string, so routing reads what it sees). */
+const parseFrontmatter = (source) => parseDocument(source, { schema: "failsafe" });
+/** The top-level `description` pair of a parsed frontmatter document (quoted or plain key, block or flow map). */
+function descriptionPair(document) {
+    const contents = document.contents;
+    if (!isMap(contents))
+        return undefined;
+    return contents.items.find(pair => isScalar(pair.key) && pair.key.value === "description");
+}
+function scalarText(document) {
+    const value = descriptionPair(document)?.value;
+    return isScalar(value) && typeof value.value === "string" ? value.value.trim() : undefined;
+}
 /**
- * One past the last line of the scalar that starts at `lines[index]`: every following indented line, including blank
- * lines inside it (a block scalar's paragraph breaks). Trailing blank lines are left to the surrounding document.
+ * The frontmatter `description` (plain, quoted or block scalar), or `undefined` when absent. Parsed with the same `yaml`
+ * package and schema as the skills catalog; like the catalog, frontmatter that is not valid YAML (an unquoted `: ` in a
+ * legacy description) falls back to the raw `description:` line.
  */
+export function readSkillDescription(content) {
+    const match = FRONTMATTER.exec(splitBom(content)[1]);
+    if (!match)
+        return undefined;
+    const document = parseFrontmatter(match[2]);
+    const text = scalarText(document);
+    if (text !== undefined || !document.errors.length)
+        return text;
+    return /^description:[ \t]*(.+)$/mu.exec(match[2])?.[1]?.trim() || undefined;
+}
+/** Legacy fallback for frontmatter the YAML parser rejects: one past the last line of the scalar at `lines[index]`. */
 function scalarEnd(lines, index) {
     let end = index + 1;
     for (let i = index + 1; i < lines.length; i++) {
@@ -562,74 +849,96 @@ function scalarEnd(lines, index) {
     }
     return end;
 }
-/** YAML literal (`|`) or folded (`>`) block body, de-indented; chomping is irrelevant because the result is trimmed. */
-function blockScalar(style, lines) {
-    const indent = Math.min(...lines.filter(line => line.trim()).map(line => /^\s*/u.exec(line)[0].length));
-    const text = lines.map(line => line.trim() ? line.slice(indent).trimEnd() : "").join("\n");
-    // Folding: a single line break becomes a space, and each extra blank line keeps one newline.
-    return (style === "|" ? text : text.replace(/([^\n])\n(?=[^\n])/gu, "$1 ").replace(/\n(\n+)/gu, "$1")).trim();
-}
-/** The frontmatter `description` (plain, quoted or block scalar), or `undefined` when absent. */
-export function readSkillDescription(content) {
-    const match = FRONTMATTER.exec(splitBom(content)[1]);
-    if (!match)
-        return undefined;
-    const lines = match[2].split(/\r?\n/u);
-    const index = lines.findIndex(line => DESCRIPTION_KEY.test(line));
-    if (index < 0)
-        return undefined;
-    const raw = lines[index].replace(/^description\s*:\s*/u, "").trimEnd();
-    const body = lines.slice(index + 1, scalarEnd(lines, index));
-    if (BLOCK_SCALAR.test(raw))
-        return body.some(line => line.trim()) ? blockScalar(raw[0], body) : "";
-    const continuation = body.map(line => line.trim()).filter(Boolean);
-    if (raw.startsWith("\"")) {
-        try {
-            return JSON.parse([raw, ...continuation].join(" "));
-        }
-        catch {
-            return raw.slice(1, -1);
-        }
+/** Rewrite the description inside frontmatter `source` (the text between the `---` lines, including its last newline). */
+function rewriteFrontmatter(source, value, newline) {
+    const document = parseFrontmatter(source);
+    const pair = document.errors.length ? undefined : descriptionPair(document);
+    const range = isNode(pair?.value) ? pair.value.range ?? undefined : undefined;
+    if (pair && range) {
+        // Exact source span of the value node: the key (however quoted), comments and every other byte stay put.
+        const [start, end] = range;
+        const replaced = source.slice(start, end);
+        const lineBreak = replaced.endsWith("\r\n") ? "\r\n" : replaced.endsWith("\n") ? "\n" : ""; // a block scalar owns its last newline
+        const gap = start > 0 && source[start - 1] === ":" ? " " : "";
+        return `${source.slice(0, start)}${gap}${value}${lineBreak}${source.slice(end)}`;
     }
-    if (raw.startsWith("'"))
-        return [raw, ...continuation].join(" ").replace(/^'|'$/gu, "").replaceAll("''", "'");
-    return [raw, ...continuation].join(" ").trim();
+    if (!document.errors.length && document.contents !== null && !isMap(document.contents)) {
+        throw new SkillProposalError("invalid_input", "SKILL.md frontmatter is not a mapping");
+    }
+    if (!document.errors.length && isMap(document.contents) && document.contents.flow) {
+        // A flow map (`{name: x}`) gains the key through the AST; the round-trip check below validates the result.
+        document.set("description", value === "" ? "" : JSON.parse(value));
+        return document.toString();
+    }
+    // No description yet, or legacy frontmatter the parser rejects: line-based replace (or append) of the `description` key.
+    const lines = source.split(/\r?\n/u);
+    if (lines.at(-1) === "")
+        lines.pop();
+    const line = `description: ${value}`;
+    const index = lines.findIndex(text => DESCRIPTION_LINE.test(text));
+    if (index < 0)
+        lines.push(line);
+    else
+        lines.splice(index, scalarEnd(lines, index) - index, line);
+    return lines.length ? `${lines.join(newline)}${newline}` : "";
 }
 /**
  * Replace (or add) the frontmatter `description`, leaving every other byte intact: a UTF-8 BOM and the file's line endings
- * are preserved, and a multi-line value (including a `|` / `>` block scalar with blank lines) is replaced whole. The value
- * is written as a JSON string, which is a valid YAML double-quoted scalar. A file without frontmatter gains one. Throws
- * `invalid_input` unless the result reads back as exactly the (whitespace-normalized) proposed description.
+ * are preserved, and the value node's exact YAML source range is replaced (quoted keys, indented or flow maps, block
+ * scalars with blank lines). The value is written as a JSON string, which is a valid YAML double-quoted scalar. A file
+ * without frontmatter gains one. Throws `invalid_input` unless the rewritten frontmatter parses without any YAML error
+ * (e.g. `DUPLICATE_KEY`), every other key parses exactly as before, and its `description` is exactly the
+ * (whitespace-normalized) proposed one.
  */
 export function replaceSkillDescription(content, description, name) {
     const proposed = description.replace(/\s+/gu, " ").trim();
-    const value = `description: ${JSON.stringify(proposed)}`;
+    const value = JSON.stringify(proposed);
     const [bom, body] = splitBom(content);
     const match = FRONTMATTER.exec(body);
-    let updated;
+    let updated, before, after;
     if (!match) {
         const eol = eolOf(body);
-        const header = [...(name ? [`name: ${JSON.stringify(name)}`] : []), value].join(eol);
-        updated = `${bom}---${eol}${header}${eol}---${eol}${eol}${body}`;
+        after = [...(name ? [`name: ${JSON.stringify(name)}`] : []), `description: ${value}`].join(eol) + eol;
+        updated = `${bom}---${eol}${after}---${eol}${eol}${body}`;
     }
     else {
         const newline = match[1].endsWith("\r\n") ? "\r\n" : "\n";
-        const lines = match[2].split(/\r?\n/u);
-        if (lines.at(-1) === "")
-            lines.pop();
-        const index = lines.findIndex(line => DESCRIPTION_KEY.test(line));
-        if (index < 0)
-            lines.push(value);
-        else
-            lines.splice(index, scalarEnd(lines, index) - index, value);
-        updated = `${bom}${match[1]}${lines.join(newline)}${newline}${match[3]}${body.slice(match[0].length)}`;
+        before = match[2];
+        after = rewriteFrontmatter(before, value, newline);
+        updated = `${bom}${match[1]}${after}${match[3]}${body.slice(match[0].length)}`;
     }
-    if (readSkillDescription(updated) !== proposed) {
-        throw new SkillProposalError("invalid_input", "Rewritten SKILL.md frontmatter does not read back as the proposed description");
+    const document = parseFrontmatter(after);
+    const fail = (why) => { throw new SkillProposalError("invalid_input", `Rewritten SKILL.md frontmatter ${why}`); };
+    if (document.errors.length)
+        fail(`is not valid YAML (${document.errors.map(error => error.code).join(", ")})`);
+    if (scalarText(document) !== proposed || readSkillDescription(updated) !== proposed)
+        fail("does not read back as the proposed description");
+    if (before !== undefined) {
+        const original = parseFrontmatter(before);
+        if (!original.errors.length) {
+            const others = (doc) => {
+                const data = doc.toJS();
+                if (!data || typeof data !== "object" || Array.isArray(data))
+                    return {};
+                const { description: _ignored, ...rest } = data;
+                return rest;
+            };
+            if (JSON.stringify(others(original)) !== JSON.stringify(others(document)))
+                fail("changed keys other than description");
+        }
     }
     return updated;
 }
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/u;
+/** CommonMark ATX `## Pitfalls` (≤ 3 spaces of indent: 4 is an indented code block), optional closing `#`s. */
+const PITFALLS_HEADING = /^ {0,3}##[ \t]+pitfalls(?:[ \t]+#+)?[ \t]*$/iu;
+const PITFALLS_SETEXT_TEXT = /^ {0,3}pitfalls[ \t]*$/iu;
+/** Any level-1/2 ATX heading (including an empty `##`). */
+const SECTION_HEADING = /^ {0,3}#{1,2}(?:[ \t]|$)/u;
+const SETEXT_H1 = /^ {0,3}=+[ \t]*$/u;
+const SETEXT_H2 = /^ {0,3}-+[ \t]*$/u;
+/** Lines that can never be setext heading text: blank, ATX headings, list items, block quotes, indented code. */
+const NOT_PARAGRAPH = /^(?:\s*$| {0,3}(?:#{1,6}(?:[ \t]|$)|[-+*][ \t]|\d{1,9}[.)][ \t]|>)| {4}|\t)/u;
 /** Which lines are inside (or delimit) a fenced code block, and the fence still open at the end of the file, if any. */
 function fencedLines(lines) {
     const fenced = [];
@@ -650,10 +959,22 @@ function fencedLines(lines) {
     });
     return { fenced, ...(open ? { open } : {}) };
 }
+/** How many leading rows (`\n`-terminated lines) the YAML frontmatter block occupies, its closing `---` included; 0 if none. */
+function frontmatterRows(content) {
+    const match = FRONTMATTER.exec(splitBom(content)[1]);
+    if (!match)
+        return 0;
+    const block = match[0];
+    return (block.match(/\n/gu)?.length ?? 0) + (block.endsWith("\n") ? 0 : 1);
+}
+/** `lines[i]` is setext heading text underlined (`===` = h1, `---` = h2) by `lines[i + 1]`, outside any fence. */
+const setextAt = (lines, fenced, i) => i + 1 < lines.length && !fenced[i] && !fenced[i + 1] && !NOT_PARAGRAPH.test(lines[i]) &&
+    (SETEXT_H1.test(lines[i + 1]) || SETEXT_H2.test(lines[i + 1]));
 /**
  * Append bullets under the file's `## Pitfalls` section (created at the end when missing). Existing text is untouched,
- * the file's line endings are kept, and headings or section ends inside fenced code blocks (``` / ~~~) are ignored, so a
- * bullet never lands inside code.
+ * the file's line endings are kept, and section detection follows CommonMark: a heading needs at most 3 spaces of indent
+ * (4 = indented code), headings inside fenced code (``` / ~~~) are ignored, and the section ends at the next level-1/2
+ * ATX heading or setext (`===` / `---` underlined) heading, so a bullet never lands inside code or the next section.
  */
 export function appendSkillPitfalls(content, bullets) {
     const items = bullets.map(bullet => bullet.replace(/\s+/gu, " ").trim()).filter(Boolean).map(bullet => `- ${bullet}`);
@@ -663,26 +984,43 @@ export function appendSkillPitfalls(content, bullets) {
     // Each element keeps its own terminator, so untouched lines stay byte-for-byte identical.
     const rows = content.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
     const lines = rows.map(row => row.replace(/\r?\n$/u, ""));
-    const { fenced, open } = fencedLines(lines);
-    const heading = lines.findIndex((line, i) => !fenced[i] && /^##\s+pitfalls\s*$/iu.test(line.trim()));
+    // Markdown starts strictly AFTER the YAML frontmatter's closing `---`: a `# comment` (or a ``` inside a block scalar)
+    // up there is YAML, never a heading or a fence, so frontmatter rows are masked out of every scan below.
+    const frontmatter = frontmatterRows(content);
+    const scanned = fencedLines(lines.slice(frontmatter));
+    const fenced = [...Array.from({ length: frontmatter }, () => true), ...scanned.fenced];
+    const open = scanned.open && { ...scanned.open, at: scanned.open.at + frontmatter };
+    let heading = -1, bodyStart = -1;
+    for (let i = 0; i < lines.length && heading < 0; i++) {
+        if (fenced[i])
+            continue;
+        if (PITFALLS_HEADING.test(lines[i])) {
+            heading = i;
+            bodyStart = i + 1;
+        }
+        else if (PITFALLS_SETEXT_TEXT.test(lines[i]) && setextAt(lines, fenced, i) && SETEXT_H2.test(lines[i + 1])) {
+            heading = i;
+            bodyStart = i + 2;
+        }
+    }
     if (heading < 0) {
         // An unclosed fence runs to the end of the file: close it first so the new section is never code.
         const body = `${content.replace(/\s+$/u, "")}${open ? `${eol}${open.marker}` : ""}`;
         return `${body}${eol}${eol}## Pitfalls${eol}${eol}${items.join(eol)}${eol}`;
     }
-    let end = heading + 1;
-    while (end < lines.length && (fenced[end] || !/^#{1,2}\s/u.test(lines[end])))
+    let end = bodyStart;
+    while (end < lines.length && (fenced[end] || !(SECTION_HEADING.test(lines[end]) || setextAt(lines, fenced, end))))
         end++;
     // A fence left open inside the section swallows the rest of the file: insert before it.
-    if (open && open.at > heading && open.at < end)
+    if (open && open.at >= bodyStart && open.at < end)
         end = open.at;
     let insert = end;
-    while (insert > heading + 1 && lines[insert - 1].trim() === "")
+    while (insert > bodyStart && lines[insert - 1].trim() === "")
         insert--;
     const before = rows.slice(0, insert), after = rows.slice(insert);
     if (before.length && !before.at(-1).endsWith("\n"))
         before[before.length - 1] += eol;
-    const spacer = insert === heading + 1 ? [eol] : [];
+    const spacer = insert === bodyStart ? [eol] : [];
     const added = items.map((item, i) => i === items.length - 1 && !after.length && !content.endsWith("\n") ? item : `${item}${eol}`);
     return [...before, ...spacer, ...added, ...after].join("");
 }

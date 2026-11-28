@@ -218,6 +218,19 @@ test("Slack incoming webhook URLs are redacted with the other secrets", () => {
   assert.equal(redactSecrets(text), "Alerts go to [redacted] now");
 });
 
+test("redactSecrets is linear on long hyphen-/dot-joined runs and still redacts keyed credentials and URL userinfo", () => {
+  for (const input of ["a-".repeat(50_000), "a.".repeat(50_000), "token-".repeat(20_000), "api-key-".repeat(15_000), `https://${"a.".repeat(50_000)}`]) {
+    redactSecrets(input); // warm-up
+    const started = performance.now();
+    assert.equal(redactSecrets(input), input);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 20, `${input.slice(0, 8)}… took ${elapsed.toFixed(1)}ms`);
+  }
+  assert.equal(redactSecrets('my_api_key = "abc" via https://user:pass@db.example.test/x, x-secret-header: q; db_password_v2=1'),
+    'my_api_key = [redacted] via https://[redacted]@db.example.test/x, x-secret-header: [redacted]; db_password_v2=[redacted]');
+  assert.equal(redactSecrets(`${"a-".repeat(40)}token=hunter2`), `${"a-".repeat(40)}token=[redacted]`, "any identifier prefix is kept");
+});
+
 test("deterministic ingestion collapses recurring Captain's Log blockers by topic through their lifecycle", t => {
   const { db } = fixture(t);
   assert.deepEqual(syncDeterministicExpectations(db, "main", NOW), {

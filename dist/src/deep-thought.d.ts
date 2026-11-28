@@ -43,6 +43,8 @@ type DeepThoughtManager = MemoryCandidateManager & {
 /** Structural subset of `QmdMemoryRuntime` the curator needs. */
 export type DeepThoughtRuntime = {
     searchableCorpora(): string[];
+    /** The running `fleetCommons.allowExpired` (enabled and opted in); cached answers citing Fleet entries honor it live. */
+    readonly fleetCommonsAllowExpired?: boolean;
     getMemorySearchManager(params: NonNullable<ReturnType<typeof getContext>>): Promise<{
         manager: DeepThoughtManager | null;
         error?: string;

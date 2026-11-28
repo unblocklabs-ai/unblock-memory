@@ -15,7 +15,7 @@ import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
 import { nonBlank } from "./guards.js";
 import type { RecallHitDisposition, RecallHitRecord, RecallLedgerWriter, RecallQueryOutcome } from "./recall-ledger.js";
-import { hasWhispererTrigger, trustedWhispererOrigin, type WhispererPrompt } from "./whisperer-prompt.js";
+import { hasWhispererTrigger, trustedWhispererOrigin, type WhispererContribution, type WhispererPrompt } from "./whisperer-prompt.js";
 import { WhispererAdmissionTracker } from "./whisperer-admission.js";
 import { planRecall, type RecallPlan } from "./memory-query-v2.js";
 import {
@@ -32,6 +32,7 @@ import { WORKSPACE_AUDIENCE } from "./expectations-store.js";
 import { computeBrightnessMap, type BrightnessConfig } from "./memory-brightness.js";
 import { findMatchingCrystalsReadOnly, recordCrystalHitsAtPath, type CrystalMatch, type CrystalTier } from "./memory-crystals.js";
 import { chatTypeFromSessionKey } from "./session-chat-type.js";
+import { FLEET_COMMONS_PREFIX, filterActiveFleetCitations } from "./fleet-commons.js";
 
 const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
 const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
@@ -161,6 +162,7 @@ async function lookupDerivedObservations(params: {
   queryText: string;
   audienceKey: string;
   allowedCorpora: readonly string[];
+  allowExpired?: boolean;
   isCoolingDown: (id: string) => boolean;
 }): Promise<DerivedObservationMatch[]> {
   const { options, agentId, queryText, audienceKey, allowedCorpora } = params;
@@ -168,7 +170,8 @@ async function lookupDerivedObservations(params: {
     agentId, queryText, audienceKey, allowedCorpora,
     minTokenOverlap: options.minTokenOverlap ?? DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP,
     minSharedTokens: options.minSharedTokens ?? DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS,
-  }).filter(match => !params.isCoolingDown(match.observation.id));
+  // This reader otherwise uses the last sync's expiry policy. Bypass expiry (not revision checks) for an active opt-in.
+  }, params.allowExpired ? Number.NEGATIVE_INFINITY : Date.now()).filter(match => !params.isCoolingDown(match.observation.id));
   if (!candidates.length) return [];
   const sets = new Map<string, string[]>();
   for (const match of candidates) {
@@ -179,10 +182,8 @@ async function lookupDerivedObservations(params: {
     try { return [key, await options.getCollectionGenerations(agentId, corpora)] as const; }
     catch { return [key, undefined] as const; }
   })));
-  const verified = candidates.filter(match => derivedObservationGenerationsFresh(match.observation.collectionGenerations,
+  return candidates.filter(match => derivedObservationGenerationsFresh(match.observation.collectionGenerations,
     snapshots.get(JSON.stringify(canonicalCorpora(match.observation.corpora)))));
-  const maxHints = options.maxHints ?? DEFAULT_DERIVED_MAX_HINTS;
-  return maxHints > 0 ? verified.slice(0, maxHints) : verified;
 }
 
 function crystalHint({ crystal }: CrystalMatch): CrystalHint {
@@ -199,6 +200,7 @@ function failureFields(error: unknown) {
 }
 
 type MemoryWhispererRuntime = {
+  readonly fleetCommonsAllowExpired?: boolean;
   getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }): Promise<{
     manager: MemoryCandidateManager | null;
   }>;
@@ -450,6 +452,13 @@ export function registerMemoryWhisperer(
   });
   const mode = config.mode ?? DEFAULTS.memoryWhisperer.mode;
   const legacy = mode === "legacy";
+  const replayChecks = new WeakMap<WhisperResult, () => WhisperResult | undefined>();
+  /**
+   * A result with a live recheck (raw Fleet hits, derived citations) exposes it as `finalize`, so the combined prompt
+   * re-checks at its OWN delivery boundary: a Fleet hit retired while sibling whisperers were still finishing is dropped.
+   */
+  const withFinalize = (result: WhisperResult | undefined, check = result && replayChecks.get(result)): WhispererContribution | undefined =>
+    result && check ? { ...result, finalize: check } : result;
   const sessions = new WhispererAdmissionTracker<SessionData, WhisperResult>({
     maxSessions: MAX_SESSIONS, maxRunsPerSession: MAX_SEEN_RUNS,
   });
@@ -479,7 +488,11 @@ export function registerMemoryWhisperer(
     if (input.action === "skip" ||
         ((input.family === "cron_wrapper" || input.family === "heartbeat_control") && surface !== "cron" && surface !== "heartbeat")) return;
     const admission = sessions.lookup({ agentId, scope, runId });
-    if (admission.kind === "replay") return admission.result;
+    if (admission.kind === "replay") {
+      const result = await admission.result;
+      const check = result && replayChecks.get(result);
+      return check ? withFinalize(check(), check) : result;
+    }
     if (admission.kind === "superseded") return undefined;
     const currentRequest = queryUserText(input.text);
     if (!currentRequest) return;
@@ -560,6 +573,7 @@ export function registerMemoryWhisperer(
       if (!audienceKey) return [];
       return lookupDerivedObservations({
         options: derivedObservations, agentId, queryText: currentRequest, audienceKey, allowedCorpora: corpora,
+        allowExpired: runtime.fleetCommonsAllowExpired,
         isCoolingDown: id => syntheses.has(id),
       });
     } : undefined);
@@ -578,6 +592,27 @@ export function registerMemoryWhisperer(
       return maxHints > 0 ? matches.slice(0, maxHints) : matches;
     } : undefined);
     let memoryHints: string[] = [];
+    /** Raw hits behind `memoryHints`, and the live-cache recheck for any Fleet Commons hit among them. */
+    let rawEmitted: RankedHint[] = [];
+    let liveRaw: ((hints: readonly RankedHint[]) => RankedHint[]) | undefined;
+    const activeRaw = (hints: readonly RankedHint[]) => {
+      if (!liveRaw || !hints.some(({ hit }) => hit.path.startsWith(FLEET_COMMONS_PREFIX))) return [...hints];
+      return liveRaw(hints);
+    };
+    /**
+     * `memoryHints` as they may be delivered NOW: a raw Fleet hit retired, superseded or expired (under the running
+     * `allowExpired` policy) since it was rendered is dropped. The very same array when nothing changed.
+     */
+    const liveMemoryHints = () => {
+      const active = activeRaw(rawEmitted);
+      return active.length === rawEmitted.length ? memoryHints : packHints(active, memoryHint, MAX_PAYLOAD_CHARS).encoded;
+    };
+    const rawFleetEmitted = () => rawEmitted.some(({ hit }) => hit.path.startsWith(FLEET_COMMONS_PREFIX));
+    /** The raw-only result rechecked at delivery: `normal` itself when nothing changed. */
+    const liveNormal = (normal: WhisperResult | undefined): WhisperResult | undefined => {
+      const hints = liveMemoryHints();
+      return hints === memoryHints ? normal : hints.length ? { appendContext: renderHints(hints) } : undefined;
+    };
     const run = async () => {
       const visible = visibleQueryConversation(event.prompt, event.messages, currentRequest, options.syntheticInput);
       const judgeConversation = selectJudgeConversation(visible);
@@ -705,7 +740,16 @@ export function registerMemoryWhisperer(
       });
       if (signal.aborted || !sessions.isCurrent(state)) return;
       turn.stage = "render";
-      const { emitted, encoded } = packHints(selected, memoryHint, MAX_PAYLOAD_CHARS);
+      // Judging is async: a raw Fleet entry retired or expired meanwhile is dropped before it can be rendered.
+      if (manager.activeFleetHits) {
+        const check = manager.activeFleetHits.bind(manager);
+        liveRaw = hints => {
+          const active = new Set(check(hints.map(({ hit }) => hit)));
+          return hints.filter(({ hit }) => active.has(hit));
+        };
+      }
+      const deliverable = activeRaw(selected);
+      const { emitted, encoded } = packHints(deliverable, memoryHint, MAX_PAYLOAD_CHARS);
       let selection: Map<string, RecallSelection> | undefined;
       if (recallLedger) {
         selection = new Map();
@@ -721,6 +765,7 @@ export function registerMemoryWhisperer(
       }
       for (const candidate of emitted) passages.set(candidate.id, state.turn);
       memoryHints = encoded;
+      rawEmitted = emitted;
       diagnostics?.record(agentId, "memory", "emitted");
       const appendContext = renderHints(memoryHints);
       turn.measurement.outcome = "ok";
@@ -738,15 +783,23 @@ export function registerMemoryWhisperer(
      * without any, the normal result is returned as-is. An abort here never discards the normal result.
      */
     const withDerived = async (normal: WhisperResult | undefined): Promise<WhisperResult | undefined> => {
-      if ((!derivedObservations && !crystals) || signal.aborted) return normal;
+      if ((!derivedObservations && !crystals) || signal.aborted) return liveNormal(normal);
       if (!await derivedLookup.settle() || !await crystalLookup.settle()) {
         derivedWaitAborted = true;
-        return normal;
+        return liveNormal(normal);
       }
-      if ((!derivedLookup.matches.length && !crystalLookup.matches.length) || !sessions.isCurrent(state)) return normal;
-      const derived = packHints(derivedLookup.matches, derivedHint, derivedObservations?.maxPayloadChars ?? MAX_PAYLOAD_CHARS);
+      if ((!derivedLookup.matches.length && !crystalLookup.matches.length) || !sessions.isCurrent(state)) return liveNormal(normal);
+      const activeDerived = (matches: readonly DerivedObservationMatch[]) => derivedObservations && matches.length
+        ? filterActiveFleetCitations(derivedObservations.dbPathForAgent(agentId), matches,
+          match => match.observation.citations.map(citation => citation.source), runtime.fleetCommonsAllowExpired)
+        : [];
+      const matches = activeDerived(derivedLookup.matches);
+      const maxHints = derivedObservations?.maxHints ?? DEFAULT_DERIVED_MAX_HINTS;
+      const budget = derivedObservations?.maxPayloadChars ?? MAX_PAYLOAD_CHARS;
+      const derived = packHints(maxHints > 0 ? matches.slice(0, maxHints) : matches, derivedHint, budget);
       const crystal = packHints(crystalLookup.matches, crystalHint, crystals?.maxPayloadChars ?? MAX_PAYLOAD_CHARS);
-      if (!derived.emitted.length && !crystal.emitted.length) return normal;
+      if (!derived.emitted.length && !crystal.emitted.length) return liveNormal(normal);
+      const rawHints = liveMemoryHints();
       for (const match of derived.emitted) syntheses.set(match.observation.id, state.turn);
       for (const match of crystal.emitted) recentCrystals.set(match.crystal.id, state.turn);
       derivedEmitted = derived.emitted.length;
@@ -763,17 +816,29 @@ export function registerMemoryWhisperer(
         diagnostics?.record(agentId, "memory", "emitted");
         turn.reason = derived.emitted.length ? "derived_emitted" : "crystal_emitted";
       }
-      const appendContext = renderHints([...derived.encoded, ...crystal.encoded, ...memoryHints]);
+      const appendContext = renderHints([...derived.encoded, ...crystal.encoded, ...rawHints]);
       turn.measurement.outcome = "ok";
-      turn.measurement.results = memoryHints.length + derived.emitted.length + crystal.emitted.length;
+      turn.measurement.results = rawHints.length + derived.emitted.length + crystal.emitted.length;
       turn.measurement.contextChars = appendContext.length;
-      return { appendContext };
+      const result = { appendContext };
+      if (derived.emitted.length || rawFleetEmitted()) replayChecks.set(result, () => {
+        const active = activeDerived(derived.emitted);
+        const raw = liveMemoryHints();
+        if (active.length === derived.emitted.length && raw === rawHints) return result;
+        const fresh = packHints(active, derivedHint, budget);
+        if (!fresh.emitted.length && !crystal.emitted.length) return liveNormal(normal);
+        return { appendContext: renderHints([...fresh.encoded, ...crystal.encoded, ...raw]) };
+      });
+      return result;
     };
     // Prompt rebuilds need the same context, not another retrieval or an empty hook result.
     state.result = (async () => {
       try {
         const normal = await abortable(run(), signal);
-        return await withDerived(normal);
+        const result = await withDerived(normal);
+        // Same-run prompt replay rechecks raw Fleet hits too: one retired after this render is never replayed.
+        if (result && !replayChecks.has(result) && rawFleetEmitted()) replayChecks.set(result, () => liveNormal(result));
+        return result;
       } catch (error) {
         if (signal.aborted) return;
         if (error instanceof QueryInputBudgetError) {
@@ -823,7 +888,7 @@ export function registerMemoryWhisperer(
         state.controller.abort();
       }
     })();
-    return state.result;
+    return state.result.then(result => withFinalize(result));
   };
 
   sessions.attach(api);

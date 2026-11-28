@@ -65,6 +65,7 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         onError?: (error: unknown) => void;
     });
     memoryDatabasePath(agentId: string): string;
+    get fleetCommonsAllowExpired(): boolean;
     searchableCorpora(): string[];
     getMemorySearchManager(params: {
         cfg: OpenClawConfig;

@@ -40,7 +40,7 @@ export declare const SKILLS_DEFAULTS: {
     readonly maxNewSkillsPerRun: 2;
     /** Positive + negative prompts replayed per candidate (`0` = unlimited). */
     readonly maxReplayExamples: 40;
-    /** Concurrent replay judgments (`0` = all at once). */
+    /** Concurrent replay judgments, each one `scoreCatalog` call (`0` = all at once). */
     readonly replayConcurrency: 4;
     /** Per replay judgment (`0` = the decision model's unbounded default). */
     readonly replayTimeoutMs: 0;
@@ -166,10 +166,13 @@ export type StewardSkillsPassResult = Outcome & {
     nextDueAt?: number;
     usage?: StewardUsage;
 };
+/** What a replayed prompt is: the exact request the skill router saw, or the run's recall query standing in for it. */
+type ReplayBasis = "routed_request" | "query_proxy";
 export type ReplayExample = {
     prompt: string;
     label: "positive" | "negative";
     source: string;
+    basis?: ReplayBasis;
 };
 export type ReplayGates = {
     minRecallGainPp: number;
@@ -189,7 +192,9 @@ export type ReplayOutcome = {
 /**
  * Replay real examples through the production scorer for BOTH descriptions. Each judgment is one isolated single-candidate
  * call (the production scorer judges every skill independently), so a candidate is measured exactly as it would be routed.
- * An example whose baseline or candidate judgment fails is dropped from both sides (and counted in `examplesFailed`).
+ * `concurrency` bounds the individual `scoreCatalog` calls in flight (baseline and candidate count separately), so `1`
+ * means strictly one judgment at a time. An example whose baseline or candidate judgment fails is dropped from both sides
+ * (and counted in `examplesFailed`).
  */
 export declare function replaySkillDescription(params: {
     skillName: string;

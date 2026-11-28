@@ -281,9 +281,19 @@ export async function searchMemory(manager, queries, options) {
     }
     observation.eligible = candidates.length;
     options.onCandidates?.(observation);
+    /**
+     * Final delivery boundary: judging is async, so a Fleet Commons hit retired, superseded or expired since retrieval is
+     * dropped right before results are returned (to `memory_search`, `deep_thought` and the whisperer alike).
+     */
+    const stillActive = (entries, hitOf) => {
+        if (!manager.activeFleetHits || !entries.length)
+            return entries;
+        const active = new Set(manager.activeFleetHits(entries.map(hitOf)));
+        return entries.filter(entry => active.has(hitOf(entry)));
+    };
     const fallback = (reason) => {
         // Retrieval scores are not decision model usefulness probabilities.
-        const ranked = rankHits([...candidates], entry => entry.hit, options.brightness).map(entry => entry.hit);
+        const ranked = rankHits(stillActive([...candidates], entry => entry.hit), entry => entry.hit, options.brightness).map(entry => entry.hit);
         const limit = options.maxResults ?? 5;
         const results = ranked.slice(0, limit);
         if (trackTrace) {
@@ -370,7 +380,7 @@ export async function searchMemory(manager, queries, options) {
     observation.judgeMs = timings.judgeMs ?? 0;
     if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
         return fallback("all_judgments_failed");
-    const ranked = rankHits(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result, options.brightness);
+    const ranked = rankHits(stillActive(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result), entry => entry.result, options.brightness);
     const maxResults = options.maxResults ?? 5;
     const passed = topicCount
         ? reserveTopicFinalists(ranked, topicCount, maxResults)

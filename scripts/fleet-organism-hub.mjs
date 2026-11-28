@@ -19,15 +19,22 @@ const { values } = parseArgs({
     "max-clock-skew-ms": { type: "string" },
     "snapshot-ttl-ms": { type: "string" },
     "max-alias-length": { type: "string" },
+    "max-title-chars": { type: "string" },
+    "max-body-chars": { type: "string" },
     "forbidden-terms-file": { type: "string" },
   },
 });
 const port = Number(values.port);
 if (!/^\d+$/u.test(values.port) || port > 65535) throw new Error("Invalid --port");
 const fallback = values["token-file"];
+const ingestTokens = values["ingest-tokens-file"] === undefined ? undefined : JSON.parse(readFileSync(values["ingest-tokens-file"], "utf8"));
+if (ingestTokens !== undefined && (ingestTokens === null || typeof ingestTokens !== "object" || Array.isArray(ingestTokens)
+  || !Object.values(ingestTokens).every(token => typeof token === "string"))) {
+  throw new Error("--ingest-tokens-file must be a JSON object of node alias -> token");
+}
 const covered = {
   read: Boolean(values["read-token-file"] ?? fallback),
-  ingest: Boolean(values["ingest-token-file"] ?? values["ingest-tokens-file"] ?? fallback),
+  ingest: Boolean(values["ingest-token-file"] ?? fallback) || Object.keys(ingestTokens ?? {}).length > 0,
   operator: Boolean(values["operator-token-file"] ?? fallback),
 };
 if (!Object.values(covered).every(Boolean) && !["localhost", "127.0.0.1", "::1"].includes(values.host)) {
@@ -46,12 +53,8 @@ const limit = flag => {
 const limits = Object.fromEntries(Object.entries({
   maxBodyBytes: limit("max-body-bytes"), maxClockSkewMs: limit("max-clock-skew-ms"),
   snapshotTtlMs: limit("snapshot-ttl-ms"), maxAliasLength: limit("max-alias-length"),
+  maxTitleChars: limit("max-title-chars"), maxBodyChars: limit("max-body-chars"),
 }).filter(([, value]) => value !== undefined));
-const ingestTokens = values["ingest-tokens-file"] === undefined ? undefined : JSON.parse(readFileSync(values["ingest-tokens-file"], "utf8"));
-if (ingestTokens !== undefined && (ingestTokens === null || typeof ingestTokens !== "object" || Array.isArray(ingestTokens)
-  || !Object.values(ingestTokens).every(token => typeof token === "string"))) {
-  throw new Error("--ingest-tokens-file must be a JSON object of node alias -> token");
-}
 // One forbidden Commons term per line (client names, codenames); blank lines and # comments are ignored.
 const forbiddenTerms = values["forbidden-terms-file"] === undefined ? undefined : readFileSync(values["forbidden-terms-file"], "utf8")
   .split(/\r?\n/u).map(line => line.trim()).filter(line => line && !line.startsWith("#"));

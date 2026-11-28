@@ -86,7 +86,7 @@ declare const qualitySchema: Type.TObject<{
 declare const sentimentSchema: Type.TObject<{
     sentiment: Type.TObject<{
         type: Type.TLiteral<"choice">;
-        choice: Type.TEnum<("satisfied" | "dissatisfied" | "mixed" | "neutral" | "unrelated" | "unclear")[]>;
+        choice: Type.TEnum<("mixed" | "satisfied" | "dissatisfied" | "neutral" | "unrelated" | "unclear")[]>;
         confidence: Type.TNumber;
         probabilities: Type.TObject<{
             [k: string]: Type.TNumber;
