@@ -172,42 +172,44 @@ export class CurationStore {
             if (row.type === "ambiguous_event_time" && params.status === "resolved" && !params.annotation) {
                 throw new Error("resolving an ambiguous event-time task requires a date annotation");
             }
-            if (params.annotation) {
-                if (row.type !== "ambiguous_event_time") {
-                    throw new Error("date annotations can only resolve ambiguous event-time tasks");
-                }
-                if (params.status !== "resolved") {
-                    throw new Error("date annotations require resolved status");
-                }
-                if (!Number.isFinite(Date.parse(params.annotation.eventTime))) {
-                    throw new Error("date annotation eventTime must be an ISO 8601 timestamp");
-                }
-                const fingerprint = params.annotation.scope === "document" ? "" : row.content_fingerprint;
-                if (params.annotation.scope === "chunk" && !fingerprint) {
-                    throw new Error("chunk annotation requires a content fingerprint");
-                }
-                this.#db.prepare(`
-          INSERT INTO temporal_annotations
-            (corpus, collection, path, content_fingerprint, event_time, basis, evidence,
-             qmd_hash, qmd_seq, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-          ON CONFLICT(corpus, collection, path, content_fingerprint) DO UPDATE SET
-            event_time = excluded.event_time,
-            basis = excluded.basis,
-            evidence = excluded.evidence,
-            qmd_hash = NULL,
-            qmd_seq = NULL,
-            updated_at = excluded.updated_at
-        `).run(row.corpus, row.collection, row.path, fingerprint, params.annotation.eventTime, params.annotation.basis, params.annotation.evidence, now, now);
-            }
+            if (params.annotation)
+                this.#writeTaskAnnotation(row, params.status, params.annotation, now);
             this.#db.prepare(`
         UPDATE maintenance_tasks
         SET status = ?, resolution_note = ?, updated_at = ?
         WHERE id = ?
       `).run(params.status, params.note ?? null, now, params.id);
-            const updated = task(this.#db.prepare("SELECT * FROM maintenance_tasks WHERE id = ?").get(params.id));
-            return updated;
+            return task(this.#db.prepare("SELECT * FROM maintenance_tasks WHERE id = ?").get(params.id));
         });
+    }
+    /** Validates and upserts a task's date annotation, resetting its QMD locator; runs inside `updateTask`'s transaction. */
+    #writeTaskAnnotation(row, status, annotation, now) {
+        if (row.type !== "ambiguous_event_time") {
+            throw new Error("date annotations can only resolve ambiguous event-time tasks");
+        }
+        if (status !== "resolved") {
+            throw new Error("date annotations require resolved status");
+        }
+        if (!Number.isFinite(Date.parse(annotation.eventTime))) {
+            throw new Error("date annotation eventTime must be an ISO 8601 timestamp");
+        }
+        const fingerprint = annotation.scope === "document" ? "" : row.content_fingerprint;
+        if (annotation.scope === "chunk" && !fingerprint) {
+            throw new Error("chunk annotation requires a content fingerprint");
+        }
+        this.#db.prepare(`
+      INSERT INTO temporal_annotations
+        (corpus, collection, path, content_fingerprint, event_time, basis, evidence,
+         qmd_hash, qmd_seq, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+      ON CONFLICT(corpus, collection, path, content_fingerprint) DO UPDATE SET
+        event_time = excluded.event_time,
+        basis = excluded.basis,
+        evidence = excluded.evidence,
+        qmd_hash = NULL,
+        qmd_seq = NULL,
+        updated_at = excluded.updated_at
+    `).run(row.corpus, row.collection, row.path, fingerprint, annotation.eventTime, annotation.basis, annotation.evidence, now, now);
     }
     updateAnnotationLocation(params) {
         this.#db.prepare(`

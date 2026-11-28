@@ -1,5 +1,32 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLOutputValue } from "node:sqlite";
 import { zstdDecompressSync } from "node:zlib";
+import { record } from "./guards.js";
+
+export const hostSessionCatalog = {
+  from: `FROM session_windows w LEFT JOIN conversations c ON c.conversation_id=w.primary_conversation_id`,
+  provider: "COALESCE(w.channel,c.channel)",
+  accountId: "COALESCE(w.account_id,c.account_id)",
+};
+
+export function decodeTranscriptEvent(row: { eventJson: string }): Record<string, unknown> | undefined {
+  let event: unknown;
+  try { event = JSON.parse(row.eventJson); }
+  catch { throw new Error("invalid transcript event JSON"); }
+  return record(event);
+}
+
+/** Share column inspection only within one snapshot, not across host migrations. */
+export function inspectTranscriptColumns(db: DatabaseSync) {
+  const tables = new Map<string, ReadonlySet<SQLOutputValue>>();
+  return (table: string) => {
+    let columns = tables.get(table);
+    if (!columns) {
+      columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+      tables.set(table, columns);
+    }
+    return columns;
+  };
+}
 
 /** Identity fence, not a payload-format allowlist. Required capabilities are checked below. */
 export function agentTranscriptSchemaVersion(db: DatabaseSync, errorMessage?: string): number {
@@ -44,21 +71,19 @@ export class AgentTranscriptReader {
   readonly #utf8Storage: boolean;
   readonly #indexed: boolean;
   readonly #classified: boolean;
-  constructor(readonly db: DatabaseSync, agentId: string, errorMessage?: string) {
+  constructor(readonly db: DatabaseSync, agentId: string, errorMessage?: string, columns = inspectTranscriptColumns(db)) {
     const version = agentTranscriptSchemaVersion(db, errorMessage);
     this.#schemaVersion = version;
     this.#utf8Storage = db.prepare("PRAGMA encoding").get()?.encoding === "UTF-8";
     assertAgentTranscriptIdentity(db, agentId, version, errorMessage);
-    const required = {
-      transcript_events: ["session_id", "seq", "event_json", "created_at"],
-      session_transcript_active_events: ["session_id", "active_position", "event_seq"],
-    };
-    const columns = (table: string) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
-    for (const [table, names] of Object.entries(required)) {
-      const found = columns(table);
-      if (names.some(name => !found.has(name))) throw new Error(`Unsupported transcript capabilities: ${table}`);
-    }
     const payload = columns("transcript_events");
+    if (["session_id", "seq", "event_json", "created_at"].some(name => !payload.has(name))) {
+      throw new Error("Unsupported transcript capabilities: transcript_events");
+    }
+    const active = columns("session_transcript_active_events");
+    if (["session_id", "active_position", "event_seq"].some(name => !active.has(name))) {
+      throw new Error("Unsupported transcript capabilities: session_transcript_active_events");
+    }
     this.#compressed = payload.has("event_zstd") && payload.has("event_utf8_bytes");
     if ((version >= 23 || payload.has("event_zstd") || payload.has("event_utf8_bytes")) && !this.#compressed) {
       throw new Error("Unsupported transcript compression capabilities");
@@ -68,7 +93,7 @@ export class AgentTranscriptReader {
     const index = columns("session_transcript_index_state");
     this.#indexed = ["session_id", "indexed_seq", "needs_rebuild"].every(name => index.has(name));
     if ((version >= 25 || index.size > 0) && !this.#indexed) throw new Error("Unsupported transcript index capabilities");
-    this.#classified = columns("session_transcript_active_events").has("context_eligible");
+    this.#classified = active.has("context_eligible");
   }
 
   /** Include storage availability in incremental fingerprints, not just hot row counts. */

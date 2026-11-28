@@ -6,8 +6,9 @@ export type QualityCursor = {
     documentId: number;
     seq: number;
 };
+type QualityStructure = "empty" | "encoded_message" | "serialized_message" | "plain_or_structured";
 /** A formatting clue, never proof that JSON or structured data is worthless. */
-export declare function qualityStructure(text: string): "empty" | "encoded_message" | "serialized_message" | "plain_or_structured";
+export declare function qualityStructure(text: string): QualityStructure;
 export declare function auditQualityPage(params: {
     db: QMDStore["internal"]["db"];
     curation: CurationStore;
@@ -63,3 +64,4 @@ export declare function auditQualityPage(params: {
     policy: string;
     scope: string;
 }>;
+export {};

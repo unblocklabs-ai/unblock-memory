@@ -10,6 +10,40 @@ import { nonBlank, record } from "./guards.js";
 import { classifySyntheticInput, isSyntheticEvidence, type SyntheticInputFilterConfig } from "./synthetic-input.js";
 import { sliceHeadSafe } from "./text-span.js";
 
+type QueryHistoryEntry = { kind: "reset" } | { kind: "skip" } |
+  { kind: "message"; userTurn: boolean; mirror: boolean; message: QueryConversation["history"][number] };
+
+function decodeQueryHistory(item: unknown, syntheticInput?: SyntheticInputFilterConfig): QueryHistoryEntry {
+  const event = record(item), message = record(event?.type === "message" ? event.message : item);
+  if (event?.type === "compaction" || message?.role === "compactionSummary") return { kind: "reset" };
+  if (!message || message.role === "toolResult" || message.role === "tool") return { kind: "skip" };
+  const meta = record(message.__openclaw);
+  if (message.role === "user" && record(meta?.senderIdentity)?.senderKind === "bot") return { kind: "reset" };
+  const mirror = message.provider === "openclaw" && message.model === "delivery-mirror";
+  if (message.role === "assistant" && (message.channel === "analysis" || message.stopReason === "error" ||
+    message.stopReason === "aborted" || (message.provider === "openclaw" && message.model === "gateway-injected") ||
+    (mirror && record(message.openclawDeliveryMirror)?.kind === "channel-final-suppressed"))) return { kind: "skip" };
+  const text = messageText(message);
+  const sender = nonBlank(meta?.senderId) ?? nonBlank(message.senderId);
+  const upstream = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : undefined;
+  const content = text?.role === "user"
+    ? (upstream ? queryUserText(upstream, sender) : undefined) ??
+      // A decorated upstream string can fall back to content; a rejected Conversation info envelope cannot.
+      (upstream && CONVERSATION_INFO.test(upstream.trim()) ? undefined : (text.text ? queryUserText(text.text, sender) : undefined))
+    : text?.text;
+  const classified = classifySyntheticInput({ text: content ?? "", role: message.role,
+    inputProvenance: message.inputProvenance ?? message.provenance ?? event?.inputProvenance,
+    display: message.display ?? event?.display,
+  }, syntheticInput);
+  const userTurn = message.role === "user";
+  const unusable = !classified.text || isSyntheticEvidence(classified);
+  if (userTurn && (unusable || /^(?:<relevant-memories>|<unblock_memory>|<conversation_context>)/.test(classified.text))) {
+    return { kind: "reset" };
+  }
+  if (!text || unusable) return { kind: "skip" };
+  return { kind: "message", userTurn, mirror, message: { role: text.role, content: classified.text } };
+}
+
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
 export function visibleQueryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string,
   syntheticInput?: SyntheticInputFilterConfig): QueryConversation {
@@ -17,45 +51,19 @@ export function visibleQueryConversation(prompt: string, messages: readonly unkn
   const visible: QueryConversation["history"] = [];
   const assistantTexts = new Map<string, boolean>();
   for (const item of messages) {
-    const event = record(item), message = record(event?.type === "message" ? event.message : item);
-    if (event?.type === "compaction" || message?.role === "compactionSummary") {
+    const entry = decodeQueryHistory(item, syntheticInput);
+    if (entry.kind === "reset") {
       visible.length = 0; assistantTexts.clear(); continue;
     }
-    if (!message || message.role === "toolResult" || message.role === "tool") continue;
-    const meta = record(message.__openclaw);
-    if (message.role === "user" && record(meta?.senderIdentity)?.senderKind === "bot") {
-      visible.length = 0; assistantTexts.clear(); continue;
-    }
-    const mirror = message.provider === "openclaw" && message.model === "delivery-mirror";
-    if (message.role === "assistant" && (message.channel === "analysis" || message.stopReason === "error" ||
-      message.stopReason === "aborted" || (message.provider === "openclaw" && message.model === "gateway-injected") ||
-      (mirror && record(message.openclawDeliveryMirror)?.kind === "channel-final-suppressed"))) continue;
-    const text = messageText(message);
-    const sender = nonBlank(meta?.senderId) ?? nonBlank(message.senderId);
-    const upstream = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : undefined;
-    const content = text?.role === "user"
-      ? (upstream ? queryUserText(upstream, sender) : undefined) ??
-        // Fall back to canonical message.content only when upstreamUserText is absent or has a decorated non-envelope prefix,
-        // never to bypass a rejected Conversation info envelope.
-        (upstream && CONVERSATION_INFO.test(upstream.trim()) ? undefined : (text.text ? queryUserText(text.text, sender) : undefined))
-      : text?.text;
-    const classified = classifySyntheticInput({ text: content ?? "", role: message.role,
-      inputProvenance: message.inputProvenance ?? message.provenance ?? event?.inputProvenance,
-      display: message.display ?? event?.display,
-    }, syntheticInput);
-    if (message.role === "user") {
-      assistantTexts.clear();
-      if (!classified.text || isSyntheticEvidence(classified) || /^(?:<relevant-memories>|<unblock_memory>|<conversation_context>)/.test(classified.text)) {
-        visible.length = 0; continue;
-      }
-    }
-    if (!text || !classified.text || isSyntheticEvidence(classified)) continue;
-    if (text.role === "assistant") {
-      const previous = assistantTexts.get(classified.text);
-      assistantTexts.set(classified.text, mirror);
+    if (entry.kind === "skip") continue;
+    if (entry.userTurn) assistantTexts.clear();
+    const { message, mirror } = entry;
+    if (message.role === "assistant") {
+      const previous = assistantTexts.get(message.content);
+      assistantTexts.set(message.content, mirror);
       if (previous !== undefined && (mirror || previous)) continue;
     }
-    visible.push({ role: text.role, content: classified.text });
+    visible.push(message);
   }
   const last = visible.at(-1);
   if (last?.role === "user" && last.content.replaceAll("\r\n", "\n") === currentRequest.replaceAll("\r\n", "\n")) visible.pop();

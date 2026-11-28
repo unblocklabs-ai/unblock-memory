@@ -1,4 +1,14 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLOutputValue } from "node:sqlite";
+export declare const hostSessionCatalog: {
+    from: string;
+    provider: string;
+    accountId: string;
+};
+export declare function decodeTranscriptEvent(row: {
+    eventJson: string;
+}): Record<string, unknown> | undefined;
+/** Share column inspection only within one snapshot, not across host migrations. */
+export declare function inspectTranscriptColumns(db: DatabaseSync): (table: string) => ReadonlySet<SQLOutputValue>;
 /** Identity fence, not a payload-format allowlist. Required capabilities are checked below. */
 export declare function agentTranscriptSchemaVersion(db: DatabaseSync, errorMessage?: string): number;
 export declare function assertAgentTranscriptIdentity(db: DatabaseSync, agentId: string, version: number, errorMessage?: string): void;
@@ -26,7 +36,7 @@ type TranscriptSnapshot = {
 export declare class AgentTranscriptReader {
     #private;
     readonly db: DatabaseSync;
-    constructor(db: DatabaseSync, agentId: string, errorMessage?: string);
+    constructor(db: DatabaseSync, agentId: string, errorMessage?: string, columns?: (table: string) => ReadonlySet<SQLOutputValue>);
     /** Include storage availability in incremental fingerprints, not just hot row counts. */
     coldSql(sessionIdExpression: string): string;
     /** Caller owns a transaction so metadata, cold marker, bounds and rows share one snapshot. */

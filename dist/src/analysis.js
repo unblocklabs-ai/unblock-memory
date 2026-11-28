@@ -283,30 +283,17 @@ function members(db, runId, clusterId, limit, offset, sort, temporal) {
         date_asc: "julianday(COALESCE(m.event_time, m.source_modified_at)) ASC, m.hash, m.seq",
     }[sort];
     const rows = db.prepare(`
-    WITH candidate_times AS (
+    WITH chronology AS (
       SELECT
         m.hash,
         m.seq,
         d.collection,
         d.path,
         d.modified_at AS source_modified_at,
-        CASE
-          WHEN d.collection = ? THEN d.modified_at
-          WHEN d.path GLOB '*[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9].md'
-            THEN substr(d.path, length(d.path) - 12, 10) || 'T00:00:00.000Z'
-          ELSE annotation.event_time
-        END AS event_time,
-        CASE
-          WHEN d.collection = ? THEN 'session'
-          WHEN d.path GLOB '*[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9].md' THEN 'path'
-          ELSE annotation.basis
-        END AS event_time_basis,
-        CASE
-          WHEN d.collection = ? THEN 1
-          WHEN d.path GLOB '*[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9].md' THEN 2
-          WHEN annotation.event_time IS NOT NULL THEN 3
-          ELSE 4
-        END AS priority
+        d.collection = ? AS is_session,
+        d.path GLOB '*[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9].md' AS is_dated_path,
+        annotation.event_time AS annotation_time,
+        annotation.basis AS annotation_basis
       FROM memory_analysis_available_memberships m
       JOIN documents d ON d.hash = m.hash AND d.active = 1
       LEFT JOIN memory_temporal_annotations annotation
@@ -315,6 +302,30 @@ function members(db, runId, clusterId, limit, offset, sort, temporal) {
        AND (annotation.document_wide = 1 OR
             (annotation.qmd_hash = m.hash AND annotation.qmd_seq = m.seq))
       WHERE m.run_id = ? AND m.cluster_id = ?
+    ), candidate_times AS (
+      SELECT
+        hash,
+        seq,
+        collection,
+        path,
+        source_modified_at,
+        CASE
+          WHEN is_session THEN source_modified_at
+          WHEN is_dated_path THEN substr(path, length(path) - 12, 10) || 'T00:00:00.000Z'
+          ELSE annotation_time
+        END AS event_time,
+        CASE
+          WHEN is_session THEN 'session'
+          WHEN is_dated_path THEN 'path'
+          ELSE annotation_basis
+        END AS event_time_basis,
+        CASE
+          WHEN is_session THEN 1
+          WHEN is_dated_path THEN 2
+          WHEN annotation_time IS NOT NULL THEN 3
+          ELSE 4
+        END AS priority
+      FROM chronology
     ), ranked_times AS (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY hash, seq
@@ -344,7 +355,7 @@ function members(db, runId, clusterId, limit, offset, sort, temporal) {
     SELECT * FROM member_rows m
     ORDER BY ${order}
     LIMIT ? OFFSET ?
-  `).all(temporal.sessionCollection ?? "", temporal.sessionCollection ?? "", temporal.sessionCollection ?? "", runId, clusterId, runId, clusterId, limit, offset);
+  `).all(temporal.sessionCollection ?? "", runId, clusterId, runId, clusterId, limit, offset);
     let collections;
     let paths;
     let remaining = DEFAULTS.analysis.totalExcerptMaxBytes;

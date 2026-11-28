@@ -17,7 +17,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
-import { AgentTranscriptReader } from "./agent-transcript.js";
+import { AgentTranscriptReader, decodeTranscriptEvent, hostSessionCatalog } from "./agent-transcript.js";
 import { record, nonBlank } from "./guards.js";
 import { jsonHash } from "./json-hash.js";
 import { isInteractionCategory } from "./people-background.js";
@@ -61,6 +61,7 @@ export type ReviewManifest = {
 
 type IdentityEntry = { person: ReviewPerson; confirmedHuman: boolean };
 type TranscriptSnapshot = Extract<ReturnType<AgentTranscriptReader["read"]>, { kind: "ready" }>;
+type Exchange = { kind: "attributed"; person: ReviewPerson } | { kind: "unattributed" } | { kind: "excluded" };
 
 /**
  * Trimmed, non-empty sentence spans of a blurb: `[start, end)` is the trimmed sentence and `segmentEnd` the end of its
@@ -209,33 +210,30 @@ function inventorySessionTranscript(
   const sessionId = String(session.sessionId);
   const participants = new Set<string>();
   const messages: unknown[] = [];
-  let currentPerson: ReviewPerson | undefined;
-  let excludedExchange = false;
+  let exchange: Exchange = { kind: "unattributed" };
 
   for (const row of snapshot.rows) {
     const inWindow = row.createdAt >= window.since && row.createdAt < window.until;
-    let event: Record<string, unknown> | undefined;
-    try { event = record(JSON.parse(row.eventJson)); }
-    catch { gap(`Invalid event JSON at ${row.seq}`, sessionId); currentPerson = undefined; excludedExchange = false; continue; }
+    let event: ReturnType<typeof decodeTranscriptEvent>;
+    try { event = decodeTranscriptEvent(row); }
+    catch { gap(`Invalid event JSON at ${row.seq}`, sessionId); exchange = { kind: "unattributed" }; continue; }
     if (event?.type !== "message") continue;
     const message = record(event.message), meta = record(message?.__openclaw);
     if (!message || (message.provenance !== undefined && record(message.provenance)?.kind !== "external_user")) {
-      currentPerson = undefined;
-      excludedExchange = true;
+      exchange = { kind: "excluded" };
       continue;
     }
     if (message.role === "user") {
       const transport = record(meta?.transport), sender = nonBlank(meta?.senderId);
       const identity = record(meta?.senderIdentity);
       const provider = nonBlank(transport?.channel), account = nonBlank(transport?.accountId) ?? nonBlank(session.accountId);
-      currentPerson = undefined;
-      excludedExchange = false;
-      if (identity?.senderKind === "bot") { excludedExchange = true; continue; }
+      if (identity?.senderKind === "bot") { exchange = { kind: "excluded" }; continue; }
       const resolved = sender && provider && account ? byIdentity.get(JSON.stringify([provider, account, sender])) : undefined;
       const person = resolved?.person;
       if (!person || (!resolved.confirmedHuman && identity?.senderKind !== "human") || provider !== session.provider || account !== session.accountId ||
           transport?.conversationRef !== session.conversationId || meta?.turnTainted === true) {
-        excludedExchange = !!provider && !!account && (provider !== session.provider || account !== session.accountId);
+        exchange = provider && account && (provider !== session.provider || account !== session.accountId)
+          ? { kind: "excluded" } : { kind: "unattributed" };
         if (inWindow) gap(`Unmapped or ambiguous exact identity at event ${row.seq}`, sessionId);
         messages.push({ seq: row.seq, role: "boundary", timestamp: row.createdAt });
         continue;
@@ -250,7 +248,7 @@ function inventorySessionTranscript(
         gap(`Non-text human content requires original-source review at event ${row.seq}`, sessionId);
       }
       const extracted = raw ? responseUserText(raw, sender!) : undefined;
-      currentPerson = person;
+      exchange = { kind: "attributed", person };
       if (inWindow) participants.add(person.personId);
       if (!extracted) gap(`Unreadable human request at event ${row.seq}`, sessionId);
       messages.push({
@@ -258,15 +256,19 @@ function inventorySessionTranscript(
         provider, accountScope: account, senderId: sender, threadId: transport?.threadId ?? null,
         text: extracted?.text ?? "Unreadable request; inspect the native original", nonText, media,
       });
-    } else if (!currentPerson) {
+      continue;
+    }
+    if (exchange.kind !== "attributed") {
       // A rejected user identity fences its entire exchange, not just the
       // request. Never export another account's replies or tool results.
-      if (inWindow && !excludedExchange && ["assistant", "toolResult", "tool"].includes(String(message.role))) {
+      if (inWindow && exchange.kind === "unattributed" && ["assistant", "toolResult", "tool"].includes(String(message.role))) {
         gap(`Unattributed output at event ${row.seq}; relevant activity unknown`, sessionId);
       }
       continue;
-    } else if (meta?.turnTainted === true || meta?.resultContentSource === "network") {
-      if (inWindow) participants.add(currentPerson.personId);
+    }
+    const personId = exchange.person.personId;
+    if (meta?.turnTainted === true || meta?.resultContentSource === "network") {
+      if (inWindow) participants.add(personId);
       gap(`Untrusted ${String(message.role)} output requires original-source review at event ${row.seq}`, sessionId);
       if (message.role === "assistant" && ["error", "aborted", "cancelled"].includes(String(message.stopReason))) {
         messages.push({ seq: row.seq, role: "assistant_outcome", timestamp: row.createdAt, stopReason: message.stopReason, detailsWithheld: true });
@@ -275,14 +277,14 @@ function inventorySessionTranscript(
       if (message.provider === "openclaw" && ["delivery-mirror", "gateway-injected"].includes(String(message.model))) continue;
       const calls = Array.isArray(message.content) ? message.content.map(record).filter(part => part?.type === "toolCall") : [];
       if (calls.length) {
-        if (inWindow) participants.add(currentPerson.personId);
+        if (inWindow) participants.add(personId);
         messages.push({ seq: row.seq, role: "tool_calls", timestamp: row.createdAt, calls });
       }
       if (message.channel === "analysis") continue; // Never export hidden reasoning.
       const visibleContent = Array.isArray(message.openclawDisplayContent) ? message.openclawDisplayContent : message.content;
       const text = messageText({ ...message, content: visibleContent })?.text;
       if (message.errorMessage || ["error", "aborted", "cancelled"].includes(String(message.stopReason))) {
-        if (inWindow) participants.add(currentPerson.personId);
+        if (inWindow) participants.add(personId);
         messages.push({
           seq: row.seq, role: "assistant_outcome", timestamp: row.createdAt,
           stopReason: message.stopReason, errorMessage: message.errorMessage,
@@ -292,17 +294,17 @@ function inventorySessionTranscript(
       if ((Array.isArray(visibleContent) && visibleContent.map(record).some(part => !["text", "toolCall", "thinking"].includes(String(part?.type)))) ||
           (Array.isArray(mediaUrls) && mediaUrls.length > 0)) {
         gap(`Non-text assistant output requires original-source review at event ${row.seq}`, sessionId);
-        if (inWindow) participants.add(currentPerson.personId);
+        if (inWindow) participants.add(personId);
         messages.push({
           seq: row.seq, role: "assistant_media", timestamp: row.createdAt,
           mediaUrls: Array.isArray(mediaUrls) ? mediaUrls.filter(url => typeof url === "string") : [],
         });
       }
       if (!text || ["NO_REPLY", "HEARTBEAT_OK"].includes(text.trim())) continue;
-      if (inWindow) participants.add(currentPerson.personId);
+      if (inWindow) participants.add(personId);
       messages.push({ seq: row.seq, role: "assistant", timestamp: row.createdAt, text });
     } else if (message.role === "toolResult" || message.role === "tool") {
-      if (inWindow) participants.add(currentPerson.personId);
+      if (inWindow) participants.add(personId);
       const parts = Array.isArray(message.content) ? message.content.map(record) : undefined;
       const text = nonBlank(message.content) ?? (parts
         ? parts.flatMap(part => part?.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n").trim()
@@ -373,9 +375,9 @@ export function inventoryPeople(options: {
     // Scan the catalog, not session start dates or audit's capped candidate window.
     // Cold/inaccessible history cannot be proven irrelevant and remains explicit work.
     const sessions = db.prepare(`SELECT w.session_id sessionId, w.session_key sessionKey,
-      w.primary_conversation_id conversationId, COALESCE(w.account_id,c.account_id,'') accountId,
-      COALESCE(w.channel,c.channel,'') provider, w.chat_type chatType
-      FROM session_windows w LEFT JOIN conversations c ON c.conversation_id=w.primary_conversation_id
+      w.primary_conversation_id conversationId, COALESCE(${hostSessionCatalog.accountId},'') accountId,
+      COALESCE(${hostSessionCatalog.provider},'') provider, w.chat_type chatType
+      ${hostSessionCatalog.from}
       ORDER BY w.session_id`).all();
     const orphaned = db.prepare(`SELECT DISTINCT e.session_id sessionId FROM transcript_events e
       LEFT JOIN session_windows w ON w.session_id=e.session_id

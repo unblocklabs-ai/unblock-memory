@@ -32,6 +32,12 @@ export type MaintenanceTask = {
     createdAt: string;
     updatedAt: string;
 };
+type TaskAnnotation = {
+    scope: "chunk" | "document";
+    eventTime: string;
+    basis: TemporalBasis;
+    evidence: string;
+};
 export declare function chunkFingerprint(text: string): string;
 export declare class CurationStore {
     #private;
@@ -57,12 +63,7 @@ export declare class CurationStore {
         id: string;
         status: Exclude<MaintenanceStatus, "pending">;
         note?: string;
-        annotation?: {
-            scope: "chunk" | "document";
-            eventTime: string;
-            basis: TemporalBasis;
-            evidence: string;
-        };
+        annotation?: TaskAnnotation;
     }): MaintenanceTask | undefined;
     updateAnnotationLocation(params: {
         annotation: TemporalAnnotation;

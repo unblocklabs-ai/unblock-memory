@@ -114,6 +114,22 @@ function inActivationOrder(entries: readonly ActiveSkillEntry[]): ActiveSkillEnt
     (a.canonicalPath < b.canonicalPath ? -1 : a.canonicalPath > b.canonicalPath ? 1 : 0));
 }
 
+// Separate admissions append even when the clock repeats a millisecond or moves backward.
+function nextAddedAt(entries: Iterable<ActiveSkillEntry>, now: number): number {
+  for (const entry of entries) now = Math.max(now, entry.addedAtMs + 1);
+  return now;
+}
+
+function mergeCompactedSkills(inherited: readonly ActiveSkillEntry[], successor: Iterable<ActiveSkillEntry>): ActiveSkillEntry[] {
+  const merged = new Map<string, ActiveSkillEntry>();
+  for (const entry of inherited) if (!merged.has(entry.canonicalPath)) merged.set(entry.canonicalPath, entry);
+  let addedAtMs = nextAddedAt(merged.values(), Date.now());
+  for (const entry of inActivationOrder([...successor])) {
+    if (!merged.has(entry.canonicalPath)) merged.set(entry.canonicalPath, { ...entry, addedAtMs: addedAtMs++ });
+  }
+  return [...merged.values()].slice(0, settings.maxActiveSkillsPerSession);
+}
+
 function renderSkills(entries: readonly ActiveSkillEntry[], emitted?: string[]): string | undefined {
   const header = "<skills>\nRelevant skills for this conversation (load SKILL.md via skills_read or read before following a skill's instructions):\n";
   const footer = "</skills>";
@@ -236,12 +252,6 @@ export function registerSkillWhisperer(
     if (!entries.length) return;
     store?.upsert(state.scope, entries);
     for (const entry of entries) state.skills?.set(entry.canonicalPath, entry);
-  };
-
-  // Separate admissions append even when the clock repeats a millisecond or moves backward.
-  const nextAddedAt = (state: SessionState, now: number) => {
-    for (const entry of state.skills?.values() ?? []) now = Math.max(now, entry.addedAtMs + 1);
-    return now;
   };
 
   const retireRun = (state: SessionState) => {
@@ -369,7 +379,7 @@ export function registerSkillWhisperer(
         const current = activeSkills(state, params, catalog);
         prune(state, current, store);
         const now = Date.now();
-        const addedAtMs = nextAddedAt(state, now);
+        const addedAtMs = nextAddedAt(state.skills?.values() ?? [], now);
         const additions: ActiveSkillEntry[] = [];
         for (const { index, score } of matches) {
           if (skills.size + additions.length >= settings.maxActiveSkillsPerSession) break;
@@ -471,7 +481,7 @@ export function registerSkillWhisperer(
       const entry = matchedByName?.[1] ?? catalog?.get(canonicalPath) ?? readSkillCatalogEntry(canonicalPath);
       save(state, [{ canonicalPath, name: entry.name, description: entry.description,
         source: prior?.source ?? "read", score: prior?.score, addedTurn: prior?.addedTurn ?? state.turn,
-        addedAtMs: prior?.addedAtMs ?? nextAddedAt(state, now), lastUsedAtMs: now, openedAtMs: now }], store);
+        addedAtMs: prior?.addedAtMs ?? nextAddedAt(state.skills?.values() ?? [], now), lastUsedAtMs: now, openedAtMs: now }], store);
     } catch {
       api.logger.warn("unblock-memory skill whisperer could not pin a read skill");
     }
@@ -516,13 +526,7 @@ export function registerSkillWhisperer(
         if (!inherited.length) continue;
         const next = stateFor(sessionKey(agentId, successor), agentId, successor);
         const skills = hydrate(next, store);
-        const merged = new Map<string, ActiveSkillEntry>();
-        for (const entry of inherited) if (!merged.has(entry.canonicalPath)) merged.set(entry.canonicalPath, entry);
-        let addedAtMs = nextAddedAt({ ...next, skills: merged }, Date.now());
-        for (const entry of inActivationOrder([...skills.values()])) {
-          if (!merged.has(entry.canonicalPath)) merged.set(entry.canonicalPath, { ...entry, addedAtMs: addedAtMs++ });
-        }
-        const entries = [...merged.values()].slice(0, settings.maxActiveSkillsPerSession);
+        const entries = mergeCompactedSkills(inherited, skills.values());
         store?.rebindSession(scopes, successor, entries);
         skills.clear();
         for (const entry of entries) {

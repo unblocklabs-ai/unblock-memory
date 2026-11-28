@@ -3,10 +3,11 @@ import { DatabaseSync } from "node:sqlite";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
+import { hostSessionCatalog } from "./agent-transcript.js";
 import type { ChatType } from "./config.js";
 import type { ExtractionSession } from "./extraction-store.js";
 import type { ExtractionMessage } from "./extraction-model.js";
-import { projectMessage, type SessionProjectionInput } from "./session-projector.js";
+import { projectDecodedMessage, projectMessage, type SessionProjectionInput } from "./session-projector.js";
 
 export function extractionSessions(databasePath: string, agentId: string, chatTypes: ChatType[]): ExtractionSession[] {
   const db = new DatabaseSync(databasePath, { readOnly: true });
@@ -15,11 +16,11 @@ export function extractionSessions(databasePath: string, agentId: string, chatTy
     if (db.prepare("SELECT agent_id FROM schema_meta WHERE meta_key='primary'").get()?.agent_id !== agentId) {
       throw new Error("Wrong extraction source agent");
     }
-    return db.prepare(`SELECT w.session_id,w.session_key,w.chat_type,COALESCE(w.channel,c.channel) AS provider,
-      COALESCE(w.account_id,c.account_id) AS account_id,COALESCE(c.native_channel_id,c.native_direct_user_id,c.peer_id,w.primary_conversation_id) AS conversation_id,
+    return db.prepare(`SELECT w.session_id,w.session_key,w.chat_type,${hostSessionCatalog.provider} AS provider,
+      ${hostSessionCatalog.accountId} AS account_id,COALESCE(c.native_channel_id,c.native_direct_user_id,c.peer_id,w.primary_conversation_id) AS conversation_id,
       COALESCE(w.started_at,w.created_at) AS started_at, COALESCE(w.transcript_updated_at,w.updated_at,w.created_at) AS changed_at,
-      r.generation,(SELECT MAX(seq) FROM transcript_events WHERE session_id=w.session_id) AS tail FROM session_windows w
-      LEFT JOIN conversations c ON c.conversation_id=w.primary_conversation_id
+      r.generation,(SELECT MAX(seq) FROM transcript_events WHERE session_id=w.session_id) AS tail
+      ${hostSessionCatalog.from}
       LEFT JOIN transcript_rewrite_watermarks r ON r.session_id=w.session_id
       WHERE w.chat_type IN (${chatTypes.map(() => "?").join(",")}) ORDER BY w.created_at,w.session_id`)
       .all(...chatTypes).map(r => ({ sessionId: String(r.session_id), sessionKey: String(r.session_key),
@@ -38,6 +39,19 @@ const resetSchema = Type.Object({ kind: Type.Literal("reset"), cursor: Type.Stri
 const missingSchema = Type.Object({ kind: Type.Union([Type.Literal("missing"), Type.Literal("unavailable")]) });
 export type ExtractionPage = { kind: "page"; cursor: string; hasMore: boolean; messages: ExtractionMessage[]; entryCount: number } |
   { kind: "reset"; cursor: string } | { kind: "missing" } | { kind: "unavailable" };
+
+export function bindExtractionPageReader({ agentId, agentName, session, signal, readPage }: {
+  agentId: string; agentName: string; session: ExtractionSession; signal: AbortSignal; readPage?: typeof readExtractionPage;
+}) {
+  const read = readPage ?? readExtractionPage;
+  return async (cursor: string | null) => {
+    signal.throwIfAborted();
+    const page = await abortable(read(agentId, agentName, session, cursor, undefined, signal), signal);
+    signal.throwIfAborted();
+    return page;
+  };
+}
+
 export async function readExtractionPage(agentId: string, agentName: string, session: ExtractionSession,
   cursor: string | null, read?: (params: { agentId: string; sessionId: string; sessionKey: string;
     cursor?: string; maxMessages: number; maxBytes: number }) => Promise<unknown>,
@@ -54,7 +68,6 @@ export async function readExtractionPage(agentId: string, agentName: string, ses
     signal?.throwIfAborted();
     const pending = readDelta({ agentId, sessionId: session.sessionId,
       sessionKey: session.sessionKey, ...(cursor ? { cursor } : {}), maxMessages: 40, maxBytes });
-    if (signal) void pending.catch(() => {});
     result = await abortable(pending, signal);
     signal?.throwIfAborted();
     if (!Value.Check(pageSchema, result)) break;
@@ -69,8 +82,11 @@ export async function readExtractionPage(agentId: string, agentName: string, ses
     const messages = result.entries.flatMap(entry => {
       const createdAt = Date.parse(entry.createdAt ?? "");
       if (!Number.isFinite(createdAt)) throw new Error("Extraction message has no source date");
-      const projected = projectMessage({ eventJson: JSON.stringify({ type: "message", timestamp: entry.createdAt, message: entry.message }), createdAt },
-        { ...session, agentName, timezone: "UTC", events: [], syntheticInput });
+      // Injected readers retain the JSON boundary; SDK entries are already decoded from the transcript.
+      const projected = read
+        ? projectMessage({ eventJson: JSON.stringify({ type: "message", timestamp: entry.createdAt, message: entry.message }), createdAt },
+          { ...session, agentName, timezone: "UTC", events: [], syntheticInput })
+        : projectDecodedMessage(entry.message, { createdAt }, { ...session, agentName, syntheticInput });
       return projected?.text ? [{ id: entry.entryId, speaker: projected.speaker, role: projected.role, text: projected.text, timestamp: projected.timestamp }] : [];
     });
     return { kind: "page", cursor: result.cursor, hasMore: result.hasMore, messages, entryCount: result.entries.length };

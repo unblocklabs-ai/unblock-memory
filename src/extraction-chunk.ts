@@ -1,11 +1,9 @@
 import { DEFAULTS } from "./defaults.js";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { abortable } from "./abortable.js";
 import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageBytes, extractionMessageTokens, extractionOverhead,
   extractionValidationTranscriptBudget, type ExtractionMessage } from "./extraction-model.js";
-import { readExtractionPage } from "./extraction-source.js";
-import type { ExtractionSession } from "./extraction-store.js";
+import { bindExtractionPageReader } from "./extraction-source.js";
 import { jsonHash } from "./json-hash.js";
 
 const PREFIX = "unblock-extraction:v1:";
@@ -82,18 +80,9 @@ function decodeBookmark(cursor: string): Static<typeof bookmarkSchema> | undefin
 }
 
 /** SDK pages are transport only. A chunk always belongs to exactly one session. */
-export async function readExtractionChunk(params: { agentId: string; agentName: string; session: ExtractionSession;
-  cursor: string | null; context: ExtractionMessage[]; signal: AbortSignal;
-  readPage?: typeof readExtractionPage }) {
-  const read = params.readPage ?? readExtractionPage;
-  const fetchPage = async (cursor: string | null) => {
-    params.signal.throwIfAborted();
-    const pending = read(params.agentId, params.agentName, params.session, cursor, undefined, params.signal);
-    void pending.catch(() => {});
-    const page = await abortable(pending, params.signal);
-    params.signal.throwIfAborted();
-    return page;
-  };
+export async function readExtractionChunk(params: { cursor: string | null; context: ExtractionMessage[] } &
+  (Parameters<typeof bindExtractionPageReader>[0] | { fetchPage: ReturnType<typeof bindExtractionPageReader> })) {
+  const fetchPage = "fetchPage" in params ? params.fetchPage : bindExtractionPageReader(params);
   let resume: Static<typeof bookmarkSchema> | undefined;
   if (params.cursor?.startsWith(PREFIX)) {
     resume = decodeBookmark(params.cursor);

@@ -81,6 +81,24 @@ function inActivationOrder(entries) {
     return entries.toSorted((a, b) => a.addedAtMs - b.addedAtMs ||
         (a.canonicalPath < b.canonicalPath ? -1 : a.canonicalPath > b.canonicalPath ? 1 : 0));
 }
+// Separate admissions append even when the clock repeats a millisecond or moves backward.
+function nextAddedAt(entries, now) {
+    for (const entry of entries)
+        now = Math.max(now, entry.addedAtMs + 1);
+    return now;
+}
+function mergeCompactedSkills(inherited, successor) {
+    const merged = new Map();
+    for (const entry of inherited)
+        if (!merged.has(entry.canonicalPath))
+            merged.set(entry.canonicalPath, entry);
+    let addedAtMs = nextAddedAt(merged.values(), Date.now());
+    for (const entry of inActivationOrder([...successor])) {
+        if (!merged.has(entry.canonicalPath))
+            merged.set(entry.canonicalPath, { ...entry, addedAtMs: addedAtMs++ });
+    }
+    return [...merged.values()].slice(0, settings.maxActiveSkillsPerSession);
+}
 function renderSkills(entries, emitted) {
     const header = "<skills>\nRelevant skills for this conversation (load SKILL.md via skills_read or read before following a skill's instructions):\n";
     const footer = "</skills>";
@@ -203,12 +221,6 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
         store?.upsert(state.scope, entries);
         for (const entry of entries)
             state.skills?.set(entry.canonicalPath, entry);
-    };
-    // Separate admissions append even when the clock repeats a millisecond or moves backward.
-    const nextAddedAt = (state, now) => {
-        for (const entry of state.skills?.values() ?? [])
-            now = Math.max(now, entry.addedAtMs + 1);
-        return now;
     };
     const retireRun = (state) => {
         state.controller?.abort();
@@ -351,7 +363,7 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
                 const current = activeSkills(state, params, catalog);
                 prune(state, current, store);
                 const now = Date.now();
-                const addedAtMs = nextAddedAt(state, now);
+                const addedAtMs = nextAddedAt(state.skills?.values() ?? [], now);
                 const additions = [];
                 for (const { index, score } of matches) {
                     if (skills.size + additions.length >= settings.maxActiveSkillsPerSession)
@@ -473,7 +485,7 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
             const entry = matchedByName?.[1] ?? catalog?.get(canonicalPath) ?? readSkillCatalogEntry(canonicalPath);
             save(state, [{ canonicalPath, name: entry.name, description: entry.description,
                     source: prior?.source ?? "read", score: prior?.score, addedTurn: prior?.addedTurn ?? state.turn,
-                    addedAtMs: prior?.addedAtMs ?? nextAddedAt(state, now), lastUsedAtMs: now, openedAtMs: now }], store);
+                    addedAtMs: prior?.addedAtMs ?? nextAddedAt(state.skills?.values() ?? [], now), lastUsedAtMs: now, openedAtMs: now }], store);
         }
         catch {
             api.logger.warn("unblock-memory skill whisperer could not pin a read skill");
@@ -526,16 +538,7 @@ export function registerSkillWhisperer(api, runtime, config, decisionModel, diag
                     continue;
                 const next = stateFor(sessionKey(agentId, successor), agentId, successor);
                 const skills = hydrate(next, store);
-                const merged = new Map();
-                for (const entry of inherited)
-                    if (!merged.has(entry.canonicalPath))
-                        merged.set(entry.canonicalPath, entry);
-                let addedAtMs = nextAddedAt({ ...next, skills: merged }, Date.now());
-                for (const entry of inActivationOrder([...skills.values()])) {
-                    if (!merged.has(entry.canonicalPath))
-                        merged.set(entry.canonicalPath, { ...entry, addedAtMs: addedAtMs++ });
-                }
-                const entries = [...merged.values()].slice(0, settings.maxActiveSkillsPerSession);
+                const entries = mergeCompactedSkills(inherited, skills.values());
                 store?.rebindSession(scopes, successor, entries);
                 skills.clear();
                 for (const entry of entries) {

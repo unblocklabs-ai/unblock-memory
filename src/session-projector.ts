@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ChatType } from "./config.js";
 import { projectLoggieMessage } from "./loggie-projection.js";
-import { applyProposal, parseAttachments, parseInternalMessage } from "./session-noise.js";
+import { applyProposal, nextMarkdownFence, parseAttachments, parseInternalMessage } from "./session-noise.js";
+import { decodeTranscriptEvent } from "./agent-transcript.js";
 import { nonBlank, record } from "./guards.js";
 import { classifySyntheticInput, isSyntheticEvidence, type SyntheticInputFilterConfig } from "./synthetic-input.js";
 
@@ -84,15 +85,14 @@ function textContent(value: unknown): string | undefined {
 }
 
 export function projectMessage(row: SessionProjectionInput["events"][number], input: SessionProjectionInput): ProjectedMessage | undefined {
-  let event: unknown;
-  try {
-    event = JSON.parse(row.eventJson);
-  } catch {
-    throw new Error("invalid transcript event JSON");
-  }
-  const eventRecord = record(event);
-  if (eventRecord?.type !== "message") return undefined;
-  const message = record(eventRecord?.message);
+  const event = decodeTranscriptEvent(row);
+  if (event?.type !== "message") return undefined;
+  return projectDecodedMessage(event.message, row, input, event);
+}
+
+export function projectDecodedMessage(value: unknown, source: { createdAt: number },
+  input: Omit<SessionProjectionInput, "events" | "timezone">, event?: Record<string, unknown>): ProjectedMessage | undefined {
+  const message = record(value);
   if (!message) throw new Error("invalid transcript message event");
   const role = message.role;
   if (role !== "user" && role !== "assistant") return undefined;
@@ -123,8 +123,8 @@ export function projectMessage(row: SessionProjectionInput["events"][number], in
   const report = trusted ? parseInternalMessage(text, true) : undefined;
   if (!report?.edits.length) {
     const classified = classifySyntheticInput({ text, role,
-      inputProvenance: message.inputProvenance ?? message.provenance ?? eventRecord.inputProvenance,
-      display: message.display ?? eventRecord.display,
+      inputProvenance: message.inputProvenance ?? message.provenance ?? event?.inputProvenance,
+      display: message.display ?? event?.display,
     }, input.syntheticInput);
     if (isSyntheticEvidence(classified)) return undefined;
     if (classified.family === "internal_context" && input.diagnostics) input.diagnostics.internalMessagesCleaned++;
@@ -148,7 +148,7 @@ export function projectMessage(row: SessionProjectionInput["events"][number], in
     speaker: speaker.replace(/[\r\n]+/gu, " "),
     text: meeting?.text ?? text,
     meeting,
-    timestamp: timestamp(eventRecord.timestamp) ?? row.createdAt ?? timestamp(message.timestamp) ?? input.startedAt,
+    timestamp: timestamp(event?.timestamp) ?? source.createdAt ?? timestamp(message.timestamp) ?? input.startedAt,
   };
 }
 
@@ -229,16 +229,12 @@ export function projectSessionDocument(input: SessionProjectionInput): {
 /** Legacy fallback only. New projections retain exact boundaries before rendering Markdown. */
 export function parseSessionMessageSpans(content: string): SessionMessageSpan[] {
   const messages: SessionMessageSpan[] = [];
-  let fence: { char: string; length: number } | undefined;
+  let fence: string | undefined;
   for (const line of content.matchAll(/[^\n]*(?:\n|$)/gu)) {
     const text = line[0].replace(/\n$/u, "");
     const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(text);
-    if (fence) {
-      if (delimiter?.[1]?.[0] === fence.char && delimiter[1].length >= fence.length && !delimiter[2]?.trim()) fence = undefined;
-      continue;
-    }
-    if (delimiter) {
-      fence = { char: delimiter[1]![0]!, length: delimiter[1]!.length };
+    if (fence || delimiter) {
+      fence = nextMarkdownFence(fence, delimiter);
       continue;
     }
     const match = MESSAGE_HEADING.exec(text);

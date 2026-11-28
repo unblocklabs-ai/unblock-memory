@@ -60,24 +60,32 @@ export function parseInternalMessage(text, trustedInterSession) {
         preserved: [{ start, end: close }],
     };
 }
+/** Scanners provide their own delimiter match; only the open/close rule is shared. */
+export function nextMarkdownFence(open, delimiter) {
+    if (!delimiter)
+        return open;
+    if (!open)
+        return delimiter[1];
+    return delimiter[1].startsWith(open) && !delimiter[2].trim() ? undefined : open;
+}
 /** Fenced/indented examples are deliberately outside attachment grammar. */
 function codeRanges(text) {
     const ranges = [];
-    const lines = [...text.matchAll(/[^\n]*(?:\n|$)/g)].filter(m => m[0]);
     let open;
-    for (const line of lines) {
-        const fence = /^ {0,3}(`{3,}|~{3,})(.*)/.exec(line[0]);
-        if (!fence)
+    let start = 0;
+    for (const line of text.matchAll(/[^\n]*(?:\n|$)/g)) {
+        const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)/.exec(line[0]);
+        if (!delimiter)
             continue;
+        const next = nextMarkdownFence(open, delimiter);
         if (!open)
-            open = { start: line.index, char: fence[1][0], length: fence[1].length };
-        else if (fence[1][0] === open.char && fence[1].length >= open.length && !fence[2].trim()) {
-            ranges.push({ start: open.start, end: line.index + line[0].length, closingStart: line.index });
-            open = undefined;
-        }
+            start = line.index;
+        else if (!next)
+            ranges.push({ start, end: line.index + line[0].length });
+        open = next;
     }
     if (open)
-        ranges.push({ start: open.start, end: text.length });
+        ranges.push({ start, end: text.length });
     return ranges;
 }
 /** Narrow HTML export grammar, not a general-purpose regex HTML stripper. Unknown HTML stays intact. */

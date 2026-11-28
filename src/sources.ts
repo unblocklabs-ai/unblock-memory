@@ -50,31 +50,31 @@ function assertWorkspaceSourceHasNoSymlinkRoot(
   }
 }
 
+/** Expands `~` and resolves relative paths against the workspace (lexically; no symlink resolution). */
+function resolveWorkspacePath(workspaceDir: string, inputPath: string): string {
+  const expanded = expandHome(inputPath);
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(workspaceDir, expanded);
+}
+
 export function resolveSource(workspaceDir: string, configuredPath: string, corpus = "memory"): ResolvedSource {
-  const expanded = expandHome(configuredPath);
-  const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(workspaceDir, expanded);
+  const absolute = resolveWorkspacePath(workspaceDir, configuredPath);
   const exists = existsSync(absolute);
   const magicIndex = absolute.search(GLOB_MAGIC);
+  let root: string, pattern: string, watchPath: string;
   if (exists || magicIndex < 0) {
     // An existing path is taken literally; a missing one is a file only when it names Markdown.
     const isFile = exists ? !statSync(absolute).isDirectory() : basename(absolute).toLowerCase().endsWith(".md");
-    const root = isFile ? dirname(absolute) : absolute;
-    assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
-    return {
-      collection: collectionName(absolute),
-      corpus,
-      configuredPath,
-      kind: "files",
-      root,
-      pattern: isFile ? basename(absolute) : "**/*.md",
-      watchPath: absolute,
-    };
+    root = isFile ? dirname(absolute) : absolute;
+    pattern = isFile ? basename(absolute) : "**/*.md";
+    watchPath = absolute;
+  } else {
+    const prefix = absolute.slice(0, magicIndex);
+    root = prefix.slice(0, prefix.lastIndexOf(sep)) || sep;
+    pattern = relative(root, absolute).split(sep).join("/");
+    watchPath = root;
   }
-  const prefix = absolute.slice(0, magicIndex);
-  const root = prefix.slice(0, prefix.lastIndexOf(sep)) || sep;
-  const pattern = relative(root, absolute).split(sep).join("/");
   assertWorkspaceSourceHasNoSymlinkRoot(workspaceDir, configuredPath, root);
-  return { collection: collectionName(absolute), corpus, configuredPath, kind: "files", root, pattern, watchPath: root };
+  return { collection: collectionName(absolute), corpus, configuredPath, kind: "files", root, pattern, watchPath };
 }
 
 function resolveFileSource(
@@ -136,9 +136,7 @@ export function resolveConfiguredSkillPath(
   sources: readonly ResolvedSource[],
 ): string | undefined {
   if (basename(inputPath).toLowerCase() !== "skill.md") return undefined;
-  const target = resolve(isAbsolute(expandHome(inputPath))
-    ? expandHome(inputPath)
-    : resolve(workspaceDir, inputPath));
+  const target = resolveWorkspacePath(workspaceDir, inputPath);
   let canonicalTarget: string;
   try {
     canonicalTarget = realpathSync(target);

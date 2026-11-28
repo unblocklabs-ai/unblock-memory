@@ -59,20 +59,27 @@ export function parseInternalMessage(text: string, trustedInterSession: boolean)
   };
 }
 
+/** Scanners provide their own delimiter match; only the open/close rule is shared. */
+export function nextMarkdownFence(open: string | undefined, delimiter: RegExpExecArray | null): string | undefined {
+  if (!delimiter) return open;
+  if (!open) return delimiter[1];
+  return delimiter[1]!.startsWith(open) && !delimiter[2]!.trim() ? undefined : open;
+}
+
 /** Fenced/indented examples are deliberately outside attachment grammar. */
-function codeRanges(text: string): { start: number; end: number; closingStart?: number }[] {
-  const ranges: { start: number; end: number; closingStart?: number }[] = [];
-  const lines = [...text.matchAll(/[^\n]*(?:\n|$)/g)].filter(m => m[0]);
-  let open: { start: number; char: string; length: number } | undefined;
-  for (const line of lines) {
-    const fence = /^ {0,3}(`{3,}|~{3,})(.*)/.exec(line[0]);
-    if (!fence) continue;
-    if (!open) open = { start: line.index, char: fence[1][0], length: fence[1].length };
-    else if (fence[1][0] === open.char && fence[1].length >= open.length && !fence[2].trim()) {
-      ranges.push({ start: open.start, end: line.index + line[0].length, closingStart: line.index }); open = undefined;
-    }
+function codeRanges(text: string): { start: number; end: number }[] {
+  const ranges: { start: number; end: number }[] = [];
+  let open: string | undefined;
+  let start = 0;
+  for (const line of text.matchAll(/[^\n]*(?:\n|$)/g)) {
+    const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)/.exec(line[0]);
+    if (!delimiter) continue;
+    const next = nextMarkdownFence(open, delimiter);
+    if (!open) start = line.index;
+    else if (!next) ranges.push({ start, end: line.index + line[0].length });
+    open = next;
   }
-  if (open) ranges.push({ start: open.start, end: text.length });
+  if (open) ranges.push({ start, end: text.length });
   return ranges;
 }
 

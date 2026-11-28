@@ -1,9 +1,8 @@
 import { DEFAULTS } from "./defaults.js";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { abortable } from "./abortable.js";
 import { EXTRACTION_INPUT_LIMIT, EXTRACTION_INPUT_TARGET, extractionMessageBytes, extractionMessageTokens, extractionOverhead, extractionValidationTranscriptBudget } from "./extraction-model.js";
-import { readExtractionPage } from "./extraction-source.js";
+import { bindExtractionPageReader } from "./extraction-source.js";
 import { jsonHash } from "./json-hash.js";
 const PREFIX = "unblock-extraction:v1:";
 const bookmarkSchema = Type.Object({ before: Type.Union([Type.Null(), Type.String()]), fence: Type.String(),
@@ -87,15 +86,7 @@ function decodeBookmark(cursor) {
 }
 /** SDK pages are transport only. A chunk always belongs to exactly one session. */
 export async function readExtractionChunk(params) {
-    const read = params.readPage ?? readExtractionPage;
-    const fetchPage = async (cursor) => {
-        params.signal.throwIfAborted();
-        const pending = read(params.agentId, params.agentName, params.session, cursor, undefined, params.signal);
-        void pending.catch(() => { });
-        const page = await abortable(pending, params.signal);
-        params.signal.throwIfAborted();
-        return page;
-    };
+    const fetchPage = "fetchPage" in params ? params.fetchPage : bindExtractionPageReader(params);
     let resume;
     if (params.cursor?.startsWith(PREFIX)) {
         resume = decodeBookmark(params.cursor);

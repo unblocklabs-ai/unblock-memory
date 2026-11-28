@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
+import { ensureSchemaUnderWriteLock, immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 
 // Loaded by plain-Node workers and offline tools (Voltaire Drift, whisper prefetch): keep this module free of `openclaw`.
 
@@ -490,10 +490,7 @@ function ensureSchema(db: DatabaseSync): void {
       Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='deep_thought_jobs'").get()) &&
       Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='derived_observations'").get());
   };
-  // Fast path avoids taking the write lock on every open.
-  if (ready(read())) return;
-  immediateTransaction(db, () => {
-    if (ready(read())) return;
+  ensureSchemaUnderWriteLock(db, () => ready(read()), () => {
     db.exec(SCHEMA);
     db.prepare("INSERT OR IGNORE INTO memory_schema VALUES (?,?)").run(COMPONENT, SCHEMA_VERSION);
   });

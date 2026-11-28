@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { immediateTransaction, openMemoryDatabase } from "./memory-database.js";
+import { ensureSchemaUnderWriteLock, immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 
 // Loaded by plain-Node workers and offline tools: keep this module (and its imports) free of `openclaw`.
 
@@ -121,10 +121,7 @@ function ensureWorkSchema(db: DatabaseSync): void {
     return version === SCHEMA_VERSION && Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='work_items'").get()) &&
       hasProgress();
   };
-  // Fast path avoids taking the write lock on every open.
-  if (ready(read())) return;
-  immediateTransaction(db, () => {
-    if (ready(read())) return;
+  ensureSchemaUnderWriteLock(db, () => ready(read()), () => {
     db.exec(SCHEMA);
     if (!hasProgress()) db.exec("ALTER TABLE work_items ADD COLUMN progressed_attempt INTEGER NOT NULL DEFAULT 0");
     db.prepare("INSERT OR IGNORE INTO memory_schema VALUES ('work',?)").run(SCHEMA_VERSION);

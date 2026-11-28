@@ -1,6 +1,5 @@
 import { type ExtractionMessage } from "./extraction-model.js";
-import { readExtractionPage } from "./extraction-source.js";
-import type { ExtractionSession } from "./extraction-store.js";
+import { bindExtractionPageReader } from "./extraction-source.js";
 export declare function extractionHistory(messages: ExtractionMessage[], count: number): ExtractionMessage[];
 /**
  * The host cursor that fences a stored checkpoint cursor: the bookmark's page fence, or the cursor itself.
@@ -9,14 +8,11 @@ export declare function extractionHistory(messages: ExtractionMessage[], count: 
 export declare function checkpointFence(cursor: string): string | undefined;
 /** SDK pages are transport only. A chunk always belongs to exactly one session. */
 export declare function readExtractionChunk(params: {
-    agentId: string;
-    agentName: string;
-    session: ExtractionSession;
     cursor: string | null;
     context: ExtractionMessage[];
-    signal: AbortSignal;
-    readPage?: typeof readExtractionPage;
-}): Promise<{
+} & (Parameters<typeof bindExtractionPageReader>[0] | {
+    fetchPage: ReturnType<typeof bindExtractionPageReader>;
+})): Promise<{
     kind: "reset";
     cursor: string;
 } | {

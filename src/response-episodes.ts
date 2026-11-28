@@ -40,6 +40,65 @@ function isHumanSender(meta: Record<string, unknown> | undefined): boolean {
   return identity?.senderKind !== "bot" && (identity?.senderKind === "human" || meta?.senderIsOwner === true);
 }
 
+type ResponseEvent =
+  | { kind: "ignore" }
+  /** Transcript discontinuity: the in-flight request, response, and history cannot carry across it. */
+  | { kind: "boundary" }
+  /** A counted filtered event; `partialFollowup` first closes the follow-up with preceding clean evidence. */
+  | { kind: "filtered"; partialFollowup: boolean }
+  | { kind: "user"; senderId: string; thread: string; text: string; contextLimited: boolean }
+  | { kind: "assistant"; memorySearchCalls: number; reply?: { text: string; model: string; final: boolean } };
+
+const IGNORE: ResponseEvent = { kind: "ignore" };
+const BOUNDARY: ResponseEvent = { kind: "boundary" };
+const FILTERED: ResponseEvent = { kind: "filtered", partialFollowup: false };
+
+/** Classifies one transcript row without touching episode state. */
+function classifyEvent(row: Row, session: ResponseSession, config: ResponseAuditConfig): ResponseEvent {
+  let e: Record<string, unknown> | undefined;
+  try { e = record(JSON.parse(row.eventJson)); } catch { return FILTERED; }
+  if (e?.type !== "message") {
+    // Compaction/context rewrites cannot silently join unrelated transcript segments.
+    return e?.type === "compaction" ? BOUNDARY : IGNORE;
+  }
+  const m = record(e.message), meta = record(m?.__openclaw);
+  if (!m) return BOUNDARY;
+  if (m.role === "toolResult") return IGNORE; // Tool bodies/thinking are never sent.
+  if (m.role === "user") {
+    const transport = record(meta?.transport);
+    const senderId = meta?.senderId;
+    if (m.provenance !== undefined || !isHumanSender(meta) ||
+        typeof senderId !== "string" || !isApprovedSender(config.senderIds, senderId) ||
+        transport?.channel !== "slack" || transport.conversationRef !== session.conversationId) {
+      return FILTERED;
+    }
+    const raw = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : messageText(m)?.text;
+    const visible = raw ? responseUserText(raw, senderId) : undefined;
+    if (!visible) return FILTERED;
+    const thread = typeof transport.threadId === "string" ? transport.threadId : "";
+    return { kind: "user", senderId, thread, text: visible.text, contextLimited: visible.contextLimited };
+  }
+  if (m.role !== "assistant") return FILTERED;
+  if (m.provenance !== undefined || meta?.turnTainted === true) return FILTERED;
+  if (m.provider === "openclaw" && (m.model === "delivery-mirror" || m.model === "gateway-injected")) {
+    // Preserve only preceding clean assistant evidence, never the synthetic notice.
+    // This is not a completed response and cannot enter the original quality grade.
+    return { kind: "filtered", partialFollowup: true };
+  }
+  if (m.stopReason === "error" || m.stopReason === "aborted") return BOUNDARY;
+  const memorySearchCalls = Array.isArray(m.content) ? m.content.filter(p => {
+    const block = record(p);
+    return block?.type === "toolCall" && (block.name === "memory_search" || block.name === "memory_get");
+  }).length : 0;
+  const text = messageText(m)?.text;
+  if (!text || text === "NO_REPLY" || text === "HEARTBEAT_OK" || m.channel === "analysis") return { kind: "assistant", memorySearchCalls };
+  return { kind: "assistant", memorySearchCalls, reply: {
+    text,
+    model: typeof m.model === "string" ? m.model : "unknown",
+    final: meta?.runTerminal === true || (m.stopReason === "stop" && m.channel !== "commentary"),
+  } };
+}
+
 /** Never deduce human identity from text or the user role alone. */
 export function responseEpisodes(session: ResponseSession, rows: readonly Row[], config: ResponseAuditConfig) {
   const coverage: ResponseCoverage = { completedResponses: 0, eligible: 0, noFeedback: 0,
@@ -83,50 +142,20 @@ export function responseEpisodes(session: ResponseSession, rows: readonly Row[],
     history.push(text);
     if (history.length > config.historyMessages) { history.shift(); historyDropped = true; }
   };
-  for (const row of rows) {
-    let e: Record<string, unknown> | undefined;
-    try { e = record(JSON.parse(row.eventJson)); } catch { filterOut(); continue; }
-    if (e?.type !== "message") {
-      // Compaction/context rewrites cannot silently join unrelated transcript segments.
-      if (e?.type === "compaction") boundary();
-      continue;
+  const onUser = (row: Row, event: Extract<ResponseEvent, { kind: "user" }>) => {
+    const { senderId, thread } = event;
+    if ((current && (current.senderId !== senderId || current.thread !== thread)) ||
+        pending.some(p => p.senderId !== senderId || p.thread !== thread)) boundary();
+    closeFollowup(true);
+    if (event.contextLimited) historyDropped = true;
+    const text: Text = { seq: row.seq, role: "user", text: event.text };
+    if (current) {
+      if (!current.final) boundary();
+      else current.feedback.push(text);
     }
-    const m = record(e.message), meta = record(m?.__openclaw);
-    if (!m) { boundary(); continue; }
-    if (m.role === "toolResult") continue; // Tool bodies/thinking are never sent.
-    if (m.role === "user") {
-      const transport = record(meta?.transport);
-      const senderId = meta?.senderId;
-      if (m.provenance !== undefined || !isHumanSender(meta) ||
-          typeof senderId !== "string" || !isApprovedSender(config.senderIds, senderId) ||
-          transport?.channel !== "slack" || transport.conversationRef !== session.conversationId) {
-        filterOut(); continue;
-      }
-      const raw = typeof meta?.upstreamUserText === "string" ? meta.upstreamUserText : messageText(m)?.text;
-      const visible = raw ? responseUserText(raw, senderId) : undefined;
-      if (!visible) { filterOut(); continue; }
-      const thread = typeof transport.threadId === "string" ? transport.threadId : "";
-      if ((current && (current.senderId !== senderId || current.thread !== thread)) ||
-          pending.some(p => p.senderId !== senderId || p.thread !== thread)) boundary();
-      closeFollowup(true);
-      if (visible.contextLimited) historyDropped = true;
-      const text: Text = { seq: row.seq, role: "user", text: visible.text };
-      if (current) {
-        if (!current.final) boundary();
-        else current.feedback.push(text);
-      }
-      pending.push({ text, senderId, thread });
-      continue;
-    }
-    if (m.role !== "assistant") { filterOut(); continue; }
-    if (m.provenance !== undefined || meta?.turnTainted === true) { filterOut(); continue; }
-    if (m.provider === "openclaw" && (m.model === "delivery-mirror" || m.model === "gateway-injected")) {
-      // Preserve only preceding clean assistant evidence, never the synthetic notice.
-      // This is not a completed response and cannot enter the original quality grade.
-      closeFollowup(true, true);
-      filterOut(); continue;
-    }
-    if (m.stopReason === "error" || m.stopReason === "aborted") { boundary(); continue; }
+    pending.push({ text, senderId, thread });
+  };
+  const onAssistant = (row: Row, event: Extract<ResponseEvent, { kind: "assistant" }>) => {
     if (pending.length) {
       const request = pending.map(p => p.text), identity = pending[0]!;
       finish(true);
@@ -136,21 +165,29 @@ export function responseEpisodes(session: ResponseSession, rows: readonly Row[],
       pending = [];
       request.forEach(remember);
     }
-    if (!current) continue;
-    if (Array.isArray(m.content)) {
-      current.memorySearchCalls += m.content.filter(p => {
-        const block = record(p);
-        return block?.type === "toolCall" && (block.name === "memory_search" || block.name === "memory_get");
-      }).length;
-    }
-    const text = messageText(m)?.text;
-    if (!text || text === "NO_REPLY" || text === "HEARTBEAT_OK" || m.channel === "analysis") continue;
-    const item: Text = { seq: row.seq, role: "assistant", text };
+    if (!current) return;
+    current.memorySearchCalls += event.memorySearchCalls;
+    const { reply } = event;
+    if (!reply) return;
+    const item: Text = { seq: row.seq, role: "assistant", text: reply.text };
     current.answer.push(item);
     remember(item);
-    current.model = typeof m.model === "string" ? m.model : "unknown";
+    current.model = reply.model;
     current.timestamp = row.createdAt;
-    current.final ||= meta?.runTerminal === true || (m.stopReason === "stop" && m.channel !== "commentary");
+    current.final ||= reply.final;
+  };
+  for (const row of rows) {
+    const event = classifyEvent(row, session, config);
+    switch (event.kind) {
+      case "ignore": break;
+      case "boundary": boundary(); break;
+      case "filtered":
+        if (event.partialFollowup) closeFollowup(true, true);
+        filterOut();
+        break;
+      case "user": onUser(row, event); break;
+      case "assistant": onAssistant(row, event); break;
+    }
   }
   if (current?.final) closeFollowup(true);
   finish(false); // No next assistant turn: the feedback block may still grow.

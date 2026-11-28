@@ -130,6 +130,67 @@ function toolTraceToHits(traces) {
         finalRank: trace.finalRank,
     }));
 }
+/** Records at most one recall-ledger query row per `memory_search` execution; later calls are no-ops. */
+function toolQueryRecorder(recallLedger, active, decisionModel, identity, request) {
+    let recorded = false;
+    return (outcome, rankingMode, hits = [], fallbackReason, usage = {}) => {
+        if (!recallLedger || recorded)
+            return;
+        recorded = true;
+        recallLedger.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
+            kind: "query",
+            record: {
+                eventKey: identity.eventKey,
+                createdAtMs: identity.createdAtMs,
+                agentId: active.agentId,
+                source: "tool",
+                sessionId: active.requestContext.sessionId,
+                sessionKey: active.requestContext.sessionKey,
+                runId: active.runId,
+                ...toolOrigin(active),
+                lexQuery: request.queries?.lex,
+                vecQuery: request.queries?.vec,
+                queryFallback: false,
+                corpora: request.corpora,
+                sessionFilterJson: request.sessionFilterJson,
+                rankingMode,
+                fallbackReason,
+                decisionModel: decisionModel.model,
+                minUsefulness: request.minUsefulness ?? 0.7,
+                outcome,
+                ...usage,
+                ...(recallLedger.recipeHash ? { recipeHash: recallLedger.recipeHash } : {}),
+                hits,
+            },
+        });
+    };
+}
+/**
+ * Compact only the public tool response; internal ranking and consumers keep
+ * full-precision scores and the host's source/citation compatibility fields.
+ */
+function formatSearchResponse(search) {
+    const retrieval = search.rankingMode === "retrieval";
+    const payload = {
+        rankingMode: search.rankingMode,
+        scoreMeaning: retrieval ? "retrieval_rank" : "usefulness_probability",
+        minUsefulnessApplied: !retrieval,
+        ...(search.fallbackReason ? { fallbackReason: search.fallbackReason,
+            warning: "decision model usefulness ranking unavailable; returning unjudged retrieval-ranked leads. Scores are retrieval ranks, not usefulness probabilities; minUsefulness was not applied. Verify evidence with memory_get." }
+            : search.requestsFailed ? { warning: `${search.requestsFailed} candidate usefulness judgments failed; results are partial` } : {}),
+        results: search.results.map(({ source: _source, citation: _citation, vectorScore: _vectorScore, textScore: _textScore, locator: _locator, session, sessionMessages, ...result }) => ({
+            ...result,
+            snippet: result.corpus === "sessions" ? sessionMessages ?? [{ body: result.snippet, partial: true }] : result.snippet,
+            // Retrieval fallback keeps raw retrieval scores; decision ranking rounds usefulness probabilities.
+            score: retrieval ? result.score : Number(result.score.toFixed(2)),
+            ...(session ? { session: { ...session, startedAt: new Date(session.startedAt).toISOString() } } : {}),
+        })),
+    };
+    return {
+        content: [{ type: "text", text: JSON.stringify(payload) }],
+        details: payload,
+    };
+}
 function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger) {
     const active = getContext(ctx);
     if (!active)
@@ -144,56 +205,22 @@ function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger
             const createdAtMs = Date.now();
             const measurement = { outcome: "failed", elapsedMs: 0 };
             const eventKey = `tool:${toolEventScope(active)}:${nonBlank(toolCallId) ?? randomUUID()}`;
-            let parsedQueries;
-            let effectiveCorpora = runtime.searchableCorpora();
-            let sessionFilterJson;
-            let requestedMinUsefulness;
-            let ledgerRecorded = false;
-            const enqueueToolQuery = (outcome, rankingMode, hits = [], fallbackReason, usage = {}) => {
-                if (!recallLedger || ledgerRecorded)
-                    return;
-                ledgerRecorded = true;
-                recallLedger.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
-                    kind: "query",
-                    record: {
-                        eventKey,
-                        createdAtMs,
-                        agentId: active.agentId,
-                        source: "tool",
-                        sessionId: active.requestContext.sessionId,
-                        sessionKey: active.requestContext.sessionKey,
-                        runId: active.runId,
-                        ...toolOrigin(active),
-                        lexQuery: parsedQueries?.lex,
-                        vecQuery: parsedQueries?.vec,
-                        queryFallback: false,
-                        corpora: effectiveCorpora,
-                        sessionFilterJson,
-                        rankingMode,
-                        fallbackReason,
-                        decisionModel: decisionModel.model,
-                        minUsefulness: requestedMinUsefulness ?? 0.7,
-                        outcome,
-                        ...usage,
-                        ...(recallLedger.recipeHash ? { recipeHash: recallLedger.recipeHash } : {}),
-                        hits,
-                    },
-                });
-            };
+            const request = { corpora: runtime.searchableCorpora() };
+            const enqueueToolQuery = toolQueryRecorder(recallLedger, active, decisionModel, { eventKey, createdAtMs }, request);
             try {
                 signal?.throwIfAborted();
                 const { bm25Query, vectorQuery, corpora, sessionFilter, maxResults, minUsefulness, } = Value.Parse(searchParameters, params);
                 const queries = { lex: bm25Query.trim(), vec: vectorQuery.trim() };
                 const normalizedCorpora = corpora?.map((corpus) => corpus.trim());
-                effectiveCorpora = normalizedCorpora?.length && !normalizedCorpora.includes("all")
+                request.corpora = normalizedCorpora?.length && !normalizedCorpora.includes("all")
                     ? normalizedCorpora
                     : runtime.searchableCorpora();
-                sessionFilterJson = sessionFilter ? JSON.stringify(sessionFilter) : undefined;
-                requestedMinUsefulness = minUsefulness;
+                request.sessionFilterJson = sessionFilter ? JSON.stringify(sessionFilter) : undefined;
+                request.minUsefulness = minUsefulness;
                 // Reject oversized explicit inputs before credential resolution, query capture, or any service call.
                 prepareQueryConversation([], queries.lex);
                 const { conversation } = prepareQueryConversation([], queries.vec);
-                parsedQueries = queries;
+                request.queries = queries;
                 let apiKey;
                 try {
                     apiKey = await resolveDecisionCredential(decisionModel);
@@ -237,26 +264,7 @@ function createSearchTool(runtime, ctx, decisionModel, diagnostics, recallLedger
                     enqueueToolQuery(ledgerOutcome, search.rankingMode, toolTraceToHits(traces), search.fallbackReason === "input_too_large" ? undefined : search.fallbackReason, { ...(search.inputTokens !== undefined ? { inputTokens: search.inputTokens } : {}),
                         ...(search.outputTokens !== undefined ? { outputTokens: search.outputTokens } : {}) });
                 }
-                // Compact only the public tool response; internal ranking and consumers keep
-                // full-precision scores and the host's source/citation compatibility fields.
-                const payload = {
-                    rankingMode: search.rankingMode,
-                    scoreMeaning: search.rankingMode === "retrieval" ? "retrieval_rank" : "usefulness_probability",
-                    minUsefulnessApplied: search.rankingMode !== "retrieval",
-                    ...(search.fallbackReason ? { fallbackReason: search.fallbackReason,
-                        warning: "decision model usefulness ranking unavailable; returning unjudged retrieval-ranked leads. Scores are retrieval ranks, not usefulness probabilities; minUsefulness was not applied. Verify evidence with memory_get." }
-                        : search.requestsFailed ? { warning: `${search.requestsFailed} candidate usefulness judgments failed; results are partial` } : {}),
-                    results: search.results.map(({ source: _source, citation: _citation, vectorScore: _vectorScore, textScore: _textScore, locator: _locator, session, sessionMessages, ...result }) => ({
-                        ...result,
-                        snippet: result.corpus === "sessions" ? sessionMessages ?? [{ body: result.snippet, partial: true }] : result.snippet,
-                        score: search.rankingMode === "retrieval" ? result.score : Number(result.score.toFixed(2)),
-                        ...(session ? { session: { ...session, startedAt: new Date(session.startedAt).toISOString() } } : {}),
-                    })),
-                };
-                return {
-                    content: [{ type: "text", text: JSON.stringify(payload) }],
-                    details: payload,
-                };
+                return formatSearchResponse(search);
             }
             catch (error) {
                 if (error instanceof QueryInputBudgetError) {
@@ -368,6 +376,30 @@ function createSyncStatusTool(runtime, ctx) {
         },
     };
 }
+function managerTool(descriptor) {
+    return descriptor;
+}
+function registerManagerTool(api, runtime, descriptor) {
+    const { name, label, description, parameters, run } = descriptor;
+    api.registerTool((ctx) => {
+        const active = getContext(ctx);
+        if (!active)
+            return null;
+        return {
+            name,
+            label,
+            description,
+            parameters,
+            async execute(_toolCallId, params, signal) {
+                const options = Value.Parse(parameters, params);
+                const { manager, error } = await runtime.getMemorySearchManager(active);
+                if (!manager)
+                    return managerUnavailable(error);
+                return run(manager, options, signal);
+            },
+        };
+    }, { names: [name] });
+}
 const reclusterParameters = Type.Object({
     space: Type.Optional(Type.Object({
         method: Type.Optional(Type.Union([Type.Literal("umap"), Type.Literal("none")])),
@@ -384,53 +416,35 @@ const reclusterParameters = Type.Object({
     }, { additionalProperties: false })),
     seed: Type.Optional(Type.Integer({ minimum: 0, maximum: 4_294_967_295 })),
 }, { additionalProperties: false });
-function createReclusterTool(runtime, ctx) {
-    const active = getContext(ctx);
-    if (!active)
-        return null;
-    return {
-        name: "memory_recluster",
-        label: "Recluster Memory",
-        description: "Rebuild memory clusters from existing QMD vectors. Call only when memory_list_clusters reports missing or stale analysis.",
-        parameters: reclusterParameters,
-        async execute(_toolCallId, params, signal) {
-            const options = Value.Parse(reclusterParameters, params);
-            const { manager, error } = await runtime.getMemorySearchManager(active);
-            if (!manager)
-                return managerUnavailable(error);
-            try {
-                return jsonResult(await manager.recluster(options, signal));
-            }
-            catch (analysisError) {
-                return jsonResult({
-                    status: "unavailable",
-                    error: analysisError instanceof Error ? analysisError.message : String(analysisError),
-                });
-            }
-        },
-    };
-}
+const reclusterTool = managerTool({
+    name: "memory_recluster",
+    label: "Recluster Memory",
+    description: "Rebuild memory clusters from existing QMD vectors. Call only when memory_list_clusters reports missing or stale analysis.",
+    parameters: reclusterParameters,
+    async run(manager, options, signal) {
+        try {
+            return jsonResult(await manager.recluster(options, signal));
+        }
+        catch (analysisError) {
+            return jsonResult({
+                status: "unavailable",
+                error: analysisError instanceof Error ? analysisError.message : String(analysisError),
+            });
+        }
+    },
+});
 const listClustersParameters = Type.Object({
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
 }, { additionalProperties: false });
-function createListClustersTool(runtime, ctx) {
-    const active = getContext(ctx);
-    if (!active)
-        return null;
-    return {
-        name: "memory_list_clusters",
-        label: "List Memory Clusters",
-        description: "List current memory clusters and freshness. Call this before memory_recluster or memory_fetch_cluster.",
-        parameters: listClustersParameters,
-        async execute(_toolCallId, params) {
-            const { limit } = Value.Parse(listClustersParameters, params);
-            const { manager, error } = await runtime.getMemorySearchManager(active);
-            if (!manager)
-                return managerUnavailable(error);
-            return jsonResult(await manager.listClusters(limit));
-        },
-    };
-}
+const listClustersTool = managerTool({
+    name: "memory_list_clusters",
+    label: "List Memory Clusters",
+    description: "List current memory clusters and freshness. Call this before memory_recluster or memory_fetch_cluster.",
+    parameters: listClustersParameters,
+    async run(manager, { limit }) {
+        return jsonResult(await manager.listClusters(limit));
+    },
+});
 const fetchClusterParameters = Type.Object({
     clusterId: Type.String({ pattern: "^[0-9a-f]{10}$" }),
     topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
@@ -443,24 +457,15 @@ const fetchClusterParameters = Type.Object({
         Type.Literal("date_asc"),
     ])),
 }, { additionalProperties: false });
-function createFetchClusterTool(runtime, ctx) {
-    const active = getContext(ctx);
-    if (!active)
-        return null;
-    return {
-        name: "memory_fetch_cluster",
-        label: "Fetch Memory Cluster",
-        description: "Fetch a sorted page of QMD chunks for a clusterId returned by memory_list_clusters.",
-        parameters: fetchClusterParameters,
-        async execute(_toolCallId, params) {
-            const { clusterId, topK, offset, sort } = Value.Parse(fetchClusterParameters, params);
-            const { manager, error } = await runtime.getMemorySearchManager(active);
-            if (!manager)
-                return managerUnavailable(error);
-            return jsonResult(await manager.fetchCluster({ clusterId, topK, offset, sort }));
-        },
-    };
-}
+const fetchClusterTool = managerTool({
+    name: "memory_fetch_cluster",
+    label: "Fetch Memory Cluster",
+    description: "Fetch a sorted page of QMD chunks for a clusterId returned by memory_list_clusters.",
+    parameters: fetchClusterParameters,
+    async run(manager, { clusterId, topK, offset, sort }) {
+        return jsonResult(await manager.fetchCluster({ clusterId, topK, offset, sort }));
+    },
+});
 const maintenanceStatus = Type.Union([
     Type.Literal("pending"),
     Type.Literal("resolved"),
@@ -504,24 +509,15 @@ const listMaintenanceParameters = Type.Object({
     status: Type.Optional(maintenanceStatus),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
 }, { additionalProperties: false });
-function createListMaintenanceTool(runtime, ctx) {
-    const active = getContext(ctx);
-    if (!active)
-        return null;
-    return {
-        name: "memory_list_maintenance_tasks",
-        label: "List Memory Maintenance Tasks",
-        description: "List a bounded curation inbox of chronology, duplicate and quality-review indicators.",
-        parameters: listMaintenanceParameters,
-        async execute(_toolCallId, params) {
-            const options = Value.Parse(listMaintenanceParameters, params);
-            const { manager, error } = await runtime.getMemorySearchManager(active);
-            if (!manager)
-                return managerUnavailable(error);
-            return jsonResult({ status: "ok", tasks: await manager.listMaintenanceTasks(options) });
-        },
-    };
-}
+const listMaintenanceTool = managerTool({
+    name: "memory_list_maintenance_tasks",
+    label: "List Memory Maintenance Tasks",
+    description: "List a bounded curation inbox of chronology, duplicate and quality-review indicators.",
+    parameters: listMaintenanceParameters,
+    async run(manager, options) {
+        return jsonResult({ status: "ok", tasks: await manager.listMaintenanceTasks(options) });
+    },
+});
 const isoTimestamp = Type.String({ pattern: ISO_TIMESTAMP_PATTERN });
 const updateMaintenanceParameters = Type.Object({
     taskId: Type.String({ pattern: "\\S" }),
@@ -543,32 +539,23 @@ const updateMaintenanceParameters = Type.Object({
         evidence: Type.String({ minLength: 1, maxLength: 500 }),
     }, { additionalProperties: false })),
 }, { additionalProperties: false });
-function createUpdateMaintenanceTool(runtime, ctx) {
-    const active = getContext(ctx);
-    if (!active)
-        return null;
-    return {
-        name: "memory_update_maintenance_task",
-        label: "Update Memory Maintenance Task",
-        description: "Resolve completed work, defer outstanding work, or dismiss an irrelevant memory-maintenance proposal. This tool never edits source Markdown.",
-        parameters: updateMaintenanceParameters,
-        async execute(_toolCallId, params) {
-            const { taskId, action, note, annotation } = Value.Parse(updateMaintenanceParameters, params);
-            const { manager, error } = await runtime.getMemorySearchManager(active);
-            if (!manager)
-                return managerUnavailable(error);
-            const updated = manager.updateMaintenanceTask({
-                id: taskId,
-                status: action === "resolve" ? "resolved" : action === "defer" ? "deferred" : "irrelevant",
-                note,
-                ...(annotation
-                    ? { annotation: { ...annotation, scope: annotation.scope ?? "chunk" } }
-                    : {}),
-            });
-            return jsonResult(updated ? { status: "ok", task: updated } : { status: "not_found" });
-        },
-    };
-}
+const updateMaintenanceTool = managerTool({
+    name: "memory_update_maintenance_task",
+    label: "Update Memory Maintenance Task",
+    description: "Resolve completed work, defer outstanding work, or dismiss an irrelevant memory-maintenance proposal. This tool never edits source Markdown.",
+    parameters: updateMaintenanceParameters,
+    async run(manager, { taskId, action, note, annotation }) {
+        const updated = manager.updateMaintenanceTask({
+            id: taskId,
+            status: action === "resolve" ? "resolved" : action === "defer" ? "deferred" : "irrelevant",
+            note,
+            ...(annotation
+                ? { annotation: { ...annotation, scope: annotation.scope ?? "chunk" } }
+                : {}),
+        });
+        return jsonResult(updated ? { status: "ok", task: updated } : { status: "not_found" });
+    },
+});
 function formatDateInTimezone(timestamp, timezone) {
     const parts = new Intl.DateTimeFormat("en-US", {
         timeZone: timezone,
@@ -723,6 +710,12 @@ export function registerUnblockMemory(api) {
         api.logger.warn('unblock-memory skillWhisperer.enabled is true but no corpus has kind "skills"; Skill Whisperer is inactive');
     }
     const memoryDatabasePath = (agentId) => runtime.memoryDatabasePath(agentId);
+    const collectionGenerations = async (cfg, agentId, corpora) => {
+        const { manager, error } = await runtime.getMemorySearchManager({ cfg, agentId });
+        if (!manager)
+            throw new Error(error ?? "memory manager unavailable");
+        return manager.getCollectionGenerations(corpora);
+    };
     const whisperer = config.memoryWhisperer;
     const brightness = whisperer.brightness && whisperer.brightness.recipe !== "off" ? whisperer.brightness : undefined;
     registerWhispererPrompt(api, {
@@ -735,12 +728,7 @@ export function registerUnblockMemory(api) {
                     minTokenOverlap: whisperer.derivedMinTokenOverlap,
                     minSharedTokens: whisperer.derivedMinSharedTokens,
                     // Same per-agent index snapshot deep_thought stamps on a synthesis; any advance retires the whisper.
-                    getCollectionGenerations: async (agentId, corpora) => {
-                        const { manager, error } = await runtime.getMemorySearchManager({ cfg: api.config, agentId });
-                        if (!manager)
-                            throw new Error(error ?? "memory manager unavailable");
-                        return manager.getCollectionGenerations(corpora);
-                    },
+                    getCollectionGenerations: async (agentId, corpora) => collectionGenerations(api.config, agentId, corpora),
                 },
             } : {}),
             ...(whisperer.crystalsEnabled ? {
@@ -779,27 +767,13 @@ export function registerUnblockMemory(api) {
         names: ["memory_sync_sessions"],
     });
     api.registerTool((ctx) => createSyncStatusTool(runtime, ctx), { names: ["memory_sync_status"] });
-    api.registerTool((ctx) => createReclusterTool(runtime, ctx), { names: ["memory_recluster"] });
-    api.registerTool((ctx) => createListClustersTool(runtime, ctx), {
-        names: ["memory_list_clusters"],
-    });
-    api.registerTool((ctx) => createFetchClusterTool(runtime, ctx), {
-        names: ["memory_fetch_cluster"],
-    });
+    registerManagerTool(api, runtime, reclusterTool);
+    registerManagerTool(api, runtime, listClustersTool);
+    registerManagerTool(api, runtime, fetchClusterTool);
     api.registerTool((ctx) => createAuditQualityTool(runtime, ctx, config), { names: ["memory_audit_quality"] });
-    api.registerTool((ctx) => createListMaintenanceTool(runtime, ctx), {
-        names: ["memory_list_maintenance_tasks"],
-    });
-    api.registerTool((ctx) => createUpdateMaintenanceTool(runtime, ctx), {
-        names: ["memory_update_maintenance_task"],
-    });
+    registerManagerTool(api, runtime, listMaintenanceTool);
+    registerManagerTool(api, runtime, updateMaintenanceTool);
     registerReviewTools(api, runtime, config, diagnostics);
-    const generationsFor = (cfg, agentId) => async (corpora) => {
-        const { manager, error } = await runtime.getMemorySearchManager({ cfg, agentId });
-        if (!manager)
-            throw new Error(error ?? "memory manager unavailable");
-        return manager.getCollectionGenerations(corpora);
-    };
     stewardMemory = {
         getMemorySearchManager: params => runtime.getMemorySearchManager(params),
         analysisExecutable: Boolean(config.analysis.executable),
@@ -834,24 +808,23 @@ export function registerUnblockMemory(api) {
             deepThoughtStores.set(agentId, store);
             return store;
         };
-        // Headless Overnight Thinking investigations: same deps and durable store, explicit audience, no caller session.
-        stewardMemory.deepThought = (agentId, cfg) => {
+        // Per-agent deps over the supplied config: durable store when it opens, plus that agent's index generations.
+        const deepThoughtFor = (agentId, cfg) => {
             const store = deepThoughtStore(agentId);
-            return { ...deepThought, ...(store ? { store } : {}), getCollectionGenerations: generationsFor(cfg, agentId) };
-        };
-        api.registerTool((ctx) => {
-            const active = getContext(ctx);
-            if (!active)
-                return createDeepThoughtTool(ctx, deepThought);
-            const store = deepThoughtStore(active.agentId);
-            return createDeepThoughtTool(ctx, {
+            return {
                 ...deepThought,
                 ...(store ? { store } : {}),
                 // Generations are per agent index; any indexed change behind the searched corpora invalidates a cached answer.
-                getCollectionGenerations: generationsFor(active.cfg, active.agentId),
+                getCollectionGenerations: (corpora) => collectionGenerations(cfg, agentId, corpora),
                 // audienceKey stays unset: the default isolates cached answers per agent + session key + channel + account +
                 // native channel, so a private DM/session answer is never served to another session.
-            });
+            };
+        };
+        // Headless Overnight Thinking investigations: same deps and durable store, explicit audience, no caller session.
+        stewardMemory.deepThought = deepThoughtFor;
+        api.registerTool((ctx) => {
+            const active = getContext(ctx);
+            return createDeepThoughtTool(ctx, active ? deepThoughtFor(active.agentId, active.cfg) : deepThought);
         }, { names: ["deep_thought"] });
         api.on("gateway_stop", () => {
             cancelAllDeepThoughtJobs();

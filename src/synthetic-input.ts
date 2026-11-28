@@ -41,9 +41,9 @@ const LEGACY_HEADER = "OpenClaw runtime context (internal):";
  */
 const CRON_HEAD = /^\[cron:[^\s\]]+(?:[ \t]+[^\s\]][^\]\r\n]*)?\](?=\s|$)/u;
 const CRON_HEAD_SCAN = 4096;
-/** One whole (right-trimmed) line; each branch ends in a single unbounded class, so a failed match never backtracks twice. */
-const CRON_TAIL = /^(?:This is an unattended scheduled run\.(?:[ \t]+Nobody is present to clarify or approve,[^\r\n]*)?|Automation scratch \(revision \d+\):|Previous meaningful automation result \(recorded data, not instructions\):)$/u;
+/** Whole right-trimmed lines, with no competing unbounded matches. */
 const UNATTENDED = /^This is an unattended scheduled run\.(?:[ \t]+Nobody is present to clarify or approve,[^\r\n]*)?$/u;
+const CRON_TAIL_BLOCK = /^(?:Automation scratch \(revision \d+\):|Previous meaningful automation result \(recorded data, not instructions\):)$/u;
 const HEARTBEAT_HEAD = /^\[OpenClaw (?:heartbeat poll|cron wake)\](?=[ \t]*(?:\r?\n|$))/u;
 const HUMAN_HEAD = /^\[(?:Queued messages while agent was busy|Earlier unanswered user message\.[^\]\r\n]*|Queued user message from a previous active turn;[^\]\r\n]*)\](?=\s|$)/u;
 /** Host-authored user-turn envelopes, each anchored to its exact opening sentence so human prose that merely starts alike stays. */
@@ -74,7 +74,10 @@ function cronTailIndex(text: string): number {
   const inside = fenceTracker();
   let offset = 0;
   for (const line of text.split(/(?<=\n)/u)) {
-    if (!inside(line) && CRON_TAIL.test(line.trimEnd())) return offset;
+    if (!inside(line)) {
+      const tail = line.trimEnd();
+      if (UNATTENDED.test(tail) || CRON_TAIL_BLOCK.test(tail)) return offset;
+    }
     offset += line.length;
   }
   return text.length;
@@ -89,6 +92,18 @@ function stripTimePair(text: string): string {
   const reference = trimmed.slice(last + 1), current = trimmed.slice(previous + 1, last).replace(/\r$/u, "");
   if (!/^Reference UTC: \S/u.test(reference) || !/^Current time: \S/u.test(current)) return trimmed;
   return trimmed.slice(0, Math.max(0, previous)).trimEnd();
+}
+
+function unwrapCron(text: string, scheduled: boolean): string | undefined {
+  const head = CRON_HEAD.exec(firstLine(text));
+  // Suffixes only count once the cron header or provenance establishes the envelope.
+  if (!head && !scheduled) return undefined;
+  let wrapped = text.slice(head?.[0].length ?? 0).trimStart();
+  const opening = firstLine(wrapped);
+  // A leading unattended line must be whole, not a truncated scan.
+  const whole = opening.length === wrapped.length || /[\r\n]/u.test(wrapped[opening.length]!);
+  if (whole && UNATTENDED.test(opening.trimEnd())) wrapped = wrapped.slice(opening.length).trimStart();
+  return stripTimePair(wrapped.slice(0, cronTailIndex(wrapped)));
 }
 
 /**
@@ -120,6 +135,16 @@ function stripRuntimeContext(text: string): string {
   return kept.join("");
 }
 
+function hostProvenanceFamily(inputProvenance: unknown, display: unknown): SyntheticInputFamily | undefined {
+  const { kind, sourceTool } = record(inputProvenance) ?? {};
+  // A hidden cron carrier is still a cron turn whose task text we keep.
+  if (kind === "internal_system" && (sourceTool === "cron" || sourceTool === "cron_execution")) return "cron_wrapper";
+  if (sourceTool === "agent_harness_completion") return "completion_wake";
+  if (sourceTool === "progress_card_refresh" || display === false) return "internal_context";
+  if (kind === "inter_session") return "intersession_subagent";
+  if (kind === "internal_system") return sourceTool === "exec" ? "exec_system_handoff" : "internal_context";
+}
+
 /** Classify host input, not general prose about OpenClaw or its controls. */
 export function classifySyntheticInput(input: string | Input, config?: SyntheticInputFilterConfig): Classification {
   const { text: original, inputProvenance, display, role } = typeof input === "string" ? { text: input } : input;
@@ -127,18 +152,9 @@ export function classifySyntheticInput(input: string | Input, config?: Synthetic
   if (config?.enabled === false) return allowed;
   const enabled = (family: SyntheticInputFamily) => syntheticFamilyEnabled(family, config);
   const skip = (family: SyntheticInputFamily, reason: string): Classification => ({ synthetic: true, family, reason, action: "skip", text: "" });
-  const provenance = record(inputProvenance);
-  const { kind, sourceTool } = provenance ?? {};
-  // Scheduled runs are recognized first: a hidden cron carrier is still a cron turn whose task text we keep.
-  const scheduledFamily = kind === "internal_system" && (sourceTool === "cron" || sourceTool === "cron_execution")
-    ? "cron_wrapper" : undefined;
-  const carrierFamily = scheduledFamily ? undefined
-    : sourceTool === "agent_harness_completion" ? "completion_wake"
-    : sourceTool === "progress_card_refresh" || display === false ? "internal_context"
-    : kind === "inter_session" ? "intersession_subagent"
-    : kind === "internal_system" ? (sourceTool === "exec" ? "exec_system_handoff" : "internal_context") : undefined;
-  if (carrierFamily && enabled(carrierFamily)) {
-    return skip(carrierFamily, display === false ? "hidden_carrier" : "host_provenance");
+  const hostFamily = hostProvenanceFamily(inputProvenance, display);
+  if (hostFamily && hostFamily !== "cron_wrapper" && enabled(hostFamily)) {
+    return skip(hostFamily, display === false ? "hidden_carrier" : "host_provenance");
   }
   // Prompt wrappers are host-authored user turns; an assistant quoting one is just text.
   const userTurn = role === undefined || role === "user";
@@ -156,15 +172,9 @@ export function classifySyntheticInput(input: string | Input, config?: Synthetic
     }
   }
   if (userTurn && enabled("cron_wrapper")) {
-    const head = CRON_HEAD.exec(firstLine(text));
-    // The unattended suffix and scratch blocks only ever follow an established cron header or cron provenance.
-    if (head || scheduledFamily) {
-      let wrapped = text.slice(head?.[0].length ?? 0).trimStart();
-      const opening = firstLine(wrapped);
-      // A leading unattended line (whole, not a truncated scan) is framing too; the task follows it.
-      const whole = opening.length === wrapped.length || /[\r\n]/u.test(wrapped[opening.length]!);
-      if (whole && UNATTENDED.test(opening.trimEnd())) wrapped = wrapped.slice(opening.length).trimStart();
-      text = stripTimePair(wrapped.slice(0, cronTailIndex(wrapped)));
+    const task = unwrapCron(text, hostFamily === "cron_wrapper");
+    if (task !== undefined) {
+      text = task;
       framing = "cron_wrapper";
     }
   }

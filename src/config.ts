@@ -173,20 +173,32 @@ const DEFAULT_QUALITY_AUDIT: UnblockMemoryConfig["qualityAudit"] = {
   enabled: false, corpora: [], minNoise: DEFAULTS.quality.defaultMinNoise,
 };
 
+/** The enabled flag plus explicit non-skill corpus approval shared by Quality Audit and Evidence Review. */
+function resolveCorpusApproval(config: Record<string, unknown>, label: string, corpora: readonly CorpusConfig[]) {
+  const enabled = config.enabled ?? false;
+  const selected = config.corpora ?? [];
+  if (typeof enabled !== "boolean") throw new Error(`${label}.enabled must be a boolean`);
+  if (!Array.isArray(selected) || !selected.every((name): name is string =>
+    typeof name === "string" && corpora.some(corpus => corpus.name === name && corpus.kind !== "skills"))) {
+    throw new Error(`${label}.corpora must list configured non-skill corpora`);
+  }
+  if (enabled && !selected.length) throw new Error(`enabled ${label} requires explicit corpora`);
+  return { enabled, corpora: [...new Set(selected)] };
+}
+
 function resolveQualityAudit(value: unknown, corpora: readonly CorpusConfig[]): UnblockMemoryConfig["qualityAudit"] {
   if (value === undefined) return { ...DEFAULT_QUALITY_AUDIT };
   const config = checkedConfig(value, ["enabled", "corpora", "minNoise"], "qualityAudit", "");
-  const enabled = config.enabled ?? false;
-  const selected = config.corpora ?? [];
-  const minNoise = config.minNoise ?? DEFAULT_QUALITY_AUDIT.minNoise;
-  if (typeof enabled !== "boolean") throw new Error("qualityAudit.enabled must be a boolean");
-  if (!Array.isArray(selected) || !selected.every((name): name is string =>
-    typeof name === "string" && corpora.some(corpus => corpus.name === name && corpus.kind !== "skills"))) {
-    throw new Error("qualityAudit.corpora must list configured non-skill corpora");
-  }
-  if (enabled && !selected.length) throw new Error("enabled qualityAudit requires explicit corpora");
-  const validatedMinNoise = probability(minNoise, "qualityAudit.minNoise");
-  return { enabled, corpora: [...new Set(selected)], minNoise: validatedMinNoise };
+  const approval = resolveCorpusApproval(config, "qualityAudit", corpora);
+  const minNoise = probability(config.minNoise ?? DEFAULT_QUALITY_AUDIT.minNoise, "qualityAudit.minNoise");
+  return { ...approval, minNoise };
+}
+
+function resolveEvidenceReview(value: unknown, corpora: readonly CorpusConfig[]): UnblockMemoryConfig["evidenceReview"] {
+  if (value === undefined) return { enabled: false, corpora: [] };
+  const config = checkedConfig(value, ["enabled", "corpora"], "evidenceReview", "");
+  try { return resolveCorpusApproval(config, "evidenceReview", corpora); }
+  catch { throw new Error("evidenceReview requires a boolean enabled and explicit configured non-skill corpora when enabled"); }
 }
 
 function resolveDecisionModel(value: unknown): DecisionModelPluginConfig {
@@ -636,15 +648,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   const corpora = resolveCorpora(config.corpora);
   const people = resolvePeople(config.people);
   const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
-  let evidenceReview: UnblockMemoryConfig["evidenceReview"] = { enabled: false, corpora: [] };
-  if (config.evidenceReview !== undefined) {
-    const value = config.evidenceReview;
-    checkedConfig(value, ["enabled", "corpora"], "evidenceReview", "");
-    try {
-      const approved = resolveQualityAudit(value, corpora);
-      evidenceReview = { enabled: approved.enabled, corpora: approved.corpora };
-    } catch { throw new Error("evidenceReview requires a boolean enabled and explicit configured non-skill corpora when enabled"); }
-  }
+  const evidenceReview = resolveEvidenceReview(config.evidenceReview, corpora);
   if (
     config.keepEmbeddingModelWarm !== undefined &&
     typeof config.keepEmbeddingModelWarm !== "boolean"

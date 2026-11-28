@@ -73,15 +73,20 @@ function readSkillSource(source) {
     visit(source.root);
     return entries;
 }
-function frontmatterValue(body, key) {
-    const frontmatter = /^\uFEFF?---[ \t]*\r?\n((?:[^\n]*\n)*?)---[ \t]*(?:\r?\n|$)/u.exec(body)?.[1];
+function parseSkillFrontmatter(body) {
+    const source = /^\uFEFF?---[ \t]*\r?\n((?:[^\n]*\n)*?)---[ \t]*(?:\r?\n|$)/u.exec(body)?.[1];
+    if (source === undefined)
+        return;
+    return { source, document: parseDocument(source, { schema: "failsafe" }) };
+}
+function frontmatterValue(frontmatter, key) {
     if (frontmatter === undefined)
         return;
-    const document = parseDocument(frontmatter, { schema: "failsafe" });
+    const { source, document } = frontmatter;
     const scalar = document.get(key, true);
     // Some existing skills use unquoted punctuation that is invalid YAML.
     if (!isScalar(scalar) && document.errors.length) {
-        const raw = new RegExp(`^${key}:[ \\t]*(.+)$`, "mu").exec(frontmatter)?.[1]?.trim();
+        const raw = new RegExp(`^${key}:[ \\t]*(.+)$`, "mu").exec(source)?.[1]?.trim();
         if (raw)
             return raw;
     }
@@ -92,10 +97,10 @@ function frontmatterValue(body, key) {
         : scalar.value.trim();
 }
 export function readSkillCatalogEntry(path) {
-    const body = readFileSync(path, "utf8");
+    const frontmatter = parseSkillFrontmatter(readFileSync(path, "utf8"));
     return {
-        name: frontmatterValue(body, "name") || basename(dirname(path)),
-        description: frontmatterValue(body, "description") ?? "",
+        name: frontmatterValue(frontmatter, "name") || basename(dirname(path)),
+        description: frontmatterValue(frontmatter, "description") ?? "",
         path,
     };
 }
@@ -238,7 +243,8 @@ function lineSpan(body, position, text) {
     const endLine = startLine + Math.max(0, text.split("\n").length - 1);
     return { startLine, endLine };
 }
-function sessionAllowedPaths(metadataByPath, collection, filter) {
+/** Validates `filter` eagerly (even when nothing will be matched) and compiles it into a metadata predicate. */
+function sessionFilterPredicate(filter) {
     const startedFrom = filter.startedFrom === undefined ? undefined : Date.parse(filter.startedFrom);
     const startedTo = filter.startedTo === undefined ? undefined : Date.parse(filter.startedTo);
     if (startedFrom !== undefined && !Number.isFinite(startedFrom)) {
@@ -253,15 +259,36 @@ function sessionAllowedPaths(metadataByPath, collection, filter) {
     const provider = filter.provider?.trim().toLowerCase();
     const accountId = filter.accountId?.trim();
     const conversationId = filter.conversationId?.trim();
-    const paths = [...metadataByPath].flatMap(([path, metadata]) => (startedFrom === undefined || metadata.startedAt >= startedFrom) &&
+    return (metadata) => (startedFrom === undefined || metadata.startedAt >= startedFrom) &&
         (startedTo === undefined || metadata.startedAt <= startedTo) &&
         (provider === undefined || metadata.provider?.trim().toLowerCase() === provider) &&
         (filter.chatType === undefined || metadata.chatType === filter.chatType) &&
         (accountId === undefined || metadata.accountId?.trim() === accountId) &&
-        (conversationId === undefined || metadata.conversationId?.trim() === conversationId)
-        ? [path]
-        : []);
-    return { [collection]: paths };
+        (conversationId === undefined || metadata.conversationId?.trim() === conversationId);
+}
+function sessionAllowedPaths(metadataByPath, collection, filter) {
+    const matches = sessionFilterPredicate(filter);
+    return { [collection]: [...metadataByPath].flatMap(([path, metadata]) => matches(metadata) ? [path] : []) };
+}
+/** Splits a raw `qmd://<collection>/<relative path>` hit URI; the remainder is kept verbatim. */
+function parseQmdUri(file) {
+    const match = /^qmd:\/\/([^/]+)\//.exec(file);
+    return match ? { collection: match[1], relativePath: file.slice(match[0].length) } : undefined;
+}
+function renderExtractedHit(hit, record, locator, maxSnippetChars) {
+    const fits = record !== undefined && record.text.length <= (maxSnippetChars ?? Infinity);
+    if (!fits)
+        return;
+    const item = extractedHit(record, hit.score);
+    if (locator) {
+        item.locator = {
+            ...locator,
+            rawLeafId: memoryPassageId(hit.bestChunk || record.text),
+            observedAtMs: Number.isFinite(record.observedAt) ? record.observedAt : undefined,
+            observedAtBasis: Number.isFinite(record.observedAt) ? "extracted" : "unknown",
+        };
+    }
+    return item;
 }
 export class QmdMemoryManager {
     #dbPath;
@@ -387,10 +414,16 @@ export class QmdMemoryManager {
         const state = this.#getSessionState();
         // Revision first: a concurrent write then only causes one extra reload, never a missed one.
         const revision = state.revision();
-        const manifest = state.readManifest();
+        this.#adoptSessionSnapshot(state.readManifest(), () => revision);
+    }
+    /**
+     * The manifest, its path index, and the revision it was read at always change together.
+     * `revision` is resolved last: reload passes its pre-read sample, sync samples after its projection.
+     */
+    #adoptSessionSnapshot(manifest, revision) {
         this.#sessionMetadata = sessionMetadataByPath(manifest);
         this.#sessionManifest = manifest;
-        this.#sessionManifestRevision = revision;
+        this.#sessionManifestRevision = revision();
     }
     async #refreshSessionMetadata() {
         if (!this.#sessions)
@@ -489,26 +522,8 @@ export class QmdMemoryManager {
         this.#assertOpen();
         await mkdir(dirname(this.#dbPath), { recursive: true });
         this.#assertOpen();
-        if (this.#storeFactory) {
-            const created = await this.#storeFactory();
-            if (this.#closed) {
-                await created.close().catch(() => undefined);
-                throw new Error(MANAGER_CLOSED_ERROR);
-            }
-            try {
-                const store = created;
-                if (store.internal) {
-                    ensureMemoryAnalysisSchema(store.internal.db);
-                    markStaleForAnalysisCollectionChange(store.internal.db, this.#indexCollections, this.#hasSkills);
-                }
-            }
-            catch (error) {
-                await created.close().catch(() => undefined);
-                throw error;
-            }
-            this.#store = created;
-            return created;
-        }
+        if (this.#storeFactory)
+            return this.#publishStore({ kind: "factory", store: await this.#storeFactory() });
         const { createStore } = await import("@unblocklabs/qmd");
         this.#assertOpen();
         const store = await createStore({
@@ -524,44 +539,65 @@ export class QmdMemoryManager {
                         ? [[EXTRACTED_COLLECTION, { projected: true, includeByDefault: false }]] : [])]),
             },
         });
+        return this.#publishStore({ kind: "native", store });
+    }
+    /**
+     * Prepares a freshly opened store and publishes it as `#store`, closing it on any failure (including a close that
+     * raced the open). Factory stores stay lightweight; only native QMD stores get secure delete, pruning, and chunking.
+     */
+    async #publishStore(opened) {
+        const { store } = opened;
         try {
             this.#assertOpen();
-            enableSecureDelete(store);
-            ensureMemoryAnalysisSchema(store.internal.db);
-            markStaleForAnalysisCollectionChange(store.internal.db, this.#indexCollections, this.#hasSkills);
-            const configuredCollections = new Set(this.#collectionNames());
-            const staleCollections = (await store.getStatus()).collections
-                .map((collection) => collection.name)
-                .filter((collection) => !configuredCollections.has(collection));
-            if (staleCollections.length > 0) {
-                const latestRunId = latestAnalysisRunId(store.internal.db);
-                let prunedAnalysisInput = false;
-                if (latestRunId !== undefined) {
-                    const appearsInAnalysis = store.internal.db.prepare(`
-            SELECT 1
-            FROM memory_analysis_memberships membership
-            JOIN documents document ON document.hash = membership.hash
-            WHERE membership.run_id = ? AND document.collection = ?
-            LIMIT 1
-          `);
-                    prunedAnalysisInput = staleCollections.some((collection) => appearsInAnalysis.get(latestRunId, collection));
-                }
-                const prunedDocuments = pruneStaleCollections(store, staleCollections);
-                if (prunedDocuments > 0 && prunedAnalysisInput)
-                    this.#markAnalysisStale(store.internal.db);
+            if (opened.kind === "native")
+                enableSecureDelete(opened.store);
+            const { internal } = store;
+            if (internal) {
+                ensureMemoryAnalysisSchema(internal.db);
+                markStaleForAnalysisCollectionChange(internal.db, this.#indexCollections, this.#hasSkills);
             }
-            await ensureSemanticChunking(store);
-            this.#assertOpen();
+            if (opened.kind === "native") {
+                await this.#pruneUnconfiguredCollections(opened.store);
+                await ensureSemanticChunking(opened.store);
+                this.#assertOpen();
+            }
         }
         catch (error) {
             await store.close().catch(() => undefined);
             throw error;
         }
-        this.#cleanupRemovedDocuments = (changedDocuments) => {
-            cleanupRemovedDocuments(store, changedDocuments);
-        };
+        if (opened.kind === "native") {
+            const native = opened.store;
+            this.#cleanupRemovedDocuments = (changedDocuments) => {
+                cleanupRemovedDocuments(native, changedDocuments);
+            };
+        }
         this.#store = store;
         return store;
+    }
+    /** Drops collections no longer configured, marking analysis stale only when pruned documents fed the latest run. */
+    async #pruneUnconfiguredCollections(store) {
+        const configuredCollections = new Set(this.#collectionNames());
+        const staleCollections = (await store.getStatus()).collections
+            .map((collection) => collection.name)
+            .filter((collection) => !configuredCollections.has(collection));
+        if (staleCollections.length === 0)
+            return;
+        const latestRunId = latestAnalysisRunId(store.internal.db);
+        let prunedAnalysisInput = false;
+        if (latestRunId !== undefined) {
+            const appearsInAnalysis = store.internal.db.prepare(`
+        SELECT 1
+        FROM memory_analysis_memberships membership
+        JOIN documents document ON document.hash = membership.hash
+        WHERE membership.run_id = ? AND document.collection = ?
+        LIMIT 1
+      `);
+            prunedAnalysisInput = staleCollections.some((collection) => appearsInAnalysis.get(latestRunId, collection));
+        }
+        const prunedDocuments = pruneStaleCollections(store, staleCollections);
+        if (prunedDocuments > 0 && prunedAnalysisInput)
+            this.#markAnalysisStale(store.internal.db);
     }
     #collectionNames(corpora) {
         const extracted = this.#publishedExtraction ? [EXTRACTED_COLLECTION] : [];
@@ -618,8 +654,8 @@ export class QmdMemoryManager {
             .filter(r => extraction.chatTypes.includes(r.metadata.chatType));
         if (!filter)
             return records;
-        const allowed = new Set(sessionAllowedPaths(new Map(records.map(r => [extractedPath(r), r.metadata])), EXTRACTED_COLLECTION, filter)[EXTRACTED_COLLECTION]);
-        return records.filter(r => allowed.has(extractedPath(r)));
+        const matches = sessionFilterPredicate(filter);
+        return records.filter(r => matches(r.metadata));
     }
     /** Search scope: session-filtered transcripts plus currently published extracted memories. */
     #allowedPaths(collections, filter) {
@@ -722,9 +758,7 @@ export class QmdMemoryManager {
                 }
                 catch { /* The original error wins. */ }
             });
-            this.#sessionMetadata = sessionMetadataByPath(synced.manifest);
-            this.#sessionManifest = synced.manifest;
-            this.#sessionManifestRevision = state.revision();
+            this.#adoptSessionSnapshot(synced.manifest, () => state.revision());
             if (synced.result.skipReason)
                 return synced.result;
             await this.#refreshIndexStatus(store);
@@ -1224,82 +1258,79 @@ export class QmdMemoryManager {
                 chunkPos: ref?.chunkPos ?? hit.chunkPos,
                 chunkLen: ref?.chunkLen ?? hit.chunkLen,
             } : undefined;
-            const collection = /^qmd:\/\/([^/]+)\//.exec(hit.file)?.[1];
-            if (collection === EXTRACTED_COLLECTION) {
-                const record = current.get(hit.file);
-                if (record && record.text.length <= (opts?.maxSnippetChars ?? Infinity)) {
-                    const item = extractedHit(record, hit.score);
-                    if (locator) {
-                        item.locator = {
-                            ...locator,
-                            rawLeafId: memoryPassageId(hit.bestChunk || record.text),
-                            observedAtMs: Number.isFinite(record.observedAt) ? record.observedAt : undefined,
-                            observedAtBasis: Number.isFinite(record.observedAt) ? "extracted" : "unknown",
-                        };
-                    }
+            const uri = parseQmdUri(hit.file);
+            if (uri?.collection === EXTRACTED_COLLECTION) {
+                const item = renderExtractedHit(hit, current.get(hit.file), locator, opts?.maxSnippetChars);
+                if (item)
                     results.push(item);
-                }
                 continue;
             }
-            const source = collection ? this.#sources.get(collection) : undefined;
-            const corpus = source?.corpus;
-            if (!corpus || !source)
+            const source = uri ? this.#sources.get(uri.collection) : undefined;
+            if (!uri || !source?.corpus)
                 continue;
-            const relativePath = collection && hit.file.startsWith(`qmd://${collection}/`)
-                ? hit.file.slice(`qmd://${collection}/`.length)
-                : undefined;
-            const session = corpus === "sessions" && relativePath
-                ? this.#sessionMetadata.get(relativePath)
-                : undefined;
-            const projection = session ? this.#sessionManifest?.sessions[session.sessionId] : undefined;
-            // Never apply offsets from a newer projection to an older indexed snapshot.
-            const messages = corpus === "sessions"
-                ? projection?.messages && projection.documentPath === relativePath &&
-                    projection.projectionHash === (ref?.docHash ?? projectionHash(hit.body))
-                    ? projection.messages : parseSessionMessageSpans(hit.body)
-                : undefined;
-            const contextSpan = messages ? sessionContextSpans(hit.body, hit.chunkPos, messages) : undefined;
-            const messageTimestamp = contextSpan?.message.timestamp;
-            const messageTimestampMs = contextSpan?.message.timestampMs;
-            const selected = whisperer ? await renderMemoryPassage(hit, messages)
-                : corpus === "sessions" && this.#sessions && tokenizer
-                    ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text), opts?.maxSnippetChars, messages)
-                    : { text: hit.bestChunk, position: hit.chunkPos };
-            if (!selected?.text)
-                continue;
-            const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
-            const item = {
-                path: hit.file,
-                ...span,
-                score: hit.score,
-                vectorScore: hit.score,
-                snippet: selected.text,
-                ...(messages ? { sessionMessages: sessionSnippetMessages(hit.body, selected, messages, this.#sessions) } : {}),
-                source: "memory",
-                corpus,
-                ...(session ? { session } : {}),
-                ...(messageTimestamp ? { messageTimestamp } : {}),
-                citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
-            };
-            if (locator) {
-                const isMemoryDateSource = corpus !== "sessions" && relativePath !== undefined && (corpus === "memory" || basename(source.root) === "memory" || /(?:^|\/)memory\//u.test(relativePath));
-                const fileDateMs = isMemoryDateSource && relativePath ? parseDailyFilenameDateMs(relativePath) : undefined;
-                item.locator = {
-                    ...locator,
-                    rawLeafId: memoryPassageId(hit.bestChunk),
-                    observedAtMs: messageTimestampMs ?? fileDateMs,
-                    observedAtBasis: messageTimestampMs !== undefined
-                        ? "session_message"
-                        : fileDateMs !== undefined
-                            ? "filename_date"
-                            : "unknown",
-                };
-            }
-            results.push(item);
+            const item = await this.#renderIndexedHit(hit, source, uri.relativePath, locator, {
+                tokenizer, maxSnippetChars: opts?.maxSnippetChars, whisperer,
+            });
+            if (item)
+                results.push(item);
         }
         // Expansion above can yield; recheck only derived hits once more before returning.
         const finalPaths = new Set(this.#currentExtracted(results.map(hit => hit.path), opts?.sessionFilter).map(extractedUri));
         return results.filter(hit => !hit.path.startsWith(EXTRACTED_PREFIX) || finalPaths.has(hit.path));
+    }
+    /** Session metadata and message spans for a transcript hit; `{}` for every other corpus. */
+    #selectSessionContext(hit, corpus, relativePath) {
+        if (corpus !== "sessions")
+            return {};
+        const session = relativePath ? this.#sessionMetadata.get(relativePath) : undefined;
+        const projection = session ? this.#sessionManifest?.sessions[session.sessionId] : undefined;
+        // Never apply offsets from a newer projection to an older indexed snapshot.
+        const messages = projection?.messages && projection.documentPath === relativePath &&
+            projection.projectionHash === (hit.ref?.docHash ?? projectionHash(hit.body))
+            ? projection.messages : parseSessionMessageSpans(hit.body);
+        return { session, messages };
+    }
+    async #renderIndexedHit(hit, source, relativePath, locator, { tokenizer, maxSnippetChars, whisperer }) {
+        const { corpus } = source;
+        const { session, messages } = this.#selectSessionContext(hit, corpus, relativePath);
+        const contextSpan = messages ? sessionContextSpans(hit.body, hit.chunkPos, messages) : undefined;
+        const messageTimestamp = contextSpan?.message.timestamp;
+        const messageTimestampMs = contextSpan?.message.timestampMs;
+        const selected = whisperer ? await renderMemoryPassage(hit, messages)
+            : corpus === "sessions" && this.#sessions && tokenizer
+                ? await expandSessionSearchHit(hit, this.#sessions.maxExpandedTokens, (text) => tokenizer.countTokens(text), maxSnippetChars, messages)
+                : { text: hit.bestChunk, position: hit.chunkPos };
+        if (!selected?.text)
+            return;
+        const span = lineSpan(hit.body, selected.position, selected.sourceText ?? selected.text);
+        const item = {
+            path: hit.file,
+            ...span,
+            score: hit.score,
+            vectorScore: hit.score,
+            snippet: selected.text,
+            ...(messages ? { sessionMessages: sessionSnippetMessages(hit.body, selected, messages, this.#sessions) } : {}),
+            source: "memory",
+            corpus,
+            ...(session ? { session } : {}),
+            ...(messageTimestamp ? { messageTimestamp } : {}),
+            citation: `${hit.displayPath}#L${span.startLine}-L${span.endLine}`,
+        };
+        if (locator) {
+            const isMemoryDateSource = corpus !== "sessions" && (corpus === "memory" || basename(source.root) === "memory" || /(?:^|\/)memory\//u.test(relativePath));
+            const fileDateMs = isMemoryDateSource && relativePath ? parseDailyFilenameDateMs(relativePath) : undefined;
+            item.locator = {
+                ...locator,
+                rawLeafId: memoryPassageId(hit.bestChunk),
+                observedAtMs: messageTimestampMs ?? fileDateMs,
+                observedAtBasis: messageTimestampMs !== undefined
+                    ? "session_message"
+                    : fileDateMs !== undefined
+                        ? "filename_date"
+                        : "unknown",
+            };
+        }
+        return item;
     }
     async listSkills() {
         return this.#getSkillCatalog().map((entry) => ({ ...entry }));

@@ -62,6 +62,9 @@ export type SessionContextSpans = {
     };
 };
 export declare function projectMessage(row: SessionProjectionInput["events"][number], input: SessionProjectionInput): ProjectedMessage | undefined;
+export declare function projectDecodedMessage(value: unknown, source: {
+    createdAt: number;
+}, input: Omit<SessionProjectionInput, "events" | "timezone">, event?: Record<string, unknown>): ProjectedMessage | undefined;
 export declare function projectSession(input: SessionProjectionInput): string | undefined;
 export declare function projectSessionDocument(input: SessionProjectionInput): {
     content: string;

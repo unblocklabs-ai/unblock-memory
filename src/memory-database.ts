@@ -70,6 +70,51 @@ export function immediateTransaction<T>(db: DatabaseSync, fn: () => T): T {
   catch (error) { db.exec("ROLLBACK"); throw error; }
 }
 
+type LegacyStore = (typeof legacyStores)[number];
+
+function requireIntegrity(db: DatabaseSync, schema: string, message: string): void {
+  const integrity = db.prepare(`PRAGMA ${schema}.integrity_check`).all();
+  if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error(message);
+}
+
+/** Copies one attached legacy store into `main` and verifies it; runs inside the consolidation transaction. */
+function copyLegacyStore(db: DatabaseSync, source: LegacyStore): void {
+  const schema = identifier(`legacy_${source.component}`);
+  const version = Number(db.prepare(`PRAGMA ${schema}.user_version`).get()?.user_version);
+  if (source.component === "people" ? version < 0 || version > 4 : version !== 0) {
+    throw new Error(`Unsupported legacy ${source.component} schema version`);
+  }
+  requireIntegrity(db, schema, `Invalid legacy ${source.component} database`);
+  const objects = db.prepare(`SELECT type,name,tbl_name,sql FROM ${schema}.sqlite_schema WHERE name NOT LIKE 'sqlite_%'`).all();
+  if (source.component === "people" && version === 0 && objects.length) throw new Error("Unversioned legacy people schema");
+  for (const object of objects) {
+    if ((object.type !== "table" && object.type !== "index") || typeof object.sql !== "string" ||
+        !source.tables.some(name => name === object.tbl_name) || /CREATE\s+VIRTUAL\s+TABLE/i.test(object.sql)) {
+      throw new Error(`Unsupported legacy ${source.component} schema object`);
+    }
+  }
+  const tables = objects.filter(object => object.type === "table");
+  if (source.component === "people" && version > 0) {
+    const required = ["companies", "people", "person_identities", "person_dossiers", "people_todos",
+      ...(version >= 2 ? ["person_whisper_receipts"] : []),
+      ...(version === 2 ? ["person_evidence_receipts"] : []),
+      ...(version === 4 ? ["person_dossier_changes"] : [])];
+    if (required.some(name => !tables.some(table => table.name === name))) throw new Error("Incomplete legacy people schema");
+  }
+  for (const table of tables) db.exec(String(table.sql));
+  for (const table of tables) {
+    const name = identifier(String(table.name));
+    db.exec(`INSERT INTO main.${name} SELECT * FROM ${schema}.${name}`);
+    const counts = db.prepare(`SELECT (SELECT count(*) FROM main.${name}) AS actual,
+      (SELECT count(*) FROM ${schema}.${name}) AS expected`).get();
+    const different = db.prepare(`SELECT * FROM ${schema}.${name} EXCEPT SELECT * FROM main.${name}`).get();
+    const extra = db.prepare(`SELECT * FROM main.${name} EXCEPT SELECT * FROM ${schema}.${name}`).get();
+    if (counts?.actual !== counts?.expected || different || extra) throw new Error(`Legacy ${source.component} copy verification failed`);
+  }
+  for (const index of objects.filter(object => object.type === "index")) db.exec(String(index.sql));
+  if (source.component === "people") db.prepare("INSERT INTO memory_schema VALUES ('people',?)").run(version);
+}
+
 function consolidate(db: DatabaseSync, directory: string): void {
   const completed = () => {
     const version = db.prepare("SELECT version FROM memory_schema WHERE component='storage'").get()?.version;
@@ -94,46 +139,9 @@ function consolidate(db: DatabaseSync, directory: string): void {
       if (!completed()) {
         const existing = db.prepare("SELECT name FROM main.sqlite_schema WHERE type='table' AND name!='memory_schema'").get();
         if (existing) throw new Error("Unmarked durable database is not empty; refusing to overwrite it");
-        for (const source of sources) {
-          const schema = identifier(`legacy_${source.component}`);
-          const version = Number(db.prepare(`PRAGMA ${schema}.user_version`).get()?.user_version);
-          if (source.component === "people" ? version < 0 || version > 4 : version !== 0) {
-            throw new Error(`Unsupported legacy ${source.component} schema version`);
-          }
-          const integrity = db.prepare(`PRAGMA ${schema}.integrity_check`).all();
-          if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error(`Invalid legacy ${source.component} database`);
-          const objects = db.prepare(`SELECT type,name,tbl_name,sql FROM ${schema}.sqlite_schema WHERE name NOT LIKE 'sqlite_%'`).all();
-          if (source.component === "people" && version === 0 && objects.length) throw new Error("Unversioned legacy people schema");
-          for (const object of objects) {
-            if ((object.type !== "table" && object.type !== "index") || typeof object.sql !== "string" ||
-                !source.tables.some(name => name === object.tbl_name) || /CREATE\s+VIRTUAL\s+TABLE/i.test(object.sql)) {
-              throw new Error(`Unsupported legacy ${source.component} schema object`);
-            }
-          }
-          const tables = objects.filter(object => object.type === "table");
-          if (source.component === "people" && version > 0) {
-            const required = ["companies", "people", "person_identities", "person_dossiers", "people_todos",
-              ...(version >= 2 ? ["person_whisper_receipts"] : []),
-              ...(version === 2 ? ["person_evidence_receipts"] : []),
-              ...(version === 4 ? ["person_dossier_changes"] : [])];
-            if (required.some(name => !tables.some(table => table.name === name))) throw new Error("Incomplete legacy people schema");
-          }
-          for (const table of tables) db.exec(String(table.sql));
-          for (const table of tables) {
-            const name = identifier(String(table.name));
-            db.exec(`INSERT INTO main.${name} SELECT * FROM ${schema}.${name}`);
-            const counts = db.prepare(`SELECT (SELECT count(*) FROM main.${name}) AS actual,
-              (SELECT count(*) FROM ${schema}.${name}) AS expected`).get();
-            const different = db.prepare(`SELECT * FROM ${schema}.${name} EXCEPT SELECT * FROM main.${name}`).get();
-            const extra = db.prepare(`SELECT * FROM main.${name} EXCEPT SELECT * FROM ${schema}.${name}`).get();
-            if (counts?.actual !== counts?.expected || different || extra) throw new Error(`Legacy ${source.component} copy verification failed`);
-          }
-          for (const index of objects.filter(object => object.type === "index")) db.exec(String(index.sql));
-          if (source.component === "people") db.prepare("INSERT INTO memory_schema VALUES ('people',?)").run(version);
-        }
+        for (const source of sources) copyLegacyStore(db, source);
         if (db.prepare("PRAGMA main.foreign_key_check").get()) throw new Error("Migrated memory has broken foreign keys");
-        const integrity = db.prepare("PRAGMA main.integrity_check").all();
-        if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error("Migrated memory integrity check failed");
+        requireIntegrity(db, "main", "Migrated memory integrity check failed");
         db.prepare("INSERT INTO memory_schema VALUES ('storage',1)").run();
       }
       db.exec("COMMIT");
@@ -142,6 +150,18 @@ function consolidate(db: DatabaseSync, directory: string): void {
   } finally {
     for (const alias of attached.reverse()) db.exec(`DETACH DATABASE ${identifier(alias)}`);
   }
+}
+
+/**
+ * Double-checked schema install: `ready()` first runs lock-free (avoiding the write lock on every open),
+ * then again under `BEGIN IMMEDIATE` before `install()` runs in that same transaction.
+ */
+export function ensureSchemaUnderWriteLock(db: DatabaseSync, ready: () => boolean, install: () => void): void {
+  if (ready()) return;
+  immediateTransaction(db, () => {
+    if (ready()) return;
+    install();
+  });
 }
 
 export function tableExists(db: DatabaseSync, name: string): boolean {

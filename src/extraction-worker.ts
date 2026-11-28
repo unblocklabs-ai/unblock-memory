@@ -15,7 +15,7 @@ import {
   ExtractionStore,
   type ExtractionSession,
 } from "./extraction-store.js";
-import { readExtractionPage } from "./extraction-source.js";
+import { bindExtractionPageReader, readExtractionPage } from "./extraction-source.js";
 import { checkpointFence, extractionHistory, readExtractionChunk } from "./extraction-chunk.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 
@@ -114,6 +114,7 @@ async function processSession(params: {
     version, policyFingerprint, apiKey, signal, leaseAbort, readPage, extract, validate,
   } = params;
   const extractionConfig = config.extraction;
+  const fetchPage = bindExtractionPageReader({ agentId, agentName, session, signal, readPage });
   // Verify a cursor against the source before an intentional rewind discards it, so a rewritten or deleted
   // session still withdraws its stale observations instead of replaying as a fresh source.
   const rewindFrom = store.rewindCursor(session, since, policyFingerprint);
@@ -122,10 +123,9 @@ async function processSession(params: {
     let kind: Awaited<ReturnType<typeof readPage>>["kind"] = "reset"; // A malformed bookmark is a reset.
     if (fence !== undefined) {
       try {
+        const page = await fetchPage(fence);
         signal.throwIfAborted();
-        const pending = readPage(agentId, agentName, session, fence, undefined, signal);
-        void pending.catch(() => {});
-        kind = (await abortable(pending, signal)).kind;
+        kind = page.kind;
       } catch {
         signal.throwIfAborted();
         kind = "unavailable";
@@ -151,13 +151,9 @@ async function processSession(params: {
   let stage = "read";
   try {
     const page = await readExtractionChunk({
-      agentId,
-      agentName,
-      session,
       cursor: checkpoint.cursor,
       context: extractionHistory(checkpoint.context, extractionConfig.historyMessages),
-      signal,
-      readPage,
+      fetchPage,
     });
     signal.throwIfAborted();
     if (page.kind === "unavailable") {
@@ -199,10 +195,7 @@ async function processSession(params: {
     });
 
     // A branch rewrite during inference invalidates its proposals. Appends are safe and processed next time.
-    signal.throwIfAborted();
-    const checkPending = readPage(agentId, agentName, session, page.fence, undefined, signal);
-    void checkPending.catch(() => {});
-    const check = await abortable(checkPending, signal);
+    const check = await fetchPage(page.fence);
     signal.throwIfAborted();
     if (handleResetOrMissing(store, session.sessionId, check, owner, policyFingerprint)) {
       return { processed: 1, accepted: 0, rejected, unchanged: 0, failed: 0 };

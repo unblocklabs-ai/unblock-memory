@@ -2,7 +2,7 @@ import { DEFAULTS } from "./defaults.js";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { AgentTranscriptReader, agentTranscriptSchemaVersion, assertAgentTranscriptIdentity } from "./agent-transcript.js";
+import { AgentTranscriptReader, agentTranscriptSchemaVersion, assertAgentTranscriptIdentity, hostSessionCatalog, inspectTranscriptColumns } from "./agent-transcript.js";
 import { projectSessionDocument, sessionDocumentPath, } from "./session-projector.js";
 export const PROJECTOR_VERSION = 9;
 // Source lives in src/, published code in dist/src/. Read our own pinned dependency
@@ -69,12 +69,11 @@ function assertDocumentPath(documentPath) {
     }
     return documentPath;
 }
-function assertSchema(db, expectedAgentId) {
+function assertSchema(db, expectedAgentId, columns) {
     const version = agentTranscriptSchemaVersion(db);
     for (const [table, required] of Object.entries(REQUIRED_COLUMNS)) {
-        const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all()
-            .map((column) => column.name));
-        const missing = required.find((column) => !columns.has(column));
+        const found = columns(table);
+        const missing = required.find((column) => !found.has(column));
         if (missing)
             throw new Error(`unsupported OpenClaw agent database: missing ${table}.${missing}`);
     }
@@ -84,33 +83,31 @@ function readSnapshot(params) {
     const db = new DatabaseSync(params.databasePath, { readOnly: true });
     try {
         db.exec(`PRAGMA query_only = ON; PRAGMA busy_timeout = ${DEFAULTS.sqlite.mainBusyTimeoutMs}; BEGIN`);
-        assertSchema(db, params.agentId);
-        const transcripts = new AgentTranscriptReader(db, params.agentId);
+        const columns = inspectTranscriptColumns(db);
+        assertSchema(db, params.agentId, columns);
+        const transcripts = new AgentTranscriptReader(db, params.agentId, undefined, columns);
         const placeholders = params.chatTypes.map(() => "?").join(", ");
         const windows = db.prepare(`
       SELECT
-        window.session_id AS sessionId,
-        window.chat_type AS chatType,
-        COALESCE(window.channel, conversation.channel) AS provider,
-        COALESCE(window.account_id, conversation.account_id) AS accountId,
-        COALESCE(conversation.native_channel_id, conversation.native_direct_user_id,
-                 conversation.peer_id, window.primary_conversation_id) AS conversationId,
-        conversation.label AS label,
-        COALESCE(window.started_at, window.created_at) AS startedAt,
+        w.session_id AS sessionId,
+        w.chat_type AS chatType,
+        ${hostSessionCatalog.provider} AS provider,
+        ${hostSessionCatalog.accountId} AS accountId,
+        COALESCE(c.native_channel_id, c.native_direct_user_id, c.peer_id, w.primary_conversation_id) AS conversationId,
+        c.label AS label,
+        COALESCE(w.started_at, w.created_at) AS startedAt,
         rewrite.generation AS sourceGeneration,
         MAX(active.event_seq) AS maxSeq,
         COUNT(active.event_seq) AS activeEventCount,
-        ${transcripts.coldSql("window.session_id")} AS cold
-      FROM session_windows AS window
-      LEFT JOIN conversations AS conversation
-        ON conversation.conversation_id = window.primary_conversation_id
+        ${transcripts.coldSql("w.session_id")} AS cold
+      ${hostSessionCatalog.from}
       LEFT JOIN transcript_rewrite_watermarks AS rewrite
-        ON rewrite.session_id = window.session_id
+        ON rewrite.session_id = w.session_id
       LEFT JOIN session_transcript_active_events AS active
-        ON active.session_id = window.session_id
-      WHERE window.chat_type IN (${placeholders})
-      GROUP BY window.session_id
-      ORDER BY window.created_at, window.session_id
+        ON active.session_id = w.session_id
+      WHERE w.chat_type IN (${placeholders})
+      GROUP BY w.session_id
+      ORDER BY w.created_at, w.session_id
     `).all(...params.chatTypes);
         const snapshot = windows.map((window) => {
             const metadata = windowMetadata(window);
