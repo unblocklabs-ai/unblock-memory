@@ -44,7 +44,7 @@ export declare function primePersonDossier(params: {
     questions?: undefined;
     evidence?: undefined;
 } | {
-    status: "ok" | "partial";
+    status: "partial" | "ok";
     personId: string;
     name: string;
     version: string;

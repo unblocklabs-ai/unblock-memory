@@ -5,6 +5,7 @@ import { isAbsolute } from "node:path";
 import { DEFAULT_EMOTIONAL_SALIENCE_OPTIONS } from "./emotional-salience.js";
 import { isRecord } from "./guards.js";
 import { CRYSTALS_DEFAULTS } from "./steward-crystals.js";
+import { SKILLS_DEFAULTS } from "./steward-skills.js";
 
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const searchRankings = ["retrieval", "decision"] as const;
@@ -12,6 +13,8 @@ const peopleModes = ["publish", "shadow"] as const;
 const confidences = ["high", "medium", "low"] as const;
 const chatTypes = ["channel", "group", "direct"] as const;
 const expectationChatTypes = ["workspace", "channel", "group", "direct"] as const;
+/** `recall_queries.chat_type` values a skills replay may quote; `"unknown"` covers rows recorded without one. */
+const skillReplayChatTypes = ["workspace", "channel", "group", "direct", "unknown"] as const;
 
 type StewardDeepThoughtConfig = {
   enabled: boolean;
@@ -228,12 +231,23 @@ type StewardOvernightConfig = {
   /** Per model call and per investigation timeout in ms (`0` = unlimited). */
   timeoutMs: number;
 };
+/**
+ * Self-writing skills (`steward-skills.ts`): replay-validated description updates, grounded pitfall patches and
+ * crystal-mined new skills, all written as `pending` rows in `skill_proposals`. Review-only: the Steward never writes a
+ * live `SKILL.md`; only `memory-steward skill-apply` does, on an operator-approved proposal. Every field mirrors
+ * `SKILLS_DEFAULTS`; `0` = unlimited for caps, budgets and timeouts.
+ */
+type StewardSkillsConfig = { enabled: boolean } & {
+  -readonly [K in keyof typeof SKILLS_DEFAULTS]: (typeof SKILLS_DEFAULTS)[K] extends readonly string[] ? string[]
+    : (typeof SKILLS_DEFAULTS)[K] extends boolean ? boolean : number;
+};
 export type StewardConfig = {
   enabled: boolean; model: string; reasoning: typeof efforts[number]; endpoint: string;
   apiKey?: string; apiKeyFile?: string; maxActiveBackground: number;
   deepThought: StewardDeepThoughtConfig; peopleShadow: StewardPeopleShadowConfig;
   captainsLog: StewardCaptainsLogConfig; outcomeLedger: StewardOutcomeLedgerConfig;
   expectations: StewardExpectationsConfig; crystals: StewardCrystalsConfig; overnight: StewardOvernightConfig;
+  skills: StewardSkillsConfig;
 };
 
 const DEFAULT_STEWARD_CONFIG: StewardConfig = {
@@ -334,6 +348,11 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     dailyLogCorpora: ["memory", "knowledge"],
     timeoutMs: 0,
   },
+  // Default-on is safe: proposals are review-only and nothing touches a live skill without an operator apply.
+  skills: {
+    enabled: true, ...SKILLS_DEFAULTS, allowedCorpora: [...SKILLS_DEFAULTS.allowedCorpora],
+    allowedAudiences: [...SKILLS_DEFAULTS.allowedAudiences], allowedChatTypes: [...SKILLS_DEFAULTS.allowedChatTypes],
+  },
 };
 
 function section(value: unknown = {}, defaults: object, label: string, optional: string[] = []) {
@@ -357,6 +376,13 @@ function numberBetweenZeroAnd(max: number, value: unknown, key: string) {
   return value;
 }
 const unitInterval = (value: unknown, key: string) => numberBetweenZeroAnd(1, value, key);
+/** Percentage-point gate (`-100..100`). */
+function percentagePoints(value: unknown, key: string) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < -100 || value > 100) {
+    throw new Error(`steward.${key} must be a number between -100 and 100`);
+  }
+  return value;
+}
 /** Inside Out intensity scale, 0 (none) to 3 (overwhelming). */
 const intensity = (value: unknown, key: string) => numberBetweenZeroAnd(3, value, key);
 function enabled(value: unknown, label: string) {
@@ -379,12 +405,13 @@ function enumList<T>(allowed: readonly T[], value: unknown, key: string): T[] {
 }
 const chatTypeList = (value: unknown, key: string): ChatType[] => enumList(chatTypes, value, key);
 const expectationChatTypeList = (value: unknown, key: string): ExpectationChatType[] => enumList(expectationChatTypes, value, key);
-function corpusList(value: unknown, key: string): string[] {
+function nameList(value: unknown, key: string, noun: string): string[] {
   if (!Array.isArray(value) || !value.every(entry => typeof entry === "string" && entry.trim())) {
-    throw new Error(`steward.${key} must be an array of non-empty corpus names`);
+    throw new Error(`steward.${key} must be an array of non-empty ${noun}`);
   }
   return [...new Set(value.map(entry => (entry as string).trim()))];
 }
+const corpusList = (value: unknown, key: string) => nameList(value, key, "corpus names");
 function hour(value: unknown, key: string): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 23) {
     throw new Error(`steward.${key} must be an integer between 0 and 23`);
@@ -421,6 +448,7 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
   const e = section(c.expectations, defaults.expectations, "steward.expectations");
   const cr = section(c.crystals, defaults.crystals, "steward.crystals");
   const on = section(c.overnight, defaults.overnight, "steward.overnight", ["quietHoursStartHour", "quietHoursEndHour"]);
+  const sk = section(c.skills, defaults.skills, "steward.skills");
   if ((on.quietHoursStartHour === undefined) !== (on.quietHoursEndHour === undefined)) {
     throw new Error("steward.overnight.quietHoursStartHour and quietHoursEndHour must be set together");
   }
@@ -558,6 +586,40 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       dailyLogChatTypes: expectationChatTypeList(on.dailyLogChatTypes, "overnight.dailyLogChatTypes"),
       dailyLogCorpora: corpusList(on.dailyLogCorpora, "overnight.dailyLogCorpora"),
       timeoutMs: integer(on.timeoutMs, 0, "overnight.timeoutMs"),
+    },
+    skills: {
+      enabled: enabled(sk.enabled, "steward.skills"),
+      intervalMinutes: integer(sk.intervalMinutes, 1, "skills.intervalMinutes"),
+      lookbackDays: integer(sk.lookbackDays, 0, "skills.lookbackDays"),
+      enableDescriptionOptimizer: boolean(sk.enableDescriptionOptimizer, "steward.skills.enableDescriptionOptimizer"),
+      enablePitfallPatches: boolean(sk.enablePitfallPatches, "steward.skills.enablePitfallPatches"),
+      enableNewSkills: boolean(sk.enableNewSkills, "steward.skills.enableNewSkills"),
+      minSamplesPerSkill: integer(sk.minSamplesPerSkill, 0, "skills.minSamplesPerSkill"),
+      minRecallGainPp: percentagePoints(sk.minRecallGainPp, "skills.minRecallGainPp"),
+      maxFalseActivationPp: percentagePoints(sk.maxFalseActivationPp, "skills.maxFalseActivationPp"),
+      maxCriticalRegressions: integer(sk.maxCriticalRegressions, 0, "skills.maxCriticalRegressions"),
+      minPositivesEvaluated: integer(sk.minPositivesEvaluated, 0, "skills.minPositivesEvaluated"),
+      minNegativesEvaluated: integer(sk.minNegativesEvaluated, 0, "skills.minNegativesEvaluated"),
+      maxReplayFailureRate: unitInterval(sk.maxReplayFailureRate, "skills.maxReplayFailureRate"),
+      maxDescriptionsPerRun: integer(sk.maxDescriptionsPerRun, 0, "skills.maxDescriptionsPerRun"),
+      maxPitfallsPerRun: integer(sk.maxPitfallsPerRun, 0, "skills.maxPitfallsPerRun"),
+      maxNewSkillsPerRun: integer(sk.maxNewSkillsPerRun, 0, "skills.maxNewSkillsPerRun"),
+      maxReplayExamples: integer(sk.maxReplayExamples, 0, "skills.maxReplayExamples"),
+      replayConcurrency: integer(sk.replayConcurrency, 0, "skills.replayConcurrency"),
+      replayTimeoutMs: integer(sk.replayTimeoutMs, 0, "skills.replayTimeoutMs"),
+      replayMinUsefulness: unitInterval(sk.replayMinUsefulness, "skills.replayMinUsefulness"),
+      minPitfallEvidence: integer(sk.minPitfallEvidence, 1, "skills.minPitfallEvidence"),
+      maxEvidencePerSkill: integer(sk.maxEvidencePerSkill, 0, "skills.maxEvidencePerSkill"),
+      maxEvidenceChars: integer(sk.maxEvidenceChars, 0, "skills.maxEvidenceChars"),
+      maxSkillBodyChars: integer(sk.maxSkillBodyChars, 0, "skills.maxSkillBodyChars"),
+      maxDescriptionChars: integer(sk.maxDescriptionChars, 0, "skills.maxDescriptionChars"),
+      allowedCorpora: corpusList(sk.allowedCorpora, "skills.allowedCorpora"),
+      allowedAudiences: nameList(sk.allowedAudiences, "skills.allowedAudiences", "audience keys (\"*\" = any)"),
+      allowedChatTypes: enumList(skillReplayChatTypes, sk.allowedChatTypes, "skills.allowedChatTypes"),
+      newSkillMinHits: integer(sk.newSkillMinHits, 0, "skills.newSkillMinHits"),
+      newSkillMinBrightness: unitInterval(sk.newSkillMinBrightness, "skills.newSkillMinBrightness"),
+      coverageMinOverlap: unitInterval(sk.coverageMinOverlap, "skills.coverageMinOverlap"),
+      timeoutMs: integer(sk.timeoutMs, 0, "skills.timeoutMs"),
     },
   };
 }

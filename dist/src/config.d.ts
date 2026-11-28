@@ -1,4 +1,5 @@
 import { type ExtractionConfig } from "./extraction-config.js";
+import { type FleetCommonsConfig } from "./fleet-commons.js";
 import { type ResponseAuditConfig } from "./response-config.js";
 import { type PeoplePrimerConfig } from "./people-primer-config.js";
 import { type PeopleLearningConfig } from "./people-learning-config.js";
@@ -49,6 +50,8 @@ export type WhispererTriggersConfig = {
 export type UnblockMemoryConfig = {
     myTurn: MyTurnConfig;
     extraction: ExtractionConfig;
+    /** Off by default: the sanitized fleet-wide Commons feed, projected into QMD as the searchable `"fleet"` corpus. */
+    fleetCommons: FleetCommonsConfig;
     corpora: readonly CorpusConfig[];
     keepEmbeddingModelWarm: boolean;
     syntheticInput?: SyntheticInputFilterConfig;

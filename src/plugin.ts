@@ -40,6 +40,7 @@ import { DeepThoughtStore } from "./deep-thought-store.js";
 import { resolveStewardCredential } from "./steward-config.js";
 import { createStewardRunner, type StewardRunner } from "./steward-runner.js";
 import { registerStewardRuntime, type StewardMemoryAccess } from "./steward-runtime.js";
+import type { SkillCatalogEntry } from "./manager.js";
 import { brightnessRecipeHash } from "./memory-brightness.js";
 import { RecallLedgerWriter, type RecallHitRecord, type RecallQueryOutcome } from "./recall-ledger.js";
 import type { MemoryReadResult } from "./contracts.js";
@@ -795,6 +796,7 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     analysisExecutable: config.analysis.executable,
     keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
     extraction: config.extraction,
+    fleetCommons: config.fleetCommons,
     syntheticInput: config.syntheticInput,
     recallLedgerEnabled: config.recallLedger.enabled,
   });
@@ -815,6 +817,15 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   if (config.corpora.some((corpus) => corpus.kind === "sessions" && corpus.syncIntervalMinutes > 0)) {
     api.on("gateway_start", () => runtime.startSessionSyncSchedule(api.config, (error) => {
       api.logger.warn(`unblock-memory scheduled session sync could not start: ${String(error)}`);
+    }));
+  }
+  if (config.fleetCommons.enabled) {
+    // Each tick pulls the sanitized fleet feed into every open agent's cache and projected `unblock-fleet` collection.
+    api.on("gateway_start", (_event, ctx) => runtime.startFleetCommonsSchedule((error) => {
+      api.logger.warn(`unblock-memory fleet commons sync failed: ${String(error)}`);
+    }, {
+      onRejected: (message) => api.logger.warn(message),
+      ...(ctx?.abortSignal ? { signal: ctx.abortSignal } : {}),
     }));
   }
   let peopleWhisperer: ReturnType<typeof registerPeopleHooks>;
@@ -920,6 +931,15 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
     getMemorySearchManager: params => runtime.getMemorySearchManager(params),
     analysisExecutable: Boolean(config.analysis.executable),
     release: agentId => runtime.closeMemorySearchManager({ agentId }),
+    // Canonical paths only (what skill_open_events / memory_outcomes record), first entry per canonical file.
+    skillCatalog: async params => {
+      const canonical = new Map<string, SkillCatalogEntry>();
+      for (const entry of await runtime.listSkills(params)) {
+        const path = runtime.resolveSkillPath(params, entry.path);
+        if (path && !canonical.has(path)) canonical.set(path, { ...entry, path });
+      }
+      return [...canonical.values()];
+    },
   };
   if (config.steward.enabled && config.steward.deepThought.enabled) {
     const deepThought: DeepThoughtDeps = {

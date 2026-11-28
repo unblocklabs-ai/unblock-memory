@@ -800,6 +800,30 @@ test("a pre-release v2 ledger heals back to v1 and a v1 ledger missing additive 
   }
 });
 
+test("recall_queries carries the (agent_id, run_id, created_at_ms) index the Skills pass reads by, also on an existing v1 ledger", async () => {
+  const root = await tempDir();
+  try {
+    const dbPath = join(root, MEMORY_DATABASE);
+    writeRecallBatch(dbPath, [{ kind: "query", record: sampleQuery({ eventKey: "indexed" }) }]);
+    const indexColumns = (db: DatabaseSync) => db.prepare("SELECT name FROM pragma_index_info('recall_queries_agent_run') ORDER BY seqno")
+      .all().map(row => row.name);
+    let db = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(indexColumns(db), ["agent_id", "run_id", "created_at_ms"]);
+      db.exec("DROP INDEX recall_queries_agent_run"); // a v1 ledger written before the index shipped
+    } finally { db.close(); }
+    db = openRecallLedger(dbPath);
+    try {
+      assert.deepEqual(indexColumns(db), ["agent_id", "run_id", "created_at_ms"], "the fast path does not skip the missing index");
+      const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT run_id FROM recall_queries WHERE agent_id=? AND run_id=? AND created_at_ms>=?`)
+        .all("main", "r", 0).map(row => String(row.detail)).join("\n");
+      assert.match(plan, /recall_queries_agent_run/u);
+    } finally { db.close(); }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("purging a person also erases skill routing and open events bound to their sessions and runs", async () => {
   const root = await tempDir();
   try {

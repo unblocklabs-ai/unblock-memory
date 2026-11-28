@@ -11,6 +11,7 @@ import { listAgentIds, resolveAgentIdentity } from "openclaw/plugin-sdk/agent-ru
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
 import type { ExtractionConfig } from "./extraction-config.js";
+import type { FleetCommonsConfig, FleetCommonsSyncResult } from "./fleet-commons.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager, type ManagerSessionConfig, type SkillCatalogEntry } from "./manager.js";
 import { resolveTimezone } from "./session-projector.js";
@@ -59,9 +60,18 @@ function liveRun(row: WorkItem | undefined, now = Date.now()): row is WorkItem {
 const curationDatabasePath = (directory: string) => join(directory, MEMORY_DATABASE);
 const qmdDatabasePath = (directory: string) => join(directory, "index.sqlite");
 
+type FleetCommonsScheduleHooks = {
+  onError: (error: unknown) => void;
+  /** Receives one warning per sync that rejected feed entries (sanitized ids and fixed reasons only). */
+  onRejected?: (message: string) => void;
+  /** Gateway lifetime signal: aborting it stops the schedule and in-flight requests. */
+  signal?: AbortSignal;
+};
+
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #corpora: readonly CorpusConfig[];
   readonly #extraction?: ExtractionConfig;
+  readonly #fleetCommons?: FleetCommonsConfig;
   readonly #syntheticInput?: ManagerSessionConfig["syntheticInput"];
   readonly #analysisExecutable?: string;
   readonly #keepEmbeddingModelWarm: boolean;
@@ -81,6 +91,75 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   #closePromise?: Promise<void>;
   #sessionSyncTimer?: NodeJS.Timeout;
   #schedule?: { cfg: OpenClawConfig; onError: (error: unknown) => void };
+  #fleetCommonsTimer?: NodeJS.Timeout;
+  #fleetCommonsRun?: Promise<void>;
+  /** Callbacks and gateway signal from `startFleetCommonsSchedule`; initial syncs on open report through them too. */
+  #fleetCommonsHooks?: FleetCommonsScheduleHooks;
+  /** Aborted by `close()`: stops in-flight Fleet Commons requests instead of waiting out their timeouts. */
+  readonly #fleetCommonsLifetime = new AbortController();
+
+  /**
+   * Periodic Fleet Commons sync (only when `fleetCommons.enabled`): every `syncIntervalMinutes`, each already-open agent
+   * manager pulls the feed into its own cache and projected collection; unused agents are never cold-started. A run still
+   * in flight skips the next tick. `close()` or the gateway `signal` stops the timer and aborts in-flight requests.
+   */
+  startFleetCommonsSchedule(onError: (error: unknown) => void, options: Omit<FleetCommonsScheduleHooks, "onError"> = {}): void {
+    this.stopFleetCommonsSchedule();
+    const fleetCommons = this.#fleetCommons;
+    if (this.#shutdownStarted || !fleetCommons?.enabled || options.signal?.aborted) return;
+    const hooks = { ...options, onError };
+    this.#fleetCommonsHooks = hooks;
+    options.signal?.addEventListener("abort", () => {
+      if (this.#fleetCommonsHooks === hooks) this.stopFleetCommonsSchedule();
+    }, { once: true });
+    const intervalMs = Math.min(2 ** 31 - 1, Math.max(1, Math.round(fleetCommons.syncIntervalMinutes * 60_000)));
+    this.#fleetCommonsTimer = setInterval(() => {
+      if (this.#shutdownStarted || this.#fleetCommonsRun) return;
+      this.#fleetCommonsRun = (async () => {
+        for (const [agentId, entry] of [...this.#managers]) {
+          if (this.#shutdownStarted) return;
+          // Only managers that finished starting; a failed or in-progress start is not an open manager.
+          if (!entry.ready || !await entry.ready.then(() => true, () => false)) continue;
+          if (this.#managers.get(agentId) === entry) await this.#syncFleetCommonsFor(agentId, entry.manager);
+        }
+      })().catch(onError).finally(() => { this.#fleetCommonsRun = undefined; });
+    }, intervalMs);
+    this.#fleetCommonsTimer.unref();
+  }
+
+  stopFleetCommonsSchedule(): void {
+    if (this.#fleetCommonsTimer) clearInterval(this.#fleetCommonsTimer);
+    this.#fleetCommonsTimer = undefined;
+    this.#fleetCommonsHooks = undefined;
+  }
+
+  /** One Fleet Commons sync for one agent; `disabled` without touching the index when `fleetCommons.enabled` is false. */
+  async syncFleetCommons(params: { cfg: OpenClawConfig; agentId: string }, signal?: AbortSignal): Promise<FleetCommonsSyncResult> {
+    if (!this.#fleetCommons?.enabled) return { status: "disabled" };
+    const { manager, error } = await this.getMemorySearchManager(params);
+    if (!manager) throw new Error(error ?? "memory unavailable");
+    return manager.syncFleetCommons(signal);
+  }
+
+  /** Background sync of one open manager: errors and rejected entries are reported, never thrown. */
+  async #syncFleetCommonsFor(agentId: string, manager: QmdMemoryManager): Promise<void> {
+    if (!this.#fleetCommons?.enabled) return;
+    const hooks = this.#fleetCommonsHooks;
+    const signal = hooks?.signal ? AbortSignal.any([this.#fleetCommonsLifetime.signal, hooks.signal]) : this.#fleetCommonsLifetime.signal;
+    if (signal.aborted || this.#shutdownStarted) return;
+    try {
+      const result = await manager.syncFleetCommons(signal);
+      if (result.status === "disabled" || !result.rejected.length) return;
+      const message = `unblock-memory fleet commons rejected ${result.rejected.length} entr${result.rejected.length === 1 ? "y" : "ies"}` +
+        ` for agent ${agentId}: ${result.rejected.map(({ id, reasons }) => `${id} (${reasons.join(", ")})`).join("; ")}`;
+      if (hooks?.onRejected) hooks.onRejected(message);
+      else console.warn(message);
+    } catch (error) {
+      if (signal.aborted || this.#shutdownStarted) return;
+      if (hooks) hooks.onError(error);
+      else this.#reportError(error);
+    }
+  }
 
   startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void {
     this.stopSessionSyncSchedule();
@@ -158,6 +237,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       keepEmbeddingModelWarm?: boolean;
       stateRoot?: string;
       extraction?: ExtractionConfig;
+      fleetCommons?: FleetCommonsConfig;
       syntheticInput?: ManagerSessionConfig["syntheticInput"];
       recallLedgerEnabled?: boolean;
       onError?: (error: unknown) => void;
@@ -165,6 +245,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   ) {
     this.#corpora = corpora;
     this.#extraction = options.extraction;
+    this.#fleetCommons = options.fleetCommons;
     this.#syntheticInput = options.syntheticInput;
     this.#analysisExecutable = options.analysisExecutable;
     this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
@@ -182,6 +263,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     if (this.#extraction?.enabled && this.#extraction.publish && !names.includes("extracted")) {
       names.push("extracted");
     }
+    if (this.#fleetCommons?.enabled && !names.includes("fleet")) names.push("fleet");
     return names;
   }
 
@@ -207,7 +289,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
           this.#managers.set(params.agentId, entry);
         }
         if (startMemory) {
-          entry.ready ??= this.#startManager(entry.manager);
+          entry.ready ??= this.#startManager(params.agentId, entry.manager);
           await entry.ready;
         }
         const blockedAfter = this.#admissionBlockedReason();
@@ -531,6 +613,8 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     this.#shutdownStarted = true;
+    this.stopFleetCommonsSchedule();
+    this.#fleetCommonsLifetime.abort(new Error("memory runtime is closing"));
     this.#interruptSessionSyncs();
     const closing = (async () => { await this.closeAllMemorySearchManagers(); })();
     this.#closePromise = closing;
@@ -578,6 +662,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       dbPath: qmdDatabasePath(stateDir),
       curationPath: curationDatabasePath(stateDir),
       extraction: this.#extraction,
+      ...(this.#fleetCommons ? { fleetCommons: this.#fleetCommons } : {}),
       sources,
       keepModelsWarm: this.#keepEmbeddingModelWarm,
       analysisExecutable: this.#analysisExecutable,
@@ -586,7 +671,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     });
   }
 
-  async #startManager(manager: QmdMemoryManager): Promise<void> {
+  async #startManager(agentId: string, manager: QmdMemoryManager): Promise<void> {
     try {
       await manager.start();
     } catch (error) {
@@ -594,6 +679,8 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       await manager.close().catch(() => undefined);
       throw error;
     }
+    // Initial Fleet Commons sync on open, in the background: the fetch never holds the manager's write queue.
+    void this.#syncFleetCommonsFor(agentId, manager);
   }
 
   #sessionConfig(cfg: OpenClawConfig, agentId: string): ManagerSessionConfig | undefined {

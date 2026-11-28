@@ -5,6 +5,7 @@ import {
   resolveDecisionConfig,
 } from "@unblocklabs/decisions";
 import { resolveExtraction, type ExtractionConfig } from "./extraction-config.js";
+import { resolveFleetCommonsConfig, type FleetCommonsConfig } from "./fleet-commons.js";
 import { resolveResponseAudit, type ResponseAuditConfig } from "./response-config.js";
 import { resolvePeoplePrimer, type PeoplePrimerConfig } from "./people-primer-config.js";
 import { DEFAULT_LEARNING, resolvePeopleLearning, type PeopleLearningConfig } from "./people-learning-config.js";
@@ -80,6 +81,8 @@ export type WhispererTriggersConfig = {
 export type UnblockMemoryConfig = {
   myTurn: MyTurnConfig;
   extraction: ExtractionConfig;
+  /** Off by default: the sanitized fleet-wide Commons feed, projected into QMD as the searchable `"fleet"` corpus. */
+  fleetCommons: FleetCommonsConfig;
   corpora: readonly CorpusConfig[];
   keepEmbeddingModelWarm: boolean;
   syntheticInput?: SyntheticInputFilterConfig;
@@ -310,7 +313,7 @@ function resolveQueryApi(value: unknown): UnblockMemoryConfig["memoryWhisperer"]
 }
 
 function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[],
-  extraction: Pick<ExtractionConfig, "enabled" | "publish">): UnblockMemoryConfig["memoryWhisperer"] {
+  extraction: Pick<ExtractionConfig, "enabled" | "publish">, fleetCommons: Pick<FleetCommonsConfig, "enabled">): UnblockMemoryConfig["memoryWhisperer"] {
   if (value === undefined) {
     return { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined), brightness: resolveBrightness(undefined) };
   }
@@ -334,9 +337,15 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
       !corpora.some(corpus => corpus.name === "extracted")) {
     throw new Error('unblock-memory memoryWhisperer.corpora may list "extracted" only when extraction.enabled and extraction.publish are both true');
   }
+  // Likewise the projected Fleet Commons feed is searchable as `"fleet"` exactly when `fleetCommons.enabled`.
+  if (Array.isArray(selected) && selected.includes("fleet") && !fleetCommons.enabled &&
+      !corpora.some(corpus => corpus.name === "fleet")) {
+    throw new Error('unblock-memory memoryWhisperer.corpora may list "fleet" only when fleetCommons.enabled is true');
+  }
   if (!Array.isArray(selected) || !selected.every((name): name is string => typeof name === "string" &&
-    ((name === "extracted" && extractedPublished) || corpora.some(corpus => corpus.name === name && corpus.kind !== "skills")))) {
-    throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora (or published \"extracted\")");
+    ((name === "extracted" && extractedPublished) || (name === "fleet" && fleetCommons.enabled) ||
+      corpora.some(corpus => corpus.name === name && corpus.kind !== "skills")))) {
+    throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora (or published \"extracted\" / enabled \"fleet\")");
   }
   if (enabled && !selected.length) throw new Error("unblock-memory enabled memoryWhisperer requires explicit corpora");
   const cooldownTurns = config.cooldownTurns ?? DEFAULT_MEMORY_WHISPERER.cooldownTurns;
@@ -642,7 +651,7 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   if (value === undefined || value === null) value = {};
   const config = checkedConfig(
     value,
-    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers", "syntheticInput"],
+    ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "fleetCommons", "recallLedger", "steward", "whispererTriggers", "syntheticInput"],
     "config",
   );
   const corpora = resolveCorpora(config.corpora);
@@ -705,15 +714,22 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   }
   // Resolved before the Memory Whisperer, whose corpora may include the published `extracted` corpus.
   const extraction = resolveExtraction(config.extraction, corpora);
+  let fleetCommons: FleetCommonsConfig;
+  try { fleetCommons = resolveFleetCommonsConfig(config.fleetCommons); }
+  catch (error) { throw new Error(`unblock-memory ${error instanceof Error ? error.message : String(error)}`); }
+  if (fleetCommons.enabled && corpora.some(corpus => corpus.name === "fleet")) {
+    throw new Error("unblock-memory fleetCommons reserves the derived corpus name fleet");
+  }
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
     syntheticInput: resolveSyntheticInput(config.syntheticInput),
     myTurn: resolveMyTurn(config.myTurn),
     extraction,
+    fleetCommons,
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,
     responseAudit: resolveResponseAudit(config.responseAudit, corpora),
     insideOut: resolveInsideOut(config.insideOut),
-    memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora, extraction),
+    memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora, extraction, fleetCommons),
     safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
     expectationsWhisperer: resolveExpectationsWhisperer(config.expectationsWhisperer),
     whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),

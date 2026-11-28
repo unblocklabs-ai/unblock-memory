@@ -29,11 +29,11 @@ export declare const DEFAULT_LEARNING: {
 export declare function resolvePeopleLearning(value: unknown, enabled: boolean): PeopleLearningConfig;
 export declare function learningForAgent(config: PeopleLearningConfig, agentId: string): {
     enabled: boolean;
+    timezone?: string | undefined;
     nightly: boolean;
     weekly: boolean;
     nightlySchedule: string;
     weeklySchedule: string;
-    timezone?: string | undefined;
     legacyJobIds?: string[] | undefined;
     agents: {};
 };

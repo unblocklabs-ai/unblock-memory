@@ -4,6 +4,7 @@ import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import { EXTRACTED_COLLECTION, EXTRACTED_PREFIX, extractedRecords, extractedPath, extractedHit, extractedUri, syncExtractedIndex } from "./extraction-index.js";
+import { FLEET_COMMONS_COLLECTION, FLEET_COMMONS_PREFIX, FleetCommonsReader, fleetCommonsDocument, fleetCommonsHit, fleetCommonsPath, fleetCommonsUri, syncFleetCommons, } from "./fleet-commons.js";
 import chokidar from "chokidar";
 import picomatch from "picomatch";
 import { isScalar, parseDocument } from "yaml";
@@ -290,12 +291,25 @@ function renderExtractedHit(hit, record, locator, maxSnippetChars) {
     }
     return item;
 }
+/** Fleet Commons hits are fleet-wide, sanitized entries: never session-scoped, so a session filter never hides them. */
+function renderFleetHit(hit, entry, locator, maxSnippetChars) {
+    if (!entry)
+        return;
+    // A long entry yields its matched passage, bounded to the budget, rather than being dropped.
+    const item = fleetCommonsHit(entry, hit.score, maxSnippetChars, hit.bestChunk ? { text: hit.bestChunk, start: hit.chunkPos } : undefined);
+    if (locator)
+        item.locator = { ...locator, rawLeafId: memoryPassageId(hit.bestChunk || entry.body), observedAtBasis: "unknown" };
+    return item;
+}
 export class QmdMemoryManager {
     #dbPath;
     #workspaceDir;
     #curationPath;
     /** Present only when extracted memories are published into search. */
     #publishedExtraction;
+    /** Present only when the Fleet Commons feed is projected into search (`fleetCommons.enabled`). */
+    #fleetCommons;
+    #fleetReader;
     #sources;
     /** Non-skill sources: the QMD-indexed, analyzable corpora. */
     #indexSources;
@@ -367,6 +381,7 @@ export class QmdMemoryManager {
         this.#dbPath = params.dbPath;
         this.#curationPath = params.curationPath ?? `${params.dbPath}.curation.sqlite`;
         this.#publishedExtraction = params.extraction?.enabled && params.extraction.publish ? params.extraction : undefined;
+        this.#fleetCommons = params.fleetCommons?.enabled ? params.fleetCommons : undefined;
         this.#workspaceDir = params.workspaceDir;
         this.#sources = new Map(params.sources.map((source) => [source.collection, source]));
         this.#indexSources = [...this.#sources.values()].filter((source) => source.kind !== "skills");
@@ -531,12 +546,13 @@ export class QmdMemoryManager {
             keepModelsWarm: this.#keepModelsWarm,
             config: {
                 collections: Object.fromEntries(
-                // Sessions and extracted facts are QMD projected collections: written through the store, never globbed.
+                // Sessions, extracted facts and Fleet Commons are QMD projected collections: written through the store, never globbed.
                 [...this.#indexSources.map((source) => [
                         source.collection,
                         source.kind === "sessions" ? { projected: true } : { path: source.root, pattern: source.pattern },
                     ]), ...(this.#publishedExtraction
-                        ? [[EXTRACTED_COLLECTION, { projected: true, includeByDefault: false }]] : [])]),
+                        ? [[EXTRACTED_COLLECTION, { projected: true, includeByDefault: false }]] : []),
+                    ...(this.#fleetCommons ? [[FLEET_COMMONS_COLLECTION, { projected: true, includeByDefault: false }]] : [])]),
             },
         });
         return this.#publishStore({ kind: "native", store });
@@ -601,25 +617,28 @@ export class QmdMemoryManager {
     }
     #collectionNames(corpora) {
         const extracted = this.#publishedExtraction ? [EXTRACTED_COLLECTION] : [];
+        const fleet = this.#fleetCommons ? [FLEET_COMMONS_COLLECTION] : [];
         if (corpora === undefined)
-            return [...this.#indexCollections, ...extracted];
+            return [...this.#indexCollections, ...extracted, ...fleet];
         if (corpora.length === 0)
             throw new Error("memory_search corpora must not be empty");
         const selected = new Set(corpora);
         if (selected.has("all")) {
             if (selected.size > 1)
                 throw new Error('memory_search corpus "all" must be used alone');
-            return [...this.#indexCollections, ...extracted];
+            return [...this.#indexCollections, ...extracted, ...fleet];
         }
         const known = new Set(this.#indexSources.map((source) => source.corpus));
         if (extracted.length)
             known.add("extracted");
+        if (fleet.length)
+            known.add("fleet");
         const unknown = [...selected].find((corpus) => !known.has(corpus));
         if (unknown)
             throw new Error(`memory_search unknown corpus: ${unknown}`);
         return [...this.#indexSources
                 .filter((source) => selected.has(source.corpus))
-                .map((source) => source.collection), ...(selected.has("extracted") ? extracted : [])];
+                .map((source) => source.collection), ...(selected.has("extracted") ? extracted : []), ...(selected.has("fleet") ? fleet : [])];
     }
     /**
      * Current QMD generation of every collection behind `corpora` (omitted or `["all"]` = every indexed collection), for
@@ -645,6 +664,38 @@ export class QmdMemoryManager {
             await this.#refreshIndexStatus(store);
         });
     }
+    /**
+     * Pull the Fleet Commons feed into SQLite (authoritative) and its projected QMD collection. The HTTP fetch and
+     * validation run outside `#operationChain`; only the SQLite replace and QMD projection queue behind indexing like every
+     * other write. `disabled` when `fleetCommons.enabled` is false.
+     */
+    syncFleetCommons(signal) {
+        return this.#runFenced(async () => {
+            const config = this.#fleetCommons;
+            if (!config)
+                return { status: "disabled" };
+            // close() aborts an in-flight feed request instead of waiting out its timeout.
+            const lifetime = this.#reviewLifetime.signal;
+            return syncFleetCommons({
+                config, storePath: this.#curationPath, signal: signal ? AbortSignal.any([signal, lifetime]) : lifetime,
+                commit: apply => this.#enqueue(async () => {
+                    const store = await this.#getStore();
+                    const result = await apply(store);
+                    if (result.status !== "disabled" && result.changed)
+                        await this.#refreshIndexStatus(store);
+                    return result;
+                }),
+            });
+        });
+    }
+    /** Cached Fleet Commons entries still servable now; re-read only after a commit, expiry checked in memory. */
+    #currentFleet() {
+        const config = this.#fleetCommons;
+        if (!config)
+            return [];
+        this.#fleetReader ??= new FleetCommonsReader(this.#curationPath);
+        return this.#fleetReader.current(config.allowExpired);
+    }
     #currentExtracted(paths, filter) {
         const extraction = this.#publishedExtraction;
         if (!extraction)
@@ -657,14 +708,16 @@ export class QmdMemoryManager {
         const matches = sessionFilterPredicate(filter);
         return records.filter(r => matches(r.metadata));
     }
-    /** Search scope: session-filtered transcripts plus currently published extracted memories. */
+    /** Search scope: session-filtered transcripts plus currently published extracted memories and Fleet Commons entries. */
     #allowedPaths(collections, filter) {
         const sessions = this.#sessions;
         const allowed = filter && sessions && collections.includes(sessions.collection)
             ? sessionAllowedPaths(this.#sessionMetadata, sessions.collection, filter) : undefined;
-        return collections.includes(EXTRACTED_COLLECTION)
-            ? { ...allowed, [EXTRACTED_COLLECTION]: this.#currentExtracted(undefined, filter).map(extractedPath) }
-            : allowed;
+        const extracted = collections.includes(EXTRACTED_COLLECTION)
+            ? { [EXTRACTED_COLLECTION]: this.#currentExtracted(undefined, filter).map(extractedPath) } : undefined;
+        const fleet = collections.includes(FLEET_COMMONS_COLLECTION)
+            ? { [FLEET_COMMONS_COLLECTION]: this.#currentFleet().map(fleetCommonsPath) } : undefined;
+        return extracted || fleet ? { ...allowed, ...extracted, ...fleet } : allowed;
     }
     async #updateAndEmbed(store, collections, force) {
         // Sessions and extracted facts are QMD projected collections: `update()` never globs them.
@@ -824,6 +877,8 @@ export class QmdMemoryManager {
     corpusForCollection(collection) {
         if (collection === EXTRACTED_COLLECTION)
             return this.#publishedExtraction ? "extracted" : undefined;
+        if (collection === FLEET_COMMONS_COLLECTION)
+            return this.#fleetCommons ? "fleet" : undefined;
         const source = this.#sources.get(collection);
         return source && source.kind !== "skills" ? source.corpus : undefined;
     }
@@ -1245,11 +1300,15 @@ export class QmdMemoryManager {
         const tokenizer = store.internal?.llm;
         const results = [];
         const current = new Map(this.#currentExtracted(hits.map(hit => hit.file), opts?.sessionFilter).map(r => [extractedUri(r), r]));
+        const fleet = new Map(hits.some(hit => hit.file.startsWith(FLEET_COMMONS_PREFIX))
+            ? this.#currentFleet().map(entry => [fleetCommonsUri(entry), entry]) : []);
         for (const hit of hits) {
             opts?.signal?.throwIfAborted();
             // Proactive hints must retain the entire matched chunk, even when expanded
             // turn/message context exceeds their budget. Ordinary search is unchanged.
-            if (hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity))
+            // Fleet Commons passages are bounded to the budget by renderFleetHit instead.
+            const uri = parseQmdUri(hit.file);
+            if (uri?.collection !== FLEET_COMMONS_COLLECTION && hit.bestChunk.length > (opts?.maxSnippetChars ?? Infinity))
                 continue;
             const { ref } = hit;
             const locator = this.#trackRecallLocators ? {
@@ -1258,9 +1317,14 @@ export class QmdMemoryManager {
                 chunkPos: ref?.chunkPos ?? hit.chunkPos,
                 chunkLen: ref?.chunkLen ?? hit.chunkLen,
             } : undefined;
-            const uri = parseQmdUri(hit.file);
             if (uri?.collection === EXTRACTED_COLLECTION) {
                 const item = renderExtractedHit(hit, current.get(hit.file), locator, opts?.maxSnippetChars);
+                if (item)
+                    results.push(item);
+                continue;
+            }
+            if (uri?.collection === FLEET_COMMONS_COLLECTION) {
+                const item = renderFleetHit(hit, fleet.get(hit.file), locator, opts?.maxSnippetChars);
                 if (item)
                     results.push(item);
                 continue;
@@ -1422,6 +1486,10 @@ export class QmdMemoryManager {
                 return record ? buildReadResult({ content: `${record.text}\nObserved: ${new Date(record.observedAt).toISOString()}\nSource: ${extractedHit(record, 1).citation}`,
                     path: relPath, from, lines, cursor }) : notFound();
             }
+            if (relPath.startsWith(FLEET_COMMONS_PREFIX)) {
+                const entry = this.#currentFleet().find(candidate => relPath === fleetCommonsUri(candidate));
+                return entry ? buildReadResult({ content: fleetCommonsDocument(entry), path: relPath, from, lines, cursor }) : notFound();
+            }
             const safe = parseSafeVirtualPath(relPath, this.#sources);
             if (!safe || safe.source.kind === "skills")
                 return notFound();
@@ -1502,5 +1570,7 @@ export class QmdMemoryManager {
         this.#sessionStateDb?.close();
         this.#sessionStateDb = undefined;
         this.#sessionState = undefined;
+        this.#fleetReader?.close();
+        this.#fleetReader = undefined;
     }
 }

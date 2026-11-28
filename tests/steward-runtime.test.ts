@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { once } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import type { QMDStore } from "@unblocklabs/qmd";
 import { resolveConfig } from "../src/config.js";
 import { listExpectations } from "../src/expectations-store.js";
+import { syncFleetCommons, type FleetCommonsEntry } from "../src/fleet-commons.js";
+import { createFleetOrganismHub } from "../src/fleet-organism-hub.js";
 import { MemoryCrystalsStore } from "../src/memory-crystals.js";
 import { OutcomeLedgerStore } from "../src/outcome-ledger.js";
 import { OUTCOME_LEDGER_KIND } from "../src/outcome-ledger.js";
 import { writeRecallBatch, type RecallLedgerEvent } from "../src/recall-ledger.js";
+import { listSkillProposals, sha256, upsertSkillProposal, type SkillProposalInput } from "../src/skill-proposals-store.js";
 import { resolveStewardConfig } from "../src/steward-config.js";
 import { type CaptainsLogDecide } from "../src/steward-expectations.js";
 import { createStewardRunner, type StewardCompleteRequest, type StewardCompleteResult, type StewardRunner } from "../src/steward-runner.js";
@@ -24,7 +29,7 @@ const HOUR = 3_600_000;
 class FakeCommand {
   readonly commands = new Map<string, FakeCommand>();
   readonly defaults: Record<string, unknown> = {};
-  handler?: (opts: Record<string, unknown>) => unknown;
+  handler?: (...args: unknown[]) => unknown;
   command(name: string) { const child = new FakeCommand(); this.commands.set(name, child); return child; }
   description() { return this; }
   option(flags: string, _description?: string, fallback?: unknown) {
@@ -32,7 +37,7 @@ class FakeCommand {
     return this;
   }
   requiredOption(flags: string, description?: string, fallback?: unknown) { return this.option(flags, description, fallback); }
-  action(handler: (opts: Record<string, unknown>) => unknown) { this.handler = handler; return this; }
+  action(handler: (...args: never[]) => unknown) { this.handler = handler as (...args: unknown[]) => unknown; return this; }
 }
 const optionKey = (flags: string) => flags.split(/[ ,]/u)[0]!.replace(/^--/u, "").replace(/-(\w)/gu, (_, c: string) => c.toUpperCase());
 type CliRegistrar = (ctx: { program: FakeCommand; config: unknown }) => void;
@@ -62,21 +67,26 @@ function harness(t: TestContext, steward: unknown = {}, overrides: (root: string
     listAgents: () => ["main"],
     ...overrides(root),
   });
-  const run = async (...argv: string[]) => {
+  /** `name <positional...> --flag value ...`; commands declared as `"name <arg>"` receive positionals first, like commander. */
+  const runText = async (...argv: string[]) => {
     const program = new FakeCommand();
     cli!({ program, config: {} });
     const [name, ...rest] = argv;
-    const command = program.commands.get("memory-steward")!.commands.get(name!)!;
+    const commands = program.commands.get("memory-steward")!.commands;
+    const command = commands.get(name!) ?? [...commands].find(([declared]) => declared.split(" ")[0] === name)![1];
+    const positionals: string[] = [];
+    while (rest.length && !rest[0]!.startsWith("--")) positionals.push(rest.shift()!);
     const opts: Record<string, unknown> = { ...command.defaults };
     for (let i = 0; i < rest.length; i += 2) opts[optionKey(rest[i]!)] = rest[i + 1];
     const lines: string[] = [];
     const log = console.log;
     console.log = (line: unknown) => { lines.push(String(line)); };
-    try { await command.handler!(opts); }
+    try { await command.handler!(...positionals, opts); }
     finally { console.log = log; }
-    return JSON.parse(lines.join("\n")) as Record<string, unknown>;
+    return lines.join("\n");
   };
-  return { root, dbPath, runtime, handlers, warnings, run, runnerRequests: () => runnerRequests };
+  const run = async (...argv: string[]) => JSON.parse(await runText(...argv)) as Record<string, unknown>;
+  return { root, dbPath, runtime, handlers, warnings, run, runText, runnerRequests: () => runnerRequests };
 }
 
 function deliveredMemory(at: number, runId: string): RecallLedgerEvent[] {
@@ -127,7 +137,8 @@ test("the default-on Outcome Ledger runs without a model runner and gates on its
 
 test("blockers lists open [BLOCKED] entries and validates its limit; disabling the ledger skips it", async t => {
   const h = harness(t, { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
-    expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false } });
+    expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false },
+    skills: { enabled: false } });
   assert.equal(h.runtime.enabled, false);
   assert.deepEqual(await h.run("blockers", "--agent", "main"), { agentId: "main", count: 0, blockers: [] });
   await assert.rejects(h.run("blockers", "--limit", "-1"), /--limit/u);
@@ -518,4 +529,315 @@ test("background ticks open the memory manager only when Crystals or Overnight i
   await quiet.runtime.tick();
   assert.equal(quiet.runtime.lastOvernightResults().get("main")?.status, "outside_quiet_hours");
   assert.equal(quietFake.calls.managers, 0, "outside quiet hours the manager is never started");
+});
+
+/* ═════════════════════════ Step 4: self-writing skills + Fleet Organism ═════════════════════════ */
+
+const OTHER_PASSES_OFF = { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
+  expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false } };
+const LIVE_SKILL = "---\nname: deploy\ndescription: Deploy things.\n---\n\n# Deploy\n\n1. Ship it.\n";
+
+/** A workspace with one live `skills/deploy/SKILL.md`, and the plugin config whose `skills` corpus roots it. */
+function skillsWorkspace(root: string, extra: Record<string, unknown> = {}) {
+  const workspace = join(root, "workspace");
+  mkdirSync(join(workspace, "skills", "deploy"), { recursive: true });
+  const live = join(workspace, "skills", "deploy", "SKILL.md");
+  writeFileSync(live, LIVE_SKILL);
+  const pluginConfig = resolveConfig({ corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] },
+    { name: "skills", kind: "skills", paths: ["skills"] }], ...extra });
+  return { workspace, live, pluginConfig };
+}
+
+function seedProposals(dbPath: string, ...inputs: SkillProposalInput[]) {
+  const store = new WorkStore(dbPath);
+  try { return inputs.map(input => upsertSkillProposal(store.db, input).proposal); } finally { store.close(); }
+}
+
+const replayMetrics = (recallGainPp: number) => ({ baselineRecall: 0.4, candidateRecall: 0.4 + recallGainPp / 100, recallGainPp,
+  baselineFalseActivation: 0, candidateFalseActivation: 0, falseActivationDeltaPp: 0, criticalRegressions: 0, samplesEvaluated: 12 });
+const descriptionUpdate = (live: string): SkillProposalInput => ({ agentId: "main", kind: "description_update", skillName: "deploy",
+  skillPath: live, title: "Sharpen routing description for deploy", rationale: "Missed deploy requests", baseSha256: sha256(LIVE_SKILL),
+  proposedDescription: "Deploy services safely with rollback checks.",
+  proposedContent: LIVE_SKILL.replace("Deploy things.", "\"Deploy services safely with rollback checks.\""), replayMetrics: replayMetrics(12.4) });
+const newSkill: SkillProposalInput = { agentId: "main", kind: "new_skill", skillName: "rollback", skillPath: "rollback/SKILL.md",
+  title: "New skill: Roll back a release", rationale: "Recurring procedure", proposedDescription: "Roll back a bad release.",
+  proposedContent: "---\nname: \"rollback\"\ndescription: \"Roll back a bad release.\"\n---\n\n# Roll back\n\n## Steps\n\n1. Revert.\n" };
+
+test("memory-steward skills / skill-review / skill-apply: read-only listing, operator review, and a confined apply", async t => {
+  let ws!: ReturnType<typeof skillsWorkspace>;
+  const h = harness(t, { ...OTHER_PASSES_OFF, skills: { enabled: false } }, root => {
+    ws = skillsWorkspace(root);
+    return { pluginConfig: ws.pluginConfig, workspaceDirForAgent: () => ws.workspace };
+  });
+  const exitCode = process.exitCode;
+  t.after(() => { process.exitCode = exitCode; });
+  const empty = await h.run("skills");
+  assert.deepEqual(empty.proposals, []);
+  assert.equal((empty.summary as { total: number }).total, 0);
+  assert.partialDeepStrictEqual(await h.run("skill-review", "skillprop:none", "--approve", "true"), { status: "error", code: "not_found" });
+  assert.equal(existsSync(h.dbPath), false, "listing and a not-found review never create the database");
+  await assert.rejects(h.run("skills", "--status", "maybe"), /--status must be one of/u);
+  await assert.rejects(h.run("skills", "--kind", "rewrite"), /--kind must be one of/u);
+  await assert.rejects(h.run("skills", "--limit", "-1"), /--limit/u);
+  await assert.rejects(h.run("skills", "--agent", "ghost"), /Unknown steward agent/u);
+
+  const [update, fresh, pitfall] = seedProposals(h.dbPath, descriptionUpdate(ws.live), newSkill, { ...descriptionUpdate(ws.live),
+    kind: "pitfall_patch", title: "Add 1 pitfall to deploy", proposedDescription: null, proposedContent: `${LIVE_SKILL}\n## Pitfalls\n\n- Check flags.\n` });
+  assert.equal(((await h.run("skills", "--status", "pending")).proposals as unknown[]).length, 3);
+  assert.deepEqual(((await h.run("skills", "--kind", "new_skill")).proposals as { id: string }[]).map(p => p.id), [fresh!.id]);
+  assert.equal(((await h.run("skills", "--limit", "1")).proposals as unknown[]).length, 1);
+
+  await assert.rejects(h.run("skill-review", update!.id), /exactly one of --approve or --reject/u);
+  await assert.rejects(h.run("skill-review", update!.id, "--approve", "true", "--reject", "true"), /exactly one/u);
+  assert.partialDeepStrictEqual(await h.run("skill-apply", update!.id), { status: "error", code: "invalid_state" },
+    "nothing is applied before an operator approves it");
+  assert.equal(readFileSync(ws.live, "utf8"), LIVE_SKILL);
+  const approved = await h.run("skill-review", update!.id, "--approve", "true", "--by", "ops", "--note", "lgtm");
+  assert.partialDeepStrictEqual(approved, { status: "approved", proposal: { reviewedBy: "ops", reviewNote: "lgtm" } });
+  assert.partialDeepStrictEqual(await h.run("skill-review", update!.id, "--reject", "true"), { status: "error", code: "invalid_state" });
+  assert.equal((await h.run("skill-review", pitfall!.id, "--reject", "true")).status, "rejected");
+
+  const preview = await h.run("skill-apply", update!.id, "--dry-run", "true");
+  assert.equal(preview.status, "preview");
+  assert.match(String(preview.diff), /^\+description: "Deploy services safely with rollback checks\."$/mu);
+  assert.equal(readFileSync(ws.live, "utf8"), LIVE_SKILL, "a dry run never writes");
+  assert.partialDeepStrictEqual(await h.run("skill-apply", update!.id), { status: "applied", targetPath: ws.live });
+  assert.match(readFileSync(ws.live, "utf8"), /description: "Deploy services safely with rollback checks\."/u);
+
+  await h.run("skill-review", fresh!.id, "--approve", "true");
+  assert.partialDeepStrictEqual(await h.run("skill-apply", fresh!.id, "--target-dir", join(h.root, "elsewhere")),
+    { status: "error", code: "path_outside_root" }, "new skills only land inside a configured skills corpus root");
+  const landed = join(ws.workspace, "skills", "rollback", "SKILL.md");
+  assert.partialDeepStrictEqual(await h.run("skill-apply", fresh!.id), { status: "applied", targetPath: landed });
+  assert.equal(readFileSync(landed, "utf8"), newSkill.proposedContent);
+  const store = new WorkStore(h.dbPath);
+  try {
+    assert.deepEqual(listSkillProposals(store.db, { agentId: "main" }).map(p => [p.kind, p.status]).sort(),
+      [["description_update", "applied"], ["new_skill", "applied"], ["pitfall_patch", "rejected"]]);
+  } finally { store.close(); }
+});
+
+test("the Skills pass runs on the background tick (gated by workDue) and via skills --run, with the catalog and decision credentials", async t => {
+  const catalogCalls: string[] = [];
+  const released: string[] = [];
+  let ws!: ReturnType<typeof skillsWorkspace>;
+  // No routing history and no crystals: a correct pass makes zero model calls.
+  const runner: Pick<StewardRunner, "complete"> = { complete: async () => { throw new Error("unexpected model call"); } };
+  const memory: StewardMemoryAccess = {
+    async getMemorySearchManager() { return { manager: null }; },
+    async skillCatalog({ agentId }) { catalogCalls.push(agentId); return [{ name: "deploy", description: "Deploy things.", path: ws.live }]; },
+    async release(agentId) { released.push(agentId); },
+  };
+  const h = harness(t, OTHER_PASSES_OFF, root => {
+    ws = skillsWorkspace(root, { decisionModel: { apiKey: "test-decision-key" } });
+    return { pluginConfig: ws.pluginConfig, workspaceDirForAgent: () => ws.workspace, createRunner: () => runner, memory: () => memory };
+  });
+  assert.equal(h.runtime.enabled, true, "the default-on Skills pass alone enables the background loop");
+  assert.equal((await h.run("status")).skills, true);
+  await h.runtime.tick();
+  const first = h.runtime.lastSkillsResults().get("main");
+  assert.partialDeepStrictEqual(first, { status: "ok", modelCalls: 0, proposals: [], errors: [] },
+    "decisionModel credentials reach the replay (no replay_unavailable)");
+  assert.deepEqual(catalogCalls, ["main"]);
+  await h.runtime.tick();
+  assert.equal(h.runtime.lastSkillsResults().get("main")?.status, "not_due");
+  assert.deepEqual(catalogCalls, ["main"], "a not-due tick never lists the skill catalog");
+  assert.ok(Object.hasOwn((await h.run("status")).counts as object, "steward_skills"));
+  assert.equal((await h.run("skills", "--run", "true")).status, "ok", "--run ignores the schedule");
+  assert.deepEqual(catalogCalls, ["main", "main"]);
+  assert.deepEqual(released, ["main"], "the CLI releases the borrowed manager");
+  assert.deepEqual(h.warnings, []);
+});
+
+test("the Skills pass reports replay_unavailable without decisionModel, and never runs without a skills corpus or runner", async t => {
+  const exitCode = process.exitCode;
+  t.after(() => { process.exitCode = exitCode; });
+  let ws!: ReturnType<typeof skillsWorkspace>;
+  const runner: Pick<StewardRunner, "complete"> = { complete: async () => { throw new Error("unexpected model call"); } };
+  const memory: StewardMemoryAccess = {
+    async getMemorySearchManager() { return { manager: null }; },
+    async skillCatalog() { return [{ name: "deploy", description: "Deploy things.", path: ws.live }]; },
+  };
+  const noDecision = harness(t, OTHER_PASSES_OFF, root => {
+    ws = skillsWorkspace(root, { decisionModel: { enabled: false } });
+    return { pluginConfig: ws.pluginConfig, workspaceDirForAgent: () => ws.workspace, createRunner: () => runner, memory: () => memory };
+  });
+  await noDecision.runtime.tick();
+  assert.deepEqual(noDecision.runtime.lastSkillsResults().get("main")?.errors, ["description_update:*:replay_unavailable"]);
+
+  const noCorpus = harness(t, OTHER_PASSES_OFF, () => ({ pluginConfig: resolveConfig({}), createRunner: () => runner, memory: () => memory }));
+  await noCorpus.runtime.tick();
+  assert.equal(noCorpus.runtime.lastSkillsResults().size, 0, "no skills corpus = no root any apply could land in");
+
+  const noRunner = harness(t, OTHER_PASSES_OFF, () => ({ memory: () => memory }));
+  assert.deepEqual(await noRunner.run("skills", "--run", "true"), { status: "disabled" });
+  assert.equal(existsSync(noRunner.dbPath), false);
+});
+
+test("skill-apply confines targets to the configured skills sources and previews through a read-only connection", async t => {
+  const exitCode = process.exitCode;
+  t.after(() => { process.exitCode = exitCode; });
+  let ws!: ReturnType<typeof skillsWorkspace>;
+  const opened: string[] = [];
+  const h = harness(t, { ...OTHER_PASSES_OFF, skills: { enabled: false } }, root => {
+    ws = skillsWorkspace(root);
+    return { pluginConfig: ws.pluginConfig, workspaceDirForAgent: () => ws.workspace,
+      openWorkStore: (dbPath: string) => { opened.push(dbPath); return new WorkStore(dbPath); } };
+  });
+  // A SKILL.md in the workspace but outside every skills source, and one reached through a symlink escaping the root.
+  const stray = join(ws.workspace, "notes", "SKILL.md");
+  mkdirSync(join(ws.workspace, "notes"));
+  writeFileSync(stray, LIVE_SKILL);
+  const outside = join(h.root, "outside", "evil");
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(outside, "SKILL.md"), LIVE_SKILL);
+  symlinkSync(outside, join(ws.workspace, "skills", "evil"));
+  const [update, strayUpdate, escaped] = seedProposals(h.dbPath, descriptionUpdate(ws.live), { ...descriptionUpdate(stray), skillName: "notes" },
+    { ...descriptionUpdate(join(ws.workspace, "skills", "evil", "SKILL.md")), skillName: "evil" });
+  for (const proposal of [update!, strayUpdate!, escaped!]) await h.run("skill-review", proposal.id, "--approve", "true");
+  for (const proposal of [strayUpdate!, escaped!]) {
+    assert.partialDeepStrictEqual(await h.run("skill-apply", proposal.id), { status: "error", code: "path_outside_root" });
+  }
+  assert.equal(readFileSync(stray, "utf8"), LIVE_SKILL);
+  assert.equal(readFileSync(join(outside, "SKILL.md"), "utf8"), LIVE_SKILL);
+
+  opened.length = 0;
+  const preview = await h.run("skill-apply", update!.id, "--dry-run", "true");
+  assert.equal(preview.status, "preview");
+  assert.deepEqual(opened, [], "a dry run never opens the read-write work store");
+  assert.equal(readFileSync(ws.live, "utf8"), LIVE_SKILL);
+  assert.partialDeepStrictEqual(await h.run("skill-apply", update!.id), { status: "applied", targetPath: ws.live });
+  assert.deepEqual(opened, [h.dbPath], "a real apply uses the work store");
+});
+
+test("skills --run shares the skills-corpus admission check and skips catalog skills outside the configured sources", async t => {
+  const exitCode = process.exitCode;
+  t.after(() => { process.exitCode = exitCode; });
+  let ws!: ReturnType<typeof skillsWorkspace>;
+  const catalogCalls: string[] = [];
+  const runner: Pick<StewardRunner, "complete"> = { complete: async () => { throw new Error("unexpected model call"); } };
+  const memory: StewardMemoryAccess = {
+    async getMemorySearchManager() { return { manager: null }; },
+    async skillCatalog({ agentId }) {
+      catalogCalls.push(agentId);
+      return [{ name: "deploy", description: "Deploy things.", path: ws.live }, { name: "stray", description: "Stray.", path: join(h.root, "stray", "SKILL.md") }];
+    },
+  };
+  const noCorpus = harness(t, OTHER_PASSES_OFF, () => ({ pluginConfig: resolveConfig({}), createRunner: () => runner, memory: () => memory }));
+  assert.partialDeepStrictEqual(await noCorpus.run("skills", "--run", "true"), { status: "unavailable" });
+  assert.deepEqual(catalogCalls, [], "no skills corpus: --run never lists the catalog or drafts anything");
+
+  const h = harness(t, OTHER_PASSES_OFF, root => {
+    ws = skillsWorkspace(root, { decisionModel: { apiKey: "test-decision-key" } });
+    return { pluginConfig: ws.pluginConfig, workspaceDirForAgent: () => ws.workspace, createRunner: () => runner, memory: () => memory };
+  });
+  await h.runtime.tick();
+  assert.partialDeepStrictEqual(h.runtime.lastSkillsResults().get("main"), { status: "ok", errors: ["catalog:stray:outside_skill_sources"] },
+    "the background tick skips a catalog skill outside every skills source");
+  const result = await h.run("skills", "--run", "true");
+  assert.partialDeepStrictEqual(result, { status: "ok", modelCalls: 0, errors: ["catalog:stray:outside_skill_sources"] },
+    "--run applies the same admission check");
+});
+
+test("memory-steward fleet-telemetry / fleet-brief / fleet-commons read real stores read-only; --sync goes through the manager", async t => {
+  const exitCode = process.exitCode;
+  t.after(() => { process.exitCode = exitCode; });
+  const syncs: string[] = [];
+  const released: string[] = [];
+  const memory: StewardMemoryAccess = {
+    async getMemorySearchManager({ agentId }) {
+      return { manager: {
+        async listClusters() { return { status: "not_analyzed" as const, clusters: [], noise: null, stale: false, staleSince: null, analyzedAt: null }; },
+        async fetchCluster() { return { status: "not_analyzed" as const, stale: false, staleSince: null, analyzedAt: null }; },
+        async recluster() { throw new Error("unexpected recluster"); },
+        async getCollectionGenerations() { return {}; },
+        corpusForCollection: () => undefined,
+        async syncFleetCommons() { syncs.push(agentId); return { status: "synced" as const, count: 1, changed: true, rejected: [] }; },
+      } };
+    },
+    async release(agentId) { released.push(agentId); },
+  };
+  let live = "";
+  const h = harness(t, { ...OTHER_PASSES_OFF, skills: { enabled: false } }, root => {
+    live = join(root, "skills", "deploy", "SKILL.md");
+    return { memory: () => memory,
+      pluginConfig: resolveConfig({ fleetCommons: { enabled: true, feedPath: join(root, "feed.json") } }) };
+  });
+  const telemetry = await h.run("fleet-telemetry");
+  assert.partialDeepStrictEqual(telemetry, { schemaVersion: 1, nodeId: "local", agentId: "default", skillProposals: { pending: 0, byKind: {} } });
+  assert.partialDeepStrictEqual(await h.run("fleet-brief"), { operatorOnly: true, skillProposals: [], blockers: [] });
+  assert.deepEqual(await h.run("fleet-commons"), { agentId: "main", enabled: true, summary: { count: 0 }, entries: [] });
+  assert.equal(existsSync(h.dbPath), false, "fleet reporting never creates the database");
+  await assert.rejects(h.run("fleet-telemetry", "--format", "xml"), /--format must be one of: json, prometheus/u);
+  await assert.rejects(h.run("fleet-brief", "--format", "html"), /--format must be one of: json, markdown/u);
+  await assert.rejects(h.run("fleet-telemetry", "--node", "/home/alice/node"), /fleet node and agent aliases/u);
+  await assert.rejects(h.run("fleet-telemetry", "--since-hours", "-1"), /--since-hours/u);
+  await assert.rejects(h.run("fleet-brief", "--due-soon-hours", "soon"), /--due-soon-hours/u);
+
+  // Real Step 4A rows feed both channels; real Step 4B cache rows feed fleet-commons.
+  seedProposals(h.dbPath, descriptionUpdate(live), newSkill);
+  const entry: FleetCommonsEntry = { id: "deploy-flag", revision: 3, category: "tool_pitfall", severity: "warn", title: "Deploy flag",
+    body: "Pass --wait to the deploy tool.", tags: ["deploy"], updatedAt: Date.now() };
+  writeFileSync(join(h.root, "feed.json"), JSON.stringify({ entries: [entry] }));
+  const store = { syncProjectedCollection: async () => ({ upserted: 1, unchanged: 0, retracted: 0, embedded: 0, generation: 1 }) };
+  await syncFleetCommons({ config: resolveConfig({ fleetCommons: { enabled: true, feedPath: join(h.root, "feed.json") } }).fleetCommons,
+    storePath: h.dbPath, store: store as Pick<QMDStore, "syncProjectedCollection"> });
+
+  assert.deepEqual((await h.run("fleet-telemetry", "--node", "charizard")).skillProposals,
+    { pending: 2, byKind: { description_update: 1, new_skill: 1 } });
+  const scrape = await h.runText("fleet-telemetry", "--node", "charizard", "--format", "prometheus");
+  assert.match(scrape, /^unblock_memory_skill_proposals_pending\{node="charizard",agent="default",kind="description_update"\} 1$/mu);
+  assert.match(scrape, /^unblock_memory_skill_proposals_pending\{node="charizard",agent="default",kind="new_skill"\} 1$/mu);
+  assert.doesNotMatch(scrape, /deploy services|rollback|Sharpen/iu, "telemetry carries counts, never proposal text");
+  const brief = await h.run("fleet-brief", "--limit", "1");
+  assert.deepEqual(brief.skillProposals, [{ kind: "description_update", skillName: "deploy",
+    title: "Sharpen routing description for deploy", recallGainPp: 12.4 }]);
+  const markdown = await h.runText("fleet-brief", "--format", "markdown");
+  assert.match(markdown, /^## Pending Self-Writing Skill Proposals\n- \*\*local \/ default:\*\* Sharpen routing description for deploy .* 12\.4 pp recall\n- .*Roll back a release/mu);
+  assert.match(markdown, /2 pending skill approvals/u);
+  const cached = await h.run("fleet-commons") as { summary: { count: number; lastSyncAt?: number; feedDigest?: string }; entries: unknown[] };
+  assert.equal(cached.summary.count, 1);
+  assert.ok(Number.isSafeInteger(cached.summary.lastSyncAt) && /^[a-f0-9]{64}$/u.test(cached.summary.feedDigest ?? ""));
+  assert.deepEqual(cached.entries, [entry]);
+
+  assert.partialDeepStrictEqual(await h.run("fleet-commons", "--sync", "true"), { status: "synced", count: 1 });
+  assert.deepEqual([syncs, released], [["main"], ["main"]]);
+  const disabled = harness(t, { ...OTHER_PASSES_OFF, skills: { enabled: false } }, () => ({ memory: () => memory, pluginConfig: resolveConfig({}) }));
+  assert.deepEqual(await disabled.run("fleet-commons", "--sync", "true"), { status: "disabled" });
+  assert.equal((await disabled.run("status")).fleetCommons, false);
+  assert.equal((await h.run("status")).fleetCommons, true);
+});
+
+test("fleet-telemetry / fleet-brief export --agent-alias (default \"default\"), never the local agent id, and --push with --token-file", async t => {
+  const h = harness(t, { ...OTHER_PASSES_OFF, skills: { enabled: false } });
+  const ingestFile = join(h.root, "ingest-token");
+  writeFileSync(ingestFile, "ingest-secret\n");
+  const hub = createFleetOrganismHub({ dbPath: ":memory:", ingestToken: "ingest-secret", operatorToken: "operator-secret" });
+  hub.listen(0, "127.0.0.1");
+  await once(hub, "listening");
+  t.after(() => new Promise<void>(resolve => hub.close(() => resolve())));
+  const address = hub.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `http://127.0.0.1:${address.port}`;
+
+  assert.equal((await h.run("fleet-telemetry")).agentId, "default");
+  assert.doesNotMatch(await h.runText("fleet-telemetry", "--format", "prometheus"), /agent="main"/u);
+  assert.partialDeepStrictEqual(await h.run("fleet-brief", "--agent-alias", "ops-a"), { agentId: "ops-a", operatorOnly: true });
+  await assert.rejects(h.run("fleet-telemetry", "--agent-alias", "/home/alice/agent"), /fleet node and agent aliases/u);
+  await assert.rejects(h.run("fleet-telemetry", "--token-file", ingestFile), /--token-file requires --push/u);
+  await assert.rejects(h.run("fleet-telemetry", "--push", "http://fleet-hub.example.test/api/v1/telemetry"), /must use https:\/\//u);
+  await assert.rejects(h.run("fleet-telemetry", "--push", `${base}/api/v1/telemetry`), /HTTP 401/u, "no --token-file = no bearer");
+  await assert.rejects(h.run("fleet-telemetry", "--push", `${base}/api/v1/telemetry`, "--token-file", ingestFile,
+    "--push-timeout-ms", "-1"), /--push-timeout-ms/u);
+
+  const pushed = await h.run("fleet-telemetry", "--node", "charizard", "--push", `${base}/api/v1/telemetry`, "--token-file", ingestFile);
+  assert.equal(pushed.agentId, "default");
+  await h.run("fleet-brief", "--node", "charizard", "--agent-alias", "ops-a", "--push", `${base}/api/v1/brief`, "--token-file", ingestFile);
+  const scrape = await (await fetch(`${base}/metrics`)).text();
+  assert.match(scrape, /^unblock_memory_crystals_active\{node="charizard",agent="default",tier="stm"\} 0$/mu);
+  assert.doesNotMatch(scrape, /agent="main"/u);
+  const stored = await (await fetch(`${base}/api/v1/brief`, { headers: { Authorization: "Bearer operator-secret" } })).json() as
+    { briefs: Array<{ nodeId: string; agentId: string }> };
+  assert.deepEqual(stored.briefs.map(({ nodeId, agentId }) => [nodeId, agentId]), [["charizard", "ops-a"]]);
+  assert.equal(existsSync(h.dbPath), false, "pushing never creates the local database");
 });

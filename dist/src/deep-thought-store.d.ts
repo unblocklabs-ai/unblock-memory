@@ -171,7 +171,7 @@ export type FindMatchingDerivedObservationsParams = DerivedObservationMatchQuery
  * Read-only candidate lookup (ACL + deterministic scoring, no freshness check) against an existing database file.
  * Returns `[]` — never throws for a missing database or table — so callers on the hot path can probe cheaply.
  */
-export declare function readDerivedObservationCandidates(dbPath: string, query: DerivedObservationMatchQuery): DerivedObservationMatch[];
+export declare function readDerivedObservationCandidates(dbPath: string, query: DerivedObservationMatchQuery, nowMs?: number): DerivedObservationMatch[];
 /**
  * Read-only `findMatchingDerivedObservations`: identical matching and verification, but never writes (stale rows are
  * skipped, not marked). `[]` when the database or `derived_observations` table does not exist.
@@ -225,8 +225,8 @@ export declare class DeepThoughtStore {
     saveDerivedObservation(input: SaveDerivedObservationInput): DerivedObservation;
     /**
      * Exact-key lookup of the `fresh` observation. Hits (and counts the hit) only when `currentGenerations` records exactly
-     * the same collections at exactly the same generations; otherwise the row is marked `stale` and `undefined` is returned.
-     * An empty `currentGenerations` cannot verify anything: it misses without invalidating.
+     * the same collections at exactly the same generations and every cited Fleet Commons entry is still active; otherwise the
+     * row is marked `stale` and `undefined` is returned. An empty `currentGenerations` cannot verify anything: it misses without invalidating.
      */
     findFreshDerivedObservation(input: DerivedObservationKey & {
         currentGenerations: Readonly<Record<string, number>>;

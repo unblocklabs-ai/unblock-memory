@@ -2,6 +2,8 @@ import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plug
 import type { MemoryAnalysisSummary, MemoryClusterDetail, MemoryClusterList, MemoryClusterSort } from "./analysis.js";
 import type { UnblockMemoryConfig } from "./config.js";
 import { type DeepThoughtDeps } from "./deep-thought.js";
+import { type FleetCommonsSyncResult } from "./fleet-commons.js";
+import type { SkillCatalogEntry } from "./manager.js";
 import { type OutcomeLedgerPassResult } from "./outcome-ledger.js";
 import { type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
@@ -10,6 +12,7 @@ import { type CaptainsLogDecide, type ExpectationsPassResult, type ResolveFromCa
 import { type PeopleShadowPassResult } from "./steward-people-shadow.js";
 import { type OvernightThinkingPassResult } from "./steward-overnight.js";
 import type { StewardRunner } from "./steward-runner.js";
+import { type StewardSkillsPassResult } from "./steward-skills.js";
 import { WorkStore } from "./work-store.js";
 /** Process-wide (all agents, all plugin instances) background Steward slot; returns a one-shot release or undefined at capacity. */
 export declare function tryAcquireBackgroundSlot(maxActive: number): (() => void) | undefined;
@@ -26,6 +29,8 @@ type StewardMemoryManager = {
     recluster(options?: undefined, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
     getCollectionGenerations(corpora?: readonly string[]): Promise<Record<string, number>>;
     corpusForCollection(collection: string): string | undefined;
+    /** `memory-steward fleet-commons --sync`: pull the Fleet Commons feed into this agent's cache and projected collection. */
+    syncFleetCommons?(signal?: AbortSignal): Promise<FleetCommonsSyncResult>;
 };
 /** Memory access for the Crystals and Overnight passes; supplied by the plugin once its QMD runtime exists. */
 export type StewardMemoryAccess = {
@@ -42,6 +47,14 @@ export type StewardMemoryAccess = {
     deepThought?(agentId: string, cfg: OpenClawConfig): DeepThoughtDeps | undefined;
     /** Close one agent's manager after a CLI `--run`, so its file watchers never keep the CLI process alive. */
     release?(agentId: string): Promise<void>;
+    /**
+     * The live skill catalog with canonical absolute `SKILL.md` paths (the paths `skill_open_events` / `memory_outcomes`
+     * record), without starting a memory sync. Absent = the Skills pass skips.
+     */
+    skillCatalog?(params: {
+        cfg: OpenClawConfig;
+        agentId: string;
+    }): Promise<SkillCatalogEntry[]>;
 };
 type StewardRuntimeOptions = {
     config: StewardConfig;
@@ -75,6 +88,7 @@ export declare function registerStewardRuntime(api: OpenClawPluginApi, options: 
     lastCaptainsLogResolutions: () => Map<string, ResolveFromCaptainsLogResult>;
     lastCrystalsResults: () => Map<string, CrystalsPassResult>;
     lastOvernightResults: () => Map<string, OvernightThinkingPassResult>;
+    lastSkillsResults: () => Map<string, StewardSkillsPassResult>;
     enabled: boolean;
 };
 export {};

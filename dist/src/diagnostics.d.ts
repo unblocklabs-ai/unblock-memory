@@ -12,17 +12,17 @@ export declare class WhispererDiagnostics {
     measureSearch(agentId: string, observation: Parameters<RetrievalTelemetry["record"]>[1]): void;
     snapshot(agentId: string): {
         skill: {
+            unavailable?: number | undefined;
+            emitted?: number | undefined;
+            rejected?: number | undefined;
+            missing_key?: number | undefined;
+            timed_out?: number | undefined;
             cancelled?: number | undefined;
             failed?: number | undefined;
-            timed_out?: number | undefined;
-            missing_key?: number | undefined;
+            payload_limit?: number | undefined;
             decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
-            rejected?: number | undefined;
-            emitted?: number | undefined;
             active_reused?: number | undefined;
-            unavailable?: number | undefined;
-            payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
             queries_generated?: number | undefined;
             generation_fallback?: number | undefined;
@@ -42,17 +42,17 @@ export declare class WhispererDiagnostics {
             partial_response?: number | undefined;
         };
         memory: {
+            unavailable?: number | undefined;
+            emitted?: number | undefined;
+            rejected?: number | undefined;
+            missing_key?: number | undefined;
+            timed_out?: number | undefined;
             cancelled?: number | undefined;
             failed?: number | undefined;
-            timed_out?: number | undefined;
-            missing_key?: number | undefined;
+            payload_limit?: number | undefined;
             decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
-            rejected?: number | undefined;
-            emitted?: number | undefined;
             active_reused?: number | undefined;
-            unavailable?: number | undefined;
-            payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
             queries_generated?: number | undefined;
             generation_fallback?: number | undefined;
@@ -72,17 +72,17 @@ export declare class WhispererDiagnostics {
             partial_response?: number | undefined;
         };
         myTurn: {
+            unavailable?: number | undefined;
+            emitted?: number | undefined;
+            rejected?: number | undefined;
+            missing_key?: number | undefined;
+            timed_out?: number | undefined;
             cancelled?: number | undefined;
             failed?: number | undefined;
-            timed_out?: number | undefined;
-            missing_key?: number | undefined;
+            payload_limit?: number | undefined;
             decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
-            rejected?: number | undefined;
-            emitted?: number | undefined;
             active_reused?: number | undefined;
-            unavailable?: number | undefined;
-            payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
             queries_generated?: number | undefined;
             generation_fallback?: number | undefined;
@@ -105,17 +105,17 @@ export declare class WhispererDiagnostics {
             matchedScenarios: {
                 [k: string]: number;
             };
+            unavailable?: number | undefined;
+            emitted?: number | undefined;
+            rejected?: number | undefined;
+            missing_key?: number | undefined;
+            timed_out?: number | undefined;
             cancelled?: number | undefined;
             failed?: number | undefined;
-            timed_out?: number | undefined;
-            missing_key?: number | undefined;
+            payload_limit?: number | undefined;
             decision_disabled?: number | undefined;
             no_candidates?: number | undefined;
-            rejected?: number | undefined;
-            emitted?: number | undefined;
             active_reused?: number | undefined;
-            unavailable?: number | undefined;
-            payload_limit?: number | undefined;
             redundancy_unavailable?: number | undefined;
             queries_generated?: number | undefined;
             generation_fallback?: number | undefined;
@@ -140,17 +140,17 @@ export declare class WhispererDiagnostics {
                 [k: string]: {
                     calls: number;
                     outcomes: {
-                        cancelled?: number | undefined;
-                        ok?: number | undefined;
-                        skipped?: number | undefined;
                         partial?: number | undefined;
+                        ok?: number | undefined;
                         empty?: number | undefined;
-                        failed?: number | undefined;
-                        timed_out?: number | undefined;
                         degraded?: number | undefined;
+                        timed_out?: number | undefined;
+                        cancelled?: number | undefined;
+                        skipped?: number | undefined;
+                        failed?: number | undefined;
                     };
                     slowestRecent: {
-                        outcome: "cancelled" | "ok" | "skipped" | "partial" | "empty" | "failed" | "timed_out" | "degraded";
+                        outcome: "partial" | "ok" | "empty" | "degraded" | "timed_out" | "cancelled" | "skipped" | "failed";
                         setupMs?: number | undefined;
                         queueWaitMs?: number | undefined;
                         metadataMs?: number | undefined;

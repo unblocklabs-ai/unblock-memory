@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
@@ -8,14 +8,25 @@ import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-e
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import type { MemoryAnalysisSummary, MemoryClusterDetail, MemoryClusterList, MemoryClusterSort } from "./analysis.js";
 import type { UnblockMemoryConfig } from "./config.js";
+import { resolveDecisionCredential } from "./decision-client.js";
 import { runDeepThoughtInvestigation, type DeepThoughtDeps } from "./deep-thought.js";
 import { DEFAULTS } from "./defaults.js";
 import { EXPECTATION_STATUSES, ExpectationsStore, syncDeterministicExpectations } from "./expectations-store.js";
+import { readFleetCommonsEntries, summarizeFleetCommons, type FleetCommonsSyncResult } from "./fleet-commons.js";
+import {
+  buildNodeBriefSnapshot, buildNodeTelemetrySnapshot, formatPrometheusMetrics, pushNodeSnapshot, renderFleetMorningBrief,
+} from "./fleet-organism.js";
+import type { SkillCatalogEntry } from "./manager.js";
 import { CRYSTAL_TIERS, listCrystals, MemoryCrystalsStore, summarizeCrystals } from "./memory-crystals.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { runOutcomeLedgerPass, summarizeOutcomeMetrics, type OutcomeLedgerPassResult } from "./outcome-ledger.js";
 import { responseCohort } from "./response-audit.js";
 import { resolveTimezone } from "./session-projector.js";
+import {
+  applyApprovedProposal, listSkillProposals, reviewSkillProposal, SKILL_PROPOSAL_KINDS, SKILL_PROPOSAL_STATUSES, SkillProposalError,
+  summarizeSkillProposals, type SkillSource,
+} from "./skill-proposals-store.js";
+import { resolveSources } from "./sources.js";
 import { listOpenBlockers, runCaptainsLogPass, type CaptainsLogPassOptions, type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
 import { CRYSTALS_KIND, runCrystalsPass, type CrystalsAnalysis, type CrystalsPassOptions, type CrystalsPassResult } from "./steward-crystals.js";
@@ -36,6 +47,9 @@ import {
   type OvernightInvestigate, type OvernightThinkingPassOptions, type OvernightThinkingPassResult,
 } from "./steward-overnight.js";
 import type { StewardRunner } from "./steward-runner.js";
+import {
+  runStewardSkillsPass, SKILLS_WORK_KIND, type SkillReplayDecision, type StewardSkillsPassOptions, type StewardSkillsPassResult,
+} from "./steward-skills.js";
 import { WorkStore } from "./work-store.js";
 
 /* ═════════════════════════ Background semaphore ═════════════════════════ */
@@ -75,6 +89,8 @@ type StewardMemoryManager = {
   recluster(options?: undefined, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
   getCollectionGenerations(corpora?: readonly string[]): Promise<Record<string, number>>;
   corpusForCollection(collection: string): string | undefined;
+  /** `memory-steward fleet-commons --sync`: pull the Fleet Commons feed into this agent's cache and projected collection. */
+  syncFleetCommons?(signal?: AbortSignal): Promise<FleetCommonsSyncResult>;
 };
 
 /** Memory access for the Crystals and Overnight passes; supplied by the plugin once its QMD runtime exists. */
@@ -86,6 +102,11 @@ export type StewardMemoryAccess = {
   deepThought?(agentId: string, cfg: OpenClawConfig): DeepThoughtDeps | undefined;
   /** Close one agent's manager after a CLI `--run`, so its file watchers never keep the CLI process alive. */
   release?(agentId: string): Promise<void>;
+  /**
+   * The live skill catalog with canonical absolute `SKILL.md` paths (the paths `skill_open_events` / `memory_outcomes`
+   * record), without starting a memory sync. Absent = the Skills pass skips.
+   */
+  skillCatalog?(params: { cfg: OpenClawConfig; agentId: string }): Promise<SkillCatalogEntry[]>;
 };
 
 type StewardRuntimeOptions = {
@@ -327,6 +348,51 @@ function overnightPassOptions(
   };
 }
 
+/** A not-due Skills tick, reported without ever listing the agent's skill catalog. */
+function skillsNotDue(store: WorkStore, agentId: string): StewardSkillsPassResult {
+  const item = store.get(SKILLS_WORK_KIND, agentId);
+  return { status: item?.status === "running" ? "already_running" : "not_due", descriptionUpdates: 0, pitfallPatches: 0, newSkills: 0,
+    modelCalls: 0, replayJudgments: 0, proposals: [], rejected: [], errors: [], ...(item ? { nextDueAt: item.dueAt } : {}) };
+}
+
+/**
+ * The production `scoreSkillCatalog` replay credential: the plugin's own `decisionModel` (endpoint, model, key). Undefined
+ * (decisionModel disabled, or no key) makes the pass record `replay_unavailable` and skip description updates only.
+ */
+async function skillReplayDecision(pluginConfig: UnblockMemoryConfig | undefined): Promise<SkillReplayDecision | undefined> {
+  const decision = pluginConfig?.decisionModel;
+  if (!decision?.enabled) return undefined;
+  const apiKey = await resolveDecisionCredential(decision).catch(() => undefined);
+  return apiKey ? { apiKey, endpoint: decision.endpoint, model: decision.model } : undefined;
+}
+
+/** One Skills pass, shared by the background tick and `memory-steward skills --run`. */
+function skillsPassOptions(
+  config: StewardConfig["skills"],
+  base: Pick<StewardSkillsPassOptions, "agentId" | "workStore" | "owner" | "signal" | "ignoreDueAt">,
+  runner: Pick<StewardRunner, "complete">,
+  catalog: readonly SkillCatalogEntry[],
+  decision: SkillReplayDecision | undefined,
+  allowedSkillSources: readonly SkillSource[] | undefined,
+): StewardSkillsPassOptions {
+  const { enabled: _enabled, ...tuning } = config;
+  return { ...base, ...tuning, runner, catalog, ...(decision ? { decision } : {}), ...(allowedSkillSources ? { allowedSkillSources } : {}) };
+}
+
+/**
+ * The skills-corpus admission check shared by the background tick, `skills --run` and `skill-apply`: never draft or land
+ * a proposal without a configured skills corpus. No plugin config (embedded/test hosts) leaves the pass unconfined.
+ */
+const skillsCorpusConfigured = (pluginConfig: UnblockMemoryConfig | undefined) =>
+  !pluginConfig || pluginConfig.corpora.some(corpus => corpus.kind === "skills");
+
+/** Configured skills sources (root + glob) for one agent: the only places `skill-apply` may write a `SKILL.md`. */
+function skillSources(pluginConfig: UnblockMemoryConfig | undefined, workspaceDir: string): SkillSource[] | undefined {
+  if (!pluginConfig) return undefined;
+  const skillCorpora = pluginConfig.corpora.filter(corpus => corpus.kind === "skills");
+  return resolveSources(workspaceDir, skillCorpora).map(({ root, pattern }) => ({ root, pattern }));
+}
+
 class StewardShutdownError extends Error {
   override name = "StewardShutdownError";
   constructor() { super("gateway stopping"); }
@@ -352,10 +418,14 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
   const lastCaptainsLogResolutions = new Map<string, ResolveFromCaptainsLogResult>();
   const lastCrystalsResults = new Map<string, CrystalsPassResult>();
   const lastOvernightResults = new Map<string, OvernightThinkingPassResult>();
+  const lastSkillsResults = new Map<string, StewardSkillsPassResult>();
   const outcomeLedger = options.config.outcomeLedger;
   const expectations = options.config.expectations;
   const crystals = options.config.crystals;
   const overnight = options.config.overnight;
+  const skills = options.config.skills;
+  // Never draft proposals that no `skill-apply` could ever land: without a skills corpus there is no allowed root.
+  const skillsCorpusReady = skillsCorpusConfigured(options.pluginConfig);
   // Same cohort Response Audit writes, so outcomes never mix verdicts from another judge configuration.
   const outcomeCohort = options.pluginConfig?.responseAudit.enabled
     ? responseCohort(options.pluginConfig.responseAudit, options.pluginConfig.decisionModel.model, options.pluginConfig.decisionModel.endpoint)
@@ -459,7 +529,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
               warn: message => api.logger.warn(message) });
             if (followUp?.resolution) lastCaptainsLogResolutions.set(agentId, followUp.resolution);
           }
-          const memory = crystals.enabled || overnight.enabled ? options.memory?.() : undefined;
+          const memory = crystals.enabled || overnight.enabled || skills.enabled ? options.memory?.() : undefined;
           if (crystals.enabled && memory && !signal.aborted) {
             try {
               // Never cold-start the agent's QMD manager on a tick where the pass is not due.
@@ -498,6 +568,22 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
               if (!signal.aborted) api.logger.warn(`unblock-memory steward overnight (${agentId}): ${String(error)}`);
             }
           }
+          if (skills.enabled && skillsCorpusReady && runner && memory?.skillCatalog && !signal.aborted) {
+            try {
+              // Review-only: drafts `pending` skill_proposals, never a live SKILL.md. Not due = never list the catalog.
+              if (!workDue(store, SKILLS_WORK_KIND, agentId)) {
+                lastSkillsResults.set(agentId, skillsNotDue(store, agentId));
+              } else {
+                const catalog = await memory.skillCatalog({ cfg: api.config, agentId });
+                const decision = await skillReplayDecision(options.pluginConfig);
+                const sources = skillSources(options.pluginConfig, workspaceDirForAgent(api.config, agentId));
+                lastSkillsResults.set(agentId, await runStewardSkillsPass(skillsPassOptions(skills,
+                  { agentId, workStore: store, owner, signal }, runner, catalog, decision, sources)));
+              }
+            } catch (error) {
+              if (!signal.aborted) api.logger.warn(`unblock-memory steward skills (${agentId}): ${String(error)}`);
+            }
+          }
         } catch (error) {
           if (!signal.aborted) api.logger.warn(`unblock-memory steward (${agentId}): ${String(error)}`);
         } finally {
@@ -526,7 +612,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
 
   const enabled = api.registrationMode !== "cli-metadata" && options.config.enabled &&
     (options.config.peopleShadow.enabled || options.config.captainsLog.enabled || outcomeLedger.enabled || expectations.enabled ||
-      crystals.enabled || overnight.enabled);
+      crystals.enabled || overnight.enabled || skills.enabled);
   if (enabled) {
     api.on("gateway_start", () => {
       if (timer) clearInterval(timer);
@@ -538,6 +624,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
       if (expectations.enabled) intervals.push(expectations.intervalMinutes);
       if (crystals.enabled) intervals.push(crystals.intervalMinutes);
       if (overnight.enabled) intervals.push(overnight.intervalMinutes);
+      if (skills.enabled) intervals.push(skills.intervalMinutes);
       const intervalMs = Math.max(1, Math.min(...intervals)) * 60_000;
       timer = setInterval(() => { void tick(); }, intervalMs);
       timer.unref();
@@ -556,6 +643,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
     lastCaptainsLogResolutions: () => new Map(lastCaptainsLogResolutions),
     lastCrystalsResults: () => new Map(lastCrystalsResults),
     lastOvernightResults: () => new Map(lastOvernightResults),
+    lastSkillsResults: () => new Map(lastSkillsResults),
     enabled,
   };
 }
@@ -599,7 +687,7 @@ function registerStewardCli(
     } finally { db.close(); }
   };
   api.registerCli(({ program, config: cfg }) => {
-    const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, expectations, crystals, overnight, re-drive");
+    const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, expectations, crystals, overnight, skills, fleet, re-drive");
     root.command("status").description("Work item counts by kind/status plus the quarantined backlog")
       .option("--agent <id>", "Agent id", "main").option("--kind <kind>", "Filter one work kind")
       .action((opts: { agent: string; kind?: string }) => {
@@ -616,6 +704,8 @@ function registerStewardCli(
             expectations: options.config.expectations.enabled,
             crystals: options.config.crystals.enabled,
             overnight: options.config.overnight.enabled,
+            skills: options.config.skills.enabled,
+            fleetCommons: options.pluginConfig?.fleetCommons.enabled ?? false,
             counts: summarize(items),
             quarantined: items.filter(item => item.status === "quarantined")
               .map(({ kind, scope, strikes, lastError }) => ({ kind, scope, strikes, lastError })),
@@ -817,9 +907,188 @@ function registerStewardCli(
           postmortems: listShortfallPostmortems(dbPath, { agentId: opts.agent, limit }),
         }, null, 2));
       });
+    /** Parse one `--x <one of>` filter; undefined when omitted. */
+    const oneOf = <T extends string>(value: string | undefined, allowed: readonly T[], flag: string): T | undefined => {
+      if (value === undefined) return undefined;
+      const matched = allowed.find(entry => entry === value.trim());
+      if (!matched) throw new Error(`${flag} must be one of: ${allowed.join(", ")}`);
+      return matched;
+    };
+    /** Skill-proposal store errors are operator outcomes (not found, wrong state, conflict), printed as JSON with exit 1. */
+    const proposalFailure = (error: unknown) => {
+      if (!(error instanceof SkillProposalError)) throw error;
+      console.log(JSON.stringify({ status: "error", code: error.code, message: error.message }, null, 2));
+      process.exitCode = 1;
+    };
+    root.command("skills").description("Self-writing skill proposals (read-only); --run triggers one review-only Skills pass now")
+      .option("--agent <id>", "Agent id", "main")
+      .option("--status <status>", `Filter one status (${SKILL_PROPOSAL_STATUSES.join(", ")})`)
+      .option("--kind <kind>", `Filter one kind (${SKILL_PROPOSAL_KINDS.join(", ")})`)
+      .option("--limit <n>", "Maximum proposals (0 = unlimited)", "0")
+      .option("--run", "Run one Skills pass now (ignores the schedule; writes only pending proposals)", false)
+      .action(async (opts: { agent: string; status?: string; kind?: string; limit: string; run?: boolean }) => {
+        const limit = nonNegativeLimit(opts.limit);
+        const status = oneOf(opts.status, SKILL_PROPOSAL_STATUSES, "--status");
+        const kind = oneOf(opts.kind, SKILL_PROPOSAL_KINDS, "--kind");
+        const dbPath = knownAgent(cfg, opts.agent);
+        if (opts.run) {
+          const runner = options.createRunner();
+          if (!runner) { console.log(JSON.stringify({ status: "disabled" })); process.exitCode = 1; return; }
+          if (!skillsCorpusConfigured(options.pluginConfig)) {
+            console.log(JSON.stringify({ status: "unavailable", reason: "no skills corpus configured: no proposal could ever be applied" }));
+            process.exitCode = 1;
+            return;
+          }
+          const sources = skillSources(options.pluginConfig, workspaceDirForAgent(cfg, opts.agent));
+          const memory = options.memory?.();
+          if (!memory?.skillCatalog) {
+            console.log(JSON.stringify({ status: "unavailable", reason: "skill catalog unavailable for this agent" }));
+            process.exitCode = 1;
+            return;
+          }
+          let catalog: SkillCatalogEntry[];
+          try { catalog = await memory.skillCatalog({ cfg, agentId: opts.agent }); }
+          finally { try { await memory.release?.(opts.agent); } catch {} }
+          const store = openWorkStore(dbPath);
+          try {
+            const result = await runStewardSkillsPass(skillsPassOptions(options.config.skills, {
+              agentId: opts.agent, workStore: store, owner: `steward-cli:${process.pid}:${randomUUID()}`, ignoreDueAt: true,
+            }, runner, catalog, await skillReplayDecision(options.pluginConfig), sources));
+            console.log(JSON.stringify(result, null, 2));
+            if (result.status === "failed") process.exitCode = 1;
+          } finally { store.close(); }
+          return;
+        }
+        // Never creates or migrates an absent database (or one without the skill_proposals table).
+        withReadOnlyDb(dbPath, db => {
+          console.log(JSON.stringify({
+            agentId: opts.agent, ...(status ? { status } : {}), ...(kind ? { kind } : {}),
+            summary: summarizeSkillProposals(db, opts.agent),
+            proposals: listSkillProposals(db, { agentId: opts.agent, ...(status ? { status } : {}), ...(kind ? { kind } : {}), limit }),
+          }, null, 2));
+        });
+      });
+    root.command("skill-review <id>").description("Approve or reject one pending skill proposal (never touches a live SKILL.md)")
+      .option("--agent <id>", "Agent id", "main")
+      .option("--approve", "Approve the proposal", false)
+      .option("--reject", "Reject the proposal (it is never re-raised)", false)
+      .option("--by <name>", "Reviewer recorded on the proposal")
+      .option("--note <text>", "Review note recorded on the proposal")
+      .action((id: string, opts: { agent: string; approve?: boolean; reject?: boolean; by?: string; note?: string }) => {
+        if (Boolean(opts.approve) === Boolean(opts.reject)) throw new Error("skill-review needs exactly one of --approve or --reject");
+        const dbPath = knownAgent(cfg, opts.agent);
+        if (!existsSync(dbPath)) return proposalFailure(new SkillProposalError("not_found", `Skill proposal ${id} not found`));
+        withStore(dbPath, store => {
+          try {
+            const proposal = reviewSkillProposal(store.db, { id, agentId: opts.agent, decision: opts.approve ? "approved" : "rejected",
+              ...(opts.by === undefined ? {} : { reviewedBy: opts.by }), ...(opts.note === undefined ? {} : { note: opts.note }) });
+            console.log(JSON.stringify({ status: proposal.status, proposal }, null, 2));
+          } catch (error) { proposalFailure(error); }
+        });
+      });
+    root.command("skill-apply <id>").description("Write one approved proposal's SKILL.md inside a configured skills corpus root")
+      .option("--agent <id>", "Agent id", "main")
+      .option("--dry-run", "Preview the diff without writing or changing state", false)
+      .option("--target-dir <dir>", "Directory for new_skill proposals (default: the first configured skills corpus root)")
+      .action((id: string, opts: { agent: string; dryRun?: boolean; targetDir?: string }) => {
+        const dbPath = knownAgent(cfg, opts.agent);
+        const allowedSources = skillSources(options.pluginConfig, workspaceDirForAgent(cfg, opts.agent)) ?? [];
+        const targetDirForNewSkills = opts.targetDir === undefined ? allowedSources[0]?.root : resolve(opts.targetDir);
+        if (!existsSync(dbPath)) return proposalFailure(new SkillProposalError("not_found", `Skill proposal ${id} not found`));
+        const apply = (db: DatabaseSync) => {
+          try {
+            const result = applyApprovedProposal(db, { id, agentId: opts.agent, allowedSources, dryRun: Boolean(opts.dryRun),
+              ...(targetDirForNewSkills ? { targetDirForNewSkills } : {}) });
+            console.log(JSON.stringify(result, null, 2));
+          } catch (error) { proposalFailure(error); }
+        };
+        // A preview never writes: it reads through a read-only connection and never opens (or migrates) the work store.
+        if (opts.dryRun) withReadOnlyDb(dbPath, apply);
+        else withStore(dbPath, store => apply(store.db));
+      });
+    /** `--x <n>` hours, `0` allowed. */
+    const hoursOption = (value: string, flag: string) => {
+      const hours = Number(value);
+      if (!Number.isFinite(hours) || hours < 0) throw new Error(`${flag} must be a non-negative number`);
+      return hours;
+    };
+    type FleetOpts = { agent: string; agentAlias: string; node: string; push?: string; tokenFile?: string; pushTimeoutMs: string };
+    /**
+     * The local `--agent` id selects the store; only the operator-assigned `--agent-alias` leaves the node, so a
+     * client-named agent id never becomes a Prometheus label or hub row key.
+     */
+    const fleetIds = (opts: FleetOpts) => ({ nodeId: opts.node, agentId: opts.agentAlias, sourceAgentId: opts.agent });
+    /** Optional `--push <endpoint>`: POST the snapshot to the hub (https:// unless loopback, enforced by pushNodeSnapshot). */
+    const pushFleetSnapshot = async (snapshot: Parameters<typeof pushNodeSnapshot>[0], opts: FleetOpts) => {
+      if (opts.push === undefined) {
+        if (opts.tokenFile !== undefined) throw new Error("--token-file requires --push");
+        return;
+      }
+      const timeoutMs = Number(opts.pushTimeoutMs);
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error("--push-timeout-ms must be a non-negative integer");
+      await pushNodeSnapshot(snapshot, { endpoint: opts.push, timeoutMs, ...(opts.tokenFile === undefined ? {} : { apiKeyFile: resolve(opts.tokenFile) }) });
+    };
+    const fleetOptions = (command: ReturnType<typeof root.command>, nodeHelp: string, pushPath: string) => command
+      .option("--agent <id>", "Local agent id whose store is read (never exported)", "main")
+      .option("--agent-alias <alias>", "Operator-assigned agent alias reported in place of the agent id", "default")
+      .option("--node <id>", nodeHelp, "local")
+      .option("--push <url>", `POST the JSON snapshot to this hub endpoint (e.g. https://hub.example${pushPath})`)
+      .option("--token-file <path>", "Bearer token file for --push")
+      .option("--push-timeout-ms <n>", "Timeout for --push in ms (0 = none)", "10000");
+    fleetOptions(root.command("fleet-telemetry").description("Anonymous Fleet Organism telemetry snapshot for one agent (read-only)"),
+      "Operator-assigned node alias reported to the fleet hub", "/api/v1/telemetry")
+      .option("--since-hours <n>", "Outcome lookback in hours (0 = all history)", "24")
+      .option("--format <format>", "json or prometheus", "json")
+      .action(async (opts: FleetOpts & { sinceHours: string; format: string }) => {
+        const format = oneOf(opts.format, ["json", "prometheus"] as const, "--format");
+        const sinceHours = hoursOption(opts.sinceHours, "--since-hours");
+        const snapshot = buildNodeTelemetrySnapshot(knownAgent(cfg, opts.agent), { ...fleetIds(opts), sinceHours });
+        await pushFleetSnapshot(snapshot, opts);
+        console.log(format === "prometheus" ? formatPrometheusMetrics([snapshot]).trimEnd() : JSON.stringify(snapshot, null, 2));
+      });
+    fleetOptions(root.command("fleet-brief").description("Operator-only Fleet Morning Brief for one agent (read-only; never telemetry)"),
+      "Operator-assigned node alias", "/api/v1/brief")
+      .option("--due-soon-hours <n>", "Expectations due within n hours (0 = overdue only)", "24")
+      .option("--limit <n>", "Maximum items per section (0 = unlimited)", "0")
+      .option("--format <format>", "json or markdown", "json")
+      .action(async (opts: FleetOpts & { dueSoonHours: string; limit: string; format: string }) => {
+        const format = oneOf(opts.format, ["json", "markdown"] as const, "--format");
+        const dueSoonHours = hoursOption(opts.dueSoonHours, "--due-soon-hours");
+        const limit = nonNegativeLimit(opts.limit);
+        const dbPath = knownAgent(cfg, opts.agent);
+        const ids = fleetIds(opts);
+        const brief = buildNodeBriefSnapshot(dbPath, { ...ids, dueSoonHours, limit });
+        await pushFleetSnapshot(brief, opts);
+        console.log(format === "markdown"
+          ? renderFleetMorningBrief([brief], [buildNodeTelemetrySnapshot(dbPath, { ...ids, nowMs: brief.collectedAtMs })]).trimEnd()
+          : JSON.stringify(brief, null, 2));
+      });
+    root.command("fleet-commons").description("Cached Fleet Commons entries (read-only); --sync pulls the feed into search now")
+      .option("--agent <id>", "Agent id", "main")
+      .option("--sync", "Sync the configured feed into this agent's cache and unblock-fleet collection", false)
+      .action(async (opts: { agent: string; sync?: boolean }) => {
+        const dbPath = knownAgent(cfg, opts.agent);
+        const enabled = options.pluginConfig?.fleetCommons.enabled ?? false;
+        if (opts.sync) {
+          if (!enabled) { console.log(JSON.stringify({ status: "disabled" })); process.exitCode = 1; return; }
+          await withCliManager(opts.agent, () => true, async manager => {
+            if (!manager?.syncFleetCommons) {
+              console.log(JSON.stringify({ status: "unavailable", reason: "memory index unavailable for this agent" }));
+              process.exitCode = 1;
+              return;
+            }
+            console.log(JSON.stringify(await manager.syncFleetCommons(), null, 2));
+          });
+          return;
+        }
+        // Each reader opens an existing file read-only and never creates or migrates anything.
+        console.log(JSON.stringify({
+          agentId: opts.agent, enabled, summary: summarizeFleetCommons(dbPath), entries: readFleetCommonsEntries(dbPath),
+        }, null, 2));
+      });
     root.command("requeue").description("Explicitly re-drive one quarantined or completed work item")
       .requiredOption("--scope <scope>", "Exact work scope")
-      .option("--kind <kind>", "Work kind (e.g. people_shadow, people_interactions, captains_log, outcome_ledger, expectations, memory_crystals, overnight_thinking)", PEOPLE_SHADOW_KIND)
+      .option("--kind <kind>", `Work kind (e.g. people_shadow, people_interactions, captains_log, outcome_ledger, expectations, memory_crystals, overnight_thinking, ${SKILLS_WORK_KIND})`, PEOPLE_SHADOW_KIND)
       .option("--agent <id>", "Agent id", "main")
       .action((opts: { agent: string; kind: string; scope: string }) => {
         const dbPath = knownAgent(cfg, opts.agent);
@@ -833,5 +1102,5 @@ function registerStewardCli(
           console.log(JSON.stringify({ status: "requeued", item: store.get(opts.kind, opts.scope) }, null, 2));
         });
       });
-  }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report, Captain's Log, outcomes, blockers, expectations, crystals and overnight thinking", hasSubcommands: true }] });
+  }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report, Captain's Log, outcomes, blockers, expectations, crystals, overnight thinking, skill proposals and fleet telemetry", hasSubcommands: true }] });
 }

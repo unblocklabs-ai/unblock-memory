@@ -1,4 +1,5 @@
 import type { ExtractionConfig } from "./extraction-config.js";
+import { type FleetCommonsConfig, type FleetCommonsSyncResult } from "./fleet-commons.js";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { type AnalysisRunner, type MemoryAnalysisSummary, type MemoryClusterDetail, type MemoryClusterList, type MemoryClusterSort, type MemoryReclusterOptions } from "./analysis.js";
 import type { CorpusMemorySearchResult, CorpusSearchOptions, MemoryEmbeddingProbeResult, MemoryProviderStatus, MemoryReadCursor, MemoryReadResult, MemoryRequestContext, MemorySearchManagerContract, MemorySyncParams } from "./contracts.js";
@@ -68,17 +69,17 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
                 [k: string]: {
                     calls: number;
                     outcomes: {
-                        cancelled?: number | undefined;
-                        ok?: number | undefined;
-                        skipped?: number | undefined;
                         partial?: number | undefined;
+                        ok?: number | undefined;
                         empty?: number | undefined;
-                        failed?: number | undefined;
-                        timed_out?: number | undefined;
                         degraded?: number | undefined;
+                        timed_out?: number | undefined;
+                        cancelled?: number | undefined;
+                        skipped?: number | undefined;
+                        failed?: number | undefined;
                     };
                     slowestRecent: {
-                        outcome: "cancelled" | "ok" | "skipped" | "partial" | "empty" | "failed" | "timed_out" | "degraded";
+                        outcome: "partial" | "ok" | "empty" | "degraded" | "timed_out" | "cancelled" | "skipped" | "failed";
                         setupMs?: number | undefined;
                         queueWaitMs?: number | undefined;
                         metadataMs?: number | undefined;
@@ -129,6 +130,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         dbPath: string;
         curationPath?: string;
         extraction?: ExtractionConfig;
+        fleetCommons?: FleetCommonsConfig;
         workspaceDir: string;
         sources: readonly ResolvedSource[];
         storeFactory?: () => Promise<ManagerStore>;
@@ -146,6 +148,12 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
      */
     getCollectionGenerations(corpora?: readonly string[]): Promise<Record<string, number>>;
     syncExtracted(): Promise<void>;
+    /**
+     * Pull the Fleet Commons feed into SQLite (authoritative) and its projected QMD collection. The HTTP fetch and
+     * validation run outside `#operationChain`; only the SQLite replace and QMD projection queue behind indexing like every
+     * other write. `disabled` when `fleetCommons.enabled` is false.
+     */
+    syncFleetCommons(signal?: AbortSignal): Promise<FleetCommonsSyncResult>;
     sync(params?: MemorySyncParams): Promise<void>;
     syncSessions(force?: boolean, onPhase?: (phase: "projecting" | "indexing") => void, options?: {
         persist?: (manifest: SessionManifest) => void;
@@ -266,7 +274,7 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         after?: QualityCursor;
         signal: AbortSignal;
     }): Promise<{
-        status: "ok" | "partial";
+        status: "partial" | "ok";
         done: boolean;
         next: QualityCursor | undefined;
         scanned: number;

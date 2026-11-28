@@ -1,6 +1,7 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import type { CorpusConfig } from "./config.js";
 import type { ExtractionConfig } from "./extraction-config.js";
+import type { FleetCommonsConfig, FleetCommonsSyncResult } from "./fleet-commons.js";
 import type { MemoryPluginRuntimeContract } from "./contracts.js";
 import { QmdMemoryManager, type ManagerSessionConfig, type SkillCatalogEntry } from "./manager.js";
 import { type SessionSyncResult } from "./session-sync.js";
@@ -30,8 +31,27 @@ export type SessionSyncStartResult = {
     status: "unavailable";
     error: string;
 };
+type FleetCommonsScheduleHooks = {
+    onError: (error: unknown) => void;
+    /** Receives one warning per sync that rejected feed entries (sanitized ids and fixed reasons only). */
+    onRejected?: (message: string) => void;
+    /** Gateway lifetime signal: aborting it stops the schedule and in-flight requests. */
+    signal?: AbortSignal;
+};
 export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     #private;
+    /**
+     * Periodic Fleet Commons sync (only when `fleetCommons.enabled`): every `syncIntervalMinutes`, each already-open agent
+     * manager pulls the feed into its own cache and projected collection; unused agents are never cold-started. A run still
+     * in flight skips the next tick. `close()` or the gateway `signal` stops the timer and aborts in-flight requests.
+     */
+    startFleetCommonsSchedule(onError: (error: unknown) => void, options?: Omit<FleetCommonsScheduleHooks, "onError">): void;
+    stopFleetCommonsSchedule(): void;
+    /** One Fleet Commons sync for one agent; `disabled` without touching the index when `fleetCommons.enabled` is false. */
+    syncFleetCommons(params: {
+        cfg: OpenClawConfig;
+        agentId: string;
+    }, signal?: AbortSignal): Promise<FleetCommonsSyncResult>;
     startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void;
     stopSessionSyncSchedule(): void;
     constructor(corpora: readonly CorpusConfig[], options?: {
@@ -39,6 +59,7 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         keepEmbeddingModelWarm?: boolean;
         stateRoot?: string;
         extraction?: ExtractionConfig;
+        fleetCommons?: FleetCommonsConfig;
         syntheticInput?: ManagerSessionConfig["syntheticInput"];
         recallLedgerEnabled?: boolean;
         onError?: (error: unknown) => void;
@@ -83,3 +104,4 @@ export declare class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
         agentId: string;
     }, path: string): string | undefined;
 }
+export {};

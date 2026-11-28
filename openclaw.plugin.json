@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.22.1",
+  "version": "0.23.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -244,6 +244,18 @@
     "expectationsWhisperer.enabled": {
       "label": "Expectations Whisperer",
       "help": "Append open commitments, blockers and todos (from Captain's Log, people todos and Steward session extraction) that match the turn's channel, person, keywords or due window. Read-only local lookup, no model call. Enabled by default."
+    },
+    "steward.skills.enabled": {
+      "label": "Self-Writing Skills",
+      "help": "Review-only skill proposals (description updates, pitfall patches, new skills) in skill_proposals. Nothing touches a live SKILL.md until an operator runs `openclaw memory-steward skill-review <id> --approve` and `skill-apply <id>`."
+    },
+    "fleetCommons.enabled": {
+      "label": "Fleet Commons",
+      "help": "Search a sanitized fleet-wide Commons feed as the \"fleet\" corpus. Requires fleetCommons.endpoint or fleetCommons.feedPath."
+    },
+    "fleetCommons.apiKey": {
+      "label": "Fleet Commons API Key",
+      "sensitive": true
     }
   },
   "configSchema": {
@@ -332,6 +344,87 @@
             "type": "number",
             "minimum": 0,
             "maximum": 1
+          }
+        }
+      },
+      "fleetCommons": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Fleet Commons: a sanitized, fleet-wide feed of tool pitfalls, API workarounds, platform outages and procedures, re-validated locally (secrets, emails, phone numbers, Slack IDs, local paths, client identifiers), cached in SQLite and projected into QMD as the searchable \"fleet\" corpus (collection unblock-fleet). Off by default; enabling requires endpoint or feedPath. Inspect or sync with `openclaw memory-steward fleet-commons [--sync]`.",
+        "if": {
+          "properties": {
+            "enabled": {
+              "const": true
+            }
+          },
+          "required": [
+            "enabled"
+          ]
+        },
+        "then": {
+          "anyOf": [
+            {
+              "required": [
+                "endpoint"
+              ]
+            },
+            {
+              "required": [
+                "feedPath"
+              ]
+            }
+          ]
+        },
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "endpoint": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^\\s@/?#]+(?:[/?#]\\S*)?$",
+            "description": "HTTP(S) feed URL (no embedded credentials; `@` is allowed in the path) returning {\"entries\": [...]}, e.g. the Fleet Organism hub's /api/v1/commons. ETag-cached."
+          },
+          "feedPath": {
+            "type": "string",
+            "pattern": "^/",
+            "description": "Absolute path to a local JSON feed file (used instead of endpoint)."
+          },
+          "apiKey": {
+            "type": "string",
+            "pattern": "^[\\x21-\\x7e]+$",
+            "description": "Bearer token for endpoint."
+          },
+          "apiKeyFile": {
+            "type": "string",
+            "pattern": "^/",
+            "description": "Absolute path to a file holding the bearer token for endpoint."
+          },
+          "syncIntervalMinutes": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Background sync interval while the gateway runs. Default 15."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483647,
+            "description": "Feed read/request timeout. Default 10000."
+          },
+          "maxEntries": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Entries kept after validation, most severe then most recently updated first. Default 0 = unlimited."
+          },
+          "maxFeedBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Feed bytes read (streamed) before JSON parsing; a larger feed fails the sync and keeps the last good cache. Default 5242880 (5 MiB); 0 = unlimited."
+          },
+          "allowExpired": {
+            "type": "boolean",
+            "description": "Keep and serve entries past their expiresAt. Default false."
           }
         }
       },
@@ -848,7 +941,7 @@
               "pattern": "\\S"
             },
             "default": [],
-            "description": "Explicit known non-skill corpus names (required when enabled). \"extracted\" is allowed only when extraction.enabled and extraction.publish are both true."
+            "description": "Explicit known non-skill corpus names (required when enabled). \"extracted\" is allowed only when extraction.enabled and extraction.publish are both true; \"fleet\" only when fleetCommons.enabled is true."
           },
           "minUsefulness": {
             "type": "number",
@@ -1983,6 +2076,192 @@
               "quietHoursEndHour": [
                 "quietHoursStartHour"
               ]
+            }
+          },
+          "skills": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Self-writing skills (review-only): replay-validated routing description updates, grounded ## Pitfalls patches from hurt outcomes and post-mortems, and new SKILL.md drafts mined from procedural memory crystals. Every draft is a pending row in skill_proposals; the Steward never writes a live SKILL.md. Review with `openclaw memory-steward skills`, `skill-review <id> --approve|--reject` and `skill-apply <id>`, which writes only inside configured skills corpus roots. Needs the Steward model and a skills corpus; description replay also needs decisionModel. Enabled by default.",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "intervalMinutes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Default 1440 (daily)."
+              },
+              "lookbackDays": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "History window for routing, opens, outcomes and post-mortems. Default 30; 0 = unlimited."
+              },
+              "enableDescriptionOptimizer": {
+                "type": "boolean",
+                "description": "Propose routing descriptions that beat the live one on a replay of real prompts through the production skill router. Default true."
+              },
+              "enablePitfallPatches": {
+                "type": "boolean",
+                "description": "Propose grounded ## Pitfalls bullets from hurt skill outcomes. Default true."
+              },
+              "enableNewSkills": {
+                "type": "boolean",
+                "description": "Draft new skills from procedural crystals no catalog skill covers. Default true."
+              },
+              "minSamplesPerSkill": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Labelled replay samples a skill needs before its description is optimized. Default 5."
+              },
+              "minRecallGainPp": {
+                "type": "number",
+                "minimum": -100,
+                "maximum": 100,
+                "description": "Replay gate: minimum recall gain in percentage points. Default 3."
+              },
+              "maxFalseActivationPp": {
+                "type": "number",
+                "minimum": -100,
+                "maximum": 100,
+                "description": "Replay gate: maximum false-activation increase in percentage points. Default 1."
+              },
+              "maxCriticalRegressions": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Replay gate: previously-routed positives the candidate may lose. Default 0."
+              },
+              "minPositivesEvaluated": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Successfully replayed positives a candidate needs before the recall gate can pass; fewer makes the replay indeterminate instead of vacuously passing. Default 1; 0 = no minimum."
+              },
+              "minNegativesEvaluated": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Successfully replayed negatives a candidate needs before the false-activation gate can pass; fewer makes the replay indeterminate. Default 1; 0 = no minimum."
+              },
+              "maxReplayFailureRate": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Share of replay examples whose scorer judgment may fail before the replay is indeterminate (a scorer outage is retried on the next pass, never recorded as attempted). Default 0.25; 1 = tolerate any."
+              },
+              "maxDescriptionsPerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Description model calls per pass. Default 3; 0 = unlimited."
+              },
+              "maxPitfallsPerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Pitfall model calls per pass. Default 3; 0 = unlimited."
+              },
+              "maxNewSkillsPerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "New-skill model calls per pass. Default 2; 0 = unlimited."
+              },
+              "maxReplayExamples": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Positive + negative prompts replayed per candidate. Default 40; 0 = unlimited."
+              },
+              "replayConcurrency": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Concurrent replay judgments. Default 4; 0 = all at once."
+              },
+              "replayTimeoutMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Per replay judgment. Default 0 = the decision model's unbounded default."
+              },
+              "replayMinUsefulness": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Replay activation threshold. Defaults to the production Skill Whisperer threshold."
+              },
+              "minPitfallEvidence": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Hurt outcomes + post-mortems a skill needs before a pitfall patch is drafted. Default 2."
+              },
+              "maxEvidencePerSkill": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Evidence items sent per skill. Default 12; 0 = unlimited."
+              },
+              "maxEvidenceChars": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Characters per evidence item or example prompt. Default 1200; 0 = unlimited."
+              },
+              "maxSkillBodyChars": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Characters of the live SKILL.md sent to the model. Default 8000; 0 = unlimited."
+              },
+              "maxDescriptionChars": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Characters of a proposed description. Default 0 = unlimited."
+              },
+              "allowedCorpora": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "\\S"
+                },
+                "uniqueItems": true,
+                "description": "Crystal corpora allowed into new-skill mining; every corpus a crystal cites must be listed. Default [\"memory\", \"knowledge\"]; add \"sessions\" / \"extracted\" to opt in."
+              },
+              "allowedAudiences": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "\\S"
+                },
+                "uniqueItems": true,
+                "description": "Crystal audiences allowed into new-skill mining. Default [\"workspace\"]; \"*\" = any audience."
+              },
+              "allowedChatTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "workspace",
+                    "channel",
+                    "group",
+                    "direct",
+                    "unknown"
+                  ]
+                },
+                "uniqueItems": true,
+                "description": "recall_queries chat types whose prompts may be replayed or quoted to the model. Default [\"workspace\", \"channel\"]; \"unknown\" covers rows recorded without one."
+              },
+              "newSkillMinHits": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "An STM crystal qualifies for new-skill mining with at least this many hits (LTM always qualifies). Default 3."
+              },
+              "newSkillMinBrightness": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "...or at least this brightness. Default 0.75."
+              },
+              "coverageMinOverlap": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Token overlap at which an existing skill already covers a crystal's theme. Default 0.5."
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Per model call; 0 = unlimited (the pass signal still aborts)."
+              }
             }
           }
         },

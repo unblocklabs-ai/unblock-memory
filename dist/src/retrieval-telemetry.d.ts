@@ -17,14 +17,14 @@ export declare class RetrievalTelemetry {
             [k: string]: {
                 calls: number;
                 outcomes: {
-                    cancelled?: number | undefined;
-                    ok?: number | undefined;
-                    skipped?: number | undefined;
                     partial?: number | undefined;
+                    ok?: number | undefined;
                     empty?: number | undefined;
-                    failed?: number | undefined;
-                    timed_out?: number | undefined;
                     degraded?: number | undefined;
+                    timed_out?: number | undefined;
+                    cancelled?: number | undefined;
+                    skipped?: number | undefined;
+                    failed?: number | undefined;
                 };
                 slowestRecent: {
                     outcome: RetrievalOutcome;

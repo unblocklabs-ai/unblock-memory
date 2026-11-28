@@ -654,6 +654,7 @@ export function registerUnblockMemory(api) {
         analysisExecutable: config.analysis.executable,
         keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
         extraction: config.extraction,
+        fleetCommons: config.fleetCommons,
         syntheticInput: config.syntheticInput,
         recallLedgerEnabled: config.recallLedger.enabled,
     });
@@ -673,6 +674,15 @@ export function registerUnblockMemory(api) {
     if (config.corpora.some((corpus) => corpus.kind === "sessions" && corpus.syncIntervalMinutes > 0)) {
         api.on("gateway_start", () => runtime.startSessionSyncSchedule(api.config, (error) => {
             api.logger.warn(`unblock-memory scheduled session sync could not start: ${String(error)}`);
+        }));
+    }
+    if (config.fleetCommons.enabled) {
+        // Each tick pulls the sanitized fleet feed into every open agent's cache and projected `unblock-fleet` collection.
+        api.on("gateway_start", (_event, ctx) => runtime.startFleetCommonsSchedule((error) => {
+            api.logger.warn(`unblock-memory fleet commons sync failed: ${String(error)}`);
+        }, {
+            onRejected: (message) => api.logger.warn(message),
+            ...(ctx?.abortSignal ? { signal: ctx.abortSignal } : {}),
         }));
     }
     let peopleWhisperer;
@@ -778,6 +788,16 @@ export function registerUnblockMemory(api) {
         getMemorySearchManager: params => runtime.getMemorySearchManager(params),
         analysisExecutable: Boolean(config.analysis.executable),
         release: agentId => runtime.closeMemorySearchManager({ agentId }),
+        // Canonical paths only (what skill_open_events / memory_outcomes record), first entry per canonical file.
+        skillCatalog: async (params) => {
+            const canonical = new Map();
+            for (const entry of await runtime.listSkills(params)) {
+                const path = runtime.resolveSkillPath(params, entry.path);
+                if (path && !canonical.has(path))
+                    canonical.set(path, { ...entry, path });
+            }
+            return [...canonical.values()];
+        },
     };
     if (config.steward.enabled && config.steward.deepThought.enabled) {
         const deepThought = {

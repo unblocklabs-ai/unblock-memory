@@ -53,7 +53,7 @@ type CheckpointResult = {
 } & CoverageResult;
 export declare function manifestRevision(manifest: ReviewManifest): string;
 export declare function verifyLearningCoverage(manifest: ReviewManifest, receipt: LearningReceipt, now?: number): {
-    status: "partial" | "complete" | "invalid";
+    status: "complete" | "partial" | "invalid";
     expectedPeople: number;
     expectedSessions: number;
     expectedAssertions: number;
@@ -85,17 +85,17 @@ export declare class PeopleLearningStore {
                 changeId: string;
             }[];
             peopleReviews: {
-                personId: string;
                 status: "reviewed" | "no_interactions" | "unresolved";
                 reason: string;
+                personId: string;
                 reviewedAt: string;
                 sessionIds: string[];
                 sourceRefs: string[];
             }[];
             assertionReviews: {
                 correctionsCheckedAt?: string | undefined;
-                reason: string;
                 disposition: "retired" | "unresolved" | "revalidated" | "corrected";
+                reason: string;
                 reviewedAt: string;
                 sourceRefs: string[];
                 assertionId: string;
@@ -127,17 +127,17 @@ export declare class PeopleLearningStore {
                 changeId: string;
             }[];
             peopleReviews: {
-                personId: string;
                 status: "reviewed" | "no_interactions" | "unresolved";
                 reason: string;
+                personId: string;
                 reviewedAt: string;
                 sessionIds: string[];
                 sourceRefs: string[];
             }[];
             assertionReviews: {
                 correctionsCheckedAt?: string | undefined;
-                reason: string;
                 disposition: "retired" | "unresolved" | "revalidated" | "corrected";
+                reason: string;
                 reviewedAt: string;
                 sourceRefs: string[];
                 assertionId: string;

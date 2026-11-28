@@ -749,3 +749,82 @@ test("steward.crystals and steward.overnight are on by default; host manifest an
     assert.throws(() => resolveConfig(invalid), /steward/, JSON.stringify(invalid));
   }
 });
+
+test("steward.skills is on by default (review-only), mirrors SKILLS_DEFAULTS, and host manifest and runtime resolver agree", async () => {
+  const { SKILLS_DEFAULTS } = await import("../src/steward-skills.js");
+  const validate = await manifestValidator("unblock-memory:test:steward-skills");
+  const host = validate({});
+  assert.equal(host.ok, true);
+  const skills = resolveConfig(host.value).steward.skills;
+  assert.deepEqual(skills, { enabled: true, ...SKILLS_DEFAULTS, allowedCorpora: ["memory", "knowledge"], allowedAudiences: ["workspace"],
+    allowedChatTypes: ["workspace", "channel"] });
+  const tuned = { steward: { skills: {
+    enabled: false, intervalMinutes: 60, lookbackDays: 0, enableDescriptionOptimizer: false, enablePitfallPatches: false,
+    enableNewSkills: false, minSamplesPerSkill: 0, minRecallGainPp: -5, maxFalseActivationPp: 0, maxCriticalRegressions: 2,
+    minPositivesEvaluated: 0, minNegativesEvaluated: 0, maxReplayFailureRate: 1, maxDescriptionsPerRun: 0, maxPitfallsPerRun: 0, maxNewSkillsPerRun: 0, maxReplayExamples: 0, replayConcurrency: 0,
+    replayTimeoutMs: 5000, replayMinUsefulness: 0.5, minPitfallEvidence: 1, maxEvidencePerSkill: 0, maxEvidenceChars: 0,
+    maxSkillBodyChars: 0, maxDescriptionChars: 300, allowedCorpora: ["memory", "sessions", "extracted"], allowedAudiences: ["*"],
+    allowedChatTypes: ["workspace", "channel", "group", "direct", "unknown"], newSkillMinHits: 0, newSkillMinBrightness: 0,
+    coverageMinOverlap: 1, timeoutMs: 1,
+  } } };
+  const hosted = validate(tuned);
+  assert.equal(hosted.ok, true, JSON.stringify(hosted.errors));
+  assert.deepEqual(resolveConfig(hosted.value).steward.skills, tuned.steward.skills, "explicit 0 = unlimited values are preserved");
+  for (const invalid of [
+    { extra: true }, { enabled: "true" }, { intervalMinutes: 0 }, { lookbackDays: -1 }, { enableNewSkills: 1 },
+    { minRecallGainPp: 101 }, { maxFalseActivationPp: -101 }, { maxDescriptionsPerRun: 1.5 }, { replayConcurrency: -1 },
+    { replayMinUsefulness: 1.1 }, { minPitfallEvidence: 0 }, { allowedCorpora: "memory" }, { allowedCorpora: [""] },
+    { allowedAudiences: [""] }, { allowedChatTypes: ["dm"] }, { newSkillMinBrightness: 2 }, { coverageMinOverlap: -0.1 },
+    { timeoutMs: -1 }, { minPositivesEvaluated: -1 }, { minNegativesEvaluated: 0.5 }, { maxReplayFailureRate: 1.5 },
+    { maxReplayFailureRate: -0.1 },
+  ]) {
+    const config = { steward: { skills: invalid } };
+    assert.equal(validate(config).ok, false, JSON.stringify(invalid));
+    assert.throws(() => resolveConfig(config), /steward/u, JSON.stringify(invalid));
+  }
+});
+
+test("fleetCommons is off by default; enabling it admits \"fleet\" in memoryWhisperer.corpora and reserves the corpus name", async () => {
+  const validate = await manifestValidator("unblock-memory:test:fleet-commons");
+  const host = validate({});
+  assert.equal(host.ok, true);
+  assert.deepEqual(resolveConfig(host.value).fleetCommons,
+    { enabled: false, syncIntervalMinutes: 15, timeoutMs: 10_000, maxEntries: 0, maxFeedBytes: 5 * 1024 * 1024, allowExpired: false });
+  const enabled = {
+    fleetCommons: { enabled: true, endpoint: "https://fleet.example.test/api/v1/commons", apiKeyFile: "/etc/fleet-token",
+      syncIntervalMinutes: 0.5, timeoutMs: 2000, maxEntries: 50, maxFeedBytes: 0, allowExpired: true },
+    memoryWhisperer: { enabled: true, corpora: ["memory", "fleet"] },
+  };
+  const hosted = validate(enabled);
+  assert.equal(hosted.ok, true, JSON.stringify(hosted.errors));
+  const resolved = resolveConfig(hosted.value);
+  assert.deepEqual(resolved.fleetCommons, enabled.fleetCommons);
+  assert.deepEqual(resolved.memoryWhisperer.corpora, ["memory", "fleet"]);
+  assert.deepEqual(resolveConfig({ fleetCommons: { enabled: true, feedPath: "/srv/fleet/feed.json" } }).fleetCommons.feedPath,
+    "/srv/fleet/feed.json");
+  // "fleet" is only a whisperer corpus while the feed is enabled (parallel to published "extracted").
+  assert.throws(() => resolveConfig({ memoryWhisperer: { enabled: true, corpora: ["memory", "fleet"] } }),
+    /may list "fleet" only when fleetCommons\.enabled/u);
+  assert.throws(() => resolveConfig({ fleetCommons: { enabled: false, feedPath: "/srv/feed.json" },
+    memoryWhisperer: { enabled: true, corpora: ["fleet"] } }), /fleetCommons\.enabled/u);
+  assert.throws(() => resolveConfig({ fleetCommons: { enabled: true, feedPath: "/srv/feed.json" },
+    corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "fleet", kind: "files", paths: ["fleet"] }] }),
+  /reserves the derived corpus name fleet/u);
+  for (const invalid of [
+    { enabled: true }, { enabled: "yes" }, { extra: true }, { endpoint: "ftp://fleet.example.test" },
+    { endpoint: "https://user:pass@fleet.example.test" }, { feedPath: "relative/feed.json" }, { apiKeyFile: "token" },
+    { syncIntervalMinutes: 0 }, { timeoutMs: 0 }, { timeoutMs: 2 ** 31 }, { maxEntries: -1 }, { allowExpired: 1 },
+    { maxFeedBytes: -1 }, { endpoint: "https://user@fleet.example.test/commons" }, { endpoint: "https://fleet.example.test/a b" },
+    { enabled: true, apiKeyFile: "/etc/fleet-token" },
+  ]) {
+    // Host schema and resolver agree, including "enabled requires endpoint or feedPath".
+    assert.throws(() => resolveConfig({ fleetCommons: invalid }), /unblock-memory .*fleetCommons/u, JSON.stringify(invalid));
+    assert.equal(validate({ fleetCommons: invalid }).ok, false, JSON.stringify(invalid));
+  }
+  // `@` is allowed in the endpoint path (never in the authority) by both.
+  for (const endpoint of ["https://fleet.example.test/@team/commons", "https://fleet.example.test/commons?scope=@ops"]) {
+    const config = { fleetCommons: { enabled: true, endpoint } };
+    assert.equal(validate(config).ok, true, endpoint);
+    assert.equal(resolveConfig(config).fleetCommons.endpoint, endpoint);
+  }
+});

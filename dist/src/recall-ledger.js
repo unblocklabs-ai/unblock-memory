@@ -134,6 +134,7 @@ CREATE INDEX IF NOT EXISTS idx_recall_queries_time ON recall_queries (created_at
 CREATE INDEX IF NOT EXISTS idx_recall_queries_agent_time ON recall_queries (agent_id, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_recall_queries_origin ON recall_queries (agent_id, provider, account_id, sender_id, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_recall_queries_parent ON recall_queries (parent_query_id) WHERE parent_query_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS recall_queries_agent_run ON recall_queries (agent_id, run_id, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_recall_hits_leaf_time ON recall_hits (raw_leaf_id, hit_at_ms);
 CREATE INDEX IF NOT EXISTS idx_recall_hits_doc_time ON recall_hits (doc_hash, hit_at_ms) WHERE doc_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_recall_hits_session_time ON recall_hits (target_session_id, hit_at_ms) WHERE target_session_id IS NOT NULL;
@@ -182,6 +183,8 @@ const ADDITIVE_COLUMNS = {
     recall_queries: { input_tokens: "INTEGER", output_tokens: "INTEGER", recipe_hash: RECIPE_HASH_TYPE, input_family: "TEXT" },
     skill_routing_events: { recipe_hash: RECIPE_HASH_TYPE },
 };
+/** Indexes added after v1 shipped: an existing v1 database gains them on its next open (all `IF NOT EXISTS`). */
+const ADDITIVE_INDEXES = ["recall_queries_agent_run"];
 /** Pre-release Phase B builds stamped 2 for the same additive layout; heal those back to 1 for rollback safety. */
 const PRE_RELEASE_VERSION = 2;
 function ensureRecallLedgerSchema(db) {
@@ -190,8 +193,9 @@ function ensureRecallLedgerSchema(db) {
         const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
         return Object.entries(definitions).flatMap(([name, type]) => columns.has(name) ? [] : [`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`]);
     });
+    const indexExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?");
     const complete = () => ADDITIVE_TABLES.every(table => tableExists(db, table)) &&
-        pendingColumns().length === 0;
+        pendingColumns().length === 0 && ADDITIVE_INDEXES.every(name => indexExists.get(name) !== undefined);
     // Fast path avoids the write lock on every open.
     if (version.get()?.version === RECALL_LEDGER_SCHEMA_VERSION && complete())
         return;

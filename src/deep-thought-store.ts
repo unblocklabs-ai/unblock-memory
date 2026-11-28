@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { fleetCitationsActive } from "./fleet-commons.js";
 import { ensureSchemaUnderWriteLock, immediateTransaction, openMemoryDatabase } from "./memory-database.js";
 
 // Loaded by plain-Node workers and offline tools (Voltaire Drift, whisper prefetch): keep this module free of `openclaw`.
@@ -361,8 +362,11 @@ function nonNegativeInteger(value: number | undefined, fallback: number, field: 
  * are all allowed. Exact normalized-question hash → score 1; otherwise score = |shared| / |stored question tokens|
  * (capped below 1), kept when it reaches `minTokenOverlap` with at least `minSharedTokens` shared tokens.
  * Sorted by score desc, then newest first. Unlimited: callers apply `maxResults` after verification.
+ * Rows citing a Fleet Commons entry that has since expired or been retired are never candidates; their ids are pushed to
+ * `stale` (when given) so writable callers can invalidate them.
  */
-function scoreCandidates(db: DatabaseSync, query: DerivedObservationMatchQuery): DerivedObservationMatch[] {
+function scoreCandidates(db: DatabaseSync, query: DerivedObservationMatchQuery, nowMs: number,
+  stale?: string[]): DerivedObservationMatch[] {
   requireText(query.agentId, "agentId"); requireText(query.audienceKey, "audienceKey");
   const minOverlap = boundedOverlap(query.minTokenOverlap, DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP, "minTokenOverlap");
   const minShared = Math.max(1, nonNegativeInteger(query.minSharedTokens, DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS, "minSharedTokens"));
@@ -379,6 +383,7 @@ function scoreCandidates(db: DatabaseSync, query: DerivedObservationMatchQuery):
     try { found = observation(row); } catch { continue; }
     if (found.audienceKey !== query.audienceKey || found.agentId !== query.agentId) continue;
     if (!Array.isArray(found.corpora) || !found.corpora.length || !found.corpora.every(corpus => allowed.has(corpus))) continue;
+    if (!citedFleetActive(db, found, nowMs)) { stale?.push(found.id); continue; }
     if (found.questionHash === queryHash) {
       matches.push({ observation: found, score: 1, kind: "exact", sharedTokens: queryTokens.size });
       continue;
@@ -393,6 +398,12 @@ function scoreCandidates(db: DatabaseSync, query: DerivedObservationMatchQuery):
     matches.push({ observation: found, score, kind: "overlap", sharedTokens: shared });
   }
   return matches.sort((a, b) => b.score - a.score || b.observation.createdAt - a.observation.createdAt);
+}
+
+/** Fleet Commons expiry never moves a collection generation, so a synthesis citing a lapsed entry is checked directly. */
+function citedFleetActive(db: DatabaseSync, found: DerivedObservation, nowMs: number): boolean {
+  return !Array.isArray(found.citations) ||
+    fleetCitationsActive(db, found.citations.flatMap(citation => typeof citation?.source === "string" ? [citation.source] : []), nowMs);
 }
 
 function limited<T>(items: T[], maxResults: number | undefined): T[] {
@@ -420,10 +431,11 @@ function openReadOnly(dbPath: string): DatabaseSync | undefined {
  * Read-only candidate lookup (ACL + deterministic scoring, no freshness check) against an existing database file.
  * Returns `[]` — never throws for a missing database or table — so callers on the hot path can probe cheaply.
  */
-export function readDerivedObservationCandidates(dbPath: string, query: DerivedObservationMatchQuery): DerivedObservationMatch[] {
+export function readDerivedObservationCandidates(dbPath: string, query: DerivedObservationMatchQuery,
+  nowMs = Date.now()): DerivedObservationMatch[] {
   const db = openReadOnly(dbPath);
   if (!db) return [];
-  try { return scoreCandidates(db, query); }
+  try { return scoreCandidates(db, query, nowMs); }
   finally { db.close(); }
 }
 
@@ -434,7 +446,7 @@ export function readDerivedObservationCandidates(dbPath: string, query: DerivedO
 export function findMatchingDerivedObservationsReadOnly(dbPath: string,
   params: FindMatchingDerivedObservationsParams): DerivedObservationMatch[] {
   if (isEmptyGenerations(params.currentGenerations)) return [];
-  const candidates = readDerivedObservationCandidates(dbPath, params);
+  const candidates = readDerivedObservationCandidates(dbPath, params, params.nowMs);
   const allowedKey = JSON.stringify(canonicalCorpora(params.allowedCorpora));
   return limited(candidates.filter(match => verifyAgainst(match.observation, params.currentGenerations, allowedKey) === "fresh"),
     params.maxResults);
@@ -631,8 +643,8 @@ export class DeepThoughtStore {
 
   /**
    * Exact-key lookup of the `fresh` observation. Hits (and counts the hit) only when `currentGenerations` records exactly
-   * the same collections at exactly the same generations; otherwise the row is marked `stale` and `undefined` is returned.
-   * An empty `currentGenerations` cannot verify anything: it misses without invalidating.
+   * the same collections at exactly the same generations and every cited Fleet Commons entry is still active; otherwise the
+   * row is marked `stale` and `undefined` is returned. An empty `currentGenerations` cannot verify anything: it misses without invalidating.
    */
   findFreshDerivedObservation(input: DerivedObservationKey & {
     currentGenerations: Readonly<Record<string, number>>; nowMs?: number;
@@ -647,7 +659,7 @@ export class DeepThoughtStore {
         ORDER BY created_at DESC LIMIT 1`).get(input.agentId, questionHash, input.audienceKey, corpora);
       if (!row) return undefined;
       const found = observation(row);
-      if (!generationsMatch(found.collectionGenerations, input.currentGenerations)) {
+      if (!generationsMatch(found.collectionGenerations, input.currentGenerations) || !citedFleetActive(this.db, found, now)) {
         this.db.prepare("UPDATE derived_observations SET status='stale', invalidated_at=? WHERE id=? AND status='fresh'").run(now, found.id);
         return undefined;
       }
@@ -665,10 +677,10 @@ export class DeepThoughtStore {
   findMatchingDerivedObservations(params: FindMatchingDerivedObservationsParams): DerivedObservationMatch[] {
     if (isEmptyGenerations(params.currentGenerations)) return [];
     const now = params.nowMs ?? Date.now();
-    const candidates = scoreCandidates(this.db, params);
+    const stale: string[] = [];
+    const candidates = scoreCandidates(this.db, params, now, stale);
     const allowedKey = JSON.stringify(canonicalCorpora(params.allowedCorpora));
     const fresh: DerivedObservationMatch[] = [];
-    const stale: string[] = [];
     for (const match of candidates) {
       const verdict = verifyAgainst(match.observation, params.currentGenerations, allowedKey);
       if (verdict === "fresh") fresh.push(match);

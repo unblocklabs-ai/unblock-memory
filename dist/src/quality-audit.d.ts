@@ -23,7 +23,7 @@ export declare function auditQualityPage(params: {
     signal: AbortSignal;
     isActive: () => boolean;
 }): Promise<{
-    status: "ok" | "partial";
+    status: "partial" | "ok";
     done: boolean;
     next: QualityCursor | undefined;
     scanned: number;
@@ -44,7 +44,7 @@ export declare function auditQualityPage(params: {
     scope: string;
 } | {
     error: string;
-    status: "ok" | "partial";
+    status: "partial" | "ok";
     done: boolean;
     next: QualityCursor | undefined;
     scanned: number;

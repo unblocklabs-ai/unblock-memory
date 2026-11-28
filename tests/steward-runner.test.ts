@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
+import { DEFAULTS } from "../src/defaults.js";
 import { resolveStewardConfig, resolveStewardCredential } from "../src/steward-config.js";
 import { createStewardRunner, stripOptionalNulls, toStrictJsonSchema, type StewardRunRequest } from "../src/steward-runner.js";
 import { DEEP_THOUGHT_RESULT_SCHEMA } from "../src/deep-thought.js";
@@ -77,6 +78,16 @@ test("config defaults, nested overrides and strict boundaries", () => {
       minRecurrence: 2, lookaheadMinutes: 720, maxVoltairePerRun: 5, maxPostmortemsPerRun: 5, maxPreAnswersPerRun: 3,
       minConfidence: "medium", recallChatTypes: ["channel", "group"], saveDerivedObservations: true, writeDailyLogNotes: true,
       dailyLogChatTypes: ["workspace", "channel"], dailyLogCorpora: ["memory", "knowledge"], timeoutMs: 0,
+    },
+    // Review-only self-writing skills: on by default, pinned explicitly so a default change is a visible test change.
+    skills: {
+      enabled: true, intervalMinutes: 1440, lookbackDays: 30, enableDescriptionOptimizer: true, enablePitfallPatches: true,
+      enableNewSkills: true, minSamplesPerSkill: 5, minRecallGainPp: 3, maxFalseActivationPp: 1, maxCriticalRegressions: 0,
+      minPositivesEvaluated: 1, minNegativesEvaluated: 1, maxReplayFailureRate: 0.25, maxDescriptionsPerRun: 3, maxPitfallsPerRun: 3, maxNewSkillsPerRun: 2, maxReplayExamples: 40, replayConcurrency: 4,
+      replayTimeoutMs: 0, replayMinUsefulness: DEFAULTS.skillWhisperer.minDecisionUsefulness, minPitfallEvidence: 2,
+      maxEvidencePerSkill: 12, maxEvidenceChars: 1200, maxSkillBodyChars: 8000, maxDescriptionChars: 0,
+      allowedCorpora: ["memory", "knowledge"], allowedAudiences: ["workspace"], allowedChatTypes: ["workspace", "channel"],
+      newSkillMinHits: 3, newSkillMinBrightness: 0.75, coverageMinOverlap: 0.5, timeoutMs: 0,
     },
   });
   const overridden = resolveStewardConfig({

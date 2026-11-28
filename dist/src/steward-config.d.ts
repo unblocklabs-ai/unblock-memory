@@ -1,5 +1,6 @@
 import type { ChatType, DecisionModelPluginConfig } from "./config.js";
 import type { ExpectationChatType } from "./expectations-store.js";
+import { SKILLS_DEFAULTS } from "./steward-skills.js";
 declare const efforts: readonly ["off", "minimal", "low", "medium", "high", "xhigh"];
 declare const peopleModes: readonly ["publish", "shadow"];
 declare const confidences: readonly ["high", "medium", "low"];
@@ -218,6 +219,17 @@ type StewardOvernightConfig = {
     /** Per model call and per investigation timeout in ms (`0` = unlimited). */
     timeoutMs: number;
 };
+/**
+ * Self-writing skills (`steward-skills.ts`): replay-validated description updates, grounded pitfall patches and
+ * crystal-mined new skills, all written as `pending` rows in `skill_proposals`. Review-only: the Steward never writes a
+ * live `SKILL.md`; only `memory-steward skill-apply` does, on an operator-approved proposal. Every field mirrors
+ * `SKILLS_DEFAULTS`; `0` = unlimited for caps, budgets and timeouts.
+ */
+type StewardSkillsConfig = {
+    enabled: boolean;
+} & {
+    -readonly [K in keyof typeof SKILLS_DEFAULTS]: (typeof SKILLS_DEFAULTS)[K] extends readonly string[] ? string[] : (typeof SKILLS_DEFAULTS)[K] extends boolean ? boolean : number;
+};
 export type StewardConfig = {
     enabled: boolean;
     model: string;
@@ -233,6 +245,7 @@ export type StewardConfig = {
     expectations: StewardExpectationsConfig;
     crystals: StewardCrystalsConfig;
     overnight: StewardOvernightConfig;
+    skills: StewardSkillsConfig;
 };
 export declare function resolveStewardConfig(value: unknown): StewardConfig;
 /** Bind the runner's resolveApiKey callback to its destination. Never inherit another origin's key. */

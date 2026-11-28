@@ -518,11 +518,14 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
   assert.equal(metadata.hooks.length, 0, "cli-metadata never starts background work");
   const shadowHooks = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }).hooks;
   const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
-    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false } } }).hooks;
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false },
+    skills: { enabled: false } } }).hooks;
   const crystalsOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
-    outcomeLedger: { enabled: false }, expectations: { enabled: false }, overnight: { enabled: false } } }).hooks;
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, overnight: { enabled: false }, skills: { enabled: false } } }).hooks;
   const overnightOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
-    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false } } }).hooks;
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false }, skills: { enabled: false } } }).hooks;
+  const skillsOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false } } }).hooks;
   const ledgerOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
     expectations: { enabled: false } } }).hooks;
   const expectationsOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
@@ -535,6 +538,8 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
     "the default-on Crystals pass alone still starts the background Steward loop");
   assert.equal(overnightOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
     "the default-on Overnight pass alone still starts the background Steward loop");
+  assert.equal(skillsOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
+    "the default-on self-writing Skills pass alone still starts the background Steward loop");
   assert.equal(shadowHooks.filter(name => name === "gateway_start").length, quietHooks.filter(name => name === "gateway_start").length + 1,
     "the background Steward loop adds exactly one gateway_start hook");
 });

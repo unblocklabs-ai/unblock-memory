@@ -33,6 +33,8 @@ settings; a rotated credential file is reread without a restart.
 | Post-Captain's-Log expectations check | Expectations pass + `captainsLogDecisionResolve` + `decisionModel.enabled`; a decision-model credential | Skipped; new blockers are still mirrored right after the append | Warning only; Captain's Log stays appended and items stay open for the regular sweep |
 | Memory Crystals pass | `steward.enabled` + `steward.crystals.enabled`; a QMD index. Synthesis needs a Steward credential and analysis clusters; reclustering needs `analysis.executable` | STM decay and LTM promotion still run (no model); no new crystals | The pass releases its lease and retries next interval; existing crystals are untouched |
 | Overnight Thinking pass | `steward.enabled` + `steward.overnight.enabled`; a Steward credential. Voltaire Drift and pre-answering also need `steward.deepThought.enabled` and a QMD index | Skipped | Per-item failures are listed in `errors`; a failed pass publishes nothing and retries within 15 minutes |
+| Self-writing skills pass | `steward.enabled` + `steward.skills.enabled`; a Steward credential and a `skills` corpus. Description updates also need `decisionModel` for replay | Pitfall patches and new-skill drafts still run; description updates are skipped (`description_update:*:replay_unavailable`) | Isolated failures are listed in `errors`; nothing is proposed for a failed subject, and a live `SKILL.md` is never written |
+| Fleet Commons (`"fleet"` corpus) | `fleetCommons.enabled` + `endpoint` or `feedPath`; a QMD index | Unchanged: search over the cached entries needs no model | A failed sync keeps the last good cache and projection; invalid entries are rejected one by one |
 
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
 one it registers no hook and reports inactive. Expectations Whisperer is on by
@@ -294,6 +296,114 @@ immutable dated observations and never replaces earlier ones. It still forms par
 checkpoint policy fingerprint, so changing it rewinds sessions like any other policy change. Settings are operator-controlled; reload/restart after edits.
 Extraction always uses its own 10-second decision model deadline, not `decisionModel.timeoutMs`.
 
+## Fleet Commons
+
+`fleetCommons` (off by default) pulls a sanitized, fleet-wide feed of tool pitfalls,
+API workarounds, platform outages and procedures into each agent's
+`unblock-memory.sqlite` (the authoritative cache) and projects it into QMD as the
+`unblock-fleet` collection, searchable as the `"fleet"` corpus (`memory_search`,
+`memory_get` paths `qmd://unblock-fleet/<id>/<revision>`, citations
+`fleet:<id>@r<revision>`). Every entry is re-validated locally before it is cached:
+unknown fields, secrets and credentials, email addresses, phone numbers, Slack IDs,
+local filesystem paths and client/personal identifiers reject that entry only, and
+the newest revision per id wins. Expired entries drop out at the next sync (and stop
+being served immediately) unless `allowExpired` is true. The feed is either
+`endpoint` (HTTP(S), `Authorization: Bearer` from `apiKey`/`apiKeyFile`, ETag-cached,
+redirects refused) or a local `feedPath`; both return `{ "entries": [...] }`. The
+Fleet Organism hub (`scripts/fleet-organism-hub.mjs`) serves exactly that shape at
+`/api/v1/commons` and applies the same validation when entries are POSTed. Enabling
+also adds `"fleet"` to the corpora `memory_search` and `deep_thought` may select, and
+allows `"fleet"` in `memoryWhisperer.corpora`. A configured corpus named `fleet` is
+then rejected. Each agent syncs once when its memory manager opens, then while the
+Gateway runs every already-open agent syncs each `syncIntervalMinutes` (unused agents
+are never started just to sync). The feed request and validation run outside the
+manager's write queue, so a slow feed never delays search or indexing; only the SQLite
+replace and QMD projection are queued. Gateway shutdown aborts in-flight requests, and
+rejected entries are logged with their sanitized id and reasons. If the projected
+`unblock-fleet` collection lost documents (for example a rebuilt `index.sqlite`), the
+next sync re-projects the cache even when the feed is unchanged or answers `304`.
+Entries longer than a caller's snippet budget return their matched passage, bounded to
+that budget, with line numbers into the `memory_get` document (title, blank line, body,
+provenance). A cached `deep_thought` synthesis that cites a Fleet entry which has since
+expired or been retired is treated as stale. Hygiene is tuned against operational prose:
+status-code lists (`500 502 503`), versions, dates, epoch timestamps, all-caps error
+codes (`UNAVAILABLE`), hex digests and placeholders (`Authorization: Bearer <token>`,
+`token: must be refreshed`) pass, while real tokens, `+`-prefixed or 3-3-4 phone
+numbers, emails, digit-bearing Slack IDs and local paths are rejected.
+`openclaw memory-steward fleet-commons --agent main [--sync]` prints the cached
+entries read-only, or syncs now.
+
+```json
+{
+  "fleetCommons": {
+    "enabled": true,
+    "endpoint": "https://fleet-hub.example.com/api/v1/commons",
+    "apiKeyFile": "/etc/unblock-memory/fleet-hub-token"
+  },
+  "memoryWhisperer": { "enabled": true, "corpora": ["memory", "fleet"] }
+}
+```
+
+| Setting | Default | Meaning / supported range |
+| --- | --- | --- |
+| `fleetCommons.enabled` | `false` | Sync and search the Fleet Commons feed; requires `endpoint` or `feedPath` |
+| `fleetCommons.endpoint` | Unset | HTTP(S) feed URL without embedded credentials (`@` is allowed in the path, never before the host) |
+| `fleetCommons.feedPath` | Unset | Absolute path to a local JSON feed file (takes precedence over `endpoint`) |
+| `fleetCommons.apiKey` / `apiKeyFile` | Unset | Bearer token for `endpoint`, inline or from an absolute file path; never sent to a local feed |
+| `fleetCommons.syncIntervalMinutes` | `15` | `> 0` minutes between background syncs |
+| `fleetCommons.timeoutMs` | `10000` | `1..2147483647` ms per feed read or request |
+| `fleetCommons.maxEntries` | `0` | `>= 0` entries kept after validation, most severe then most recently updated first (`0` = unlimited) |
+| `fleetCommons.maxFeedBytes` | `5242880` | `>= 0` feed bytes streamed before JSON parsing; a larger feed fails the sync and keeps the last good cache (`0` = unlimited) |
+| `fleetCommons.allowExpired` | `false` | Keep and serve entries past `expiresAt` |
+
+### Fleet Organism telemetry and Morning Brief
+
+Fleet telemetry is pull-based and read-only: nothing leaves a node unless an operator
+runs a command (or their own scheduler) that pushes it.
+`openclaw memory-steward fleet-telemetry --agent main [--node <alias>] [--agent-alias <alias>] [--since-hours <n>] [--format json|prometheus] [--push <url> [--token-file <path>] [--push-timeout-ms <n>]]`
+prints an anonymous aggregate snapshot (outcome KPIs by recipe, crystal and
+expectation counts, derived-observation hits, pending skill proposals by kind,
+flagged sentiment-drift count, quarantined work items). It carries no text, names,
+paths or ids beyond the operator-assigned `--node` alias (default `local`) and
+`--agent-alias` (default `default`); the local `--agent` id only selects the store and
+is never exported, so a client-named agent never becomes a Prometheus label. Aliases
+are at most 64 characters. `openclaw memory-steward fleet-brief --agent main [--node <alias>] [--agent-alias <alias>] [--due-soon-hours <n>] [--limit <n>] [--format json|markdown] [--push <url> ...]`
+prints the **operator-only** Morning Brief: open blockers, overdue and due-soon
+expectations, sentiment drift, pending skill proposals (highest replay recall gain
+first) and quarantined work. It does contain private text, so never route it to a
+metrics system. Neither command creates or migrates a database. `--push` POSTs the
+JSON snapshot to that exact hub endpoint (`/api/v1/telemetry` or `/api/v1/brief`)
+with `Authorization: Bearer` from `--token-file`, refuses redirects, and requires
+`https://` unless the host is loopback; `--push-timeout-ms` defaults to `10000`
+(`0` = none). The optional hub,
+`node scripts/fleet-organism-hub.mjs [--host 127.0.0.1] [--port 8787] [--db <path>] [--token-file <path>] [--read-token-file <path>] [--ingest-token-file <path>] [--ingest-tokens-file <path>] [--operator-token-file <path>] [--private-metrics] [--max-body-bytes <n>] [--max-clock-skew-ms <n>] [--snapshot-ttl-ms <n>] [--max-alias-length <n>] [--forbidden-terms-file <path>]`
+(run `npm run build` first in a source checkout), stores the latest snapshot per
+node/agent. It serves `/metrics` (Prometheus; public unless `--private-metrics`),
+`/api/v1/ab-leaderboard`, `/api/v1/brief[?format=markdown]` and the Commons feed.
+
+Hub bearer tokens are split by role. The **read** token (`--read-token-file`) may
+`GET /api/v1/commons` (and `/metrics` when private); the **ingest** token
+(`--ingest-token-file`) may `POST /api/v1/telemetry` and `POST /api/v1/brief` for any
+node, while `--ingest-tokens-file` (a JSON object of node alias to token) binds each
+token to snapshots carrying its own `nodeId` (`403` otherwise); the **operator** token
+(`--operator-token-file`) may `POST /api/v1/commons`, `GET /api/v1/brief` and
+`GET /api/v1/ab-leaderboard`. `--token-file` is an all-roles fallback used only for
+roles given no token of their own. A role with no token is open, which the hub allows
+only on loopback: binding beyond loopback needs a token for every role. Every POST
+must send `Content-Type: application/json` (`415` otherwise), so a browser page cannot
+post to a tokenless loopback hub with a simple form.
+
+The hub rejects snapshots collected more than `--max-clock-skew-ms` in the future
+(default `300000`, `0` = no check) with `400`, and answers `409` instead of silently
+dropping a snapshot older than the stored one. Telemetry older than
+`--snapshot-ttl-ms` (default `172800000`, 48 hours; `0` = never) leaves `/metrics` and
+both leaderboards. `--max-alias-length` caps node/agent aliases (default `64`, `0` =
+unlimited). The A/B leaderboard keeps snapshots with different `sinceHours` windows in
+separate rows, each with `coverageFromMs` (`null` = all history) and `coverageToMs`.
+Commons revisions are immutable: re-posting an identical revision returns `200`,
+retiring it (`status: "retired"`) returns `200`, but reactivating a retired revision or
+changing a stored revision's content returns `409`. Post a higher revision instead.
+
 ## Settings reference
 
 The tables show resolved defaults. For source-specific entries,
@@ -331,7 +441,7 @@ contract; these tables explain their effects.
 | `skillWhisperer.cooldownTurns` | `10` | Legacy nonnegative integer, accepted for compatibility; no longer used |
 | `skillWhisperer.recipeHash` | `"default"` | Non-empty label (trimmed) stamped on every skill routing exposure for A/B experiments; reported per arm by `memory-steward outcomes` (`byRecipe`, `--recipe`) |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, decision model key and host hooks |
-| `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills. `"extracted"` is accepted only when `extraction.enabled` and `extraction.publish` are both true; it then whispers published extracted facts, plus derived observations and crystals grounded in `extracted` |
+| `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills. `"extracted"` is accepted only when `extraction.enabled` and `extraction.publish` are both true; it then whispers published extracted facts, plus derived observations and crystals grounded in `extracted`. `"fleet"` is accepted only when `fleetCommons.enabled` is true; it then whispers cached Fleet Commons entries |
 | `memoryWhisperer.mode` | `"v2"` | `"v2"`: decision-model recall gate + corpus router and grounded topic extraction (up to three topics), run in parallel within `min(2 s, timeoutMs / 2)`; never calls a query-model API. `"legacy"`: opt-in rollback to one query pair per turn from `api` (or deterministic local queries). See [Memory Whisperer](retrieval.md#memory-whisperer) |
 | `memoryWhisperer.api.endpoint` | Empty | **Legacy mode only.** Optional query-model API URL; unset or empty uses deterministic local queries. Still accepted in v2 so existing configs load, but ignored there (one `query_api_ignored` startup log note). |
 | `memoryWhisperer.api.apiKeyFile` | unset | **Legacy mode only.** Absolute path to a file containing the API bearer token. Missing credentials, timeouts, or API failures fall back to deterministic local queries before decision model judging. |
@@ -1079,7 +1189,7 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   `openclaw memory-steward shadow-report --agent main`; `memory-steward status`
   lists backlog and quarantined items, and `memory-steward requeue --scope <scope>`
   re-drives one item (`--kind people_interactions`, `captains_log`,
-  `outcome_ledger`, `expectations`, `memory_crystals` or `overnight_thinking` for other work kinds). Leases are renewed during model calls; a
+  `outcome_ledger`, `expectations`, `memory_crystals`, `overnight_thinking` or `steward_skills` for other work kinds). Leases are renewed during model calls; a
   Gateway stop releases them without strikes. On nightly manifests, interaction
   learning (`people_interactions`) also proposes net-new dossier claims; it is on by
   default in `publish` mode and off in `shadow` mode unless
@@ -1219,6 +1329,48 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   `openclaw memory-steward overnight --agent main [--limit <n>]` prints
   `{ agentId, summary, shifts, postmortems }` read-only (never creating a database);
   add `--run` to run one pass now, ignoring both the schedule and quiet hours.
+- **Self-writing skills** (review-only): every `intervalMinutes` (default daily), one
+  fenced pass per agent drafts `pending` rows in `skill_proposals` and **never
+  writes a live `SKILL.md`**. The pass has three phases. *Description updates* cover
+  skills with missed activations (opened without a whisper) or poor precision
+  (whispered, then ignored or hurt). Each gets a candidate routing description, and
+  only a candidate that beats the live one on a replay of real historical prompts
+  through the production `scoreSkillCatalog` router (`decisionModel` credentials) is
+  proposed. It must gain at least `minRecallGainPp` recall, add at most
+  `maxFalseActivationPp` false activations and cause at most `maxCriticalRegressions`
+  regressions, on at least `minPositivesEvaluated` positives, `minNegativesEvaluated`
+  negatives and `minSamplesPerSkill` examples that were actually scored; otherwise the
+  replay is `indeterminate`, never a pass. Labels are reconciled per skill and run
+  first, so a `hurt` turn is a negative even when the skill was opened. *Pitfall patches* add grounded `## Pitfalls` bullets from at least
+  `minPitfallEvidence` `hurt` outcomes and shortfall post-mortems, and every bullet
+  must cite the supplied evidence; each `hurt` item carries the failing turn's redacted,
+  bounded queries (from `allowedChatTypes` only). *New skills* draft complete `SKILL.md` files from
+  procedural memory crystals (LTM, or a not-yet-stale STM crystal with `newSkillMinHits`
+  hits or `newSkillMinBrightness`) that no catalog skill already covers. Every corpus a
+  crystal cites must be in `allowedCorpora` and its audience in `allowedAudiences`.
+  Only prompts from `allowedChatTypes` are replayed or quoted. Identical inputs are
+  never re-sent to the model (a description input is keyed on the live file and the
+  skill's own missed/imprecise exposures, so new unrelated prompts never re-open it),
+  a replay lost to a scorer outage is retried on the next pass, and an operator
+  rejection is never re-raised. Catalog skills outside every configured `skills`
+  source are skipped before any model call, and without a `skills` corpus neither the
+  pass nor `--run` runs.
+  `openclaw memory-steward skills --agent main [--status <status>] [--kind <kind>] [--limit <n>]`
+  lists proposals read-only (`--run` runs one pass now).
+  `memory-steward skill-review <id> [--agent main] --approve|--reject [--by <name>] [--note <text>]`
+  records the decision. `memory-steward skill-apply <id> [--agent main] [--dry-run] [--target-dir <dir>]`
+  writes one **approved** proposal's file, atomically, and only where a configured
+  `skills` source admits it: inside its root and matching its glob, both lexically
+  and after resolving symlinks (symlinks and `..` cannot escape). An existing file must
+  still match the SHA-256 it was drafted from, and a new skill is created with an
+  atomic no-clobber link, so it never overwrites a file that appeared meanwhile. If
+  the file already holds exactly the proposed bytes (an earlier apply crashed before
+  recording it), the proposal is simply marked applied. Description rewrites keep a
+  UTF-8 BOM and the file's line endings, replace a `|`/`>` block scalar whole, and must
+  read back as the reviewed description; pitfall bullets never land inside fenced code.
+  New skills land in `--target-dir` (default: the first skills root), which must
+  itself be admitted by a skills source. `--dry-run` reads through a read-only
+  connection.
 
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
@@ -1323,6 +1475,28 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.overnight.dailyLogChatTypes` | `["workspace", "channel"]` | Audience kinds (`"workspace"`, `"channel"`, `"group"`, `"direct"`) whose Voltaire shifts may reach the daily log or an audience-less `core_memories` anchor; add `"group"` or `"direct"` to opt in |
 | `steward.overnight.dailyLogCorpora` | `["memory", "knowledge"]` | Corpora a Voltaire shift must draw all of its evidence from to reach the daily log or an audience-less `core_memories` anchor; add `"sessions"` or `"extracted"` to opt in |
 | `steward.overnight.timeoutMs` | `0` | `>= 0` ms per model call and per investigation (`0` = unlimited) |
+| `steward.skills.enabled` | `true` | Starts the review-only self-writing skills loop on Gateway start (needs a Steward credential and a `skills` corpus) |
+| `steward.skills.intervalMinutes` | `1440` | `>= 1` minutes between passes |
+| `steward.skills.lookbackDays` | `30` | `>= 0` days of routing, opens, outcomes and post-mortems considered (`0` = unlimited) |
+| `steward.skills.enableDescriptionOptimizer` / `enablePitfallPatches` / `enableNewSkills` | `true` | Toggle each phase |
+| `steward.skills.minSamplesPerSkill` | `5` | `>= 0` labelled replay samples before a skill's description is optimized |
+| `steward.skills.minRecallGainPp` / `maxFalseActivationPp` | `3` / `1` | `-100..100` percentage-point replay gates |
+| `steward.skills.maxCriticalRegressions` | `0` | `>= 0` previously-routed positives a candidate may lose |
+| `steward.skills.minPositivesEvaluated` / `minNegativesEvaluated` | `1` / `1` | `>= 0` successfully replayed positives / negatives before the recall / false-activation gates can pass; fewer (or fewer than `minSamplesPerSkill` evaluated in total) is `indeterminate`, never a vacuous pass (`0` = no minimum) |
+| `steward.skills.maxReplayFailureRate` | `0.25` | `0..1` share of replay examples whose scorer judgment may fail before the replay is `indeterminate:scorer_failures`; a scorer outage leaves the input unattempted so the next pass retries it (`1` = tolerate any) |
+| `steward.skills.maxDescriptionsPerRun` / `maxPitfallsPerRun` / `maxNewSkillsPerRun` | `3` / `3` / `2` | `>= 0` model calls per phase per pass (`0` = unlimited) |
+| `steward.skills.maxReplayExamples` | `40` | `>= 0` positive + negative prompts replayed per candidate (`0` = unlimited) |
+| `steward.skills.replayConcurrency` | `4` | `>= 0` concurrent replay judgments (`0` = all at once) |
+| `steward.skills.replayTimeoutMs` | `0` | `>= 0` ms per replay judgment (`0` = the decision model's unbounded default) |
+| `steward.skills.replayMinUsefulness` | Skill Whisperer threshold | `0..1` replay activation threshold |
+| `steward.skills.minPitfallEvidence` | `2` | `>= 1` hurt outcomes + post-mortems before a pitfall patch is drafted |
+| `steward.skills.maxEvidencePerSkill` / `maxEvidenceChars` / `maxSkillBodyChars` / `maxDescriptionChars` | `12` / `1200` / `8000` / `0` | `>= 0` model input and output budgets (`0` = unlimited) |
+| `steward.skills.allowedCorpora` | `["memory", "knowledge"]` | Corpora every cited crystal member must come from; add `"sessions"` or `"extracted"` to opt in |
+| `steward.skills.allowedAudiences` | `["workspace"]` | Crystal audiences allowed into new-skill mining (`"*"` = any) |
+| `steward.skills.allowedChatTypes` | `["workspace", "channel"]` | `recall_queries` chat types (`workspace`, `channel`, `group`, `direct`, `unknown`) whose prompts may be replayed or quoted. Rows recorded without a chat type infer it from the session key (as `steward.overnight.recallChatTypes` does), else count as `unknown`; a run with any disallowed row is skipped whole. Every quoted prompt is redacted and bounded by `maxEvidenceChars` before the drafter or the replay scorer sees it |
+| `steward.skills.newSkillMinHits` / `newSkillMinBrightness` | `3` / `0.75` | An STM crystal qualifies for new-skill mining at either threshold (LTM always qualifies) |
+| `steward.skills.coverageMinOverlap` | `0.5` | `0..1` token overlap at which an existing skill already covers a crystal's theme |
+| `steward.skills.timeoutMs` | `0` | `>= 0` ms per model call (`0` = unlimited) |
 
 **Enabling `deep_thought` approves sending the question plus the memory excerpts it
 opens to the Steward endpoint. Enabling the People shadow approves sending one
@@ -1335,7 +1509,12 @@ entries plus the open workspace/channel expectations (never group or DM ones) to
 `maxMembersPerCluster` workspace memory excerpts per cluster; enabling Overnight
 Thinking approves `deep_thought` investigations of recurring questions in their own
 audience, sending both conclusions to compare, and sending each `hurt` outcome's
-subject and signals.** Both
+subject and signals. Leaving self-writing skills on approves sending each candidate
+skill's `SKILL.md`, its missed or falsely-activated request prompts (from
+`allowedChatTypes` only), its `hurt` outcome signals and post-mortems, and eligible
+crystal titles, summaries and source paths to the Steward endpoint. It also approves
+replaying those prompts against both descriptions through the `decisionModel`
+endpoint.** Both
 features call `steward.endpoint` directly (`stream: false`, `store: false`) with
 OpenAI strict JSON schemas; the host LLM runtime is not used, because it denies
 plugin model overrides by default and would ignore the Steward endpoint and key.
