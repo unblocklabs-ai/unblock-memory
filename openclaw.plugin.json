@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.22.0",
+  "version": "0.22.1",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -944,7 +944,7 @@
                 "minimum": 0,
                 "maximum": 3,
                 "default": 3,
-                "description": "emotion_v1 multiplies the 30-day outcome time constant by (1 + salience × emotionDecayStretch)."
+                "description": "emotion_v1 multiplies the 30-day outcome time constant by (1 + salience \u00d7 emotionDecayStretch)."
               },
               "emotionMaxBonus": {
                 "type": "number",
@@ -1945,7 +1945,7 @@
               },
               "writeDailyLogNotes": {
                 "type": "boolean",
-                "description": "Append a ❔ was / ✅ now note to <workspace>/memory/YYYY-MM-DD.md for shifts allowed by dailyLogChatTypes and dailyLogCorpora. Default true."
+                "description": "Append a \u2754 was / \u2705 now note to <workspace>/memory/YYYY-MM-DD.md for shifts allowed by dailyLogChatTypes and dailyLogCorpora. Default true."
               },
               "dailyLogChatTypes": {
                 "type": "array",
