@@ -59,6 +59,7 @@ function liveRun(row: WorkItem | undefined, now = Date.now()): row is WorkItem {
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #corpora: readonly CorpusConfig[];
   readonly #extraction?: ExtractionConfig;
+  readonly #syntheticInput?: ManagerSessionConfig["syntheticInput"];
   readonly #analysisExecutable?: string;
   readonly #keepEmbeddingModelWarm: boolean;
   readonly #stateRoot: string;
@@ -156,12 +157,14 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       keepEmbeddingModelWarm?: boolean;
       stateRoot?: string;
       extraction?: ExtractionConfig;
+      syntheticInput?: ManagerSessionConfig["syntheticInput"];
       recallLedgerEnabled?: boolean;
       onError?: (error: unknown) => void;
     } = {},
   ) {
     this.#corpora = corpora;
     this.#extraction = options.extraction;
+    this.#syntheticInput = options.syntheticInput;
     this.#analysisExecutable = options.analysisExecutable;
     this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
     this.#stateRoot = options.stateRoot ?? resolveStateDir();
@@ -628,6 +631,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       statePath: join(stateDir, MEMORY_DATABASE),
       legacyStateDir: stateDir,
       timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
+      syntheticInput: this.#syntheticInput,
     };
   }
 

@@ -458,6 +458,33 @@ test("maxClustersPerRun counts synthesis attempts only, never unchanged or priva
   assert.deepEqual(f.rows("SELECT cluster_id FROM memory_crystals ORDER BY cluster_id"), [{ cluster_id: "fresh-1" }, { cluster_id: "known" }]);
 });
 
+test("Flashbulb evidence wins the synthesis budget and a representative slot only after cluster-wide ACL", async t => {
+  const f = fixture(t);
+  const mundane = cluster("mundane"), salient = cluster("salient"), privateTail = cluster("private-tail");
+  const publicPath = "qmd://memory/2026-11-26.md";
+  const privatePath = "qmd://sessions/direct/2026-11-26--private-session.md";
+  salient.members[2] = member("release-failure", { sourcePaths: [publicPath], eventTimeSource: publicPath });
+  privateTail.members[2] = member("private", { text: "PRIVATE_FLASHBULB", sourcePaths: [privatePath], eventTimeSource: privatePath });
+  f.db.exec(`CREATE TABLE captains_log_entries (agent_id TEXT, day TEXT, salience_score REAL) STRICT;
+    INSERT INTO captains_log_entries VALUES ('main', '2026-11-26', 0.8);
+    CREATE TABLE inside_out (session_id TEXT, intensity REAL) STRICT;
+    INSERT INTO inside_out VALUES ('private-session', 3);`);
+  f.load([mundane, privateTail, salient]);
+
+  const result = await f.run({ maxClustersPerRun: 1, maxMembersPerCluster: 2 });
+  assert.equal(result.status, "ok");
+  assert.equal(result.skippedAudience, 1);
+  assert.equal(result.synthesized, 1);
+  assert.equal(result.created, 1);
+  assert.deepEqual(f.prompts.map(prompt => prompt.members.map(member => member.text)),
+    [[salient.members[2]!.text, salient.members[0]!.text]]);
+  assert.deepEqual(f.rows("SELECT cluster_id, tier, corpora_json FROM memory_crystals"),
+    [{ cluster_id: "salient", tier: "stm", corpora_json: '["memory"]' }]);
+  assert.deepEqual(f.rows("SELECT source_path FROM memory_crystal_members ORDER BY ordinal"),
+    [{ source_path: publicPath }, { source_path: "qmd://memory/salient-a.md" }]);
+  assert.deepEqual(f.rows("SELECT id FROM core_memories"), [], "high salience alone cannot create a core memory");
+});
+
 test("allowedCorpora is the source of truth: explicitly listing sessions opts session evidence in (unresolved source ids never)", async t => {
   const f = fixture(t);
   const personal = cluster("personal-ea");
@@ -482,4 +509,39 @@ test("allowedCorpora is the source of truth: explicitly listing sessions opts se
   assert.match(JSON.stringify(f.prompts), /morning flights/u);
   assert.deepEqual(f.rows("SELECT cluster_id,corpora_json FROM memory_crystals"),
     [{ cluster_id: "personal-ea", corpora_json: '["memory","sessions"]' }]);
+});
+
+test("Flashbulb evidence takes at most a bounded, high-salience-only reserve; representatives keep the rest and the toggle turns it off", async t => {
+  const f = fixture(t);
+  const big: Cluster = { id: "big", members: Array.from({ length: 11 }, (_, i) => member(`big-${i}`)) };
+  const day = (i: number) => `qmd://memory/2026-11-${String(10 + i).padStart(2, "0")}.md`;
+  // Tail members 8..10 sit outside the representative page of 8; 9 and 10 are high salience, 8 is only routine.
+  for (const i of [8, 9, 10]) big.members[i] = member(`big-${i}`, { sourcePaths: [day(i)], eventTimeSource: day(i) });
+  f.db.exec(`CREATE TABLE captains_log_entries (agent_id TEXT, day TEXT, salience_score REAL, salience_signals_json TEXT) STRICT;
+    INSERT INTO captains_log_entries VALUES ('main', '2026-11-18', 0.6, '{"highSalience":false}'),
+      ('main', '2026-11-19', 0.8, '{"highSalience":true}'), ('main', '2026-11-20', 0.95, '{"highSalience":true}');`);
+  f.load([big]);
+  const texts = () => f.prompts.at(-1)!.members.map(entry => entry.text);
+  const representative = big.members.slice(0, 8).map(entry => entry.text);
+
+  assert.equal((await f.run({ maxMembersPerCluster: 8 })).status, "ok");
+  assert.deepEqual(texts(), [big.members[10]!.text, big.members[9]!.text, ...representative.slice(0, 6)],
+    "two of eight slots (a quarter) go to the strongest high-salience evidence; the routine 0.6 entry never moves");
+  const digest = f.rows("SELECT input_digest FROM memory_crystals")[0]?.input_digest;
+
+  // A new routine grade on a tail member cannot churn the crystal input.
+  f.db.exec(`UPDATE captains_log_entries SET salience_score=0.69 WHERE day='2026-11-18'`);
+  f.advance();
+  const again = await f.run({ maxMembersPerCluster: 8 });
+  assert.equal(again.status, "ok");
+  assert.equal(again.skippedUnchanged, 1, "the same evidence re-verifies instead of re-synthesizing");
+  assert.equal(f.rows("SELECT input_digest FROM memory_crystals")[0]?.input_digest, digest);
+
+  const off = fixture(t);
+  off.db.exec(`CREATE TABLE captains_log_entries (agent_id TEXT, day TEXT, salience_score REAL, salience_signals_json TEXT) STRICT;
+    INSERT INTO captains_log_entries VALUES ('main', '2026-11-20', 0.95, '{"highSalience":true}');`);
+  off.load([big]);
+  assert.equal((await off.run({ maxMembersPerCluster: 8, prioritizeEmotionalSalience: false })).status, "ok");
+  assert.deepEqual(off.prompts.at(-1)!.members.map(entry => entry.text), representative,
+    "prioritizeEmotionalSalience: false sends the representative sample only");
 });

@@ -594,7 +594,8 @@ test("memory whisperer requires explicit, known non-skill corpora and bounded co
     enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5, maxHints: 3, cooldownTurns: 10, timeoutMs: 5000,
     mode: "v2", api: { endpoint: "" }, recipeHash: "default", derivedObservations: true,
     derivedMaxHints: 2, derivedMinTokenOverlap: 0.45, derivedMinSharedTokens: 2,
-    brightness: { recipe: "off", weight: 0.08, decayRate: 0.5, lookbackDays: 90, maxBoost: 0.15 },
+    brightness: { recipe: "off", weight: 0.08, decayRate: 0.5, lookbackDays: 90, maxBoost: 0.15,
+      emotionDecayStretch: 3, emotionMaxBonus: 0.35 },
     crystalsEnabled: true, crystalMaxHints: 2, crystalMinTokenOverlap: 0.35, crystalMinSharedTokens: 2, crystalLtmRankBoost: 0.01,
   });
   assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.5);
@@ -1039,6 +1040,55 @@ function ledgerSink() {
   return { records, sink: { writer: { enqueue: (_path: string, entry: never) => { records.push(entry); } },
     dbPathForAgent: () => "/unused/ledger.sqlite" } as unknown as Parameters<typeof registerMemoryWhisperer>[5] };
 }
+
+test("runtime wakes misreported as user input do not reach planning, retrieval, or the recall ledger", async t => {
+  const { records, sink } = ledgerSink();
+  const model = v2Model(t, { gate: () => gateReply({ need_recall: 0.9, corpus_0: 0.9, corpus_1: 0.9 }) });
+  const h = harness([], { config: v2Config, recallLedger: sink });
+  t.after(h.stop);
+  const wake = "Continue the OpenClaw runtime event.";
+  assert.equal(await h.before({ prompt: "Unrelated model prompt", currentUserMessage: wake, messages: [] }, context), undefined);
+  assert.equal(await h.before({ prompt: `OpenClaw: ${wake}`, messages: [] }, { ...context, runId: "legacy" }), undefined);
+  assert.equal(model.kinds.length, 0);
+  assert.deepEqual(h.searches, []);
+  assert.deepEqual(records, []);
+
+  const configured = resolveConfig({ syntheticInput: { skipFamilies: [] } });
+  const unfiltered = harness([], { config: v2Config, whisperer: { syntheticInput: configured.syntheticInput } });
+  t.after(unfiltered.stop);
+  await unfiltered.before({ prompt: wake, messages: [] }, context);
+  assert.ok(model.kinds.includes("gate"), "clearing the default families also clears the wake lockout");
+});
+
+test("opted-in scheduled recall and mixed human turns send only their task to the planner", async t => {
+  const { records, sink } = ledgerSink();
+  const requests: string[] = [];
+  v2Model(t, {
+    gate: () => gateReply({ need_recall: 0.9, corpus_0: 0.9, corpus_1: 0.9 }),
+    extract: body => {
+      requests.push(String(body.state));
+      return topicsReply(["/api/accounts"]);
+    },
+  });
+  const h = harness([], { config: v2Config, recallLedger: sink });
+  t.after(h.stop);
+  let dispatch: Before | undefined;
+  const api = { on(_name: string, handler: Before) { dispatch = handler; }, logger: { warn() {} } } as unknown as OpenClawPluginApi;
+  registerWhispererPrompt(api, { memory: h.before }, resolveConfig({ whispererTriggers: {
+    cron: ["memory"], heartbeat: ["memory"],
+  } }).whispererTriggers);
+  const task = "Check heartbeat on /api/accounts.";
+  const human = `Does "Continue the OpenClaw runtime event." apply to /api/accounts?`;
+  await dispatch!({ prompt: `[cron:abc Accounts check] ${task}\n\nThis is an unattended scheduled run.\n\nAutomation scratch (revision 3):\nstale data`,
+    messages: [] }, { ...context, trigger: "cron" });
+  await dispatch!({ prompt: `[OpenClaw heartbeat poll]\n${task}`, messages: [] },
+    { ...context, trigger: "heartbeat", runId: "heartbeat" });
+  await dispatch!({ prompt: "ignored", messages: [], currentUserMessage: `${human}\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nprivate result\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>` },
+    { ...context, runId: "human" });
+  assert.deepEqual(requests, [task, task, human].map(text => `Current request: ${text}`));
+  assert.equal(h.searches.length, 3);
+  assert.deepEqual(records.map(row => row.record.inputFamily), ["cron_wrapper", "heartbeat_control", undefined]);
+});
 
 test("v2: default mode resolves from config and never constructs or calls the configured query API", async t => {
   assert.equal(v2Config.mode, "v2");

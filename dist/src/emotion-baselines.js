@@ -55,7 +55,8 @@ function initializeEmotionBaselines(db) {
     INSERT OR REPLACE INTO memory_schema VALUES ('emotion-baselines',2);`);
     });
 }
-function gradeSignature(row) {
+/** Identity of one grade's inputs; an `inside_out_deviations` row describes a grade only while signatures match. */
+export function gradeSignature(row) {
     return jsonHash([row.interaction_id, row.rubric, row.model, row.person_id ?? null, row.target_at,
         row.reviewed_at, row.error, ...INSIDE_OUT_EMOTIONS.map(e => row[e])]);
 }
@@ -581,10 +582,12 @@ export function baselineFingerprint(db, options) {
 }
 /**
  * Delete one person's baselines and assessment history. With `grades`, also erase their six
- * probabilities and person link, keeping a tombstone so the reply is never sent to the decision model again.
+ * probabilities and person link, keeping a tombstone so the reply is never sent to the decision model again, and scrub
+ * the emotion values other ledgers derived from those grades: Captain's Log salience grounded on a purged message
+ * (the log text stays) and Inside Out signals on Outcome Ledger rows in a purged session (verdicts stay).
  */
 export function purgeEmotionProfile(db, personId, options = {}) {
-    const counts = { baselines: 0, assessments: 0, grades: 0 };
+    const counts = { baselines: 0, assessments: 0, grades: 0, captainsLogEntries: 0, outcomes: 0 };
     if (!tableExists(db, "inside_out"))
         return counts;
     initializeEmotionBaselines(db);
@@ -592,13 +595,291 @@ export function purgeEmotionProfile(db, personId, options = {}) {
         db.prepare(`INSERT INTO inside_out_person_generations (person_id, generation) VALUES (?, 1)
       ON CONFLICT(person_id) DO UPDATE SET generation = generation + 1`).run(personId);
         if (options.grades) {
+            // Collected before the tombstone clears the link: these are the only grades the derived ledgers could cite.
+            const purged = db.prepare("SELECT DISTINCT session_id, message_id FROM inside_out WHERE person_id=?").all(personId)
+                .map(row => [String(row.session_id), String(row.message_id)]);
             counts.assessments += Number(db.prepare(`DELETE FROM inside_out_deviations WHERE (interaction_id,rubric) IN
         (SELECT interaction_id,rubric FROM inside_out WHERE person_id=?)`).run(personId).changes);
-            counts.grades = Number(db.prepare(`UPDATE inside_out SET ${INSIDE_OUT_EMOTIONS.map(e => `${e}=NULL`).join(",")},
+            // Intensity, its distribution and valence are person-scoped emotion data too; drift reads only these columns.
+            const derived = PURGED_COLUMNS.filter(column => hasColumn(db, "inside_out", column));
+            counts.grades = Number(db.prepare(`UPDATE inside_out SET ${[...INSIDE_OUT_EMOTIONS, ...derived].map(e => `${e}=NULL`).join(",")},
         error=?,person_id=NULL WHERE person_id=?`).run(PURGED_GRADE, personId).changes);
+            if (purged.length)
+                Object.assign(counts, scrubDerivedEmotion(db, purged));
         }
         counts.assessments += Number(db.prepare("DELETE FROM inside_out_deviations WHERE person_id=?").run(personId).changes);
         counts.baselines = Number(db.prepare("DELETE FROM person_emotion_baselines WHERE person_id=?").run(personId).changes);
         return counts;
     });
+}
+const CAPTAINS_LOG_SALIENCE = ["salience_score", "emotional_intensity", "relative_salience", "salience_signals_json"];
+const OUTCOME_EMOTION_SIGNALS = ["insideOutValence", "insideOutIntensity", "insideOutDelta", "sharpDrop"];
+/** Removes derived emotion values that cite purged `(session_id, message_id)` grades; runs inside the purge transaction. */
+function scrubDerivedEmotion(db, purged) {
+    const scrubbed = { captainsLogEntries: 0, outcomes: 0 };
+    const pairs = JSON.stringify(purged), sessions = JSON.stringify([...new Set(purged.map(([session]) => session))]);
+    if (tableExists(db, "captains_log_entries") && hasColumn(db, "captains_log_entries", "salience_signals_json")) {
+        const columns = CAPTAINS_LOG_SALIENCE.filter(column => hasColumn(db, "captains_log_entries", column));
+        scrubbed.captainsLogEntries = Number(db.prepare(`UPDATE captains_log_entries SET ${columns.map(c => `${c}=NULL`).join(",")}
+      WHERE json_valid(salience_signals_json) AND EXISTS (
+        SELECT 1 FROM json_each(salience_signals_json,'$.signals') s JOIN json_each(?) p
+        ON json_extract(s.value,'$.sessionId')=json_extract(p.value,'$[0]') AND json_extract(s.value,'$.messageId')=json_extract(p.value,'$[1]'))`)
+            .run(pairs).changes);
+    }
+    if (tableExists(db, "memory_outcomes") && ["session_id", "signals_json"].every(column => hasColumn(db, "memory_outcomes", column))) {
+        // Outcome rows record the session, not the graded message: scrub every Inside Out reading in a purged session.
+        const paths = OUTCOME_EMOTION_SIGNALS.map(key => `'$.${key}'`).join(",");
+        scrubbed.outcomes = Number(db.prepare(`UPDATE memory_outcomes SET signals_json=json_remove(signals_json,${paths})
+      WHERE session_id IN (SELECT value FROM json_each(?)) AND json_valid(signals_json)
+        AND (${OUTCOME_EMOTION_SIGNALS.map(key => `json_type(signals_json,'$.${key}') IS NOT NULL`).join(" OR ")})`)
+            .run(sessions).changes);
+    }
+    return scrubbed;
+}
+const PURGED_COLUMNS = ["intensity", "intensity_probs_json", "intensity_rubric", "valence"];
+function hasColumn(db, table, column) {
+    return !!db.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name=?").get(table, column);
+}
+const mean = (values) => values.length ? values.reduce((sum, v) => sum + v, 0) / values.length : null;
+// ---------------------------------------------------------------------------------------------------------------
+// Unsigned intensity: absolute 0..3 level, kept separate from its one-sided person-relative position.
+// ---------------------------------------------------------------------------------------------------------------
+const INTENSITY_VERSION = "intensity-upper-tail-v1";
+/** Float tolerance for ties between stored expected scores. */
+const INTENSITY_EPSILON = 1e-9;
+/**
+ * One-sided upper-tail intensity relative to the person's own earlier grades. Prepared once per export.
+ * A stoic person's rare 2 lands near the top of their distribution even though it is only "clear" in absolute terms.
+ */
+export function intensityReader(db, options = {}) {
+    const minimum = options.minInteractions ?? DEFAULTS.insideOut.defaultBaselineMinInteractions;
+    if (!Number.isInteger(minimum) || minimum < 1)
+        throw new Error("Invalid intensity minInteractions");
+    const available = tableExists(db, "inside_out") && hasColumn(db, "inside_out", "intensity") && hasColumn(db, "inside_out", "person_id");
+    const prior = available ? db.prepare(`SELECT count(*) n,avg(intensity) mean,
+      coalesce(sum(intensity<:value-${INTENSITY_EPSILON}),0) below,coalesce(sum(abs(intensity-:value)<=${INTENSITY_EPSILON}),0) tied
+    FROM inside_out WHERE person_id=:person AND rubric=:rubric AND model=:model AND intensity_rubric IS :intensityRubric
+      AND error IS NULL AND intensity IS NOT NULL AND target_at IS NOT NULL AND target_at<:at`) : undefined;
+    return (row) => {
+        const value = typeof row.intensity === "number" && Number.isFinite(row.intensity) ? row.intensity : null;
+        const result = { version: INTENSITY_VERSION, status: "ok", absoluteIntensity: value, count: 0,
+            minInteractions: minimum, intensityMean: null, intensityPercentile: null, intensitySpike: null };
+        if (row.error !== null && row.error !== undefined)
+            return { ...result, status: "grade_failed" };
+        if (value === null)
+            return { ...result, status: "unknown_intensity" };
+        if (row.person_id === null || row.person_id === undefined)
+            return { ...result, status: "unlinked_person" };
+        if (row.target_at === null || row.target_at === undefined)
+            return { ...result, status: "missing_time" };
+        const stats = prior.get({ person: row.person_id, rubric: row.rubric ?? null, model: row.model ?? null,
+            intensityRubric: row.intensity_rubric ?? null, at: row.target_at, value });
+        const count = Number(stats.n), average = count ? Number(stats.mean) : null;
+        if (count < minimum)
+            return { ...result, status: "insufficient_history", count, intensityMean: average };
+        return { ...result, count, intensityMean: average,
+            intensityPercentile: (Number(stats.below) + Number(stats.tied) / 2) / count,
+            intensitySpike: Math.max(0, value - average) };
+    };
+}
+/** Per-person absolute intensity distribution (0..3), from grades that carry one. Old NULL rows are excluded, not zero. */
+export function intensityProfiles(db, options = {}) {
+    if (!tableExists(db, "inside_out") || !hasColumn(db, "inside_out", "intensity") || !hasColumn(db, "inside_out", "person_id"))
+        return [];
+    const rows = db.prepare(`SELECT person_id,intensity_rubric,intensity,target_at FROM inside_out
+    WHERE person_id IS NOT NULL AND (? IS NULL OR person_id=?) AND error IS NULL AND intensity IS NOT NULL
+      AND target_at IS NOT NULL AND target_at<=? ORDER BY person_id,intensity_rubric,intensity`)
+        .all(options.personId ?? null, options.personId ?? null, options.now ?? Date.now());
+    const groups = new Map();
+    for (const row of rows) {
+        const key = JSON.stringify([row.person_id, row.intensity_rubric]);
+        let group = groups.get(key);
+        if (!group)
+            groups.set(key, group = { personId: String(row.person_id), intensityRubric: String(row.intensity_rubric ?? ""),
+                values: [], firstAt: Infinity, lastAt: -Infinity });
+        group.values.push(Number(row.intensity));
+        group.firstAt = Math.min(group.firstAt, Number(row.target_at));
+        group.lastAt = Math.max(group.lastAt, Number(row.target_at));
+    }
+    const quantile = (sorted, p) => {
+        const position = (sorted.length - 1) * p, lower = Math.floor(position);
+        return sorted[lower] + (sorted[Math.ceil(position)] - sorted[lower]) * (position - lower);
+    };
+    return [...groups.values()].map(({ values, ...group }) => ({ ...group, count: values.length, mean: mean(values),
+        median: quantile(values, 0.5), p90: quantile(values, 0.9), max: values.at(-1) }));
+}
+// ---------------------------------------------------------------------------------------------------------------
+// Boiling-frog drift: recent absolute levels against an anchored early baseline, never a rolling window.
+// ---------------------------------------------------------------------------------------------------------------
+export const SENTIMENT_DRIFT_METRICS = ["valence", "anger", "agent_frustration", "agent_dissatisfaction"];
+/** valence (-1..1) worsens downward; Inside Out anger and Response Audit agent frustration (0..1) and dissatisfaction (0..3) upward. */
+const LOWER_IS_WORSE = {
+    valence: true, anger: false, agent_frustration: false, agent_dissatisfaction: false,
+};
+const DEFAULT_SENTIMENT_DRIFT = {
+    recentWeeks: 3,
+    anchorWeeks: 4,
+    minWeeklySamples: 1,
+    minAnchorSamples: 5,
+    minRecentSamples: 3,
+    driftThresholds: { valence: 0.2, anger: 0.15, agent_frustration: 0.15, agent_dissatisfaction: 0.5 },
+    levelThresholds: { valence: -0.3, anger: 0.5, agent_frustration: 0.5, agent_dissatisfaction: 1.5 },
+};
+function positiveInteger(value, name) {
+    if (!Number.isInteger(value) || value < 1)
+        throw new Error(`Invalid sentiment drift ${name}`);
+    return value;
+}
+function thresholdMap(defaults, overrides, name) {
+    const merged = { ...defaults, ...overrides };
+    for (const metric of SENTIMENT_DRIFT_METRICS) {
+        const value = merged[metric];
+        if (value !== null && !Number.isFinite(value))
+            throw new Error(`Invalid sentiment drift ${name}.${metric}`);
+    }
+    return merged;
+}
+function driftSamples(db, options) {
+    const samples = new Map(SENTIMENT_DRIFT_METRICS.map(metric => [metric, []]));
+    if (!tableExists(db, "inside_out") || !hasColumn(db, "inside_out", "person_id"))
+        return samples;
+    const person = options.personId ?? null;
+    const derived = "joy-max(sadness,fear,anger,disgust)";
+    const valence = hasColumn(db, "inside_out", "valence") ? `coalesce(valence,${derived})` : derived;
+    // One sample per reply: an interaction regraded under several rubrics must not count twice.
+    for (const row of db.prepare(`SELECT person_id,min(target_at) at,avg(${valence}) valence,avg(anger) anger FROM inside_out
+    WHERE person_id IS NOT NULL AND (? IS NULL OR person_id=?) AND (? IS NULL OR rubric=?) AND error IS NULL
+      AND target_at IS NOT NULL AND target_at<=? AND ${INSIDE_OUT_EMOTIONS.map(e => `${e} BETWEEN 0 AND 1`).join(" AND ")}
+    GROUP BY interaction_id,person_id`).iterate(person, person, options.rubric ?? null, options.rubric ?? null, options.now)) {
+        const base = { personId: String(row.person_id), at: Number(row.at) };
+        samples.get("valence").push({ ...base, value: Number(row.valence) });
+        samples.get("anger").push({ ...base, value: Number(row.anger) });
+    }
+    if (!tableExists(db, "response_results"))
+        return samples;
+    // Response Audit is session-keyed; attribute a session only when its graded replies name exactly one person.
+    // Every grade counts, linked or not: a session with any other human, any unlinked reply or any purged reply is
+    // never pinned on the one person still linked there (purging Bob must not hand Bob's frustration to Alice).
+    const audit = db.prepare(`WITH session_person AS (
+      SELECT session_id,min(person_id) person_id FROM inside_out GROUP BY session_id
+      HAVING count(DISTINCT human_key)=1 AND count(person_id)=count(*) AND count(DISTINCT person_id)=1
+        AND coalesce(sum(error IS '${PURGED_GRADE}'),0)=0
+    ), latest AS (
+      SELECT r.session_id,r.episode_at,r.result,row_number() OVER (PARTITION BY r.session_id,r.id ORDER BY r.assessed_at DESC,r.cohort) rn
+      FROM response_results r WHERE r.status='ok' AND r.active=1 AND r.result IS NOT NULL AND json_valid(r.result)
+        AND (? IS NULL OR r.cohort=?) AND r.episode_at<=?
+    )
+    SELECT sp.person_id,l.episode_at at,
+      json_extract(l.result,'$.feedback.annoyance.noul') annoyance,json_extract(l.result,'$.feedback.frustration.noul') frustration,
+      json_extract(l.result,'$.feedback.dissatisfactionIntensity.score') dissatisfaction,
+      json_extract(l.result,'$.feedback.dissatisfactionIntensity.confidence') confidence
+    FROM latest l JOIN session_person sp ON sp.session_id=l.session_id WHERE l.rn=1 AND (? IS NULL OR sp.person_id=?)`);
+    const number = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+    for (const row of audit.iterate(options.responseCohort ?? null, options.responseCohort ?? null, options.now, person, person)) {
+        const base = { personId: String(row.person_id), at: Number(row.at) };
+        const annoyance = number(row.annoyance), frustration = number(row.frustration), dissatisfaction = number(row.dissatisfaction);
+        if (annoyance !== null || frustration !== null) {
+            samples.get("agent_frustration").push({ ...base, value: Math.max(annoyance ?? 0, frustration ?? 0) });
+        }
+        if (dissatisfaction !== null && (number(row.confidence) ?? 0) >= options.minResponseConfidence) {
+            samples.get("agent_dissatisfaction").push({ ...base, value: dissatisfaction });
+        }
+    }
+    return samples;
+}
+/**
+ * Long-horizon drift per person and metric. The anchor is the person's earliest stable weeks, so a slow
+ * week-over-week creep that a rolling baseline would absorb still shows as distance from where they started.
+ * Read-only; derived on demand from grades and audit results, so nothing person-scoped is persisted here.
+ */
+export function detectSentimentDrift(db, options = {}) {
+    const now = options.now ?? Date.now();
+    if (!Number.isFinite(now))
+        throw new Error("Invalid sentiment drift now");
+    const recentWeeks = options.recentWeeks ?? DEFAULT_SENTIMENT_DRIFT.recentWeeks;
+    if (!Number.isFinite(recentWeeks) || recentWeeks <= 0)
+        throw new Error("Invalid sentiment drift recentWeeks");
+    const anchorWeeks = positiveInteger(options.anchorWeeks ?? DEFAULT_SENTIMENT_DRIFT.anchorWeeks, "anchorWeeks");
+    const minWeekly = positiveInteger(options.minWeeklySamples ?? DEFAULT_SENTIMENT_DRIFT.minWeeklySamples, "minWeeklySamples");
+    const minAnchor = positiveInteger(options.minAnchorSamples ?? DEFAULT_SENTIMENT_DRIFT.minAnchorSamples, "minAnchorSamples");
+    const minRecent = positiveInteger(options.minRecentSamples ?? DEFAULT_SENTIMENT_DRIFT.minRecentSamples, "minRecentSamples");
+    const minResponseConfidence = options.minResponseConfidence ?? DEFAULTS.responseAudit.scoreHigh;
+    if (!Number.isFinite(minResponseConfidence) || minResponseConfidence < 0 || minResponseConfidence > 1) {
+        throw new Error("Invalid sentiment drift minResponseConfidence");
+    }
+    const drift = thresholdMap(DEFAULT_SENTIMENT_DRIFT.driftThresholds, options.driftThresholds, "driftThresholds");
+    const level = thresholdMap(DEFAULT_SENTIMENT_DRIFT.levelThresholds, options.levelThresholds, "levelThresholds");
+    const recentStart = now - recentWeeks * WEEK;
+    const samples = readSnapshot(db, () => driftSamples(db, { now, personId: options.personId, rubric: options.rubric,
+        responseCohort: options.responseCohort, minResponseConfidence }));
+    const reports = [];
+    const fmt = (value) => Number(value.toFixed(3));
+    for (const metric of SENTIMENT_DRIFT_METRICS) {
+        const lowerIsWorse = LOWER_IS_WORSE[metric], sign = lowerIsWorse ? -1 : 1;
+        const byPerson = new Map();
+        for (const sample of samples.get(metric)) {
+            const list = byPerson.get(sample.personId);
+            if (list)
+                list.push(sample);
+            else
+                byPerson.set(sample.personId, [sample]);
+        }
+        for (const [personId, personSamples] of [...byPerson].sort(([a], [b]) => a.localeCompare(b))) {
+            const weeks = new Map();
+            for (const { at, value } of personSamples) {
+                const list = weeks.get(weekStart(at));
+                if (list)
+                    list.push(value);
+                else
+                    weeks.set(weekStart(at), [value]);
+            }
+            const ordered = [...weeks].sort(([a], [b]) => a - b);
+            // Anchor: earliest stable weeks that finish before the recent window, so the two never overlap.
+            const anchor = ordered.filter(([start, values]) => start + WEEK <= recentStart && values.length >= minWeekly).slice(0, anchorWeeks);
+            const anchorValues = anchor.flatMap(([, values]) => values);
+            const recentValues = personSamples.filter(sample => sample.at >= recentStart).map(sample => sample.value);
+            const stable = ordered.filter(([, values]) => values.length >= minWeekly);
+            const [previousWeek, lastWeek] = stable.slice(-2);
+            const anchoredMean = anchorValues.length >= minAnchor ? mean(anchorValues) : null;
+            const recentMean = recentValues.length >= minRecent ? mean(recentValues) : null;
+            const absoluteDelta = anchoredMean !== null && recentMean !== null ? recentMean - anchoredMean : null;
+            const worsening = absoluteDelta === null ? null : sign * absoluteDelta;
+            const reasons = [];
+            let flagged = false;
+            if (recentMean === null)
+                reasons.push(`insufficient_recent_samples (${recentValues.length} < ${minRecent})`);
+            else {
+                const driftLimit = drift[metric], levelLimit = level[metric];
+                if (anchoredMean === null)
+                    reasons.push(`insufficient_anchor_history (${anchorValues.length} < ${minAnchor})`);
+                else if (driftLimit !== null && worsening >= driftLimit) {
+                    flagged = true;
+                    reasons.push(`anchored_drift: ${metric} ${lowerIsWorse ? "fell" : "rose"} ${fmt(Math.abs(absoluteDelta))} from the anchored baseline ${fmt(anchoredMean)} to ${fmt(recentMean)} (threshold ${driftLimit})`);
+                }
+                if (levelLimit !== null && sign * (recentMean - levelLimit) >= 0) {
+                    flagged = true;
+                    reasons.push(`sustained_level: recent ${metric} ${fmt(recentMean)} is ${lowerIsWorse ? "at or below" : "at or above"} ${levelLimit}`);
+                }
+                if (!reasons.length)
+                    reasons.push("stable");
+            }
+            reports.push({
+                personId, metric, direction: lowerIsWorse ? "lower_is_worse" : "higher_is_worse",
+                anchoredMean, anchorStart: anchor[0]?.[0] ?? null, anchorEnd: anchor.length ? anchor.at(-1)[0] + WEEK : null,
+                anchorSamples: anchorValues.length, recentMean, recentStart, recentSamples: recentValues.length,
+                absoluteDelta, worsening, recentAbsoluteLevel: recentMean,
+                rollingWeeklyDelta: previousWeek && lastWeek ? mean(lastWeek[1]) - mean(previousWeek[1]) : null,
+                weeksObserved: weeks.size, flagged, reason: reasons.join("; "),
+            });
+        }
+    }
+    return reports;
+}
+/** Compact view for `memory-emotions baselines`: flagged entries plus counts. */
+export function summarizeSentimentDrift(reports) {
+    return {
+        people: new Set(reports.map(report => report.personId)).size,
+        evaluated: reports.filter(report => report.recentMean !== null).length,
+        flagged: reports.filter(report => report.flagged),
+    };
 }

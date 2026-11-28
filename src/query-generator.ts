@@ -7,9 +7,11 @@ import { messageText } from "./whisperer-context.js";
 import { CONVERSATION_INFO, queryUserText } from "./response-text.js";
 import { parseQueryPair, prepareQueryConversation, type QueryConversation, type QueryPair } from "./query-contract.js";
 import { nonBlank, record } from "./guards.js";
+import { classifySyntheticInput, isSyntheticEvidence, type SyntheticInputFilterConfig } from "./synthetic-input.js";
 
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
-export function visibleQueryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string): QueryConversation {
+export function visibleQueryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string,
+  syntheticInput?: SyntheticInputFilterConfig): QueryConversation {
   const currentRequest = queryUserText(currentUserMessage !== undefined ? currentUserMessage : prompt) ?? "";
   const visible: QueryConversation["history"] = [];
   const assistantTexts = new Map<string, boolean>();
@@ -20,7 +22,7 @@ export function visibleQueryConversation(prompt: string, messages: readonly unkn
     }
     if (!message || message.role === "toolResult" || message.role === "tool") continue;
     const meta = record(message.__openclaw);
-    if (message.provenance !== undefined || (message.role === "user" && record(meta?.senderIdentity)?.senderKind === "bot")) {
+    if (message.role === "user" && record(meta?.senderIdentity)?.senderKind === "bot") {
       visible.length = 0; assistantTexts.clear(); continue;
     }
     const mirror = message.provider === "openclaw" && message.model === "delivery-mirror";
@@ -36,19 +38,23 @@ export function visibleQueryConversation(prompt: string, messages: readonly unkn
         // never to bypass a rejected Conversation info envelope.
         (upstream && CONVERSATION_INFO.test(upstream.trim()) ? undefined : (text.text ? queryUserText(text.text, sender) : undefined))
       : text?.text;
+    const classified = classifySyntheticInput({ text: content ?? "", role: message.role,
+      inputProvenance: message.inputProvenance ?? message.provenance ?? event?.inputProvenance,
+      display: message.display ?? event?.display,
+    }, syntheticInput);
     if (message.role === "user") {
       assistantTexts.clear();
-      if (!content || /^(?:\[cron:|\[OpenClaw heartbeat poll\]|\[Inter-session message\]|\[Queued messages while agent was busy\]|\[Subagent Context\]|<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>|<relevant-memories>|<unblock_memory>|<conversation_context>)/.test(content)) {
+      if (!classified.text || isSyntheticEvidence(classified) || /^(?:<relevant-memories>|<unblock_memory>|<conversation_context>)/.test(classified.text)) {
         visible.length = 0; continue;
       }
     }
-    if (!text || !content || (text.role === "assistant" && (content === "NO_REPLY" || content === "HEARTBEAT_OK"))) continue;
+    if (!text || !classified.text || isSyntheticEvidence(classified)) continue;
     if (text.role === "assistant") {
-      const previous = assistantTexts.get(content);
-      assistantTexts.set(content, mirror);
+      const previous = assistantTexts.get(classified.text);
+      assistantTexts.set(classified.text, mirror);
       if (previous !== undefined && (mirror || previous)) continue;
     }
-    visible.push({ role: text.role, content });
+    visible.push({ role: text.role, content: classified.text });
   }
   const last = visible.at(-1);
   if (last?.role === "user" && last.content.replaceAll("\r\n", "\n") === currentRequest.replaceAll("\r\n", "\n")) visible.pop();

@@ -6,7 +6,7 @@ import { abortable } from "./abortable.js";
 import type { ChatType } from "./config.js";
 import type { ExtractionSession } from "./extraction-store.js";
 import type { ExtractionMessage } from "./extraction-model.js";
-import { projectMessage } from "./session-projector.js";
+import { projectMessage, type SessionProjectionInput } from "./session-projector.js";
 
 export function extractionSessions(databasePath: string, agentId: string, chatTypes: ChatType[]): ExtractionSession[] {
   const db = new DatabaseSync(databasePath, { readOnly: true });
@@ -41,7 +41,7 @@ export type ExtractionPage = { kind: "page"; cursor: string; hasMore: boolean; m
 export async function readExtractionPage(agentId: string, agentName: string, session: ExtractionSession,
   cursor: string | null, read?: (params: { agentId: string; sessionId: string; sessionKey: string;
     cursor?: string; maxMessages: number; maxBytes: number }) => Promise<unknown>,
-  signal?: AbortSignal): Promise<ExtractionPage> {
+  signal?: AbortSignal, syntheticInput?: SessionProjectionInput["syntheticInput"]): Promise<ExtractionPage> {
   signal?.throwIfAborted();
   // Runtime-only import: the supported host export ships JS without a declaration file.
   const sdkPath = "openclaw/plugin-sdk/session-transcript-runtime";
@@ -70,7 +70,7 @@ export async function readExtractionPage(agentId: string, agentName: string, ses
       const createdAt = Date.parse(entry.createdAt ?? "");
       if (!Number.isFinite(createdAt)) throw new Error("Extraction message has no source date");
       const projected = projectMessage({ eventJson: JSON.stringify({ type: "message", timestamp: entry.createdAt, message: entry.message }), createdAt },
-        { ...session, agentName, timezone: "UTC", events: [] });
+        { ...session, agentName, timezone: "UTC", events: [], syntheticInput });
       return projected?.text ? [{ id: entry.entryId, speaker: projected.speaker, role: projected.role, text: projected.text, timestamp: projected.timestamp }] : [];
     });
     return { kind: "page", cursor: result.cursor, hasMore: result.hasMore, messages, entryCount: result.entries.length };

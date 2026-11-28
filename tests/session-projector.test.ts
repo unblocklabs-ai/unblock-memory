@@ -176,17 +176,22 @@ test("creates provider-first safe paths and hashes private iMessage identities",
   }), /(^|\/)\.\.?\//);
 });
 
-test("excludes exact role-specific transport placeholders, not substantive or quoted messages", () => {
-  const project = (role: string, content: string) => projectSession({
+test("excludes runtime placeholders and preserves substantive messages with stripped wrappers", () => {
+  const project = (role: string, content: string, metadata: Record<string, unknown> = {}) => projectSession({
     sessionId: "sentinels", chatType: "group", startedAt: 1, agentName: "Bill", timezone: "UTC",
-    events: [{ createdAt: 1, eventJson: JSON.stringify({ type: "message", message: { role, content } }) }],
+    events: [{ createdAt: 1, eventJson: JSON.stringify({ type: "message", message: { role, content, ...metadata } }) }],
   });
   assert.equal(project("assistant", "  NO_REPLY\n"), undefined);
   assert.equal(project("user", "[Queued messages while agent was busy]"), undefined);
+  assert.equal(project("user", "Continue the OpenClaw runtime event."), undefined);
+  assert.equal(project("user", "opaque wake body", { display: false }), undefined);
+  assert.equal(project("user", "opaque wake body", { provenance: { kind: "inter_session", sourceTool: "agent_harness_completion" } }), undefined);
+  const queued = project("user", "[Queued messages while agent was busy]\nPlease review the incident.");
+  assert.match(queued ?? "", /Please review the incident/u);
+  assert.doesNotMatch(queued ?? "", /Queued messages/u);
   for (const [role, content] of [
-    ["user", "NO_REPLY"],
+    ["user", "What happens when I send NO_REPLY?"],
     ["assistant", "Use NO_REPLY for silent completion."],
-    ["user", "[Queued messages while agent was busy]\nPlease review the incident."],
     ["user", "[Audio attachment: recording.m4a]"],
   ]) assert.ok(project(role!, content!)?.includes(content!));
 });

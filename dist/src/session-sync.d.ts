@@ -1,7 +1,7 @@
 import type { ChatType } from "./config.js";
 import { type SessionMetadata, type SessionProjectionInput } from "./session-projector.js";
 import type { SessionManifest } from "./session-sync-state.js";
-export declare const PROJECTOR_VERSION = 8;
+export declare const PROJECTOR_VERSION = 9;
 export type SessionSyncResult = {
     scanned: number;
     unchanged: number;
@@ -22,6 +22,7 @@ type ProjectionOptions = {
     agentName: string;
     timezone: string;
     chatTypes: readonly ChatType[];
+    syntheticInput?: SessionProjectionInput["syntheticInput"];
 };
 /** A projected session document: QMD stores it directly; nothing is written to disk. */
 type SessionDocument = {

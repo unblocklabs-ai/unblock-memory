@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
 import { DEFAULTS } from "./defaults.js";
+import { readPathSalience } from "./emotional-salience.js";
 import { redactSecrets, WORKSPACE_AUDIENCE } from "./expectations-store.js";
 import { tableExists } from "./memory-database.js";
 import { ensureMemoryCrystalsSchema, recordCoreMemory } from "./memory-crystals.js";
@@ -20,7 +21,10 @@ export const CRYSTALS_DEFAULTS = {
     ltmPromoteMinHits: 5,
     allowedCorpora: ["memory", "knowledge"],
     timeoutMs: 0,
+    prioritizeEmotionalSalience: true,
 };
+/** At most this share of a cluster's member slots may go to high-salience non-representative evidence (at least one). */
+const EMOTION_SLOT_SHARE = 1 / 4;
 const CRYSTAL_SYNTHESIS_SCHEMA = Type.Object({
     shouldCrystallize: Type.Boolean(),
     title: Type.String(),
@@ -118,10 +122,11 @@ async function readWorkspaceEvidence(options, clusterId, availableSize, runId, l
             const resolved = memberSources(member, allowed, options.corpusForCollection);
             if (!resolved?.sources.length)
                 return "audience";
-            if (offset === 0 && evidence.length < limit && member.text.trim()) {
+            if (member.text.trim()) {
                 const span = indexedSpan(member);
                 if (span)
-                    evidence.push({ ...resolved.sources[0], ...span, member, text: redactSecrets(member.text), corpora: resolved.corpora });
+                    evidence.push({ ...resolved.sources[0], ...span, member, corpora: resolved.corpora,
+                        paths: resolved.sources.map(source => source.sourcePath), representative: offset === 0 });
             }
         }
         if (seen.size === availableSize && !page?.hasMore)
@@ -234,7 +239,7 @@ function addUsage(total, next) {
 }
 /** Run one per-agent scheduled pass. Publication, decay and re-arming share the WorkStore commit fence. */
 export async function runCrystalsPass(options) {
-    const { agentId, analysis, workStore, runner, now = Date.now, intervalMinutes = CRYSTALS_DEFAULTS.intervalMinutes, reclusterMinIntervalMinutes = CRYSTALS_DEFAULTS.reclusterMinIntervalMinutes, autoRecluster = CRYSTALS_DEFAULTS.autoRecluster, minClusterSize = CRYSTALS_DEFAULTS.minClusterSize, maxClusters = ANALYSIS_PAGE_LIMIT, maxClustersPerRun = CRYSTALS_DEFAULTS.maxClustersPerRun, maxMembersPerCluster = CRYSTALS_DEFAULTS.maxMembersPerCluster, stmStaleAfterMinutes = CRYSTALS_DEFAULTS.stmStaleAfterMinutes, ltmPromoteMinHelped = CRYSTALS_DEFAULTS.ltmPromoteMinHelped, ltmPromoteMinHits = CRYSTALS_DEFAULTS.ltmPromoteMinHits, allowedCorpora = CRYSTALS_DEFAULTS.allowedCorpora, timeoutMs = CRYSTALS_DEFAULTS.timeoutMs, leaseMs = DEFAULTS.steward.leaseMs, heartbeatMs = Math.max(1, Math.floor(leaseMs / 3)), } = options;
+    const { agentId, analysis, workStore, runner, now = Date.now, intervalMinutes = CRYSTALS_DEFAULTS.intervalMinutes, reclusterMinIntervalMinutes = CRYSTALS_DEFAULTS.reclusterMinIntervalMinutes, autoRecluster = CRYSTALS_DEFAULTS.autoRecluster, minClusterSize = CRYSTALS_DEFAULTS.minClusterSize, maxClusters = ANALYSIS_PAGE_LIMIT, maxClustersPerRun = CRYSTALS_DEFAULTS.maxClustersPerRun, maxMembersPerCluster = CRYSTALS_DEFAULTS.maxMembersPerCluster, stmStaleAfterMinutes = CRYSTALS_DEFAULTS.stmStaleAfterMinutes, ltmPromoteMinHelped = CRYSTALS_DEFAULTS.ltmPromoteMinHelped, ltmPromoteMinHits = CRYSTALS_DEFAULTS.ltmPromoteMinHits, allowedCorpora = CRYSTALS_DEFAULTS.allowedCorpora, timeoutMs = CRYSTALS_DEFAULTS.timeoutMs, prioritizeEmotionalSalience = CRYSTALS_DEFAULTS.prioritizeEmotionalSalience, leaseMs = DEFAULTS.steward.leaseMs, heartbeatMs = Math.max(1, Math.floor(leaseMs / 3)), } = options;
     for (const [name, value, minimum] of [["intervalMinutes", intervalMinutes, 1], ["reclusterMinIntervalMinutes", reclusterMinIntervalMinutes, 0],
         ["minClusterSize", minClusterSize, 1], ["maxClusters", maxClusters, 1], ["maxClustersPerRun", maxClustersPerRun, 0],
         ["maxMembersPerCluster", maxMembersPerCluster, 0], ["stmStaleAfterMinutes", stmStaleAfterMinutes, 0],
@@ -305,17 +310,56 @@ export async function runCrystalsPass(options) {
             const plannedDigests = new Set();
             const eligible = list.clusters.filter(cluster => cluster.availableSize >= minClusterSize);
             const memberLimit = maxMembersPerCluster || ANALYSIS_PAGE_LIMIT;
-            // No further model calls after a credential fault; unchanged crystals still re-verify (and renew) for free.
-            let modelUnavailable = false;
-            // The cap counts synthesis attempts only: unchanged, private or ineligible clusters never consume the budget.
+            const candidates = [];
+            const paths = new Set();
             for (const cluster of eligible) {
-                const { clusterId, availableSize, meanProbability: brightness } = cluster;
-                const evidence = await readWorkspaceEvidence(options, clusterId, availableSize, list.runId, memberLimit, allowed, signal);
-                if (evidence === "audience") {
+                const members = await readWorkspaceEvidence(options, cluster.clusterId, cluster.availableSize, list.runId, memberLimit, allowed, signal);
+                if (members === "audience") {
                     counts.skippedAudience++;
                     continue;
                 }
-                if (!evidence?.length)
+                if (!members?.length)
+                    continue;
+                candidates.push({ cluster, members });
+                for (const member of members)
+                    for (const path of member.paths)
+                        paths.add(path);
+            }
+            signal.throwIfAborted();
+            // Only after every alias and member passed ACL do we read salience for those sources, and never grades from the future.
+            const salience = prioritizeEmotionalSalience && paths.size
+                ? readPathSalience(workStore.db, agentId, [...paths], { nowMs: startedAt,
+                    ...(options.baselineMinInteractions !== undefined ? { baselineMinInteractions: options.baselineMinInteractions } : {}) })
+                : new Map();
+            const reserved = Math.max(1, Math.floor(memberLimit * EMOTION_SLOT_SHARE));
+            const ranked = candidates.map(({ cluster, members }) => {
+                // Only the configured high-salience gate counts; a routine nonzero grade never moves evidence.
+                const scored = members.map((item, index) => ({ item, index, salience: Math.max(0, ...item.paths.map(path => {
+                        const signal = salience.get(path);
+                        return signal?.highSalience ? signal.salienceScore : 0;
+                    })) }));
+                const peak = scored.reduce((max, entry) => Math.max(max, entry.salience), 0);
+                // Representatives keep their native order and the top slots, so a new grade swaps at most the bounded reserve
+                // and the input digest stays stable across passes.
+                const flashbulb = scored.filter(({ item, salience }) => !item.representative && salience > 0)
+                    .sort((a, b) => b.salience - a.salience || a.index - b.index).slice(0, Math.min(reserved, memberLimit));
+                const representatives = scored.filter(({ item }) => item.representative).slice(0, memberLimit - flashbulb.length);
+                const evidence = [...flashbulb, ...representatives]
+                    .map(({ item: { paths: _paths, representative: _representative, ...item } }) => ({ ...item, text: redactSecrets(item.member.text) }));
+                return { cluster, evidence, peak };
+            });
+            if (maxClustersPerRun > 0 && ranked.some(entry => entry.peak > 0)) {
+                // Native analysis orders by size. The bounded boost can move close peers ahead, not swamp cluster size.
+                const priority = ({ cluster, peak }) => Math.log1p(cluster.size) + 0.1 * peak;
+                ranked.sort((a, b) => priority(b) - priority(a));
+            }
+            // No further model calls after a credential fault; unchanged crystals still re-verify (and renew) for free.
+            let modelUnavailable = false;
+            // The cap counts synthesis attempts only: unchanged, private or ineligible clusters never consume the budget.
+            for (const { cluster, evidence } of ranked) {
+                signal.throwIfAborted();
+                const { clusterId, meanProbability: brightness } = cluster;
+                if (!evidence.length)
                     continue;
                 const inputDigest = hash(evidence.map(({ member }) => memberKey(member)).sort().join("\n"));
                 if (plannedDigests.has(inputDigest))

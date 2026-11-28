@@ -690,6 +690,7 @@ export function registerUnblockMemory(api) {
         analysisExecutable: config.analysis.executable,
         keepEmbeddingModelWarm: config.keepEmbeddingModelWarm,
         extraction: config.extraction,
+        syntheticInput: config.syntheticInput,
         recallLedgerEnabled: config.recallLedger.enabled,
     });
     registerExtraction(api, config, runtime);
@@ -749,6 +750,7 @@ export function registerUnblockMemory(api) {
     const brightness = whisperer.brightness && whisperer.brightness.recipe !== "off" ? whisperer.brightness : undefined;
     registerWhispererPrompt(api, {
         memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics, recallLedger, {
+            syntheticInput: config.syntheticInput,
             ...(config.memoryWhisperer.derivedObservations !== false ? {
                 derivedObservations: {
                     dbPathForAgent: memoryDatabasePath,
@@ -776,7 +778,8 @@ export function registerUnblockMemory(api) {
                     ...(whisperer.crystalLtmRankBoost !== undefined ? { ltmRankBoost: whisperer.crystalLtmRankBoost } : {}),
                 },
             } : {}),
-            ...(brightness ? { brightness: { ...brightness, dbPathForAgent: memoryDatabasePath } } : {}),
+            ...(brightness ? { brightness: { ...brightness, dbPathForAgent: memoryDatabasePath,
+                    baselineMinInteractions: config.insideOut.baselineMinInteractions } } : {}),
             ...(whisperer.recipeHash ? { recipeHash: whisperer.recipeHash } : {}),
         }),
         skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics, recallLedger && {

@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { AgentTranscriptReader } from "./agent-transcript.js";
+import { jsonHash } from "./json-hash.js";
 
 type InsideOutEvent = {
   type: string; seq: number; id?: string; parentId?: string | null; targetId?: string | null; timestamp?: string;
@@ -17,6 +18,23 @@ type InsideOutEvent = {
       senderIdentity?: { id?: string; senderKind?: string; type?: string; pluginId?: string; accountId?: string };
       transport?: { channel?: string; threadId?: string | number } } };
 };
+/** A live transcript row as Inside Out grades it: parsed, sequenced, and timestamped from the row when the event has none. */
+function liveTranscriptEvent(row: { eventJson: string; seq: number; createdAt: number }): InsideOutEvent {
+  const event = JSON.parse(row.eventJson) as InsideOutEvent;
+  event.seq = row.seq;
+  event.timestamp ??= new Date(row.createdAt).toISOString();
+  return event;
+}
+
+/**
+ * The message identity Inside Out stores as `message_id` for a live transcript row: the event id, or the hash of the
+ * event exactly as {@link liveTranscriptEvent} builds it. Captain's Log joins grades on this, so ID-less events match.
+ */
+export function liveTranscriptMessageId(row: { eventJson: string; seq: number; createdAt: number }): string {
+  const event = liveTranscriptEvent(row);
+  return event.id ?? jsonHash(event);
+}
+
 export type InsideOutSource = { sessionId: string; channel: string; account: string; source: string; events: InsideOutEvent[] };
 type SourceReader = { source: string; sessionId?: string; signature: string; revision: string; read: () => InsideOutSource };
 type Paths = { agentId: string; databasePath: string; sessionsDir?: string; sessionId?: string };
@@ -100,12 +118,7 @@ export async function* readInsideOutSources(paths: Paths, errors: string[]): Asy
           try {
             const snapshot = transcripts.read(sessionId, { maxSeq: Number(s.tail) });
             if (snapshot.kind !== "ready") throw new Error(`Transcript unavailable: ${snapshot.kind}`);
-            const events = snapshot.rows.map(row => {
-              const event = JSON.parse(row.eventJson) as InsideOutEvent;
-              event.seq = row.seq;
-              event.timestamp ??= new Date(row.createdAt).toISOString();
-              return event;
-            });
+            const events = snapshot.rows.map(liveTranscriptEvent);
             return { sessionId, source, events, ...metadata.get(sessionId)! };
           } finally { db.exec("COMMIT"); }
         } };

@@ -1,5 +1,6 @@
 import type { ChatType } from "./config.js";
 import { projectLoggieMessage } from "./loggie-projection.js";
+import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 export type SessionMetadata = {
     sessionId: string;
     provider?: string;
@@ -16,6 +17,7 @@ export type SessionProjectionInput = SessionMetadata & {
         eventJson: string;
         createdAt: number;
     }[];
+    syntheticInput?: SyntheticInputFilterConfig;
     /** Optional counters for this projection pass; never contains source text. */
     diagnostics?: {
         internalMessagesCleaned: number;

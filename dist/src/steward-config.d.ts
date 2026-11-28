@@ -78,6 +78,14 @@ type StewardCaptainsLogConfig = {
     timeoutMs: number;
     /** Chat types excluded from workspace `memory/YYYY-MM-DD.md` distillation (default: `["direct"]`). */
     excludeChatTypes: ChatType[];
+    /** Cue emotionally salient human messages (Inside Out grades) to Steward and rank salient entries behind blockers. */
+    includeEmotionalSalience: boolean;
+    /** 0..1 salience score at which a graded message is cued as high-salience. */
+    minSalienceScore: number;
+    /** 0..3 absolute Inside Out intensity at which a message is always high-salience, regardless of the person's history. */
+    minAbsoluteIntensity: number;
+    /** 0..3 absolute intensity below which a person-relative spike never counts (a rare-but-trivial blip stays quiet). */
+    minRelativeIntensity: number;
 };
 /** Deterministic (no model call) outcome scoring of memory hits, skills and person whispers into `memory_outcomes`. */
 type StewardOutcomeLedgerConfig = {
@@ -165,6 +173,11 @@ type StewardCrystalsConfig = {
     allowedCorpora: string[];
     /** Per model call timeout in ms (`0` = unlimited). */
     timeoutMs: number;
+    /**
+     * Let high-salience (Flashbulb) evidence take a bounded share (≤ 1/4, at least one) of a cluster's member slots and
+     * nudge synthesis order; representative members keep the remaining slots.
+     */
+    prioritizeEmotionalSalience: boolean;
 };
 /** Overnight Thinking: Voltaire Drift, Shortfall Post-Mortems and Anticipatory Pre-Answering (`steward-overnight.ts`). */
 type StewardOvernightConfig = {

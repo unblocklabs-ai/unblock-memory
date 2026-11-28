@@ -79,8 +79,8 @@ export declare class PeopleLearningStore {
                 changeId: string;
             }[];
             peopleReviews: {
-                status: "reviewed" | "no_interactions" | "unresolved";
                 personId: string;
+                status: "reviewed" | "no_interactions" | "unresolved";
                 reason: string;
                 reviewedAt: string;
                 sessionIds: string[];
@@ -89,10 +89,10 @@ export declare class PeopleLearningStore {
             assertionReviews: {
                 correctionsCheckedAt?: string | undefined;
                 reason: string;
+                disposition: "retired" | "unresolved" | "revalidated" | "corrected";
                 reviewedAt: string;
                 sourceRefs: string[];
                 assertionId: string;
-                disposition: "retired" | "unresolved" | "revalidated" | "corrected";
             }[];
             sourceGapReviews: {
                 status: "resolved" | "unresolved";
@@ -121,8 +121,8 @@ export declare class PeopleLearningStore {
                 changeId: string;
             }[];
             peopleReviews: {
-                status: "reviewed" | "no_interactions" | "unresolved";
                 personId: string;
+                status: "reviewed" | "no_interactions" | "unresolved";
                 reason: string;
                 reviewedAt: string;
                 sessionIds: string[];
@@ -131,10 +131,10 @@ export declare class PeopleLearningStore {
             assertionReviews: {
                 correctionsCheckedAt?: string | undefined;
                 reason: string;
+                disposition: "retired" | "unresolved" | "revalidated" | "corrected";
                 reviewedAt: string;
                 sourceRefs: string[];
                 assertionId: string;
-                disposition: "retired" | "unresolved" | "revalidated" | "corrected";
             }[];
             sourceGapReviews: {
                 status: "resolved" | "unresolved";

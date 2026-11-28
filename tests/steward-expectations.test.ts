@@ -180,6 +180,16 @@ test("extracts grounded commitments and predictions, dropping hallucinated refs,
   assert.equal(second?.kind === "extract" && second.prompt.openExpectations.length, 1, "only this audience's open expectations are offered");
 });
 
+test("human heartbeat commitments enter the evidence, standalone runtime wakes do not", async t => {
+  const f = fixture(t);
+  const human = "I will fix heartbeat alerts for /api/accounts by Friday.";
+  f.seed("human", human);
+  f.seed("runtime", "OpenClaw: Continue the OpenClaw runtime event.");
+  await f.run();
+  assert.match(f.promptText(), /I will fix heartbeat alerts for \/api\/accounts by Friday\./u);
+  assert.doesNotMatch(f.promptText(), /Continue the OpenClaw runtime event/u);
+});
+
 test("due sweep resolves kept (0.1) and broken (0.9), maps prediction verdicts and leaves young items alone", async t => {
   const f = fixture(t, { sweep: prompt => ({ judgments: [
     { ref: "e1", verdict: "kept", surpriseScore: 0.1, resolutionNote: "Fix shipped and confirmed in #acme.", sessionRefs: ["s1"] },

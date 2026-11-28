@@ -92,7 +92,9 @@ export type OutcomeLedgerPassOptions = {
 
 type Cursor = { at: number; kind: OutcomeSubjectKind; evidence: string; subject: string };
 type Sweep = { from: number; through: number; after?: Cursor };
-type Watermark = { schemaVersion: 1; lastMeasuredAtMs: number; sweep?: Sweep };
+type Watermark = { schemaVersion: 1; lastMeasuredAtMs: number; sweep?: Sweep;
+  /** Stamped once {@link repairValenceAttribution} has restated this agent's legacy rows; it never rescans after. */
+  valenceAttributionRepaired?: true };
 type Exposure = Cursor & {
   sourceId: number; session: string | null; sessionKey: string | null; run: string | null;
   recipe: string | null; delivered: boolean; provider: string | null; account: string | null; sender: string | null;
@@ -103,6 +105,7 @@ function readWatermark(json: string | null): Watermark {
   const value = JSON.parse(json) as Watermark | null;
   const sweep = value?.sweep;
   if (value?.schemaVersion !== 1 || !Number.isSafeInteger(value.lastMeasuredAtMs) ||
+      (value.valenceAttributionRepaired !== undefined && value.valenceAttributionRepaired !== true) ||
       (sweep && (!Number.isSafeInteger(sweep.from) || !Number.isSafeInteger(sweep.through) ||
         !sweep.after || !Number.isSafeInteger(sweep.after.at) ||
         !["memory_hit", "skill", "person_whisper"].includes(sweep.after.kind) ||
@@ -207,10 +210,13 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
   const insideOut = tableExists(db, "inside_out");
   // Per-exposure grade lookups are keyed by session and time; keep them off a full table scan.
   if (insideOut) db.exec("CREATE INDEX IF NOT EXISTS idx_inside_out_session_target ON inside_out(session_id, target_at)");
-  const hasPerson = insideOut && columns(db, "inside_out").has("person_id");
+  const insideOutColumns = insideOut ? columns(db, "inside_out") : new Set<SQLOutputValue>();
+  const hasPerson = insideOutColumns.has("person_id");
   const valence = "joy-max(sadness,fear,anger,disgust)";
+  // Unsigned 0..3 intensity exists only on grades written since it was added; NULL is unknown, never calm.
+  const intensity = insideOutColumns.has("intensity") ? "intensity" : "NULL";
   const grade = insideOut ? db.prepare(`SELECT interaction_id,rubric,human_key,${hasPerson ? "person_id" : "NULL"} person_id,
-    channel,sender_id,${valence} valence FROM inside_out
+    channel,sender_id,${valence} valence,${intensity} intensity FROM inside_out
     WHERE session_id=:session AND target_at BETWEEN :from AND :through AND error IS NULL AND (${valence}) IS NOT NULL
     ORDER BY target_at,reviewed_at DESC,interaction_id,rubric LIMIT 1`) : undefined;
   const baseline = insideOut ? db.prepare(`SELECT count(*) n, avg(v) mean, avg(v*v) squareMean FROM (
@@ -245,6 +251,8 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
     const current = session ? grade?.get({ session, from: Math.max(at + 1, Number(episode?.episode_at ?? at) + 1),
       through: typeof following === "number" ? following : through }) : undefined;
     let insideOutDelta: number | null = null;
+    let insideOutValence: number | null = null;
+    let insideOutIntensity: number | null = null;
     let baselineCount = 0;
     let sharpDrop = false;
     if (current && baseline && typeof current.valence === "number" &&
@@ -252,6 +260,8 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
         (!exposure.sender || exposure.sender === current.sender_id) &&
         (!exposure.provider || exposure.provider === current.channel) &&
         (!exposure.account || exposure.account === identityAccount(current.human_key))) {
+      insideOutValence = current.valence;
+      insideOutIntensity = typeof current.intensity === "number" ? current.intensity : null;
       const history = baseline.get({
         person: current.person_id, human: current.human_key, rubric: current.rubric,
         since: at - lookbackMs, before: at, interaction: current.interaction_id,
@@ -263,16 +273,18 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
         sharpDrop = insideOutDelta <= -Math.max(0.25, 2 * Math.sqrt(Math.max(0, Number(history.squareMean) - mean * mean)));
       }
     }
+    // Only agent-attributed evidence is negative. An Inside Out valence drop is the human's own emotion about
+    // anything (grief, bad news, a crisis), so it stays observational telemetry and never blames recalled memory.
     const shortfall = response?.status === "reported_shortfall";
-    const negative = shortfall || sharpDrop;
+    const negative = shortfall;
     const positive = response?.status === "acknowledged_success";
     const used = kind === "skill" ? opened : kind === "memory_hit" ? read || exposure.delivered : exposure.delivered;
     const explicitUse = read || opened;
     const verdict: Verdict = negative && used ? "hurt"
       : !negative && (explicitUse || (used && positive)) ? "helped" : "ignored";
-    const reason = negative ? !used ? "negative_without_exposure" : shortfall ? "reported_shortfall" : "personal_valence_drop"
+    const reason = negative ? !used ? "negative_without_exposure" : "reported_shortfall"
       : read ? "read" : opened ? "opened" : used && positive ? "acknowledged_success" : "no_use_or_outcome_signal";
-    const confidence = verdict === "hurt" ? (shortfall ? 0.9 : 0.7)
+    const confidence = verdict === "hurt" ? 0.9
       : verdict === "helped" ? (explicitUse && positive ? 0.95 : 0.8) : explicitUse || !used ? 0.8 : 0.5;
     const episodeId = stringOrNull(episode?.id);
     const turnId = episodeId ? `episode:${episodeId}` : run ? `run:${run}` : exposure.evidence;
@@ -280,9 +292,28 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
       session, verdict, confidence,
       signals: { delivered: exposure.delivered, opened, read, responseOutcome: response?.status ?? null,
         responseEpisodeId: episodeId, responseBasis: response?.basis ?? [],
-        insideOutDelta, baselineCount, negative, turnId, reason },
+        insideOutDelta, insideOutValence, insideOutIntensity, baselineCount, sharpDrop, negative, turnId, reason },
     };
   };
+}
+
+/**
+ * Earlier versions let an Inside Out valence drop alone mark a used subject `hurt`. Rows outside the rescan
+ * window are never re-scored, so restate them from their own stored signals with the same verdict rules
+ * (`used` was necessarily true for that reason). Idempotent; touches only rows still carrying the old reason.
+ */
+function repairValenceAttribution(db: DatabaseSync, agentId: string): number {
+  const explicit = "(json_extract(signals_json,'$.read')=1 OR json_extract(signals_json,'$.opened')=1)";
+  const positive = "json_extract(signals_json,'$.responseOutcome') IS 'acknowledged_success'";
+  return Number(db.prepare(`UPDATE memory_outcomes SET
+      verdict=CASE WHEN ${explicit} OR ${positive} THEN 'helped' ELSE 'ignored' END,
+      confidence=CASE WHEN ${explicit} AND ${positive} THEN 0.95 WHEN ${explicit} OR ${positive} THEN 0.8 ELSE 0.5 END,
+      signals_json=json_set(signals_json,'$.negative',json('false'),'$.sharpDrop',json('true'),
+        '$.reason',CASE WHEN json_extract(signals_json,'$.read')=1 THEN 'read'
+          WHEN json_extract(signals_json,'$.opened')=1 THEN 'opened'
+          WHEN ${positive} THEN 'acknowledged_success' ELSE 'no_use_or_outcome_signal' END,
+        '$.attributionRepair','valence_drop_not_agent_fault')
+    WHERE agent_id=? AND json_extract(signals_json,'$.reason')='personal_valence_drop'`).run(agentId).changes);
 }
 
 function identityAccount(json: SQLOutputValue): unknown {
@@ -374,7 +405,8 @@ export async function runOutcomeLedgerPass(options: OutcomeLedgerPassOptions): P
     const cursor = last && { at: last.at, kind: last.kind, evidence: last.evidence, subject: last.subject };
     const lastMeasuredAtMs = Math.max(watermark.lastMeasuredAtMs, hasMore && cursor ? cursor.at : sweep.through);
     const artifact: Watermark = { schemaVersion: 1, lastMeasuredAtMs,
-      ...(hasMore && cursor ? { sweep: { from: sweep.from, through: sweep.through, after: cursor } } : {}) };
+      ...(hasMore && cursor ? { sweep: { from: sweep.from, through: sweep.through, after: cursor } } : {}),
+      valenceAttributionRepaired: true };
     signal?.throwIfAborted();
     const pruned = workStore.commitWithDomain(claim, { nextDueAt, keepArtifact: true, now: now() }, () => {
       const put = db.prepare(`INSERT INTO memory_outcomes
@@ -389,6 +421,8 @@ export async function runOutcomeLedgerPass(options: OutcomeLedgerPassOptions): P
       }
       const drop = db.prepare("DELETE FROM memory_outcomes WHERE id=? AND subject_kind='memory_hit'");
       for (const id of unexposed) drop.run(id);
+      // One-time: current scoring never writes the legacy reason, so a stamped watermark skips the json_extract scan.
+      if (!watermark.valenceAttributionRepaired) repairValenceAttribution(db, agentId);
       const removed = retentionMs ? db.prepare("DELETE FROM memory_outcomes WHERE agent_id=? AND measured_at<?")
         .run(agentId, retentionFloor).changes : 0;
       workStore.stageArtifact(claim, { stage: "watermark", artifactJson: JSON.stringify(artifact), now: now() });
@@ -444,7 +478,8 @@ export function summarizeOutcomeMetrics(dbOrStore: DatabaseSync | OutcomeLedgerS
   const rows = db.prepare(`WITH selected AS (
     SELECT recipe_hash,verdict,subject_kind,coalesce(json_extract(signals_json,'$.turnId'),evidence_turn_id) turn,
       json_extract(signals_json,'$.opened') opened,json_extract(signals_json,'$.delivered') delivered,
-      coalesce(json_extract(signals_json,'$.negative'),json_extract(signals_json,'$.responseOutcome')='reported_shortfall',0) negative
+      -- Shortfalls are agent-attributed audit evidence only; legacy rows also set negative on a valence drop.
+      json_extract(signals_json,'$.responseOutcome') IS 'reported_shortfall' negative
     FROM memory_outcomes WHERE agent_id=:agent AND measured_at>=:since AND measured_at<:until
       AND (:recipe IS NULL OR recipe_hash=:recipe)
   ), grouped AS (

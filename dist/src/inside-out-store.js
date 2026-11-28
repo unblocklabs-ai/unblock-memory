@@ -27,12 +27,37 @@ export const PERSON_MATCH = `SELECT min(i.person_id) person_id FROM person_ident
   WHERE i.provider=e.channel AND i.external_id=e.sender_id
   AND (i.account_scope=json_extract(e.human_key,'$[1]') OR substr(json_extract(e.human_key,'$[1]'),1,8)='session:')
   HAVING count(DISTINCT i.person_id)=1`;
+/** Derived signed valence: joy against the strongest negative emotion, in -1..1. */
+export const INSIDE_OUT_VALENCE_SQL = "joy-max(sadness,fear,anger,disgust)";
+/**
+ * Additive columns (never a rubric change, so per-person 6-emotion history and grade caches stay valid):
+ * - `intensity`: expected unsigned 0..3 emotional weight; NULL on rows graded before it existed (unknown, not calm).
+ * - `intensity_probs_json`: the 0..3 probability distribution behind it.
+ * - `intensity_rubric`: which intensity question produced it, versioned separately from the presence rubric.
+ * - `valence`: stored `joy - max(sadness, fear, anger, disgust)`; backfilled once because it derives from existing grades.
+ */
+const ADDITIVE_COLUMNS = [
+    ["person_id", "TEXT"], ["intensity", "REAL"], ["intensity_probs_json", "TEXT"], ["intensity_rubric", "TEXT"], ["valence", "REAL"],
+];
 function ensureInsideOutSchema(db) {
     db.exec(SCHEMA);
-    if (!db.prepare("SELECT 1 FROM pragma_table_info('inside_out') WHERE name='person_id'").get()) {
-        db.exec("ALTER TABLE inside_out ADD COLUMN person_id TEXT");
+    const present = new Set(db.prepare("SELECT name FROM pragma_table_info('inside_out')").all().map(row => row.name));
+    const missing = ADDITIVE_COLUMNS.filter(([name]) => !present.has(name));
+    if (missing.length) {
+        immediateTransaction(db, () => {
+            for (const [name, type] of missing) {
+                if (!db.prepare("SELECT 1 FROM pragma_table_info('inside_out') WHERE name=?").get(name)) {
+                    db.exec(`ALTER TABLE inside_out ADD COLUMN ${name} ${type}`);
+                    if (name === "valence") {
+                        db.exec(`UPDATE inside_out SET valence=${INSIDE_OUT_VALENCE_SQL} WHERE error IS NULL AND (${INSIDE_OUT_VALENCE_SQL}) IS NOT NULL`);
+                    }
+                }
+            }
+        });
     }
     db.exec("CREATE INDEX IF NOT EXISTS inside_out_person_time ON inside_out(person_id,target_at)");
+    // Salience (Captain's Log, Crystals, Brightness) and the Outcome Ledger read grades by session, often in a time window.
+    db.exec("CREATE INDEX IF NOT EXISTS idx_inside_out_session_target ON inside_out(session_id, target_at)");
 }
 export function openInsideOutStore(path) {
     const db = openMemoryDatabase(path);
@@ -192,12 +217,12 @@ export function purgeInsideOutPerson(path, personId, options = {}) {
     if (!personId.trim())
         throw new Error("A PeopleSQL person ID is required");
     if (!existsSync(path))
-        return { baselines: 0, assessments: 0, grades: 0 };
+        return { baselines: 0, assessments: 0, grades: 0, captainsLogEntries: 0, outcomes: 0 };
     // Never create Inside Out tables in a store that has none.
     const db = openMemoryDatabase(path);
     try {
         if (!tableExists(db, "inside_out"))
-            return { baselines: 0, assessments: 0, grades: 0 };
+            return { baselines: 0, assessments: 0, grades: 0, captainsLogEntries: 0, outcomes: 0 };
         ensureInsideOutSchema(db);
         // Erasing grades must cover replies linked to this person since the last refresh.
         if (options.grades)

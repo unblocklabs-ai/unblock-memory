@@ -7,6 +7,22 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { AgentTranscriptReader } from "./agent-transcript.js";
+import { jsonHash } from "./json-hash.js";
+/** A live transcript row as Inside Out grades it: parsed, sequenced, and timestamped from the row when the event has none. */
+function liveTranscriptEvent(row) {
+    const event = JSON.parse(row.eventJson);
+    event.seq = row.seq;
+    event.timestamp ??= new Date(row.createdAt).toISOString();
+    return event;
+}
+/**
+ * The message identity Inside Out stores as `message_id` for a live transcript row: the event id, or the hash of the
+ * event exactly as {@link liveTranscriptEvent} builds it. Captain's Log joins grades on this, so ID-less events match.
+ */
+export function liveTranscriptMessageId(row) {
+    const event = liveTranscriptEvent(row);
+    return event.id ?? jsonHash(event);
+}
 /** Files contain branch trees; keep the selected leaf, not abandoned sibling conversations. */
 function selectedBranch(events) {
     const nodes = new Map(events.filter(e => e.id).map(e => [e.id, e]));
@@ -91,12 +107,7 @@ export async function* readInsideOutSources(paths, errors) {
                             const snapshot = transcripts.read(sessionId, { maxSeq: Number(s.tail) });
                             if (snapshot.kind !== "ready")
                                 throw new Error(`Transcript unavailable: ${snapshot.kind}`);
-                            const events = snapshot.rows.map(row => {
-                                const event = JSON.parse(row.eventJson);
-                                event.seq = row.seq;
-                                event.timestamp ??= new Date(row.createdAt).toISOString();
-                                return event;
-                            });
+                            const events = snapshot.rows.map(liveTranscriptEvent);
                             return { sessionId, source, events, ...metadata.get(sessionId) };
                         }
                         finally {

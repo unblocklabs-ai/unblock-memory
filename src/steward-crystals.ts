@@ -5,6 +5,7 @@ import { Value } from "typebox/value";
 import { abortable } from "./abortable.js";
 import type { MemoryAnalysisSummary, MemoryClusterDetail, MemoryClusterList, MemoryClusterSort } from "./analysis.js";
 import { DEFAULTS } from "./defaults.js";
+import { readPathSalience } from "./emotional-salience.js";
 import { redactSecrets, WORKSPACE_AUDIENCE } from "./expectations-store.js";
 import { tableExists } from "./memory-database.js";
 import { ensureMemoryCrystalsSchema, recordCoreMemory } from "./memory-crystals.js";
@@ -24,7 +25,10 @@ export const CRYSTALS_DEFAULTS = {
   ltmPromoteMinHits: 5,
   allowedCorpora: ["memory", "knowledge"],
   timeoutMs: 0,
+  prioritizeEmotionalSalience: true,
 } as const;
+/** At most this share of a cluster's member slots may go to high-salience non-representative evidence (at least one). */
+const EMOTION_SLOT_SHARE = 1 / 4;
 
 const CRYSTAL_SYNTHESIS_SCHEMA = Type.Object({
   shouldCrystallize: Type.Boolean(),
@@ -73,6 +77,13 @@ export type CrystalsPassOptions = {
   ltmPromoteMinHits?: number;
   allowedCorpora?: readonly string[];
   timeoutMs?: number;
+  /**
+   * Let high-salience (Flashbulb) evidence take a bounded share of member slots and nudge the synthesis order. Off: the
+   * representative sample only, and no salience is read.
+   */
+  prioritizeEmotionalSalience?: boolean;
+  /** Prior intensity grades a person needs before relative intensity counts (`insideOut.baselineMinInteractions`). */
+  baselineMinInteractions?: number;
   /** Operator run (`memory-steward crystals --run`): start before the schedule (never steals a live lease). */
   ignoreDueAt?: boolean;
   signal?: AbortSignal;
@@ -101,6 +112,7 @@ const WATERMARK = Type.Object({ schemaVersion: Type.Literal(1), lastReclusterAtM
 type Source = { corpus: string; sourcePath: string };
 type Span = { chunkPos: number; chunkLen: number; quoteHash: string };
 type Evidence = Source & Span & { member: AnalysisMember; text: string; corpora: string[] };
+type EvidenceCandidate = Omit<Evidence, "text"> & { paths: string[]; representative: boolean };
 const memberKey = (member: AnalysisMember) => `${member.hash}:${member.seq}`;
 const spanKey = (docHash: string, pos: number, len: number) => `${docHash}:${pos}:${len}`;
 
@@ -156,8 +168,8 @@ function indexedSpan(member: CrystalAnalysisMember): Span | undefined {
 }
 
 async function readWorkspaceEvidence(options: CrystalsPassOptions, clusterId: string, availableSize: number, runId: string | undefined,
-  limit: number, allowed: ReadonlySet<string>, signal: AbortSignal): Promise<Evidence[] | "audience" | undefined> {
-  const evidence: Evidence[] = [];
+  limit: number, allowed: ReadonlySet<string>, signal: AbortSignal): Promise<EvidenceCandidate[] | "audience" | undefined> {
+  const evidence: EvidenceCandidate[] = [];
   const seen = new Set<string>();
   let offset = 0;
   // Inspect every member before sending the representative sample. A private tail cannot hide behind the prompt cap.
@@ -175,9 +187,10 @@ async function readWorkspaceEvidence(options: CrystalsPassOptions, clusterId: st
       seen.add(key);
       const resolved = memberSources(member, allowed, options.corpusForCollection);
       if (!resolved?.sources.length) return "audience";
-      if (offset === 0 && evidence.length < limit && member.text.trim()) {
+      if (member.text.trim()) {
         const span = indexedSpan(member);
-        if (span) evidence.push({ ...resolved.sources[0]!, ...span, member, text: redactSecrets(member.text), corpora: resolved.corpora });
+        if (span) evidence.push({ ...resolved.sources[0]!, ...span, member, corpora: resolved.corpora,
+          paths: resolved.sources.map(source => source.sourcePath), representative: offset === 0 });
       }
     }
     if (seen.size === availableSize && !page?.hasMore) return evidence;
@@ -304,6 +317,7 @@ export async function runCrystalsPass(options: CrystalsPassOptions): Promise<Cry
     ltmPromoteMinHits = CRYSTALS_DEFAULTS.ltmPromoteMinHits,
     allowedCorpora = CRYSTALS_DEFAULTS.allowedCorpora,
     timeoutMs = CRYSTALS_DEFAULTS.timeoutMs,
+    prioritizeEmotionalSalience = CRYSTALS_DEFAULTS.prioritizeEmotionalSalience,
     leaseMs = DEFAULTS.steward.leaseMs,
     heartbeatMs = Math.max(1, Math.floor(leaseMs / 3)),
   } = options;
@@ -373,14 +387,50 @@ export async function runCrystalsPass(options: CrystalsPassOptions): Promise<Cry
       const plannedDigests = new Set<string>();
       const eligible = list.clusters.filter(cluster => cluster.availableSize >= minClusterSize);
       const memberLimit = maxMembersPerCluster || ANALYSIS_PAGE_LIMIT;
+      const candidates: { cluster: typeof eligible[number]; members: EvidenceCandidate[] }[] = [];
+      const paths = new Set<string>();
+      for (const cluster of eligible) {
+        const members = await readWorkspaceEvidence(options, cluster.clusterId, cluster.availableSize, list.runId, memberLimit, allowed, signal);
+        if (members === "audience") { counts.skippedAudience++; continue; }
+        if (!members?.length) continue;
+        candidates.push({ cluster, members });
+        for (const member of members) for (const path of member.paths) paths.add(path);
+      }
+      signal.throwIfAborted();
+      // Only after every alias and member passed ACL do we read salience for those sources, and never grades from the future.
+      const salience = prioritizeEmotionalSalience && paths.size
+        ? readPathSalience(workStore.db, agentId, [...paths], { nowMs: startedAt,
+          ...(options.baselineMinInteractions !== undefined ? { baselineMinInteractions: options.baselineMinInteractions } : {}) })
+        : new Map<string, { salienceScore: number; highSalience: boolean }>();
+      const reserved = Math.max(1, Math.floor(memberLimit * EMOTION_SLOT_SHARE));
+      const ranked = candidates.map(({ cluster, members }) => {
+        // Only the configured high-salience gate counts; a routine nonzero grade never moves evidence.
+        const scored = members.map((item, index) => ({ item, index, salience: Math.max(0, ...item.paths.map(path => {
+          const signal = salience.get(path);
+          return signal?.highSalience ? signal.salienceScore : 0;
+        })) }));
+        const peak = scored.reduce((max, entry) => Math.max(max, entry.salience), 0);
+        // Representatives keep their native order and the top slots, so a new grade swaps at most the bounded reserve
+        // and the input digest stays stable across passes.
+        const flashbulb = scored.filter(({ item, salience }) => !item.representative && salience > 0)
+          .sort((a, b) => b.salience - a.salience || a.index - b.index).slice(0, Math.min(reserved, memberLimit));
+        const representatives = scored.filter(({ item }) => item.representative).slice(0, memberLimit - flashbulb.length);
+        const evidence: Evidence[] = [...flashbulb, ...representatives]
+          .map(({ item: { paths: _paths, representative: _representative, ...item } }) => ({ ...item, text: redactSecrets(item.member.text) }));
+        return { cluster, evidence, peak };
+      });
+      if (maxClustersPerRun > 0 && ranked.some(entry => entry.peak > 0)) {
+        // Native analysis orders by size. The bounded boost can move close peers ahead, not swamp cluster size.
+        const priority = ({ cluster, peak }: typeof ranked[number]) => Math.log1p(cluster.size) + 0.1 * peak;
+        ranked.sort((a, b) => priority(b) - priority(a));
+      }
       // No further model calls after a credential fault; unchanged crystals still re-verify (and renew) for free.
       let modelUnavailable = false;
       // The cap counts synthesis attempts only: unchanged, private or ineligible clusters never consume the budget.
-      for (const cluster of eligible) {
-        const { clusterId, availableSize, meanProbability: brightness } = cluster;
-        const evidence = await readWorkspaceEvidence(options, clusterId, availableSize, list.runId, memberLimit, allowed, signal);
-        if (evidence === "audience") { counts.skippedAudience++; continue; }
-        if (!evidence?.length) continue;
+      for (const { cluster, evidence } of ranked) {
+        signal.throwIfAborted();
+        const { clusterId, meanProbability: brightness } = cluster;
+        if (!evidence.length) continue;
         const inputDigest = hash(evidence.map(({ member }) => memberKey(member)).sort().join("\n"));
         if (plannedDigests.has(inputDigest)) continue;
         const hashes = evidence.map(({ member }) => member.hash).sort();

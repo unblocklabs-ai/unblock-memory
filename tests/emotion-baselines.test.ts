@@ -10,9 +10,12 @@ import { DatabaseSync } from "node:sqlite";
 import { resolveConfig } from "../src/config.js";
 import { PeopleStore } from "../src/people-store.js";
 import { Worker } from "node:worker_threads";
-import { baselineFingerprint, baselineInputSnapshot, deviationReader, refreshEmotionBaselines } from "../src/emotion-baselines.js";
+import { baselineFingerprint, baselineInputSnapshot, detectSentimentDrift, deviationReader, intensityProfiles, intensityReader,
+  refreshEmotionBaselines, type SentimentDriftReport } from "../src/emotion-baselines.js";
+import { ResponseAuditStore } from "../src/response-store.js";
+import { OutcomeLedgerStore } from "../src/outcome-ledger.js";
 import { runInsideOut, reportInsideOut, refreshInsideOutBaselines, reportInsideOutBaselines, linkInsideOutPeople,
-  purgeInsideOutPerson, refreshInsideOutBaselinesAsync } from "../src/inside-out.js";
+  purgeInsideOutPerson, refreshInsideOutBaselinesAsync, reportInsideOutBaselineOverview, reportInsideOutDrift } from "../src/inside-out.js";
 import { openInsideOutStore, refreshWithFingerprint } from "../src/inside-out-store.js";
 
 // Owns the persisted statistical contract: real PeopleSQL identities, transcript grading,
@@ -402,15 +405,15 @@ test("terminating a worker mid-transaction rolls back and releases the shared st
 test("purging without grades removes derived history; the next refresh rebuilds only from current links", async () => {
   const { path, ids: [one, two], now } = await gradedStore([{ account: "one", grades: 60, weeks: 3 }, { account: "two", grades: 60, weeks: 3 }]);
   refreshInsideOutBaselines(path, { now });
-  assert.deepEqual(purgeInsideOutPerson(path, one!), { baselines: 3, assessments: 60, grades: 0 });
+  assert.deepEqual(purgeInsideOutPerson(path, one!), { baselines: 3, assessments: 60, grades: 0, captainsLogEntries: 0, outcomes: 0 });
   assert.equal(reportInsideOutBaselines(path, { personId: one }).length, 0);
   assert.equal(reportInsideOutBaselines(path, { personId: two }).length, 3);
   assert.deepEqual(refreshInsideOutBaselines(path, { now }), { snapshots: 3, comparisons: 60 }, "grades remain, so statistics return");
-  assert.deepEqual(purgeInsideOutPerson(path, "unknown-person", { grades: true }), { baselines: 0, assessments: 0, grades: 0 });
+  assert.deepEqual(purgeInsideOutPerson(path, "unknown-person", { grades: true }), { baselines: 0, assessments: 0, grades: 0, captainsLogEntries: 0, outcomes: 0 });
   assert.throws(() => purgeInsideOutPerson(path, " "), /person ID is required/);
   const empty = join(await mkdtemp(join(tmpdir(), "emotion-empty-")), "unblock-memory.sqlite");
   new PeopleStore(empty, { maxOpenTodos: 100, maxBlurbChars: 1000 }).close();
-  assert.deepEqual(purgeInsideOutPerson(empty, one!), { baselines: 0, assessments: 0, grades: 0 });
+  assert.deepEqual(purgeInsideOutPerson(empty, one!), { baselines: 0, assessments: 0, grades: 0, captainsLogEntries: 0, outcomes: 0 });
   const probe = new DatabaseSync(empty, { readOnly: true });
   assert.equal(probe.prepare("SELECT 1 FROM sqlite_schema WHERE name='inside_out'").get(), undefined, "purge never creates Inside Out tables");
   probe.close();
@@ -681,7 +684,7 @@ test("analytics-only purge during an in-flight refresh prevents restoring purged
     if (sql === "BEGIN IMMEDIATE" && !racedRecompare) {
       racedRecompare = true;
       const purged = purgeInsideOutPerson(path, one!);
-      assert.deepEqual(purged, { baselines: 3, assessments: 60, grades: 0 });
+      assert.deepEqual(purged, { baselines: 3, assessments: 60, grades: 0, captainsLogEntries: 0, outcomes: 0 });
     }
     return exec.call(this, sql);
   });
@@ -792,7 +795,7 @@ test("analytics-only purge between pre-pass snapshot and refreshEmotionBaselines
     if (sql === "COMMIT" && !racedA) {
       racedA = true;
       const purged = purgeInsideOutPerson(storeA.path, oneA!);
-      assert.deepEqual(purged, { baselines: 2, assessments: 40, grades: 0 });
+      assert.deepEqual(purged, { baselines: 2, assessments: 40, grades: 0, captainsLogEntries: 0, outcomes: 0 });
     }
     return out;
   });
@@ -856,4 +859,247 @@ test("analytics-only purge between pre-pass snapshot and refreshEmotionBaselines
   assert.equal(dbC.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(oneC!)?.n, 0);
   assert.equal(dbC.prepare("SELECT count(*) n FROM person_emotion_baselines WHERE person_id=?").get(twoC!)?.n, 2);
   assert.equal(dbC.prepare("SELECT count(*) n FROM inside_out_deviations WHERE person_id=?").get(twoC!)?.n, 40);
+});
+
+// --- Absolute + relative intensity and anchored long-horizon drift -------------------------------------------
+
+type DriftGrade = { person: string; at: number; joy?: number; sadness?: number; anger?: number; intensity?: number | null; session?: string };
+
+async function driftStore(people: string[]) {
+  const root = await mkdtemp(join(tmpdir(), "emotion-drift-")), path = join(root, "unblock-memory.sqlite");
+  const store = new PeopleStore(path, { maxOpenTodos: 100, maxBlurbChars: 1000 });
+  const ids = Object.fromEntries(people.map(name => [name, store.upsertIdentity({ provider: "slack", accountScope: name, externalId: "u" }).person.id]));
+  store.close();
+  const db = openInsideOutStore(path);
+  const insert = db.prepare(`INSERT INTO inside_out (interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,
+    channel,source,target_at,reviewed_at,model,context_trimmed,joy,sadness,fear,anger,disgust,surprise,error,person_id,
+    intensity,intensity_probs_json,intensity_rubric,valence) VALUES (?,'emotion-presence-v2',?,?,'a',?,'u','slack','s.jsonl',?,?,'jev-test',0,
+    ?,?,0.05,?,0.05,0.05,NULL,?,?,?,?,NULL)`);
+  let n = 0;
+  const add = (grade: DriftGrade) => {
+    const id = `${grade.person}-${n++}`, intensity = grade.intensity ?? null;
+    insert.run(id, grade.session ?? `session-${grade.person}`, id, JSON.stringify(["slack", grade.person, "u"]), grade.at, grade.at,
+      grade.joy ?? 0.5, grade.sadness ?? 0.05, grade.anger ?? 0.05, ids[grade.person]!, intensity,
+      intensity === null ? null : JSON.stringify({ 0: 0.25, 1: 0.25, 2: 0.25, 3: 0.25 }), intensity === null ? null : "emotion-intensity-v1");
+  };
+  return { path, db, ids, add };
+}
+
+const find = (reports: SentimentDriftReport[], personId: string, metric: SentimentDriftReport["metric"]) =>
+  reports.find(report => report.personId === personId && report.metric === metric)!;
+
+test("relative intensity is one-sided and person-relative, while absolute intensity is always kept", async t => {
+  const { path, db, ids, add } = await driftStore(["stoic", "expressive"]);
+  t.after(() => db.close());
+  for (let i = 0; i < 25; i++) {
+    add({ person: "stoic", at: FIRST_WEEK + i * 3_600_000, intensity: 0.1 + (i % 3) * 0.1 });
+    add({ person: "expressive", at: FIRST_WEEK + i * 3_600_000, intensity: 1.5 + (i % 4) * 0.5 });
+  }
+  const at = FIRST_WEEK + 30 * 3_600_000;
+  add({ person: "stoic", at, intensity: 2 });
+  add({ person: "expressive", at, intensity: 2 });
+  add({ person: "stoic", at: at + 1, intensity: null });
+  add({ person: "stoic", at: at + 2, intensity: 0 });
+  const read = intensityReader(db, { minInteractions: 20 });
+  const row = (person: string, target: number) => db.prepare("SELECT * FROM inside_out WHERE person_id=? AND target_at=?").get(ids[person]!, target)!;
+  const stoic = read(row("stoic", at)), expressive = read(row("expressive", at));
+  assert.equal(stoic.absoluteIntensity, 2);
+  assert.equal(expressive.absoluteIntensity, 2, "the same absolute 2 for both people");
+  assert.equal(stoic.status, "ok");
+  assert.equal(stoic.count, 25);
+  assert.equal(stoic.intensityPercentile, 1, "a stoic person's rare 2 tops everything they expressed before");
+  assert.ok(Math.abs(stoic.intensitySpike! - (2 - stoic.intensityMean!)) < 1e-12 && stoic.intensitySpike! > 1.7);
+  assert.ok(expressive.intensityPercentile! < 0.6, `routine for an expressive person (${expressive.intensityPercentile})`);
+  assert.ok(expressive.intensitySpike! < 0.3);
+  const calmer = read(row("stoic", at + 2));
+  assert.equal(calmer.intensitySpike, 0, "one-sided: calmer than usual is never a negative spike");
+  assert.ok(calmer.intensityPercentile! < 0.05);
+  assert.equal(read(row("stoic", at + 1)).status, "unknown_intensity", "NULL intensity is unknown, never treated as 0");
+  assert.equal(read(row("stoic", at + 1)).absoluteIntensity, null);
+  assert.equal(intensityReader(db, { minInteractions: 30 })(row("stoic", at)).status, "insufficient_history");
+  assert.equal(intensityReader(db, { minInteractions: 1 })(row("stoic", FIRST_WEEK + 3_600_000)).count, 1, "minimum is configurable down to 1");
+  assert.throws(() => intensityReader(db, { minInteractions: 0 }), /minInteractions/);
+
+  const profiles = intensityProfiles(db, { now: at + 10 });
+  const stoicProfile = profiles.find(p => p.personId === ids.stoic)!;
+  assert.equal(stoicProfile.count, 27, "NULL rows are excluded from the absolute profile");
+  assert.equal(stoicProfile.max, 2);
+  const exported = reportInsideOut(path, { personal: true, personId: ids.stoic, minInteractions: 20 });
+  const spike = exported.find(r => r.target_at === at)!.personal_intensity as { intensityPercentile: number; absoluteIntensity: number };
+  assert.deepEqual([spike.absoluteIntensity, spike.intensityPercentile], [2, 1]);
+});
+
+test("boiling-frog drift: slow weekly frustration creep is flagged against the anchored start even when week-over-week change is tiny", async t => {
+  const { path, db, ids, add } = await driftStore(["frog", "steady", "chronic", "quiet"]);
+  t.after(() => db.close());
+  const weeks = 12, now = FIRST_WEEK + weeks * WEEK - 1;
+  for (let week = 0; week < weeks; week++) {
+    for (let i = 0; i < 5; i++) {
+      const at = FIRST_WEEK + week * WEEK + i * 86400_000;
+      // +0.02 anger per week: never alarming week to week, +0.22 over the quarter.
+      add({ person: "frog", at, anger: 0.1 + 0.02 * week, joy: 0.5 });
+      add({ person: "steady", at, anger: 0.1 + (i % 2) * 0.02, joy: 0.5 });
+      add({ person: "chronic", at, anger: 0.7, joy: 0.2 });
+      if (week < 6) add({ person: "quiet", at, anger: 0.1 });
+    }
+  }
+  // Agent-directed audit frustration for the frog, creeping the same way, keyed by the frog's session.
+  new ResponseAuditStore(path).close();
+  const audit = db.prepare(`INSERT INTO response_results (cohort,id,session_id,input_hash,episode_at,active,status,assessed_at,result)
+    VALUES (?,?,?,'hash',?,1,'ok',?,?)`);
+  for (let week = 0; week < weeks; week++) {
+    for (let i = 0; i < 3; i++) {
+      const at = FIRST_WEEK + week * WEEK + i * 86400_000 + 1;
+      const result = JSON.stringify({ feedback: { annoyance: { noul: 0.05 }, frustration: { noul: 0.1 + 0.03 * week },
+        dissatisfactionIntensity: { score: 0.2 + 0.1 * week, confidence: i === 2 ? 0.5 : 0.9 } } });
+      audit.run("current", `frog-${week}-${i}`, "session-frog", at, at, result);
+      // The same episode re-assessed in an older cohort is not double counted.
+      audit.run("older", `frog-${week}-${i}`, "session-frog", at, at - 1, result);
+    }
+  }
+  const reports = detectSentimentDrift(db, { now });
+  const anger = find(reports, ids.frog!, "anger");
+  assert.equal(anger.flagged, true, anger.reason);
+  assert.match(anger.reason, /^anchored_drift: anger rose 0\.17 from the anchored baseline 0\.13 to 0\.3 \(threshold 0\.15\)$/);
+  assert.ok(Math.abs(anger.anchoredMean! - 0.13) < 1e-9, "anchor = the first four weeks, not a rolling window");
+  assert.ok(Math.abs(anger.recentMean! - 0.3) < 1e-9);
+  assert.ok(Math.abs(anger.absoluteDelta! - 0.17) < 1e-9);
+  assert.equal(anger.recentAbsoluteLevel, anger.recentMean);
+  assert.ok(Math.abs(anger.rollingWeeklyDelta! - 0.02) < 1e-9, "a rolling week-over-week view sees only +0.02");
+  assert.deepEqual([anger.anchorStart, anger.anchorEnd, anger.anchorSamples, anger.recentSamples, anger.weeksObserved],
+    [FIRST_WEEK, FIRST_WEEK + 4 * WEEK, 20, 15, 12]);
+  assert.ok(anger.anchorEnd! <= anger.recentStart, "anchor and recent windows never overlap");
+  const valence = find(reports, ids.frog!, "valence");
+  assert.equal(valence.direction, "lower_is_worse");
+  assert.ok(valence.absoluteDelta! < 0 && Math.abs(valence.worsening! + valence.absoluteDelta!) < 1e-12);
+
+  const frustration = find(reports, ids.frog!, "agent_frustration");
+  assert.equal(frustration.flagged, true, frustration.reason);
+  assert.equal(frustration.anchorSamples, 12, "one sample per episode: the older cohort's copy is ignored");
+  assert.ok(Math.abs(frustration.absoluteDelta! - 0.255) < 1e-9);
+  const dissatisfaction = find(reports, ids.frog!, "agent_dissatisfaction");
+  assert.equal(dissatisfaction.anchorSamples, 8, "low-confidence dissatisfaction scores are excluded by default");
+  assert.equal(dissatisfaction.flagged, true, dissatisfaction.reason);
+  assert.equal(find(detectSentimentDrift(db, { now, minResponseConfidence: 0 }), ids.frog!, "agent_dissatisfaction").anchorSamples, 12);
+  assert.equal(find(detectSentimentDrift(db, { now, responseCohort: "older" }), ids.frog!, "agent_frustration").anchorSamples, 12);
+
+  const steady = find(reports, ids.steady!, "anger");
+  assert.deepEqual([steady.flagged, steady.reason], [false, "stable"]);
+  assert.ok(Math.abs(steady.absoluteDelta!) < 0.01);
+  assert.equal(find(reports, ids.steady!, "agent_frustration"), undefined, "no audit evidence, no invented metric");
+
+  // Chronic frustration from day one never drifts, but its absolute level is not masked either.
+  const chronic = find(reports, ids.chronic!, "anger");
+  assert.equal(chronic.flagged, true);
+  assert.match(chronic.reason, /^sustained_level: recent anger 0\.7 is at or above 0\.5$/);
+  assert.equal(find(detectSentimentDrift(db, { now, levelThresholds: { anger: null } }), ids.chronic!, "anger").flagged, false);
+
+  const quiet = find(reports, ids.quiet!, "anger");
+  assert.deepEqual([quiet.flagged, quiet.recentMean], [false, null]);
+  assert.match(quiet.reason, /^insufficient_recent_samples/);
+
+  // Every window and threshold is configurable; nothing is a hardcoded lockout.
+  assert.equal(find(detectSentimentDrift(db, { now, driftThresholds: { anger: 0.3 } }), ids.frog!, "anger").flagged, false);
+  assert.equal(find(detectSentimentDrift(db, { now, driftThresholds: { anger: null } }), ids.frog!, "anger").reason, "stable");
+  const longRecent = find(detectSentimentDrift(db, { now, recentWeeks: 6, anchorWeeks: 2 }), ids.frog!, "anger");
+  assert.ok(Math.abs(longRecent.anchoredMean! - 0.11) < 1e-9 && Math.abs(longRecent.recentMean! - 0.27) < 1e-9);
+  const noAnchor = find(detectSentimentDrift(db, { now, recentWeeks: 12 }), ids.frog!, "anger");
+  assert.match(noAnchor.reason, /insufficient_anchor_history/, "a recent window covering all history leaves no anchor");
+  assert.equal(detectSentimentDrift(db, { now, personId: ids.frog }).every(report => report.personId === ids.frog), true);
+  assert.throws(() => detectSentimentDrift(db, { now, anchorWeeks: 0 }), /anchorWeeks/);
+  assert.throws(() => detectSentimentDrift(db, { now, driftThresholds: { anger: Number.NaN } }), /driftThresholds\.anger/);
+
+  // The operator overview carries the drift summary next to weekly baselines.
+  const overview = reportInsideOutBaselineOverview(path, { drift: { now } });
+  assert.deepEqual(overview.drift.flagged.map(report => [report.personId, report.metric]).sort(),
+    [[ids.chronic, "anger"], [ids.chronic, "valence"], [ids.frog, "agent_dissatisfaction"], [ids.frog, "agent_frustration"], [ids.frog, "anger"]].sort());
+  assert.deepEqual(reportInsideOutDrift(path, { now }), reports);
+});
+
+test("purging a person's grades clears intensity, valence and every drift input; purge without grades keeps raw drift inputs", async t => {
+  const { path, db, ids, add } = await driftStore(["one", "two"]);
+  t.after(() => db.close());
+  for (let week = 0; week < 8; week++) {
+    for (let i = 0; i < 4; i++) {
+      for (const person of ["one", "two"]) add({ person, at: FIRST_WEEK + week * WEEK + i * 86400_000, anger: 0.1 + 0.05 * week, intensity: 1 });
+    }
+  }
+  new ResponseAuditStore(path).close();
+  db.prepare(`INSERT INTO response_results (cohort,id,session_id,input_hash,episode_at,active,status,assessed_at,result)
+    VALUES ('c','e','session-one','h',?,1,'ok',?,?)`).run(FIRST_WEEK, FIRST_WEEK, JSON.stringify({ feedback: { frustration: { noul: 0.9 } } }));
+  const now = FIRST_WEEK + 8 * WEEK - 1;
+  assert.equal(detectSentimentDrift(db, { now, personId: ids.one, minRecentSamples: 1 }).length, 3);
+  assert.deepEqual(purgeInsideOutPerson(path, ids.one!), { baselines: 0, assessments: 0, grades: 0, captainsLogEntries: 0, outcomes: 0 });
+  assert.equal(detectSentimentDrift(db, { now, personId: ids.one }).length, 3, "analytics-only purge leaves raw grades, as before");
+
+  const purged = purgeInsideOutPerson(path, ids.one!, { grades: true });
+  assert.equal(purged.grades, 32);
+  const leftovers = db.prepare(`SELECT count(*) n FROM inside_out WHERE session_id='session-one' AND (intensity IS NOT NULL
+    OR intensity_probs_json IS NOT NULL OR intensity_rubric IS NOT NULL OR valence IS NOT NULL OR person_id IS NOT NULL OR joy IS NOT NULL)`).get()!;
+  assert.equal(leftovers.n, 0);
+  assert.deepEqual(detectSentimentDrift(db, { now, personId: ids.one }), [], "no Inside Out or session-linked audit drift remains");
+  assert.deepEqual(intensityProfiles(db, { personId: ids.one, now }), []);
+  assert.equal(detectSentimentDrift(db, { now, personId: ids.two }).length, 2, "other people are untouched");
+  assert.equal(intensityProfiles(db, { personId: ids.two, now })[0]?.count, 32);
+});
+
+test("purging Bob in a shared session never hands his frustration to Alice, and scrubs derived emotion ledgers", async t => {
+  const { path, db, ids, add } = await driftStore(["alice", "bob"]);
+  t.after(() => db.close());
+  for (let week = 0; week < 8; week++) {
+    for (let i = 0; i < 4; i++) {
+      const at = FIRST_WEEK + week * WEEK + i * 86400_000;
+      add({ person: "alice", at, anger: 0.1, intensity: 1, session: "shared" });
+      add({ person: "bob", at: at + 1, anger: 0.6, intensity: 2.5, session: "shared" });
+      add({ person: "alice", at: at + 2, anger: 0.1, intensity: 1 });
+    }
+  }
+  new ResponseAuditStore(path).close();
+  const audit = db.prepare(`INSERT INTO response_results (cohort,id,session_id,input_hash,episode_at,active,status,assessed_at,result)
+    VALUES ('c',?,?,'h',?,1,'ok',?,?)`);
+  for (let week = 0; week < 8; week++) {
+    const at = FIRST_WEEK + week * WEEK + 3;
+    audit.run(`shared-${week}`, "shared", at, at, JSON.stringify({ feedback: { frustration: { noul: 0.95 } } }));
+    audit.run(`solo-${week}`, "session-alice", at, at, JSON.stringify({ feedback: { frustration: { noul: 0.05 } } }));
+  }
+  const now = FIRST_WEEK + 8 * WEEK - 1;
+  const frustration = () => detectSentimentDrift(db, { now, minRecentSamples: 1, minAnchorSamples: 1 })
+    .filter(report => report.metric === "agent_frustration")
+    .map(report => [report.personId, Number(report.recentMean!.toFixed(6))]);
+  assert.deepEqual(frustration(), [[ids.alice, 0.05]],
+    "a session with two humans is attributed to nobody");
+
+  // Derived ledgers that cite Bob's and Alice's graded messages.
+  const bobMessage = String(db.prepare("SELECT message_id FROM inside_out WHERE person_id=? LIMIT 1").get(ids.bob!)!.message_id);
+  const aliceShared = String(db.prepare("SELECT message_id FROM inside_out WHERE person_id=? AND session_id='shared' LIMIT 1").get(ids.alice!)!.message_id);
+  db.exec(`CREATE TABLE captains_log_entries (id TEXT PRIMARY KEY, topic TEXT, salience_score REAL, emotional_intensity REAL,
+    relative_salience REAL, salience_signals_json TEXT)`);
+  const entry = db.prepare("INSERT INTO captains_log_entries VALUES (?,?,0.9,2.5,0.8,?)");
+  const signals = (messageId: string) => JSON.stringify({ highSalience: true, grounding: "message", label: "frustration/setback",
+    signals: [{ ref: "m1", sessionId: "shared", messageId, salienceScore: 0.9 }] });
+  entry.run("bob-entry", "Outage", signals(bobMessage));
+  entry.run("alice-entry", "Launch", signals(aliceShared));
+  new OutcomeLedgerStore(db);
+  const outcome = db.prepare(`INSERT INTO memory_outcomes (id,agent_id,subject_kind,subject_id,verdict,confidence,evidence_turn_id,
+    session_id,signals_json,measured_at) VALUES (?,'main','memory_hit','qmd://memory/a.md','helped',0.8,'turn',?,?,1)`);
+  const outcomeSignals = JSON.stringify({ read: true, insideOutValence: -0.6, insideOutIntensity: 2.5, insideOutDelta: -0.4,
+    sharpDrop: true, baselineCount: 12, reason: "read" });
+  outcome.run("in-shared", "shared", outcomeSignals);
+  outcome.run("elsewhere", "session-alice", outcomeSignals);
+
+  const purged = purgeInsideOutPerson(path, ids.bob!, { grades: true });
+  assert.equal(purged.grades, 32);
+  assert.deepEqual([purged.captainsLogEntries, purged.outcomes], [1, 1]);
+  assert.deepEqual(frustration(), [[ids.alice, 0.05]],
+    "after the purge Alice is still the only linked person in `shared`, yet its frustration is never hers");
+
+  const rows = db.prepare("SELECT id, topic, salience_score, emotional_intensity, relative_salience, salience_signals_json FROM captains_log_entries ORDER BY id").all();
+  assert.deepEqual(rows.map(row => ({ ...row })), [
+    { id: "alice-entry", topic: "Launch", salience_score: 0.9, emotional_intensity: 2.5, relative_salience: 0.8, salience_signals_json: signals(aliceShared) },
+    { id: "bob-entry", topic: "Outage", salience_score: null, emotional_intensity: null, relative_salience: null, salience_signals_json: null },
+  ], "only the entry grounded on Bob's message loses its emotion fields; its text stays");
+  const stored = (id: string) => db.prepare("SELECT verdict, confidence, signals_json FROM memory_outcomes WHERE id=?").get(id)!;
+  assert.deepEqual({ ...stored("in-shared"), signals_json: JSON.parse(String(stored("in-shared").signals_json)) },
+    { verdict: "helped", confidence: 0.8, signals_json: { read: true, baselineCount: 12, reason: "read" } }, "verdicts are preserved");
+  assert.deepEqual(JSON.parse(String(stored("elsewhere").signals_json)), JSON.parse(outcomeSignals), "other sessions are untouched");
 });

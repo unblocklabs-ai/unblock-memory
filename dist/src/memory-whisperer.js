@@ -2,6 +2,8 @@ import { DEFAULTS } from "./defaults.js";
 import { resolveDecisionCredential, DecisionRequestError } from "./decision-client.js";
 import { complementaryIndices, reviewMemoryRedundancy } from "./decision-review.js";
 import { ApiQueryGenerator, fallbackQueries, QueryApiError, visibleQueryConversation } from "./query-generator.js";
+import { queryUserText } from "./response-text.js";
+import { classifySyntheticInput } from "./synthetic-input.js";
 import { selectJudgeConversation } from "./judge-context.js";
 import { prepareQueryConversation, QueryInputBudgetError } from "./query-contract.js";
 import { searchMemory, memoryPassageId } from "./memory-search.js";
@@ -337,15 +339,25 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
         const corpora = config.corpora;
         if (!corpora.length)
             return;
+        const rawCurrent = event.currentUserMessage ?? event.prompt;
+        const input = classifySyntheticInput({
+            // A legacy prompt can wrap the wake in a sender envelope.
+            text: queryUserText(rawCurrent) ?? rawCurrent,
+            inputProvenance: context.inputProvenance,
+            display: event.display,
+        }, options.syntheticInput);
+        if (input.action === "skip" ||
+            ((input.family === "cron_wrapper" || input.family === "heartbeat_control") && surface !== "cron" && surface !== "heartbeat"))
+            return;
         const admission = sessions.lookup({ agentId, scope, runId });
         if (admission.kind === "replay")
             return admission.result;
         if (admission.kind === "superseded")
             return undefined;
-        const currentUserMessage = typeof event.currentUserMessage === "string" ? event.currentUserMessage : undefined;
-        const rawCurrent = currentUserMessage !== undefined ? currentUserMessage : event.prompt;
-        if (!rawCurrent.replace(/^\s*From: [^\r\n]+ \([^()\r\n]+\)\s*$/, "").trim())
+        const currentRequest = queryUserText(input.text);
+        if (!currentRequest)
             return;
+        const inputFamily = surface === "cron" ? "cron_wrapper" : surface === "heartbeat" ? "heartbeat_control" : undefined;
         const started = performance.now();
         const asOf = new Date().toISOString();
         const turn = {
@@ -392,6 +404,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                     sessionKey,
                     runId,
                     ...origin,
+                    inputFamily,
                     lexQuery: generatedQueries?.map(pair => pair.lex).join("\n"),
                     vecQuery: generatedQueries?.map(pair => pair.vec).join("\n"),
                     ...(recipeHash ? { recipeHash } : {}),
@@ -421,9 +434,8 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 const audienceKey = nonBlank((derivedObservations.audienceKey ?? deepThoughtAudienceKey)(audience));
                 if (!audienceKey)
                     return;
-                const queryText = visibleQueryConversation(event.prompt, event.messages, currentUserMessage).currentRequest;
                 derivedMatches = await lookupDerivedObservations({
-                    options: derivedObservations, agentId, queryText, audienceKey, allowedCorpora: corpora,
+                    options: derivedObservations, agentId, queryText: currentRequest, audienceKey, allowedCorpora: corpora,
                     isCoolingDown: id => recent.has(`derived:${id}`),
                 });
             }
@@ -443,9 +455,8 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 await Promise.resolve();
                 const audience = derivedAudienceContext(context, agentId, sessionKey);
                 const audienceKey = nonBlank((crystals.audienceKey ?? deepThoughtAudienceKey)(audience));
-                const queryText = visibleQueryConversation(event.prompt, event.messages, currentUserMessage).currentRequest;
                 const matches = findMatchingCrystalsReadOnly(crystals.dbPathForAgent(agentId), {
-                    agentId, queryText, audienceKeys: [WORKSPACE_AUDIENCE, ...(audienceKey ? [audienceKey] : [])], allowedCorpora: corpora,
+                    agentId, queryText: currentRequest, audienceKeys: [WORKSPACE_AUDIENCE, ...(audienceKey ? [audienceKey] : [])], allowedCorpora: corpora,
                     ...(crystals.minTokenOverlap !== undefined ? { minTokenOverlap: crystals.minTokenOverlap } : {}),
                     ...(crystals.minSharedTokens !== undefined ? { minSharedTokens: crystals.minSharedTokens } : {}),
                     ...(crystals.ltmRankBoost !== undefined ? { ltmRankBoost: crystals.ltmRankBoost } : {}),
@@ -464,7 +475,7 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
         })() : Promise.resolve();
         let memoryHints = [];
         const run = async () => {
-            const visible = visibleQueryConversation(event.prompt, event.messages, currentUserMessage);
+            const visible = visibleQueryConversation(event.prompt, event.messages, currentRequest, options.syntheticInput);
             const judgeConversation = selectJudgeConversation(visible);
             if (judgeConversation.status === "input_too_large")
                 throw new QueryInputBudgetError();
@@ -531,6 +542,8 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                         recipe: brightness.recipe, weight: brightness.weight, maxBoost: brightness.maxBoost,
                         lookup: (subjects) => computeBrightnessMap(brightness.dbPathForAgent(agentId), {
                             agentId, recipe: brightness.recipe, subjects, decayRate: brightness.decayRate, lookbackDays: brightness.lookbackDays,
+                            emotionDecayStretch: brightness.emotionDecayStretch, emotionMaxBonus: brightness.emotionMaxBonus,
+                            ...(brightness.baselineMinInteractions !== undefined ? { baselineMinInteractions: brightness.baselineMinInteractions } : {}),
                         }),
                     } } : {}),
                 onCandidates: observation => {

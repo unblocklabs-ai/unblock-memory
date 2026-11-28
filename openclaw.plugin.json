@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -902,14 +902,15 @@
           "brightness": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Brightness A/B recipe: after usefulness gating, re-orders finalists by recall evidence (actr_v1: decayed recall reads and emitted hits) or outcome evidence (outcome_v1: helped/hurt/ignored outcomes, core memories, surprising expectations). Read-only lookup; missing evidence is neutral. A non-off recipe stamps brightness:<recipe> on memory_whisperer recall_queries unless memoryWhisperer.recipeHash is set.",
+            "description": "Re-orders usefulness-qualified finalists using recall (actr_v1), outcome (outcome_v1), or outcome plus emotional salience (emotion_v1) evidence. Read-only; missing evidence is neutral. Active recipes stamp brightness:<recipe> unless memoryWhisperer.recipeHash is set.",
             "properties": {
               "recipe": {
                 "type": "string",
                 "enum": [
                   "off",
                   "actr_v1",
-                  "outcome_v1"
+                  "outcome_v1",
+                  "emotion_v1"
                 ],
                 "default": "off",
                 "description": "off (default) skips the lookup entirely."
@@ -937,6 +938,20 @@
                 "minimum": 0,
                 "default": 0.15,
                 "description": "Absolute cap on the brightness adjustment."
+              },
+              "emotionDecayStretch": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 3,
+                "default": 3,
+                "description": "emotion_v1 multiplies the 30-day outcome time constant by (1 + salience × emotionDecayStretch)."
+              },
+              "emotionMaxBonus": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 0.35,
+                "default": 0.35,
+                "description": "Maximum additive emotion_v1 bonus at peak salience. A confirmed hurt outcome suppresses the bonus."
               }
             }
           },
@@ -1010,6 +1025,45 @@
         "default": {
           "enabled": false,
           "channels": {}
+        }
+      },
+      "syntheticInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "skipFamilies": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "completion_wake",
+                "internal_context",
+                "heartbeat_control",
+                "intersession_subagent",
+                "cron_wrapper",
+                "exec_system_handoff",
+                "reset_compaction",
+                "human_framing"
+              ]
+            }
+          },
+          "extraExactAliases": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "\\S"
+            }
+          },
+          "extraPrefixes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "\\S"
+            }
+          }
         }
       },
       "whispererTriggers": {
@@ -1561,6 +1615,24 @@
                     "direct"
                   ]
                 }
+              },
+              "includeEmotionalSalience": {
+                "type": "boolean"
+              },
+              "minSalienceScore": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "minAbsoluteIntensity": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 3
+              },
+              "minRelativeIntensity": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 3
               }
             }
           },
@@ -1740,12 +1812,12 @@
               "maxClustersPerRun": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Synthesis model calls per pass; unchanged, private or ineligible clusters never count. Default 0 = unlimited."
+                "description": "Synthesis model calls per pass; unchanged, private or ineligible clusters never count. Peak emotional salience gives eligible clusters a small priority boost. Default 0 = unlimited."
               },
               "maxMembersPerCluster": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Evidence members per synthesis. Default 12; 0 = the analysis page limit."
+                "description": "Evidence members per synthesis. Salient excerpts are prioritized after corpus checks. Default 12; 0 = the analysis page limit."
               },
               "stmStaleAfterMinutes": {
                 "type": "integer",
@@ -1775,6 +1847,10 @@
                 "type": "integer",
                 "minimum": 0,
                 "description": "Per model call; 0 = unlimited."
+              },
+              "prioritizeEmotionalSalience": {
+                "type": "boolean",
+                "description": "Let high-salience (Flashbulb) evidence take a bounded share (at most 1/4, at least one) of a cluster's member slots and nudge synthesis order; representative members keep the rest. Default true."
               }
             }
           },

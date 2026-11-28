@@ -2,6 +2,7 @@ import type { ChatType, DecisionModelPluginConfig } from "./config.js";
 import { resolveDecisionCredential } from "./decision-client.js";
 import type { ExpectationChatType } from "./expectations-store.js";
 import { isAbsolute } from "node:path";
+import { DEFAULT_EMOTIONAL_SALIENCE_OPTIONS } from "./emotional-salience.js";
 import { isRecord } from "./guards.js";
 import { CRYSTALS_DEFAULTS } from "./steward-crystals.js";
 
@@ -87,6 +88,14 @@ type StewardCaptainsLogConfig = {
   timeoutMs: number;
   /** Chat types excluded from workspace `memory/YYYY-MM-DD.md` distillation (default: `["direct"]`). */
   excludeChatTypes: ChatType[];
+  /** Cue emotionally salient human messages (Inside Out grades) to Steward and rank salient entries behind blockers. */
+  includeEmotionalSalience: boolean;
+  /** 0..1 salience score at which a graded message is cued as high-salience. */
+  minSalienceScore: number;
+  /** 0..3 absolute Inside Out intensity at which a message is always high-salience, regardless of the person's history. */
+  minAbsoluteIntensity: number;
+  /** 0..3 absolute intensity below which a person-relative spike never counts (a rare-but-trivial blip stays quiet). */
+  minRelativeIntensity: number;
 };
 /** Deterministic (no model call) outcome scoring of memory hits, skills and person whispers into `memory_outcomes`. */
 type StewardOutcomeLedgerConfig = {
@@ -174,6 +183,11 @@ type StewardCrystalsConfig = {
   allowedCorpora: string[];
   /** Per model call timeout in ms (`0` = unlimited). */
   timeoutMs: number;
+  /**
+   * Let high-salience (Flashbulb) evidence take a bounded share (≤ 1/4, at least one) of a cluster's member slots and
+   * nudge synthesis order; representative members keep the remaining slots.
+   */
+  prioritizeEmotionalSalience: boolean;
 };
 /** Overnight Thinking: Voltaire Drift, Shortfall Post-Mortems and Anticipatory Pre-Answering (`steward-overnight.ts`). */
 type StewardOvernightConfig = {
@@ -266,6 +280,10 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     maxExistingLogChars: 0,
     timeoutMs: 0,
     excludeChatTypes: ["direct"],
+    includeEmotionalSalience: true,
+    minSalienceScore: DEFAULT_EMOTIONAL_SALIENCE_OPTIONS.minSalienceScore,
+    minAbsoluteIntensity: DEFAULT_EMOTIONAL_SALIENCE_OPTIONS.minAbsoluteIntensity,
+    minRelativeIntensity: DEFAULT_EMOTIONAL_SALIENCE_OPTIONS.minRelativeIntensity,
   },
   outcomeLedger: {
     enabled: true,
@@ -335,6 +353,13 @@ function integer(value: unknown, min: number, key: string) {
 function unitInterval(value: unknown, key: string) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
     throw new Error(`steward.${key} must be a number between 0 and 1`);
+  }
+  return value;
+}
+/** Inside Out intensity scale, 0 (none) to 3 (overwhelming). */
+function intensity(value: unknown, key: string) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 3) {
+    throw new Error(`steward.${key} must be a number between 0 and 3`);
   }
   return value;
 }
@@ -471,6 +496,10 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       maxExistingLogChars: integer(cl.maxExistingLogChars, 0, "captainsLog.maxExistingLogChars"),
       timeoutMs: integer(cl.timeoutMs, 0, "captainsLog.timeoutMs"),
       excludeChatTypes: chatTypeList(cl.excludeChatTypes, "captainsLog.excludeChatTypes"),
+      includeEmotionalSalience: boolean(cl.includeEmotionalSalience, "steward.captainsLog.includeEmotionalSalience"),
+      minSalienceScore: unitInterval(cl.minSalienceScore, "captainsLog.minSalienceScore"),
+      minAbsoluteIntensity: intensity(cl.minAbsoluteIntensity, "captainsLog.minAbsoluteIntensity"),
+      minRelativeIntensity: intensity(cl.minRelativeIntensity, "captainsLog.minRelativeIntensity"),
     },
     outcomeLedger: {
       enabled: enabled(o.enabled, "steward.outcomeLedger"),
@@ -515,6 +544,7 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       ltmPromoteMinHits: integer(cr.ltmPromoteMinHits, 0, "crystals.ltmPromoteMinHits"),
       allowedCorpora: corpusList(cr.allowedCorpora, "crystals.allowedCorpora"),
       timeoutMs: integer(cr.timeoutMs, 0, "crystals.timeoutMs"),
+      prioritizeEmotionalSalience: boolean(cr.prioritizeEmotionalSalience, "steward.crystals.prioritizeEmotionalSalience"),
     },
     overnight: {
       enabled: enabled(on.enabled, "steward.overnight"),

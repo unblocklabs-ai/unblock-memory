@@ -1,6 +1,7 @@
 import type { ChatType } from "./config.js";
 import type { ExtractionSession } from "./extraction-store.js";
 import type { ExtractionMessage } from "./extraction-model.js";
+import { type SessionProjectionInput } from "./session-projector.js";
 export declare function extractionSessions(databasePath: string, agentId: string, chatTypes: ChatType[]): ExtractionSession[];
 export type ExtractionPage = {
     kind: "page";
@@ -23,4 +24,4 @@ export declare function readExtractionPage(agentId: string, agentName: string, s
     cursor?: string;
     maxMessages: number;
     maxBytes: number;
-}) => Promise<unknown>, signal?: AbortSignal): Promise<ExtractionPage>;
+}) => Promise<unknown>, signal?: AbortSignal, syntheticInput?: SessionProjectionInput["syntheticInput"]): Promise<ExtractionPage>;

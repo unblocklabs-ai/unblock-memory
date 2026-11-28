@@ -5,6 +5,7 @@ import type { ChatType, UnblockMemoryConfig } from "./config.js";
 import { type DeterministicSyncResult, type ExpectationChatType, type ExpectationKind } from "./expectations-store.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
 import { type WorkStore } from "./work-store.js";
+import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 /**
  * Steward Expectations pass: a fenced `WorkStore` run (`kind='expectations'`, `scope=agentId`).
  *
@@ -88,6 +89,7 @@ export type ExpectationsPassOptions = {
     signal?: AbortSignal;
     leaseMs?: number;
     heartbeatMs?: number;
+    syntheticInput?: SyntheticInputFilterConfig;
     now?: () => number;
 };
 type PassOutcome = {

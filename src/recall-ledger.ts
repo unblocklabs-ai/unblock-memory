@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { DEFAULTS } from "./defaults.js";
 import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
+import type { SyntheticInputFamily } from "./synthetic-input.js";
 
 // Loaded by the background writer worker with plain Node resolution:
 // this module and its imports must stay free of `openclaw`.
@@ -96,6 +97,7 @@ export type RecallQueryRecord = {
   channelId?: string;
   threadId?: string;
   chatType?: string;
+  inputFamily?: SyntheticInputFamily;
   lexQuery?: string;
   vecQuery?: string;
   queryFallback: boolean;
@@ -339,7 +341,7 @@ CREATE INDEX IF NOT EXISTS idx_skill_open_agent_time ON skill_open_events (agent
 
 const ADDITIVE_TABLES = ["recall_queries", "recall_hits", "recall_reads", "skill_routing_events", "skill_open_events"];
 const ADDITIVE_COLUMNS = {
-  recall_queries: { input_tokens: "INTEGER", output_tokens: "INTEGER", recipe_hash: RECIPE_HASH_TYPE },
+  recall_queries: { input_tokens: "INTEGER", output_tokens: "INTEGER", recipe_hash: RECIPE_HASH_TYPE, input_family: "TEXT" },
   skill_routing_events: { recipe_hash: RECIPE_HASH_TYPE },
 };
 /** Pre-release Phase B builds stamped 2 for the same additive layout; heal those back to 1 for rollback safety. */
@@ -419,14 +421,14 @@ function writeRecallBatchIntoDb(
       provider, account_id, sender_id, channel_id, thread_id, chat_type,
       lex_query, vec_query, query_fallback,
       corpora_json, session_filter_json, ranking_mode, fallback_reason, decision_model, min_usefulness,
-      outcome, parent_query_id, input_tokens, output_tokens, recipe_hash
+      outcome, parent_query_id, input_tokens, output_tokens, recipe_hash, input_family
     ) VALUES (
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?
     )
     ON CONFLICT(event_key) DO NOTHING
   `);
@@ -499,6 +501,7 @@ function writeRecallBatchIntoDb(
           truncIntOrNull(r.inputTokens),
           truncIntOrNull(r.outputTokens),
           r.recipeHash?.trim() || "default",
+          r.inputFamily ?? null,
         );
         if (Number(result.changes) > 0) {
           written++;

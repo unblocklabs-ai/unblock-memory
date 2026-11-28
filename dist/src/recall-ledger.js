@@ -179,7 +179,7 @@ CREATE INDEX IF NOT EXISTS idx_skill_open_agent_time ON skill_open_events (agent
 `;
 const ADDITIVE_TABLES = ["recall_queries", "recall_hits", "recall_reads", "skill_routing_events", "skill_open_events"];
 const ADDITIVE_COLUMNS = {
-    recall_queries: { input_tokens: "INTEGER", output_tokens: "INTEGER", recipe_hash: RECIPE_HASH_TYPE },
+    recall_queries: { input_tokens: "INTEGER", output_tokens: "INTEGER", recipe_hash: RECIPE_HASH_TYPE, input_family: "TEXT" },
     skill_routing_events: { recipe_hash: RECIPE_HASH_TYPE },
 };
 /** Pre-release Phase B builds stamped 2 for the same additive layout; heal those back to 1 for rollback safety. */
@@ -254,14 +254,14 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
       provider, account_id, sender_id, channel_id, thread_id, chat_type,
       lex_query, vec_query, query_fallback,
       corpora_json, session_filter_json, ranking_mode, fallback_reason, decision_model, min_usefulness,
-      outcome, parent_query_id, input_tokens, output_tokens, recipe_hash
+      outcome, parent_query_id, input_tokens, output_tokens, recipe_hash, input_family
     ) VALUES (
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?
     )
     ON CONFLICT(event_key) DO NOTHING
   `);
@@ -304,7 +304,7 @@ function writeRecallBatchIntoDb(db, events, options = {}) {
             if (event.kind === "query") {
                 const r = event.record;
                 const createdAtMs = requiredInt(r.createdAtMs, fallbackNow);
-                const result = insertQuery.run(r.eventKey, createdAtMs, r.agentId, r.source, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.provider ?? null, r.accountId ?? null, r.senderId ?? null, r.channelId ?? null, r.threadId ?? null, r.chatType ?? null, r.lexQuery ?? null, r.vecQuery ?? null, r.queryFallback ? 1 : 0, JSON.stringify(r.corpora), r.sessionFilterJson ?? null, r.rankingMode, r.fallbackReason ?? null, r.decisionModel ?? null, finiteOrNull(r.minUsefulness), r.outcome, positiveIntOrNull(r.parentQueryId), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), r.recipeHash?.trim() || "default");
+                const result = insertQuery.run(r.eventKey, createdAtMs, r.agentId, r.source, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null, r.provider ?? null, r.accountId ?? null, r.senderId ?? null, r.channelId ?? null, r.threadId ?? null, r.chatType ?? null, r.lexQuery ?? null, r.vecQuery ?? null, r.queryFallback ? 1 : 0, JSON.stringify(r.corpora), r.sessionFilterJson ?? null, r.rankingMode, r.fallbackReason ?? null, r.decisionModel ?? null, finiteOrNull(r.minUsefulness), r.outcome, positiveIntOrNull(r.parentQueryId), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), r.recipeHash?.trim() || "default", r.inputFamily ?? null);
                 if (Number(result.changes) > 0) {
                     written++;
                     const queryId = Number(result.lastInsertRowid);

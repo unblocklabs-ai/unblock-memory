@@ -177,6 +177,11 @@ function consolidate(db, directory) {
 export function tableExists(db, name) {
     return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name));
 }
+export function readTableColumns(db, name) {
+    return new Set(tableExists(db, name)
+        ? db.prepare("SELECT name FROM pragma_table_info(?)").all(name).map(row => String(row.name))
+        : []);
+}
 /** File existence no longer tells us which feature has initialized its tables. */
 export function hasMemoryTable(path, table) {
     if (!existsSync(path) && !(basename(path) === MEMORY_DATABASE &&

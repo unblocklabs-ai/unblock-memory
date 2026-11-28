@@ -309,8 +309,10 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   assert.equal(rows.length, 8);
   assert.equal(requests.length, 8);
   for (const request of requests) {
-    assert.deepEqual(Object.keys(request.questions).sort(), [...emotions].sort());
-    assert.ok(Object.values(request.questions).every(q => q.type === "noul"));
+    // Six presence Nouls plus one piggybacked 0..3 intensity Score, in the same request.
+    assert.deepEqual(Object.keys(request.questions).sort(), [...emotions, "intensity"].sort());
+    assert.ok(emotions.every(e => request.questions[e]?.type === "noul"));
+    assert.equal(request.questions.intensity?.type, "score");
     const [state] = request.state;
     const target = state.target;
     if (target.text === "Please include this too.") {
@@ -410,6 +412,7 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
       throw new Error("Large-history percentile did not match the preceding binned population");
     db.close();
     await program.parseAsync(["node","openclaw","memory-emotions","baselines","--person",person,"--limit","1"]);
+    await program.parseAsync(["node","openclaw","memory-emotions","baselines","--person",person,"--limit","1","--with-drift"]);
     process.stdout.write(JSON.stringify({output,calls}));
   `);
   const cli = await promisify(execFile)(process.execPath, ["--import", import.meta.resolve("tsx"), cliPath], childOptions);
@@ -419,6 +422,8 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   assert.equal(cliResult.output[2].length, 4);
   assert.equal(cliResult.output[3].reviewed, 4);
   assert.deepEqual(cliResult.output[4], { snapshots: 0, comparisons: 0 });
+  // `baselines` keeps its original array shape by default so existing scripts never break.
+  assert.ok(Array.isArray(cliResult.output[5]));
   assert.ok(cliResult.output[5].some((s: { cumulative: { joy: { count: number } } }) => s.cumulative.joy.count === 3));
   assert.equal(cliResult.output[6].length, 3, "the person filter follows exact PeopleSQL links");
   assert.ok(cliResult.output[6].every((r: { personal_deviation: { history: unknown[] } }) => r.personal_deviation.history.length === 1));
@@ -426,6 +431,11 @@ test("Inside Out uses real OpenClaw storage: follow-ups, queued progress replies
   assert.equal(cliResult.output[8][0].week_end - cliResult.output[5][0].week_end, 7 * 86400_000,
     "manual-only startup publishes the next completed week without inference");
   assert.equal(cliResult.output[8][0].weekly.joy.count, 0);
+  // `--with-drift` opts into the relative snapshots plus absolute intensity profiles and the anchored drift summary.
+  assert.deepEqual(Object.keys(cliResult.output[9]), ["baselines", "intensity", "drift"]);
+  assert.deepEqual(cliResult.output[9].baselines, cliResult.output[8], "the same snapshots, only wrapped");
+  assert.deepEqual(cliResult.output[9].intensity, [], "fixture grades predate intensity, so no profile is invented");
+  assert.deepEqual(Object.keys(cliResult.output[9].drift), ["people", "evaluated", "flagged"]);
   assert.equal(cliResult.calls, 8, "reports and the cached background pass do not repeat inference");
   const evolved = new DatabaseSync(options.databasePath);
   try {
@@ -1059,4 +1069,108 @@ test("a manual pass keeps the row's due_at as of commit, even if the schedule mo
 
 test("interruptInsideOut is a synchronous no-op for owners without an active pass", () => {
   assert.equal(interruptInsideOut("nobody"), 0);
+});
+
+test("intensity piggybacks on the presence call: mixed joy+grief keeps its weight, and missing or malformed answers stay unknown", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-intensity-")), sessionsDir = join(root, "sessions");
+  await mkdir(sessionsDir);
+  const replies = ["Mixed", "Routine", "Missing", "Malformed"];
+  await writeFile(join(sessionsDir, "s.jsonl"), [{ type: "session", id: "s" },
+    ...replies.flatMap((text, i) => [event(`a${i}`, assistant(`Answer ${i}`)), event(`u${i}`, user(text))])]
+    .map(e => JSON.stringify(e)).join("\n"));
+  const score = (probabilities: number[]) => ({ type: "score", confidence: Math.max(...probabilities),
+    score: probabilities.reduce((sum, p, i) => sum + i * p, 0),
+    probabilities: Object.fromEntries(probabilities.map((p, i) => [String(i), p])) });
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+    calls++;
+    const request = JSON.parse(String(init.body)), target = request.state[0].target.text as string;
+    assert.equal(request.questions.intensity.type, "score");
+    assert.equal(request.questions.intensity.criteria.length, 4, "anchored 0..3 levels");
+    const presence = (values: Record<string, number>) => Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: values[e] ?? 0.05 }]));
+    const answers = {
+      // Graduation the week of a funeral: strong joy and strong sadness net to ~0 valence, but the moment is a 3.
+      Mixed: { ...presence({ joy: 0.9, sadness: 0.9 }), intensity: score([0, 0, 0.1, 0.9]) },
+      Routine: { ...presence({}), intensity: score([0.9, 0.1, 0, 0]) },
+      Missing: presence({ joy: 0.6 }),
+      Malformed: { ...presence({ anger: 0.7 }), intensity: { type: "score", score: 7, confidence: 1, probabilities: { 0: 1 } } },
+    }[target];
+    return Response.json({ answers });
+  });
+  const storePath = join(root, "unblock-memory.sqlite");
+  const result = await runInsideOut({ agentId: "main", databasePath: join(root, "absent.sqlite"), sessionsDir, storePath, config: cfg() });
+  assert.equal("reviewed" in result && result.reviewed, 4, "a missing or malformed intensity never fails the presence grade");
+  assert.equal(calls, 4, "one decision request per reply");
+  const rows = new Map(reportInsideOut(storePath).map(row => [row.message_id, row]));
+  const mixed = rows.get("u0")!;
+  assert.ok(Math.abs(Number(mixed.intensity) - 2.9) < 1e-9);
+  assert.equal(mixed.valence, 0, "valence = joy - max(negatives) nets out");
+  assert.equal(mixed.intensity_rubric, "emotion-intensity-v1");
+  assert.match(String(mixed.rubric), /^emotion-presence-v2(@|$)/, "the presence rubric is unchanged, so 6-emotion history is not forked");
+  assert.deepEqual(JSON.parse(String(mixed.intensity_probs_json)), { 0: 0, 1: 0, 2: 0.1, 3: 0.9 });
+  assert.ok(Math.abs(Number(rows.get("u1")!.intensity) - 0.1) < 1e-9);
+  for (const id of ["u2", "u3"]) {
+    const row = rows.get(id)!;
+    assert.equal(row.error, null);
+    assert.equal(row.intensity, null, "unknown intensity is NULL, never 0");
+    assert.equal(row.intensity_probs_json, null);
+    assert.equal(row.intensity_rubric, null);
+    assert.equal(typeof row.valence, "number");
+  }
+  assert.ok(Math.abs(Number(rows.get("u2")!.valence) - 0.55) < 1e-9);
+  const [summary] = reportInsideOut(storePath, { summary: true });
+  assert.equal(summary?.intensity_interactions, 2, "bucket intensity averages only rows that have one");
+  assert.ok(Math.abs(Number(summary?.intensity) - 1.5) < 1e-9);
+  const [exported] = reportInsideOut(storePath, { personal: true });
+  assert.equal((exported?.personal_intensity as { status: string }).status, "unlinked_person");
+  assert.equal((exported?.personal_intensity as { absoluteIntensity: number }).absoluteIntensity, mixed.intensity);
+});
+
+test("legacy Inside Out stores gain intensity columns additively: old grades keep NULL intensity and get derived valence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-legacy-intensity-")), storePath = join(root, "unblock-memory.sqlite");
+  linkInsideOutPeople(storePath);
+  const legacy = new DatabaseSync(storePath);
+  // Downgrade to the previous release's table shape, before intensity and valence existed.
+  for (const column of ["intensity", "intensity_probs_json", "intensity_rubric", "valence"]) legacy.exec(`ALTER TABLE inside_out DROP COLUMN ${column}`);
+  assert.deepEqual(legacy.prepare("SELECT name FROM pragma_table_info('inside_out')").all().map(row => row.name).slice(-2), ["error", "person_id"]);
+  const insert = legacy.prepare(`INSERT INTO inside_out VALUES (?,'emotion-presence-v2','s',?,'a','h','u','slack','s.jsonl',1,1,'m',0,?,?,?,?,?,?,?,NULL)`);
+  insert.run("ok", "ok", 0.7, 0.1, 0.2, 0.4, 0, 0, null);
+  insert.run("failed", "failed", null, null, null, null, null, null, "Decision model request failed");
+  legacy.close();
+  assert.equal(reportInsideOut(storePath, { summary: true })[0]?.interactions, 1, "read-only reports work before migration");
+  assert.equal(linkInsideOutPeople(storePath).unlinked, 2);
+  const rows = new Map(reportInsideOut(storePath).map(row => [row.interaction_id, row]));
+  assert.ok(Math.abs(Number(rows.get("ok")!.valence) - 0.3) < 1e-9);
+  assert.equal(rows.get("ok")!.intensity, null);
+  assert.equal(rows.get("ok")!.joy, 0.7, "existing probabilities are untouched");
+  assert.equal(rows.get("failed")!.valence, null);
+  linkInsideOutPeople(storePath);
+  assert.ok(Math.abs(Number(reportInsideOut(storePath).find(row => row.interaction_id === "ok")?.valence) - 0.3) < 1e-9, "the migration is idempotent");
+});
+
+test("Inside Out grades exactly the human text Captain's Log sees: runtime framing is stripped, synthetic turns are skipped", async t => {
+  const root = await mkdtemp(join(tmpdir(), "inside-out-synthetic-"));
+  const databasePath = join(root, "agent.sqlite"), db = createAgentDatabase(databasePath);
+  insertSession(db, { sessionId: "s", chatType: "channel" });
+  const internal = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nPRIVATE_RUNTIME_CONTEXT\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+  const messages = [user("Q"), assistant("Deployed."),
+    user(`Thanks, the deploy worked!\n\n${internal}`), assistant("Great."),
+    user("[Queued messages while agent was busy]\nAlso, the dashboard looks right."), assistant("Noted."),
+    { ...user("Hidden carrier text"), display: false }, assistant("Ok."),
+    user("A new session was started via /new or /reset. Greet the user."), assistant("Hi!"),
+    user("Human follow-up")];
+  messages.forEach((message, i) => {
+    db.prepare("INSERT INTO transcript_events VALUES(?,?,?,?)").run("s", i + 1, JSON.stringify(event(`m${i}`, message)), 1000 + i);
+    db.prepare("INSERT INTO session_transcript_active_events VALUES(?,?,?,?)").run("s", i, i + 1, i);
+  });
+  db.close();
+  const targets: string[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+    const { state: [state] } = JSON.parse(String(init.body));
+    assert.doesNotMatch(JSON.stringify(state), /PRIVATE_RUNTIME_CONTEXT|Queued messages|Hidden carrier/u);
+    targets.push(state.target.text);
+    return Response.json({ answers: Object.fromEntries(emotions.map(e => [e, { type: "noul", noul: 0.4 }])) });
+  });
+  await runInsideOut({ agentId: "main", databasePath, storePath: join(root, "unblock-memory.sqlite"), config: cfg() });
+  assert.deepEqual([...new Set(targets)], ["Thanks, the deploy worked!", "Also, the dashboard looks right.", "Human follow-up"]);
 });

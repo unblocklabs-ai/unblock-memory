@@ -15,6 +15,7 @@ export declare const CRYSTALS_DEFAULTS: {
     readonly ltmPromoteMinHits: 5;
     readonly allowedCorpora: readonly ["memory", "knowledge"];
     readonly timeoutMs: 0;
+    readonly prioritizeEmotionalSalience: true;
 };
 declare const CRYSTAL_SYNTHESIS_SCHEMA: Type.TObject<{
     shouldCrystallize: Type.TBoolean;
@@ -66,6 +67,13 @@ export type CrystalsPassOptions = {
     ltmPromoteMinHits?: number;
     allowedCorpora?: readonly string[];
     timeoutMs?: number;
+    /**
+     * Let high-salience (Flashbulb) evidence take a bounded share of member slots and nudge the synthesis order. Off: the
+     * representative sample only, and no salience is read.
+     */
+    prioritizeEmotionalSalience?: boolean;
+    /** Prior intensity grades a person needs before relative intensity counts (`insideOut.baselineMinInteractions`). */
+    baselineMinInteractions?: number;
     /** Operator run (`memory-steward crystals --run`): start before the schedule (never steals a live lease). */
     ignoreDueAt?: boolean;
     signal?: AbortSignal;

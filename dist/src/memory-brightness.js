@@ -1,7 +1,11 @@
 import { DatabaseSync } from "node:sqlite";
-export const BRIGHTNESS_RECIPES = ["off", "actr_v1", "outcome_v1"];
+import { readPathSalience } from "./emotional-salience.js";
+import { readTableColumns } from "./memory-database.js";
+export const BRIGHTNESS_RECIPES = ["off", "actr_v1", "outcome_v1", "emotion_v1"];
+export const EMOTION_BRIGHTNESS_LIMITS = { emotionDecayStretch: 3, emotionMaxBonus: 0.35 };
 export const DEFAULT_BRIGHTNESS_CONFIG = {
     recipe: "off", weight: 0.08, decayRate: 0.5, lookbackDays: 90, maxBoost: 0.15,
+    ...EMOTION_BRIGHTNESS_LIMITS,
 };
 export function brightnessRecipeHash(recipe) {
     return recipe === "off" ? "default" : `brightness:${recipe}`;
@@ -12,12 +16,15 @@ export function memorySubjectId(_corpus, path) {
 }
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
+const OUTCOME_DECAY_MS = 30 * DAY_MS;
 const OUTCOME_WEIGHTS = { helped: 1, hurt: -1.5, ignored: -0.12 };
 // One bound batch parameter, without a SQLite variable-count limit on the number of subjects.
 const SUBJECTS = "(SELECT value FROM json_each(:subjects))";
+/** Grounded emotional salience (0..1) per subject; zero or unknown salience is no Flashbulb signal. */
+const salienceScores = (paths) => new Map([...paths].flatMap(([path, { salienceScore }]) => salienceScore > 0 ? [[path, salienceScore]] : []));
 /** Missing or unavailable evidence is neutral. Never initialize or migrate a ledger on the search path. */
 export function computeBrightnessMap(dbOrPath, options) {
-    const { agentId, recipe, subjects, nowMs = Date.now(), decayRate = DEFAULT_BRIGHTNESS_CONFIG.decayRate, lookbackDays = DEFAULT_BRIGHTNESS_CONFIG.lookbackDays } = options;
+    const { agentId, recipe, subjects, nowMs = Date.now(), decayRate = DEFAULT_BRIGHTNESS_CONFIG.decayRate, lookbackDays = DEFAULT_BRIGHTNESS_CONFIG.lookbackDays, emotionDecayStretch = DEFAULT_BRIGHTNESS_CONFIG.emotionDecayStretch, emotionMaxBonus = DEFAULT_BRIGHTNESS_CONFIG.emotionMaxBonus } = options;
     const result = new Map();
     if (recipe === "off" || !subjects.length)
         return result;
@@ -39,11 +46,14 @@ export function computeBrightnessMap(dbOrPath, options) {
         try {
             if (typeof dbOrPath === "string")
                 db.exec("PRAGMA busy_timeout = 50");
-            const tables = new Set(db.prepare(`SELECT name FROM sqlite_schema WHERE type='table' AND name IN
-        ('recall_reads','recall_hits','recall_queries','memory_outcomes','core_memories','expectations')`).all().map(row => row.name));
+            const hasColumns = (table, ...required) => {
+                const columns = readTableColumns(db, table);
+                return required.every(column => columns.has(column));
+            };
             if (recipe === "actr_v1") {
-                const hasReads = tables.has("recall_reads");
-                const hasHits = tables.has("recall_hits") && tables.has("recall_queries");
+                const hasReads = hasColumns("recall_reads", "source_path", "read_at_ms", "agent_id", "status");
+                const hasHits = hasColumns("recall_hits", "source_path", "hit_at_ms", "query_id", "disposition") &&
+                    hasColumns("recall_queries", "id", "agent_id");
                 if (!hasReads && !hasHits)
                     return result;
                 const activation = (at) => Math.max(1, (nowMs - at) / HOUR_MS) ** -decayRate;
@@ -63,29 +73,58 @@ export function computeBrightnessMap(dbOrPath, options) {
                 }
             }
             else {
-                if (!tables.has("memory_outcomes") && !tables.has("core_memories") && !tables.has("expectations"))
+                // The same evidence window as outcomes: a grade or log entry outside the lookback is no Flashbulb signal.
+                const salience = recipe === "emotion_v1" ? salienceScores(readPathSalience(db, agentId, [...keys], {
+                    nowMs, lookbackDays, ...(options.baselineMinInteractions !== undefined
+                        ? { baselineMinInteractions: options.baselineMinInteractions } : {}),
+                })) : undefined;
+                const hasOutcomes = hasColumns("memory_outcomes", "subject_id", "verdict", "confidence", "measured_at", "agent_id", "subject_kind");
+                const hasCore = hasColumns("core_memories", "agent_id", "source_path");
+                const hasExpectations = hasColumns("expectations", "evidence_json", "surprise_score", "agent_id", "status", "resolved_at_ms");
+                if (!hasOutcomes && !hasCore && !hasExpectations && !salience?.size)
                     return result;
-                if (tables.has("memory_outcomes")) {
+                const flashbulb = new Map();
+                const stretch = Math.max(0, Math.min(EMOTION_BRIGHTNESS_LIMITS.emotionDecayStretch, emotionDecayStretch));
+                const maxBonus = Math.max(0, Math.min(EMOTION_BRIGHTNESS_LIMITS.emotionMaxBonus, emotionMaxBonus));
+                if (hasOutcomes) {
                     for (const row of db.prepare(`SELECT subject_id, verdict, confidence, measured_at FROM memory_outcomes
             WHERE agent_id=:agent AND subject_kind='memory_hit' AND measured_at BETWEEN :since AND :now
               AND subject_id IN ${SUBJECTS}`).iterate(window)) {
                         const weight = OUTCOME_WEIGHTS[row.verdict];
-                        add(String(row.subject_id), weight * Number(row.confidence) * Math.exp(-(nowMs - Number(row.measured_at)) / (30 * DAY_MS)));
+                        const subject = String(row.subject_id);
+                        const value = weight * Number(row.confidence);
+                        const age = (nowMs - Number(row.measured_at)) / OUTCOME_DECAY_MS;
+                        const baseline = value * Math.exp(-age);
+                        add(subject, baseline);
+                        const emotion = salience?.get(subject);
+                        if (emotion) {
+                            const adjustment = flashbulb.get(subject) ?? { decayDelta: 0, hurt: false };
+                            adjustment.decayDelta += value * Math.exp(-age / (1 + emotion * stretch)) - baseline;
+                            adjustment.hurt ||= row.verdict === "hurt" && value < 0;
+                            flashbulb.set(subject, adjustment);
+                        }
                     }
                 }
-                if (tables.has("core_memories")) {
+                if (hasCore) {
                     for (const row of db.prepare(`SELECT DISTINCT source_path FROM core_memories
             WHERE agent_id=:agent AND source_path IN ${SUBJECTS}`).iterate(scope)) {
                         add(String(row.source_path), 0.35);
                     }
                 }
-                if (tables.has("expectations")) {
+                if (hasExpectations) {
                     // Only explicit source links contribute; session or text overlap does not establish a link.
                     for (const row of db.prepare(`SELECT json_extract(evidence_json,'$.sourcePath') AS source_path, surprise_score
             FROM expectations WHERE agent_id=:agent AND status!='open' AND resolved_at_ms BETWEEN :since AND :now
               AND surprise_score>=0.5 AND json_extract(evidence_json,'$.sourcePath') IN ${SUBJECTS}`).iterate(window)) {
                         add(String(row.source_path), 0.35 * Number(row.surprise_score));
                     }
+                }
+                for (const [subject, emotion] of salience ?? []) {
+                    const { decayDelta = 0, hurt = false } = flashbulb.get(subject) ?? {};
+                    // A confirmed hurt may persist longer, but emotion cannot improve that subject over outcome_v1.
+                    const adjustment = hurt ? Math.min(0, decayDelta) : decayDelta + maxBonus * emotion;
+                    if (adjustment)
+                        add(subject, adjustment);
                 }
             }
         }

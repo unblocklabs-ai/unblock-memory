@@ -55,6 +55,7 @@ test("config defaults, nested overrides and strict boundaries", () => {
     captainsLog: {
       enabled: true, intervalMinutes: 180, lookbackMinutes: 190, maxSessionsPerRun: 0,
       maxCharsPerSession: 0, maxExistingLogChars: 0, timeoutMs: 0, excludeChatTypes: ["direct"],
+      includeEmotionalSalience: true, minSalienceScore: 0.7, minAbsoluteIntensity: 2.2, minRelativeIntensity: 1.5,
     },
     outcomeLedger: {
       enabled: true, intervalMinutes: 60, lookbackMs: 604_800_000, maxRowsPerPass: 0, matchWindowMs: 1_800_000, retentionDays: 0,
@@ -69,7 +70,7 @@ test("config defaults, nested overrides and strict boundaries", () => {
     crystals: {
       enabled: true, intervalMinutes: 360, reclusterMinIntervalMinutes: 720, autoRecluster: true, minClusterSize: 3,
       maxClustersPerRun: 0, maxMembersPerCluster: 12, stmStaleAfterMinutes: 20_160, ltmPromoteMinHelped: 3, ltmPromoteMinHits: 5,
-      allowedCorpora: ["memory", "knowledge"], timeoutMs: 0,
+      allowedCorpora: ["memory", "knowledge"], timeoutMs: 0, prioritizeEmotionalSalience: true,
     },
     overnight: {
       enabled: true, intervalMinutes: 720, voltaireEnabled: true, postmortemsEnabled: true, preAnswerEnabled: true, lookbackDays: 30,
@@ -82,7 +83,8 @@ test("config defaults, nested overrides and strict boundaries", () => {
     reasoning: "off", endpoint: "http://localhost:123/v1/responses/",
     deepThought: { maxTurns: 40, timeoutMs: 600_000, syncWaitMs: 0, jobRetentionMs: 60_000, reasoning: "low", searchRanking: "decision", searchMinUsefulness: 0.4 },
     peopleShadow: { mode: "shadow", minConfidence: "high", maxItemsPerRun: 5 },
-    captainsLog: { intervalMinutes: 60, lookbackMinutes: 70, excludeChatTypes: ["direct", "group"] },
+    captainsLog: { intervalMinutes: 60, lookbackMinutes: 70, excludeChatTypes: ["direct", "group"],
+      includeEmotionalSalience: false, minSalienceScore: 0.5, minAbsoluteIntensity: 3, minRelativeIntensity: 0 },
   });
   assert.equal(overridden.endpoint, "http://localhost:123/v1/responses");
   assert.equal(overridden.deepThought.maxTurns, 40);
@@ -94,6 +96,8 @@ test("config defaults, nested overrides and strict boundaries", () => {
   assert.equal(overridden.peopleShadow.mode, "shadow");
   assert.equal(overridden.peopleShadow.minConfidence, "high");
   assert.deepEqual(overridden.captainsLog.excludeChatTypes, ["direct", "group"]);
+  assert.deepEqual([overridden.captainsLog.includeEmotionalSalience, overridden.captainsLog.minSalienceScore,
+    overridden.captainsLog.minAbsoluteIntensity, overridden.captainsLog.minRelativeIntensity], [false, 0.5, 3, 0]);
   for (const bad of [null, [], { extra: false }, { deepThought: { extra: 0 } }, { peopleShadow: { other: true } },
     { captainsLog: { extra: true } }, { enabled: null }, { peopleShadow: { enabled: 1 } }, { deepThought: [] }, { model: " " }, { reasoning: "adaptive" },
     { apiKey: "bad key" }, { apiKeyFile: 2 }, { apiKeyFile: "relative/secret.env" }, { apiKeyFile: "./secret.env" }, { maxActiveBackground: 0 },
@@ -107,7 +111,9 @@ test("config defaults, nested overrides and strict boundaries", () => {
     { peopleShadow: { maxHandles: -1 } }, { peopleShadow: { maxExcerptChars: -1 } }, { peopleShadow: { maxExportBytes: -1 } },
     { captainsLog: { intervalMinutes: 0 } }, { captainsLog: { lookbackMinutes: 0 } }, { captainsLog: { maxSessionsPerRun: -1 } },
     { captainsLog: { maxCharsPerSession: -1 } }, { captainsLog: { maxExistingLogChars: -1 } }, { captainsLog: { timeoutMs: -1 } },
-    { captainsLog: { excludeChatTypes: ["thread"] } }]) {
+    { captainsLog: { excludeChatTypes: ["thread"] } }, { captainsLog: { includeEmotionalSalience: "yes" } },
+    { captainsLog: { minSalienceScore: 1.1 } }, { captainsLog: { minSalienceScore: -0.1 } },
+    { captainsLog: { minAbsoluteIntensity: 3.1 } }, { captainsLog: { minRelativeIntensity: -1 } }]) {
     assert.throws(() => resolveStewardConfig(bad));
   }
   for (const endpoint of ["not a URL", "file:///private", "https://u:p@x.test", "https://x.test/?", "https://x.test/#fragment",

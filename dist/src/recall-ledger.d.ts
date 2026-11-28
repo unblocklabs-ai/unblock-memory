@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { SyntheticInputFamily } from "./synthetic-input.js";
 /**
  * Stays 1: skill event tables, token columns, and recipe stamps are purely additive, so a rollback to v0.16.0
  * (which rejects any other version) still opens the ledger. Opens self-heal missing additive objects.
@@ -59,6 +60,7 @@ export type RecallQueryRecord = {
     channelId?: string;
     threadId?: string;
     chatType?: string;
+    inputFamily?: SyntheticInputFamily;
     lexQuery?: string;
     vecQuery?: string;
     queryFallback: boolean;

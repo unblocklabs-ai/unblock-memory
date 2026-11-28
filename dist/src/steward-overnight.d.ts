@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
 import { type WorkStore } from "./work-store.js";
+import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 /**
  * Overnight Thinking Steward: a fenced `WorkStore` run (`kind='overnight_thinking'`, `scope=agentId`) that uses
  * agent time while humans sleep.
@@ -178,6 +179,7 @@ export type OvernightThinkingPassOptions = {
     signal?: AbortSignal;
     leaseMs?: number;
     heartbeatMs?: number;
+    syntheticInput?: SyntheticInputFilterConfig;
     now?: () => number;
 };
 type PassStatus = "not_due" | "already_running" | "aborted" | "outside_quiet_hours" | "disabled" | "empty" | "completed" | "failed";

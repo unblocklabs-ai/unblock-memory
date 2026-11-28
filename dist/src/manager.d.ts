@@ -33,6 +33,7 @@ export type ManagerSessionConfig = {
     /** Pre-0.18 state directory whose `sessions-manifest.json` is imported once on upgrade. */
     legacyStateDir?: string;
     timezone: string;
+    syntheticInput?: import("./synthetic-input.js").SyntheticInputFilterConfig;
 };
 export type SkillCatalogEntry = {
     name: string;

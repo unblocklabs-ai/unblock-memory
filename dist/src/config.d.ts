@@ -7,6 +7,7 @@ import { type SafetyWhispererConfig } from "./safety-config.js";
 import { type MyTurnConfig } from "./my-turn.js";
 import { type RecallLedgerConfig } from "./recall-ledger.js";
 import { type StewardConfig } from "./steward-config.js";
+import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 import { type ExpectationsWhispererConfig } from "./expectations-whisperer.js";
 import { type BrightnessConfig } from "./memory-brightness.js";
 export type FileCorpusConfig = {
@@ -50,6 +51,7 @@ export type UnblockMemoryConfig = {
     extraction: ExtractionConfig;
     corpora: readonly CorpusConfig[];
     keepEmbeddingModelWarm: boolean;
+    syntheticInput?: SyntheticInputFilterConfig;
     analysis: {
         executable?: string;
     };
@@ -115,7 +117,7 @@ export type UnblockMemoryConfig = {
         /** Minimum shared meaningful tokens for a non-exact question match. Resolved default: `2`. */
         derivedMinSharedTokens?: number;
         /**
-         * Brightness A/B recipe: re-orders usefulness-qualified finalists by recall/outcome evidence. Resolved default:
+         * Brightness A/B recipe: re-orders usefulness-qualified finalists by recall, outcome, or emotion evidence. Resolved default:
          * `recipe: "off"` (no lookup). A non-`off` recipe also stamps `brightness:<recipe>` as `recipeHash` unless one is set.
          */
         brightness?: BrightnessConfig;

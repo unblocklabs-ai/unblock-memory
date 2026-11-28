@@ -1,8 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import type { ChatType } from "./config.js";
+import { type EmotionalSalienceOptions } from "./emotional-salience.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
 import { type WorkStore } from "./work-store.js";
+import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 export declare const CAPTAINS_LOG_KIND = "captains_log";
 export declare const CAPTAINS_LOG_SCHEMA: Type.TObject<{
     shouldAppend: Type.TBoolean;
@@ -11,6 +13,8 @@ export declare const CAPTAINS_LOG_SCHEMA: Type.TObject<{
         summary: Type.TString;
         blocked: Type.TOptional<Type.TBoolean>;
         sessionRefs: Type.TOptional<Type.TArray<Type.TString>>;
+        /** Opaque message handles (`m1`, …) the entry rests on; only salience-cued messages carry one. */
+        messageRefs: Type.TOptional<Type.TArray<Type.TString>>;
     }>>;
     skipReason: Type.TOptional<Type.TString>;
 }>;
@@ -21,6 +25,28 @@ declare const CAPTURED_ENTRY: Type.TObject<{
     channels: Type.TArray<Type.TString>;
     sessionRefs: Type.TArray<Type.TString>;
     nativeChannels: Type.TOptional<Type.TArray<Type.TString>>;
+    salienceScore: Type.TOptional<Type.TNumber>;
+    emotionalIntensity: Type.TOptional<Type.TNumber>;
+    relativeSalience: Type.TOptional<Type.TNumber>;
+    salienceSignals: Type.TOptional<Type.TObject<{
+        highSalience: Type.TBoolean;
+        /** `message`: cited via `messageRefs`; `session`: the single salient message of the only cited session. */
+        grounding: Type.TUnion<[Type.TLiteral<"message">, Type.TLiteral<"session">]>;
+        label: Type.TString;
+        signals: Type.TArray<Type.TObject<{
+            ref: Type.TString;
+            sessionId: Type.TString;
+            messageId: Type.TString;
+            salienceScore: Type.TNumber;
+            absoluteIntensity: Type.TUnion<[Type.TNumber, Type.TNull]>;
+            relativeIntensityPercentile: Type.TUnion<[Type.TNumber, Type.TNull]>;
+            maxEmotionUnusualness: Type.TUnion<[Type.TNumber, Type.TNull]>;
+            valence: Type.TUnion<[Type.TNumber, Type.TNull]>;
+            dominantEmotion: Type.TUnion<[Type.TString, Type.TNull]>;
+            label: Type.TString;
+            highSalience: Type.TBoolean;
+        }>>;
+    }>>;
 }>;
 type CapturedEntry = Static<typeof CAPTURED_ENTRY>;
 declare const ARTIFACT: Type.TObject<{
@@ -38,6 +64,28 @@ declare const ARTIFACT: Type.TObject<{
             channels: Type.TArray<Type.TString>;
             sessionRefs: Type.TArray<Type.TString>;
             nativeChannels: Type.TOptional<Type.TArray<Type.TString>>;
+            salienceScore: Type.TOptional<Type.TNumber>;
+            emotionalIntensity: Type.TOptional<Type.TNumber>;
+            relativeSalience: Type.TOptional<Type.TNumber>;
+            salienceSignals: Type.TOptional<Type.TObject<{
+                highSalience: Type.TBoolean;
+                /** `message`: cited via `messageRefs`; `session`: the single salient message of the only cited session. */
+                grounding: Type.TUnion<[Type.TLiteral<"message">, Type.TLiteral<"session">]>;
+                label: Type.TString;
+                signals: Type.TArray<Type.TObject<{
+                    ref: Type.TString;
+                    sessionId: Type.TString;
+                    messageId: Type.TString;
+                    salienceScore: Type.TNumber;
+                    absoluteIntensity: Type.TUnion<[Type.TNumber, Type.TNull]>;
+                    relativeIntensityPercentile: Type.TUnion<[Type.TNumber, Type.TNull]>;
+                    maxEmotionUnusualness: Type.TUnion<[Type.TNumber, Type.TNull]>;
+                    valence: Type.TUnion<[Type.TNumber, Type.TNull]>;
+                    dominantEmotion: Type.TUnion<[Type.TString, Type.TNull]>;
+                    label: Type.TString;
+                    highSalience: Type.TBoolean;
+                }>>;
+            }>>;
         }>>>;
     }>>;
     schemaVersion: Type.TLiteral<1>;
@@ -46,7 +94,7 @@ declare const ARTIFACT: Type.TObject<{
     lastEntryHash: Type.TOptional<Type.TString>;
 }>;
 export type CaptainsLogWatermark = Omit<Static<typeof ARTIFACT>, "pendingAppend">;
-type CaptainsLogEntry = CapturedEntry & {
+export type CaptainsLogEntry = Omit<CapturedEntry, "salienceSignals"> & {
     id: string;
     agentId: string;
     day: string;
@@ -56,7 +104,10 @@ type CaptainsLogEntry = CapturedEntry & {
     resolvedAtMs: number | null;
     resolutionNote: string | null;
 };
-/** Newest captures first, with entries from each section in rendered order. Zero or omitted limit is unlimited. */
+/**
+ * `[BLOCKED]` entries first, then high-salience entries (strongest first), then newest captures, with entries from each
+ * section in rendered order. Zero or omitted limit is unlimited.
+ */
 export declare function listCaptainsLogEntries(db: DatabaseSync, options: {
     agentId: string;
     day?: string;
@@ -91,15 +142,32 @@ export type CaptainsLogPassOptions = {
     maxExistingLogChars?: number;
     timeoutMs?: number;
     excludeChatTypes?: readonly ChatType[];
+    /**
+     * Cue emotionally salient human messages (Inside Out grades in the work database) to Steward, persist grounded salience
+     * privately in the ledger, and rank salient entries right behind blockers. Missing or late grades never block capture.
+     * Default true.
+     */
+    includeEmotionalSalience?: boolean;
+    /** A message is cued once its salience score (0..1) reaches this. Defaults to the salience reader's default. */
+    minSalienceScore?: number;
+    /** A message is cued once its absolute intensity (0..3) reaches this. Defaults to the salience reader's default. */
+    minAbsoluteIntensity?: number;
+    /** Person-relative spikes count only from this absolute intensity (0..3) up. Defaults to the salience reader's default. */
+    minRelativeIntensity?: number;
+    /** Prior intensity grades a person needs before relative intensity counts (`insideOut.baselineMinInteractions`). */
+    baselineMinInteractions?: number;
+    /** Remaining salience weights and thresholds; the top-level thresholds above take precedence. */
+    salience?: EmotionalSalienceOptions;
     /** Preview without acquiring a lease, creating a file, or moving the schedule or watermark. */
     dryRun?: boolean;
     signal?: AbortSignal;
     leaseMs?: number;
     heartbeatMs?: number;
+    syntheticInput?: SyntheticInputFilterConfig;
     now?: () => number;
 };
 /** A Captain's Log entry as just appended, with its durable ledger id. */
-type AppendedCaptainsLogEntry = CapturedEntry & {
+type AppendedCaptainsLogEntry = Omit<CapturedEntry, "salienceSignals"> & {
     id: string;
 };
 type PassOutcome = {

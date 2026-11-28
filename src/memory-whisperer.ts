@@ -6,6 +6,8 @@ import { resolveDecisionCredential, DecisionRequestError } from "./decision-clie
 import { complementaryIndices, reviewMemoryRedundancy } from "./decision-review.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { ApiQueryGenerator, fallbackQueries, QueryApiError, visibleQueryConversation } from "./query-generator.js";
+import { queryUserText } from "./response-text.js";
+import { classifySyntheticInput, type SyntheticInputFilterConfig } from "./synthetic-input.js";
 import { selectJudgeConversation } from "./judge-context.js";
 import { prepareQueryConversation, QueryInputBudgetError, type QueryConversation, type QueryPair } from "./query-contract.js";
 import { searchMemory, memoryPassageId, type MemoryCandidateManager, type RecallCandidateTrace } from "./memory-search.js";
@@ -96,9 +98,10 @@ type CrystalWhisperOptions = {
 };
 
 /** Optional: re-order usefulness-qualified finalists by Brightness evidence (never on the `off` recipe). */
-type BrightnessWhisperOptions = BrightnessConfig & { dbPathForAgent: (agentId: string) => string };
+type BrightnessWhisperOptions = BrightnessConfig & { dbPathForAgent: (agentId: string) => string; baselineMinInteractions?: number };
 
 export type MemoryWhispererOptions = {
+  syntheticInput?: SyntheticInputFilterConfig;
   derivedObservations?: DerivedObservationWhisperOptions;
   crystals?: CrystalWhisperOptions;
   brightness?: BrightnessWhisperOptions;
@@ -497,12 +500,21 @@ export function registerMemoryWhisperer(
     if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope) return;
     const corpora = config.corpora;
     if (!corpora.length) return;
+    const rawCurrent = event.currentUserMessage ?? event.prompt;
+    const input = classifySyntheticInput({
+      // A legacy prompt can wrap the wake in a sender envelope.
+      text: queryUserText(rawCurrent) ?? rawCurrent,
+      inputProvenance: context.inputProvenance,
+      display: (event as Record<string, unknown>).display,
+    }, options.syntheticInput);
+    if (input.action === "skip" ||
+        ((input.family === "cron_wrapper" || input.family === "heartbeat_control") && surface !== "cron" && surface !== "heartbeat")) return;
     const admission = sessions.lookup({ agentId, scope, runId });
     if (admission.kind === "replay") return admission.result;
     if (admission.kind === "superseded") return undefined;
-    const currentUserMessage = typeof event.currentUserMessage === "string" ? event.currentUserMessage : undefined;
-    const rawCurrent = currentUserMessage !== undefined ? currentUserMessage : event.prompt;
-    if (!rawCurrent.replace(/^\s*From: [^\r\n]+ \([^()\r\n]+\)\s*$/, "").trim()) return;
+    const currentRequest = queryUserText(input.text);
+    if (!currentRequest) return;
+    const inputFamily = surface === "cron" ? "cron_wrapper" : surface === "heartbeat" ? "heartbeat_control" : undefined;
     const started = performance.now();
     const asOf = new Date().toISOString();
     const turn: TurnTelemetry = {
@@ -554,6 +566,7 @@ export function registerMemoryWhisperer(
           sessionKey,
           runId,
           ...origin,
+          inputFamily,
           lexQuery: generatedQueries?.map(pair => pair.lex).join("\n"),
           vecQuery: generatedQueries?.map(pair => pair.vec).join("\n"),
           ...(recipeHash ? { recipeHash } : {}),
@@ -581,9 +594,8 @@ export function registerMemoryWhisperer(
         const audience = derivedAudienceContext(context as Record<string, unknown>, agentId, sessionKey);
         const audienceKey = nonBlank((derivedObservations.audienceKey ?? deepThoughtAudienceKey)(audience));
         if (!audienceKey) return;
-        const queryText = visibleQueryConversation(event.prompt, event.messages, currentUserMessage).currentRequest;
         derivedMatches = await lookupDerivedObservations({
-          options: derivedObservations, agentId, queryText, audienceKey, allowedCorpora: corpora,
+          options: derivedObservations, agentId, queryText: currentRequest, audienceKey, allowedCorpora: corpora,
           isCoolingDown: id => recent.has(`derived:${id}`),
         });
       } catch (error) {
@@ -600,9 +612,8 @@ export function registerMemoryWhisperer(
         await Promise.resolve();
         const audience = derivedAudienceContext(context as Record<string, unknown>, agentId, sessionKey);
         const audienceKey = nonBlank((crystals.audienceKey ?? deepThoughtAudienceKey)(audience));
-        const queryText = visibleQueryConversation(event.prompt, event.messages, currentUserMessage).currentRequest;
         const matches = findMatchingCrystalsReadOnly(crystals.dbPathForAgent(agentId), {
-          agentId, queryText, audienceKeys: [WORKSPACE_AUDIENCE, ...(audienceKey ? [audienceKey] : [])], allowedCorpora: corpora,
+          agentId, queryText: currentRequest, audienceKeys: [WORKSPACE_AUDIENCE, ...(audienceKey ? [audienceKey] : [])], allowedCorpora: corpora,
           ...(crystals.minTokenOverlap !== undefined ? { minTokenOverlap: crystals.minTokenOverlap } : {}),
           ...(crystals.minSharedTokens !== undefined ? { minSharedTokens: crystals.minSharedTokens } : {}),
           ...(crystals.ltmRankBoost !== undefined ? { ltmRankBoost: crystals.ltmRankBoost } : {}),
@@ -618,7 +629,7 @@ export function registerMemoryWhisperer(
     })() : Promise.resolve();
     let memoryHints: MemoryHint[] = [];
     const run = async () => {
-      const visible = visibleQueryConversation(event.prompt, event.messages, currentUserMessage);
+      const visible = visibleQueryConversation(event.prompt, event.messages, currentRequest, options.syntheticInput);
       const judgeConversation = selectJudgeConversation(visible);
       if (judgeConversation.status === "input_too_large") throw new QueryInputBudgetError();
       // Legacy only: the query-model contract has its own token budget. v2 plans from the bounded judge context.
@@ -680,6 +691,8 @@ export function registerMemoryWhisperer(
           recipe: brightness.recipe, weight: brightness.weight, maxBoost: brightness.maxBoost,
           lookup: (subjects: readonly string[]) => computeBrightnessMap(brightness.dbPathForAgent(agentId), {
             agentId, recipe: brightness.recipe, subjects, decayRate: brightness.decayRate, lookbackDays: brightness.lookbackDays,
+            emotionDecayStretch: brightness.emotionDecayStretch, emotionMaxBonus: brightness.emotionMaxBonus,
+            ...(brightness.baselineMinInteractions !== undefined ? { baselineMinInteractions: brightness.baselineMinInteractions } : {}),
           }),
         } } : {}),
         onCandidates: observation => {

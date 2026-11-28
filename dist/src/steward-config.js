@@ -1,5 +1,6 @@
 import { resolveDecisionCredential } from "./decision-client.js";
 import { isAbsolute } from "node:path";
+import { DEFAULT_EMOTIONAL_SALIENCE_OPTIONS } from "./emotional-salience.js";
 import { isRecord } from "./guards.js";
 import { CRYSTALS_DEFAULTS } from "./steward-crystals.js";
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"];
@@ -52,6 +53,10 @@ const DEFAULT_STEWARD_CONFIG = {
         maxExistingLogChars: 0,
         timeoutMs: 0,
         excludeChatTypes: ["direct"],
+        includeEmotionalSalience: true,
+        minSalienceScore: DEFAULT_EMOTIONAL_SALIENCE_OPTIONS.minSalienceScore,
+        minAbsoluteIntensity: DEFAULT_EMOTIONAL_SALIENCE_OPTIONS.minAbsoluteIntensity,
+        minRelativeIntensity: DEFAULT_EMOTIONAL_SALIENCE_OPTIONS.minRelativeIntensity,
     },
     outcomeLedger: {
         enabled: true,
@@ -121,6 +126,13 @@ function integer(value, min, key) {
 function unitInterval(value, key) {
     if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
         throw new Error(`steward.${key} must be a number between 0 and 1`);
+    }
+    return value;
+}
+/** Inside Out intensity scale, 0 (none) to 3 (overwhelming). */
+function intensity(value, key) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 3) {
+        throw new Error(`steward.${key} must be a number between 0 and 3`);
     }
     return value;
 }
@@ -272,6 +284,10 @@ export function resolveStewardConfig(value) {
             maxExistingLogChars: integer(cl.maxExistingLogChars, 0, "captainsLog.maxExistingLogChars"),
             timeoutMs: integer(cl.timeoutMs, 0, "captainsLog.timeoutMs"),
             excludeChatTypes: chatTypeList(cl.excludeChatTypes, "captainsLog.excludeChatTypes"),
+            includeEmotionalSalience: boolean(cl.includeEmotionalSalience, "steward.captainsLog.includeEmotionalSalience"),
+            minSalienceScore: unitInterval(cl.minSalienceScore, "captainsLog.minSalienceScore"),
+            minAbsoluteIntensity: intensity(cl.minAbsoluteIntensity, "captainsLog.minAbsoluteIntensity"),
+            minRelativeIntensity: intensity(cl.minRelativeIntensity, "captainsLog.minRelativeIntensity"),
         },
         outcomeLedger: {
             enabled: enabled(o.enabled, "steward.outcomeLedger"),
@@ -316,6 +332,7 @@ export function resolveStewardConfig(value) {
             ltmPromoteMinHits: integer(cr.ltmPromoteMinHits, 0, "crystals.ltmPromoteMinHits"),
             allowedCorpora: corpusList(cr.allowedCorpora, "crystals.allowedCorpora"),
             timeoutMs: integer(cr.timeoutMs, 0, "crystals.timeoutMs"),
+            prioritizeEmotionalSalience: boolean(cr.prioritizeEmotionalSalience, "steward.crystals.prioritizeEmotionalSalience"),
         },
         overnight: {
             enabled: enabled(on.enabled, "steward.overnight"),

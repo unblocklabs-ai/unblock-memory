@@ -3,6 +3,7 @@ import type { ChatType } from "./config.js";
 import { projectLoggieMessage } from "./loggie-projection.js";
 import { applyProposal, parseAttachments, parseInternalMessage } from "./session-noise.js";
 import { nonBlank, record } from "./guards.js";
+import { classifySyntheticInput, isSyntheticEvidence, type SyntheticInputFilterConfig } from "./synthetic-input.js";
 
 export type SessionMetadata = {
   sessionId: string;
@@ -18,6 +19,7 @@ export type SessionProjectionInput = SessionMetadata & {
   agentName: string;
   timezone: string;
   events: readonly { eventJson: string; createdAt: number }[];
+  syntheticInput?: SyntheticInputFilterConfig;
   /** Optional counters for this projection pass; never contains source text. */
   diagnostics?: { internalMessagesCleaned: number; attachmentsCleaned: number; attachmentBudgetSkipped: number };
 };
@@ -99,15 +101,6 @@ export function projectMessage(row: SessionProjectionInput["events"][number], in
   }
   let text = textContent(message.content);
   if (!text) return undefined;
-  if (text === "HEARTBEAT_OK") return undefined;
-  if (role === "assistant" && text === "NO_REPLY") return undefined;
-  if (role === "user" && (
-    text === "[OpenClaw heartbeat poll]" ||
-    text === "[Queued messages while agent was busy]" ||
-    text.startsWith("[Subagent Context]") ||
-    text.startsWith("<relevant-memories>")
-  )) return undefined;
-
   const metadata = record(message.__openclaw);
   const speaker = role === "assistant"
     ? input.agentName
@@ -121,12 +114,25 @@ export function projectMessage(row: SessionProjectionInput["events"][number], in
   if (role === "user" && speaker !== "User") {
     text = text.replace(/^From:[^\n]*\n/u, "").trim();
   }
-  if (!text) return undefined;
-  if (role === "user" && input.provider?.toLowerCase() !== "loggie") {
-    const provenance = record(message.provenance);
-    const trusted = provenance?.kind === "inter_session" &&
-      (provenance.sourceTool === "subagent_announce" || provenance.sourceTool === "agent_harness_task");
-    const internal = parseInternalMessage(text, trusted);
+  const loggie = input.provider?.toLowerCase() === "loggie";
+  const provenance = record(message.provenance);
+  const trusted = role === "user" && !loggie && provenance?.kind === "inter_session" &&
+    (provenance.sourceTool === "subagent_announce" || provenance.sourceTool === "agent_harness_task");
+  // An authenticated child result that passes the exact completion grammar is useful, searchable work; it bypasses the
+  // inter-session carrier skip and is projected through the safe parser below. Placeholder wakes never parse.
+  const report = trusted ? parseInternalMessage(text, true) : undefined;
+  if (!report?.edits.length) {
+    const classified = classifySyntheticInput({ text, role,
+      inputProvenance: message.inputProvenance ?? message.provenance ?? eventRecord.inputProvenance,
+      display: message.display ?? eventRecord.display,
+    }, input.syntheticInput);
+    if (isSyntheticEvidence(classified)) return undefined;
+    if (classified.family === "internal_context" && input.diagnostics) input.diagnostics.internalMessagesCleaned++;
+    text = classified.text;
+  }
+  if (!text || (role === "user" && text.startsWith("<relevant-memories>"))) return undefined;
+  if (role === "user" && !loggie) {
+    const internal = report?.edits.length ? report : parseInternalMessage(text, trusted);
     const proposal = internal.edits.length ? internal : parseAttachments(text);
     if (input.diagnostics) {
       if (internal.edits.length) input.diagnostics.internalMessagesCleaned++;

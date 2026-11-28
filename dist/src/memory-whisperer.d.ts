@@ -1,6 +1,7 @@
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
+import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 import { type MemoryCandidateManager } from "./memory-search.js";
 import type { RecallLedgerWriter } from "./recall-ledger.js";
 import type { WhispererPrompt } from "./whisperer-prompt.js";
@@ -51,8 +52,10 @@ type CrystalWhisperOptions = {
 /** Optional: re-order usefulness-qualified finalists by Brightness evidence (never on the `off` recipe). */
 type BrightnessWhisperOptions = BrightnessConfig & {
     dbPathForAgent: (agentId: string) => string;
+    baselineMinInteractions?: number;
 };
 export type MemoryWhispererOptions = {
+    syntheticInput?: SyntheticInputFilterConfig;
     derivedObservations?: DerivedObservationWhisperOptions;
     crystals?: CrystalWhisperOptions;
     brightness?: BrightnessWhisperOptions;

@@ -1,7 +1,8 @@
 import type { UnblockMemoryConfig } from "./config.js";
 import { type QueryConversation, type QueryPair } from "./query-contract.js";
+import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
-export declare function visibleQueryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string): QueryConversation;
+export declare function visibleQueryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string, syntheticInput?: SyntheticInputFilterConfig): QueryConversation;
 export declare function queryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string): QueryConversation;
 /** Deterministic query pair used when the resident query API fails or times out. */
 export declare function fallbackQueries(conversation: QueryConversation): QueryPair;

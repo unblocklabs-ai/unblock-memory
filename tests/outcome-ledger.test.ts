@@ -248,7 +248,7 @@ test("disabled Response Audit (no cohort) never attaches historical audit rows",
   assert.equal(db.prepare("SELECT verdict FROM memory_outcomes").get()?.verdict, "hurt");
 });
 
-test("uses earlier grades from the same person and rubric to distinguish blunt feedback from a sharp drop", async t => {
+test("records a personal valence drop as telemetry without blaming the exposure for it", async t => {
   const { dbPath, db, run } = fixture(t);
   const memory = "qmd://memory/guide.md";
   writeRecallBatch(dbPath, [
@@ -272,10 +272,107 @@ test("uses earlier grades from the same person and rubric to distinguish blunt f
   assert.equal((await run(base + 1_000, { baselineMinInteractions: 3 })).status, "ok");
   assert.equal(db.prepare("SELECT 1 FROM sqlite_schema WHERE type='index' AND name='idx_inside_out_session_target'").get()?.["1"], 1);
   const rows = db.prepare("SELECT session_id,verdict,signals_json FROM memory_outcomes ORDER BY session_id").all();
-  assert.deepEqual(rows.map(row => [row.session_id, row.verdict]), [["blunt", "helped"], ["drop", "hurt"]]);
-  assert.deepEqual(rows.map(row => JSON.parse(String(row.signals_json)).baselineCount), [3, 3]);
-  assert.equal(JSON.parse(String(rows[1]?.signals_json)).insideOutDelta, -1);
-  assert.equal(summarizeOutcomeMetrics(db, { agentId }).shortfallsPer100Turns, 50);
+  // The drop is the human's own emotion (grief, bad news): the read memory still counts as used, never as hurt.
+  assert.deepEqual(rows.map(row => [row.session_id, row.verdict]), [["blunt", "helped"], ["drop", "helped"]]);
+  const [blunt, drop] = rows.map(row => JSON.parse(String(row.signals_json)));
+  assert.deepEqual([blunt.baselineCount, drop.baselineCount], [3, 3]);
+  assert.equal(blunt.sharpDrop, false, "blunt feedback near this person's usual tone is not a drop");
+  assert.equal(drop.sharpDrop, true);
+  assert.equal(drop.insideOutDelta, -1);
+  assert.ok(drop.insideOutDelta < 0);
+  assert.equal(drop.insideOutValence, -0.5);
+  assert.equal(drop.insideOutIntensity, null, "grades without an intensity answer stay unknown, not 0");
+  assert.equal(drop.negative, false);
+  assert.equal(drop.reason, "read");
+  assert.equal(summarizeOutcomeMetrics(db, { agentId }).shortfallsPer100Turns, 0);
+  assert.deepEqual(summarizeOutcomeMetrics(db, { agentId }).byVerdict, { helped: 2, ignored: 0, hurt: 0 });
+});
+
+test("a sharp valence drop without a Response Audit shortfall is not hurt; a reported shortfall still is", async t => {
+  const { dbPath, db, run } = fixture(t);
+  const memory = "qmd://memory/guide.md";
+  writeRecallBatch(dbPath, [
+    query("grief", base, [hit(memory)], "grief"),
+    query("shortfall", base, [hit(memory)], "shortfall"),
+  ]);
+  openInsideOutStore(dbPath).close();
+  new ResponseAuditStore(dbPath).close();
+  const grade = db.prepare(`INSERT INTO inside_out (interaction_id,rubric,session_id,message_id,assistant_id,human_key,
+    sender_id,channel,source,target_at,reviewed_at,model,context_trimmed,joy,sadness,fear,anger,disgust,surprise,person_id,intensity)
+    VALUES (?,'v1',?,'message','assistant',?,'sender','slack','transcript',?,?,'model',0,?,?,0,0,0,0,'person',?)`);
+  const human = JSON.stringify(["slack", "workspace", "sender"]);
+  for (const offset of [200, 300, 400]) grade.run(`history/${offset}`, "history", human, base - offset, base, 0.8, 0.05, 0.5);
+  // Quiet, devastating news after a delivered memory: valence collapses and intensity is 3.
+  grade.run("grief/reply", "grief", human, base + 40, base + 60, 0.05, 0.95, 3);
+  grade.run("shortfall/reply", "shortfall", human, base + 40, base + 60, 0.8, 0.05, 0.5);
+  const shortfall = auditPayload("correction");
+  db.prepare(`INSERT INTO response_results (cohort,id,session_id,input_hash,episode_at,active,status,assessed_at,result)
+    VALUES ('current','answer','shortfall','hash',?,1,'ok',?,?)`).run(base + 20, base + 30, shortfall);
+
+  assert.equal((await run(base + 1_000, { baselineMinInteractions: 3, responseCohort: "current" })).status, "ok");
+  const rows = new Map(db.prepare("SELECT session_id,verdict,confidence,signals_json FROM memory_outcomes").all()
+    .map(row => [String(row.session_id), { verdict: row.verdict, confidence: row.confidence, signals: JSON.parse(String(row.signals_json)) }]));
+  const grief = rows.get("grief")!;
+  assert.equal(grief.signals.sharpDrop, true);
+  assert.ok(grief.signals.insideOutDelta < 0);
+  assert.equal(grief.signals.insideOutValence, 0.05 - 0.95);
+  assert.equal(grief.signals.insideOutIntensity, 3);
+  assert.equal(grief.signals.negative, false);
+  assert.notEqual(grief.verdict, "hurt");
+  assert.equal(grief.verdict, "ignored", "delivered but unread, no audit outcome");
+  const reported = rows.get("shortfall")!;
+  assert.equal(reported.verdict, "hurt");
+  assert.equal(reported.confidence, 0.9);
+  assert.equal(reported.signals.reason, "reported_shortfall");
+  assert.equal(reported.signals.sharpDrop, false);
+  const summary = summarizeOutcomeMetrics(db, { agentId });
+  assert.equal(summary.shortfallsPer100Turns, 50, "only the audited shortfall turn counts; the grief turn does not");
+  assert.deepEqual(getSubjectOutcomeStats(db, { agentId, subjectKind: "memory_hit", subjectId: memory }),
+    { helped: 0, ignored: 1, hurt: 1, netScore: -1 });
+});
+
+test("legacy valence-drop hurt rows outside the rescan window are restated and stop counting as shortfalls", async t => {
+  const { db, store, run } = fixture(t);
+  const legacy = (id: string, subject: string, signals: Record<string, unknown>) => db.prepare(`INSERT INTO memory_outcomes VALUES
+    (?,?,'memory_hit',?,'default','hurt',0.7,?,'session',?,?)`).run(id, agentId, subject, `query:${id}`,
+    JSON.stringify({ delivered: true, opened: false, read: false, responseOutcome: null, insideOutDelta: -0.9, negative: true,
+      turnId: `run:${id}`, reason: "personal_valence_drop", ...signals }), base - 30 * day);
+  legacy("old-read", "qmd://memory/read.md", { read: true });
+  legacy("old-unread", "qmd://memory/unread.md", {});
+  db.prepare(`INSERT INTO memory_outcomes VALUES ('real','main','memory_hit','qmd://memory/bad.md','default','hurt',0.9,
+    'query:real','session',?,?)`).run(JSON.stringify({ delivered: true, read: true, responseOutcome: "reported_shortfall",
+    negative: true, turnId: "run:real", reason: "reported_shortfall" }), base - 30 * day);
+  assert.equal(summarizeOutcomeMetrics(store, { agentId }).shortfallsPer100Turns, 100 / 3,
+    "metrics already ignore the legacy valence-drop negative flag before any repair");
+
+  assert.equal((await run(base)).status, "ok");
+  const rows = new Map(db.prepare("SELECT id,verdict,confidence,signals_json FROM memory_outcomes").all()
+    .map(row => [String(row.id), { verdict: row.verdict, confidence: row.confidence, signals: JSON.parse(String(row.signals_json)) }]));
+  assert.deepEqual([rows.get("old-read")?.verdict, rows.get("old-read")?.confidence, rows.get("old-read")?.signals.reason], ["helped", 0.8, "read"]);
+  assert.deepEqual([rows.get("old-unread")?.verdict, rows.get("old-unread")?.confidence, rows.get("old-unread")?.signals.reason],
+    ["ignored", 0.5, "no_use_or_outcome_signal"]);
+  assert.equal(rows.get("old-read")?.signals.sharpDrop, true);
+  assert.equal(rows.get("old-read")?.signals.negative, false);
+  assert.equal(rows.get("old-read")?.signals.insideOutDelta, -0.9, "telemetry is kept");
+  assert.equal(rows.get("real")?.verdict, "hurt", "agent-attributed shortfalls are untouched");
+  assert.deepEqual(summarizeOutcomeMetrics(store, { agentId }).byVerdict, { helped: 1, ignored: 1, hurt: 1 });
+  const before = db.prepare("SELECT signals_json FROM memory_outcomes ORDER BY id").all();
+  assert.equal((await run(base + 61_000)).status, "ok");
+  assert.deepEqual(db.prepare("SELECT signals_json FROM memory_outcomes ORDER BY id").all(), before, "the repair is idempotent");
+
+  // The repair is stamped in the watermark and runs once per database: later passes never rescan for the legacy reason.
+  const stamped = db.prepare("SELECT artifact_json j FROM work_items WHERE kind='outcome_ledger'").get();
+  assert.equal(JSON.parse(String(stamped?.j)).valenceAttributionRepaired, true);
+  legacy("late-legacy", "qmd://memory/late.md", { read: true });
+  let scanned = false;
+  const prepare = db.prepare;
+  t.mock.method(db, "prepare", function(this: typeof db, sql: string) {
+    if (sql.includes("personal_valence_drop")) scanned = true;
+    return prepare.call(this, sql);
+  });
+  assert.equal((await run(base + 122_000)).status, "ok");
+  assert.equal(scanned, false, "no json_extract repair scan after the stamp");
+  assert.equal(db.prepare("SELECT verdict FROM memory_outcomes WHERE id='late-legacy'").get()?.verdict, "hurt");
 });
 
 test("leases gate periodic work, tied timestamps page without loss, and a failed commit rolls back rows and cursor", async t => {
@@ -309,7 +406,7 @@ test("leases gate periodic work, tied timestamps page without loss, and a failed
   const replay = await run(base + 181_000, { maxRowsPerPass: 0, retentionDays: 0 });
   assert.deepEqual(replay, { status: "ok", measured: 2, pruned: 0, lastMeasuredAtMs: base + 900, nextDueAt: base + 241_000 });
   assert.deepEqual(JSON.parse(String(workStore.get(job.kind, job.scope)?.artifactJson)),
-    { schemaVersion: 1, lastMeasuredAtMs: base + 900 });
+    { schemaVersion: 1, lastMeasuredAtMs: base + 900, valenceAttributionRepaired: true });
   const ids = () => db.prepare("SELECT id FROM memory_outcomes ORDER BY id").all().map(row => row.id);
   const recovered = ids();
   assert.equal(recovered.length, 4);

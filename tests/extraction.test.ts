@@ -677,6 +677,33 @@ test("extraction-runtime gateway_stop aborts and drains in-flight RPC runs befor
   assert.equal(responses[1]!.ok, false);
 });
 
+test("the extractor only checkpoints visible evidence, not synthetic wake-only pages", async t => {
+  const root = await mkdtempDisposable(join(tmpdir(), "extraction-synthetic-"));
+  t.after(() => root.remove());
+  const storePath = join(root.path, "memory.sqlite");
+  const entries = [{ entryId: "wake", message: { role: "user", content: "Continue the OpenClaw runtime event." },
+    createdAt: "2026-11-27T00:00:00Z" }];
+  const readPage: typeof readExtractionPage = (agentId, agentName, source, cursor, _read, abort) =>
+    readExtractionPage(agentId, agentName, source, cursor, async () => ({
+      kind: "page", cursor: String(entries.length), hasMore: false, entries: entries.slice(Number(cursor ?? 0)),
+    }), abort);
+  const seen: string[] = [];
+  const run = () => runExtraction({ config: config(), storePath, agentId: "main", agentName: "Bill",
+    signal: signal(), since: 0, sessions: () => [{ ...session, sourceRevision: String(entries.length) }], readPage,
+    extract: async ({ messages }) => { seen.push(...messages.map(message => message.text)); return []; },
+  });
+  await run();
+  const store = new ExtractionStore(storePath);
+  t.after(() => store.close());
+  assert.deepEqual(seen, []);
+  assert.equal(store.report().sessions[0]?.checkpointed, 0);
+  entries.push({ entryId: "human", message: { role: "user", content: "The accounts route now requires a workspace ID." },
+    createdAt: "2026-11-27T00:01:00Z" });
+  await run();
+  assert.deepEqual(seen, [entries[1]!.message.content]);
+  assert.equal(store.report().sessions[0]?.checkpointed, 1);
+});
+
 test("readExtractionPage propagates cancellation before and during host page reads", async () => {
   const preAborted = new AbortController();
   preAborted.abort(new Error("already cancelled"));

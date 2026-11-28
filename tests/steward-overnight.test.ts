@@ -8,7 +8,7 @@ import test, { type TestContext } from "node:test";
 import { deepThoughtAudienceKey, DeepThoughtStore } from "../src/deep-thought-store.js";
 import { ensureMemoryCrystalsSchema, listCoreMemories } from "../src/memory-crystals.js";
 import { OutcomeLedgerStore } from "../src/outcome-ledger.js";
-import { openRecallLedger } from "../src/recall-ledger.js";
+import { openRecallLedger, writeRecallBatch } from "../src/recall-ledger.js";
 import {
   ensureOvernightThinkingSchema, listShortfallPostmortems, listVoltaireShifts, OVERNIGHT_KIND, overnightLocalParts,
   runOvernightThinkingPass, summarizeOvernightThinking, withinQuietHours, type OvernightInvestigateParams,
@@ -292,6 +292,52 @@ test("Voltaire: a first answer to a recurring question seeds a derived observati
   assert.equal(saved?.answer, "Sage owns the LMNT launch.");
   assert.equal(saved?.audienceKey, AUDIENCE);
   assert.deepEqual(saved?.collectionGenerations, { notes: 7 });
+});
+
+test("Voltaire and Pre-Answer mine human questions, not legacy runtime or opted-in cron queries", async t => {
+  const f = fixture(t);
+  const wake = "OpenClaw: Continue the OpenClaw runtime event.";
+  const task = "Run the daily report";
+  const human = "Why is heartbeat failing on /api/accounts?";
+  for (const daysAgo of [14, 7]) {
+    const at = START - daysAgo * DAY + MINUTE;
+    f.recallQuery(wake, at);
+    f.recallQuery(`[cron:ab10 Daily report] ${task}`, at);
+    f.recallQuery(human, at);
+  }
+  const { runner } = fakeRunner({});
+  const assertHumanOnly = async (phase: "voltaire" | "preAnswers") => {
+    const probe = investigator(() => ({ answer: "The route now requires authentication." }));
+    const result = await runOvernightThinkingPass(f.options({ runner, investigate: probe.investigate,
+      voltaireEnabled: phase === "voltaire", preAnswerEnabled: phase === "preAnswers", postmortemsEnabled: false,
+      saveDerivedObservations: false, ignoreDueAt: true }));
+    assert.equal(result[phase].candidates, 1);
+    assert.deepEqual(probe.calls.map(call => call.question), [human]);
+  };
+  await assertHumanOnly("voltaire"); // Only legacy text available.
+  writeRecallBatch(f.dbPath, [14, 7].map(daysAgo => ({ kind: "query", record: {
+    eventKey: `cron-${daysAgo}`, createdAtMs: START - daysAgo * DAY + MINUTE, agentId: AGENT, source: "whisperer",
+    sessionKey: CHANNEL_SESSION, provider: "slack", accountId: "default", senderId: "U1", chatType: "channel",
+    inputFamily: "cron_wrapper", vecQuery: task, queryFallback: false, corpora: ["notes"], rankingMode: "decision",
+    outcome: "emitted", hits: [],
+  } })));
+  await assertHumanOnly("preAnswers"); // Also sees normalized cron payloads with durable provenance.
+});
+
+test("mixed human + internal-context turns feed only the human text to deep_thought", async t => {
+  const f = fixture(t);
+  const human = "Why is heartbeat failing on /api/accounts?";
+  const internal = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n[Internal task completion event]\nPRIVATE_CHILD_RESULT\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+  // Same human question across turns that carried different runtime context: one recurring group, never the internal block.
+  f.recallQuery(`${human}\n\n${internal}`, START - 14 * DAY + MINUTE);
+  f.recallQuery(`${internal}\n\n${human}`, START - 7 * DAY + MINUTE);
+  const { runner } = fakeRunner({});
+  const probe = investigator(() => ({ answer: "The route now requires authentication." }));
+  const result = await runOvernightThinkingPass(f.options({ runner, investigate: probe.investigate, voltaireEnabled: false,
+    preAnswerEnabled: true, postmortemsEnabled: false, saveDerivedObservations: false, ignoreDueAt: true }));
+  assert.equal(result.preAnswers.candidates, 1, "normalized, hashed and grouped on the stripped text");
+  assert.deepEqual(probe.calls.map(call => call.question), [human]);
+  assert.doesNotMatch(JSON.stringify(probe.calls), /PRIVATE_CHILD_RESULT|OPENCLAW_INTERNAL_CONTEXT/u);
 });
 
 /* ───────────────────────────── Phase B: Shortfall Post-Mortems ───────────────────────────── */

@@ -11,6 +11,7 @@ import { chatTypeFromSessionKey } from "./session-chat-type.js";
 import { MEMORY_CRYSTALS_COMPONENT, MEMORY_CRYSTALS_SCHEMA_VERSION, recordCoreMemory } from "./memory-crystals.js";
 import { immediateTransaction, tableExists } from "./memory-database.js";
 import { startWorkHeartbeat, WorkFenceLostError } from "./work-store.js";
+import { humanEvidenceText, syntheticFamilyEnabled } from "./synthetic-input.js";
 // Loaded by plain-Node workers and offline tools (`memory-steward overnight`): keep this module free of `openclaw`.
 /**
  * Overnight Thinking Steward: a fenced `WorkStore` run (`kind='overnight_thinking'`, `scope=agentId`) that uses
@@ -404,19 +405,27 @@ function adaptiveCoreMemoryAnchor(db, anchor) {
 }
 const candidateKey = (questionHash, audienceKey, corpora) => JSON.stringify([questionHash, audienceKey, corpora]);
 /** `chatTypes` undefined = every chat type (used to classify audiences, not to mine questions). */
-function readRecallRows(db, agentId, sinceMs, untilMs, chatTypes) {
+function readRecallRows(db, agentId, sinceMs, untilMs, syntheticInput) {
     if (!tableExists(db, "recall_queries"))
         return [];
-    const rows = db.prepare(`SELECT created_at_ms, session_key, provider, account_id, sender_id, chat_type, lex_query, vec_query, corpora_json
+    // The writer adds input_family without requiring legacy read-only consumers to migrate first.
+    const inputFamilyColumn = db.prepare("SELECT 1 FROM pragma_table_info('recall_queries') WHERE name='input_family'").get()
+        ? "input_family" : "NULL AS input_family";
+    const rows = db.prepare(`SELECT created_at_ms, session_key, provider, account_id, sender_id, chat_type, lex_query, vec_query, corpora_json, ${inputFamilyColumn}
     FROM recall_queries WHERE agent_id=? AND source!='drift_rerun' AND created_at_ms>=? AND created_at_ms<=?
     ORDER BY created_at_ms, id`).all(agentId, sinceMs, untilMs);
     return rows.flatMap(row => {
         // Historical rows (e.g. untyped `agent:<id>:main` DM sessions) stored no chat type: infer it from the session key.
         const chatType = nonEmpty(row.chat_type)?.toLowerCase() ?? chatTypeFromSessionKey(nonEmpty(row.session_key));
-        if (!chatType || (chatTypes && !chatTypes.has(chatType)))
+        if (!chatType)
             return [];
-        const question = nonEmpty(row.vec_query) ?? nonEmpty(row.lex_query);
-        if (!question || !normalizeDeepThoughtQuestion(question))
+        const raw = nonEmpty(row.vec_query) ?? nonEmpty(row.lex_query);
+        if (!raw)
+            return [];
+        // Normalize, hash, group and investigate only the human text: internal blocks in a mixed turn never reach deep_thought.
+        const human = humanEvidenceText(raw, syntheticInput);
+        const question = nonEmpty(human) ?? raw;
+        if (!normalizeDeepThoughtQuestion(question))
             return [];
         let corpora;
         try {
@@ -433,7 +442,9 @@ function readRecallRows(db, agentId, sinceMs, untilMs, chatTypes) {
             accountId: nonEmpty(row.account_id), senderId: nonEmpty(row.sender_id) });
         if (!audienceKey)
             return [];
-        return [{ at: Number(row.created_at_ms), question, questionHash: deepThoughtQuestionHash(question), audienceKey, corpora, chatType }];
+        return [{ at: Number(row.created_at_ms), question, questionHash: deepThoughtQuestionHash(question), audienceKey, corpora, chatType,
+                inputFamily: row.input_family === "cron_wrapper" || row.input_family === "heartbeat_control" ? row.input_family : undefined,
+                synthetic: human === undefined }];
     });
 }
 function latestObservation(db, agentId, questionHash, audienceKey, corpora) {
@@ -532,8 +543,9 @@ export async function runOvernightThinkingPass(options) {
         const logCorpora = new Set(options.dailyLogCorpora ?? OVERNIGHT_DAILY_LOG_DEFAULTS.corpora);
         // Audience kinds are classified from EVERY recall row (any chat type), so a DM or MPDM audience is recognized as
         // one even when `recallChatTypes` does not mine it.
-        const seenRows = (voltaireOn || preAnswerOn) ? readRecallRows(db, agentId, sinceMs, startedAt) : [];
-        const recall = seenRows.filter(row => chatTypes.has(row.chatType));
+        const seenRows = (voltaireOn || preAnswerOn) ? readRecallRows(db, agentId, sinceMs, startedAt, options.syntheticInput) : [];
+        const recall = seenRows.filter(row => chatTypes.has(row.chatType) && !row.synthetic &&
+            !(row.inputFamily && syntheticFamilyEnabled(row.inputFamily, options.syntheticInput)));
         const audienceKinds = new Map();
         for (const row of seenRows)
             audienceKinds.set(row.audienceKey, (audienceKinds.get(row.audienceKey) ?? new Set()).add(row.chatType));
@@ -637,6 +649,10 @@ export async function runOvernightThinkingPass(options) {
                 const rows = db.prepare(`SELECT * FROM derived_observations WHERE agent_id=? AND status IN ('fresh','stale')
           ORDER BY created_at DESC, id`).all(agentId);
                 for (const row of rows) {
+                    // A stored question that still carries runtime framing is never re-investigated: only its human text could
+                    // be asked again, and that is a different investigation (the hash check below would reject it anyway).
+                    if (humanEvidenceText(String(row.question), options.syntheticInput) !== String(row.question))
+                        continue;
                     let corpora;
                     try {
                         corpora = canonicalCorpora(JSON.parse(String(row.corpora_json)));
@@ -813,7 +829,8 @@ export async function runOvernightThinkingPass(options) {
                     result.errors.push("upcoming_topics:failed");
                 }
                 for (const item of Array.isArray(topics) ? topics : []) {
-                    const question = nonEmpty(item?.topic);
+                    const topic = nonEmpty(item?.topic);
+                    const question = topic === undefined ? undefined : nonEmpty(humanEvidenceText(topic, options.syntheticInput));
                     const audienceKey = nonEmpty(item?.audienceKey) ?? nonEmpty(options.defaultAudienceKey);
                     const corpora = canonicalCorpora(item?.corpora?.length ? item.corpora : options.defaultCorpora ?? []);
                     if (!question || !normalizeDeepThoughtQuestion(question) || !audienceKey || !corpora.length)

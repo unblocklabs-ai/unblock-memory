@@ -96,7 +96,7 @@ test("query preparation excludes mirrors, tools, synthetic turns and compacted h
   const messages = [
     { role: "user", content: "Discarded old request" },
     { type: "compaction", summary: "Never include this" },
-    { role: "user", content: "Injected", provenance: { kind: "internal" } },
+    { role: "user", content: "Injected", provenance: { kind: "internal_system" } },
     { role: "user", content: "Earlier question" },
     { role: "assistant", channel: "analysis", content: "Private thinking" },
     { role: "assistant", content: [{ type: "toolCall", name: "search" }] },

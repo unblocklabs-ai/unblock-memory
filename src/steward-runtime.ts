@@ -152,7 +152,7 @@ async function afterCaptainsLogAppend(options: StewardRuntimeOptions, params: {
 /** One Expectations pass, shared by the background tick and `memory-steward expectations --run`. */
 function expectationsPassOptions(
   config: StewardConfig["expectations"],
-  base: Pick<ExpectationsPassOptions, "agentId" | "workStore" | "owner" | "timezone" | "signal">,
+  base: Pick<ExpectationsPassOptions, "agentId" | "workStore" | "owner" | "timezone" | "signal" | "syntheticInput">,
   runner: Pick<StewardRunner, "complete"> | undefined,
   databasePath: () => string,
 ): ExpectationsPassOptions {
@@ -177,6 +177,17 @@ function expectationsPassOptions(
 }
 
 /** Analysis adapter over one agent's memory manager. `recluster` is offered only with a configured analysis worker. */
+/** Captain's Log emotional-salience tuning shared by the background tick and the `captains-log` CLI. */
+function captainsLogSalience(cl: StewardConfig["captainsLog"], pluginConfig: UnblockMemoryConfig | undefined) {
+  return {
+    includeEmotionalSalience: cl.includeEmotionalSalience,
+    minSalienceScore: cl.minSalienceScore,
+    minAbsoluteIntensity: cl.minAbsoluteIntensity,
+    minRelativeIntensity: cl.minRelativeIntensity,
+    ...(pluginConfig ? { baselineMinInteractions: pluginConfig.insideOut.baselineMinInteractions } : {}),
+  };
+}
+
 function crystalsAnalysis(manager: StewardMemoryManager, analysisExecutable: boolean): CrystalsAnalysis {
   return {
     listClusters: limit => manager.listClusters(limit),
@@ -195,6 +206,7 @@ function crystalsPassOptions(
   runner: Pick<StewardRunner, "complete"> | undefined,
   manager: StewardMemoryManager,
   analysisExecutable: boolean,
+  pluginConfig?: UnblockMemoryConfig,
 ): CrystalsPassOptions {
   return {
     ...base,
@@ -212,6 +224,8 @@ function crystalsPassOptions(
     ltmPromoteMinHits: config.ltmPromoteMinHits,
     allowedCorpora: config.allowedCorpora,
     timeoutMs: config.timeoutMs,
+    prioritizeEmotionalSalience: config.prioritizeEmotionalSalience,
+    ...(pluginConfig ? { baselineMinInteractions: pluginConfig.insideOut.baselineMinInteractions } : {}),
     ...(runner ? { runner } : {}),
   };
 }
@@ -265,7 +279,7 @@ function crystalsNotDue(store: WorkStore, agentId: string): CrystalsPassResult {
 /** One Overnight Thinking pass, shared by the background tick and `memory-steward overnight --run`. */
 function overnightPassOptions(
   config: StewardConfig["overnight"],
-  base: Pick<OvernightThinkingPassOptions, "agentId" | "workStore" | "owner" | "timezone" | "signal" | "ignoreDueAt" | "ignoreQuietHours">,
+  base: Pick<OvernightThinkingPassOptions, "agentId" | "workStore" | "owner" | "timezone" | "signal" | "ignoreDueAt" | "ignoreQuietHours" | "syntheticInput">,
   runner: Pick<StewardRunner, "complete">,
   memory: { manager: StewardMemoryManager; deepThought?: DeepThoughtDeps; cfg: OpenClawConfig } | undefined,
   workspaceDir: () => string,
@@ -389,7 +403,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
             try {
               // Runs without a runner too: Captain's Log blockers + people todos are mirrored at zero model cost.
               lastExpectationsResults.set(agentId, await runExpectationsPass(expectationsPassOptions(
-                expectations, { agentId, workStore: store, owner, timezone, signal }, runner,
+                expectations, { agentId, workStore: store, owner, timezone, signal, syntheticInput: options.pluginConfig?.syntheticInput }, runner,
                 () => transcriptDbForAgent(api.config, agentId),
               )));
             } catch (error) {
@@ -420,6 +434,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
             const databasePath = transcriptDbForAgent(api.config, agentId);
             const captainsLog = await runCaptainsLogPass({
               agentId,
+              syntheticInput: options.pluginConfig?.syntheticInput,
               databasePath,
               workspaceDir,
               workStore: store,
@@ -433,6 +448,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
               maxExistingLogChars: cl.maxExistingLogChars,
               timeoutMs: cl.timeoutMs,
               excludeChatTypes: cl.excludeChatTypes,
+              ...captainsLogSalience(cl, options.pluginConfig),
               signal,
             });
             lastCaptainsLogResults.set(agentId, captainsLog);
@@ -451,7 +467,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
                 const { manager, error } = await memory.getMemorySearchManager({ cfg: api.config, agentId });
                 if (!manager) throw new Error(error ?? "memory manager unavailable");
                 lastCrystalsResults.set(agentId, await runCrystalsPass(crystalsPassOptions(crystals, { agentId, workStore: store, owner, signal },
-                  runner, manager, memory.analysisExecutable === true)));
+                  runner, manager, memory.analysisExecutable === true, options.pluginConfig)));
               }
             } catch (error) {
               // Isolated: a Crystals fault must not skip this agent's Overnight pass.
@@ -472,7 +488,7 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
               }
               const deepThought = manager ? memory?.deepThought?.(agentId, api.config) : undefined;
               lastOvernightResults.set(agentId, await runOvernightThinkingPass(overnightPassOptions(overnight,
-                { agentId, workStore: store, owner, timezone, signal }, runner,
+                { agentId, workStore: store, owner, timezone, signal, syntheticInput: options.pluginConfig?.syntheticInput }, runner,
                 manager ? { manager, cfg: api.config, ...(deepThought ? { deepThought } : {}) } : undefined,
                 () => workspaceDirForAgent(api.config, agentId))));
             } catch (error) {
@@ -619,6 +635,7 @@ function registerStewardCli(
           const cl = options.config.captainsLog;
           const result = await runCaptainsLogPass({
             agentId: opts.agent,
+            syntheticInput: options.pluginConfig?.syntheticInput,
             databasePath: transcriptDbForAgent(cfg, opts.agent),
             workspaceDir: workspaceDirForAgent(cfg, opts.agent),
             workStore: store,
@@ -632,6 +649,7 @@ function registerStewardCli(
             maxExistingLogChars: cl.maxExistingLogChars,
             timeoutMs: cl.timeoutMs,
             excludeChatTypes: cl.excludeChatTypes,
+            ...captainsLogSalience(cl, options.pluginConfig),
             dryRun: Boolean(opts.dryRun),
           });
           // A dry run never appends, so it never resolves or mirrors anything either.
@@ -694,6 +712,7 @@ function registerStewardCli(
           try {
             const result = await runExpectationsPass(expectationsPassOptions(options.config.expectations, {
               agentId: opts.agent, workStore: store, owner: `steward-cli:${process.pid}:${randomUUID()}`,
+              syntheticInput: options.pluginConfig?.syntheticInput,
               timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
             }, runner, () => transcriptDbForAgent(cfg, opts.agent)));
             console.log(JSON.stringify(result, null, 2));
@@ -752,7 +771,7 @@ function registerStewardCli(
             try {
               const result = await runCrystalsPass(crystalsPassOptions(options.config.crystals, {
                 agentId: opts.agent, workStore: store, owner: `steward-cli:${process.pid}:${randomUUID()}`, ignoreDueAt: true,
-              }, runner, manager, memory?.analysisExecutable === true));
+              }, runner, manager, memory?.analysisExecutable === true, options.pluginConfig));
               console.log(JSON.stringify(result, null, 2));
               if (result.status === "failed") process.exitCode = 1;
             } finally { store.close(); }
@@ -786,6 +805,7 @@ function registerStewardCli(
             try {
               const result = await runOvernightThinkingPass(overnightPassOptions(overnight, {
                 agentId: opts.agent, workStore: store, owner: `steward-cli:${process.pid}:${randomUUID()}`,
+                syntheticInput: options.pluginConfig?.syntheticInput,
                 timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()), ignoreDueAt: true, ignoreQuietHours: true,
               }, runner, manager ? { manager, cfg, ...(deepThought ? { deepThought } : {}) } : undefined,
               () => workspaceDirForAgent(cfg, opts.agent)));

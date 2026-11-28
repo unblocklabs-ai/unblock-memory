@@ -7,7 +7,52 @@ import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import type { UnblockMemoryConfig } from "./config.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { dateOption } from "./date-option.js";
-import { interruptInsideOut, linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselines } from "./inside-out.js";
+import { interruptInsideOut, linkInsideOutPeople, purgeInsideOutPerson, repairInsideOutIdentities, reportInsideOut, runInsideOut, refreshInsideOutBaselinesAsync, reportInsideOutBaselineOverview, reportInsideOutBaselines, reportInsideOutDrift } from "./inside-out.js";
+import { SENTIMENT_DRIFT_METRICS, type SentimentDriftMetric, type SentimentDriftOptions } from "./emotion-baselines.js";
+
+type DriftCliOptions = { person?: string; rubric?: string; cohort?: string; recentWeeks?: string; anchorWeeks?: string;
+  minWeeklySamples?: string; minAnchorSamples?: string; minRecentSamples?: string; minResponseConfidence?: string;
+  threshold: string[]; level: string[] };
+
+const collect = (value: string, previous: string[]) => [...previous, value];
+
+/** `metric=value`; `metric=off` disables that flag. */
+function thresholdFlags(entries: string[], flag: string): Partial<Record<SentimentDriftMetric, number | null>> {
+  return Object.fromEntries(entries.map(entry => {
+    const [metric, raw] = entry.split("=");
+    if (!SENTIMENT_DRIFT_METRICS.includes(metric as SentimentDriftMetric) || raw === undefined || raw === "") {
+      throw new Error(`--${flag} expects <${SENTIMENT_DRIFT_METRICS.join("|")}>=<number|off>`);
+    }
+    const value = raw === "off" ? null : Number(raw);
+    if (value !== null && !Number.isFinite(value)) throw new Error(`--${flag} ${metric} must be a number or off`);
+    return [metric, value];
+  }));
+}
+
+function driftOptions(opts: DriftCliOptions): SentimentDriftOptions {
+  const number = (value: string | undefined) => value === undefined ? undefined : Number(value);
+  return { personId: opts.person, rubric: opts.rubric, responseCohort: opts.cohort,
+    recentWeeks: number(opts.recentWeeks), anchorWeeks: number(opts.anchorWeeks), minWeeklySamples: number(opts.minWeeklySamples),
+    minAnchorSamples: number(opts.minAnchorSamples), minRecentSamples: number(opts.minRecentSamples),
+    minResponseConfidence: number(opts.minResponseConfidence),
+    driftThresholds: thresholdFlags(opts.threshold, "threshold"), levelThresholds: thresholdFlags(opts.level, "level") };
+}
+
+// Commander's option chain is not exported by the SDK types; this only adds the shared drift flags.
+type OptionChain = { option(flags: string, description: string, ...rest: unknown[]): OptionChain };
+function withDriftOptions<T extends OptionChain>(command: T): T {
+  return command
+    .option("--rubric <rubric>", "Only Inside Out grades from this presence rubric (default: all)")
+    .option("--cohort <cohort>", "Only this Response Audit cohort (default: latest assessment per episode)")
+    .option("--recent-weeks <n>", "Recent window in weeks ending now (default 3)")
+    .option("--anchor-weeks <n>", "Earliest stable weeks forming the anchored baseline (default 4)")
+    .option("--min-weekly-samples <n>", "Samples a week needs to count as stable (default 1)")
+    .option("--min-anchor-samples <n>", "Samples the anchor needs (default 5)")
+    .option("--min-recent-samples <n>", "Samples the recent window needs (default 3)")
+    .option("--min-response-confidence <p>", "Minimum audit confidence for dissatisfaction scores, 0–1 (default 0.8)")
+    .option("--threshold <metric=value>", "Drift threshold per metric; repeatable; 'off' disables", collect, [])
+    .option("--level <metric=value>", "Sustained absolute level per metric; repeatable; 'off' disables", collect, []) as T;
+}
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 
 export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryConfig) {
@@ -44,12 +89,26 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
         console.log(JSON.stringify(await refreshInsideOutBaselinesAsync(paths(cfg, opts.agent).storePath,
           { minInteractions: config.insideOut.baselineMinInteractions, recompare: opts.recompare }), null, 2));
       });
-    root.command("baselines").description("Read person-linked weekly and cumulative baseline history")
+    withDriftOptions(root.command("baselines")
+      .description("Read person-linked weekly and cumulative baseline history (--with-drift adds intensity profiles and the drift summary)")
       .option("--agent <id>", "Agent id", "main").option("--person <id>", "Exact PeopleSQL person ID")
       .option("--since <date>", "Inclusive UTC period-end date YYYY-MM-DD").option("--limit <n>", "Maximum weekly snapshots, 1–1000", "100")
-      .action((opts: { agent: string; person?: string; since?: string; limit: string }) => {
-        console.log(JSON.stringify(reportInsideOutBaselines(paths(cfg, opts.agent).storePath,
-          { personId: opts.person, since: opts.since ? dateOption(opts.since, 0) : undefined, limit: Number(opts.limit) }), null, 2));
+      .option("--with-drift", "Print { baselines, intensity, drift } instead of the baseline array; drift flags apply only with it"))
+      .action((opts: DriftCliOptions & { agent: string; since?: string; limit: string; withDrift?: boolean }) => {
+        const storePath = paths(cfg, opts.agent).storePath;
+        const history = { personId: opts.person, since: opts.since ? dateOption(opts.since, 0) : undefined, limit: Number(opts.limit) };
+        // The default stays the original array so existing scripts never break.
+        console.log(JSON.stringify(opts.withDrift
+          ? reportInsideOutBaselineOverview(storePath, { ...history, drift: driftOptions(opts) })
+          : reportInsideOutBaselines(storePath, history), null, 2));
+      });
+    withDriftOptions(root.command("drift")
+      .description("Flag long-term sentiment drift against each person's anchored early weeks; read-only, no inference")
+      .option("--agent <id>", "Agent id", "main").option("--person <id>", "Exact PeopleSQL person ID")
+      .option("--flagged-only", "Print only flagged entries"))
+      .action((opts: DriftCliOptions & { agent: string; flaggedOnly?: boolean }) => {
+        const reports = reportInsideOutDrift(paths(cfg, opts.agent).storePath, driftOptions(opts));
+        console.log(JSON.stringify(opts.flaggedOnly ? reports.filter(report => report.flagged) : reports, null, 2));
       });
     root.command("purge").description("Delete one person's emotion baselines and assessment history; no inference")
       .requiredOption("--person <id>", "Exact PeopleSQL person ID").option("--agent <id>", "Agent id", "main")
@@ -67,6 +126,7 @@ export function registerInsideOut(api: OpenClawPluginApi, config: UnblockMemoryC
         .action((opts: { agent: string; session?: string; sender?: string; since?: string; emotion?: string; min: string; bucket: string; person?: string; deviationHistory?: boolean }) => {
           console.log(JSON.stringify(reportInsideOut(paths(cfg, opts.agent).storePath, { ...opts,
             sessionId: opts.session, personId: opts.person, personal: command === "export",
+            minInteractions: config.insideOut.baselineMinInteractions,
             since: opts.since ? dateOption(opts.since, 0) : undefined, min: Number(opts.min), summary: command === "report" }), null, 2));
         });
     }

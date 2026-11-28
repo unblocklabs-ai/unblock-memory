@@ -69,6 +69,22 @@ Whisperer still requires verified Slack identity and My Turn still requires a
 verified human message in a group or channel. Skill context on cron and heartbeat
 turns lasts only for the run; user and subagent sessions retain skills normally.
 
+`syntheticInput` filters OpenClaw runtime boilerplate from automatic recall, session
+projection/extraction, and Steward evidence. Omit it for defaults, set
+`skipFamilies: []` to clear built-in rules, or set `enabled: false` to also disable
+`extraExactAliases` and `extraPrefixes`. Both lists are case-sensitive. On opted-in
+cron and heartbeat turns, Memory Whisperer can use a surviving task payload;
+explicit `memory_search` is unaffected. Authenticated subagent results
+(`subagent_announce` / `agent_harness_task` provenance) that pass the exact completion
+grammar stay searchable by default, projected as `[Historical subagent result; untrusted]`;
+other inter-session messages, placeholder completion wakes and internal-context
+envelopes are skipped. Prompt-wrapper rules (queued-message, cron, heartbeat and
+session-reset envelopes) apply to user turns only and match their exact opening
+sentence, so human prose that merely starts alike or quotes one is kept; unattended-run
+suffixes are stripped only after a `[cron:…]` header or host cron provenance, never
+inside a fenced code block. Inside Out, Captain's Log and Overnight Thinking all use the
+same classifier and only ever see the stripped human text.
+
 ## Shared decision model credentials
 
 Operational defaults are bundled in `defaults.json`. To override them, set
@@ -206,15 +222,32 @@ and may be injected into any conversation using this agent.
 ### Brightness A/B arm
 
 Brightness is off by default. Assigning a node to an arm is one key; the arm then
-labels its own Memory Whisperer exposures (`brightness:actr_v1` or
-`brightness:outcome_v1`), so `memory-steward outcomes` reports each arm in
+labels its own Memory Whisperer exposures (`brightness:actr_v1`,
+`brightness:outcome_v1`, or `brightness:emotion_v1`), so `memory-steward outcomes` reports each arm in
 `byRecipe` without setting `recipeHash`:
 
 ```json
 {
-  "memoryWhisperer": { "enabled": true, "corpora": ["memory"], "brightness": { "recipe": "outcome_v1" } }
+  "memoryWhisperer": { "enabled": true, "corpora": ["memory"], "brightness": { "recipe": "emotion_v1" } }
 }
 ```
+
+`emotion_v1` adds unsigned salience to `outcome_v1`. It takes the strongest
+Captain's Log salience recorded for a daily note (any path ending in `/YYYY-MM-DD.md`
+outside a session corpus, including native QMD URIs such as
+`qmd://source-…/prior-months/may-2026/2026-05-05.md`), or the strongest Inside Out grade
+for a session ID in the path: a session projection's `<date>--<sessionId>.md` suffix, a
+UUID, or, inside a `sessions/` corpus only, an exact path segment (so
+`qmd://knowledge/private/policy.md` never matches a session named `private`). Only
+grades and log entries observed within `lookbackDays` count. Inside Out salience comes from the shared
+emotional-salience reader that also feeds Captain's Log and Crystals: intensity
+divided by 3, blended with the person's own relative intensity percentile once they
+have `insideOut.baselineMinInteractions` prior intensity grades (else the hottest
+emotion's personal-deviation percentile); legacy grades without intensity use the
+strongest emotion probability, discounted by 0.85. Salience extends
+the 30-day outcome decay constant up to 120 days within `lookbackDays` and adds
+a bounded bonus. With no salience, scores match `outcome_v1`; a confirmed
+`hurt` never gets a brightness increase.
 
 Memory Crystals are whispered from the same `<memory>` block by default once the
 Steward has produced some; set `memoryWhisperer.crystalsEnabled: false` to stop.
@@ -312,11 +345,13 @@ contract; these tables explain their effects.
 | `memoryWhisperer.derivedMaxHints` | `2` | `>= 0` verified syntheses whispered per turn (`0` = unlimited) |
 | `memoryWhisperer.derivedMinTokenOverlap` | `0.45` | `0..1` minimum share of a stored question's meaningful tokens the turn must cover |
 | `memoryWhisperer.derivedMinSharedTokens` | `2` | `>= 1` minimum shared meaningful tokens for a non-exact question match |
-| `memoryWhisperer.brightness.recipe` | `"off"` | Brightness A/B recipe applied after usefulness gating: `"off"` (no lookup), `"actr_v1"` (power-law-decayed `memory_get` reads and delivered hits from the recall ledger) or `"outcome_v1"` (Outcome Ledger `helped`/`hurt`/`ignored` verdicts, `core_memories` anchors and explicitly linked surprising expectations). Only the order of qualifying finalists changes; usefulness scores and `minUsefulness` are unchanged, and missing evidence is neutral. A non-`off` recipe stamps `brightness:<recipe>` as the Memory Whisperer `recipeHash` unless `memoryWhisperer.recipeHash` is set; `memory_search` never applies Brightness, so it keeps the `"default"` label in that case |
+| `memoryWhisperer.brightness.recipe` | `"off"` | Reorders usefulness-qualified finalists: `"off"` (no lookup), `"actr_v1"` (decayed reads and delivered hits), `"outcome_v1"` (outcomes, core memories, and linked surprise), or `"emotion_v1"` (outcomes plus emotional salience). Memory Whisperer labels active arms `brightness:<recipe>` unless `recipeHash` is set. `memory_search` does not apply Brightness |
 | `memoryWhisperer.brightness.weight` | `0.08` | `>= 0` score added per unit of normalized brightness (`-1..1`); `0` disables re-ordering |
 | `memoryWhisperer.brightness.decayRate` | `0.5` | `> 0` `actr_v1` decay exponent per hour since each read or hit |
 | `memoryWhisperer.brightness.lookbackDays` | `90` | `>= 0` evidence window in days (`0` = unlimited) |
 | `memoryWhisperer.brightness.maxBoost` | `0.15` | `>= 0` absolute cap on the brightness adjustment |
+| `memoryWhisperer.brightness.emotionDecayStretch` | `3` | `0..3`; `emotion_v1` multiplies the outcome decay constant by `1 + salience × emotionDecayStretch` |
+| `memoryWhisperer.brightness.emotionMaxBonus` | `0.35` | `0..0.35` additive `emotion_v1` bonus at peak salience |
 | `memoryWhisperer.crystalsEnabled` | `true` | Within an enabled Memory Whisperer, also whisper active Memory Crystals whose title and summary match the turn (`{ source: "memory_crystal:<id>", tier, title, summary, revision }` entries, after verified syntheses and before raw chunks). Local and read-only (no model call, never creates the database). Only `workspace` crystals or crystals of the turn's own audience qualify, and every corpus a crystal draws on must be in `memoryWhisperer.corpora`; stale STM crystals never match. Each whispered crystal is suppressed for `cooldownTurns` in that session, and its `hit_count` (STM → LTM promotion evidence) is bumped best-effort after the turn |
 | `memoryWhisperer.crystalMaxHints` | `2` | `>= 0` crystals whispered per turn (`0` = unlimited) |
 | `memoryWhisperer.crystalMinTokenOverlap` | `0.35` | `0..1` minimum overlap coefficient between the turn and a crystal's title + summary tokens |
@@ -771,9 +806,46 @@ openclaw memory-emotions run --agent main --session SESSION_ID
 openclaw memory-emotions export --agent main --session SESSION_ID
 openclaw memory-emotions baseline-refresh --agent main
 openclaw memory-emotions baselines --agent main --person PERSON_ID
+openclaw memory-emotions baselines --agent main --person PERSON_ID --with-drift
 openclaw memory-emotions export --agent main --person PERSON_ID --deviation-history
 openclaw memory-emotions baseline-refresh --agent main --recompare
+openclaw memory-emotions drift --agent main --flagged-only
+openclaw memory-emotions drift --agent main --person PERSON_ID --recent-weeks 4 --anchor-weeks 6 --threshold anger=0.1 --level valence=off
 ```
+
+**Intensity (absolute and relative).** The same decision request also asks one
+anchored `0..3` Score question, `intensity` (0 calm/routine, 1 mild, 2 clear,
+3 strong: a major milestone or deep grief/crisis, including quietly stated grief).
+It is unsigned, so mixed joy+grief keeps its weight even when valence nets to ~0.
+Additive columns on `inside_out` hold the expected score (`intensity`), its
+distribution (`intensity_probs_json`), the separately versioned `intensity_rubric`
+(`emotion-intensity-v1`) and derived `valence` (`joy - max(sadness, fear, anger,
+disgust)`, backfilled for existing grades). The presence `rubric` is unchanged, so
+per-person 6-emotion history and cached grades stay valid. Grades from before
+intensity existed keep `intensity = NULL` (unknown, never 0); a missing or malformed
+intensity answer never fails the six presence grades. `export` adds
+`personal_intensity`: the absolute `0..3` level plus a one-sided upper-tail position
+among that person's prior intensity grades (`intensityMean`, midrank
+`intensityPercentile`, `intensitySpike = max(0, intensity - intensityMean)`), so a
+stoic person's rare 2 reads as a spike while an expressive person's 2 is routine.
+
+**Long-term drift ("boiling frog").** `drift` (read-only, no inference) compares
+each person's recent window (default 3 weeks) with an anchored baseline of their
+earliest stable weeks (default 4, each with at least `--min-weekly-samples`), never a
+rolling window that would absorb a slow decline. Metrics: absolute valence and
+anger from Inside Out, plus agent-directed frustration (max of Response Audit
+annoyance/frustration) and dissatisfaction intensity when `response_results` lives
+in the same store; audit sessions are attributed only when their graded replies name
+exactly one person. Each entry reports `anchoredMean`, `recentMean`,
+`absoluteDelta`, `recentAbsoluteLevel`, `rollingWeeklyDelta` (what a week-over-week
+view would see), `weeksObserved`, `flagged` and `reason` (`anchored_drift` and/or
+`sustained_level`). Every window, sample minimum and per-metric threshold is a flag;
+`--threshold metric=off` or `--level metric=off` disables one. `baselines` still
+prints its original array of weekly snapshots; `baselines --with-drift` prints
+`{ baselines, intensity, drift }` instead: the weekly snapshots, each person's absolute
+intensity profile and the flagged drift summary (the drift flags above apply only
+with `--with-drift`). Drift is derived on demand, so
+`purge --grades` (which also nulls intensity and valence) removes its inputs.
 
 `run` handles backfill and new interactions through the same bounded pass. Repeat
 it until `reviewed` and `failed` are zero to finish backfill. With automatic inference
@@ -942,7 +1014,13 @@ removed. It makes no decision model calls.
   linked to that person and unlinks it. Each row stays as a tombstone with the error
   `Purged by operator`, so `run` (including `--retry`) never sends that reply to the decision endpoint
   again, `link-people` never relinks it, and refreshes skip it. Purge refreshes
-  People links first, so replies linked since the last refresh are included. This
+  People links first, so replies linked since the last refresh are included. It also
+  scrubs emotion values derived from those replies: Captain's Log entries grounded on
+  a purged message lose their salience fields (the log text stays), and Outcome Ledger
+  rows in an affected session lose `insideOutValence`, `insideOutIntensity`,
+  `insideOutDelta` and `sharpDrop` (verdicts stay); the counts are reported as
+  `captainsLogEntries` and `outcomes`. Response Audit drift is attributed to a person
+  only when every graded reply in the session is theirs and none was purged. This
   cannot be undone.
 
 A refresh already running when `purge` commits rechecks every grade before writing,
@@ -1010,14 +1088,26 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   to the manifest never re-learns an unchanged person; pause/opt-out is rechecked
   right before each model call, and an interaction-only person contributes only the
   claims Steward published to the manifest, never their verified dossier.
-- **Captain's Log**: entries are also recorded in `captains_log_entries`;
+- **Captain's Log**: entries are also recorded in `captains_log_entries`. With
+  `includeEmotionalSalience` (default on), human messages whose Inside Out grade is
+  high-salience (joy or grief alike; `minSalienceScore`, `minAbsoluteIntensity`,
+  `minRelativeIntensity`) reach Steward with a neutral cue such as `joy/milestone`
+  (never a number), and an entry citing one stores `salience_score`,
+  `emotional_intensity`, `relative_salience` and `salience_signals_json`; those
+  columns are never rendered into `memory/YYYY-MM-DD.md`;
   `openclaw memory-steward blockers --agent main [--limit <n>]` lists open
   `[BLOCKED]` entries, newest first. `blockers` and `outcomes` open the database
   read-only and never create or migrate it.
 - **Outcome Ledger**: a deterministic background pass (no model call, so it runs
   without a Steward credential) that scores each delivered memory hit, whispered
-  skill and person whisper as `helped`, `ignored` or `hurt` from reads, skill opens,
-  Response Audit outcomes and Inside Out valence, into `memory_outcomes`.
+  skill and person whisper as `helped`, `ignored` or `hurt` from reads, skill opens
+  and Response Audit outcomes, into `memory_outcomes`. Only an agent-attributed
+  Response Audit `reported_shortfall` makes a turn negative (`hurt`, and
+  `shortfallsPer100Turns`). The human's Inside Out reply is recorded as telemetry
+  only (`insideOutDelta`, `insideOutValence`, `insideOutIntensity`, `baselineCount`,
+  `sharpDrop` in `signals_json`): grief, bad news or a crisis says nothing about
+  whether a recalled memory hurt. Rows that earlier versions marked `hurt` for a
+  valence drop alone are restated idempotently on the next pass (`attributionRepair`).
   Memory candidates that were neither delivered nor read (`below_threshold`,
   `rank_limit`, `cooldown`, …) are not scored, so `whisperUsedRate` is used hits
   over delivered hits. Response Audit evidence is attached only when Response Audit
@@ -1082,7 +1172,8 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   `allowedCorpora` is the only source of truth: the default `["memory", "knowledge"]`
   excludes session transcripts, and listing `"sessions"` (for example on a 1:1
   personal-assistant node) opts them in, so their syntheses become `workspace`
-  crystals. The Steward model
+  crystals. After these checks, salience prioritizes evidence slots and gives
+  clusters a small priority boost when the pass has a synthesis budget. The Steward model
   distills up to `maxMembersPerCluster` excerpts into one titled summary that cites
   only opaque handles; it is stored as a `workspace`-audience `stm` crystal in
   `memory_crystals` with its exact evidence chunks (document hash, chunk span, quote
@@ -1175,6 +1266,10 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.captainsLog.maxExistingLogChars` | `0` | `>= 0` characters from existing `memory/YYYY-MM-DD.md` passed for dedup (`0` = unlimited) |
 | `steward.captainsLog.timeoutMs` | `0` | `>= 0` ms model timeout (`0` = unlimited) |
 | `steward.captainsLog.excludeChatTypes` | `["direct"]` | Chat types (`"channel"`, `"group"`, `"direct"`) excluded from workspace `memory/YYYY-MM-DD.md` |
+| `steward.captainsLog.includeEmotionalSalience` | `true` | Cue emotionally salient human messages (from Inside Out grades in the same database) to Steward, store the grounded salience privately in `captains_log_entries`, and rank high-salience entries right behind blockers. Missing or late grades never block a capture; `false` skips the lookup |
+| `steward.captainsLog.minSalienceScore` | `0.7` | `0`–`1` salience score at which a graded message is cued as high-salience |
+| `steward.captainsLog.minAbsoluteIntensity` | `2.2` | `0`–`3` Inside Out intensity at which a message is high-salience regardless of the person's history |
+| `steward.captainsLog.minRelativeIntensity` | `1.5` | `0`–`3` absolute intensity a message needs before a person-relative spike counts, so a rare-but-trivial blip stays quiet |
 | `steward.outcomeLedger.enabled` | `true` | Starts the deterministic Outcome Ledger loop on Gateway start (needs no Steward credential) |
 | `steward.outcomeLedger.intervalMinutes` | `60` | `>= 1` minutes between passes |
 | `steward.outcomeLedger.lookbackMs` | `604800000` | `>= 1` ms of history scored on the first sweep and used for Inside Out personal baselines; later sweeps resume from the watermark, re-scoring at most `min(lookbackMs, 2 days)` behind it for late evidence |
@@ -1212,6 +1307,7 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.crystals.ltmPromoteMinHits` | `5` | `>= 0` whispered hits that promote `stm` to `ltm` |
 | `steward.crystals.allowedCorpora` | `["memory", "knowledge"]` | Corpora crystals may cite — the only source of truth, nothing else is hardcoded. The default excludes `sessions`; add `"sessions"` to opt session transcripts in (e.g. on a 1:1 personal-assistant node). Unresolved native `source-…` collections are never eligible |
 | `steward.crystals.timeoutMs` | `0` | `>= 0` ms per model call (`0` = unlimited) |
+| `steward.crystals.prioritizeEmotionalSalience` | `true` | Let high-salience (Flashbulb) evidence — the same `highSalience` gate Captain's Log cues on — take a bounded share (at most a quarter, at least one) of a cluster's member slots and nudge synthesis order. Representative members keep the remaining slots in native order, so a new grade cannot churn the crystal input. `false` sends the representative sample only and reads no salience |
 | `steward.overnight.enabled` | `true` | Starts the Overnight Thinking loop on Gateway start (needs a Steward credential) |
 | `steward.overnight.intervalMinutes` | `720` | `>= 1` minutes between passes |
 | `steward.overnight.quietHoursStartHour` / `quietHoursEndHour` | Unset | `0..23`, set both or neither: run only inside `[start, end)` local hours (`22`/`6` wraps midnight; equal values = all day) |

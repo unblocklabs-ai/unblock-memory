@@ -478,6 +478,7 @@ test("steward is optional and enabled by default; host manifest and runtime reso
       captainsLog: {
         enabled: true, intervalMinutes: 120, lookbackMinutes: 130, maxSessionsPerRun: 10,
         maxCharsPerSession: 8_000, maxExistingLogChars: 12_000, timeoutMs: 60_000, excludeChatTypes: ["direct" as const],
+        includeEmotionalSalience: false, minSalienceScore: 0.6, minAbsoluteIntensity: 2.5, minRelativeIntensity: 1,
       },
       outcomeLedger: {
         enabled: false, intervalMinutes: 30, lookbackMs: 86_400_000, maxRowsPerPass: 5_000, matchWindowMs: 600_000, retentionDays: 90,
@@ -525,6 +526,10 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     { steward: { expectations: { workspaceSweepChatTypes: "channel" } } },
     { steward: { expectations: { extract: 1 } } },
     { steward: { expectations: { sweep: "yes" } } },
+    { steward: { captainsLog: { includeEmotionalSalience: "true" } } },
+    { steward: { captainsLog: { minSalienceScore: 1.5 } } },
+    { steward: { captainsLog: { minAbsoluteIntensity: 4 } } },
+    { steward: { captainsLog: { minRelativeIntensity: -0.5 } } },
     { steward: { expectations: { captainsLogDecisionResolve: "true" } } },
     { steward: { expectations: { captainsLogResolveMinConfidence: 1.5 } } },
     { steward: { expectations: { captainsLogResolveMinConfidence: -0.1 } } },
@@ -628,7 +633,8 @@ test("memoryWhisperer derived-observation caps and thresholds are configurable t
 test("memoryWhisperer.brightness is off by default; a one-line recipe flip stamps its own recipe hash unless one is set", async () => {
   const validate = await manifestValidator("unblock-memory:test:memory-whisperer-brightness");
   const defaults = resolveConfig({}).memoryWhisperer;
-  assert.deepEqual(defaults.brightness, { recipe: "off", weight: 0.08, decayRate: 0.5, lookbackDays: 90, maxBoost: 0.15 });
+  assert.deepEqual(defaults.brightness, { recipe: "off", weight: 0.08, decayRate: 0.5, lookbackDays: 90, maxBoost: 0.15,
+    emotionDecayStretch: 3, emotionMaxBonus: 0.35 });
   assert.equal(defaults.recipeHash, "default", "existing configs stay untouched");
   assert.deepEqual([defaults.crystalsEnabled, defaults.crystalMaxHints, defaults.crystalMinTokenOverlap, defaults.crystalMinSharedTokens,
     defaults.crystalLtmRankBoost], [true, 2, 0.35, 2, 0.01]);
@@ -636,8 +642,7 @@ test("memoryWhisperer.brightness is off by default; a one-line recipe flip stamp
   assert.equal(hostDefaults.ok, true);
   assert.deepEqual(resolveConfig(hostDefaults.value).memoryWhisperer.brightness, defaults.brightness);
 
-  // The 6-vs-7 fleet A/B split: each arm is a single-key flip that also labels its exposures.
-  for (const recipe of ["actr_v1", "outcome_v1"] as const) {
+  for (const recipe of ["actr_v1", "outcome_v1", "emotion_v1"] as const) {
     const flip = { memoryWhisperer: { brightness: { recipe } } };
     const hosted = validate(flip);
     assert.equal(hosted.ok, true, JSON.stringify(hosted.errors));
@@ -650,7 +655,8 @@ test("memoryWhisperer.brightness is off by default; a one-line recipe flip stamp
   assert.equal(resolveConfig({ memoryWhisperer: { recipeHash: " exp-42 ", brightness: { recipe: "outcome_v1" } } }).memoryWhisperer.recipeHash,
     "exp-42");
   assert.equal(resolveConfig({ memoryWhisperer: { brightness: { recipe: "off" } } }).memoryWhisperer.recipeHash, "default");
-  const tuned = { memoryWhisperer: { brightness: { recipe: "actr_v1", weight: 0, decayRate: 1.2, lookbackDays: 0, maxBoost: 0 },
+  const tuned = { memoryWhisperer: { brightness: { recipe: "emotion_v1", weight: 0, decayRate: 1.2, lookbackDays: 0, maxBoost: 0,
+    emotionDecayStretch: 0, emotionMaxBonus: 0.2 },
     crystalsEnabled: false, crystalMaxHints: 0, crystalMinTokenOverlap: 1, crystalMinSharedTokens: 5, crystalLtmRankBoost: 0 } };
   assert.equal(validate(tuned).ok, true);
   const resolved = resolveConfig(tuned).memoryWhisperer;
@@ -662,6 +668,10 @@ test("memoryWhisperer.brightness is off by default; a one-line recipe flip stamp
     { brightness: { recipe: "actr_v2" } }, { brightness: { recipe: "" } }, { brightness: { extra: 1 } }, { brightness: [] },
     { brightness: { weight: -0.1 } }, { brightness: { decayRate: 0 } }, { brightness: { decayRate: -1 } },
     { brightness: { lookbackDays: -1 } }, { brightness: { lookbackDays: 1.5 } }, { brightness: { maxBoost: -1 } },
+    { brightness: { emotionDecayStretch: -1 } }, { brightness: { emotionDecayStretch: 4 } },
+    { brightness: { emotionMaxBonus: -0.1 } }, { brightness: { emotionMaxBonus: 0.4 } },
+    // Only `undefined` takes a default; `null` is rejected by both the manifest and the resolver.
+    { brightness: { emotionDecayStretch: null } }, { brightness: { emotionMaxBonus: null } }, { brightness: { weight: null } },
     { crystalsEnabled: "yes" }, { crystalMaxHints: -1 }, { crystalMaxHints: 1.5 }, { crystalMinTokenOverlap: 1.1 },
     { crystalMinSharedTokens: 0 }, { crystalLtmRankBoost: -0.01 },
   ]) {
@@ -679,7 +689,7 @@ test("steward.crystals and steward.overnight are on by default; host manifest an
   assert.deepEqual(steward.crystals, {
     enabled: true, intervalMinutes: 360, reclusterMinIntervalMinutes: 720, autoRecluster: true, minClusterSize: 3, maxClustersPerRun: 0,
     maxMembersPerCluster: 12, stmStaleAfterMinutes: 20_160, ltmPromoteMinHelped: 3, ltmPromoteMinHits: 5,
-    allowedCorpora: ["memory", "knowledge"], timeoutMs: 0,
+    allowedCorpora: ["memory", "knowledge"], timeoutMs: 0, prioritizeEmotionalSalience: true,
   });
   assert.deepEqual(steward.overnight, {
     enabled: true, intervalMinutes: 720, voltaireEnabled: true, postmortemsEnabled: true, preAnswerEnabled: true, lookbackDays: 30,
@@ -690,7 +700,8 @@ test("steward.crystals and steward.overnight are on by default; host manifest an
   const tuned = { steward: {
     crystals: { enabled: false, intervalMinutes: 30, reclusterMinIntervalMinutes: 0, autoRecluster: false, minClusterSize: 1,
       maxClustersPerRun: 4, maxMembersPerCluster: 0, stmStaleAfterMinutes: 0, ltmPromoteMinHelped: 0, ltmPromoteMinHits: 0,
-      allowedCorpora: ["memory", "knowledge", "sessions"], timeoutMs: 5000 },
+      allowedCorpora: ["memory", "knowledge", "sessions"], timeoutMs: 5000,
+      prioritizeEmotionalSalience: false },
     overnight: { enabled: false, intervalMinutes: 60, quietHoursStartHour: 22, quietHoursEndHour: 6, voltaireEnabled: false,
       postmortemsEnabled: false, preAnswerEnabled: false, lookbackDays: 0, minRecurrence: 1, lookaheadMinutes: 0, maxVoltairePerRun: 0,
       maxPostmortemsPerRun: 0, maxPreAnswersPerRun: 0, minConfidence: "high", recallChatTypes: ["channel", "group", "direct"],

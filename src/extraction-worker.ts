@@ -167,7 +167,9 @@ async function processSession(params: {
     if (handleResetOrMissing(store, session.sessionId, page, owner, policyFingerprint)) {
       return { processed: 1, accepted: 0, rejected: 0, unchanged: 0, failed: 0 };
     }
-    if (!page.entryCount) {
+    // Skipped source rows are not extraction evidence. Keep the last content checkpoint
+    // and record the exhausted revision so a synthetic-only window is not rescanned.
+    if (!page.newIds.length) {
       store.completeEmpty({
         sessionId: session.sessionId,
         expected: checkpoint.cursor,
@@ -250,7 +252,8 @@ export async function runExtraction(params: { config: UnblockMemoryConfig; store
   const heartbeat = setInterval(() => { try { store.renew(owner); } catch (error) { leaseAbort.abort(error); } }, DEFAULTS.extraction.heartbeatMs);
   heartbeat.unref();
   let processed = 0, acceptedCount = 0, rejectedCount = 0, unchanged = 0, failed = 0;
-  const readPage = params.readPage ?? readExtractionPage;
+  const readPage: typeof readExtractionPage = params.readPage ?? ((agentId, agentName, session, cursor, read, signal) =>
+    readExtractionPage(agentId, agentName, session, cursor, read, signal, params.config.syntheticInput));
   const extract = params.extract ?? extractWithDecisionModel;
   const validate = params.validate ?? validateExtractedMemories;
   const version = params.version ?? EXTRACTION_VERSION;

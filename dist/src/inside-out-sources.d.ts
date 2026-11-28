@@ -36,6 +36,15 @@ type InsideOutEvent = {
         };
     };
 };
+/**
+ * The message identity Inside Out stores as `message_id` for a live transcript row: the event id, or the hash of the
+ * event exactly as {@link liveTranscriptEvent} builds it. Captain's Log joins grades on this, so ID-less events match.
+ */
+export declare function liveTranscriptMessageId(row: {
+    eventJson: string;
+    seq: number;
+    createdAt: number;
+}): string;
 export type InsideOutSource = {
     sessionId: string;
     channel: string;

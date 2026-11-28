@@ -10,9 +10,10 @@ import { resolveSafetyWhisperer } from "./safety-config.js";
 import { resolveMyTurn } from "./my-turn.js";
 import { resolveRecallLedger } from "./recall-ledger.js";
 import { resolveStewardConfig } from "./steward-config.js";
+import { SYNTHETIC_INPUT_FAMILIES } from "./synthetic-input.js";
 import { EXPECTATIONS_WHISPERER_DEFAULTS } from "./expectations-whisperer.js";
 import { DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS, DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP } from "./deep-thought-store.js";
-import { BRIGHTNESS_RECIPES, brightnessRecipeHash, DEFAULT_BRIGHTNESS_CONFIG, } from "./memory-brightness.js";
+import { BRIGHTNESS_RECIPES, brightnessRecipeHash, DEFAULT_BRIGHTNESS_CONFIG, EMOTION_BRIGHTNESS_LIMITS, } from "./memory-brightness.js";
 import { DEFAULT_CRYSTAL_LTM_RANK_BOOST, DEFAULT_CRYSTAL_MATCH_MIN_SHARED_TOKENS, DEFAULT_CRYSTAL_MATCH_MIN_TOKEN_OVERLAP, } from "./memory-crystals.js";
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"];
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -137,10 +138,14 @@ function resolveBrightness(value) {
     if (typeof recipe !== "string" || !BRIGHTNESS_RECIPES.includes(recipe)) {
         throw new Error(`unblock-memory memoryWhisperer.brightness.recipe must be one of ${BRIGHTNESS_RECIPES.join(", ")}`);
     }
-    const number = (key, positive) => {
-        const resolved = config[key] ?? DEFAULT_BRIGHTNESS_CONFIG[key];
+    const number = (key, positive = false) => {
+        // Only `undefined` takes the default; an explicit `null` is invalid, as in openclaw.plugin.json.
+        const resolved = config[key] === undefined ? DEFAULT_BRIGHTNESS_CONFIG[key] : config[key];
         if (typeof resolved !== "number" || !Number.isFinite(resolved) || (positive ? resolved <= 0 : resolved < 0)) {
             throw new Error(`unblock-memory memoryWhisperer.brightness.${key} must be a ${positive ? "positive" : "non-negative"} number`);
+        }
+        if ((key === "emotionDecayStretch" || key === "emotionMaxBonus") && resolved > EMOTION_BRIGHTNESS_LIMITS[key]) {
+            throw new Error(`unblock-memory memoryWhisperer.brightness.${key} must be <= ${EMOTION_BRIGHTNESS_LIMITS[key]}`);
         }
         return resolved;
     };
@@ -149,8 +154,8 @@ function resolveBrightness(value) {
         throw new Error("unblock-memory memoryWhisperer.brightness.lookbackDays must be a non-negative integer (0 = unlimited)");
     }
     return {
-        recipe: recipe, weight: number("weight", false), decayRate: number("decayRate", true), lookbackDays,
-        maxBoost: number("maxBoost", false),
+        recipe: recipe, weight: number("weight"), decayRate: number("decayRate", true), lookbackDays,
+        maxBoost: number("maxBoost"), emotionDecayStretch: number("emotionDecayStretch"), emotionMaxBonus: number("emotionMaxBonus"),
     };
 }
 function resolveQueryApi(value) {
@@ -337,6 +342,40 @@ function resolveWhispererTriggers(value) {
     };
     return { cron: namesFor("cron"), subagent: namesFor("subagent"), heartbeat: namesFor("heartbeat") };
 }
+function resolveSyntheticInput(value) {
+    if (value === undefined)
+        return;
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error("unblock-memory syntheticInput must be an object");
+    const config = value;
+    assertOnlyKeys(config, ["enabled", "skipFamilies", "extraExactAliases", "extraPrefixes"], "syntheticInput");
+    const { enabled, skipFamilies } = config;
+    if (enabled !== undefined && typeof enabled !== "boolean")
+        throw new Error("unblock-memory syntheticInput.enabled must be a boolean");
+    const families = skipFamilies === undefined ? undefined : (() => {
+        const error = `unblock-memory syntheticInput.skipFamilies must be an array of: ${SYNTHETIC_INPUT_FAMILIES.join(", ")}`;
+        if (!Array.isArray(skipFamilies))
+            throw new Error(error);
+        const selected = SYNTHETIC_INPUT_FAMILIES.filter(family => skipFamilies.includes(family));
+        if (new Set(skipFamilies).size !== selected.length)
+            throw new Error(error);
+        return selected;
+    })();
+    const strings = (key) => {
+        const values = config[key];
+        if (values === undefined)
+            return undefined;
+        if (!Array.isArray(values))
+            throw new Error(`unblock-memory syntheticInput.${key} must be an array of non-blank strings`);
+        const result = values.map(value => {
+            if (typeof value !== "string" || !value.trim())
+                throw new Error(`unblock-memory syntheticInput.${key} must be an array of non-blank strings`);
+            return value.trim();
+        });
+        return [...new Set(result)];
+    };
+    return { enabled, skipFamilies: families, extraExactAliases: strings("extraExactAliases"), extraPrefixes: strings("extraPrefixes") };
+}
 function resolveCorpora(value) {
     if (value === undefined)
         return DEFAULT_CORPORA;
@@ -473,7 +512,7 @@ export function resolveConfig(value) {
         throw new Error("unblock-memory config must be an object");
     }
     const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers"], "config");
+    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers", "syntheticInput"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
@@ -553,6 +592,7 @@ export function resolveConfig(value) {
     // Resolved before the Memory Whisperer, whose corpora may include the published `extracted` corpus.
     const extraction = resolveExtraction(config.extraction, corpora);
     return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
+        syntheticInput: resolveSyntheticInput(config.syntheticInput),
         myTurn: resolveMyTurn(config.myTurn),
         extraction,
         qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),

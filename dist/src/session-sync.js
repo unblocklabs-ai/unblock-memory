@@ -4,7 +4,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { AgentTranscriptReader, agentTranscriptSchemaVersion, assertAgentTranscriptIdentity } from "./agent-transcript.js";
 import { projectSessionDocument, sessionDocumentPath, } from "./session-projector.js";
-export const PROJECTOR_VERSION = 8;
+export const PROJECTOR_VERSION = 9;
 // Source lives in src/, published code in dist/src/. Read our own pinned dependency
 // metadata, not QMD internals (which may also be substituted by runtime inspectors).
 const sourcePackage = new URL("../package.json", import.meta.url);
@@ -37,7 +37,7 @@ function windowMetadata(window) {
 }
 function projectionKey(params) {
     return JSON.stringify([PROJECTOR_VERSION, params.databasePath, params.agentId,
-        params.agentName, params.timezone, [...params.chatTypes].sort()]);
+        params.agentName, params.timezone, [...params.chatTypes].sort(), params.syntheticInput ?? null]);
 }
 // Conservative proof: any index/WAL write, replacement or QMD upgrade invalidates it.
 // This lets the quiet check skip opening QMD (and loading models) entirely.
@@ -235,6 +235,7 @@ function syncWindow(params) {
             agentName: params.agentName,
             timezone: params.timezone,
             events,
+            syntheticInput: params.syntheticInput,
             diagnostics: params.diagnostics,
         };
         projection = projectSessionDocument(input);
@@ -325,6 +326,7 @@ export async function syncSessionProjections(params) {
             force: params.force === true,
             agentName: params.agentName,
             timezone: params.timezone,
+            syntheticInput: params.syntheticInput,
             currentProjectionKey,
             previousManifestProjectionKey: previousManifest.projectionKey,
             diagnostics,

@@ -33,6 +33,7 @@ function liveRun(row, now = Date.now()) {
 export class QmdMemoryRuntime {
     #corpora;
     #extraction;
+    #syntheticInput;
     #analysisExecutable;
     #keepEmbeddingModelWarm;
     #stateRoot;
@@ -125,6 +126,7 @@ export class QmdMemoryRuntime {
     constructor(corpora, options = {}) {
         this.#corpora = corpora;
         this.#extraction = options.extraction;
+        this.#syntheticInput = options.syntheticInput;
         this.#analysisExecutable = options.analysisExecutable;
         this.#keepEmbeddingModelWarm = options.keepEmbeddingModelWarm ?? true;
         this.#stateRoot = options.stateRoot ?? resolveStateDir();
@@ -581,6 +583,7 @@ export class QmdMemoryRuntime {
             statePath: join(stateDir, MEMORY_DATABASE),
             legacyStateDir: stateDir,
             timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
+            syntheticInput: this.#syntheticInput,
         };
     }
     /** Projected (no files): the retired projection directory only keeps the collection identity stable. */

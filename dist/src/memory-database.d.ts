@@ -7,5 +7,6 @@ export declare function openMemoryDatabase(path: string, { busyTimeoutMs }?: {
 /** Runs synchronous writes atomically; never pass an async callback. */
 export declare function immediateTransaction<T>(db: DatabaseSync, fn: () => T): T;
 export declare function tableExists(db: DatabaseSync, name: string): boolean;
+export declare function readTableColumns(db: DatabaseSync, name: string): ReadonlySet<string>;
 /** File existence no longer tells us which feature has initialized its tables. */
 export declare function hasMemoryTable(path: string, table: string): boolean;
