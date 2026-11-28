@@ -1,6 +1,7 @@
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { QueryConversation, QueryPair } from "./query-contract.js";
 import { selectJudgeConversation } from "./judge-context.js";
+import { type BrightnessRecipe } from "./memory-brightness.js";
 import { type RetrievalTimings } from "./retrieval-timing.js";
 import { type RecallHitDisposition, type RecallHitLocator } from "./recall-ledger.js";
 export type MemoryCandidateManager = {
@@ -39,6 +40,15 @@ export type RecallCandidateTrace = {
     disposition: RecallHitDisposition | "passed";
     finalRank?: number;
 };
+type SearchBrightness = {
+    recipe: BrightnessRecipe;
+    weight?: number;
+    maxBoost?: number;
+    lookup?: (subjects: readonly string[]) => Map<string, {
+        normalized: number;
+        samples: number;
+    }> | undefined;
+};
 /**
  * Both entry points use the same complete passages and independent usefulness judgments.
  * A single query pair (or one-element list) searches exactly as before; 2+ topic pairs search together (one
@@ -57,6 +67,8 @@ export declare function searchMemory(manager: MemoryCandidateManager, queries: Q
     maxJudgeCandidates?: number;
     minUsefulness?: number;
     excludedPassages?: ReadonlyMap<string, number>;
+    /** Adjust finalist order only, after usefulness gating. Returned scores remain unadjusted. */
+    brightness?: SearchBrightness;
     onCandidates?: (observation: MemorySearchObservation) => void;
     onJudgment?: (event: {
         candidateIndex: number;
@@ -67,3 +79,4 @@ export declare function searchMemory(manager: MemoryCandidateManager, queries: Q
 }): Promise<MemorySearchObservation & MemoryRanking & {
     results: CorpusMemorySearchResult[];
 }>;
+export {};

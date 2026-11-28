@@ -1445,7 +1445,7 @@ test("keeps analysis fresh for a no-op manual session sync", async () => {
   }
 });
 
-test("serializes QMD writes and analysis on one operation queue", async () => {
+test("the analysis worker waits for in-flight QMD writes before it starts", async () => {
   const root = await mkdtemp(join(tmpdir(), "unblock-memory-serialize-analysis-"));
   const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
   const events: string[] = [];
@@ -1496,6 +1496,78 @@ test("serializes QMD writes and analysis on one operation queue", async () => {
     assert.equal(maxActive, 1);
     assert.deepEqual(events, ["sync:start", "sync:end", "analysis:start", "analysis:end"]);
   } finally {
+    await manager.close();
+  }
+});
+
+test("a running recluster worker never blocks foreground search; reclusters serialize with each other", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unblock-memory-recluster-nonblocking-"));
+  const backing = await createStore({ dbPath: join(root, "index.sqlite"), config: { collections: {} } });
+  const source = resolveSource(root, "MEMORY.md");
+  let updates = 0;
+  const store = createManagerStore({
+    internal: backing.internal,
+    async update() {
+      updates += 1;
+      return { collections: 0, indexed: 1, updated: 0, unchanged: 0, removed: 0, skipped: 0, needsEmbedding: 0 };
+    },
+    async vsearch() { return [{
+      file: `qmd://${source.collection}/MEMORY.md`, displayPath: `${source.collection}/MEMORY.md`,
+      title: "Memory", context: null, docid: "hash", body: "foreground recall", score: 0.8,
+      bestChunk: "foreground recall", chunkPos: 0, chunkLen: 17,
+    }]; },
+    async close() { await backing.close(); },
+  });
+  const gates: Array<() => void> = [];
+  let active = 0;
+  let maxActive = 0;
+  let runs = 0;
+  const manager = new QmdMemoryManager({
+    dbPath: backing.dbPath,
+    workspaceDir: root,
+    sources: [source],
+    storeFactory: async () => store,
+    analysisExecutable: "/worker",
+    analysisRunner: async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise<void>(resolve => gates.push(resolve));
+      runs += 1;
+      backing.internal.db.prepare(`INSERT INTO memory_analysis_runs
+        (id, created_at, completed_at, input_digest, model, embedding_fingerprint, dimensions, params_json, stale_at)
+        VALUES (?, ?, ?, 'digest', 'model', 'fingerprint', 768, '{}', NULL)`).run(`run-${runs}`, `now-${runs}`, `done-${runs}`);
+      active -= 1;
+    },
+  });
+  const parked = async () => { while (gates.length === 0) await delay(1); };
+  try {
+    const first = manager.recluster();
+    const second = manager.recluster();
+    await parked();
+    // The worker is parked mid-run: foreground recall must still answer promptly.
+    const started = performance.now();
+    const results = await Promise.race([
+      manager.search("memory"),
+      delay(1_000).then(() => { throw new Error("memory_search waited behind the recluster worker"); }),
+    ]);
+    assert.equal(results[0]?.snippet, "foreground recall");
+    assert.ok(performance.now() - started < 1_000);
+    assert.equal(gates.length, 1, "the second recluster waits for the first worker");
+    gates.shift()!();
+    const summary = await first;
+    assert.equal(summary.runId, "run-1");
+    assert.equal(summary.stale, false);
+    await parked();
+    // An index change while the worker runs must leave the new run marked stale, never presented as current.
+    await manager.sync();
+    assert.ok(updates > 0);
+    gates.shift()!();
+    const overlapped = await second;
+    assert.equal(overlapped.runId, "run-2");
+    assert.equal(overlapped.stale, true);
+    assert.equal(maxActive, 1, "reclusters never run concurrently");
+  } finally {
+    while (gates.length) gates.shift()!();
     await manager.close();
   }
 });

@@ -4,14 +4,17 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { setImmediate } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { createStore } from "@unblocklabs/qmd";
 import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { registerUnblockMemory } from "../src/plugin.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { QmdMemoryManager } from "../src/manager.js";
 import { resolveSource, resolveSessionSource } from "../src/sources.js";
-import { memoryPassageId, searchMemory } from "../src/memory-search.js";
+import { computeBrightnessMap } from "../src/memory-brightness.js";
+import { memoryPassageId, searchMemory, type RecallCandidateTrace } from "../src/memory-search.js";
 import { MEMORY_DATABASE } from "../src/memory-database.js";
+import { OutcomeLedgerStore } from "../src/outcome-ledger.js";
 import type { SessionManifest } from "../src/session-sync-state.js";
 import { sqliteSessionState } from "./helpers/session-index.js";
 
@@ -348,6 +351,57 @@ function judgeBy(t: test.TestContext, score: (excerpt: string) => number, bodies
   });
   return bodies;
 }
+
+test("outcome brightness reorders qualifying hits before truncation without changing usefulness or rescuing weak hits", async t => {
+  const hurt = topicHit("stale advice", 0.3), helped = topicHit("verified advice", 0.2), irrelevant = topicHit("unrelated answer", 0.4);
+  const manager = { searchCandidates: async () => [hurt, helped, irrelevant] };
+  const queries = { lex: "advice", vec: "What should I do?" };
+  const db = new DatabaseSync(":memory:");
+  t.after(() => db.close());
+  const ledger = new OutcomeLedgerStore(db);
+  const nowMs = Date.UTC(2026, 10, 27);
+  const insert = ledger.db.prepare(`INSERT INTO memory_outcomes
+    (id,agent_id,subject_kind,subject_id,verdict,confidence,evidence_turn_id,signals_json,measured_at)
+    VALUES (?,'main','memory_hit',?,?,1,'turn','{}',?)`);
+  for (const [hit, verdict] of [[hurt, "hurt"], [helped, "helped"], [irrelevant, "helped"]] as const) {
+    insert.run(hit.path, hit.path, verdict, nowMs);
+  }
+  judgeBy(t, excerpt => excerpt === irrelevant.snippet ? 0.1 : 0.8);
+  const options = { ...judgeOptions, maxResults: 1, minUsefulness: 0.7 };
+  const batches: (readonly string[])[] = [];
+  const brightness = { recipe: "outcome_v1" as const, weight: 8, maxBoost: 1, lookup(subjects: readonly string[]) {
+    batches.push(subjects);
+    return computeBrightnessMap(db, { agentId: "main", recipe: "outcome_v1", subjects, nowMs });
+  } };
+  for (const inactive of [undefined, { ...brightness, recipe: "off" as const }, { ...brightness, weight: 0 }]) {
+    const baseline = await searchMemory(manager, queries, { ...options, brightness: inactive });
+    assert.deepEqual(baseline.results.map(hit => [hit.path, hit.score]), [[hurt.path, 0.8]]);
+  }
+  assert.equal(batches.length, 0);
+  let traces: RecallCandidateTrace[] = [];
+  const active = await searchMemory(manager, queries, { ...options, brightness, onTrace: value => { traces = value; } });
+  assert.deepEqual(active.results.map(hit => [hit.path, hit.score]), [[helped.path, 0.8]]);
+  assert.deepEqual(batches, [[hurt.path, helped.path]]);
+  assert.deepEqual(traces.map(trace => [trace.hit.path, trace.usefulnessScore, trace.disposition, trace.finalRank]), [
+    [hurt.path, 0.8, "rank_limit", undefined], [helped.path, 0.8, "passed", 1], [irrelevant.path, 0.1, "below_threshold", undefined],
+  ]);
+  const unavailable = await searchMemory(manager, queries, { ...options,
+    brightness: { ...brightness, lookup() { throw new Error("ledger unavailable"); } } });
+  assert.deepEqual(unavailable.results.map(hit => hit.path), [hurt.path]);
+});
+
+test("retrieval fallback honors the boost cap in both directions and keeps raw retrieval scores", async () => {
+  const hurt = topicHit("stale", 0.53), neutral = topicHit("unseen", 0.51), helped = topicHit("verified", 0.46);
+  const manager = { searchCandidates: async () => [hurt, neutral, helped] };
+  const result = await searchMemory(manager, { lex: "advice", vec: "What should I do?" }, {
+    ...judgeOptions, apiKey: undefined, allowRetrievalFallback: true, maxResults: 2,
+    brightness: { recipe: "outcome_v1", weight: 0.8, maxBoost: 0.03, lookup: () => new Map([
+      [hurt.path, { normalized: -1, samples: 1 }], [helped.path, { normalized: 1, samples: 1 }],
+    ]) },
+  });
+  assert.equal(result.rankingMode, "retrieval");
+  assert.deepEqual(result.results, [neutral, hurt]);
+});
 
 test("multi-topic finalists reserve each topic's best qualifying hit before filling by usefulness", async t => {
   const topics = [{ lex: "a", vec: "a" }, { lex: "b", vec: "b" }];

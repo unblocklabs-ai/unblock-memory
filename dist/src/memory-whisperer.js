@@ -11,6 +11,10 @@ import { nonBlank } from "./guards.js";
 import { WhispererAdmissionTracker } from "./whisperer-admission.js";
 import { planRecall } from "./memory-query-v2.js";
 import { canonicalCorpora, DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS, DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP, deepThoughtAudienceKey, derivedObservationGenerationsFresh, readDerivedObservationCandidates, } from "./deep-thought-store.js";
+import { WORKSPACE_AUDIENCE } from "./expectations-store.js";
+import { computeBrightnessMap } from "./memory-brightness.js";
+import { findMatchingCrystalsReadOnly, recordCrystalHitsAtPath } from "./memory-crystals.js";
+import { chatTypeFromSessionKey } from "./session-chat-type.js";
 const MAX_JUDGE_CANDIDATES = DEFAULTS.memoryWhisperer.maxJudgeCandidates;
 const MAX_GENERATION_TIMEOUT_MS = DEFAULTS.memoryWhisperer.maxQueryGenMs;
 const MAX_PAYLOAD_CHARS = DEFAULTS.memoryWhisperer.maxInjectedChars;
@@ -88,6 +92,24 @@ function boundDerivedHints(matches, maxChars) {
     }
     return { emitted, hints };
 }
+function crystalHint({ crystal }) {
+    return { source: `memory_crystal:${crystal.id}`, tier: crystal.tier, title: crystal.title, summary: crystal.summary,
+        revision: crystal.revision };
+}
+/** Bound the crystal entries without slicing any summary; `0` = unlimited. */
+function boundCrystalHints(matches, maxChars) {
+    const emitted = [];
+    const hints = [];
+    for (const match of matches) {
+        const next = crystalHint(match);
+        if (maxChars > 0 && encodeHints([...hints, next]).length > maxChars)
+            continue;
+        emitted.push(match);
+        hints.push(next);
+    }
+    return { emitted, hints };
+}
+const DEFAULT_CRYSTAL_MAX_HINTS = 2;
 function failureFields(error) {
     return error instanceof DecisionRequestError || error instanceof QueryApiError
         ? { errorCode: error.code, httpStatus: error.status }
@@ -227,12 +249,6 @@ function splitChannelThread(value) {
     }
     return { channelId: lower };
 }
-function chatTypeFromSessionKey(sessionKey) {
-    if (!sessionKey)
-        return undefined;
-    const match = /:(direct|group|channel):/iu.exec(sessionKey);
-    return match?.[1]?.toLowerCase();
-}
 function whispererOrigin(context, sessionKey) {
     const provider = nonBlank(context.messageProvider)?.toLowerCase();
     const accountId = nonBlank(context.accountId)?.toLowerCase();
@@ -293,7 +309,12 @@ function buildRecallHits(traces, emittedRanks, selectedIds, redundantIds) {
 export function registerMemoryWhisperer(api, runtime, config, decisionModel, diagnostics, recallLedger, options = {}) {
     if (!config.enabled || !decisionModel.enabled)
         return;
-    const { derivedObservations, recipeHash } = options;
+    const { derivedObservations, crystals, recipeHash } = options;
+    const brightness = options.brightness && options.brightness.recipe !== "off" && options.brightness.weight > 0
+        ? options.brightness : undefined;
+    const recordCrystalHits = crystals?.recordHits ?? ((agentId, ids) => {
+        recordCrystalHitsAtPath(crystals.dbPathForAgent(agentId), ids, agentId);
+    });
     const mode = config.mode ?? DEFAULTS.memoryWhisperer.mode;
     const legacy = mode === "legacy";
     const sessions = new WhispererAdmissionTracker({
@@ -414,6 +435,33 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 derivedSettled = true;
             }
         })() : Promise.resolve();
+        // Memory Crystals: one local read-only lookup (zero model calls), also off the retrieval critical path.
+        let crystalSettled = false;
+        let crystalMatches = [];
+        const crystalReady = crystals ? (async () => {
+            try {
+                await Promise.resolve();
+                const audience = derivedAudienceContext(context, agentId, sessionKey);
+                const audienceKey = nonBlank((crystals.audienceKey ?? deepThoughtAudienceKey)(audience));
+                const queryText = visibleQueryConversation(event.prompt, event.messages, currentUserMessage).currentRequest;
+                const matches = findMatchingCrystalsReadOnly(crystals.dbPathForAgent(agentId), {
+                    agentId, queryText, audienceKeys: [WORKSPACE_AUDIENCE, ...(audienceKey ? [audienceKey] : [])], allowedCorpora: corpora,
+                    ...(crystals.minTokenOverlap !== undefined ? { minTokenOverlap: crystals.minTokenOverlap } : {}),
+                    ...(crystals.minSharedTokens !== undefined ? { minSharedTokens: crystals.minSharedTokens } : {}),
+                    ...(crystals.ltmRankBoost !== undefined ? { ltmRankBoost: crystals.ltmRankBoost } : {}),
+                    nowMs: Date.now(),
+                }).filter(match => !recent.has(`crystal:${match.crystal.id}`));
+                const maxHints = crystals.maxHints ?? DEFAULT_CRYSTAL_MAX_HINTS;
+                crystalMatches = maxHints > 0 ? matches.slice(0, maxHints) : matches;
+            }
+            catch (error) {
+                if (!signal.aborted)
+                    log("warn", "crystals_unavailable", failureFields(error));
+            }
+            finally {
+                crystalSettled = true;
+            }
+        })() : Promise.resolve();
         let memoryHints = [];
         const run = async () => {
             const visible = visibleQueryConversation(event.prompt, event.messages, currentUserMessage);
@@ -479,6 +527,12 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                 corpora: searchedCorpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: judgeConversation,
                 asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: DEFAULTS.memoryWhisperer.maxFinalists,
                 maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: recent,
+                ...(brightness ? { brightness: {
+                        recipe: brightness.recipe, weight: brightness.weight, maxBoost: brightness.maxBoost,
+                        lookup: (subjects) => computeBrightnessMap(brightness.dbPathForAgent(agentId), {
+                            agentId, recipe: brightness.recipe, subjects, decayRate: brightness.decayRate, lookbackDays: brightness.lookbackDays,
+                        }),
+                    } } : {}),
                 onCandidates: observation => {
                     turn.measurement.retrievalMs = observation.retrievalMs;
                     turn.measurement.candidates = observation.candidates;
@@ -566,41 +620,65 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
             return { appendContext };
         };
         let derivedEmitted = 0;
+        let crystalsEmitted = 0;
         let derivedWaitAborted = false;
-        /** Folds verified syntheses (first) into the same `<memory>` block; without any, the normal result is returned as-is. */
+        /** Waits at most until the turn deadline; `false` when the deadline (or a cancel) ended the wait. */
+        const settle = async (settled, ready) => {
+            if (settled())
+                return true;
+            await new Promise(resolve => {
+                if (signal.aborted)
+                    return resolve();
+                const onAbort = () => resolve();
+                signal.addEventListener("abort", onAbort, { once: true });
+                void ready.finally(() => { signal.removeEventListener("abort", onAbort); resolve(); });
+            });
+            return !signal.aborted;
+        };
+        /**
+         * Folds verified syntheses (first), then matched crystals, into the same `<memory>` block ahead of raw chunks;
+         * without any, the normal result is returned as-is. An abort here never discards the normal result.
+         */
         const withDerived = async (normal) => {
-            if (!derivedObservations || signal.aborted)
+            if ((!derivedObservations && !crystals) || signal.aborted)
                 return normal;
-            if (!derivedSettled) {
-                // Waits at most until the turn deadline; an abort here never discards the normal result.
-                await new Promise(resolve => {
-                    if (signal.aborted)
-                        return resolve();
-                    const onAbort = () => resolve();
-                    signal.addEventListener("abort", onAbort, { once: true });
-                    void derivedReady.finally(() => { signal.removeEventListener("abort", onAbort); resolve(); });
-                });
-                if (signal.aborted) {
-                    derivedWaitAborted = true;
-                    return normal;
-                }
+            if (!await settle(() => derivedSettled, derivedReady) || !await settle(() => crystalSettled, crystalReady)) {
+                derivedWaitAborted = true;
+                return normal;
             }
-            if (!derivedMatches.length || !sessions.isCurrent(state))
+            if ((!derivedMatches.length && !crystalMatches.length) || !sessions.isCurrent(state))
                 return normal;
-            const maxChars = derivedObservations.maxPayloadChars ?? MAX_PAYLOAD_CHARS;
-            const { emitted, hints } = boundDerivedHints(derivedMatches, maxChars);
-            if (!emitted.length)
+            const derived = derivedObservations && derivedMatches.length
+                ? boundDerivedHints(derivedMatches, derivedObservations.maxPayloadChars ?? MAX_PAYLOAD_CHARS) : { emitted: [], hints: [] };
+            const crystal = crystals && crystalMatches.length
+                ? boundCrystalHints(crystalMatches, crystals.maxPayloadChars ?? MAX_PAYLOAD_CHARS) : { emitted: [], hints: [] };
+            if (!derived.emitted.length && !crystal.emitted.length)
                 return normal;
-            for (const match of emitted)
+            for (const match of derived.emitted)
                 recent.set(`derived:${match.observation.id}`, state.turn);
-            derivedEmitted = emitted.length;
+            for (const match of crystal.emitted)
+                recent.set(`crystal:${match.crystal.id}`, state.turn);
+            derivedEmitted = derived.emitted.length;
+            crystalsEmitted = crystal.emitted.length;
+            if (crystal.emitted.length) {
+                // Real hit counts feed STM→LTM promotion; best-effort and off the hook's return path.
+                const ids = crystal.emitted.map(match => match.crystal.id);
+                setImmediate(() => {
+                    try {
+                        recordCrystalHits(agentId, ids);
+                    }
+                    catch (error) {
+                        log("warn", "crystal_hits_unrecorded", failureFields(error));
+                    }
+                });
+            }
             if (!normal) {
                 diagnostics?.record(agentId, "memory", "emitted");
-                turn.reason = "derived_emitted";
+                turn.reason = derived.emitted.length ? "derived_emitted" : "crystal_emitted";
             }
-            const appendContext = `<memory>\n${encodeHints([...hints, ...memoryHints])}\n</memory>`;
+            const appendContext = `<memory>\n${encodeHints([...derived.hints, ...crystal.hints, ...memoryHints])}\n</memory>`;
             turn.measurement.outcome = "ok";
-            turn.measurement.results = memoryHints.length + emitted.length;
+            turn.measurement.results = memoryHints.length + derived.emitted.length + crystal.emitted.length;
             turn.measurement.contextChars = appendContext.length;
             return { appendContext };
         };
@@ -654,6 +732,8 @@ export function registerMemoryWhisperer(api, runtime, config, decisionModel, dia
                     timeoutMs: config.timeoutMs,
                     requestTimeoutMs: decisionModel.timeoutMs,
                     ...(derivedObservations ? { derivedEmitted } : {}),
+                    ...(crystals ? { crystalsEmitted } : {}),
+                    ...(brightness ? { brightnessRecipe: brightness.recipe } : {}),
                     ...(recipeHash ? { recipeHash } : {}),
                 });
                 if (signal.aborted && !derivedWaitAborted)

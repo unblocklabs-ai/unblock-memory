@@ -1,6 +1,6 @@
 import { Type, type Static } from "typebox";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
-import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawConfig, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { MemoryReadCursor, MemoryReadResult, MemoryRequestContext } from "./contracts.js";
 import { type DeepThoughtStore } from "./deep-thought-store.js";
@@ -157,6 +157,13 @@ export type DeepThoughtDeps = {
     audienceKey?: string | ((caller: DeepThoughtCaller) => string | undefined);
     /** Never serve cached answers (verified answers are still saved for later/offline use). */
     bypassCache?: boolean;
+    /**
+     * Never persist (or supersede) a `derived_observations` row: the caller saves the verified answer inside its own fenced
+     * transaction. Set by headless callers whose publication must be atomic with other writes.
+     */
+    skipSave?: boolean;
+    /** Attach the pre-run `collectionGenerations` snapshot to the outcome (headless callers). */
+    reportGenerations?: boolean;
 };
 /** Caller identity passed to an `audienceKey` resolver. */
 type DeepThoughtCaller = {
@@ -185,11 +192,34 @@ export type DeepThoughtOutcome = {
     cached?: boolean;
     /** Stored derived observation that served (or was saved from) this answer. */
     derivedObservationId?: string;
+    /**
+     * Headless runs only: the QMD collection generations captured BEFORE the investigation, so a background caller that
+     * persists the answer itself (`skipSave`) records exactly what it was derived from.
+     */
+    collectionGenerations?: Record<string, number>;
 };
 /** Current process-wide in-flight `deep_thought` investigations (diagnostics/tests). */
 export declare function activeDeepThoughts(): number;
 /** Abort and clear any background `deep_thought` jobs on Gateway stop (or test cleanup). */
 export declare function cancelAllDeepThoughtJobs(): void;
+/**
+ * Headless investigation for background callers (the Overnight Thinking Steward): no tool-call wrapper and no caller
+ * session. It always investigates fresh (`bypassCache`), waits for completion (no `jobId` hand-off), and saves a
+ * verified answer under exactly `audienceKey` + `corpora` — unless `skipSave`, in which case nothing is persisted or
+ * superseded and the caller saves the answer itself (with the returned `collectionGenerations` and
+ * `unverifiedCitationsDropped`) inside its own fenced commit. With no caller origin, `lookup_person` is never offered.
+ */
+export declare function runDeepThoughtInvestigation(deps: DeepThoughtDeps, request: {
+    cfg: OpenClawConfig;
+    agentId: string;
+    question: string;
+    audienceKey: string;
+    corpora?: readonly string[];
+    focus?: string;
+    /** Do not save or supersede any `derived_observations` row (the caller commits it atomically). */
+    skipSave?: boolean;
+    signal?: AbortSignal;
+}): Promise<DeepThoughtOutcome>;
 /** Tool factory: `api.registerTool((ctx) => createDeepThoughtTool(ctx, deps), { names: ["deep_thought"] })`. */
 export declare function createDeepThoughtTool(ctx: OpenClawPluginToolContext, deps: DeepThoughtDeps | undefined): {
     name: string;

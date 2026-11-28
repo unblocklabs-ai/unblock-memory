@@ -454,7 +454,8 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     }, "lateEvidenceRescanMs stays unset: the ledger's own two-day default applies");
     assert.deepEqual(steward.expectations, {
       enabled: true, intervalMinutes: 60, lookbackMinutes: 70, dueLeadMinutes: 60, sweepAfterMinutes: 1440, maxSessionsPerRun: 0,
-      maxCharsPerSession: 0, maxSweepItems: 0, timeoutMs: 0, excludeChatTypes: ["direct"], extract: true, sweep: true, blockerAutoExpireMinutes: 4320,
+      maxCharsPerSession: 0, maxSweepItems: 0, timeoutMs: 0, excludeChatTypes: ["direct"], workspaceSweepChatTypes: ["channel"],
+      extract: true, sweep: true, blockerAutoExpireMinutes: 4320,
       captainsLogDecisionResolve: true, captainsLogResolveChatTypes: ["workspace", "channel"],
       captainsLogResolveMinConfidence: 0.85, captainsLogResolveTimeoutMs: 15_000,
     });
@@ -485,6 +486,7 @@ test("steward is optional and enabled by default; host manifest and runtime reso
       expectations: {
         enabled: false, intervalMinutes: 30, lookbackMinutes: 40, dueLeadMinutes: 0, sweepAfterMinutes: 0, maxSessionsPerRun: 10,
         maxCharsPerSession: 4_000, maxSweepItems: 25, timeoutMs: 45_000, excludeChatTypes: ["direct" as const, "group" as const],
+        workspaceSweepChatTypes: ["channel" as const, "group" as const, "direct" as const],
         extract: false, sweep: false, blockerAutoExpireMinutes: 0,
         captainsLogDecisionResolve: false,
         captainsLogResolveChatTypes: ["workspace" as const, "channel" as const, "group" as const, "direct" as const],
@@ -519,6 +521,8 @@ test("steward is optional and enabled by default; host manifest and runtime reso
     { steward: { expectations: { timeoutMs: -1 } } },
     { steward: { expectations: { excludeChatTypes: ["dm"] } } },
     { steward: { expectations: { excludeChatTypes: "direct" } } },
+    { steward: { expectations: { workspaceSweepChatTypes: ["workspace"] } } },
+    { steward: { expectations: { workspaceSweepChatTypes: "channel" } } },
     { steward: { expectations: { extract: 1 } } },
     { steward: { expectations: { sweep: "yes" } } },
     { steward: { expectations: { captainsLogDecisionResolve: "true" } } },
@@ -618,5 +622,119 @@ test("memoryWhisperer derived-observation caps and thresholds are configurable t
     { derivedMinTokenOverlap: -0.1 }, { derivedMinSharedTokens: 0 }, { derivedMinSharedTokens: "2" }]) {
     assert.equal(validate({ memoryWhisperer: invalid }).ok, false, JSON.stringify(invalid));
     assert.throws(() => resolveConfig({ memoryWhisperer: invalid }), /derived/u, JSON.stringify(invalid));
+  }
+});
+
+test("memoryWhisperer.brightness is off by default; a one-line recipe flip stamps its own recipe hash unless one is set", async () => {
+  const validate = await manifestValidator("unblock-memory:test:memory-whisperer-brightness");
+  const defaults = resolveConfig({}).memoryWhisperer;
+  assert.deepEqual(defaults.brightness, { recipe: "off", weight: 0.08, decayRate: 0.5, lookbackDays: 90, maxBoost: 0.15 });
+  assert.equal(defaults.recipeHash, "default", "existing configs stay untouched");
+  assert.deepEqual([defaults.crystalsEnabled, defaults.crystalMaxHints, defaults.crystalMinTokenOverlap, defaults.crystalMinSharedTokens,
+    defaults.crystalLtmRankBoost], [true, 2, 0.35, 2, 0.01]);
+  const hostDefaults = validate({});
+  assert.equal(hostDefaults.ok, true);
+  assert.deepEqual(resolveConfig(hostDefaults.value).memoryWhisperer.brightness, defaults.brightness);
+
+  // The 6-vs-7 fleet A/B split: each arm is a single-key flip that also labels its exposures.
+  for (const recipe of ["actr_v1", "outcome_v1"] as const) {
+    const flip = { memoryWhisperer: { brightness: { recipe } } };
+    const hosted = validate(flip);
+    assert.equal(hosted.ok, true, JSON.stringify(hosted.errors));
+    const resolved = resolveConfig(hosted.value).memoryWhisperer;
+    assert.equal(resolved.brightness?.recipe, recipe);
+    assert.equal(resolved.brightness?.weight, 0.08);
+    assert.equal(resolved.recipeHash, `brightness:${recipe}`);
+  }
+  // An explicit operator label always wins, including over an active recipe.
+  assert.equal(resolveConfig({ memoryWhisperer: { recipeHash: " exp-42 ", brightness: { recipe: "outcome_v1" } } }).memoryWhisperer.recipeHash,
+    "exp-42");
+  assert.equal(resolveConfig({ memoryWhisperer: { brightness: { recipe: "off" } } }).memoryWhisperer.recipeHash, "default");
+  const tuned = { memoryWhisperer: { brightness: { recipe: "actr_v1", weight: 0, decayRate: 1.2, lookbackDays: 0, maxBoost: 0 },
+    crystalsEnabled: false, crystalMaxHints: 0, crystalMinTokenOverlap: 1, crystalMinSharedTokens: 5, crystalLtmRankBoost: 0 } };
+  assert.equal(validate(tuned).ok, true);
+  const resolved = resolveConfig(tuned).memoryWhisperer;
+  assert.deepEqual(resolved.brightness, tuned.memoryWhisperer.brightness, "weight 0 and lookbackDays 0 (= unlimited) are preserved");
+  assert.deepEqual([resolved.crystalsEnabled, resolved.crystalMaxHints, resolved.crystalMinTokenOverlap, resolved.crystalMinSharedTokens,
+    resolved.crystalLtmRankBoost], [false, 0, 1, 5, 0]);
+
+  for (const invalid of [
+    { brightness: { recipe: "actr_v2" } }, { brightness: { recipe: "" } }, { brightness: { extra: 1 } }, { brightness: [] },
+    { brightness: { weight: -0.1 } }, { brightness: { decayRate: 0 } }, { brightness: { decayRate: -1 } },
+    { brightness: { lookbackDays: -1 } }, { brightness: { lookbackDays: 1.5 } }, { brightness: { maxBoost: -1 } },
+    { crystalsEnabled: "yes" }, { crystalMaxHints: -1 }, { crystalMaxHints: 1.5 }, { crystalMinTokenOverlap: 1.1 },
+    { crystalMinSharedTokens: 0 }, { crystalLtmRankBoost: -0.01 },
+  ]) {
+    const config = { memoryWhisperer: invalid };
+    assert.equal(validate(config).ok, false, JSON.stringify(config));
+    assert.throws(() => resolveConfig(config), /memoryWhisperer\.(brightness|crystal)/u, JSON.stringify(config));
+  }
+});
+
+test("steward.crystals and steward.overnight are on by default; host manifest and runtime resolver agree on their shape", async () => {
+  const validate = await manifestValidator("unblock-memory:test:steward-pillar-1");
+  const host = validate({});
+  assert.equal(host.ok, true);
+  const steward = resolveConfig(host.value).steward;
+  assert.deepEqual(steward.crystals, {
+    enabled: true, intervalMinutes: 360, reclusterMinIntervalMinutes: 720, autoRecluster: true, minClusterSize: 3, maxClustersPerRun: 0,
+    maxMembersPerCluster: 12, stmStaleAfterMinutes: 20_160, ltmPromoteMinHelped: 3, ltmPromoteMinHits: 5,
+    allowedCorpora: ["memory", "knowledge"], timeoutMs: 0,
+  });
+  assert.deepEqual(steward.overnight, {
+    enabled: true, intervalMinutes: 720, voltaireEnabled: true, postmortemsEnabled: true, preAnswerEnabled: true, lookbackDays: 30,
+    minRecurrence: 2, lookaheadMinutes: 720, maxVoltairePerRun: 5, maxPostmortemsPerRun: 5, maxPreAnswersPerRun: 3,
+    minConfidence: "medium", recallChatTypes: ["channel", "group"], saveDerivedObservations: true, writeDailyLogNotes: true,
+    dailyLogChatTypes: ["workspace", "channel"], dailyLogCorpora: ["memory", "knowledge"], timeoutMs: 0,
+  });
+  const tuned = { steward: {
+    crystals: { enabled: false, intervalMinutes: 30, reclusterMinIntervalMinutes: 0, autoRecluster: false, minClusterSize: 1,
+      maxClustersPerRun: 4, maxMembersPerCluster: 0, stmStaleAfterMinutes: 0, ltmPromoteMinHelped: 0, ltmPromoteMinHits: 0,
+      allowedCorpora: ["memory", "knowledge", "sessions"], timeoutMs: 5000 },
+    overnight: { enabled: false, intervalMinutes: 60, quietHoursStartHour: 22, quietHoursEndHour: 6, voltaireEnabled: false,
+      postmortemsEnabled: false, preAnswerEnabled: false, lookbackDays: 0, minRecurrence: 1, lookaheadMinutes: 0, maxVoltairePerRun: 0,
+      maxPostmortemsPerRun: 0, maxPreAnswersPerRun: 0, minConfidence: "high", recallChatTypes: ["channel", "group", "direct"],
+      saveDerivedObservations: false, writeDailyLogNotes: false,
+      dailyLogChatTypes: ["workspace", "channel", "group", "direct"], dailyLogCorpora: ["memory", "knowledge", "sessions", "extracted"],
+      timeoutMs: 1 },
+  } };
+  const hosted = validate(tuned);
+  assert.equal(hosted.ok, true, JSON.stringify(hosted.errors));
+  const resolved = resolveConfig(hosted.value).steward;
+  assert.deepEqual(resolved.crystals, tuned.steward.crystals, "explicit 0 = unlimited/never values are preserved");
+  assert.deepEqual(resolved.overnight, tuned.steward.overnight);
+  for (const invalid of [
+    { steward: { crystals: { extra: true } } },
+    { steward: { crystals: { enabled: "true" } } },
+    { steward: { crystals: { intervalMinutes: 0 } } },
+    { steward: { crystals: { reclusterMinIntervalMinutes: -1 } } },
+    { steward: { crystals: { autoRecluster: 1 } } },
+    { steward: { crystals: { minClusterSize: 0 } } },
+    { steward: { crystals: { maxClustersPerRun: -1 } } },
+    { steward: { crystals: { stmStaleAfterMinutes: 1.5 } } },
+    { steward: { crystals: { allowedCorpora: "memory" } } },
+    { steward: { crystals: { allowedCorpora: [""] } } },
+    { steward: { crystals: { timeoutMs: -1 } } },
+    { steward: { overnight: { extra: true } } },
+    { steward: { overnight: { intervalMinutes: 0 } } },
+    { steward: { overnight: { quietHoursStartHour: 22 } } },
+    { steward: { overnight: { quietHoursEndHour: 6 } } },
+    { steward: { overnight: { quietHoursStartHour: 24, quietHoursEndHour: 6 } } },
+    { steward: { overnight: { quietHoursStartHour: 22, quietHoursEndHour: -1 } } },
+    { steward: { overnight: { voltaireEnabled: "no" } } },
+    { steward: { overnight: { minRecurrence: 0 } } },
+    { steward: { overnight: { lookaheadMinutes: -1 } } },
+    { steward: { overnight: { maxPreAnswersPerRun: 1.5 } } },
+    { steward: { overnight: { minConfidence: "certain" } } },
+    { steward: { overnight: { recallChatTypes: ["dm"] } } },
+    { steward: { overnight: { writeDailyLogNotes: "true" } } },
+    { steward: { overnight: { dailyLogChatTypes: ["dm"] } } },
+    { steward: { overnight: { dailyLogChatTypes: "channel" } } },
+    { steward: { overnight: { dailyLogCorpora: [""] } } },
+    { steward: { overnight: { dailyLogCorpora: "memory" } } },
+    { steward: { overnight: { timeoutMs: -1 } } },
+  ]) {
+    assert.equal(validate(invalid).ok, false, JSON.stringify(invalid));
+    assert.throws(() => resolveConfig(invalid), /steward/, JSON.stringify(invalid));
   }
 });

@@ -574,7 +574,7 @@ test("disabled runtime registers only the CLI", () => {
   const api = { registrationMode: "full", config: {}, logger: { warn() {} },
     on: (event: string) => events.push(event), registerCli: () => {} } as unknown as OpenClawPluginApi;
   const runtime = registerStewardRuntime(api, { config: resolveStewardConfig({ enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
-    outcomeLedger: { enabled: false }, expectations: { enabled: false } }),
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false } }),
     createRunner: () => undefined, openWorkStore: () => { throw new Error("unused"); } });
   assert.equal(runtime.enabled, false);
   assert.deepEqual(events, []);

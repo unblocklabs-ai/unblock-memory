@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { CorpusMemorySearchResult, CorpusSearchOptions } from "./contracts.js";
 import type { QueryConversation, QueryPair } from "./query-contract.js";
 import { selectJudgeConversation } from "./judge-context.js";
+import { DEFAULT_BRIGHTNESS_CONFIG, memorySubjectId, type BrightnessRecipe } from "./memory-brightness.js";
 import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "./decision-ranking.js";
 import { startTiming, retrievalParts, unaccounted, type RetrievalTimings } from "./retrieval-timing.js";
@@ -46,6 +47,41 @@ export type RecallCandidateTrace = {
   disposition: RecallHitDisposition | "passed";
   finalRank?: number;
 };
+
+type SearchBrightness = {
+  recipe: BrightnessRecipe;
+  weight?: number;
+  maxBoost?: number;
+  lookup?: (subjects: readonly string[]) => Map<string, { normalized: number; samples: number }> | undefined;
+};
+
+function rankHits<T>(entries: T[], hitOf: (entry: T) => CorpusMemorySearchResult, brightness?: SearchBrightness): T[] {
+  const baseline = (a: T, b: T) => hitOf(b).score - hitOf(a).score;
+  if (brightness?.lookup && brightness.recipe !== "off" && entries.length) {
+    const { lookup, weight = DEFAULT_BRIGHTNESS_CONFIG.weight, maxBoost = DEFAULT_BRIGHTNESS_CONFIG.maxBoost } = brightness;
+    if (weight > 0 && Number.isFinite(weight) && maxBoost >= 0) {
+      const subjects = entries.map(entry => {
+        const { corpus, path } = hitOf(entry);
+        return memorySubjectId(corpus, path);
+      });
+      let scores: Map<T, number> | undefined;
+      try {
+        const evidence = lookup([...new Set(subjects)]);
+        if (evidence?.size) {
+          scores = new Map(entries.map((entry, index) => {
+            const normalized = evidence.get(subjects[index]!)?.normalized ?? 0;
+            const boost = Number.isFinite(normalized) ? Math.max(-maxBoost, Math.min(maxBoost, weight * normalized)) : 0;
+            return [entry, hitOf(entry).score + boost];
+          }));
+        }
+      } catch {
+        // Brightness is optional; a failed lookup keeps the baseline ranking.
+      }
+      if (scores) return entries.sort((a, b) => scores.get(b)! - scores.get(a)! || baseline(a, b));
+    }
+  }
+  return entries.sort(baseline);
+}
 
 function isQueryList(queries: QueryPair | readonly QueryPair[]): queries is readonly QueryPair[] {
   return Array.isArray(queries);
@@ -169,15 +205,14 @@ function reserveTopicCandidates(
 }
 
 /**
- * Finalists after usefulness filtering: reserve the most useful qualifying passage of each topic first, then fill
- * by usefulness, so one topic's many strong hits cannot push another topic's qualifying hit out of the results.
+ * Reserve the highest-ranked qualifying passage of each topic first, then fill in ranked order, so one topic's
+ * many strong hits cannot push another topic's qualifying hit out of the results.
  */
 function reserveTopicFinalists<T extends { result: CorpusMemorySearchResult }>(
-  passed: readonly T[],
+  ranked: readonly T[],
   fusion: TopicFusion,
   limit: number,
 ): T[] {
-  const ranked = [...passed].sort((a, b) => b.result.score - a.result.score);
   const picked = new Set<T>();
   for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
     const best = ranked.find(entry => fusion.topicRanks.get(memoryPassageId(entry.result.snippet))?.[topic] !== undefined);
@@ -203,6 +238,8 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   /** Cap top retrieval-ranked candidates sent to the decision endpoint (after dedup and cooldown filtering). */
   maxJudgeCandidates?: number;
   minUsefulness?: number; excludedPassages?: ReadonlyMap<string, number>;
+  /** Adjust finalist order only, after usefulness gating. Returned scores remain unadjusted. */
+  brightness?: SearchBrightness;
   onCandidates?: (observation: MemorySearchObservation) => void;
   onJudgment?: (event: { candidateIndex: number; elapsedMs: number; error?: unknown }) => void;
   onTrace?: (candidates: RecallCandidateTrace[]) => void;
@@ -289,9 +326,8 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   observation.eligible = candidates.length;
   options.onCandidates?.(observation);
   const fallback = (reason: NonNullable<MemoryRanking["fallbackReason"]>) => {
-    // Stable retrieval-score ordering (fused RRF scores from discovery) before maxResults truncation.
-    // These retrieval scores are not decision model usefulness probabilities.
-    const ranked = [...candidates].sort((a, b) => b.score - a.score);
+    // Retrieval scores are not decision model usefulness probabilities.
+    const ranked = rankHits([...candidates], hit => hit, options.brightness);
     const limit = options.maxResults ?? 5;
     const results = ranked.slice(0, limit);
     if (trackTrace) {
@@ -371,11 +407,11 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   observation.judgeMs = timings.judgeMs ?? 0;
   if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
     return fallback("all_judgments_failed");
-  const qualifying = judged.filter(({ result }) => result.score >= minUsefulness);
+  const ranked = rankHits(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result, options.brightness);
   const maxResults = options.maxResults ?? 5;
   const passed = fusion
-    ? reserveTopicFinalists(qualifying, fusion, maxResults)
-    : qualifying.sort((a, b) => b.result.score - a.result.score).slice(0, maxResults);
+    ? reserveTopicFinalists(ranked, fusion, maxResults)
+    : ranked.slice(0, maxResults);
   if (trackTrace) {
     for (const [index, entry] of passed.entries()) {
       if (entry.trace) {

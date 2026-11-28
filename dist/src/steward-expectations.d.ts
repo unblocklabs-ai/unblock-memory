@@ -76,6 +76,12 @@ export type ExpectationsPassOptions = {
     timeoutMs?: number;
     /** Defaults to `["direct"]`. Opting DMs in keeps each DM in its own strict `direct:<provider>:<accountId>:<senderId>` audience. */
     excludeChatTypes?: readonly ChatType[];
+    /**
+     * Session chat types whose conversations count as evidence when sweeping `workspace`-audience expectations (default
+     * `["channel"]`, the safe multi-user choice; a 1:1 assistant can add `"group"` / `"direct"`; `[]` = none). Sessions
+     * must also be read at all, i.e. not listed in `excludeChatTypes`.
+     */
+    workspaceSweepChatTypes?: readonly ChatType[];
     /** Disable either model stage (both default on when a runner is present). */
     extract?: boolean;
     sweep?: boolean;

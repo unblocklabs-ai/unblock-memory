@@ -1,6 +1,7 @@
 import { resolveDecisionCredential } from "./decision-client.js";
 import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
+import { CRYSTALS_DEFAULTS } from "./steward-crystals.js";
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const searchRankings = ["retrieval", "decision"];
 const peopleModes = ["publish", "shadow"];
@@ -71,6 +72,7 @@ const DEFAULT_STEWARD_CONFIG = {
         maxSweepItems: 0,
         timeoutMs: 0,
         excludeChatTypes: ["direct"],
+        workspaceSweepChatTypes: ["channel"],
         extract: true,
         sweep: true,
         blockerAutoExpireMinutes: 4320,
@@ -78,6 +80,27 @@ const DEFAULT_STEWARD_CONFIG = {
         captainsLogResolveChatTypes: ["workspace", "channel"],
         captainsLogResolveMinConfidence: 0.85,
         captainsLogResolveTimeoutMs: 15_000,
+    },
+    crystals: { enabled: true, ...CRYSTALS_DEFAULTS, allowedCorpora: [...CRYSTALS_DEFAULTS.allowedCorpora] },
+    overnight: {
+        enabled: true,
+        intervalMinutes: 720,
+        voltaireEnabled: true,
+        postmortemsEnabled: true,
+        preAnswerEnabled: true,
+        lookbackDays: 30,
+        minRecurrence: 2,
+        lookaheadMinutes: 720,
+        maxVoltairePerRun: 5,
+        maxPostmortemsPerRun: 5,
+        maxPreAnswersPerRun: 3,
+        minConfidence: "medium",
+        recallChatTypes: ["channel", "group"],
+        saveDerivedObservations: true,
+        writeDailyLogNotes: true,
+        dailyLogChatTypes: ["workspace", "channel"],
+        dailyLogCorpora: ["memory", "knowledge"],
+        timeoutMs: 0,
     },
 };
 function section(value = {}, defaults, label, optional = []) {
@@ -135,6 +158,18 @@ function expectationChatTypeList(value, key) {
     }
     return out;
 }
+function corpusList(value, key) {
+    if (!Array.isArray(value) || !value.every(entry => typeof entry === "string" && entry.trim())) {
+        throw new Error(`steward.${key} must be an array of non-empty corpus names`);
+    }
+    return [...new Set(value.map(entry => entry.trim()))];
+}
+function hour(value, key) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 23) {
+        throw new Error(`steward.${key} must be an integer between 0 and 23`);
+    }
+    return value;
+}
 function text(value, key) {
     if (typeof value !== "string" || !value.trim())
         throw new Error(`steward.${key} must be a non-empty string`);
@@ -164,6 +199,14 @@ export function resolveStewardConfig(value) {
     const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
     const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger", ["lateEvidenceRescanMs"]);
     const e = section(c.expectations, defaults.expectations, "steward.expectations");
+    const cr = section(c.crystals, defaults.crystals, "steward.crystals");
+    const on = section(c.overnight, defaults.overnight, "steward.overnight", ["quietHoursStartHour", "quietHoursEndHour"]);
+    if ((on.quietHoursStartHour === undefined) !== (on.quietHoursEndHour === undefined)) {
+        throw new Error("steward.overnight.quietHoursStartHour and quietHoursEndHour must be set together");
+    }
+    const overnightConfidence = confidences.find(level => level === on.minConfidence);
+    if (!overnightConfidence)
+        throw new Error("Invalid steward.overnight.minConfidence");
     const reasoning = efforts.find(e => e === c.reasoning);
     if (!reasoning)
         throw new Error("Invalid steward.reasoning");
@@ -251,6 +294,7 @@ export function resolveStewardConfig(value) {
             maxSweepItems: integer(e.maxSweepItems, 0, "expectations.maxSweepItems"),
             timeoutMs: integer(e.timeoutMs, 0, "expectations.timeoutMs"),
             excludeChatTypes: chatTypeList(e.excludeChatTypes, "expectations.excludeChatTypes"),
+            workspaceSweepChatTypes: chatTypeList(e.workspaceSweepChatTypes, "expectations.workspaceSweepChatTypes"),
             extract: boolean(e.extract, "steward.expectations.extract"),
             sweep: boolean(e.sweep, "steward.expectations.sweep"),
             blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
@@ -258,6 +302,44 @@ export function resolveStewardConfig(value) {
             captainsLogResolveChatTypes: expectationChatTypeList(e.captainsLogResolveChatTypes, "expectations.captainsLogResolveChatTypes"),
             captainsLogResolveMinConfidence: unitInterval(e.captainsLogResolveMinConfidence, "expectations.captainsLogResolveMinConfidence"),
             captainsLogResolveTimeoutMs: integer(e.captainsLogResolveTimeoutMs, 0, "expectations.captainsLogResolveTimeoutMs"),
+        },
+        crystals: {
+            enabled: enabled(cr.enabled, "steward.crystals"),
+            intervalMinutes: integer(cr.intervalMinutes, 1, "crystals.intervalMinutes"),
+            reclusterMinIntervalMinutes: integer(cr.reclusterMinIntervalMinutes, 0, "crystals.reclusterMinIntervalMinutes"),
+            autoRecluster: boolean(cr.autoRecluster, "steward.crystals.autoRecluster"),
+            minClusterSize: integer(cr.minClusterSize, 1, "crystals.minClusterSize"),
+            maxClustersPerRun: integer(cr.maxClustersPerRun, 0, "crystals.maxClustersPerRun"),
+            maxMembersPerCluster: integer(cr.maxMembersPerCluster, 0, "crystals.maxMembersPerCluster"),
+            stmStaleAfterMinutes: integer(cr.stmStaleAfterMinutes, 0, "crystals.stmStaleAfterMinutes"),
+            ltmPromoteMinHelped: integer(cr.ltmPromoteMinHelped, 0, "crystals.ltmPromoteMinHelped"),
+            ltmPromoteMinHits: integer(cr.ltmPromoteMinHits, 0, "crystals.ltmPromoteMinHits"),
+            allowedCorpora: corpusList(cr.allowedCorpora, "crystals.allowedCorpora"),
+            timeoutMs: integer(cr.timeoutMs, 0, "crystals.timeoutMs"),
+        },
+        overnight: {
+            enabled: enabled(on.enabled, "steward.overnight"),
+            intervalMinutes: integer(on.intervalMinutes, 1, "overnight.intervalMinutes"),
+            ...(on.quietHoursStartHour === undefined ? {} : {
+                quietHoursStartHour: hour(on.quietHoursStartHour, "overnight.quietHoursStartHour"),
+                quietHoursEndHour: hour(on.quietHoursEndHour, "overnight.quietHoursEndHour"),
+            }),
+            voltaireEnabled: boolean(on.voltaireEnabled, "steward.overnight.voltaireEnabled"),
+            postmortemsEnabled: boolean(on.postmortemsEnabled, "steward.overnight.postmortemsEnabled"),
+            preAnswerEnabled: boolean(on.preAnswerEnabled, "steward.overnight.preAnswerEnabled"),
+            lookbackDays: integer(on.lookbackDays, 0, "overnight.lookbackDays"),
+            minRecurrence: integer(on.minRecurrence, 1, "overnight.minRecurrence"),
+            lookaheadMinutes: integer(on.lookaheadMinutes, 0, "overnight.lookaheadMinutes"),
+            maxVoltairePerRun: integer(on.maxVoltairePerRun, 0, "overnight.maxVoltairePerRun"),
+            maxPostmortemsPerRun: integer(on.maxPostmortemsPerRun, 0, "overnight.maxPostmortemsPerRun"),
+            maxPreAnswersPerRun: integer(on.maxPreAnswersPerRun, 0, "overnight.maxPreAnswersPerRun"),
+            minConfidence: overnightConfidence,
+            recallChatTypes: chatTypeList(on.recallChatTypes, "overnight.recallChatTypes"),
+            saveDerivedObservations: boolean(on.saveDerivedObservations, "steward.overnight.saveDerivedObservations"),
+            writeDailyLogNotes: boolean(on.writeDailyLogNotes, "steward.overnight.writeDailyLogNotes"),
+            dailyLogChatTypes: expectationChatTypeList(on.dailyLogChatTypes, "overnight.dailyLogChatTypes"),
+            dailyLogCorpora: corpusList(on.dailyLogCorpora, "overnight.dailyLogCorpora"),
+            timeoutMs: integer(on.timeoutMs, 0, "overnight.timeoutMs"),
         },
     };
 }

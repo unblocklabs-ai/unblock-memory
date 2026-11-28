@@ -11,7 +11,8 @@ import type {
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { deepThoughtAudienceKey, DeepThoughtStore } from "../src/deep-thought-store.js";
-import { runOutcomeLedgerPass } from "../src/outcome-ledger.js";
+import { MemoryCrystalsStore } from "../src/memory-crystals.js";
+import { OutcomeLedgerStore, runOutcomeLedgerPass } from "../src/outcome-ledger.js";
 import { registerUnblockMemory, resolveFlushPlan } from "../src/plugin.js";
 import type { QmdMemoryRuntime } from "../src/runtime.js";
 import { runExpectationsPass } from "../src/steward-expectations.js";
@@ -517,7 +518,11 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
   assert.equal(metadata.hooks.length, 0, "cli-metadata never starts background work");
   const shadowHooks = register({ steward: { enabled: true, peopleShadow: { enabled: true } } }).hooks;
   const quietHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
-    outcomeLedger: { enabled: false }, expectations: { enabled: false } } }).hooks;
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false } } }).hooks;
+  const crystalsOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, overnight: { enabled: false } } }).hooks;
+  const overnightOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
+    outcomeLedger: { enabled: false }, expectations: { enabled: false }, crystals: { enabled: false } } }).hooks;
   const ledgerOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
     expectations: { enabled: false } } }).hooks;
   const expectationsOnlyHooks = register({ steward: { enabled: true, peopleShadow: { enabled: false }, captainsLog: { enabled: false },
@@ -526,6 +531,10 @@ test("steward: memory-steward CLI always registers; deep_thought and the shadow 
     "the default-on Outcome Ledger alone still starts the background Steward loop");
   assert.equal(expectationsOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
     "the default-on Expectations pass alone still starts the background Steward loop (no runner needed)");
+  assert.equal(crystalsOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
+    "the default-on Crystals pass alone still starts the background Steward loop");
+  assert.equal(overnightOnlyHooks.filter(name => name === "gateway_start").length, shadowHooks.filter(name => name === "gateway_start").length,
+    "the default-on Overnight pass alone still starts the background Steward loop");
   assert.equal(shadowHooks.filter(name => name === "gateway_start").length, quietHooks.filter(name => name === "gateway_start").length + 1,
     "the background Steward loop adds exactly one gateway_start hook");
 });
@@ -788,6 +797,8 @@ test("integration: recipeHash stamped on memory_search and skill exposures flows
   try {
     assert.deepEqual(db.prepare("SELECT source, recipe_hash FROM recall_queries").all().map(row => ({ ...row })),
       [{ source: "tool", recipe_hash: "mem-b" }]);
+    assert.equal(db.prepare("SELECT chat_type FROM recall_queries WHERE source='tool'").get()?.chat_type, "direct",
+      "toolOrigin infers the untyped main DM session agent:<id>:main as direct");
     assert.deepEqual(db.prepare("SELECT recipe_hash FROM skill_routing_events").all().map(row => row.recipe_hash), ["skill-b"]);
   } finally { db.close(); }
 
@@ -799,4 +810,178 @@ test("integration: recipeHash stamped on memory_search and skill exposures flows
   const outcomes = await plugin.cli("outcomes", "--agent", "bill");
   assert.deepEqual(Object.keys(outcomes.byRecipe as object).sort(), ["mem-b", "skill-b"]);
   assert.equal((await plugin.cli("outcomes", "--agent", "bill", "--recipe", "skill-b")).totalOutcomes, 1);
+});
+
+/* ───────────── Pillar 1 integration: Brightness A/B recipes and Memory Crystals ───────────── */
+
+type JudgeBody = { state?: [{ candidates: [{ excerpt: string }] }] };
+/** Decision endpoint stand-in: each candidate's usefulness by excerpt. */
+function judgeByExcerpt(t: TestContext, usefulness: (excerpt: string) => number) {
+  return t.mock.method(globalThis, "fetch", async (...[, init]: Parameters<typeof fetch>) => {
+    const excerpt = (JSON.parse(String(init?.body)) as JudgeBody).state?.[0].candidates[0].excerpt ?? "";
+    return Response.json({ model: "liquid/d1.2-ultra-20261116", answers: { memory_0: { type: "noul", noul: usefulness(excerpt) } } });
+  });
+}
+const memoryEntries = (result: { appendContext: string } | undefined) => {
+  const payload = result?.appendContext.match(/^<unblock_memory>\n<memory>\n([^]*)\n<\/memory>\n<\/unblock_memory>$/u)?.[1];
+  assert.ok(payload, result?.appendContext);
+  return JSON.parse(payload) as Record<string, unknown>[];
+};
+
+test("integration: brightness outcome_v1 re-orders live Memory Whisperer finalists and stamps brightness:outcome_v1 on recall_queries", async t => {
+  judgeByExcerpt(t, excerpt => excerpt.startsWith("Alpha") ? 0.92 : 0.9);
+  const plugin = await integrationPlugin(t, {
+    corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }],
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
+    recallLedger: { enabled: true },
+    // One-line A/B arm flip: no recipeHash set, so the recipe labels its own exposures.
+    memoryWhisperer: { enabled: true, corpora: ["memory"], mode: "legacy", api: { endpoint: "" }, brightness: { recipe: "outcome_v1" } },
+    expectationsWhisperer: { enabled: false },
+  });
+  const alpha = "qmd://memory/alpha.md", beta = "qmd://memory/beta.md";
+  Object.defineProperty(plugin.runtime, "getMemorySearchManager", {
+    value: async () => ({ manager: {
+      async searchCandidates() {
+        return [
+          { path: alpha, startLine: 1, endLine: 2, score: 0.5, snippet: "Alpha: the release train leaves Tuesday", source: "memory",
+            corpus: "memory", citation: "memory/alpha.md#L1-L2" },
+          { path: beta, startLine: 1, endLine: 2, score: 0.4, snippet: "Beta: the release train moved to Thursday", source: "memory",
+            corpus: "memory", citation: "memory/beta.md#L1-L2" },
+        ];
+      },
+    } }),
+  });
+  // Outcome Ledger evidence: Beta helped recent turns, Alpha hurt one.
+  const store = new WorkStore(plugin.dbPath);
+  try {
+    const ledger = new OutcomeLedgerStore(store.db);
+    const insert = ledger.db.prepare(`INSERT INTO memory_outcomes
+      (id,agent_id,subject_kind,subject_id,verdict,confidence,evidence_turn_id,signals_json,measured_at)
+      VALUES (?,'bill','memory_hit',?,?,1,'turn','{}',?)`);
+    insert.run("o-1", beta, "helped", Date.now() - 3_600_000);
+    insert.run("o-2", beta, "helped", Date.now() - 7_200_000);
+    insert.run("o-3", alpha, "hurt", Date.now() - 3_600_000);
+  } finally { store.close(); }
+
+  const result = await plugin.prompt({ prompt: "When does the release train leave?", messages: [] }, channelTurn("bright-1"));
+  assert.deepEqual(memoryEntries(result).map(entry => entry.source), [beta, alpha],
+    "Beta (usefulness 0.90, helped) now outranks Alpha (usefulness 0.92, hurt)");
+  await plugin.stop(); // Flushes the recall-ledger writer.
+
+  const db = new DatabaseSync(plugin.dbPath, { readOnly: true });
+  try {
+    assert.deepEqual(db.prepare("SELECT source, recipe_hash, outcome FROM recall_queries").all().map(row => ({ ...row })),
+      [{ source: "whisperer", recipe_hash: "brightness:outcome_v1", outcome: "emitted" }]);
+    assert.deepEqual(db.prepare("SELECT source_path, final_rank FROM recall_hits WHERE disposition='emitted' ORDER BY final_rank").all()
+      .map(row => ({ ...row })), [{ source_path: beta, final_rank: 1 }, { source_path: alpha, final_rank: 2 }]);
+  } finally { db.close(); }
+});
+
+test("integration: an active crystal is whispered on a matching turn, counts its hit, and never crosses corpora or audiences", async t => {
+  const fetch = judgeByExcerpt(t, () => 0.95);
+  const plugin = await integrationPlugin(t, {
+    corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "knowledge", kind: "files", paths: ["KNOWLEDGE.md"] }],
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
+    memoryWhisperer: { enabled: true, corpora: ["memory"], mode: "legacy", api: { endpoint: "" }, crystalMaxHints: 0 },
+    expectationsWhisperer: { enabled: false },
+  });
+  Object.defineProperty(plugin.runtime, "getMemorySearchManager", {
+    value: async () => ({ manager: { async searchCandidates() { return []; } } }),
+  });
+  const channelAudience = deepThoughtAudienceKey({ agentId: "bill", sessionKey: CHANNEL_SESSION, provider: "slack", accountId: "workspace" })!;
+  const otherAudience = deepThoughtAudienceKey({ agentId: "bill", sessionKey: "agent:bill:slack:channel:c0other", provider: "slack",
+    accountId: "workspace" })!;
+  const crystals = new MemoryCrystalsStore(plugin.dbPath);
+  const member = (path: string, corpus = "memory") => ({ corpus, sourcePath: path, docHash: `doc-${path}`, chunkPos: 0, chunkLen: 40,
+    quoteSha256: "a".repeat(64) });
+  const put = (id: string, audienceKey: string, corpora: string[], extra: { tier?: "stm" | "ltm"; title?: string; summary?: string } = {}) =>
+    crystals.upsertCrystal({ id, agentId: "bill", audienceKey, corpora, inputDigest: `digest-${id}`, tier: extra.tier ?? "stm",
+      title: extra.title ?? "Acme launch checklist owner",
+      summary: extra.summary ?? "Mira owns the Acme launch checklist and signs off QA before launch.",
+      members: corpora.map(corpus => member(`qmd://${corpus}/launch.md`, corpus)) });
+  try {
+    put("c-workspace", "workspace", ["memory"], { tier: "ltm" });
+    put("c-channel", channelAudience, ["memory"], { title: "Acme launch checklist in this channel" });
+    put("c-knowledge", "workspace", ["memory", "knowledge"]); // draws on a corpus this whisperer may not read
+    put("c-other-channel", otherAudience, ["memory"]); // another channel's audience
+    put("c-retired", "workspace", ["memory"]);
+    crystals.retireCrystal("c-retired", "bill");
+    put("c-unrelated", "workspace", ["memory"], { title: "Office plants watering rota", summary: "Ferns are watered every Monday." });
+  } finally { crystals.close(); }
+  const hits = () => {
+    const db = new DatabaseSync(plugin.dbPath, { readOnly: true });
+    try {
+      return Object.fromEntries(db.prepare("SELECT id, hit_count FROM memory_crystals ORDER BY id").all().map(row => [row.id, row.hit_count]));
+    } finally { db.close(); }
+  };
+  const settleHits = () => new Promise(resolve => setImmediate(resolve));
+  const turn = { prompt: "Who owns the Acme launch checklist?", messages: [] };
+
+  const result = await plugin.prompt(turn, channelTurn("crystal-1"));
+  const entries = memoryEntries(result);
+  assert.deepEqual(entries.map(entry => entry.source), ["memory_crystal:c-workspace", "memory_crystal:c-channel"],
+    "only this channel's and workspace crystals over allowed corpora, LTM first");
+  assert.deepEqual(entries[0], { source: "memory_crystal:c-workspace", tier: "ltm", title: "Acme launch checklist owner",
+    summary: "Mira owns the Acme launch checklist and signs off QA before launch.", revision: 1 });
+  await settleHits();
+  assert.deepEqual(hits(), { "c-channel": 1, "c-knowledge": 0, "c-other-channel": 0, "c-retired": 0, "c-unrelated": 0, "c-workspace": 1 });
+
+  // Per-session cooldown: the same session does not see the same crystals again right away.
+  assert.equal(await plugin.prompt(turn, channelTurn("crystal-2")), undefined);
+  // A DM sees only the shared workspace crystal, never the channel's.
+  const dm = await plugin.prompt(turn, { trigger: "user", agentId: "bill", sessionKey: "agent:bill:slack:direct:u-bob", sessionId: "s-dm",
+    runId: "crystal-dm", messageProvider: "slack", accountId: "workspace", senderId: "U-bob" });
+  assert.deepEqual(memoryEntries(dm).map(entry => entry.source), ["memory_crystal:c-workspace"]);
+  await settleHits();
+  assert.equal(hits()["c-workspace"], 2);
+  assert.equal(hits()["c-channel"], 1);
+  assert.equal(fetch.mock.callCount(), 0, "crystal matching is local: zero model calls");
+});
+
+test("integration: published \"extracted\" in memoryWhisperer.corpora whispers extracted facts, derived observations and crystals grounded in it", async t => {
+  judgeByExcerpt(t, () => 0.95);
+  const plugin = await integrationPlugin(t, {
+    corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "sessions", kind: "sessions", chatTypes: ["channel"] }],
+    extraction: { enabled: true, publish: true, chatTypes: ["channel"] },
+    decisionModel: { apiKey: "fake-secret", timeoutMs: 1000 },
+    memoryWhisperer: { enabled: true, corpora: ["memory", "extracted"], mode: "legacy", api: { endpoint: "" } },
+    expectationsWhisperer: { enabled: false },
+  });
+  const searched: (readonly string[] | undefined)[] = [];
+  const generationCalls: (readonly string[])[] = [];
+  Object.defineProperty(plugin.runtime, "getMemorySearchManager", {
+    value: async () => ({ manager: {
+      async searchCandidates(_queries: unknown, options: { corpora?: readonly string[] }) {
+        searched.push(options.corpora);
+        return [{ path: "qmd://unblock-extracted/facts/acme.md", startLine: 1, endLine: 1, score: 0.4,
+          snippet: "Extracted fact: Mira signs off the Acme launch checklist.", source: "memory", corpus: "extracted",
+          citation: "extracted/facts/acme.md#L1-L1" }];
+      },
+      async getCollectionGenerations(corpora: readonly string[]) {
+        generationCalls.push(corpora);
+        return { "unblock-extracted": 5 };
+      },
+    } }),
+  });
+  const toolIdentity = { agentId: "bill", sessionKey: CHANNEL_SESSION, provider: "slack", accountId: "workspace", senderId: "U-alice" };
+  const store = new DeepThoughtStore(plugin.dbPath);
+  const saved = store.saveDerivedObservation({ agentId: "bill", question: "Who owns the Acme launch checklist?",
+    audienceKey: deepThoughtAudienceKey(toolIdentity)!, corpora: ["extracted"], collectionGenerations: { "unblock-extracted": 5 },
+    answer: "Mira owns the Acme launch checklist.", confidence: "high",
+    citations: [{ source: "qmd://unblock-extracted/facts/acme.md", quote: "Mira" }] });
+  store.close();
+  const crystals = new MemoryCrystalsStore(plugin.dbPath);
+  try {
+    crystals.upsertCrystal({ id: "c-extracted", agentId: "bill", audienceKey: "workspace", corpora: ["extracted"], inputDigest: "d-x",
+      tier: "stm", title: "Acme launch checklist owner", summary: "Mira owns the Acme launch checklist and signs off QA.",
+      members: [{ corpus: "extracted", sourcePath: "qmd://unblock-extracted/facts/acme.md", docHash: "doc-x", chunkPos: 0, chunkLen: 40,
+        quoteSha256: "a".repeat(64) }] });
+  } finally { crystals.close(); }
+
+  const entries = memoryEntries(await plugin.prompt({ prompt: "Who owns the Acme launch checklist?", messages: [] }, channelTurn("x-1")));
+  assert.deepEqual(entries.map(entry => entry.source), [
+    `derived_observation:${saved.id}`, "memory_crystal:c-extracted", "qmd://unblock-extracted/facts/acme.md",
+  ], "a synthesis, a crystal and a raw fact all grounded in the published extracted corpus");
+  assert.ok(searched.length > 0 && searched.every(corpora => corpora?.includes("extracted")), JSON.stringify(searched));
+  assert.ok(generationCalls.some(corpora => corpora.includes("extracted")), "derived freshness is checked against extracted generations");
 });

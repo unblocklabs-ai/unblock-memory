@@ -118,6 +118,11 @@ type StewardExpectationsConfig = {
     excludeChatTypes: ChatType[];
     /** Model-backed extraction of commitments/predictions/blockers/decision outcomes from sessions. */
     extract: boolean;
+    /**
+     * Session chat types whose conversations are evidence for sweeping `workspace` expectations (default `["channel"]`;
+     * a 1:1 assistant can add `"group"` / `"direct"`; `[]` = none).
+     */
+    workspaceSweepChatTypes: ChatType[];
     /** Model-backed due/resolution sweep of open expectations. */
     sweep: boolean;
     /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
@@ -134,6 +139,72 @@ type StewardExpectationsConfig = {
     /** d1.2 request timeout in ms (`0` = no plugin-side limit; the decisions SDK still caps a request at 60 s). */
     captainsLogResolveTimeoutMs: number;
 };
+/** Memory Crystals: cluster → STM crystal synthesis, STM→LTM promotion and STM decay (`steward-crystals.ts`). */
+type StewardCrystalsConfig = {
+    enabled: boolean;
+    intervalMinutes: number;
+    /** Minimum minutes between automatic reclusters (only with `analysis.executable`). */
+    reclusterMinIntervalMinutes: number;
+    /** Recluster stale/missing analysis before synthesis (only with `analysis.executable`). */
+    autoRecluster: boolean;
+    minClusterSize: number;
+    /** Synthesis model calls per pass (`0` = unlimited); unchanged, private or ineligible clusters never count. */
+    maxClustersPerRun: number;
+    /** Evidence members sent per cluster (`0` = the analysis page limit). */
+    maxMembersPerCluster: number;
+    /** STM crystals retire after this many minutes without re-verification (`0` = never). */
+    stmStaleAfterMinutes: number;
+    /** Promote STM → LTM after this many `helped` outcomes on member sources. */
+    ltmPromoteMinHelped: number;
+    /** ... or after this many whispered hits. */
+    ltmPromoteMinHits: number;
+    /**
+     * Corpora crystals may draw evidence from — the ONLY source of truth (default `["memory","knowledge"]`; list
+     * `"sessions"` to opt session transcripts in, e.g. on a 1:1 personal-assistant node). Unresolved native ids never pass.
+     */
+    allowedCorpora: string[];
+    /** Per model call timeout in ms (`0` = unlimited). */
+    timeoutMs: number;
+};
+/** Overnight Thinking: Voltaire Drift, Shortfall Post-Mortems and Anticipatory Pre-Answering (`steward-overnight.ts`). */
+type StewardOvernightConfig = {
+    enabled: boolean;
+    intervalMinutes: number;
+    /** Both set → run only inside `[start, end)` local hours (wraps midnight). Both unset → normal schedule. */
+    quietHoursStartHour?: number;
+    quietHoursEndHour?: number;
+    voltaireEnabled: boolean;
+    postmortemsEnabled: boolean;
+    preAnswerEnabled: boolean;
+    /** Recall history window (`0` = unlimited). */
+    lookbackDays: number;
+    minRecurrence: number;
+    /** Pre-answer window (`0` = every weekday/hour slot). */
+    lookaheadMinutes: number;
+    /** Per-run caps (`0` = unlimited). */
+    maxVoltairePerRun: number;
+    maxPostmortemsPerRun: number;
+    maxPreAnswersPerRun: number;
+    /** Lowest diff confidence that records a shift. */
+    minConfidence: typeof confidences[number];
+    /** `recall_queries.chat_type` values mined for recurring questions. */
+    recallChatTypes: ChatType[];
+    saveDerivedObservations: boolean;
+    /** Append ❔/✅ Voltaire notes to `<workspace>/memory/YYYY-MM-DD.md` (filtered by `dailyLogChatTypes` + `dailyLogCorpora`). */
+    writeDailyLogNotes: boolean;
+    /**
+     * Audience kinds whose Voltaire shifts may reach the daily log or an audience-less `core_memories` anchor
+     * (default: `["workspace", "channel"]`; add `"group"` / `"direct"` to opt in).
+     */
+    dailyLogChatTypes: ExpectationChatType[];
+    /**
+     * Corpora a shift must draw ALL of its evidence from to reach the daily log or an audience-less `core_memories` anchor
+     * (default: `["memory", "knowledge"]`; add `"sessions"` / `"extracted"` to opt in).
+     */
+    dailyLogCorpora: string[];
+    /** Per model call and per investigation timeout in ms (`0` = unlimited). */
+    timeoutMs: number;
+};
 export type StewardConfig = {
     enabled: boolean;
     model: string;
@@ -147,6 +218,8 @@ export type StewardConfig = {
     captainsLog: StewardCaptainsLogConfig;
     outcomeLedger: StewardOutcomeLedgerConfig;
     expectations: StewardExpectationsConfig;
+    crystals: StewardCrystalsConfig;
+    overnight: StewardOvernightConfig;
 };
 export declare function resolveStewardConfig(value: unknown): StewardConfig;
 /** Bind the runner's resolveApiKey callback to its destination. Never inherit another origin's key. */

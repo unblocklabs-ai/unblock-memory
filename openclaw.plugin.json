@@ -1,7 +1,7 @@
 {
   "id": "unblock-memory",
   "name": "Unblock Memory",
-  "version": "0.20.2",
+  "version": "0.21.0",
   "description": "Indexes, retrieves, and analyzes configured workspace memory with existing QMD vectors.",
   "kind": "memory",
   "activation": {
@@ -847,7 +847,8 @@
               "type": "string",
               "pattern": "\\S"
             },
-            "default": []
+            "default": [],
+            "description": "Explicit known non-skill corpus names (required when enabled). \"extracted\" is allowed only when extraction.enabled and extraction.publish are both true."
           },
           "minUsefulness": {
             "type": "number",
@@ -897,6 +898,77 @@
             "minimum": 1,
             "default": 2,
             "description": "Minimum shared meaningful tokens for a non-exact derived-observation question match."
+          },
+          "brightness": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Brightness A/B recipe: after usefulness gating, re-orders finalists by recall evidence (actr_v1: decayed recall reads and emitted hits) or outcome evidence (outcome_v1: helped/hurt/ignored outcomes, core memories, surprising expectations). Read-only lookup; missing evidence is neutral. A non-off recipe stamps brightness:<recipe> on memory_whisperer recall_queries unless memoryWhisperer.recipeHash is set.",
+            "properties": {
+              "recipe": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "actr_v1",
+                  "outcome_v1"
+                ],
+                "default": "off",
+                "description": "off (default) skips the lookup entirely."
+              },
+              "weight": {
+                "type": "number",
+                "minimum": 0,
+                "default": 0.08,
+                "description": "Score added per unit of normalized brightness (-1..1). 0 disables re-ordering."
+              },
+              "decayRate": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "default": 0.5,
+                "description": "actr_v1 power-law decay exponent per hour."
+              },
+              "lookbackDays": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 90,
+                "description": "Evidence window in days. 0 = unlimited."
+              },
+              "maxBoost": {
+                "type": "number",
+                "minimum": 0,
+                "default": 0.15,
+                "description": "Absolute cap on the brightness adjustment."
+              }
+            }
+          },
+          "crystalsEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whisper active Memory Crystals whose title and summary match the turn, in the same <memory> block after verified syntheses and before raw chunks. Local and deterministic (no model call); only workspace or same-audience crystals whose every corpus is in memoryWhisperer.corpora qualify."
+          },
+          "crystalMaxHints": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 2,
+            "description": "Crystals whispered per turn. 0 = unlimited."
+          },
+          "crystalMinTokenOverlap": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.35,
+            "description": "Minimum overlap coefficient between the turn and a crystal's title + summary tokens."
+          },
+          "crystalMinSharedTokens": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 2,
+            "description": "Minimum shared meaningful tokens for a crystal match."
+          },
+          "crystalLtmRankBoost": {
+            "type": "number",
+            "minimum": 0,
+            "default": 0.01,
+            "description": "Additive rank boost for long-term (ltm) crystals."
           }
         },
         "default": {
@@ -1583,6 +1655,19 @@
                   ]
                 }
               },
+              "workspaceSweepChatTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "channel",
+                    "group",
+                    "direct"
+                  ]
+                },
+                "uniqueItems": true,
+                "description": "Session chat types whose conversations are evidence for sweeping workspace-audience expectations. Default [\"channel\"]; a 1:1 assistant can add \"group\" or \"direct\" (sessions must not be in excludeChatTypes); [] = none."
+              },
               "extract": {
                 "type": "boolean"
               },
@@ -1623,6 +1708,205 @@
                 "minimum": 0,
                 "description": "Post-Captain's-Log d1.2 request timeout in ms. Default 15000; 0 = no plugin-side limit (the decisions SDK still caps one request at 60 s)."
               }
+            }
+          },
+          "crystals": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Memory Crystals pass: synthesizes workspace-audience STM crystals from QMD analysis clusters (Steward model), promotes STM to LTM on helped outcomes or whispered hits, and retires stale STM. Decay and promotion run without a model. Reclustering requires analysis.executable. Enabled by default.",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "intervalMinutes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Default 360."
+              },
+              "reclusterMinIntervalMinutes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Minimum minutes between automatic reclusters. Default 720."
+              },
+              "autoRecluster": {
+                "type": "boolean",
+                "description": "Recluster missing or stale analysis before synthesis (only when analysis.executable is configured). Default true."
+              },
+              "minClusterSize": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Default 3."
+              },
+              "maxClustersPerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Synthesis model calls per pass; unchanged, private or ineligible clusters never count. Default 0 = unlimited."
+              },
+              "maxMembersPerCluster": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Evidence members per synthesis. Default 12; 0 = the analysis page limit."
+              },
+              "stmStaleAfterMinutes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "STM crystals retire after this many minutes without re-verification. Default 20160 (14 days); 0 = never."
+              },
+              "ltmPromoteMinHelped": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Promote to LTM after this many helped outcomes on member sources. Default 3."
+              },
+              "ltmPromoteMinHits": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "...or after this many whispered hits. Default 5."
+              },
+              "allowedCorpora": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "\\S"
+                },
+                "uniqueItems": true,
+                "description": "Corpora crystals may cite; the only source of truth (nothing else is hardcoded). Default [\"memory\", \"knowledge\"] excludes sessions; add \"sessions\" to opt session transcripts in (e.g. on a 1:1 personal-assistant node). Unresolved native source ids are never eligible."
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Per model call; 0 = unlimited."
+              }
+            }
+          },
+          "overnight": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Overnight Thinking pass: Voltaire Drift (re-investigate moved or recurring questions with a fresh deep_thought and record truth shifts), Shortfall Post-Mortems (diagnose hurt outcomes) and Anticipatory Pre-Answering (verify recurring questions before their usual hour). Needs the Steward model; Voltaire and pre-answering also need steward.deepThought. Enabled by default.",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "intervalMinutes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Default 720."
+              },
+              "quietHoursStartHour": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 23,
+                "description": "With quietHoursEndHour: run only inside [start, end) local hours (wraps midnight, e.g. 22 to 6). Unset = normal schedule."
+              },
+              "quietHoursEndHour": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 23
+              },
+              "voltaireEnabled": {
+                "type": "boolean"
+              },
+              "postmortemsEnabled": {
+                "type": "boolean"
+              },
+              "preAnswerEnabled": {
+                "type": "boolean"
+              },
+              "lookbackDays": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Recall history window. Default 30; 0 = unlimited."
+              },
+              "minRecurrence": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Minimum repeats (or distinct days for a rhythm). Default 2."
+              },
+              "lookaheadMinutes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Pre-answer window. Default 720; 0 = every weekday/hour slot."
+              },
+              "maxVoltairePerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Default 5; 0 = unlimited."
+              },
+              "maxPostmortemsPerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Default 5; 0 = unlimited."
+              },
+              "maxPreAnswersPerRun": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Default 3; 0 = unlimited."
+              },
+              "minConfidence": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ],
+                "description": "Lowest diff confidence that records a shift. Default medium."
+              },
+              "recallChatTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "channel",
+                    "group",
+                    "direct"
+                  ]
+                },
+                "uniqueItems": true,
+                "description": "recall_queries chat types mined for recurring questions. Default [\"channel\", \"group\"]."
+              },
+              "saveDerivedObservations": {
+                "type": "boolean",
+                "description": "Persist complete investigations as derived observations for instant whispers. Default true."
+              },
+              "writeDailyLogNotes": {
+                "type": "boolean",
+                "description": "Append a ❔ was / ✅ now note to <workspace>/memory/YYYY-MM-DD.md for shifts allowed by dailyLogChatTypes and dailyLogCorpora. Default true."
+              },
+              "dailyLogChatTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "workspace",
+                    "channel",
+                    "group",
+                    "direct"
+                  ]
+                },
+                "uniqueItems": true,
+                "description": "Audience kinds whose Voltaire shifts may reach the daily log or an audience-less core_memories anchor. Default [\"workspace\", \"channel\"]; add \"group\" or \"direct\" to opt in."
+              },
+              "dailyLogCorpora": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "\\S"
+                },
+                "uniqueItems": true,
+                "description": "Corpora a Voltaire shift must draw all of its evidence from to reach the daily log or an audience-less core_memories anchor. Default [\"memory\", \"knowledge\"]; add \"sessions\" or \"extracted\" to opt in."
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Per model call and per investigation; 0 = unlimited."
+              }
+            },
+            "dependentRequired": {
+              "quietHoursStartHour": [
+                "quietHoursEndHour"
+              ],
+              "quietHoursEndHour": [
+                "quietHoursStartHour"
+              ]
             }
           }
         },

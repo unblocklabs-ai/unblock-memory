@@ -285,6 +285,10 @@ export class QmdMemoryManager {
     #curation;
     #cleanupRemovedDocuments;
     #operationChain;
+    /** Serializes reclusters with each other only; the worker process itself never holds `#operationChain`. */
+    #reclusterInFlight;
+    /** Bumped whenever analysis input may have changed, so a recluster that overlapped a sync is marked stale. */
+    #analysisInputEpoch = 0;
     #inFlight = new Set();
     #closePromise;
     #watcher;
@@ -544,7 +548,7 @@ export class QmdMemoryManager {
                 }
                 const prunedDocuments = pruneStaleCollections(store, staleCollections);
                 if (prunedDocuments > 0 && prunedAnalysisInput)
-                    markMemoryAnalysisStale(store.internal.db);
+                    this.#markAnalysisStale(store.internal.db);
             }
             await ensureSemanticChunking(store);
             this.#assertOpen();
@@ -634,13 +638,13 @@ export class QmdMemoryManager {
             const update = await store.update({ collections: [...(collections ?? this.#indexCollections)] });
             changedDocuments = update.updated + update.removed;
             if ((update.indexed + changedDocuments > 0 || update.needsEmbedding > 0 || force) && analysisStore.internal) {
-                markMemoryAnalysisStale(analysisStore.internal.db);
+                this.#markAnalysisStale(analysisStore.internal.db);
             }
         }
         catch (error) {
             // QMD may commit earlier collections before a later collection fails.
             if (analysisStore.internal)
-                markMemoryAnalysisStale(analysisStore.internal.db);
+                this.#markAnalysisStale(analysisStore.internal.db);
             changedDocuments = Math.max(1, changedDocuments);
             throw error;
         }
@@ -655,7 +659,7 @@ export class QmdMemoryManager {
             const count = completedEmbeddingCount(embed);
             chunksEmbedded += count;
             if (count > 0 && analysisStore.internal)
-                markMemoryAnalysisStale(analysisStore.internal.db);
+                this.#markAnalysisStale(analysisStore.internal.db);
         }
         return chunksEmbedded;
     }
@@ -733,7 +737,7 @@ export class QmdMemoryManager {
         let superseded = false;
         const changed = (count) => {
             if (count > 0 && analysis.internal)
-                markMemoryAnalysisStale(analysis.internal.db);
+                this.#markAnalysisStale(analysis.internal.db);
             return count;
         };
         // Securely purge retracted or superseded (rewritten, redacted) transcript plaintext and vectors once per batch.
@@ -781,32 +785,63 @@ export class QmdMemoryManager {
             ready: async () => (await store.getStatus()).needsEmbedding === 0,
         };
     }
+    /** Trusted corpus name behind a native QMD collection id (`source-…`); skills and unknown ids are `undefined`. */
+    corpusForCollection(collection) {
+        if (collection === EXTRACTED_COLLECTION)
+            return this.#publishedExtraction ? "extracted" : undefined;
+        const source = this.#sources.get(collection);
+        return source && source.kind !== "skills" ? source.corpus : undefined;
+    }
+    /**
+     * Runs the external HDBSCAN worker OUTSIDE `#operationChain`: only the short preflight and the result read are
+     * queued, so foreground `memory_search` / Memory Whisperer turns never wait behind a minutes-long child process.
+     * Concurrent reclusters still run one at a time (`#reclusterInFlight`), and `close()` waits for a running worker.
+     * Input that changed while the worker ran (a sync marked analysis stale) leaves the new run marked stale too.
+     */
     recluster(options, signal) {
-        return this.#enqueue(async () => {
-            if (!this.#analysisExecutable) {
-                throw new Error("Memory analysis is unavailable: configure analysis.executable with an absolute worker path");
-            }
-            signal?.throwIfAborted();
-            const store = await this.#getAnalysisStore();
-            const status = await store.getStatus();
-            if (status.needsEmbedding > 0) {
-                throw new Error(`Memory analysis requires an up-to-date QMD vector index: ${status.needsEmbedding} chunks need embedding. ` +
-                    "Run memory sync and retry memory_recluster after embedding finishes.");
-            }
-            const previousRunId = latestAnalysisRunId(store.internal.db);
+        if (this.#closed)
+            return Promise.reject(new Error(MANAGER_CLOSED_ERROR));
+        const run = () => this.#runFenced(async () => {
+            const prepared = await this.#enqueue(async () => {
+                if (!this.#analysisExecutable) {
+                    throw new Error("Memory analysis is unavailable: configure analysis.executable with an absolute worker path");
+                }
+                signal?.throwIfAborted();
+                const store = await this.#getAnalysisStore();
+                const status = await store.getStatus();
+                if (status.needsEmbedding > 0) {
+                    throw new Error(`Memory analysis requires an up-to-date QMD vector index: ${status.needsEmbedding} chunks need embedding. ` +
+                        "Run memory sync and retry memory_recluster after embedding finishes.");
+                }
+                return {
+                    executable: this.#analysisExecutable,
+                    previousRunId: latestAnalysisRunId(store.internal.db),
+                    epoch: this.#analysisInputEpoch,
+                };
+            });
             await this.#analysisRunner({
-                executable: this.#analysisExecutable,
+                executable: prepared.executable,
                 dbPath: this.#dbPath,
                 collections: this.#indexCollections,
                 options,
                 signal,
             });
-            const summary = readAnalysisSummary(store.internal.db);
-            if (!summary || summary.runId === previousRunId || summary.stale) {
-                throw new Error("Memory analysis worker did not produce a new complete analysis run");
-            }
-            return summary;
+            return this.#enqueue(async () => {
+                const db = (await this.#getAnalysisStore()).internal.db;
+                const summary = readAnalysisSummary(db);
+                if (!summary || summary.runId === prepared.previousRunId || summary.stale) {
+                    throw new Error("Memory analysis worker did not produce a new complete analysis run");
+                }
+                if (this.#analysisInputEpoch === prepared.epoch)
+                    return summary;
+                // The index moved under the worker: keep the run, but never present it as current.
+                markMemoryAnalysisStale(db);
+                return readAnalysisSummary(db) ?? summary;
+            });
         });
+        const result = (this.#reclusterInFlight ?? Promise.resolve()).then(run, run);
+        this.#reclusterInFlight = result.then(() => undefined, () => undefined);
+        return result;
     }
     listClusters(limit) {
         return this.#enqueue(async () => readClusters((await this.#getAnalysisStore()).internal.db, limit));
@@ -1009,6 +1044,10 @@ export class QmdMemoryManager {
         if (!("internal" in store))
             throw new Error("Memory analysis requires the QMD SQLite store");
         return store;
+    }
+    #markAnalysisStale(db) {
+        this.#analysisInputEpoch += 1;
+        markMemoryAnalysisStale(db);
     }
     #enqueue(run) {
         if (this.#closed)

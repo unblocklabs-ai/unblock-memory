@@ -93,8 +93,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
                 "2": number;
                 "3": number;
             };
-            confidence: number;
             score: number;
+            confidence: number;
         };
         deliverableFit: {
             type: "score";
@@ -104,8 +104,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
                 "2": number;
                 "3": number;
             };
-            confidence: number;
             score: number;
+            confidence: number;
         };
         consistency: {
             type: "choice";
@@ -174,8 +174,8 @@ export declare function assessResponseStages(store: ResponseAuditStore, cohort: 
                 "2": number;
                 "3": number;
             };
-            confidence: number;
             score: number;
+            confidence: number;
         };
     }>;
 }>;

@@ -1,11 +1,41 @@
 import { createHash } from "node:crypto";
 import { selectJudgeConversation } from "./judge-context.js";
+import { DEFAULT_BRIGHTNESS_CONFIG, memorySubjectId } from "./memory-brightness.js";
 import { MEMORY_PASSAGE_CHARS, duplicateMemoryPassage } from "./memory-passage.js";
 import { judgeMemoryPassage, memoryUsefulnessRequest } from "./decision-ranking.js";
 import { startTiming, retrievalParts, unaccounted } from "./retrieval-timing.js";
 import { parseDailyFilenameDateMs } from "./recall-ledger.js";
 export function memoryPassageId(text) {
     return createHash("sha256").update(text.replace(/\s+/gu, " ").trim()).digest("hex");
+}
+function rankHits(entries, hitOf, brightness) {
+    const baseline = (a, b) => hitOf(b).score - hitOf(a).score;
+    if (brightness?.lookup && brightness.recipe !== "off" && entries.length) {
+        const { lookup, weight = DEFAULT_BRIGHTNESS_CONFIG.weight, maxBoost = DEFAULT_BRIGHTNESS_CONFIG.maxBoost } = brightness;
+        if (weight > 0 && Number.isFinite(weight) && maxBoost >= 0) {
+            const subjects = entries.map(entry => {
+                const { corpus, path } = hitOf(entry);
+                return memorySubjectId(corpus, path);
+            });
+            let scores;
+            try {
+                const evidence = lookup([...new Set(subjects)]);
+                if (evidence?.size) {
+                    scores = new Map(entries.map((entry, index) => {
+                        const normalized = evidence.get(subjects[index])?.normalized ?? 0;
+                        const boost = Number.isFinite(normalized) ? Math.max(-maxBoost, Math.min(maxBoost, weight * normalized)) : 0;
+                        return [entry, hitOf(entry).score + boost];
+                    }));
+                }
+            }
+            catch {
+                // Brightness is optional; a failed lookup keeps the baseline ranking.
+            }
+            if (scores)
+                return entries.sort((a, b) => scores.get(b) - scores.get(a) || baseline(a, b));
+        }
+    }
+    return entries.sort(baseline);
 }
 function isQueryList(queries) {
     return Array.isArray(queries);
@@ -117,11 +147,10 @@ function reserveTopicCandidates(candidates, fusion, limit) {
     return ranked.filter(candidate => picked.has(candidate));
 }
 /**
- * Finalists after usefulness filtering: reserve the most useful qualifying passage of each topic first, then fill
- * by usefulness, so one topic's many strong hits cannot push another topic's qualifying hit out of the results.
+ * Reserve the highest-ranked qualifying passage of each topic first, then fill in ranked order, so one topic's
+ * many strong hits cannot push another topic's qualifying hit out of the results.
  */
-function reserveTopicFinalists(passed, fusion, limit) {
-    const ranked = [...passed].sort((a, b) => b.result.score - a.result.score);
+function reserveTopicFinalists(ranked, fusion, limit) {
     const picked = new Set();
     for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
         const best = ranked.find(entry => fusion.topicRanks.get(memoryPassageId(entry.result.snippet))?.[topic] !== undefined);
@@ -234,9 +263,8 @@ export async function searchMemory(manager, queries, options) {
     observation.eligible = candidates.length;
     options.onCandidates?.(observation);
     const fallback = (reason) => {
-        // Stable retrieval-score ordering (fused RRF scores from discovery) before maxResults truncation.
-        // These retrieval scores are not decision model usefulness probabilities.
-        const ranked = [...candidates].sort((a, b) => b.score - a.score);
+        // Retrieval scores are not decision model usefulness probabilities.
+        const ranked = rankHits([...candidates], hit => hit, options.brightness);
         const limit = options.maxResults ?? 5;
         const results = ranked.slice(0, limit);
         if (trackTrace) {
@@ -323,11 +351,11 @@ export async function searchMemory(manager, queries, options) {
     observation.judgeMs = timings.judgeMs ?? 0;
     if (options.allowRetrievalFallback && judgePool.length && !observation.requestsSucceeded)
         return fallback("all_judgments_failed");
-    const qualifying = judged.filter(({ result }) => result.score >= minUsefulness);
+    const ranked = rankHits(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result, options.brightness);
     const maxResults = options.maxResults ?? 5;
     const passed = fusion
-        ? reserveTopicFinalists(qualifying, fusion, maxResults)
-        : qualifying.sort((a, b) => b.result.score - a.result.score).slice(0, maxResults);
+        ? reserveTopicFinalists(ranked, fusion, maxResults)
+        : ranked.slice(0, maxResults);
     if (trackTrace) {
         for (const [index, entry] of passed.entries()) {
             if (entry.trace) {

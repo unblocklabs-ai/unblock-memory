@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
-import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawConfig, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { MemoryReadCursor, MemoryReadResult, MemoryRequestContext } from "./contracts.js";
 import { resolveDecisionCredential } from "./decision-client.js";
@@ -186,6 +186,13 @@ export type DeepThoughtDeps = {
   audienceKey?: string | ((caller: DeepThoughtCaller) => string | undefined);
   /** Never serve cached answers (verified answers are still saved for later/offline use). */
   bypassCache?: boolean;
+  /**
+   * Never persist (or supersede) a `derived_observations` row: the caller saves the verified answer inside its own fenced
+   * transaction. Set by headless callers whose publication must be atomic with other writes.
+   */
+  skipSave?: boolean;
+  /** Attach the pre-run `collectionGenerations` snapshot to the outcome (headless callers). */
+  reportGenerations?: boolean;
 };
 
 /** Caller identity passed to an `audienceKey` resolver. */
@@ -213,6 +220,11 @@ export type DeepThoughtOutcome = {
   cached?: boolean;
   /** Stored derived observation that served (or was saved from) this answer. */
   derivedObservationId?: string;
+  /**
+   * Headless runs only: the QMD collection generations captured BEFORE the investigation, so a background caller that
+   * persists the answer itself (`skipSave`) records exactly what it was derived from.
+   */
+  collectionGenerations?: Record<string, number>;
 };
 
 /* ───────────────────────────── Concurrency & Job Registry ───────────────────────────── */
@@ -911,7 +923,10 @@ async function runDeepThought(
     const citationsVerified = finalOutcome.citations.length > 0 && !finalOutcome.unverifiedCitationsDropped;
     const snapshot = generations ?? await generationsReady;
     const saveKey = keyFor(snapshot);
-    if (store && saveKey && snapshot && finalOutcome.status === "complete" && nonBlank(finalOutcome.answer) &&
+    if (deps.reportGenerations && snapshot && Object.keys(snapshot).length) {
+      finalOutcome = { ...finalOutcome, collectionGenerations: { ...snapshot } };
+    }
+    if (!deps.skipSave && store && saveKey && snapshot && finalOutcome.status === "complete" && nonBlank(finalOutcome.answer) &&
         finalOutcome.confidence && citationsVerified && !usedPeopleLookup) {
       const saved = safely(() => store.saveDerivedObservation({
         ...saveKey, collectionGenerations: snapshot, answer: finalOutcome.answer!, confidence: finalOutcome.confidence!,
@@ -940,6 +955,42 @@ async function runDeepThought(
     return syncOutcome;
   }
   return waited.outcome;
+}
+
+/**
+ * Headless investigation for background callers (the Overnight Thinking Steward): no tool-call wrapper and no caller
+ * session. It always investigates fresh (`bypassCache`), waits for completion (no `jobId` hand-off), and saves a
+ * verified answer under exactly `audienceKey` + `corpora` — unless `skipSave`, in which case nothing is persisted or
+ * superseded and the caller saves the answer itself (with the returned `collectionGenerations` and
+ * `unverifiedCitationsDropped`) inside its own fenced commit. With no caller origin, `lookup_person` is never offered.
+ */
+export async function runDeepThoughtInvestigation(deps: DeepThoughtDeps, request: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  question: string;
+  audienceKey: string;
+  corpora?: readonly string[];
+  focus?: string;
+  /** Do not save or supersede any `derived_observations` row (the caller commits it atomically). */
+  skipSave?: boolean;
+  signal?: AbortSignal;
+}): Promise<DeepThoughtOutcome> {
+  const audienceKey = nonBlank(request.audienceKey);
+  const question = nonBlank(request.question);
+  if (!audienceKey || !question) {
+    return { status: "invalid_request", citations: [], openQuestions: [], hopsUsed: 0, toolCallsUsed: 0, elapsedMs: 0,
+      error: "A headless investigation needs a question and an audienceKey" };
+  }
+  const active: ActiveContext = { cfg: request.cfg, agentId: request.agentId, requestContext: {} };
+  const params: DeepThoughtParams = {
+    question, fresh: true,
+    ...(request.corpora?.length ? { corpora: [...request.corpora] } : {}),
+    ...(nonBlank(request.focus) ? { focus: request.focus!.trim() } : {}),
+  };
+  return runDeepThought(active, params, {
+    ...deps, audienceKey, bypassCache: true, reportGenerations: true, ...(request.skipSave ? { skipSave: true } : {}),
+    config: { ...deps.config, syncWaitMs: 0 },
+  }, request.signal);
 }
 
 /** Tool factory: `api.registerTool((ctx) => createDeepThoughtTool(ctx, deps), { names: ["deep_thought"] })`. */

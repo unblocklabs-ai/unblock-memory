@@ -5,6 +5,7 @@ import { type MemoryCandidateManager } from "./memory-search.js";
 import type { RecallLedgerWriter } from "./recall-ledger.js";
 import type { WhispererPrompt } from "./whisperer-prompt.js";
 import { type DeepThoughtAudienceIdentity } from "./deep-thought-store.js";
+import { type BrightnessConfig } from "./memory-brightness.js";
 /** Optional: whisper fresh, generation-verified `deep_thought` syntheses (`derived_observations`) matching the turn. */
 type DerivedObservationWhisperOptions = {
     /** The agent's memory database holding `derived_observations` (opened read-only; missing = nothing to whisper). */
@@ -28,8 +29,33 @@ type DerivedObservationWhisperOptions = {
     /** Turns a whispered synthesis stays suppressed in a session (default `memoryWhisperer.cooldownTurns`). */
     cooldownTurns?: number;
 };
+/** Optional: whisper active, ACL-matched Memory Crystals (`memory_crystals`) whose title + summary match the turn. */
+type CrystalWhisperOptions = {
+    /** The agent's memory database holding `memory_crystals` (opened read-only; missing = nothing to whisper). */
+    dbPathForAgent: (agentId: string) => string;
+    /**
+     * Caller audience in addition to the always-visible `workspace` audience. Default: `deepThoughtAudienceKey` over the
+     * hook context (the same key derived observations use). A blank result limits the turn to `workspace` crystals.
+     */
+    audienceKey?: (ctx: DeepThoughtAudienceIdentity) => string | undefined;
+    /** Crystals whispered per turn (default 2; `0` = unlimited). */
+    maxHints?: number;
+    minTokenOverlap?: number;
+    minSharedTokens?: number;
+    ltmRankBoost?: number;
+    /** Payload budget for the crystal entries (default `memoryWhisperer.maxInjectedChars`; `0` = unlimited). */
+    maxPayloadChars?: number;
+    /** Count emitted crystals (STM→LTM promotion evidence). Default: a best-effort write to the existing database. */
+    recordHits?: (agentId: string, ids: readonly string[]) => void;
+};
+/** Optional: re-order usefulness-qualified finalists by Brightness evidence (never on the `off` recipe). */
+type BrightnessWhisperOptions = BrightnessConfig & {
+    dbPathForAgent: (agentId: string) => string;
+};
 export type MemoryWhispererOptions = {
     derivedObservations?: DerivedObservationWhisperOptions;
+    crystals?: CrystalWhisperOptions;
+    brightness?: BrightnessWhisperOptions;
     /** Active retrieval recipe fingerprint; forwarded on recall-ledger query records and the completed log line. */
     recipeHash?: string;
 };

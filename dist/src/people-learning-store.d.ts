@@ -92,7 +92,7 @@ export declare class PeopleLearningStore {
                 reviewedAt: string;
                 sourceRefs: string[];
                 assertionId: string;
-                disposition: "unresolved" | "revalidated" | "corrected" | "retired";
+                disposition: "retired" | "unresolved" | "revalidated" | "corrected";
             }[];
             sourceGapReviews: {
                 status: "resolved" | "unresolved";
@@ -134,7 +134,7 @@ export declare class PeopleLearningStore {
                 reviewedAt: string;
                 sourceRefs: string[];
                 assertionId: string;
-                disposition: "unresolved" | "revalidated" | "corrected" | "retired";
+                disposition: "retired" | "unresolved" | "revalidated" | "corrected";
             }[];
             sourceGapReviews: {
                 status: "resolved" | "unresolved";

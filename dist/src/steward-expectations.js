@@ -440,11 +440,13 @@ export async function runExpectationsPass(options) {
                 return release("failed", data.failed);
             extracted.push(...captureExtraction(data, bucket, audienceKey));
         }
-        // 3. Due & resolution sweep: each item sees only its own audience's evidence (workspace items: channel
-        //    conversations, never groups or DMs), recorded since it opened or was last swept — not just this pass's cursor.
+        // 3. Due & resolution sweep: each item sees only its own audience's evidence (workspace items: conversations of a
+        //    `workspaceSweepChatTypes` chat type, default channels only), recorded since it opened or was last swept.
         const resolutions = [];
         const swept = { ...watermark.sweptAtMs };
         let sweepCalls = 0;
+        const workspaceSweepChatTypes = new Set(options.workspaceSweepChatTypes ?? ["channel"]);
+        const workspaceEvidence = (session) => workspaceSweepChatTypes.has(session.chatType);
         if (sweepOn) {
             // A conversation with unseen messages this pass sweeps its own open items now, not after `sweepAfterMinutes`;
             // quiet audiences add nothing. Workspace items are closed after each Captain's Log append instead.
@@ -454,7 +456,7 @@ export async function runExpectationsPass(options) {
             const since = (item) => Math.max(item.createdAtMs, swept[item.id] ?? 0);
             const earliest = (items) => items.reduce((min, item) => Math.min(min, since(item)), startedAt);
             const evidence = due.length ? readExcerpts(options, databasePath, earliest(due), startedAt, {}, 0, signal).excerpts : [];
-            const ownEvidence = (item) => evidence.some(session => (item.audienceKey === WORKSPACE_AUDIENCE ? session.chatType === "channel" : session.audienceKey === item.audienceKey) &&
+            const ownEvidence = (item) => evidence.some(session => (item.audienceKey === WORKSPACE_AUDIENCE ? workspaceEvidence(session) : session.audienceKey === item.audienceKey) &&
                 session.messages.some(message => message.atMs >= since(item)));
             // Items with no new evidence were checked: their next read starts here instead of re-scanning their history.
             // The `maxSweepItems` cap applies only to items that have something to judge (and unjudged ones keep their mark).
@@ -472,7 +474,7 @@ export async function runExpectationsPass(options) {
             for (const [audienceKey, items] of grouped) {
                 const from = earliest(items);
                 const bucket = evidence
-                    .filter(session => audienceKey === WORKSPACE_AUDIENCE ? session.chatType === "channel" : session.audienceKey === audienceKey)
+                    .filter(session => audienceKey === WORKSPACE_AUDIENCE ? workspaceEvidence(session) : session.audienceKey === audienceKey)
                     .flatMap(session => {
                     const messages = session.messages.filter(message => message.atMs >= from);
                     return messages.length ? [{ ...session, messages }] : [];

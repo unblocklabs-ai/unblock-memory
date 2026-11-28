@@ -14,6 +14,12 @@ import { resolveRecallLedger, type RecallLedgerConfig } from "./recall-ledger.js
 import { resolveStewardConfig, type StewardConfig } from "./steward-config.js";
 import { EXPECTATIONS_WHISPERER_DEFAULTS, type ExpectationsWhispererConfig } from "./expectations-whisperer.js";
 import { DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS, DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP } from "./deep-thought-store.js";
+import {
+  BRIGHTNESS_RECIPES, brightnessRecipeHash, DEFAULT_BRIGHTNESS_CONFIG, type BrightnessConfig, type BrightnessRecipe,
+} from "./memory-brightness.js";
+import {
+  DEFAULT_CRYSTAL_LTM_RANK_BOOST, DEFAULT_CRYSTAL_MATCH_MIN_SHARED_TOKENS, DEFAULT_CRYSTAL_MATCH_MIN_TOKEN_OVERLAP,
+} from "./memory-crystals.js";
 
 const DEFAULT_PATHS = ["MEMORY.md", "USER.md", "memory/*.md", "memory/!(dreaming)/**/*.md"] as const;
 const DEFAULT_SESSION_MAX_EXPANDED_TOKENS = 500;
@@ -121,6 +127,21 @@ export type UnblockMemoryConfig = {
     derivedMinTokenOverlap?: number;
     /** Minimum shared meaningful tokens for a non-exact question match. Resolved default: `2`. */
     derivedMinSharedTokens?: number;
+    /**
+     * Brightness A/B recipe: re-orders usefulness-qualified finalists by recall/outcome evidence. Resolved default:
+     * `recipe: "off"` (no lookup). A non-`off` recipe also stamps `brightness:<recipe>` as `recipeHash` unless one is set.
+     */
+    brightness?: BrightnessConfig;
+    /** Whisper active Memory Crystals (`memory_crystals`) matching the turn. Resolved default: `true`. */
+    crystalsEnabled?: boolean;
+    /** Crystals whispered per turn. Resolved default: `2`; `0` = unlimited. */
+    crystalMaxHints?: number;
+    /** Minimum overlap coefficient (0..1) between the turn and a crystal's title + summary. Resolved default: `0.35`. */
+    crystalMinTokenOverlap?: number;
+    /** Minimum shared meaningful tokens for a crystal match. Resolved default: `2`. */
+    crystalMinSharedTokens?: number;
+    /** Additive rank boost for long-term (`ltm`) crystals. Resolved default: `0.01`. */
+    crystalLtmRankBoost?: number;
   };
   safetyWhisperer: SafetyWhispererConfig;
   /** On by default: open commitments, blockers and todos from the `expectations` table (read-only, zero model cost). */
@@ -229,7 +250,36 @@ const DEFAULT_MEMORY_WHISPERER: UnblockMemoryConfig["memoryWhisperer"] = {
   recipeHash: DEFAULT_RECIPE_HASH, derivedObservations: true,
   derivedMaxHints: 2, derivedMinTokenOverlap: DEFAULT_DERIVED_MATCH_MIN_TOKEN_OVERLAP,
   derivedMinSharedTokens: DEFAULT_DERIVED_MATCH_MIN_SHARED_TOKENS,
+  brightness: { ...DEFAULT_BRIGHTNESS_CONFIG },
+  crystalsEnabled: true, crystalMaxHints: 2, crystalMinTokenOverlap: DEFAULT_CRYSTAL_MATCH_MIN_TOKEN_OVERLAP,
+  crystalMinSharedTokens: DEFAULT_CRYSTAL_MATCH_MIN_SHARED_TOKENS, crystalLtmRankBoost: DEFAULT_CRYSTAL_LTM_RANK_BOOST,
 };
+
+function resolveBrightness(value: unknown): BrightnessConfig {
+  if (value === undefined) return { ...DEFAULT_BRIGHTNESS_CONFIG };
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("unblock-memory memoryWhisperer.brightness must be an object");
+  const config = value as Record<string, unknown>;
+  assertOnlyKeys(config, Object.keys(DEFAULT_BRIGHTNESS_CONFIG), "memoryWhisperer.brightness");
+  const recipe = config.recipe ?? DEFAULT_BRIGHTNESS_CONFIG.recipe;
+  if (typeof recipe !== "string" || !BRIGHTNESS_RECIPES.includes(recipe as BrightnessRecipe)) {
+    throw new Error(`unblock-memory memoryWhisperer.brightness.recipe must be one of ${BRIGHTNESS_RECIPES.join(", ")}`);
+  }
+  const number = (key: "weight" | "decayRate" | "maxBoost", positive: boolean) => {
+    const resolved = config[key] ?? DEFAULT_BRIGHTNESS_CONFIG[key];
+    if (typeof resolved !== "number" || !Number.isFinite(resolved) || (positive ? resolved <= 0 : resolved < 0)) {
+      throw new Error(`unblock-memory memoryWhisperer.brightness.${key} must be a ${positive ? "positive" : "non-negative"} number`);
+    }
+    return resolved;
+  };
+  const lookbackDays = config.lookbackDays ?? DEFAULT_BRIGHTNESS_CONFIG.lookbackDays;
+  if (typeof lookbackDays !== "number" || !Number.isSafeInteger(lookbackDays) || lookbackDays < 0) {
+    throw new Error("unblock-memory memoryWhisperer.brightness.lookbackDays must be a non-negative integer (0 = unlimited)");
+  }
+  return {
+    recipe: recipe as BrightnessRecipe, weight: number("weight", false), decayRate: number("decayRate", true), lookbackDays,
+    maxBoost: number("maxBoost", false),
+  };
+}
 
 function resolveQueryApi(value: unknown): UnblockMemoryConfig["memoryWhisperer"]["api"] {
   if (value === undefined) value = {};
@@ -252,8 +302,11 @@ function resolveQueryApi(value: unknown): UnblockMemoryConfig["memoryWhisperer"]
   return { endpoint: url?.href.replace(/\/$/u, "") ?? "", ...(apiKeyFile ? { apiKeyFile } : {}) };
 }
 
-function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]): UnblockMemoryConfig["memoryWhisperer"] {
-  if (value === undefined) return { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined) };
+function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[],
+  extraction: Pick<ExtractionConfig, "enabled" | "publish">): UnblockMemoryConfig["memoryWhisperer"] {
+  if (value === undefined) {
+    return { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined), brightness: resolveBrightness(undefined) };
+  }
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("unblock-memory memoryWhisperer must be an object");
   }
@@ -274,9 +327,15 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   const complementaryHints = config.complementaryHints ?? false;
   if (typeof complementaryHints !== "boolean") throw new Error("memoryWhisperer.complementaryHints must be a boolean");
   const selected = config.corpora ?? [];
-  if (!Array.isArray(selected) || !selected.every((name): name is string =>
-    typeof name === "string" && corpora.some(corpus => corpus.name === name && corpus.kind !== "skills"))) {
-    throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora");
+  // Published extracted facts are searchable exactly like `runtime.searchableCorpora()` exposes them.
+  const extractedPublished = extraction.enabled && extraction.publish;
+  if (Array.isArray(selected) && selected.includes("extracted") && !extractedPublished &&
+      !corpora.some(corpus => corpus.name === "extracted")) {
+    throw new Error('unblock-memory memoryWhisperer.corpora may list "extracted" only when extraction.enabled and extraction.publish are both true');
+  }
+  if (!Array.isArray(selected) || !selected.every((name): name is string => typeof name === "string" &&
+    ((name === "extracted" && extractedPublished) || corpora.some(corpus => corpus.name === name && corpus.kind !== "skills")))) {
+    throw new Error("unblock-memory memoryWhisperer.corpora must list configured non-skill corpora (or published \"extracted\")");
   }
   if (enabled && !selected.length) throw new Error("unblock-memory enabled memoryWhisperer requires explicit corpora");
   const cooldownTurns = config.cooldownTurns ?? DEFAULT_MEMORY_WHISPERER.cooldownTurns;
@@ -301,6 +360,26 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
   if (typeof derivedMinSharedTokens !== "number" || !Number.isSafeInteger(derivedMinSharedTokens) || derivedMinSharedTokens < 1) {
     throw new Error("unblock-memory memoryWhisperer.derivedMinSharedTokens must be a positive integer");
   }
+  const brightness = resolveBrightness(config.brightness);
+  const crystalsEnabled = config.crystalsEnabled ?? DEFAULT_MEMORY_WHISPERER.crystalsEnabled;
+  if (typeof crystalsEnabled !== "boolean") throw new Error("unblock-memory memoryWhisperer.crystalsEnabled must be a boolean");
+  const crystalMaxHints = config.crystalMaxHints ?? DEFAULT_MEMORY_WHISPERER.crystalMaxHints;
+  if (typeof crystalMaxHints !== "number" || !Number.isSafeInteger(crystalMaxHints) || crystalMaxHints < 0) {
+    throw new Error("unblock-memory memoryWhisperer.crystalMaxHints must be a non-negative integer (0 = unlimited)");
+  }
+  const crystalMinTokenOverlap = config.crystalMinTokenOverlap ?? DEFAULT_MEMORY_WHISPERER.crystalMinTokenOverlap;
+  if (typeof crystalMinTokenOverlap !== "number" || !Number.isFinite(crystalMinTokenOverlap) || crystalMinTokenOverlap < 0 ||
+      crystalMinTokenOverlap > 1) {
+    throw new Error("unblock-memory memoryWhisperer.crystalMinTokenOverlap must be between 0 and 1");
+  }
+  const crystalMinSharedTokens = config.crystalMinSharedTokens ?? DEFAULT_MEMORY_WHISPERER.crystalMinSharedTokens;
+  if (typeof crystalMinSharedTokens !== "number" || !Number.isSafeInteger(crystalMinSharedTokens) || crystalMinSharedTokens < 1) {
+    throw new Error("unblock-memory memoryWhisperer.crystalMinSharedTokens must be a positive integer");
+  }
+  const crystalLtmRankBoost = config.crystalLtmRankBoost ?? DEFAULT_MEMORY_WHISPERER.crystalLtmRankBoost;
+  if (typeof crystalLtmRankBoost !== "number" || !Number.isFinite(crystalLtmRankBoost) || crystalLtmRankBoost < 0) {
+    throw new Error("unblock-memory memoryWhisperer.crystalLtmRankBoost must be a non-negative number");
+  }
   const mode = config.mode ?? DEFAULT_MEMORY_WHISPERER.mode;
   if (typeof mode !== "string" || !MEMORY_WHISPERER_MODES.includes(mode as MemoryWhispererMode)) {
     throw new Error('unblock-memory memoryWhisperer.mode must be "v2" or "legacy"');
@@ -311,8 +390,11 @@ function resolveMemoryWhisperer(value: unknown, corpora: readonly CorpusConfig[]
     maxHints: positiveInteger(config.maxHints, DEFAULT_MEMORY_WHISPERER.maxHints, "memoryWhisperer.maxHints", 3),
     timeoutMs: positiveInteger(config.timeoutMs, DEFAULT_MEMORY_WHISPERER.timeoutMs, "memoryWhisperer.timeoutMs", 10_000),
     api: resolveQueryApi(config.api),
-    recipeHash: recipeHash(config.recipeHash, "memoryWhisperer"),
+    // A/B lab: an active brightness recipe labels its own exposures unless the operator chose a label.
+    recipeHash: config.recipeHash === undefined && brightness.recipe !== "off"
+      ? brightnessRecipeHash(brightness.recipe) : recipeHash(config.recipeHash, "memoryWhisperer"),
     derivedObservations, derivedMaxHints, derivedMinTokenOverlap, derivedMinSharedTokens,
+    brightness, crystalsEnabled, crystalMaxHints, crystalMinTokenOverlap, crystalMinSharedTokens, crystalLtmRankBoost,
   };
 }
 
@@ -646,14 +728,16 @@ export function resolveConfig(value: unknown): UnblockMemoryConfig {
   if (skillWhisperer.enabled && !corpora.some((corpus) => corpus.kind === "skills")) {
     skillWhisperer = { ...skillWhisperer, enabled: false };
   }
+  // Resolved before the Memory Whisperer, whose corpora may include the published `extracted` corpus.
+  const extraction = resolveExtraction(config.extraction, corpora);
   return { corpora, keepEmbeddingModelWarm, analysis: analysisConfig, people, peoplePrimer, skillWhisperer,
     myTurn: resolveMyTurn(config.myTurn),
-    extraction: resolveExtraction(config.extraction, corpora),
+    extraction,
     qualityAudit: resolveQualityAudit(config.qualityAudit, corpora),
     evidenceReview,
     responseAudit: resolveResponseAudit(config.responseAudit, corpora),
     insideOut: resolveInsideOut(config.insideOut),
-    memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora),
+    memoryWhisperer: resolveMemoryWhisperer(config.memoryWhisperer, corpora, extraction),
     safetyWhisperer: resolveSafetyWhisperer(config.safetyWhisperer),
     expectationsWhisperer: resolveExpectationsWhisperer(config.expectationsWhisperer),
     whispererTriggers: resolveWhispererTriggers(config.whispererTriggers),

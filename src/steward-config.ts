@@ -3,6 +3,7 @@ import { resolveDecisionCredential } from "./decision-client.js";
 import type { ExpectationChatType } from "./expectations-store.js";
 import { isAbsolute } from "node:path";
 import { isRecord } from "./guards.js";
+import { CRYSTALS_DEFAULTS } from "./steward-crystals.js";
 
 const efforts = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const searchRankings = ["retrieval", "decision"] as const;
@@ -126,6 +127,11 @@ type StewardExpectationsConfig = {
   excludeChatTypes: ChatType[];
   /** Model-backed extraction of commitments/predictions/blockers/decision outcomes from sessions. */
   extract: boolean;
+  /**
+   * Session chat types whose conversations are evidence for sweeping `workspace` expectations (default `["channel"]`;
+   * a 1:1 assistant can add `"group"` / `"direct"`; `[]` = none).
+   */
+  workspaceSweepChatTypes: ChatType[];
   /** Model-backed due/resolution sweep of open expectations. */
   sweep: boolean;
   /** Auto-expire mirrored Captain's Log blockers not re-captured within this many minutes (default 4320 = 72h; `0` = never). */
@@ -142,12 +148,78 @@ type StewardExpectationsConfig = {
   /** d1.2 request timeout in ms (`0` = no plugin-side limit; the decisions SDK still caps a request at 60 s). */
   captainsLogResolveTimeoutMs: number;
 };
+/** Memory Crystals: cluster → STM crystal synthesis, STM→LTM promotion and STM decay (`steward-crystals.ts`). */
+type StewardCrystalsConfig = {
+  enabled: boolean;
+  intervalMinutes: number;
+  /** Minimum minutes between automatic reclusters (only with `analysis.executable`). */
+  reclusterMinIntervalMinutes: number;
+  /** Recluster stale/missing analysis before synthesis (only with `analysis.executable`). */
+  autoRecluster: boolean;
+  minClusterSize: number;
+  /** Synthesis model calls per pass (`0` = unlimited); unchanged, private or ineligible clusters never count. */
+  maxClustersPerRun: number;
+  /** Evidence members sent per cluster (`0` = the analysis page limit). */
+  maxMembersPerCluster: number;
+  /** STM crystals retire after this many minutes without re-verification (`0` = never). */
+  stmStaleAfterMinutes: number;
+  /** Promote STM → LTM after this many `helped` outcomes on member sources. */
+  ltmPromoteMinHelped: number;
+  /** ... or after this many whispered hits. */
+  ltmPromoteMinHits: number;
+  /**
+   * Corpora crystals may draw evidence from — the ONLY source of truth (default `["memory","knowledge"]`; list
+   * `"sessions"` to opt session transcripts in, e.g. on a 1:1 personal-assistant node). Unresolved native ids never pass.
+   */
+  allowedCorpora: string[];
+  /** Per model call timeout in ms (`0` = unlimited). */
+  timeoutMs: number;
+};
+/** Overnight Thinking: Voltaire Drift, Shortfall Post-Mortems and Anticipatory Pre-Answering (`steward-overnight.ts`). */
+type StewardOvernightConfig = {
+  enabled: boolean;
+  intervalMinutes: number;
+  /** Both set → run only inside `[start, end)` local hours (wraps midnight). Both unset → normal schedule. */
+  quietHoursStartHour?: number;
+  quietHoursEndHour?: number;
+  voltaireEnabled: boolean;
+  postmortemsEnabled: boolean;
+  preAnswerEnabled: boolean;
+  /** Recall history window (`0` = unlimited). */
+  lookbackDays: number;
+  minRecurrence: number;
+  /** Pre-answer window (`0` = every weekday/hour slot). */
+  lookaheadMinutes: number;
+  /** Per-run caps (`0` = unlimited). */
+  maxVoltairePerRun: number;
+  maxPostmortemsPerRun: number;
+  maxPreAnswersPerRun: number;
+  /** Lowest diff confidence that records a shift. */
+  minConfidence: typeof confidences[number];
+  /** `recall_queries.chat_type` values mined for recurring questions. */
+  recallChatTypes: ChatType[];
+  saveDerivedObservations: boolean;
+  /** Append ❔/✅ Voltaire notes to `<workspace>/memory/YYYY-MM-DD.md` (filtered by `dailyLogChatTypes` + `dailyLogCorpora`). */
+  writeDailyLogNotes: boolean;
+  /**
+   * Audience kinds whose Voltaire shifts may reach the daily log or an audience-less `core_memories` anchor
+   * (default: `["workspace", "channel"]`; add `"group"` / `"direct"` to opt in).
+   */
+  dailyLogChatTypes: ExpectationChatType[];
+  /**
+   * Corpora a shift must draw ALL of its evidence from to reach the daily log or an audience-less `core_memories` anchor
+   * (default: `["memory", "knowledge"]`; add `"sessions"` / `"extracted"` to opt in).
+   */
+  dailyLogCorpora: string[];
+  /** Per model call and per investigation timeout in ms (`0` = unlimited). */
+  timeoutMs: number;
+};
 export type StewardConfig = {
   enabled: boolean; model: string; reasoning: typeof efforts[number]; endpoint: string;
   apiKey?: string; apiKeyFile?: string; maxActiveBackground: number;
   deepThought: StewardDeepThoughtConfig; peopleShadow: StewardPeopleShadowConfig;
   captainsLog: StewardCaptainsLogConfig; outcomeLedger: StewardOutcomeLedgerConfig;
-  expectations: StewardExpectationsConfig;
+  expectations: StewardExpectationsConfig; crystals: StewardCrystalsConfig; overnight: StewardOvernightConfig;
 };
 
 const DEFAULT_STEWARD_CONFIG: StewardConfig = {
@@ -214,6 +286,7 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     maxSweepItems: 0,
     timeoutMs: 0,
     excludeChatTypes: ["direct"],
+    workspaceSweepChatTypes: ["channel"],
     extract: true,
     sweep: true,
     blockerAutoExpireMinutes: 4320,
@@ -221,6 +294,27 @@ const DEFAULT_STEWARD_CONFIG: StewardConfig = {
     captainsLogResolveChatTypes: ["workspace", "channel"],
     captainsLogResolveMinConfidence: 0.85,
     captainsLogResolveTimeoutMs: 15_000,
+  },
+  crystals: { enabled: true, ...CRYSTALS_DEFAULTS, allowedCorpora: [...CRYSTALS_DEFAULTS.allowedCorpora] },
+  overnight: {
+    enabled: true,
+    intervalMinutes: 720,
+    voltaireEnabled: true,
+    postmortemsEnabled: true,
+    preAnswerEnabled: true,
+    lookbackDays: 30,
+    minRecurrence: 2,
+    lookaheadMinutes: 720,
+    maxVoltairePerRun: 5,
+    maxPostmortemsPerRun: 5,
+    maxPreAnswersPerRun: 3,
+    minConfidence: "medium",
+    recallChatTypes: ["channel", "group"],
+    saveDerivedObservations: true,
+    writeDailyLogNotes: true,
+    dailyLogChatTypes: ["workspace", "channel"],
+    dailyLogCorpora: ["memory", "knowledge"],
+    timeoutMs: 0,
   },
 };
 
@@ -271,6 +365,18 @@ function expectationChatTypeList(value: unknown, key: string): ExpectationChatTy
   }
   return out;
 }
+function corpusList(value: unknown, key: string): string[] {
+  if (!Array.isArray(value) || !value.every(entry => typeof entry === "string" && entry.trim())) {
+    throw new Error(`steward.${key} must be an array of non-empty corpus names`);
+  }
+  return [...new Set(value.map(entry => (entry as string).trim()))];
+}
+function hour(value: unknown, key: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 23) {
+    throw new Error(`steward.${key} must be an integer between 0 and 23`);
+  }
+  return value;
+}
 function text(value: unknown, key: string) {
   if (typeof value !== "string" || !value.trim()) throw new Error(`steward.${key} must be a non-empty string`);
   return value.trim();
@@ -299,6 +405,13 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
   const cl = section(c.captainsLog, defaults.captainsLog, "steward.captainsLog");
   const o = section(c.outcomeLedger, defaults.outcomeLedger, "steward.outcomeLedger", ["lateEvidenceRescanMs"]);
   const e = section(c.expectations, defaults.expectations, "steward.expectations");
+  const cr = section(c.crystals, defaults.crystals, "steward.crystals");
+  const on = section(c.overnight, defaults.overnight, "steward.overnight", ["quietHoursStartHour", "quietHoursEndHour"]);
+  if ((on.quietHoursStartHour === undefined) !== (on.quietHoursEndHour === undefined)) {
+    throw new Error("steward.overnight.quietHoursStartHour and quietHoursEndHour must be set together");
+  }
+  const overnightConfidence = confidences.find(level => level === on.minConfidence);
+  if (!overnightConfidence) throw new Error("Invalid steward.overnight.minConfidence");
   const reasoning = efforts.find(e => e === c.reasoning);
   if (!reasoning) throw new Error("Invalid steward.reasoning");
   const deepThoughtReasoning = d.reasoning === undefined ? undefined : efforts.find(e => e === d.reasoning);
@@ -380,6 +493,7 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       maxSweepItems: integer(e.maxSweepItems, 0, "expectations.maxSweepItems"),
       timeoutMs: integer(e.timeoutMs, 0, "expectations.timeoutMs"),
       excludeChatTypes: chatTypeList(e.excludeChatTypes, "expectations.excludeChatTypes"),
+      workspaceSweepChatTypes: chatTypeList(e.workspaceSweepChatTypes, "expectations.workspaceSweepChatTypes"),
       extract: boolean(e.extract, "steward.expectations.extract"),
       sweep: boolean(e.sweep, "steward.expectations.sweep"),
       blockerAutoExpireMinutes: integer(e.blockerAutoExpireMinutes, 0, "expectations.blockerAutoExpireMinutes"),
@@ -387,6 +501,44 @@ export function resolveStewardConfig(value: unknown): StewardConfig {
       captainsLogResolveChatTypes: expectationChatTypeList(e.captainsLogResolveChatTypes, "expectations.captainsLogResolveChatTypes"),
       captainsLogResolveMinConfidence: unitInterval(e.captainsLogResolveMinConfidence, "expectations.captainsLogResolveMinConfidence"),
       captainsLogResolveTimeoutMs: integer(e.captainsLogResolveTimeoutMs, 0, "expectations.captainsLogResolveTimeoutMs"),
+    },
+    crystals: {
+      enabled: enabled(cr.enabled, "steward.crystals"),
+      intervalMinutes: integer(cr.intervalMinutes, 1, "crystals.intervalMinutes"),
+      reclusterMinIntervalMinutes: integer(cr.reclusterMinIntervalMinutes, 0, "crystals.reclusterMinIntervalMinutes"),
+      autoRecluster: boolean(cr.autoRecluster, "steward.crystals.autoRecluster"),
+      minClusterSize: integer(cr.minClusterSize, 1, "crystals.minClusterSize"),
+      maxClustersPerRun: integer(cr.maxClustersPerRun, 0, "crystals.maxClustersPerRun"),
+      maxMembersPerCluster: integer(cr.maxMembersPerCluster, 0, "crystals.maxMembersPerCluster"),
+      stmStaleAfterMinutes: integer(cr.stmStaleAfterMinutes, 0, "crystals.stmStaleAfterMinutes"),
+      ltmPromoteMinHelped: integer(cr.ltmPromoteMinHelped, 0, "crystals.ltmPromoteMinHelped"),
+      ltmPromoteMinHits: integer(cr.ltmPromoteMinHits, 0, "crystals.ltmPromoteMinHits"),
+      allowedCorpora: corpusList(cr.allowedCorpora, "crystals.allowedCorpora"),
+      timeoutMs: integer(cr.timeoutMs, 0, "crystals.timeoutMs"),
+    },
+    overnight: {
+      enabled: enabled(on.enabled, "steward.overnight"),
+      intervalMinutes: integer(on.intervalMinutes, 1, "overnight.intervalMinutes"),
+      ...(on.quietHoursStartHour === undefined ? {} : {
+        quietHoursStartHour: hour(on.quietHoursStartHour, "overnight.quietHoursStartHour"),
+        quietHoursEndHour: hour(on.quietHoursEndHour, "overnight.quietHoursEndHour"),
+      }),
+      voltaireEnabled: boolean(on.voltaireEnabled, "steward.overnight.voltaireEnabled"),
+      postmortemsEnabled: boolean(on.postmortemsEnabled, "steward.overnight.postmortemsEnabled"),
+      preAnswerEnabled: boolean(on.preAnswerEnabled, "steward.overnight.preAnswerEnabled"),
+      lookbackDays: integer(on.lookbackDays, 0, "overnight.lookbackDays"),
+      minRecurrence: integer(on.minRecurrence, 1, "overnight.minRecurrence"),
+      lookaheadMinutes: integer(on.lookaheadMinutes, 0, "overnight.lookaheadMinutes"),
+      maxVoltairePerRun: integer(on.maxVoltairePerRun, 0, "overnight.maxVoltairePerRun"),
+      maxPostmortemsPerRun: integer(on.maxPostmortemsPerRun, 0, "overnight.maxPostmortemsPerRun"),
+      maxPreAnswersPerRun: integer(on.maxPreAnswersPerRun, 0, "overnight.maxPreAnswersPerRun"),
+      minConfidence: overnightConfidence,
+      recallChatTypes: chatTypeList(on.recallChatTypes, "overnight.recallChatTypes"),
+      saveDerivedObservations: boolean(on.saveDerivedObservations, "steward.overnight.saveDerivedObservations"),
+      writeDailyLogNotes: boolean(on.writeDailyLogNotes, "steward.overnight.writeDailyLogNotes"),
+      dailyLogChatTypes: expectationChatTypeList(on.dailyLogChatTypes, "overnight.dailyLogChatTypes"),
+      dailyLogCorpora: corpusList(on.dailyLogCorpora, "overnight.dailyLogCorpora"),
+      timeoutMs: integer(on.timeoutMs, 0, "overnight.timeoutMs"),
     },
   };
 }

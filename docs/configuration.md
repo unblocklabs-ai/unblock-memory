@@ -31,6 +31,8 @@ settings; a rotated credential file is reread without a restart.
 | People shadow | `steward.enabled` + `steward.peopleShadow.enabled`; People Learning manifests | Pass stops early; no strikes, nothing published | Item retried next pass without a strike; rejected proposals strike toward quarantine |
 | Expectations pass | `steward.enabled` + `steward.expectations.enabled` | Captain's Log blockers and people todos are still mirrored (no model); session extraction and sweeps are skipped | Deterministic rows stay committed; the model stage retries within 15 minutes |
 | Post-Captain's-Log expectations check | Expectations pass + `captainsLogDecisionResolve` + `decisionModel.enabled`; a decision-model credential | Skipped; new blockers are still mirrored right after the append | Warning only; Captain's Log stays appended and items stay open for the regular sweep |
+| Memory Crystals pass | `steward.enabled` + `steward.crystals.enabled`; a QMD index. Synthesis needs a Steward credential and analysis clusters; reclustering needs `analysis.executable` | STM decay and LTM promotion still run (no model); no new crystals | The pass releases its lease and retries next interval; existing crystals are untouched |
+| Overnight Thinking pass | `steward.enabled` + `steward.overnight.enabled`; a Steward credential. Voltaire Drift and pre-answering also need `steward.deepThought.enabled` and a QMD index | Skipped | Per-item failures are listed in `errors`; a failed pass publishes nothing and retries within 15 minutes |
 
 Skill Whisperer turns on by default once a `skills` corpus is configured; without
 one it registers no hook and reports inactive. Expectations Whisperer is on by
@@ -201,6 +203,22 @@ excerpts are sent to the configured decision endpoint (defaults to
 `https://codex.unblocklabs.ai/v1/decisions` -> OpenRouter `liquid/d1.2-ultra`)
 and may be injected into any conversation using this agent.
 
+### Brightness A/B arm
+
+Brightness is off by default. Assigning a node to an arm is one key; the arm then
+labels its own Memory Whisperer exposures (`brightness:actr_v1` or
+`brightness:outcome_v1`), so `memory-steward outcomes` reports each arm in
+`byRecipe` without setting `recipeHash`:
+
+```json
+{
+  "memoryWhisperer": { "enabled": true, "corpora": ["memory"], "brightness": { "recipe": "outcome_v1" } }
+}
+```
+
+Memory Crystals are whispered from the same `<memory>` block by default once the
+Steward has produced some; set `memoryWhisperer.crystalsEnabled: false` to stop.
+
 ### People storage, without injection
 
 ```json
@@ -280,7 +298,7 @@ contract; these tables explain their effects.
 | `skillWhisperer.cooldownTurns` | `10` | Legacy nonnegative integer, accepted for compatibility; no longer used |
 | `skillWhisperer.recipeHash` | `"default"` | Non-empty label (trimmed) stamped on every skill routing exposure for A/B experiments; reported per arm by `memory-steward outcomes` (`byRecipe`, `--recipe`) |
 | `memoryWhisperer.enabled` | `false` | Requires explicit approved non-skill corpora, decision model key and host hooks |
-| `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills |
+| `memoryWhisperer.corpora` | `[]` | Explicit known corpus names; required nonempty when enabled; no `all` or skills. `"extracted"` is accepted only when `extraction.enabled` and `extraction.publish` are both true; it then whispers published extracted facts, plus derived observations and crystals grounded in `extracted` |
 | `memoryWhisperer.mode` | `"v2"` | `"v2"`: decision-model recall gate + corpus router and grounded topic extraction (up to three topics), run in parallel within `min(2 s, timeoutMs / 2)`; never calls a query-model API. `"legacy"`: opt-in rollback to one query pair per turn from `api` (or deterministic local queries). See [Memory Whisperer](retrieval.md#memory-whisperer) |
 | `memoryWhisperer.api.endpoint` | Empty | **Legacy mode only.** Optional query-model API URL; unset or empty uses deterministic local queries. Still accepted in v2 so existing configs load, but ignored there (one `query_api_ignored` startup log note). |
 | `memoryWhisperer.api.apiKeyFile` | unset | **Legacy mode only.** Absolute path to a file containing the API bearer token. Missing credentials, timeouts, or API failures fall back to deterministic local queries before decision model judging. |
@@ -294,6 +312,16 @@ contract; these tables explain their effects.
 | `memoryWhisperer.derivedMaxHints` | `2` | `>= 0` verified syntheses whispered per turn (`0` = unlimited) |
 | `memoryWhisperer.derivedMinTokenOverlap` | `0.45` | `0..1` minimum share of a stored question's meaningful tokens the turn must cover |
 | `memoryWhisperer.derivedMinSharedTokens` | `2` | `>= 1` minimum shared meaningful tokens for a non-exact question match |
+| `memoryWhisperer.brightness.recipe` | `"off"` | Brightness A/B recipe applied after usefulness gating: `"off"` (no lookup), `"actr_v1"` (power-law-decayed `memory_get` reads and delivered hits from the recall ledger) or `"outcome_v1"` (Outcome Ledger `helped`/`hurt`/`ignored` verdicts, `core_memories` anchors and explicitly linked surprising expectations). Only the order of qualifying finalists changes; usefulness scores and `minUsefulness` are unchanged, and missing evidence is neutral. A non-`off` recipe stamps `brightness:<recipe>` as the Memory Whisperer `recipeHash` unless `memoryWhisperer.recipeHash` is set; `memory_search` never applies Brightness, so it keeps the `"default"` label in that case |
+| `memoryWhisperer.brightness.weight` | `0.08` | `>= 0` score added per unit of normalized brightness (`-1..1`); `0` disables re-ordering |
+| `memoryWhisperer.brightness.decayRate` | `0.5` | `> 0` `actr_v1` decay exponent per hour since each read or hit |
+| `memoryWhisperer.brightness.lookbackDays` | `90` | `>= 0` evidence window in days (`0` = unlimited) |
+| `memoryWhisperer.brightness.maxBoost` | `0.15` | `>= 0` absolute cap on the brightness adjustment |
+| `memoryWhisperer.crystalsEnabled` | `true` | Within an enabled Memory Whisperer, also whisper active Memory Crystals whose title and summary match the turn (`{ source: "memory_crystal:<id>", tier, title, summary, revision }` entries, after verified syntheses and before raw chunks). Local and read-only (no model call, never creates the database). Only `workspace` crystals or crystals of the turn's own audience qualify, and every corpus a crystal draws on must be in `memoryWhisperer.corpora`; stale STM crystals never match. Each whispered crystal is suppressed for `cooldownTurns` in that session, and its `hit_count` (STM → LTM promotion evidence) is bumped best-effort after the turn |
+| `memoryWhisperer.crystalMaxHints` | `2` | `>= 0` crystals whispered per turn (`0` = unlimited) |
+| `memoryWhisperer.crystalMinTokenOverlap` | `0.35` | `0..1` minimum overlap coefficient between the turn and a crystal's title + summary tokens |
+| `memoryWhisperer.crystalMinSharedTokens` | `2` | `>= 1` minimum shared meaningful tokens for a crystal match |
+| `memoryWhisperer.crystalLtmRankBoost` | `0.01` | `>= 0` additive rank boost for long-term (`ltm`) crystals: breaks ties without beating a clearly better `stm` match |
 | `memoryWhisperer.recipeHash` | `"default"` | Non-empty label (trimmed) stamped on Memory Whisperer and `memory_search` recall-ledger exposures for A/B experiments; reported per arm by `memory-steward outcomes` |
 | `expectationsWhisperer.enabled` | `true` | Appends an `<expectations>` block of open commitments, predictions, blockers, decision outcomes and todos that match the turn (channel, person, keywords, or a due/overdue date). Read-only on the agent's memory database; no model call. Workspace items (Captain's Log blockers, active people todos) are visible on every eligible turn; a channel or group item only inside that exact conversation (`provider` + account + native channel id), and a direct-message item only to that exact provider + account + sender. People-derived items surface only for an `active`, injection-enabled person. Surfaces beyond user turns follow `whispererTriggers` |
 | `expectationsWhisperer.maxHints` | `5` | `>= 0` expectations per turn (`0` = unlimited); overdue first, then active blockers, due soon, person and channel matches |
@@ -927,7 +955,8 @@ baseline. Soft-deleting a person in PeopleSQL does not remove Inside Out data.
 ## Steward
 
 The Steward is an embedded sub-agent with independent features (`deep_thought`,
-People Learning, Captain's Log, the Outcome Ledger and Expectations), all **enabled by default**.
+People Learning, Captain's Log, the Outcome Ledger, Expectations, Memory Crystals and
+Overnight Thinking), all **enabled by default**.
 Fleet configs without a `steward` section load cleanly and automatically get every
 feature; set `steward.enabled: false` (or disable any sub-feature individually) to opt out.
 
@@ -972,7 +1001,7 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   `openclaw memory-steward shadow-report --agent main`; `memory-steward status`
   lists backlog and quarantined items, and `memory-steward requeue --scope <scope>`
   re-drives one item (`--kind people_interactions`, `captains_log`,
-  `outcome_ledger` or `expectations` for other work kinds). Leases are renewed during model calls; a
+  `outcome_ledger`, `expectations`, `memory_crystals` or `overnight_thinking` for other work kinds). Leases are renewed during model calls; a
   Gateway stop releases them without strikes. On nightly manifests, interaction
   learning (`people_interactions`) also proposes net-new dossier claims; it is on by
   default in `publish` mode and off in `shadow` mode unless
@@ -1021,7 +1050,8 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   channel/group/DM conversation has new messages in this pass (activity-triggered:
   a reply in that conversation sweeps its items immediately; quiet conversations
   add no model call) against
-  evidence from their own audience (workspace items: channel conversations only)
+  evidence from their own audience (workspace items: conversations whose chat type is
+  in `workspaceSweepChatTypes`, default channels only)
   recorded since the item opened or was last swept, recording
   `kept`/`broken`/`right`/`wrong`/`expired` with a surprise score (a clock-only
   `expired` requires a due date that has passed). A swept Captain's Log blocker
@@ -1042,6 +1072,62 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
   created or migrated); add `--run` to run one pass for that agent now and print its
   result. A pass that is not due reports `not_due`; `memory-steward requeue --kind
   expectations --scope <agent>` makes it due immediately.
+- **Memory Crystals** (STM/LTM synthesis and core memories): every
+  `intervalMinutes`, the pass reads the QMD analysis clusters (reclustering missing
+  or stale analysis first only when `analysis.executable` is configured and at most
+  every `reclusterMinIntervalMinutes`), inspects every member of each cluster of at
+  least `minClusterSize` chunks, and skips a cluster outright if any member comes
+  from a corpus outside `allowedCorpora` or an unresolved collection (checked against
+  every active collection holding the chunk, not only the displayed aliases).
+  `allowedCorpora` is the only source of truth: the default `["memory", "knowledge"]`
+  excludes session transcripts, and listing `"sessions"` (for example on a 1:1
+  personal-assistant node) opts them in, so their syntheses become `workspace`
+  crystals. The Steward model
+  distills up to `maxMembersPerCluster` excerpts into one titled summary that cites
+  only opaque handles; it is stored as a `workspace`-audience `stm` crystal in
+  `memory_crystals` with its exact evidence chunks (document hash, chunk span, quote
+  sha256) in `memory_crystal_members`. Unchanged evidence only re-verifies a crystal
+  (no model call) and renews its `stmStaleAfterMinutes` window. A model failure on
+  one cluster is reported in the pass's `errors` and never blocks the other clusters,
+  promotion or decay (a missing credential stops further model calls for that
+  pass). The pass and its memory index start only on a tick where it is due. When new evidence changes a crystal's summary, its revision is
+  bumped and the evidence that was new to that revision is recorded once in
+  `core_memories` (the shared `recordCoreMemory` writer). Without a model call, the
+  same pass promotes an `stm` crystal to `ltm` after `ltmPromoteMinHits` whispered
+  hits or `ltmPromoteMinHelped` `helped` outcomes on its member sources, and retires
+  `stm` crystals not re-verified within `stmStaleAfterMinutes`. Without a Steward
+  credential only decay and promotion run (and no recluster is attempted).
+  `openclaw memory-steward crystals --agent main [--tier stm|ltm] [--limit <n>]`
+  prints `{ agentId, summary, crystals }` read-only (counts by tier/status and
+  core memories by kind; an absent database is never created or migrated); add
+  `--run` to run one pass for that agent now, ignoring the schedule.
+- **Overnight Thinking**: every `intervalMinutes` (optionally only inside the local
+  `[quietHoursStartHour, quietHoursEndHour)` window, which may wrap midnight), one
+  fenced pass runs three phases, each in the candidate's own audience and corpora:
+  *Voltaire Drift* re-investigates (fresh `deep_thought`, cache bypassed) questions
+  whose stored synthesis is behind its QMD collections or that recur at least
+  `minRecurrence` times in `recallChatTypes` conversations, has the Steward model
+  compare the old and new conclusions, and records real shifts at `>= minConfidence`
+  in `voltaire_shifts`. Only a complete answer with at least one citation and no
+  unverified citation is saved, compared or published, and the new derived
+  observation supersedes the prior one inside the same fenced commit as the shift.
+  Focused `deep_thought` observations are never re-investigated. A shift whose
+  audience kind is in `dailyLogChatTypes` (default `workspace` and `channel`) and
+  whose corpora are all in `dailyLogCorpora` (default `memory` and `knowledge`) also
+  anchors one `voltaire_shift` row in `core_memories` and, with `writeDailyLogNotes`,
+  appends a ❔ was / ✅ now note to `<workspace>/memory/YYYY-MM-DD.md`. By default
+  `group` (MPDM) and DM shifts and shifts over `sessions` or `extracted` reach
+  neither; add them to those lists to opt in. An audience's kind comes from every
+  `recall_queries` chat type it was seen in (all of them must be listed), and an
+  audience never seen in recall is never eligible. *Shortfall Post-Mortems* diagnose each new `hurt` Outcome Ledger verdict
+  once into `shortfall_postmortems` (root cause plus one concrete fix).
+  *Anticipatory Pre-Answering* investigates questions asked in the coming
+  `lookaheadMinutes` weekday/hour slot on at least `minRecurrence` distinct days, so a
+  verified answer already waits as a derived observation. Investigations need
+  `steward.deepThought.enabled`; without it only post-mortems run.
+  `openclaw memory-steward overnight --agent main [--limit <n>]` prints
+  `{ agentId, summary, shifts, postmortems }` read-only (never creating a database);
+  add `--run` to run one pass now, ignoring both the schedule and quiet hours.
 
 | Setting | Default | Meaning / supported range |
 | --- | --- | --- |
@@ -1106,6 +1192,7 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.expectations.maxSweepItems` | `0` | `>= 0` open expectations judged per pass (`0` = unlimited) |
 | `steward.expectations.timeoutMs` | `0` | `>= 0` ms per model call (`0` = unlimited) |
 | `steward.expectations.excludeChatTypes` | `["direct"]` | Chat types (`"channel"`, `"group"`, `"direct"`) excluded from session extraction |
+| `steward.expectations.workspaceSweepChatTypes` | `["channel"]` | Session chat types (`"channel"`, `"group"`, `"direct"`) whose conversations are evidence when sweeping `workspace`-audience expectations; the default is the safe multi-user choice, a 1:1 assistant can add `"group"` and `"direct"` (those sessions must also not be in `excludeChatTypes`); `[]` = workspace items are never swept from sessions |
 | `steward.expectations.extract` | `true` | Model-backed extraction from sessions; `false` keeps deterministic ingestion and sweeps only |
 | `steward.expectations.sweep` | `true` | Model-backed due/resolution sweep; `false` never resolves rows by model |
 | `steward.expectations.blockerAutoExpireMinutes` | `4320` | `>= 0` minutes a mirrored Captain's Log blocker stays open without a fresh capture of its topic before it auto-expires (closing its ledger entries); `0` = never auto-expire |
@@ -1113,6 +1200,33 @@ feature; set `steward.enabled: false` (or disable any sub-feature individually) 
 | `steward.expectations.captainsLogResolveChatTypes` | `["workspace", "channel"]` | Expectation chat types (`"workspace"`, `"channel"`, `"group"`, `"direct"`) evaluated by the post-Captain's-Log d1.2 check; add `"group"` or `"direct"` to opt in |
 | `steward.expectations.captainsLogResolveMinConfidence` | `0.85` | `0`–`1` minimum probability of the chosen `resolved`/`broken` option before the post-Captain's-Log check applies it |
 | `steward.expectations.captainsLogResolveTimeoutMs` | `15000` | `>= 0` ms for the post-Captain's-Log d1.2 request (`0` = no plugin-side limit; the decisions SDK still caps one request at 60 s, and larger values are clamped to it) |
+| `steward.crystals.enabled` | `true` | Starts the Memory Crystals loop on Gateway start; decay and promotion need no Steward credential |
+| `steward.crystals.intervalMinutes` | `360` | `>= 1` minutes between passes |
+| `steward.crystals.reclusterMinIntervalMinutes` | `720` | `>= 0` minutes between automatic reclusters |
+| `steward.crystals.autoRecluster` | `true` | Recluster missing or stale analysis before synthesis (only with `analysis.executable` and a Steward credential) |
+| `steward.crystals.minClusterSize` | `3` | `>= 1` minimum available chunks in a cluster |
+| `steward.crystals.maxClustersPerRun` | `0` | `>= 0` synthesis model calls per pass (`0` = unlimited); unchanged, private or ineligible clusters never count |
+| `steward.crystals.maxMembersPerCluster` | `12` | `>= 0` evidence excerpts sent per synthesis (`0` = the 50-member analysis page) |
+| `steward.crystals.stmStaleAfterMinutes` | `20160` | `>= 0` minutes an `stm` crystal survives without re-verification (`0` = never retire) |
+| `steward.crystals.ltmPromoteMinHelped` | `3` | `>= 0` `helped` outcomes on member sources that promote `stm` to `ltm` |
+| `steward.crystals.ltmPromoteMinHits` | `5` | `>= 0` whispered hits that promote `stm` to `ltm` |
+| `steward.crystals.allowedCorpora` | `["memory", "knowledge"]` | Corpora crystals may cite — the only source of truth, nothing else is hardcoded. The default excludes `sessions`; add `"sessions"` to opt session transcripts in (e.g. on a 1:1 personal-assistant node). Unresolved native `source-…` collections are never eligible |
+| `steward.crystals.timeoutMs` | `0` | `>= 0` ms per model call (`0` = unlimited) |
+| `steward.overnight.enabled` | `true` | Starts the Overnight Thinking loop on Gateway start (needs a Steward credential) |
+| `steward.overnight.intervalMinutes` | `720` | `>= 1` minutes between passes |
+| `steward.overnight.quietHoursStartHour` / `quietHoursEndHour` | Unset | `0..23`, set both or neither: run only inside `[start, end)` local hours (`22`/`6` wraps midnight; equal values = all day) |
+| `steward.overnight.voltaireEnabled` / `postmortemsEnabled` / `preAnswerEnabled` | `true` | Toggle each phase |
+| `steward.overnight.lookbackDays` | `30` | `>= 0` days of recall history and `hurt` outcomes considered (`0` = unlimited) |
+| `steward.overnight.minRecurrence` | `2` | `>= 1` repeats for a recurring question, or distinct days for a pre-answer rhythm |
+| `steward.overnight.lookaheadMinutes` | `720` | `>= 0` pre-answer window (`0` = every weekday/hour slot) |
+| `steward.overnight.maxVoltairePerRun` / `maxPostmortemsPerRun` / `maxPreAnswersPerRun` | `5` / `5` / `3` | `>= 0` per-run caps (`0` = unlimited) |
+| `steward.overnight.minConfidence` | `"medium"` | Lowest diff confidence (`high`, `medium`, `low`) that records a shift |
+| `steward.overnight.recallChatTypes` | `["channel", "group"]` | `recall_queries` chat types mined for recurring questions; add `"direct"` to also re-investigate DM questions (kept in their own audience). Rows recorded without a chat type infer it from the session key: a `:direct:`/`:group:`/`:channel:` segment, `:dm:` (direct), or the untyped main DM session `agent:<id>:main` / `main` (direct); synthetic keys such as `:cron:` or `:subagent:` stay untyped and are skipped |
+| `steward.overnight.saveDerivedObservations` | `true` | Persist complete investigations as derived observations for instant whispers |
+| `steward.overnight.writeDailyLogNotes` | `true` | Append shift notes allowed by `dailyLogChatTypes` and `dailyLogCorpora` to `<workspace>/memory/YYYY-MM-DD.md` |
+| `steward.overnight.dailyLogChatTypes` | `["workspace", "channel"]` | Audience kinds (`"workspace"`, `"channel"`, `"group"`, `"direct"`) whose Voltaire shifts may reach the daily log or an audience-less `core_memories` anchor; add `"group"` or `"direct"` to opt in |
+| `steward.overnight.dailyLogCorpora` | `["memory", "knowledge"]` | Corpora a Voltaire shift must draw all of its evidence from to reach the daily log or an audience-less `core_memories` anchor; add `"sessions"` or `"extracted"` to opt in |
+| `steward.overnight.timeoutMs` | `0` | `>= 0` ms per model call and per investigation (`0` = unlimited) |
 
 **Enabling `deep_thought` approves sending the question plus the memory excerpts it
 opens to the Steward endpoint. Enabling the People shadow approves sending one
@@ -1121,7 +1235,11 @@ Expectations extraction or sweeps approves sending eligible session excerpts (on
 audience per request) and the open expectations of that audience. Leaving
 `captainsLogDecisionResolve` on approves sending each new Captain's Log section's
 entries plus the open workspace/channel expectations (never group or DM ones) to the
-`decisionModel` endpoint.** Both
+`decisionModel` endpoint. Enabling Memory Crystals approves sending up to
+`maxMembersPerCluster` workspace memory excerpts per cluster; enabling Overnight
+Thinking approves `deep_thought` investigations of recurring questions in their own
+audience, sending both conclusions to compare, and sending each `hurt` outcome's
+subject and signals.** Both
 features call `steward.endpoint` directly (`stream: false`, `store: false`) with
 OpenAI strict JSON schemas; the host LLM runtime is not used, because it denies
 plugin model overrides by default and would ignore the Steward endpoint and key.

@@ -16,6 +16,7 @@ import {
   type DeepThoughtOutcome,
   type DeepThoughtResult,
   type DeepThoughtRuntime,
+  runDeepThoughtInvestigation,
 } from "../src/deep-thought.js";
 import { resolveStewardConfig } from "../src/steward-config.js";
 import { createStewardRunner, type StewardRunner, type StewardRunRequest, type StewardRunResult, type StewardUsage } from "../src/steward-runner.js";
@@ -930,4 +931,61 @@ test("restart recovery retries after a transient markInterruptedJobs failure", a
   assert.equal(calls, 2, "a failed sweep is retried on the next call");
   await execute(tool(), { question: "Third?" });
   assert.equal(calls, 2, "a successful sweep is not repeated");
+});
+
+test("headless investigation (Overnight Thinking): bypasses the cache, waits for completion, saves under the explicit audience", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime, recorded } = fakeRuntime();
+  const { runner, requests, toolNames } = scriptedRunner([...GROUNDED]);
+  const audienceKey = "slack:channel:c0launch";
+  // A cached answer for this exact key already exists: a headless re-investigation must never serve it.
+  const prior = store.saveDerivedObservation({ agentId: "main", question: "When did the launch move?", audienceKey, corpora: ["memory"],
+    collectionGenerations: { memory: 1 }, answer: "The launch moved to Thursday.", confidence: "high",
+    citations: [{ source: "qmd://memory/launch.md", quote: "Thursday" }] });
+  // syncWaitMs is ignored: the background caller always waits for the finished synthesis (no jobId hand-off).
+  const background = deps(runtime, runner, { config: { ...CONFIG, syncWaitMs: 1 }, store, getCollectionGenerations: () => ({ memory: 1 }) });
+  const outcome = await runDeepThoughtInvestigation(background, {
+    cfg: {} as OpenClawConfig, agentId: "main", question: "When did the launch move?", audienceKey, corpora: ["memory"],
+  });
+  assert.equal(outcome.status, "complete");
+  assert.equal(outcome.cached, undefined, "never served from cache");
+  assert.equal(outcome.jobId, undefined);
+  assert.equal(outcome.answer, "The launch moved to Friday.");
+  assert.equal(requests.length, 1);
+  assert.deepEqual(toolNames[0], ["search_memory", "read_memory"], "no caller origin: lookup_person is never offered");
+  assert.deepEqual(recorded.searches.map(search => search.corpora), [["memory"]]);
+  const saved = store.getDerivedObservation(outcome.derivedObservationId!)!;
+  assert.equal(saved.audienceKey, audienceKey);
+  assert.deepEqual(saved.corpora, ["memory"]);
+  assert.equal(store.getDerivedObservation(prior.id)!.status, "superseded");
+
+  for (const request of [{ question: " ", audienceKey }, { question: "Q?", audienceKey: " " }]) {
+    const invalid = await runDeepThoughtInvestigation(background, { cfg: {} as OpenClawConfig, agentId: "main", ...request });
+    assert.equal(invalid.status, "invalid_request");
+  }
+  assert.equal(requests.length, 1);
+});
+
+test("headless skipSave never saves or supersedes an observation and reports the pre-run generations for a fenced commit", async t => {
+  t.after(() => cancelAllDeepThoughtJobs());
+  const fixture = storeFixture(t);
+  const store = fixture.open();
+  const { runtime } = fakeRuntime();
+  const { runner, requests } = scriptedRunner([...GROUNDED]);
+  const audienceKey = "slack:channel:c0launch";
+  const prior = store.saveDerivedObservation({ agentId: "main", question: "When did the launch move?", audienceKey, corpora: ["memory"],
+    collectionGenerations: { memory: 1 }, answer: "The launch moved to Thursday.", confidence: "high",
+    citations: [{ source: "qmd://memory/launch.md", quote: "Thursday" }] });
+  const background = deps(runtime, runner, { store, getCollectionGenerations: () => ({ memory: 2 }) });
+  const outcome = await runDeepThoughtInvestigation(background, {
+    cfg: {} as OpenClawConfig, agentId: "main", question: "When did the launch move?", audienceKey, corpora: ["memory"], skipSave: true,
+  });
+  assert.equal(outcome.status, "complete");
+  assert.equal(requests.length, 1);
+  assert.equal(outcome.derivedObservationId, undefined, "nothing was saved");
+  assert.deepEqual(outcome.collectionGenerations, { memory: 2 }, "the pre-run snapshot is handed back to the caller");
+  assert.equal(outcome.unverifiedCitationsDropped, undefined);
+  assert.equal(store.getDerivedObservation(prior.id)!.status, "fresh", "the prior conclusion is NOT superseded before the caller commits");
 });

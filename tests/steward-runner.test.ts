@@ -61,9 +61,21 @@ test("config defaults, nested overrides and strict boundaries", () => {
     },
     expectations: {
       enabled: true, intervalMinutes: 60, lookbackMinutes: 70, dueLeadMinutes: 60, sweepAfterMinutes: 1440, maxSessionsPerRun: 0,
-      maxCharsPerSession: 0, maxSweepItems: 0, timeoutMs: 0, excludeChatTypes: ["direct"], extract: true, sweep: true, blockerAutoExpireMinutes: 4320,
+      maxCharsPerSession: 0, maxSweepItems: 0, timeoutMs: 0, excludeChatTypes: ["direct"], workspaceSweepChatTypes: ["channel"],
+      extract: true, sweep: true, blockerAutoExpireMinutes: 4320,
       captainsLogDecisionResolve: true, captainsLogResolveChatTypes: ["workspace", "channel"],
       captainsLogResolveMinConfidence: 0.85, captainsLogResolveTimeoutMs: 15_000,
+    },
+    crystals: {
+      enabled: true, intervalMinutes: 360, reclusterMinIntervalMinutes: 720, autoRecluster: true, minClusterSize: 3,
+      maxClustersPerRun: 0, maxMembersPerCluster: 12, stmStaleAfterMinutes: 20_160, ltmPromoteMinHelped: 3, ltmPromoteMinHits: 5,
+      allowedCorpora: ["memory", "knowledge"], timeoutMs: 0,
+    },
+    overnight: {
+      enabled: true, intervalMinutes: 720, voltaireEnabled: true, postmortemsEnabled: true, preAnswerEnabled: true, lookbackDays: 30,
+      minRecurrence: 2, lookaheadMinutes: 720, maxVoltairePerRun: 5, maxPostmortemsPerRun: 5, maxPreAnswersPerRun: 3,
+      minConfidence: "medium", recallChatTypes: ["channel", "group"], saveDerivedObservations: true, writeDailyLogNotes: true,
+      dailyLogChatTypes: ["workspace", "channel"], dailyLogCorpora: ["memory", "knowledge"], timeoutMs: 0,
     },
   });
   const overridden = resolveStewardConfig({

@@ -34,7 +34,9 @@ import { DeepThoughtStore } from "./deep-thought-store.js";
 import { resolveStewardCredential } from "./steward-config.js";
 import { createStewardRunner } from "./steward-runner.js";
 import { registerStewardRuntime } from "./steward-runtime.js";
+import { brightnessRecipeHash } from "./memory-brightness.js";
 import { RecallLedgerWriter } from "./recall-ledger.js";
+import { chatTypeFromSessionKey } from "./session-chat-type.js";
 function managerUnavailable(error) {
     return jsonResult({ status: "unavailable", error: error ?? "memory unavailable" });
 }
@@ -91,7 +93,7 @@ function toolOrigin(active) {
     const threadId = rawChannel && splitAt > 0
         ? nonBlank(rawChannel.slice(splitAt + (splitAt === threadIdx ? ":thread:".length : ":topic:".length)))
         : deliveryThreadStr;
-    const chatType = /:(direct|group|channel):/iu.exec(active.requestContext.sessionKey ?? "")?.[1]?.toLowerCase();
+    const chatType = chatTypeFromSessionKey(active.requestContext.sessionKey);
     return {
         provider,
         accountId,
@@ -671,11 +673,14 @@ export function registerUnblockMemory(api) {
     registerResponseAudit(api, config);
     registerInsideOut(api, config);
     const stewardRunner = stewardRunnerFactory(config);
-    // Registers `memory-steward` CLI always; background loops only when steward + peopleShadow/captainsLog are enabled.
+    // Set once the QMD runtime exists (never in `cli-metadata` mode); the Crystals/Overnight passes read it lazily.
+    let stewardMemory;
+    // Registers `memory-steward` CLI always; background loops only when the steward and at least one pass are enabled.
     registerStewardRuntime(api, {
         config: config.steward,
         pluginConfig: config,
         createRunner: () => config.steward.enabled ? stewardRunner() : undefined,
+        memory: () => stewardMemory,
     });
     if (api.registrationMode === "cli-metadata") {
         registerExtraction(api, config);
@@ -740,6 +745,8 @@ export function registerUnblockMemory(api) {
         api.logger.warn('unblock-memory skillWhisperer.enabled is true but no corpus has kind "skills"; Skill Whisperer is inactive');
     }
     const memoryDatabasePath = (agentId) => runtime.memoryDatabasePath(agentId);
+    const whisperer = config.memoryWhisperer;
+    const brightness = whisperer.brightness && whisperer.brightness.recipe !== "off" ? whisperer.brightness : undefined;
     registerWhispererPrompt(api, {
         memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics, recallLedger, {
             ...(config.memoryWhisperer.derivedObservations !== false ? {
@@ -759,7 +766,18 @@ export function registerUnblockMemory(api) {
                     },
                 },
             } : {}),
-            ...(config.memoryWhisperer.recipeHash ? { recipeHash: config.memoryWhisperer.recipeHash } : {}),
+            ...(whisperer.crystalsEnabled !== false ? {
+                // Read-only, zero-model lookup of active crystals; hit counts feed STM→LTM promotion.
+                crystals: {
+                    dbPathForAgent: memoryDatabasePath,
+                    ...(whisperer.crystalMaxHints !== undefined ? { maxHints: whisperer.crystalMaxHints } : {}),
+                    ...(whisperer.crystalMinTokenOverlap !== undefined ? { minTokenOverlap: whisperer.crystalMinTokenOverlap } : {}),
+                    ...(whisperer.crystalMinSharedTokens !== undefined ? { minSharedTokens: whisperer.crystalMinSharedTokens } : {}),
+                    ...(whisperer.crystalLtmRankBoost !== undefined ? { ltmRankBoost: whisperer.crystalLtmRankBoost } : {}),
+                },
+            } : {}),
+            ...(brightness ? { brightness: { ...brightness, dbPathForAgent: memoryDatabasePath } } : {}),
+            ...(whisperer.recipeHash ? { recipeHash: whisperer.recipeHash } : {}),
         }),
         skill: registerSkillWhisperer(api, runtime, config.skillWhisperer, config.decisionModel, diagnostics, recallLedger && {
             writer: recallLedger.writer, dbPathForAgent: memoryDatabasePath,
@@ -773,8 +791,10 @@ export function registerUnblockMemory(api) {
         safety: registerSafetyWhisperer(api, config, diagnostics),
     }, config.whispererTriggers);
     api.on("gateway_stop", () => runtime.close());
-    const searchLedger = recallLedger && config.memoryWhisperer.recipeHash
-        ? { ...recallLedger, recipeHash: config.memoryWhisperer.recipeHash } : recallLedger;
+    // memory_search never applies Brightness, so it never carries a label derived from the whisperer's brightness recipe.
+    const searchRecipeHash = brightness && whisperer.recipeHash === brightnessRecipeHash(brightness.recipe)
+        ? undefined : whisperer.recipeHash;
+    const searchLedger = recallLedger && searchRecipeHash ? { ...recallLedger, recipeHash: searchRecipeHash } : recallLedger;
     api.registerTool((ctx) => createSearchTool(runtime, ctx, config.decisionModel, diagnostics, searchLedger), { names: ["memory_search"] });
     api.registerTool((ctx) => createGetTool(runtime, ctx, recallLedger), { names: ["memory_get"] });
     api.registerTool((ctx) => createSyncSessionsTool(runtime, ctx), {
@@ -796,6 +816,17 @@ export function registerUnblockMemory(api) {
         names: ["memory_update_maintenance_task"],
     });
     registerReviewTools(api, runtime, config, diagnostics);
+    const generationsFor = (cfg, agentId) => async (corpora) => {
+        const { manager, error } = await runtime.getMemorySearchManager({ cfg, agentId });
+        if (!manager)
+            throw new Error(error ?? "memory manager unavailable");
+        return manager.getCollectionGenerations(corpora);
+    };
+    stewardMemory = {
+        getMemorySearchManager: params => runtime.getMemorySearchManager(params),
+        analysisExecutable: Boolean(config.analysis.executable),
+        release: agentId => runtime.closeMemorySearchManager({ agentId }),
+    };
     if (config.steward.enabled && config.steward.deepThought.enabled) {
         const deepThought = {
             runtime,
@@ -825,6 +856,11 @@ export function registerUnblockMemory(api) {
             deepThoughtStores.set(agentId, store);
             return store;
         };
+        // Headless Overnight Thinking investigations: same deps and durable store, explicit audience, no caller session.
+        stewardMemory.deepThought = (agentId, cfg) => {
+            const store = deepThoughtStore(agentId);
+            return { ...deepThought, ...(store ? { store } : {}), getCollectionGenerations: generationsFor(cfg, agentId) };
+        };
         api.registerTool((ctx) => {
             const active = getContext(ctx);
             if (!active)
@@ -834,12 +870,7 @@ export function registerUnblockMemory(api) {
                 ...deepThought,
                 ...(store ? { store } : {}),
                 // Generations are per agent index; any indexed change behind the searched corpora invalidates a cached answer.
-                getCollectionGenerations: async (corpora) => {
-                    const { manager, error } = await runtime.getMemorySearchManager(active);
-                    if (!manager)
-                        throw new Error(error ?? "memory manager unavailable");
-                    return manager.getCollectionGenerations(corpora);
-                },
+                getCollectionGenerations: generationsFor(active.cfg, active.agentId),
                 // audienceKey stays unset: the default isolates cached answers per agent + session key + channel + account +
                 // native channel, so a private DM/session answer is never served to another session.
             });

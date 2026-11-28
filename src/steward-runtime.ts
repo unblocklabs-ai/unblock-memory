@@ -6,15 +6,19 @@ import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plug
 import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
+import type { MemoryAnalysisSummary, MemoryClusterDetail, MemoryClusterList, MemoryClusterSort } from "./analysis.js";
 import type { UnblockMemoryConfig } from "./config.js";
+import { runDeepThoughtInvestigation, type DeepThoughtDeps } from "./deep-thought.js";
 import { DEFAULTS } from "./defaults.js";
 import { EXPECTATION_STATUSES, ExpectationsStore, syncDeterministicExpectations } from "./expectations-store.js";
+import { CRYSTAL_TIERS, listCrystals, MemoryCrystalsStore, summarizeCrystals } from "./memory-crystals.js";
 import { MEMORY_DATABASE } from "./memory-database.js";
 import { runOutcomeLedgerPass, summarizeOutcomeMetrics, type OutcomeLedgerPassResult } from "./outcome-ledger.js";
 import { responseCohort } from "./response-audit.js";
 import { resolveTimezone } from "./session-projector.js";
 import { listOpenBlockers, runCaptainsLogPass, type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
+import { CRYSTALS_KIND, runCrystalsPass, type CrystalsAnalysis, type CrystalsPassOptions, type CrystalsPassResult } from "./steward-crystals.js";
 import {
   resolveExpectationsFromCaptainsLog, runExpectationsPass, type CaptainsLogDecide, type ExpectationsPassOptions, type ExpectationsPassResult,
   type ResolveFromCaptainsLogResult,
@@ -26,6 +30,11 @@ import {
   type PeopleInventoryContext,
   type PeopleShadowPassResult,
 } from "./steward-people-shadow.js";
+import {
+  listShortfallPostmortems, listVoltaireShifts, OVERNIGHT_KIND, overnightLocalParts, runOvernightThinkingPass, summarizeOvernightThinking,
+  withinQuietHours, type OvernightCitation,
+  type OvernightInvestigate, type OvernightThinkingPassOptions, type OvernightThinkingPassResult,
+} from "./steward-overnight.js";
 import type { StewardRunner } from "./steward-runner.js";
 import { WorkStore } from "./work-store.js";
 
@@ -59,6 +68,26 @@ export function activeBackgroundStewards(): number {
 
 /* ═════════════════════════ Gateway orchestrator ═════════════════════════ */
 
+/** Structural subset of `QmdMemoryManager` the Crystals and Overnight passes use. */
+type StewardMemoryManager = {
+  listClusters(limit?: number): Promise<MemoryClusterList>;
+  fetchCluster(params: { clusterId: string; topK?: number; offset?: number; sort?: MemoryClusterSort }): Promise<MemoryClusterDetail>;
+  recluster(options?: undefined, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
+  getCollectionGenerations(corpora?: readonly string[]): Promise<Record<string, number>>;
+  corpusForCollection(collection: string): string | undefined;
+};
+
+/** Memory access for the Crystals and Overnight passes; supplied by the plugin once its QMD runtime exists. */
+export type StewardMemoryAccess = {
+  getMemorySearchManager(params: { cfg: OpenClawConfig; agentId: string }): Promise<{ manager: StewardMemoryManager | null; error?: string }>;
+  /** Only when `analysis.executable` is configured: lets the Crystals pass recluster stale or missing analysis. */
+  analysisExecutable?: boolean;
+  /** Headless `deep_thought` dependencies for one agent; undefined (deep_thought disabled) skips Voltaire/pre-answering. */
+  deepThought?(agentId: string, cfg: OpenClawConfig): DeepThoughtDeps | undefined;
+  /** Close one agent's manager after a CLI `--run`, so its file watchers never keep the CLI process alive. */
+  release?(agentId: string): Promise<void>;
+};
+
 type StewardRuntimeOptions = {
   config: StewardConfig;
   /** Full plugin config (needed by publish-mode People Learning inventory and Captain's Log). */
@@ -77,6 +106,8 @@ type StewardRuntimeOptions = {
   shutdownGraceMs?: number;
   /** Test seam for the post-Captain's-Log d1.2 expectation check (defaults to `@unblocklabs/decisions`). */
   captainsLogDecide?: CaptainsLogDecide;
+  /** Memory runtime bridge (lazy: the plugin builds its runtime after registering the Steward). Absent = Crystals skip. */
+  memory?(): StewardMemoryAccess | undefined;
 };
 
 type CaptainsLogFollowUp = { resolution?: ResolveFromCaptainsLogResult };
@@ -136,11 +167,135 @@ function expectationsPassOptions(
     maxSweepItems: config.maxSweepItems,
     timeoutMs: config.timeoutMs,
     excludeChatTypes: config.excludeChatTypes,
+    workspaceSweepChatTypes: config.workspaceSweepChatTypes,
     extract: config.extract,
     sweep: config.sweep,
     blockerAutoExpireMinutes: config.blockerAutoExpireMinutes,
     // Without a runner the pass is deterministic-only and never reads transcripts.
     ...(runner ? { runner, databasePath: databasePath() } : {}),
+  };
+}
+
+/** Analysis adapter over one agent's memory manager. `recluster` is offered only with a configured analysis worker. */
+function crystalsAnalysis(manager: StewardMemoryManager, analysisExecutable: boolean): CrystalsAnalysis {
+  return {
+    listClusters: limit => manager.listClusters(limit),
+    fetchCluster: ({ clusterId, memberLimit, sort, offset }) => manager.fetchCluster({
+      clusterId, ...(memberLimit !== undefined ? { topK: memberLimit } : {}), ...(sort ? { sort } : {}),
+      ...(offset !== undefined ? { offset } : {}),
+    }),
+    ...(analysisExecutable ? { recluster: (signal?: AbortSignal) => manager.recluster(undefined, signal) } : {}),
+  };
+}
+
+/** One Crystals pass, shared by the background tick and `memory-steward crystals --run`. */
+function crystalsPassOptions(
+  config: StewardConfig["crystals"],
+  base: Pick<CrystalsPassOptions, "agentId" | "workStore" | "owner" | "signal" | "ignoreDueAt">,
+  runner: Pick<StewardRunner, "complete"> | undefined,
+  manager: StewardMemoryManager,
+  analysisExecutable: boolean,
+): CrystalsPassOptions {
+  return {
+    ...base,
+    analysis: crystalsAnalysis(manager, analysisExecutable),
+    corpusForCollection: collection => manager.corpusForCollection(collection),
+    intervalMinutes: config.intervalMinutes,
+    reclusterMinIntervalMinutes: config.reclusterMinIntervalMinutes,
+    // Without a runner nothing can be synthesized, so never pay for a recluster; decay and promotion still run.
+    autoRecluster: config.autoRecluster && runner !== undefined,
+    minClusterSize: config.minClusterSize,
+    maxClustersPerRun: config.maxClustersPerRun,
+    maxMembersPerCluster: config.maxMembersPerCluster,
+    stmStaleAfterMinutes: config.stmStaleAfterMinutes,
+    ltmPromoteMinHelped: config.ltmPromoteMinHelped,
+    ltmPromoteMinHits: config.ltmPromoteMinHits,
+    allowedCorpora: config.allowedCorpora,
+    timeoutMs: config.timeoutMs,
+    ...(runner ? { runner } : {}),
+  };
+}
+
+/** `deep_thought` cites `qmd://<collection>/<path>`; Overnight anchors want the trusted corpus name too. */
+function overnightCitation(citation: { source: string; lines?: string; date?: string; quote: string },
+  manager: StewardMemoryManager): OvernightCitation {
+  const collection = /^qmd:\/\/([^/]+)\//u.exec(citation.source)?.[1];
+  const corpus = collection ? manager.corpusForCollection(collection) : undefined;
+  return { ...citation, ...(corpus ? { corpus } : {}) };
+}
+
+/**
+ * Fresh (cache-bypassing) headless `deep_thought` under the candidate's own audience and corpora. It never saves or
+ * supersedes a `derived_observations` row itself (`skipSave`): the Overnight pass commits the verified answer inside
+ * the same fenced transaction as any Voltaire shift, so a lost fence leaves the prior conclusion untouched.
+ */
+function overnightInvestigate(deps: DeepThoughtDeps, cfg: OpenClawConfig, agentId: string, manager: StewardMemoryManager): OvernightInvestigate {
+  return async ({ question, corpora, audienceKey, signal }) => {
+    const outcome = await runDeepThoughtInvestigation(deps, { cfg, agentId, question, audienceKey, corpora, skipSave: true,
+      ...(signal ? { signal } : {}) });
+    return {
+      status: outcome.status,
+      ...(outcome.answer !== undefined ? { answer: outcome.answer } : {}),
+      ...(outcome.confidence !== undefined ? { confidence: outcome.confidence } : {}),
+      citations: outcome.citations.map(citation => overnightCitation(citation, manager)),
+      openQuestions: outcome.openQuestions,
+      ...(outcome.unverifiedCitationsDropped !== undefined ? { unverifiedCitationsDropped: outcome.unverifiedCitationsDropped } : {}),
+      ...(outcome.collectionGenerations ? { collectionGenerations: outcome.collectionGenerations } : {}),
+      ...(outcome.derivedObservationId ? { derivedObservationId: outcome.derivedObservationId } : {}),
+    };
+  };
+}
+
+/** True when a scheduled run-mode item is claimable now: absent, due, or holding an expired lease. */
+function workDue(store: WorkStore, kind: string, scope: string, nowMs = Date.now()): boolean {
+  const item = store.get(kind, scope);
+  if (!item) return true;
+  if (item.status === "running") return item.leaseUntil <= nowMs;
+  return (item.status === "pending" || item.status === "staged") && item.dueAt <= nowMs;
+}
+
+/** A not-due Crystals tick, reported without ever starting the agent's memory manager. */
+function crystalsNotDue(store: WorkStore, agentId: string): CrystalsPassResult {
+  const item = store.get(CRYSTALS_KIND, agentId);
+  return { status: item?.status === "running" ? "already_running" : "not_due", created: 0, revised: 0, skippedUnchanged: 0,
+    skippedAudience: 0, promoted: 0, retired: 0, synthesized: 0, reclustered: false, errors: [],
+    ...(item ? { nextDueAt: item.dueAt } : {}) };
+}
+
+/** One Overnight Thinking pass, shared by the background tick and `memory-steward overnight --run`. */
+function overnightPassOptions(
+  config: StewardConfig["overnight"],
+  base: Pick<OvernightThinkingPassOptions, "agentId" | "workStore" | "owner" | "timezone" | "signal" | "ignoreDueAt" | "ignoreQuietHours">,
+  runner: Pick<StewardRunner, "complete">,
+  memory: { manager: StewardMemoryManager; deepThought?: DeepThoughtDeps; cfg: OpenClawConfig } | undefined,
+  workspaceDir: () => string,
+): OvernightThinkingPassOptions {
+  const { manager, deepThought, cfg } = memory ?? {};
+  return {
+    ...base,
+    runner,
+    intervalMinutes: config.intervalMinutes,
+    ...(config.quietHoursStartHour !== undefined ? { quietHoursStartHour: config.quietHoursStartHour } : {}),
+    ...(config.quietHoursEndHour !== undefined ? { quietHoursEndHour: config.quietHoursEndHour } : {}),
+    voltaireEnabled: config.voltaireEnabled,
+    postmortemsEnabled: config.postmortemsEnabled,
+    preAnswerEnabled: config.preAnswerEnabled,
+    lookbackDays: config.lookbackDays,
+    minRecurrence: config.minRecurrence,
+    lookaheadMinutes: config.lookaheadMinutes,
+    maxVoltairePerRun: config.maxVoltairePerRun,
+    maxPostmortemsPerRun: config.maxPostmortemsPerRun,
+    maxPreAnswersPerRun: config.maxPreAnswersPerRun,
+    minConfidence: config.minConfidence,
+    recallChatTypes: config.recallChatTypes,
+    saveDerivedObservations: config.saveDerivedObservations,
+    dailyLogChatTypes: config.dailyLogChatTypes,
+    dailyLogCorpora: config.dailyLogCorpora,
+    timeoutMs: config.timeoutMs,
+    // Shifts anchor through the default writer: Memory Crystals' shared `recordCoreMemory` on its `core_memories` table.
+    ...(manager ? { getCollectionGenerations: (corpora: readonly string[]) => manager.getCollectionGenerations(corpora) } : {}),
+    ...(manager && deepThought && cfg ? { investigate: overnightInvestigate(deepThought, cfg, base.agentId, manager) } : {}),
+    ...(config.writeDailyLogNotes ? { dailyLogDir: join(workspaceDir(), "memory") } : {}),
   };
 }
 
@@ -167,8 +322,12 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
   const lastOutcomeLedgerResults = new Map<string, OutcomeLedgerPassResult>();
   const lastExpectationsResults = new Map<string, ExpectationsPassResult>();
   const lastCaptainsLogResolutions = new Map<string, ResolveFromCaptainsLogResult>();
+  const lastCrystalsResults = new Map<string, CrystalsPassResult>();
+  const lastOvernightResults = new Map<string, OvernightThinkingPassResult>();
   const outcomeLedger = options.config.outcomeLedger;
   const expectations = options.config.expectations;
+  const crystals = options.config.crystals;
+  const overnight = options.config.overnight;
   // Same cohort Response Audit writes, so outcomes never mix verdicts from another judge configuration.
   const outcomeCohort = options.pluginConfig?.responseAudit.enabled
     ? responseCohort(options.pluginConfig.responseAudit, options.pluginConfig.decisionModel.model, options.pluginConfig.decisionModel.endpoint)
@@ -190,7 +349,8 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
         if (!signal.aborted) api.logger.warn(`unblock-memory steward: ${String(error)}`);
       }
       try {
-        agents = runner || outcomeLedger.enabled || expectations.enabled ? listAgents(api.config) : [];
+        agents = runner || outcomeLedger.enabled || expectations.enabled || (crystals.enabled && options.memory?.())
+          ? listAgents(api.config) : [];
       } catch (error) {
         // `void tick()` must never surface an unhandled rejection.
         if (!signal.aborted) api.logger.warn(`unblock-memory steward: ${String(error)}`);
@@ -280,6 +440,45 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
               warn: message => api.logger.warn(message) });
             if (followUp?.resolution) lastCaptainsLogResolutions.set(agentId, followUp.resolution);
           }
+          const memory = crystals.enabled || overnight.enabled ? options.memory?.() : undefined;
+          if (crystals.enabled && memory && !signal.aborted) {
+            try {
+              // Never cold-start the agent's QMD manager on a tick where the pass is not due.
+              if (!workDue(store, CRYSTALS_KIND, agentId)) {
+                lastCrystalsResults.set(agentId, crystalsNotDue(store, agentId));
+              } else {
+                // Decay and LTM promotion need no model; synthesis needs the runner.
+                const { manager, error } = await memory.getMemorySearchManager({ cfg: api.config, agentId });
+                if (!manager) throw new Error(error ?? "memory manager unavailable");
+                lastCrystalsResults.set(agentId, await runCrystalsPass(crystalsPassOptions(crystals, { agentId, workStore: store, owner, signal },
+                  runner, manager, memory.analysisExecutable === true)));
+              }
+            } catch (error) {
+              // Isolated: a Crystals fault must not skip this agent's Overnight pass.
+              if (!signal.aborted) api.logger.warn(`unblock-memory steward crystals (${agentId}): ${String(error)}`);
+            }
+          }
+          if (overnight.enabled && runner && !signal.aborted) {
+            try {
+              let manager: StewardMemoryManager | null = null;
+              // The index is only needed for investigations: never start a manager just for post-mortems, nor on a
+              // tick where the pass is not due or falls outside its quiet hours (the pass then reports that itself).
+              const quiet = withinQuietHours(overnightLocalParts(Date.now(), timezone).hour, overnight.quietHoursStartHour,
+                overnight.quietHoursEndHour);
+              if (memory?.deepThought && (overnight.voltaireEnabled || overnight.preAnswerEnabled) && quiet &&
+                  workDue(store, OVERNIGHT_KIND, agentId)) {
+                try { manager = (await memory.getMemorySearchManager({ cfg: api.config, agentId })).manager; }
+                catch { manager = null; } // Post-mortems still run; Voltaire/pre-answering need the index.
+              }
+              const deepThought = manager ? memory?.deepThought?.(agentId, api.config) : undefined;
+              lastOvernightResults.set(agentId, await runOvernightThinkingPass(overnightPassOptions(overnight,
+                { agentId, workStore: store, owner, timezone, signal }, runner,
+                manager ? { manager, cfg: api.config, ...(deepThought ? { deepThought } : {}) } : undefined,
+                () => workspaceDirForAgent(api.config, agentId))));
+            } catch (error) {
+              if (!signal.aborted) api.logger.warn(`unblock-memory steward overnight (${agentId}): ${String(error)}`);
+            }
+          }
         } catch (error) {
           if (!signal.aborted) api.logger.warn(`unblock-memory steward (${agentId}): ${String(error)}`);
         } finally {
@@ -307,7 +506,8 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
   };
 
   const enabled = api.registrationMode !== "cli-metadata" && options.config.enabled &&
-    (options.config.peopleShadow.enabled || options.config.captainsLog.enabled || outcomeLedger.enabled || expectations.enabled);
+    (options.config.peopleShadow.enabled || options.config.captainsLog.enabled || outcomeLedger.enabled || expectations.enabled ||
+      crystals.enabled || overnight.enabled);
   if (enabled) {
     api.on("gateway_start", () => {
       if (timer) clearInterval(timer);
@@ -317,6 +517,8 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
       if (options.config.captainsLog.enabled) intervals.push(options.config.captainsLog.intervalMinutes);
       if (outcomeLedger.enabled) intervals.push(outcomeLedger.intervalMinutes);
       if (expectations.enabled) intervals.push(expectations.intervalMinutes);
+      if (crystals.enabled) intervals.push(crystals.intervalMinutes);
+      if (overnight.enabled) intervals.push(overnight.intervalMinutes);
       const intervalMs = Math.max(1, Math.min(...intervals)) * 60_000;
       timer = setInterval(() => { void tick(); }, intervalMs);
       timer.unref();
@@ -333,6 +535,8 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
     lastOutcomeLedgerResults: () => new Map(lastOutcomeLedgerResults),
     lastExpectationsResults: () => new Map(lastExpectationsResults),
     lastCaptainsLogResolutions: () => new Map(lastCaptainsLogResolutions),
+    lastCrystalsResults: () => new Map(lastCrystalsResults),
+    lastOvernightResults: () => new Map(lastOvernightResults),
     enabled,
   };
 }
@@ -376,7 +580,7 @@ function registerStewardCli(
     } finally { db.close(); }
   };
   api.registerCli(({ program, config: cfg }) => {
-    const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, expectations, re-drive");
+    const root = program.command("memory-steward").description("Steward background work: status, People report, Captain's Log, expectations, crystals, overnight, re-drive");
     root.command("status").description("Work item counts by kind/status plus the quarantined backlog")
       .option("--agent <id>", "Agent id", "main").option("--kind <kind>", "Filter one work kind")
       .action((opts: { agent: string; kind?: string }) => {
@@ -391,6 +595,8 @@ function registerStewardCli(
             captainsLog: options.config.captainsLog.enabled,
             outcomeLedger: options.config.outcomeLedger.enabled,
             expectations: options.config.expectations.enabled,
+            crystals: options.config.crystals.enabled,
+            overnight: options.config.overnight.enabled,
             counts: summarize(items),
             quarantined: items.filter(item => item.status === "quarantined")
               .map(({ kind, scope, strikes, lastError }) => ({ kind, scope, strikes, lastError })),
@@ -503,9 +709,103 @@ function registerStewardCli(
         const report = ExpectationsStore.readOnly(dbPath, undefined, read) ?? withReadOnlyDb(dbPath, read);
         console.log(JSON.stringify({ agentId: opts.agent, ...(status ? { status } : {}), ...report }, null, 2));
       });
+    const nonNegativeLimit = (value: string) => {
+      const limit = Number(value);
+      if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("--limit must be a non-negative integer");
+      return limit;
+    };
+    /** CLI `--run` only: borrow one agent's manager, always releasing it afterwards. */
+    const withCliManager = async <T>(agentId: string, needed: (memory: StewardMemoryAccess) => boolean,
+      fn: (manager: StewardMemoryManager | null, memory?: StewardMemoryAccess) => Promise<T>) => {
+      const memory = options.memory?.();
+      let manager: StewardMemoryManager | null = null;
+      try {
+        if (memory && needed(memory)) {
+          try { manager = (await memory.getMemorySearchManager({ cfg, agentId })).manager; } catch { manager = null; }
+        }
+        return await fn(manager, memory);
+      } finally {
+        if (manager) { try { await memory?.release?.(agentId); } catch {} }
+      }
+    };
+    root.command("crystals").description("Memory Crystals by tier with core-memory counts (read-only); --run triggers one Crystals pass now")
+      .option("--agent <id>", "Agent id", "main")
+      .option("--tier <tier>", `Filter one tier (${CRYSTAL_TIERS.join(", ")})`)
+      .option("--limit <n>", "Maximum crystals (0 = unlimited)", "0")
+      .option("--run", "Run one Crystals pass for this agent now and print its result", false)
+      .action(async (opts: { agent: string; tier?: string; limit: string; run?: boolean }) => {
+        const limit = nonNegativeLimit(opts.limit);
+        const tier = opts.tier === undefined ? undefined : CRYSTAL_TIERS.find(value => value === opts.tier?.trim());
+        if (opts.tier !== undefined && !tier) throw new Error(`--tier must be one of: ${CRYSTAL_TIERS.join(", ")}`);
+        const dbPath = knownAgent(cfg, opts.agent);
+        if (opts.run) {
+          await withCliManager(opts.agent, () => true, async (manager, memory) => {
+            if (!manager) {
+              console.log(JSON.stringify({ status: "unavailable", reason: "memory index unavailable for this agent" }));
+              process.exitCode = 1;
+              return;
+            }
+            let runner: Pick<StewardRunner, "complete"> | undefined;
+            try { runner = options.createRunner(); }
+            catch (error) { console.warn(`unblock-memory steward runner unavailable; running decay/promotion only: ${String(error)}`); }
+            const store = openWorkStore(dbPath);
+            try {
+              const result = await runCrystalsPass(crystalsPassOptions(options.config.crystals, {
+                agentId: opts.agent, workStore: store, owner: `steward-cli:${process.pid}:${randomUUID()}`, ignoreDueAt: true,
+              }, runner, manager, memory?.analysisExecutable === true));
+              console.log(JSON.stringify(result, null, 2));
+              if (result.status === "failed") process.exitCode = 1;
+            } finally { store.close(); }
+          });
+          return;
+        }
+        // Never creates or migrates an absent database (or one without the crystal tables).
+        const report = MemoryCrystalsStore.readOnly(dbPath, undefined, db => ({
+          summary: summarizeCrystals(db, opts.agent),
+          crystals: listCrystals(db, { agentId: opts.agent, ...(tier ? { tier } : {}), limit }),
+        })) ?? { summary: summarizeCrystals(dbPath, opts.agent), crystals: [] };
+        console.log(JSON.stringify({ agentId: opts.agent, ...(tier ? { tier } : {}), ...report }, null, 2));
+      });
+    root.command("overnight").description("Voltaire shifts and shortfall post-mortems (read-only); --run triggers one Overnight pass now")
+      .option("--agent <id>", "Agent id", "main")
+      .option("--limit <n>", "Maximum shifts and post-mortems each (0 = unlimited)", "0")
+      .option("--run", "Run one Overnight Thinking pass now (ignores the schedule and quiet hours)", false)
+      .action(async (opts: { agent: string; limit: string; run?: boolean }) => {
+        const limit = nonNegativeLimit(opts.limit);
+        const dbPath = knownAgent(cfg, opts.agent);
+        if (opts.run) {
+          const runner = options.createRunner();
+          if (!runner) { console.log(JSON.stringify({ status: "disabled" })); process.exitCode = 1; return; }
+          const overnight = options.config.overnight;
+          // Investigations need the index; a post-mortem-only run never starts a manager.
+          const needsIndex = (memory: StewardMemoryAccess) =>
+            Boolean(memory.deepThought) && (overnight.voltaireEnabled || overnight.preAnswerEnabled);
+          await withCliManager(opts.agent, needsIndex, async (manager, memory) => {
+            const deepThought = manager ? memory?.deepThought?.(opts.agent, cfg) : undefined;
+            const store = openWorkStore(dbPath);
+            try {
+              const result = await runOvernightThinkingPass(overnightPassOptions(overnight, {
+                agentId: opts.agent, workStore: store, owner: `steward-cli:${process.pid}:${randomUUID()}`,
+                timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()), ignoreDueAt: true, ignoreQuietHours: true,
+              }, runner, manager ? { manager, cfg, ...(deepThought ? { deepThought } : {}) } : undefined,
+              () => workspaceDirForAgent(cfg, opts.agent)));
+              console.log(JSON.stringify(result, null, 2));
+              if (result.status === "failed") process.exitCode = 1;
+            } finally { store.close(); }
+          });
+          return;
+        }
+        // Each reader opens an existing file read-only and never creates or migrates anything.
+        console.log(JSON.stringify({
+          agentId: opts.agent,
+          summary: summarizeOvernightThinking(dbPath, { agentId: opts.agent }),
+          shifts: listVoltaireShifts(dbPath, { agentId: opts.agent, limit }),
+          postmortems: listShortfallPostmortems(dbPath, { agentId: opts.agent, limit }),
+        }, null, 2));
+      });
     root.command("requeue").description("Explicitly re-drive one quarantined or completed work item")
       .requiredOption("--scope <scope>", "Exact work scope")
-      .option("--kind <kind>", "Work kind (e.g. people_shadow, people_interactions, captains_log, outcome_ledger, expectations)", PEOPLE_SHADOW_KIND)
+      .option("--kind <kind>", "Work kind (e.g. people_shadow, people_interactions, captains_log, outcome_ledger, expectations, memory_crystals, overnight_thinking)", PEOPLE_SHADOW_KIND)
       .option("--agent <id>", "Agent id", "main")
       .action((opts: { agent: string; kind: string; scope: string }) => {
         const dbPath = knownAgent(cfg, opts.agent);
@@ -519,5 +819,5 @@ function registerStewardCli(
           console.log(JSON.stringify({ status: "requeued", item: store.get(opts.kind, opts.scope) }, null, 2));
         });
       });
-  }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report, Captain's Log, outcomes, blockers and expectations", hasSubcommands: true }] });
+  }, { descriptors: [{ name: "memory-steward", description: "Steward background work status, People report, Captain's Log, outcomes, blockers, expectations, crystals and overnight thinking", hasSubcommands: true }] });
 }

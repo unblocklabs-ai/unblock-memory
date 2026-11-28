@@ -56,7 +56,13 @@ type MemoryAnalysisMember = {
   eventTimeSource: string;
   contentFingerprint: string;
   text: string;
+  /** Display aliases, capped per member and per page. Never use for access control. */
   sourcePaths: string[];
+  /** UTF-16 offset/length of this chunk inside the indexed document (`content.doc`). */
+  chunkPos: number;
+  chunkLen: number;
+  /** EVERY distinct active `documents.collection` holding this hash (uncapped): the ACL input. */
+  sourceCollections: string[];
 };
 
 export type MemoryClusterSort =
@@ -405,6 +411,15 @@ function sourcePaths(db: AnalysisDatabase, hash: string, limit: number): string[
   `).all<SourcePathRow>(hash, limit).map((row) => `qmd://${row.collection}/${row.path}`);
 }
 
+function sourceCollections(db: AnalysisDatabase, hash: string): string[] {
+  return db.prepare(`
+    SELECT DISTINCT collection
+    FROM documents
+    WHERE hash = ? AND active = 1
+    ORDER BY collection
+  `).all<{ collection: string }>(hash).map((row) => row.collection);
+}
+
 function byteSlice(text: string, maxBytes: number): string {
   const bytes = Buffer.from(text);
   if (bytes.length <= maxBytes) return text;
@@ -543,6 +558,9 @@ function members(
       contentFingerprint: chunkFingerprint(fullText),
       text,
       sourcePaths: aliases,
+      chunkPos: row.pos,
+      chunkLen: row.chunk_len,
+      sourceCollections: sourceCollections(db, row.hash),
     };
   });
 }

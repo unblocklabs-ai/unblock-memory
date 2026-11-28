@@ -8,6 +8,7 @@ import { type MyTurnConfig } from "./my-turn.js";
 import { type RecallLedgerConfig } from "./recall-ledger.js";
 import { type StewardConfig } from "./steward-config.js";
 import { type ExpectationsWhispererConfig } from "./expectations-whisperer.js";
+import { type BrightnessConfig } from "./memory-brightness.js";
 export type FileCorpusConfig = {
     name: string;
     kind: "files";
@@ -113,6 +114,21 @@ export type UnblockMemoryConfig = {
         derivedMinTokenOverlap?: number;
         /** Minimum shared meaningful tokens for a non-exact question match. Resolved default: `2`. */
         derivedMinSharedTokens?: number;
+        /**
+         * Brightness A/B recipe: re-orders usefulness-qualified finalists by recall/outcome evidence. Resolved default:
+         * `recipe: "off"` (no lookup). A non-`off` recipe also stamps `brightness:<recipe>` as `recipeHash` unless one is set.
+         */
+        brightness?: BrightnessConfig;
+        /** Whisper active Memory Crystals (`memory_crystals`) matching the turn. Resolved default: `true`. */
+        crystalsEnabled?: boolean;
+        /** Crystals whispered per turn. Resolved default: `2`; `0` = unlimited. */
+        crystalMaxHints?: number;
+        /** Minimum overlap coefficient (0..1) between the turn and a crystal's title + summary. Resolved default: `0.35`. */
+        crystalMinTokenOverlap?: number;
+        /** Minimum shared meaningful tokens for a crystal match. Resolved default: `2`. */
+        crystalMinSharedTokens?: number;
+        /** Additive rank boost for long-term (`ltm`) crystals. Resolved default: `0.01`. */
+        crystalLtmRankBoost?: number;
     };
     safetyWhisperer: SafetyWhispererConfig;
     /** On by default: open commitments, blockers and todos from the `expectations` table (read-only, zero model cost). */

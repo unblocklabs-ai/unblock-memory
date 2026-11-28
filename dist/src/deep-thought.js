@@ -748,7 +748,10 @@ async function runDeepThought(active, params, deps, signal) {
         const citationsVerified = finalOutcome.citations.length > 0 && !finalOutcome.unverifiedCitationsDropped;
         const snapshot = generations ?? await generationsReady;
         const saveKey = keyFor(snapshot);
-        if (store && saveKey && snapshot && finalOutcome.status === "complete" && nonBlank(finalOutcome.answer) &&
+        if (deps.reportGenerations && snapshot && Object.keys(snapshot).length) {
+            finalOutcome = { ...finalOutcome, collectionGenerations: { ...snapshot } };
+        }
+        if (!deps.skipSave && store && saveKey && snapshot && finalOutcome.status === "complete" && nonBlank(finalOutcome.answer) &&
             finalOutcome.confidence && citationsVerified && !usedPeopleLookup) {
             const saved = safely(() => store.saveDerivedObservation({
                 ...saveKey, collectionGenerations: snapshot, answer: finalOutcome.answer, confidence: finalOutcome.confidence,
@@ -778,6 +781,31 @@ async function runDeepThought(active, params, deps, signal) {
         return syncOutcome;
     }
     return waited.outcome;
+}
+/**
+ * Headless investigation for background callers (the Overnight Thinking Steward): no tool-call wrapper and no caller
+ * session. It always investigates fresh (`bypassCache`), waits for completion (no `jobId` hand-off), and saves a
+ * verified answer under exactly `audienceKey` + `corpora` — unless `skipSave`, in which case nothing is persisted or
+ * superseded and the caller saves the answer itself (with the returned `collectionGenerations` and
+ * `unverifiedCitationsDropped`) inside its own fenced commit. With no caller origin, `lookup_person` is never offered.
+ */
+export async function runDeepThoughtInvestigation(deps, request) {
+    const audienceKey = nonBlank(request.audienceKey);
+    const question = nonBlank(request.question);
+    if (!audienceKey || !question) {
+        return { status: "invalid_request", citations: [], openQuestions: [], hopsUsed: 0, toolCallsUsed: 0, elapsedMs: 0,
+            error: "A headless investigation needs a question and an audienceKey" };
+    }
+    const active = { cfg: request.cfg, agentId: request.agentId, requestContext: {} };
+    const params = {
+        question, fresh: true,
+        ...(request.corpora?.length ? { corpora: [...request.corpora] } : {}),
+        ...(nonBlank(request.focus) ? { focus: request.focus.trim() } : {}),
+    };
+    return runDeepThought(active, params, {
+        ...deps, audienceKey, bypassCache: true, reportGenerations: true, ...(request.skipSave ? { skipSave: true } : {}),
+        config: { ...deps.config, syncWaitMs: 0 },
+    }, request.signal);
 }
 /** Tool factory: `api.registerTool((ctx) => createDeepThoughtTool(ctx, deps), { names: ["deep_thought"] })`. */
 export function createDeepThoughtTool(ctx, deps) {

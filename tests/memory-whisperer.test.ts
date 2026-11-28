@@ -594,6 +594,8 @@ test("memory whisperer requires explicit, known non-skill corpora and bounded co
     enabled: false, complementaryHints: false, corpora: [], minUsefulness: 0.5, maxHints: 3, cooldownTurns: 10, timeoutMs: 5000,
     mode: "v2", api: { endpoint: "" }, recipeHash: "default", derivedObservations: true,
     derivedMaxHints: 2, derivedMinTokenOverlap: 0.45, derivedMinSharedTokens: 2,
+    brightness: { recipe: "off", weight: 0.08, decayRate: 0.5, lookbackDays: 90, maxBoost: 0.15 },
+    crystalsEnabled: true, crystalMaxHints: 2, crystalMinTokenOverlap: 0.35, crystalMinSharedTokens: 2, crystalLtmRankBoost: 0.01,
   });
   assert.equal(resolveConfig({ memoryWhisperer: {} }).memoryWhisperer.minUsefulness, 0.5);
   assert.equal(resolveConfig({ memoryWhisperer: { minUsefulness: 0.9, maxHints: 3 } }).memoryWhisperer.minUsefulness, 0.9);
@@ -610,6 +612,21 @@ test("memory whisperer requires explicit, known non-skill corpora and bounded co
     { mode: "v3" }, { mode: "" }, { mode: 2 }]) {
     assert.throws(() => resolveConfig({ memoryWhisperer: value }), /memoryWhisperer/);
   }
+});
+
+test("memoryWhisperer.corpora accepts \"extracted\" only when extraction is enabled AND published", () => {
+  const sessionCorpora = [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "sessions", kind: "sessions", chatTypes: ["channel"] }];
+  const whisper = { enabled: true, corpora: ["memory", "extracted"] };
+  assert.deepEqual(resolveConfig({ corpora: sessionCorpora, extraction: { enabled: true, publish: true, chatTypes: ["channel"] },
+    memoryWhisperer: whisper }).memoryWhisperer.corpora, ["memory", "extracted"]);
+  for (const extraction of [undefined, { enabled: true, publish: false, chatTypes: ["channel"] }, { enabled: false, publish: true }]) {
+    assert.throws(() => resolveConfig({ corpora: sessionCorpora, ...(extraction ? { extraction } : {}), memoryWhisperer: whisper }),
+      /memoryWhisperer\.corpora may list "extracted" only when extraction\.enabled and extraction\.publish are both true/u,
+      JSON.stringify(extraction));
+  }
+  // A user corpus literally named "extracted" (allowed while extraction is off) is still an ordinary configured corpus.
+  assert.deepEqual(resolveConfig({ corpora: [{ name: "memory", kind: "files", paths: ["MEMORY.md"] }, { name: "extracted", kind: "files", paths: ["X.md"] }],
+    memoryWhisperer: { enabled: true, corpora: ["extracted"] } }).memoryWhisperer.corpora, ["extracted"]);
 });
 
 test("omitting the query endpoint uses deterministic retrieval without a generator request", async t => {
@@ -631,6 +648,25 @@ test("omitting the query endpoint uses deterministic retrieval without a generat
   assert.match(h.searches[0]?.query ?? "", /deploy/i);
 });
 
+
+test("recorded whisperer origin infers direct for untyped main DM keys but never for cron/subagent keys", async t => {
+  t.mock.method(globalThis, "fetch", async () => response(0.95));
+  const { records, sink } = ledgerSink();
+  const h = harness(undefined, { config: { api: { endpoint: "" } }, recallLedger: sink });
+  t.after(h.stop);
+  const keys = ["agent:bill:main", "main", "agent:bill:slack:dm:u1", "agent:bill:slack:group:g1", "agent:bill:cron:nightly",
+    "agent:bill:subagent:abc"];
+  for (const [index, sessionKey] of keys.entries()) {
+    await h.before(event, { ...context, sessionId: `s-type-${index}`, sessionKey, runId: `r-type-${index}` });
+  }
+  const recorded = (records as unknown as { kind: string; record: { sessionKey?: string; chatType?: string } }[])
+    .filter(entry => entry.kind === "query").map(entry => [entry.record.sessionKey, entry.record.chatType ?? null]);
+  assert.deepEqual(recorded, [["agent:bill:main", "direct"], ["main", "direct"], ["agent:bill:slack:dm:u1", "direct"],
+    ["agent:bill:slack:group:g1", "group"], ["agent:bill:cron:nightly", null], ["agent:bill:subagent:abc", null]]);
+  // An explicit host chatType still wins over the session key.
+  await h.before(event, { ...context, sessionId: "s-host", sessionKey: "agent:bill:main", runId: "r-host", chatType: "channel" } as Context);
+  assert.equal((records.at(-1) as unknown as { record: { chatType?: string } }).record.chatType, "channel");
+});
 
 test("isolated judges rank useful hits, enforce threshold, deduplicate and inject original sources", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async (...[_url, init]: Parameters<typeof globalThis.fetch>) => {

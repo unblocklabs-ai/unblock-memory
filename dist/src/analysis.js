@@ -246,6 +246,14 @@ function sourcePaths(db, hash, limit) {
     LIMIT ?
   `).all(hash, limit).map((row) => `qmd://${row.collection}/${row.path}`);
 }
+function sourceCollections(db, hash) {
+    return db.prepare(`
+    SELECT DISTINCT collection
+    FROM documents
+    WHERE hash = ? AND active = 1
+    ORDER BY collection
+  `).all(hash).map((row) => row.collection);
+}
 function byteSlice(text, maxBytes) {
     const bytes = Buffer.from(text);
     if (bytes.length <= maxBytes)
@@ -362,6 +370,9 @@ function members(db, runId, clusterId, limit, offset, sort, temporal) {
             contentFingerprint: chunkFingerprint(fullText),
             text,
             sourcePaths: aliases,
+            chunkPos: row.pos,
+            chunkLen: row.chunk_len,
+            sourceCollections: sourceCollections(db, row.hash),
         };
     });
 }

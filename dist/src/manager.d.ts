@@ -151,6 +151,14 @@ export declare class QmdMemoryManager implements MemorySearchManagerContract {
         signal?: AbortSignal;
         beforeWrite?: () => void;
     }): Promise<SessionSyncResult>;
+    /** Trusted corpus name behind a native QMD collection id (`source-…`); skills and unknown ids are `undefined`. */
+    corpusForCollection(collection: string): string | undefined;
+    /**
+     * Runs the external HDBSCAN worker OUTSIDE `#operationChain`: only the short preflight and the result read are
+     * queued, so foreground `memory_search` / Memory Whisperer turns never wait behind a minutes-long child process.
+     * Concurrent reclusters still run one at a time (`#reclusterInFlight`), and `close()` waits for a running worker.
+     * Input that changed while the worker ran (a sync marked analysis stale) leaves the new run marked stale too.
+     */
     recluster(options?: MemoryReclusterOptions, signal?: AbortSignal): Promise<MemoryAnalysisSummary>;
     listClusters(limit?: number): Promise<MemoryClusterList>;
     reviewClaim(params: Omit<Parameters<typeof reviewIndexedClaim>[0], "db" | "sources" | "read"> & {

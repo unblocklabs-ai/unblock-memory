@@ -615,3 +615,25 @@ test("activity-triggered sweep: a 10-minute-old undated item is swept as soon as
   assert.equal((await f.run()).status, "empty");
   assert.equal(f.prompts.length, calls);
 });
+
+test("workspaceSweepChatTypes: the default sweeps workspace items against channels only; explicit types opt groups and DMs in", async t => {
+  const sweepTexts = async (overrides: Partial<ExpectationsPassOptions>) => {
+    const f = fixture(t, { sweep: () => ({ judgments: [] }) });
+    f.seed("public", "CHANNEL_MARKER Acme invoices render correctly now.", "channel");
+    f.seed("mpdm", "GROUP_MARKER the Acme invoice fix shipped.", "group");
+    f.seed("dm", "DIRECT_MARKER I shipped the Acme invoice fix.", "direct");
+    f.expect({ dedupKey: "workspace-invoice" });
+    const result = await f.run({ extract: false, sweepAfterMinutes: 0, excludeChatTypes: [], ...overrides });
+    assert.ok(result.status === "completed" || result.status === "empty", JSON.stringify(result));
+    return f.prompts.filter(entry => entry.kind === "sweep").map(entry => JSON.stringify(entry.prompt)).join("\n");
+  };
+  const byDefault = await sweepTexts({});
+  assert.match(byDefault, /CHANNEL_MARKER/u);
+  assert.doesNotMatch(byDefault, /GROUP_MARKER|DIRECT_MARKER/u, "default [\"channel\"]: MPDMs and DMs never reach workspace sweeps");
+  const optedIn = await sweepTexts({ workspaceSweepChatTypes: ["channel", "group", "direct"] });
+  for (const marker of ["CHANNEL_MARKER", "GROUP_MARKER", "DIRECT_MARKER"]) assert.match(optedIn, new RegExp(marker, "u"));
+  const directOnly = await sweepTexts({ workspaceSweepChatTypes: ["direct"] });
+  assert.match(directOnly, /DIRECT_MARKER/u);
+  assert.doesNotMatch(directOnly, /CHANNEL_MARKER|GROUP_MARKER/u);
+  assert.equal(await sweepTexts({ workspaceSweepChatTypes: [] }), "", "[] = workspace items are never swept from sessions");
+});

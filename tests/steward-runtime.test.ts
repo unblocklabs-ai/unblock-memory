@@ -7,12 +7,14 @@ import test, { type TestContext } from "node:test";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "../src/config.js";
 import { listExpectations } from "../src/expectations-store.js";
+import { MemoryCrystalsStore } from "../src/memory-crystals.js";
+import { OutcomeLedgerStore } from "../src/outcome-ledger.js";
 import { OUTCOME_LEDGER_KIND } from "../src/outcome-ledger.js";
 import { writeRecallBatch, type RecallLedgerEvent } from "../src/recall-ledger.js";
 import { resolveStewardConfig } from "../src/steward-config.js";
 import { type CaptainsLogDecide } from "../src/steward-expectations.js";
-import { createStewardRunner } from "../src/steward-runner.js";
-import { registerStewardRuntime } from "../src/steward-runtime.js";
+import { createStewardRunner, type StewardCompleteRequest, type StewardCompleteResult, type StewardRunner } from "../src/steward-runner.js";
+import { registerStewardRuntime, type StewardMemoryAccess } from "../src/steward-runtime.js";
 import { WorkStore } from "../src/work-store.js";
 import { createAgentDatabase, insertSession } from "./helpers/session-database.js";
 
@@ -125,7 +127,7 @@ test("the default-on Outcome Ledger runs without a model runner and gates on its
 
 test("blockers lists open [BLOCKED] entries and validates its limit; disabling the ledger skips it", async t => {
   const h = harness(t, { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
-    expectations: { enabled: false } });
+    expectations: { enabled: false }, crystals: { enabled: false }, overnight: { enabled: false } });
   assert.equal(h.runtime.enabled, false);
   assert.deepEqual(await h.run("blockers", "--agent", "main"), { agentId: "main", count: 0, blockers: [] });
   await assert.rejects(h.run("blockers", "--limit", "-1"), /--limit/u);
@@ -342,4 +344,178 @@ test("a d1.2 failure only warns; Captain's Log still appends and mirrors, and di
   assert.equal(off.runtime.lastCaptainsLogResults().get("main")?.status, "appended");
   assert.equal(calls, 1, "captainsLogDecisionResolve=false never calls d1.2");
   assert.deepEqual(off.warnings, []);
+});
+
+/* ───────────── Pillar 1: Memory Crystals and Overnight Thinking ───────────── */
+
+/** A QMD manager stand-in with no analysis run yet: the Crystals pass then only decays and promotes. */
+function fakeMemory() {
+  const calls = { managers: 0, released: [] as string[], reclusters: 0 };
+  const memory: StewardMemoryAccess = {
+    async getMemorySearchManager() {
+      calls.managers += 1;
+      return { manager: {
+        async listClusters() { return { status: "not_analyzed" as const, clusters: [], noise: null, stale: false, staleSince: null, analyzedAt: null }; },
+        async fetchCluster() { return { status: "not_analyzed" as const, stale: false, staleSince: null, analyzedAt: null }; },
+        async recluster() { calls.reclusters += 1; throw new Error("unexpected recluster"); },
+        async getCollectionGenerations() { return {}; },
+        corpusForCollection: () => undefined,
+      } };
+    },
+    async release(agentId) { calls.released.push(agentId); },
+  };
+  return { memory, calls };
+}
+
+function seedCrystal(dbPath: string, id: string, tier: "stm" | "ltm" = "stm") {
+  const store = new MemoryCrystalsStore(dbPath);
+  try {
+    store.upsertCrystal({ id, agentId: "main", tier, audienceKey: "workspace", corpora: ["memory"], inputDigest: `digest-${id}`,
+      title: `Crystal ${id}`, summary: "A durable synthesis.", staleAfterMs: tier === "stm" ? Date.now() + HOUR : null,
+      members: [{ corpus: "memory", sourcePath: "qmd://memory/a.md", docHash: "doc-a", chunkPos: 0, chunkLen: 10, quoteSha256: "b".repeat(64) }] });
+  } finally { store.close(); }
+}
+
+test("memory-steward crystals is read-only (never creating a database) and --run triggers one Crystals pass now", async t => {
+  const fake = fakeMemory();
+  const h = harness(t, { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
+    expectations: { enabled: false }, overnight: { enabled: false } }, () => ({ memory: () => fake.memory }));
+  assert.equal(h.runtime.enabled, true, "the default-on Crystals pass alone enables the background loop");
+  const empty = await h.run("crystals", "--agent", "main");
+  assert.deepEqual(empty.crystals, []);
+  assert.equal((empty.summary as { total: number }).total, 0);
+  assert.equal(existsSync(h.dbPath), false, "reporting must not create the database");
+  // An existing database without the crystal tables is neither migrated nor an error.
+  const raw = new DatabaseSync(h.dbPath);
+  raw.exec("CREATE TABLE unrelated (id INTEGER)");
+  raw.close();
+  assert.deepEqual((await h.run("crystals")).crystals, []);
+  const check = new DatabaseSync(h.dbPath, { readOnly: true });
+  assert.deepEqual(check.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(row => row.name), ["unrelated"]);
+  check.close();
+  rmSync(h.dbPath);
+  await assert.rejects(h.run("crystals", "--tier", "mid"), /--tier/u);
+  await assert.rejects(h.run("crystals", "--limit", "-1"), /--limit/u);
+  await assert.rejects(h.run("crystals", "--agent", "ghost"), /Unknown steward agent/u);
+
+  seedCrystal(h.dbPath, "c-stm");
+  seedCrystal(h.dbPath, "c-ltm", "ltm");
+  const listed = await h.run("crystals", "--tier", "ltm");
+  assert.equal(listed.tier, "ltm");
+  assert.deepEqual((listed.crystals as { id: string }[]).map(crystal => crystal.id), ["c-ltm"]);
+  assert.deepEqual((listed.summary as { activeByTier: unknown }).activeByTier, { stm: 1, ltm: 1 });
+  assert.equal(((await h.run("crystals", "--limit", "1")).crystals as unknown[]).length, 1);
+
+  // --run: no runner and no analysis yet, so a deterministic decay/promotion pass, and the CLI releases the manager.
+  const ran = await h.run("crystals", "--run", "true");
+  assert.equal(ran.status, "ok", JSON.stringify(ran));
+  assert.equal(ran.reclustered, false);
+  assert.deepEqual(fake.calls.released, ["main"]);
+  assert.equal(fake.calls.reclusters, 0, "recluster is never offered without analysis.executable");
+  assert.equal((await h.run("crystals", "--run", "true")).status, "ok", "--run ignores the schedule");
+
+  // The background tick runs it too, isolated and on its own schedule — and never cold-starts a manager when not due.
+  const managersBefore = fake.calls.managers;
+  await h.runtime.tick();
+  assert.equal(h.runtime.lastCrystalsResults().get("main")?.status, "not_due");
+  assert.equal(fake.calls.managers, managersBefore, "a not-due tick never opens the agent's memory manager");
+  assert.deepEqual(h.warnings, []);
+  const status = await h.run("status");
+  assert.equal(status.crystals, true);
+  assert.equal(status.overnight, false);
+});
+
+test("memory-steward crystals --run reports an unavailable memory index; the tick skips Crystals without one", async t => {
+  const h = harness(t, { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
+    expectations: { enabled: false }, overnight: { enabled: false } });
+  const exitCode = process.exitCode;
+  t.after(() => { process.exitCode = exitCode; });
+  assert.deepEqual(await h.run("crystals", "--run", "true"), { status: "unavailable", reason: "memory index unavailable for this agent" });
+  await h.runtime.tick();
+  assert.equal(h.runtime.lastCrystalsResults().size, 0);
+  assert.equal(existsSync(h.dbPath), false);
+});
+
+function postmortemRunner(calls: string[]): Pick<StewardRunner, "complete"> {
+  return {
+    async complete<T>(request: StewardCompleteRequest<T>): Promise<StewardCompleteResult<T>> {
+      calls.push(request.purpose);
+      return { ok: true, backend: "responses_api", usage: { requests: 1 },
+        data: { rootCause: "stale_memory", diagnosis: "An outdated note was surfaced.", recommendedFix: "Retire memory/old.md.",
+          confidence: "high" } as T };
+    },
+  };
+}
+
+test("memory-steward overnight is read-only (never creating a database) and --run ignores the schedule and quiet hours", async t => {
+  const calls: string[] = [];
+  let runnerAvailable = false;
+  const hourNow = new Date().getHours();
+  // A quiet window that excludes the current hour: the scheduled pass must wait, an operator --run must not.
+  const quiet = { quietHoursStartHour: (hourNow + 2) % 24, quietHoursEndHour: (hourNow + 3) % 24 };
+  const h = harness(t, { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
+    expectations: { enabled: false }, crystals: { enabled: false }, overnight: quiet },
+  () => ({ createRunner: () => runnerAvailable ? postmortemRunner(calls) : undefined }));
+  const exitCode = process.exitCode;
+  t.after(() => { process.exitCode = exitCode; });
+  const empty = await h.run("overnight", "--agent", "main");
+  assert.deepEqual(empty, { agentId: "main", summary: { shifts: 0, shiftsByType: {}, postmortems: 0, postmortemsByRootCause: {} },
+    shifts: [], postmortems: [] });
+  assert.equal(existsSync(h.dbPath), false, "reporting must not create the database");
+  await assert.rejects(h.run("overnight", "--limit", "x"), /--limit/u);
+  assert.deepEqual(await h.run("overnight", "--run", "true"), { status: "disabled" }, "the pass needs the Steward runner");
+  assert.equal(existsSync(h.dbPath), false);
+
+  runnerAvailable = true;
+  const ledger = new OutcomeLedgerStore(h.dbPath);
+  try {
+    ledger.db.prepare(`INSERT INTO memory_outcomes (id,agent_id,subject_kind,subject_id,verdict,confidence,evidence_turn_id,signals_json,measured_at)
+      VALUES ('o-hurt','main','memory_hit','qmd://memory/old.md','hurt',0.9,'turn-1','{}',?)`).run(Date.now() - HOUR);
+  } finally { ledger.close(); }
+  assert.equal(((await h.run("overnight")).summary as { pendingHurtOutcomes?: number }).pendingHurtOutcomes, 1);
+
+  await h.runtime.tick();
+  assert.equal(h.runtime.lastOvernightResults().get("main")?.status, "outside_quiet_hours");
+  const ran = await h.run("overnight", "--run", "true");
+  assert.equal(ran.status, "completed", JSON.stringify(ran));
+  assert.deepEqual(ran.postmortems, { candidates: 1, analyzed: 1 });
+  assert.deepEqual(calls, ["overnight_postmortem"]);
+  // No memory index in this harness: Voltaire and pre-answering have nothing to investigate with.
+  assert.equal((ran.voltaire as { investigated: number }).investigated, 0);
+
+  const report = await h.run("overnight", "--limit", "5");
+  assert.equal((report.summary as { postmortems: number }).postmortems, 1);
+  assert.deepEqual((report.postmortems as { outcomeId: string; rootCause: string }[]).map(({ outcomeId, rootCause }) => [outcomeId, rootCause]),
+    [["o-hurt", "stale_memory"]]);
+  assert.equal((await h.run("overnight", "--run", "true")).status, "empty", "--run ignores the schedule; the hurt turn is diagnosed once");
+  assert.equal((await h.run("status")).overnight, true);
+  assert.deepEqual(h.warnings, []);
+});
+
+test("background ticks open the memory manager only when Crystals or Overnight is actually due (and inside quiet hours)", async t => {
+  const calls: string[] = [];
+  const fake = fakeMemory();
+  const memory: StewardMemoryAccess = { ...fake.memory, deepThought: () => undefined };
+  const h = harness(t, { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
+    expectations: { enabled: false } }, () => ({ memory: () => memory, createRunner: () => postmortemRunner(calls) }));
+  await h.runtime.tick();
+  assert.equal(h.runtime.lastCrystalsResults().get("main")?.status, "ok");
+  assert.equal(h.runtime.lastOvernightResults().get("main")?.status, "empty");
+  assert.equal(fake.calls.managers, 2, "first tick: both passes are due, each opens the manager");
+  await h.runtime.tick();
+  assert.equal(h.runtime.lastCrystalsResults().get("main")?.status, "not_due");
+  assert.equal(h.runtime.lastOvernightResults().get("main")?.status, "not_due");
+  assert.equal(fake.calls.managers, 2, "a non-due tick never cold-starts the manager");
+  assert.deepEqual(h.warnings, []);
+
+  const hourNow = new Date().getHours();
+  const quietFake = fakeMemory();
+  const quietMemory: StewardMemoryAccess = { ...quietFake.memory, deepThought: () => undefined };
+  const quiet = harness(t, { peopleShadow: { enabled: false }, captainsLog: { enabled: false }, outcomeLedger: { enabled: false },
+    expectations: { enabled: false }, crystals: { enabled: false },
+    overnight: { quietHoursStartHour: (hourNow + 2) % 24, quietHoursEndHour: (hourNow + 3) % 24 } },
+  () => ({ memory: () => quietMemory, createRunner: () => postmortemRunner(calls) }));
+  await quiet.runtime.tick();
+  assert.equal(quiet.runtime.lastOvernightResults().get("main")?.status, "outside_quiet_hours");
+  assert.equal(quietFake.calls.managers, 0, "outside quiet hours the manager is never started");
 });

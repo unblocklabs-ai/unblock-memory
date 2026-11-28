@@ -40,7 +40,13 @@ type MemoryAnalysisMember = {
     eventTimeSource: string;
     contentFingerprint: string;
     text: string;
+    /** Display aliases, capped per member and per page. Never use for access control. */
     sourcePaths: string[];
+    /** UTF-16 offset/length of this chunk inside the indexed document (`content.doc`). */
+    chunkPos: number;
+    chunkLen: number;
+    /** EVERY distinct active `documents.collection` holding this hash (uncapped): the ACL input. */
+    sourceCollections: string[];
 };
 export type MemoryClusterSort = "representative" | "score_desc" | "score_asc" | "date_desc" | "date_asc";
 export type MemoryAnalysisSummary = {
