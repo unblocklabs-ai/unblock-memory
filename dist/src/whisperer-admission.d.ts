@@ -43,6 +43,8 @@ type LifecycleApi = Pick<OpenClawPluginApi, "on">;
 export type WhispererAdmissionOptions = {
     maxSessions: number;
     maxRunsPerSession: number;
+    /** My Turn tracks a session key across runs, resetting it when the host session ID changes. */
+    sessionKeyScope?: boolean;
 };
 export declare function admissionKey(agentId: string, scope: string): string;
 export declare class WhispererAdmissionTracker<TState, TResult> {
@@ -53,7 +55,9 @@ export declare class WhispererAdmissionTracker<TState, TResult> {
      * Classify a prompt without side effects beyond LRU recency. Call before any early-return input checks,
      * then `admit` only when the prompt should actually run.
      */
-    lookup(target: AdmissionTarget): AdmissionLookup<TState, TResult>;
+    lookup(target: AdmissionTarget & {
+        sessionId?: string;
+    }): AdmissionLookup<TState, TResult>;
     /** Supersede any previous run in this session, evict the LRU session when full, and track the new run. */
     admit(target: AdmissionTarget & {
         sessionId?: string;

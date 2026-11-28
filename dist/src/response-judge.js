@@ -157,26 +157,29 @@ const memoryCandidateSchema = Type.Object({
     basis: Type.String(),
 });
 const memoryStageSchema = Type.Array(memoryCandidateSchema);
-function qualityFields({ taskType, assessability, fitAssessability, underdelivery, failureReason, fulfillment, deliverableFit, consistency, }) {
-    return {
-        taskType,
-        assessability,
-        fitAssessability,
-        underdelivery,
-        failureReason,
-        fulfillment,
-        deliverableFit,
-        consistency,
-    };
+/** Project exactly the stage schema's own fields, in schema order, dropping any extra decision keys. */
+function schemaFields(schema, value) {
+    const source = value;
+    return Object.fromEntries(Object.keys(schema.properties).map(key => [key, source[key]]));
 }
-function feedbackBaseFields({ feedbackType, target, avoidableRework, repeatedConstraint, memoryGap }) {
-    return { feedbackType, target, avoidableRework, repeatedConstraint, memoryGap };
-}
-function sentimentFields({ sentiment, annoyance, frustration, dissatisfactionIntensity }) {
-    return { sentiment, annoyance, frustration, dissatisfactionIntensity };
-}
-function retrospectiveFields({ correction, deliveryAdmission, regression, scopeClarification, outcome, reason, }) {
-    return { correction, deliveryAdmission, regression, scopeClarification, outcome, reason };
+const qualityFields = (value) => schemaFields(qualitySchema, value);
+const feedbackBaseFields = (value) => schemaFields(feedbackSchema, value);
+const sentimentFields = (value) => schemaFields(sentimentSchema, value);
+const retrospectiveFields = (value) => schemaFields(retrospectiveSchema, value);
+/**
+ * Begin one stage attempt and run it. A failure that is not cancellation settles the attempt (spent, never refunded);
+ * a cancelled attempt stays in flight so the caller can refund it.
+ */
+export async function runStageAttempt(attempt, run) {
+    attempt.begin();
+    try {
+        return await run();
+    }
+    catch (error) {
+        if (!attempt.signal?.aborted)
+            attempt.settle?.();
+        throw error;
+    }
 }
 function validateDistributions(answers) {
     for (const answer of Object.values(answers)) {
@@ -455,17 +458,9 @@ export async function judgeResponse(episode, params, sentimentEnabled = true, ca
         contextLimited: episode.contextLimited,
         evidenceLimit: "Visible conversation only. Artifacts, tool results and external facts are not provided.",
     };
-    const attempt = async (stages, run) => {
-        cache?.begin(stages);
-        try {
-            return await run();
-        }
-        catch (error) {
-            if (!params.signal?.aborted)
-                cache?.settle?.(stages);
-            throw error;
-        }
-    };
+    const attempt = (stages, run) => runStageAttempt({
+        begin: () => cache?.begin(stages), settle: () => cache?.settle?.(stages), signal: params.signal,
+    }, run);
     const assessQuality = async () => {
         if (cache?.quality)
             return validateCachedQuality(cache.quality);

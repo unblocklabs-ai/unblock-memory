@@ -211,6 +211,15 @@ type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
     /** These begun stages failed on their own (not by cancellation): their attempt is spent, never refunded. */
     settle?: (stages: JudgeStage[]) => void;
 };
+/**
+ * Begin one stage attempt and run it. A failure that is not cancellation settles the attempt (spent, never refunded);
+ * a cancelled attempt stays in flight so the caller can refund it.
+ */
+export declare function runStageAttempt<T>(attempt: {
+    begin: () => void;
+    settle?: () => void;
+    signal?: AbortSignal;
+}, run: () => Promise<T>): Promise<T>;
 export declare function validateCachedStage<K extends keyof ResponseStages>(stage: K, value: unknown, contract?: ResponseStageContracts[K]): ResponseStages[K];
 /** Separate requests are deliberate: later feedback must not leak into the original quality grade. */
 export declare function judgeResponse(episode: ResponseEpisode, params: ResponseJudgeParams, sentimentEnabled?: boolean, cache?: StageCache): Promise<ResponseJudgment>;

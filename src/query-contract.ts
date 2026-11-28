@@ -39,9 +39,10 @@ export function prepareQueryConversation(history: QueryConversation["history"], 
     const message = history[index]!;
     const added = Buffer.byteLength(JSON.stringify(message).replaceAll("<", "\\u003c")) + (conversation.history.length ? 1 : 0);
     if (bytes + added > QUERY_CONTRACT.conversationBytes) break;
-    conversation.history.unshift(message);
+    conversation.history.push(message);
     bytes += added;
   }
+  conversation.history.reverse();
   const fits = (start: number) => queryTokenIds(serializeQueryConversation({
     history: conversation.history.slice(start), currentRequest,
   })).length <= QUERY_CONTRACT.conversationTokens;

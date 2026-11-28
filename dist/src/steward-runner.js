@@ -422,6 +422,31 @@ async function run(deps, req) {
             const summary = typeof data.summary === "string" ? data.summary : typeof data.answer === "string" ? data.answer : status;
             return { ok: true, status, data, summary, turns, toolCalls, model, usage: a.receipt() };
         };
+        /** Run one non-submit tool call. A tool fault becomes an error output for the model, never a failed run. */
+        const executeToolCall = async ({ name, id, args }) => {
+            a.check();
+            const start = performance.now();
+            let ok = false;
+            let output;
+            const tool = byName.get(name);
+            const decoded = tool && stripOptionalNulls(args, tool.parameters);
+            if (!tool)
+                output = "Error: unknown tool.";
+            else if (!isRecord(decoded) || !conforms(tool.parameters, decoded))
+                output = "Error: invalid tool arguments.";
+            else {
+                try {
+                    const result = await abortable(tool.execute(decoded, a.signal), a.signal);
+                    output = toolText(result, token, maxChars);
+                    ok = true;
+                }
+                catch {
+                    a.check();
+                    output = "Error: tool execution failed.";
+                }
+            }
+            return { name, id, ok, elapsedMs: performance.now() - start, output: maxChars > 0 ? output.slice(0, maxChars) : output };
+        };
         let correcting = false, exhausted;
         for (;;) {
             if (req.maxTurns > 0 && turns >= req.maxTurns) {
@@ -463,30 +488,7 @@ async function run(deps, req) {
             else if (calls.length > 0) {
                 // Fan out all tool calls in this turn concurrently; replay outputs and telemetry in deterministic call order.
                 toolCalls += calls.length;
-                const settled = await Promise.all(calls.map(async ({ name, id, args }) => {
-                    a.check();
-                    const start = performance.now();
-                    let ok = false;
-                    let output;
-                    const tool = byName.get(name);
-                    const decoded = tool && stripOptionalNulls(args, tool.parameters);
-                    if (!tool)
-                        output = "Error: unknown tool.";
-                    else if (!isRecord(decoded) || !conforms(tool.parameters, decoded))
-                        output = "Error: invalid tool arguments.";
-                    else {
-                        try {
-                            const result = await abortable(tool.execute(decoded, a.signal), a.signal);
-                            output = toolText(result, token, maxChars);
-                            ok = true;
-                        }
-                        catch {
-                            a.check();
-                            output = "Error: tool execution failed.";
-                        }
-                    }
-                    return { name, id, ok, elapsedMs: performance.now() - start, output: maxChars > 0 ? output.slice(0, maxChars) : output };
-                }));
+                const settled = await Promise.all(calls.map(call => executeToolCall(call)));
                 a.check();
                 for (const item of settled) {
                     report(item.name, item.ok, item.elapsedMs);

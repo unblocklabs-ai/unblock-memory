@@ -1,4 +1,5 @@
 import type { QueryConversation, QueryPair } from "./query-contract.js";
+export { sliceHeadSafe } from "./text-span.js";
 export type DecisionAccess = {
     apiKey: string;
     endpoint?: string;
@@ -40,8 +41,6 @@ type PlanStage = "gate" | "extraction";
 export declare function planningBudgetMs(turnTimeoutMs?: number, planningTimeoutMs?: number): number;
 /** Plain-text transcript for `/v1/extractions`, so returned spans index into exact conversation text. */
 export declare function conversationText(conversation: QueryConversation): string;
-/** Truncate to at most `maxChars` UTF-16 units without leaving a lone high surrogate. */
-export declare function sliceHeadSafe(text: string, maxChars: number): string;
 /**
  * Keep only anchors that occur verbatim (case-insensitively) inside a conversation message, never only in role
  * labels, and always return the conversation's own text. A span is validated against the body it points into
@@ -86,4 +85,3 @@ export declare function planRecall(params: DecisionAccess & {
     turnTimeoutMs?: number;
     planningTimeoutMs?: number;
 }): Promise<RecallPlan>;
-export {};

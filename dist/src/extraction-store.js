@@ -40,6 +40,41 @@ function parseCompleteRevision(value) {
     catch { /* Legacy plain-string complete_revision without policy binding. */ }
     return { sourceRevision: value, policy: null };
 }
+function storedCheckpoint(row) {
+    return {
+        cursor: row.cursor,
+        since: Number(row.extract_since),
+        completeRevision: row.complete_revision,
+        policyFingerprint: row.policy_fingerprint,
+    };
+}
+function resumed(stored, context, policyFingerprint) {
+    return {
+        cursor: stored.cursor,
+        context: JSON.parse(String(context)),
+        since: stored.since,
+        completeRevision: stored.completeRevision,
+        policyFingerprint,
+    };
+}
+/**
+ * What `checkpoint()` does with a stored row, decided once for it and `rewindCursor()`:
+ * - `backfill`: a broader approved `since` rewinds the cursor and widens the window;
+ * - `replay`: a policy change (or unversioned legacy progress) rewinds the cursor;
+ * - `adopt-policy`: no progress to discard, so only the fingerprint moves;
+ * - `resume`: continue from the stored cursor unchanged.
+ */
+function checkpointTransition(stored, since, policyFingerprint) {
+    if (since !== undefined && since < stored.since)
+        return "backfill";
+    if (policyFingerprint === undefined)
+        return "resume";
+    const completeRevisionPolicyMismatch = stored.completeRevision !== null && parseCompleteRevision(stored.completeRevision)?.policy !== policyFingerprint;
+    const policyChanged = stored.policyFingerprint !== policyFingerprint || completeRevisionPolicyMismatch;
+    if ((stored.cursor !== null || stored.completeRevision !== null) && policyChanged)
+        return "replay";
+    return stored.policyFingerprint !== policyFingerprint ? "adopt-policy" : "resume";
+}
 function normalize(text) {
     return text.trim().toLowerCase().replace(/\s+/gu, " ");
 }
@@ -126,16 +161,13 @@ export class ExtractionStore {
     rewindCursor(session, since, policyFingerprint) {
         const row = this.db.prepare("SELECT cursor,extract_since,complete_revision,policy_fingerprint FROM extraction_sessions WHERE session_id=?")
             .get(session.sessionId);
-        const storedCursor = (row?.cursor ?? null);
-        if (!row || storedCursor === null)
+        if (!row)
             return null;
-        if (since !== undefined && since < Number(row.extract_since))
-            return storedCursor;
-        if (policyFingerprint === undefined)
+        const stored = storedCheckpoint(row);
+        if (stored.cursor === null)
             return null;
-        const storedCompleteRevision = row.complete_revision;
-        const completeRevisionPolicyMismatch = storedCompleteRevision !== null && parseCompleteRevision(storedCompleteRevision)?.policy !== policyFingerprint;
-        return row.policy_fingerprint !== policyFingerprint || completeRevisionPolicyMismatch ? storedCursor : null;
+        const transition = checkpointTransition(stored, since, policyFingerprint);
+        return transition === "backfill" || transition === "replay" ? stored.cursor : null;
     }
     checkpoint(session, owner, since, policyFingerprint) {
         return immediateTransaction(this.db, () => {
@@ -144,44 +176,28 @@ export class ExtractionStore {
         ON CONFLICT(session_id) DO UPDATE SET metadata=excluded.metadata WHERE metadata IS NOT excluded.metadata`)
                 .run(session.sessionId, JSON.stringify(session), Date.now(), since ?? this.liveSince(), policyFingerprint ?? null);
             const row = this.db.prepare("SELECT cursor,context,extract_since,complete_revision,policy_fingerprint FROM extraction_sessions WHERE session_id=?").get(session.sessionId);
-            const storedCursor = row.cursor;
-            const storedCompleteRevision = row.complete_revision;
-            const storedPolicy = row.policy_fingerprint;
-            if (since !== undefined && since < Number(row.extract_since)) {
-                // A broader approved backfill replays the session; commit deduplicates source occurrences.
-                const nextPolicy = policyFingerprint ?? storedPolicy;
-                this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=?,policy_fingerprint=? WHERE session_id=?")
-                    .run(since, nextPolicy, session.sessionId);
-                return { cursor: null, context: [], since, completeRevision: null, policyFingerprint: nextPolicy };
-            }
-            if (policyFingerprint !== undefined) {
-                const completeRevisionPolicyMismatch = storedCompleteRevision !== null && parseCompleteRevision(storedCompleteRevision)?.policy !== policyFingerprint;
-                if ((storedCursor !== null || storedCompleteRevision !== null) && (storedPolicy !== policyFingerprint || completeRevisionPolicyMismatch)) {
+            const stored = storedCheckpoint(row);
+            switch (checkpointTransition(stored, since, policyFingerprint)) {
+                case "backfill": {
+                    // A broader approved backfill replays the session; commit deduplicates source occurrences.
+                    const nextPolicy = policyFingerprint ?? stored.policyFingerprint;
+                    this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,extract_since=?,policy_fingerprint=? WHERE session_id=?")
+                        .run(since, nextPolicy, session.sessionId);
+                    return { cursor: null, context: [], since: since, completeRevision: null, policyFingerprint: nextPolicy };
+                }
+                case "replay":
                     // A prompt or retention-policy change (or unversioned legacy cursor) replays the
                     // session from the start with existing facts retained so completion covers the full scan.
                     this.db.prepare("UPDATE extraction_sessions SET cursor=NULL,context='[]',complete_revision=NULL,policy_fingerprint=? WHERE session_id=?")
                         .run(policyFingerprint, session.sessionId);
-                    return { cursor: null, context: [], since: Number(row.extract_since), completeRevision: null, policyFingerprint };
-                }
-                if (storedPolicy !== policyFingerprint) {
+                    return { cursor: null, context: [], since: stored.since, completeRevision: null, policyFingerprint: policyFingerprint };
+                case "adopt-policy":
                     this.db.prepare("UPDATE extraction_sessions SET policy_fingerprint=? WHERE session_id=?")
                         .run(policyFingerprint, session.sessionId);
-                    return {
-                        cursor: storedCursor,
-                        context: JSON.parse(String(row.context)),
-                        since: Number(row.extract_since),
-                        completeRevision: storedCompleteRevision,
-                        policyFingerprint,
-                    };
-                }
+                    return resumed(stored, row.context, policyFingerprint);
+                case "resume":
+                    return resumed(stored, row.context, stored.policyFingerprint);
             }
-            return {
-                cursor: storedCursor,
-                context: JSON.parse(String(row.context)),
-                since: Number(row.extract_since),
-                completeRevision: storedCompleteRevision,
-                policyFingerprint: storedPolicy,
-            };
         });
     }
     records(sessionId, paths) {

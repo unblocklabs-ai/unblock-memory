@@ -42,6 +42,7 @@ import { createStewardRunner, type StewardRunner } from "./steward-runner.js";
 import { registerStewardRuntime, type StewardMemoryAccess } from "./steward-runtime.js";
 import { brightnessRecipeHash } from "./memory-brightness.js";
 import { RecallLedgerWriter, type RecallHitRecord, type RecallQueryOutcome } from "./recall-ledger.js";
+import type { MemoryReadResult } from "./contracts.js";
 import { chatTypeFromSessionKey } from "./session-chat-type.js";
 
 function managerUnavailable(error?: string) {
@@ -356,8 +357,7 @@ function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext
       const path = untrimmedPath.trim();
       const startLine = cursor?.line ?? from;
       const eventKey = `get:${toolEventScope(active)}:${nonBlank(toolCallId) ?? randomUUID()}`;
-      const { manager, error } = await runtime.getMemorySearchManager(active);
-      if (!manager) {
+      const recordRead = (result?: MemoryReadResult) => {
         recallLedger?.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
           kind: "read",
           record: {
@@ -366,12 +366,16 @@ function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext
             agentId: active.agentId,
             sessionId: active.requestContext.sessionId,
             runId: active.runId,
-            sourcePath: path,
-            startLine,
-            lineCount: lines,
-            status: "unavailable",
+            sourcePath: result?.path || path,
+            startLine: result?.status === "ok" ? (result.from ?? startLine) : startLine,
+            lineCount: result?.status === "ok" ? (result.lines ?? lines) : lines,
+            status: !result || result.status === "stale_cursor" ? "unavailable" : result.status,
           },
         });
+      };
+      const { manager, error } = await runtime.getMemorySearchManager(active);
+      if (!manager) {
+        recordRead();
         return managerUnavailable(error);
       }
       try {
@@ -382,36 +386,10 @@ function createGetTool(runtime: QmdMemoryRuntime, ctx: OpenClawPluginToolContext
           ...(cursor ? { cursor } : {}),
           requestContext: active.requestContext,
         });
-        recallLedger?.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
-          kind: "read",
-          record: {
-            eventKey,
-            readAtMs,
-            agentId: active.agentId,
-            sessionId: active.requestContext.sessionId,
-            runId: active.runId,
-            sourcePath: result.path || path,
-            startLine: result.status === "ok" ? (result.from ?? startLine) : startLine,
-            lineCount: result.status === "ok" ? (result.lines ?? lines) : lines,
-            status: result.status === "stale_cursor" ? "unavailable" : result.status,
-          },
-        });
+        recordRead(result);
         return jsonResult(result);
       } catch (readError) {
-        recallLedger?.writer.enqueue(recallLedger.dbPathForAgent(active.agentId), {
-          kind: "read",
-          record: {
-            eventKey,
-            readAtMs,
-            agentId: active.agentId,
-            sessionId: active.requestContext.sessionId,
-            runId: active.runId,
-            sourcePath: path,
-            startLine,
-            lineCount: lines,
-            status: "unavailable",
-          },
-        });
+        recordRead();
         throw readError;
       }
     },
@@ -851,14 +829,12 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
   registerWhispererPrompt(api, {
     memory: registerMemoryWhisperer(api, runtime, config.memoryWhisperer, config.decisionModel, diagnostics, recallLedger, {
       syntheticInput: config.syntheticInput,
-      ...(config.memoryWhisperer.derivedObservations !== false ? {
+      ...(whisperer.derivedObservations ? {
         derivedObservations: {
           dbPathForAgent: memoryDatabasePath,
-          ...(config.memoryWhisperer.derivedMaxHints !== undefined ? { maxHints: config.memoryWhisperer.derivedMaxHints } : {}),
-          ...(config.memoryWhisperer.derivedMinTokenOverlap !== undefined
-            ? { minTokenOverlap: config.memoryWhisperer.derivedMinTokenOverlap } : {}),
-          ...(config.memoryWhisperer.derivedMinSharedTokens !== undefined
-            ? { minSharedTokens: config.memoryWhisperer.derivedMinSharedTokens } : {}),
+          maxHints: whisperer.derivedMaxHints,
+          minTokenOverlap: whisperer.derivedMinTokenOverlap,
+          minSharedTokens: whisperer.derivedMinSharedTokens,
           // Same per-agent index snapshot deep_thought stamps on a synthesis; any advance retires the whisper.
           getCollectionGenerations: async (agentId, corpora) => {
             const { manager, error } = await runtime.getMemorySearchManager({ cfg: api.config, agentId });
@@ -867,14 +843,14 @@ export function registerUnblockMemory(api: OpenClawPluginApi): void {
           },
         },
       } : {}),
-      ...(whisperer.crystalsEnabled !== false ? {
+      ...(whisperer.crystalsEnabled ? {
         // Read-only, zero-model lookup of active crystals; hit counts feed STM→LTM promotion.
         crystals: {
           dbPathForAgent: memoryDatabasePath,
-          ...(whisperer.crystalMaxHints !== undefined ? { maxHints: whisperer.crystalMaxHints } : {}),
-          ...(whisperer.crystalMinTokenOverlap !== undefined ? { minTokenOverlap: whisperer.crystalMinTokenOverlap } : {}),
-          ...(whisperer.crystalMinSharedTokens !== undefined ? { minSharedTokens: whisperer.crystalMinSharedTokens } : {}),
-          ...(whisperer.crystalLtmRankBoost !== undefined ? { ltmRankBoost: whisperer.crystalLtmRankBoost } : {}),
+          maxHints: whisperer.crystalMaxHints,
+          minTokenOverlap: whisperer.crystalMinTokenOverlap,
+          minSharedTokens: whisperer.crystalMinSharedTokens,
+          ltmRankBoost: whisperer.crystalLtmRankBoost,
         },
       } : {}),
       ...(brightness ? { brightness: { ...brightness, dbPathForAgent: memoryDatabasePath,

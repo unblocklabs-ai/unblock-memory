@@ -33,6 +33,26 @@ export async function reviewRequestContext(runtime: QmdMemoryRuntime, active: No
   return { status: "ready", manager, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, signal: combined, timeoutMs: decisionModel.timeoutMs } as const;
 }
 
+type ReviewContext = Awaited<ReturnType<typeof reviewRequestContext>>;
+type ReadyReview = Extract<ReviewContext, { status: "ready" }>;
+type ReviewRequest = Omit<ReadyReview, "status" | "manager">;
+
+async function runReview(
+  runtime: QmdMemoryRuntime,
+  active: NonNullable<ReturnType<typeof getContext>>,
+  decisionModel: UnblockMemoryConfig["decisionModel"],
+  signal: AbortSignal | undefined,
+  review: (manager: ReadyReview["manager"], request: ReviewRequest) => Promise<unknown>,
+  unavailable: { status: "unavailable"; reason: string; needsReview?: true },
+) {
+  try {
+    const context = await reviewRequestContext(runtime, active, decisionModel, signal);
+    if (context.status !== "ready") return jsonResult(context);
+    const { status: _status, manager, ...request } = context;
+    return jsonResult(await review(manager, request));
+  } catch { return jsonResult(unavailable); }
+}
+
 export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRuntime, config: UnblockMemoryConfig, diagnostics: WhispererDiagnostics) {
   api.registerTool(ctx => {
     const active = getContext(ctx);
@@ -72,12 +92,9 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
       async execute(_id: string, params: unknown, signal?: AbortSignal) {
         const parsed = Value.Parse(claimParameters, params);
         if (!config.evidenceReview.enabled || !config.decisionModel.enabled) return jsonResult({ status: "disabled" });
-        try {
-          const context = await reviewRequestContext(runtime, active, config.decisionModel, signal);
-          if (context.status !== "ready") return jsonResult(context);
-          return jsonResult(await context.manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora,
-            apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
-        } catch { return jsonResult({ status: "unavailable", needsReview: true, reason: "Claim review failed or was cancelled; no claim verified" }); }
+        return runReview(runtime, active, config.decisionModel, signal,
+          (manager, request) => manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora, ...request }),
+          { status: "unavailable", needsReview: true, reason: "Claim review failed or was cancelled; no claim verified" });
       },
     };
   }, { names: ["memory_review_claim"] });
@@ -92,12 +109,9 @@ export function registerReviewTools(api: OpenClawPluginApi, runtime: QmdMemoryRu
       async execute(_id: string, params: unknown, signal?: AbortSignal) {
         const parsed = Value.Parse(clusterParameters, params);
         if (!config.qualityAudit.enabled || !config.decisionModel.enabled) return jsonResult({ status: "disabled" });
-        try {
-          const context = await reviewRequestContext(runtime, active, config.decisionModel, signal);
-          if (context.status !== "ready") return jsonResult(context);
-          return jsonResult(await context.manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora,
-            apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
-        } catch { return jsonResult({ status: "unavailable", reason: "Cluster review failed or was cancelled; no cluster judgment made" }); }
+        return runReview(runtime, active, config.decisionModel, signal,
+          (manager, request) => manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora, ...request }),
+          { status: "unavailable", reason: "Cluster review failed or was cancelled; no cluster judgment made" });
       },
     };
   }, { names: ["memory_review_cluster"] });

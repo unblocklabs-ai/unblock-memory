@@ -46,6 +46,17 @@ function parseSessionManifest(value, label) {
         delete parsed.generation;
     return parsed;
 }
+function storedManifestJson(db, agentId) {
+    return db.prepare("SELECT manifest_json FROM session_sync_state WHERE agent_id=?").get(agentId)?.manifest_json;
+}
+/** The retired Markdown-era manifest sidecar, when one exists. */
+function readLegacyManifest(legacyDir) {
+    if (!legacyDir)
+        return undefined;
+    const legacyPath = join(legacyDir, LEGACY_MANIFEST_FILE);
+    const legacy = readLegacyJson(legacyPath);
+    return legacy === undefined ? undefined : parseSessionManifest(legacy, legacyPath);
+}
 function readLegacyJson(path) {
     const stat = lstatSync(path, { throwIfNoEntry: false });
     if (!stat?.isFile())
@@ -105,15 +116,13 @@ export class SessionSyncState {
         return row?.manifest_json === null || row === undefined ? 0 : Number(row.revision);
     }
     readManifest() {
-        const stored = this.#db.prepare("SELECT manifest_json FROM session_sync_state WHERE agent_id=?").get(this.#agentId)?.manifest_json;
+        const stored = storedManifestJson(this.#db, this.#agentId);
         if (typeof stored === "string")
             return parseSessionManifest(JSON.parse(stored), "unblock-memory.sqlite");
-        const legacyPath = this.#legacyDir ? join(this.#legacyDir, LEGACY_MANIFEST_FILE) : undefined;
-        const legacy = legacyPath ? readLegacyJson(legacyPath) : undefined;
-        if (legacy === undefined)
+        const manifest = readLegacyManifest(this.#legacyDir);
+        if (manifest === undefined)
             return emptySessionManifest();
         // One-time upgrade import: never overwrite a manifest a sync committed meanwhile.
-        const manifest = parseSessionManifest(legacy, legacyPath);
         delete manifest.generation;
         this.#db.prepare(`INSERT INTO session_sync_state (agent_id, manifest_json, revision, updated_at) VALUES (?,?,1,?)
       ON CONFLICT(agent_id) DO UPDATE SET manifest_json=excluded.manifest_json, revision=revision+1, updated_at=excluded.updated_at
@@ -161,7 +170,7 @@ export function readSessionManifestSnapshot(databasePath, agentId, legacyDir) {
         const db = new DatabaseSync(databasePath, { readOnly: true });
         try {
             const table = db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='session_sync_state'").get();
-            const stored = table ? db.prepare("SELECT manifest_json FROM session_sync_state WHERE agent_id=?").get(agentId)?.manifest_json : undefined;
+            const stored = table ? storedManifestJson(db, agentId) : undefined;
             if (typeof stored === "string")
                 return parseSessionManifest(JSON.parse(stored), databasePath);
         }
@@ -169,9 +178,7 @@ export function readSessionManifestSnapshot(databasePath, agentId, legacyDir) {
             db.close();
         }
     }
-    const legacyPath = legacyDir ? join(legacyDir, LEGACY_MANIFEST_FILE) : undefined;
-    const legacy = legacyPath ? readLegacyJson(legacyPath) : undefined;
-    return legacy === undefined ? emptySessionManifest() : parseSessionManifest(legacy, legacyPath);
+    return readLegacyManifest(legacyDir) ?? emptySessionManifest();
 }
 /**
  * The legacy sidecars may retire once the SQLite manifest certifies a QMD collection generation and every window

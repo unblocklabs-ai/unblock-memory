@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { ResponseResult } from "./response-store.js";
 import { responseOutcome } from "./response-outcome.js";
-import { immediateTransaction } from "./memory-database.js";
+import { immediateTransaction, readTableColumns } from "./memory-database.js";
 import { jsonHash } from "./json-hash.js";
 
 export const RESPONSE_REVIEW_POLICY = "response-review-v2";
@@ -41,9 +41,8 @@ export class ResponseReviews {
         id TEXT PRIMARY KEY, occurred_at INTEGER NOT NULL, kind TEXT NOT NULL, note TEXT NOT NULL);`);
   }
 
-  #decisionColumns(): Set<string> {
-    const rows = this.db.prepare("PRAGMA table_info(response_review_decisions)").all();
-    return new Set(rows.map(row => String(row.name)));
+  #decisionColumns(): ReadonlySet<string> {
+    return readTableColumns(this.db, "response_review_decisions");
   }
 
   #ensureDecisionProvenanceColumns(): void {

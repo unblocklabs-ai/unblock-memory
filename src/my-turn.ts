@@ -10,7 +10,8 @@ import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
 import { messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { decideWithModel, estimateDecisionTokens, isDecisionTimeout, resolveDecisionCredential } from "./decision-client.js";
-import type { WhispererPrompt } from "./whisperer-prompt.js";
+import { hasWhispererTrigger, type WhispererPrompt } from "./whisperer-prompt.js";
+import { WhispererAdmissionTracker } from "./whisperer-admission.js";
 
 export type MyTurnConfig = {
   enabled: boolean;
@@ -153,46 +154,27 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
   decisionModel: UnblockMemoryConfig["decisionModel"], diagnostics?: WhispererDiagnostics,
 ): WhispererPrompt | undefined {
   if (!config.enabled) return;
-  type Run = { controller: AbortController; result: Promise<{ appendContext: string } | undefined> };
-  type Session = { sessionId?: string; latest: string; current?: Run; seenRuns: Set<string> };
-  const sessions = new Map<string, Session>();
-  const touchSession = (key: string, session: Session) => {
-    sessions.delete(key);
-    sessions.set(key, session);
-  };
-  const stop = (key: string) => {
-    sessions.get(key)?.current?.controller.abort();
-    sessions.delete(key);
-  };
+  const sessions = new WhispererAdmissionTracker<undefined, { appendContext: string }>({
+    maxSessions: MAX_SESSIONS, maxRunsPerSession: MAX_SEEN_RUNS, sessionKeyScope: true,
+  });
 
   const beforePrompt: WhispererPrompt = async (event, context, surface) => {
     const agentId = nonBlank(context.agentId), runId = nonBlank(context.runId), scope = nonBlank(context.sessionKey);
-    if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope) return;
+    if (!hasWhispererTrigger(context.trigger, surface) || !agentId || !runId || !scope) return;
     // Newer hosts expose provenance; retain compatibility with the plugin's minimum SDK.
     const provenance = "inputProvenance" in context ? context.inputProvenance : undefined;
     if (isRecord(provenance) ? provenance.kind !== "external_user" : surface && surface !== "user") return;
     const provider = groupProvider(scope, agentId);
     if (!provider || provider !== context.messageProvider?.toLowerCase() || config.channels[provider]?.enabled === false) return;
     if (!decisionModel.enabled) { diagnostics?.record(agentId, "myTurn", "decision_disabled"); return; }
-    let session = sessions.get(scope);
-    if (session && session.sessionId !== context.sessionId) { stop(scope); session = undefined; }
-    if (session) {
-      touchSession(scope, session);
-      if (session.latest === runId) return session.current?.result;
-      if (session.seenRuns.has(runId)) return undefined;
-    } else {
-      if (sessions.size >= MAX_SESSIONS) stop(sessions.keys().next().value!);
-      session = { sessionId: context.sessionId, latest: runId, seenRuns: new Set() };
-      touchSession(scope, session);
-    }
-    session.current?.controller.abort();
-    session.latest = runId;
-    session.seenRuns.add(runId);
-    if (session.seenRuns.size > MAX_SEEN_RUNS) session.seenRuns.delete(session.seenRuns.values().next().value!);
-    const activeSession = session;
-    const controller = new AbortController(), { signal } = controller;
+    const target = { agentId, scope, runId, sessionId: context.sessionId };
+    const admission = sessions.lookup(target);
+    if (admission.kind === "replay") return admission.result;
+    if (admission.kind === "superseded") return;
+    const entry = sessions.admit({ ...target, sessionKey: scope, init: () => undefined });
+    const { signal } = entry;
     const record = (outcome: Parameters<WhispererDiagnostics["record"]>[2]) => diagnostics?.record(agentId, "myTurn", outcome);
-    const timer = setTimeout(() => controller.abort(new DOMException("My Turn deadline", "TimeoutError")), DEADLINE_MS);
+    const clearDeadline = sessions.deadline(entry, DEADLINE_MS, "My Turn deadline");
     const check = async () => {
       try {
         const built = buildMyTurnState({
@@ -213,7 +195,7 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
           SHOULD_RESPOND_QUESTIONS,
           { validateModel: false },
         ), signal);
-        if (sessions.get(scope) !== activeSession || activeSession.latest !== runId) { record("cancelled"); return; }
+        if (!sessions.isCurrent(entry)) { record("cancelled"); return; }
         if (result.answers.should_respond.noul > DEFAULTS.myTurn.nudgeMaxProbability) { record("no_match"); return; }
         record("emitted");
         return { appendContext: HINT };
@@ -225,17 +207,11 @@ export function registerMyTurn(api: OpenClawPluginApi, config: MyTurnConfig,
         record(isDecisionTimeout(error, signal) ? "timed_out" : signal.aborted ? "cancelled" : "failed");
         // All failures, including exhausted credits, leave the agent's turn unchanged. Never log content or keys.
         return;
-      } finally { clearTimeout(timer); }
+      } finally { clearDeadline(); }
     };
-    const result = check();
-    session.current = { controller, result };
-    return result;
+    entry.result = check();
+    return entry.result;
   };
-  api.on("session_end", (event, context) => {
-    for (const [key, session] of sessions) {
-      if (key === event.sessionKey || key === context.sessionKey || (event.sessionId && session.sessionId === event.sessionId)) stop(key);
-    }
-  });
-  api.on("gateway_stop", () => { for (const key of sessions.keys()) stop(key); });
+  sessions.attach(api);
   return beforePrompt;
 }

@@ -363,6 +363,20 @@ function ensureSchema(db) {
         db.prepare("INSERT OR IGNORE INTO memory_schema VALUES (?,?)").run(COMPONENT, SCHEMA_VERSION);
     });
 }
+/**
+ * The single writer of new `derived_observations` rows: supersedes any `fresh` row for the same key, then inserts this one
+ * as `fresh`. Runs inside the caller's open transaction and never begins its own.
+ */
+export function insertFreshObservationInTransaction(db, row) {
+    db.prepare(`UPDATE derived_observations SET status='superseded', invalidated_at=?
+    WHERE agent_id=? AND question_hash=? AND audience_key=? AND corpora_json=? AND status='fresh'`)
+        .run(row.nowMs, row.agentId, row.questionHash, row.audienceKey, row.corporaJson);
+    db.prepare(`INSERT INTO derived_observations
+      (id,agent_id,question,question_hash,audience_key,corpora_json,collection_generations_json,answer,confidence,
+       citations_json,open_questions_json,source_job_id,status,hit_count,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'fresh',0,?)`)
+        .run(row.id, row.agentId, row.question, row.questionHash, row.audienceKey, row.corporaJson, row.collectionGenerationsJson, row.answer, row.confidence, row.citationsJson, row.openQuestionsJson, row.sourceJobId, row.nowMs);
+}
 /* ───────────────────────────── Store ───────────────────────────── */
 export class DeepThoughtStore {
     db;
@@ -462,14 +476,10 @@ export class DeepThoughtStore {
         const questionHash = deepThoughtQuestionHash(input.question, input.focus);
         const corpora = JSON.stringify(canonicalCorpora(input.corpora));
         return immediateTransaction(this.db, () => {
-            this.db.prepare(`UPDATE derived_observations SET status='superseded', invalidated_at=?
-        WHERE agent_id=? AND question_hash=? AND audience_key=? AND corpora_json=? AND status='fresh'`)
-                .run(now, input.agentId, questionHash, input.audienceKey, corpora);
-            this.db.prepare(`INSERT INTO derived_observations
-          (id,agent_id,question,question_hash,audience_key,corpora_json,collection_generations_json,answer,confidence,
-           citations_json,open_questions_json,source_job_id,status,hit_count,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'fresh',0,?)`)
-                .run(id, input.agentId, input.question, questionHash, input.audienceKey, corpora, JSON.stringify(generations), input.answer, input.confidence, JSON.stringify(input.citations), JSON.stringify(input.openQuestions ?? []), input.sourceJobId ?? null, now);
+            insertFreshObservationInTransaction(this.db, { id, agentId: input.agentId, question: input.question, questionHash,
+                audienceKey: input.audienceKey, corporaJson: corpora, collectionGenerationsJson: JSON.stringify(generations),
+                answer: input.answer, confidence: input.confidence, citationsJson: JSON.stringify(input.citations),
+                openQuestionsJson: JSON.stringify(input.openQuestions ?? []), sourceJobId: input.sourceJobId ?? null, nowMs: now });
             return observation(this.db.prepare("SELECT * FROM derived_observations WHERE id=?").get(id));
         });
     }

@@ -10,35 +10,15 @@ import { SKILL_WHISPERER_TIMEOUT_MS } from "./skill-whisperer.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
 import { abortable } from "./abortable.js";
 import { nonBlank, record } from "./guards.js";
-import type { WhispererPrompt } from "./whisperer-prompt.js";
+import { hasWhispererTrigger, trustedWhispererOrigin, type WhispererPrompt } from "./whisperer-prompt.js";
 
 const { stateMaxTokens: MAX_STATE_TOKENS, maxTrackedSessions: MAX_SESSIONS, maxRunsPerSession: RUNS_PER_SESSION } = DEFAULTS.safetyWhisperer;
 
 type SafetyPluginConfig = Pick<UnblockMemoryConfig, "safetyWhisperer" | "decisionModel" | "memoryWhisperer" | "skillWhisperer">;
-type Turn = { provider?: string; accountId?: string; senderId?: string; channelId?: string };
+type Turn = ReturnType<typeof trustedWhispererOrigin>;
 type SafetyContext = { appendContext: string };
 
 class SafetyInputError extends Error {}
-
-/** Thread replies and forum topics belong to their parent conversation (`C1:thread:1712.01`, `-100:topic:5`). */
-function conversationId(value: string | undefined): string | undefined {
-  const lower = value?.toLowerCase();
-  const index = lower ? Math.max(lower.lastIndexOf(":thread:"), lower.lastIndexOf(":topic:")) : -1;
-  return value && index > 0 ? value.slice(0, index) : value;
-}
-
-/** Only host-supplied identifiers; names and claims in message text never participate. */
-function trustedTurn(context: Record<string, unknown>): Turn {
-  const provider = nonBlank(context.messageProvider)?.toLowerCase();
-  const channelId = conversationId(nonBlank(context.chatId) ?? nonBlank(context.channelId))?.toLowerCase();
-  return {
-    provider,
-    accountId: nonBlank(context.accountId)?.toLowerCase(),
-    senderId: nonBlank(context.senderId),
-    // The host falls back to the provider name when a turn has no channel; that is not a channel.
-    channelId: channelId && channelId !== provider ? channelId : undefined,
-  };
-}
 
 // Missing turn identity is undefined and therefore never equals a configured identifier.
 function inChannel(entry: SafetyChannel, turn: Turn): boolean {
@@ -197,7 +177,7 @@ export function registerSafetyWhisperer(
     agentId: string, controller: AbortController): Promise<SafetyContext | undefined> => {
     const { signal } = controller;
     const recordOutcome = (outcome: Parameters<WhispererDiagnostics["record"]>[2]) => diagnostics?.record(agentId, "safety", outcome);
-    const turn = trustedTurn(context);
+    const turn = trustedWhispererOrigin(context);
     let scenarios: SafetyScenario[] = [];
     const timer = setTimeout(() => controller.abort(new DOMException("Safety deadline", "TimeoutError")), config.timeoutMs);
     activeControllers.set(controller, { sessionId: nonBlank(context.sessionId), sessionKey: nonBlank(context.sessionKey) });
@@ -266,7 +246,7 @@ export function registerSafetyWhisperer(
 
   const beforePrompt: WhispererPrompt = async (event, context, surface) => {
     const agentId = nonBlank(context.agentId), runId = nonBlank(context.runId);
-    if ((!surface && context.trigger !== "user") || !agentId) return;
+    if (!hasWhispererTrigger(context.trigger, surface) || !agentId) return;
     const scope = nonBlank(context.sessionId) ?? nonBlank(context.sessionKey);
     const runs = scope ? sessions.get(scope) : undefined;
     const previous = runId ? runs?.get(runId) : undefined;

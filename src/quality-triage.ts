@@ -1,6 +1,7 @@
 import { DEFAULTS } from "./defaults.js";
 import type { QMDStore } from "@unblocklabs/qmd";
 import { chunkFingerprint, type MaintenanceTask } from "./curation.js";
+import { readActiveDocument } from "./evidence-review.js";
 
 /** Routing hints only: low evidence is not permission to delete. */
 export function qualityTriage(noise: number, evidence: number, encodingDefect = false) {
@@ -23,9 +24,7 @@ export function qualityTaskPresence(
   let fingerprints = cache.get(key);
   if (!fingerprints) {
     fingerprints = new Set<string>();
-    const document = db.prepare(`SELECT d.hash, c.doc FROM documents d JOIN content c ON c.hash = d.hash
-      WHERE d.active = 1 AND d.collection = ? AND d.path = ?`)
-      .get<{ hash: string; doc: string }>(task.collection, task.path);
+    const document = readActiveDocument(db, task.collection, task.path);
     if (document) {
       const chunks = db.prepare("SELECT pos, chunk_len FROM content_vectors WHERE hash = ?")
         .all<{ pos: number; chunk_len: number }>(document.hash);

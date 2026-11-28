@@ -43,9 +43,20 @@ export type ReviewManifest = {
     }[];
     inventoryPending?: boolean;
 };
+/**
+ * Trimmed, non-empty sentence spans of a blurb: `[start, end)` is the trimmed sentence and `segmentEnd` the end of its
+ * segment (trailing whitespace included). This order IS the blurb-assertion order of `dossierAssertions`.
+ */
+export declare function blurbSentenceSpans(blurb: string): {
+    start: number;
+    end: number;
+    segmentEnd: number;
+}[];
 export declare function dossierAssertions(personId: string, dossier: PersonDossier): ReviewAssertion[];
 /** Atomically publishes a flushed 0o600 private JSON artifact; never accepts a truncated partial file. */
 export declare function privateJson(root: string, name: string, value: unknown): string;
+/** Publishes a review manifest's private artifact under its content revision. */
+export declare function publishPeopleManifest(root: string, manifest: ReviewManifest): string;
 export declare function inventoryPeople(options: {
     agentId: string;
     timezone: string;

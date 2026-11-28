@@ -19,8 +19,8 @@ export function registerExtraction(
   runtime?: QmdMemoryRuntime,
   deps?: { runExtraction?: typeof import("./extraction-worker.js").runExtraction },
 ) {
+  // gateway_stop aborts `lifetime`; gateway_start replaces an aborted one. Its signal is the stopped flag.
   let lifetime = new AbortController();
-  let stopped = false;
   let timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
   const activeRuns = new Set<Promise<void>>();
   const track = <T>(pending: Promise<T>): Promise<T> => {
@@ -81,14 +81,13 @@ export function registerExtraction(
     if (!Value.Check(runParams, params)) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "Invalid extraction parameters")); return;
     }
-    if (stopped || lifetime.signal.aborted) {
+    if (lifetime.signal.aborted) {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Extraction failed; check host prerequisites and operator report")); return;
     }
     try { respond(true, await run(api.config, params.agentId, lifetime.signal, params.since, params.sessionId)); }
     catch { respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Extraction failed; check host prerequisites and operator report")); }
   }, { scope: "operator.admin" });
   api.on("gateway_stop", async () => {
-    stopped = true;
     lifetime.abort();
     if (timer) clearInterval(timer);
     timer = undefined;
@@ -97,11 +96,11 @@ export function registerExtraction(
     }
   });
   const tick = () => {
-    if (stopped || running || lifetime.signal.aborted) return;
+    if (running || lifetime.signal.aborted) return;
     const signal = lifetime.signal;
     running = (async () => {
       for (const agentId of listAgentIds(api.config)) {
-        if (stopped || signal.aborted) break;
+        if (signal.aborted) break;
         try {
           const result = await run(api.config, agentId, signal, undefined, undefined, true);
           if (result.status === "unavailable" || (result.status === "completed" && result.failed)) api.logger.warn("unblock-memory extraction unavailable; inspect memory-extract report");
@@ -112,7 +111,6 @@ export function registerExtraction(
     })().finally(() => { running = undefined; });
   };
   api.on("gateway_start", () => {
-    stopped = false;
     if (timer) clearInterval(timer);
     timer = undefined;
     if (lifetime.signal.aborted) lifetime = new AbortController();

@@ -25,6 +25,7 @@ import type { PeopleStore, PersonDossier } from "./people-store.js";
 import { messageText } from "./whisperer-context.js";
 import { responseUserText } from "./response-text.js";
 import { reviewWindow } from "./people-learning-time.js";
+import { manifestRevision } from "./people-learning-store.js";
 
 export type ReviewKind = "nightly" | "weekly";
 type ReviewGap = { id: string; reason: string; sessionId?: string };
@@ -61,10 +62,24 @@ export type ReviewManifest = {
 type IdentityEntry = { person: ReviewPerson; confirmedHuman: boolean };
 type TranscriptSnapshot = Extract<ReturnType<AgentTranscriptReader["read"]>, { kind: "ready" }>;
 
+/**
+ * Trimmed, non-empty sentence spans of a blurb: `[start, end)` is the trimmed sentence and `segmentEnd` the end of its
+ * segment (trailing whitespace included). This order IS the blurb-assertion order of `dossierAssertions`.
+ */
+export function blurbSentenceSpans(blurb: string): { start: number; end: number; segmentEnd: number }[] {
+  const spans: { start: number; end: number; segmentEnd: number }[] = [];
+  for (const part of new Intl.Segmenter("en", { granularity: "sentence" }).segment(blurb)) {
+    const trimmed = part.segment.trim();
+    if (!trimmed) continue;
+    const start = part.index + (part.segment.length - part.segment.trimStart().length);
+    spans.push({ start, end: start + trimmed.length, segmentEnd: part.index + part.segment.length });
+  }
+  return spans;
+}
+
 export function dossierAssertions(personId: string, dossier: PersonDossier): ReviewAssertion[] {
   // The blurb is prose, not necessarily one statement. Enumerate sentences as well as section claims.
-  const sentences = [...new Intl.Segmenter("en", { granularity: "sentence" }).segment(dossier.blurb)]
-    .map(s => s.segment.trim()).filter(Boolean);
+  const sentences = blurbSentenceSpans(dossier.blurb).map(span => dossier.blurb.slice(span.start, span.end));
   const assertions: Omit<ReviewAssertion, "id">[] = [
     ...sentences.map(statement => ({ personId, category: "blurb", statement })),
     ...dossier.sections.flatMap(section => section.claims.map(claim => ({
@@ -143,6 +158,11 @@ export function privateJson(root: string, name: string, value: unknown): string 
     try { unlinkSync(temp); } catch {}
     throw error;
   }
+}
+
+/** Publishes a review manifest's private artifact under its content revision. */
+export function publishPeopleManifest(root: string, manifest: ReviewManifest): string {
+  return privateJson(root, `${manifestRevision(manifest)}.manifest.json`, manifest);
 }
 
 function loadRosterAndDossiers(people: PeopleStore) {

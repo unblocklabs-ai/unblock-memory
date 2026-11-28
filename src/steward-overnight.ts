@@ -6,15 +6,16 @@ import { Type, type Static } from "typebox";
 import { abortable } from "./abortable.js";
 import {
   canonicalCorpora, deepThoughtAudienceKey, deepThoughtQuestionHash, derivedObservationGenerationsFresh, DeepThoughtStore,
-  normalizeDeepThoughtQuestion,
+  insertFreshObservationInTransaction, normalizeDeepThoughtQuestion,
 } from "./deep-thought-store.js";
 import { DEFAULTS } from "./defaults.js";
 import { redactSecrets, WORKSPACE_AUDIENCE } from "./expectations-store.js";
 import { chatTypeFromSessionKey } from "./session-chat-type.js";
 import { MEMORY_CRYSTALS_COMPONENT, MEMORY_CRYSTALS_SCHEMA_VERSION, recordCoreMemory } from "./memory-crystals.js";
 import { immediateTransaction, tableExists } from "./memory-database.js";
+import { claimMissStatus, createStewardFence, mergeCompletionUsage, releaseFencedClaim } from "./steward-pass.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
-import { startWorkHeartbeat, WorkFenceLostError, type WorkClaim, type WorkStore } from "./work-store.js";
+import type { WorkClaim, WorkStore } from "./work-store.js";
 import { humanEvidenceText, syntheticFamilyEnabled, type SyntheticInputFilterConfig } from "./synthetic-input.js";
 
 // Loaded by plain-Node workers and offline tools (`memory-steward overnight`): keep this module free of `openclaw`.
@@ -277,16 +278,6 @@ const confidenceOf = (value: unknown): OvernightConfidence | undefined =>
 
 function nonNegative(name: string, value: number, min = 0): void {
   if (!Number.isSafeInteger(value) || value < min) throw new RangeError(`${name} must be an integer >= ${min}`);
-}
-const capped = <T>(items: readonly T[], limit: number) => limit > 0 ? items.slice(0, limit) : [...items];
-
-function addUsage(total: StewardUsage | undefined, next: StewardUsage): StewardUsage {
-  if (!total) return { ...next };
-  const sum: StewardUsage = { requests: total.requests + next.requests };
-  for (const key of ["inputTokens", "outputTokens", "cachedInputTokens", "reasoningTokens", "costUsd"] as const) {
-    if (total[key] !== undefined || next[key] !== undefined) sum[key] = (total[key] ?? 0) + (next[key] ?? 0);
-  }
-  return sum;
 }
 
 function citationSource(citation: OvernightCitation): string {
@@ -626,10 +617,227 @@ function priorFromRow(row: Record<string, unknown>): PriorObservation | undefine
   } catch { return undefined; }
 }
 
-/* ───────────────────────────── Pass ───────────────────────────── */
-
 type PendingShift = { shift: VoltaireShift; shared: boolean; priorDateIso: string };
 type PendingSave = { id: string; candidate: Candidate; result: OvernightInvestigateResult; generations: Record<string, number> };
+
+/* ───────────────────────────── Phases ───────────────────────────── */
+
+/**
+ * Per-pass plumbing shared by the three phases: ONE generation cache and ONE attempted-key set (`investigated`), so
+ * pre-answering never re-investigates what Voltaire Drift already did, and every phase reports into the same `result`.
+ */
+type OvernightPhaseContext = {
+  options: OvernightThinkingPassOptions; db: DatabaseSync; agentId: string; startedAt: number; sinceMs: number; timezone: string;
+  signal: AbortSignal; now: () => number; result: OvernightThinkingPassResult;
+  /** Human recall rows of the mined chat types. */
+  recall: readonly RecallRow[];
+  workspaceVisible: (audienceKey: string, corpora: readonly string[]) => boolean;
+  currentGenerations: (corpora: readonly string[]) => Promise<Record<string, number> | undefined>;
+  provenFresh: (prior: PriorObservation | undefined, corpora: readonly string[]) => Promise<boolean>;
+  complete: <T>(schema: typeof VOLTAIRE_DIFF_SCHEMA | typeof POSTMORTEM_SCHEMA, purpose: string, systemPrompt: string,
+    payload: unknown) => Promise<T | undefined>;
+  investigate: (candidate: Candidate, label: string) => Promise<OvernightInvestigateResult | undefined>;
+  investigated: ReadonlySet<string>;
+};
+
+/** Phase A: re-investigate moved or recurring questions and diff the old conclusion against the new one. */
+async function voltaireDriftPhase(ctx: OvernightPhaseContext, limits: {
+  minRecurrence: number; maxVoltaire: number; minConfidence: OvernightConfidence;
+}): Promise<PendingShift[]> {
+  const { options, db, agentId, signal, now, result, recall, workspaceVisible, currentGenerations, provenFresh, complete, investigate } = ctx;
+  const { minRecurrence, maxVoltaire, minConfidence } = limits;
+  const shifts: PendingShift[] = [];
+  const candidates = new Map<string, Candidate>();
+  // 1. Observations whose underlying knowledge actually moved (newest row per key decides).
+  if (options.getCollectionGenerations && tableExists(db, "derived_observations")) {
+    const seen = new Set<string>();
+    const rows = db.prepare(`SELECT * FROM derived_observations WHERE agent_id=? AND status IN ('fresh','stale')
+      ORDER BY created_at DESC, id`).all(agentId);
+    for (const row of rows) {
+      // A stored question that still carries runtime framing is never re-investigated: only its human text could
+      // be asked again, and that is a different investigation (the hash check below would reject it anyway).
+      if (humanEvidenceText(String(row.question), options.syntheticInput) !== String(row.question)) continue;
+      let corpora: string[];
+      try { corpora = canonicalCorpora(JSON.parse(String(row.corpora_json)) as string[]); } catch { continue; }
+      const audienceKey = String(row.audience_key), questionHash = String(row.question_hash);
+      // A focused investigation's hash folds in its focus, which a re-investigation cannot reproduce: re-asking the
+      // bare question would compare two different investigations and record a false shift every run.
+      if (questionHash !== deepThoughtQuestionHash(String(row.question))) continue;
+      const key = candidateKey(questionHash, audienceKey, corpora);
+      if (seen.has(key) || !corpora.length) continue;
+      seen.add(key);
+      const prior = priorFromRow(row);
+      if (!prior) continue;
+      const current = await currentGenerations(corpora);
+      if (!current || derivedObservationGenerationsFresh(prior.generations, current)) continue;
+      candidates.set(key, { question: String(row.question), questionHash, audienceKey, corpora, key, prior,
+        shared: workspaceVisible(audienceKey, corpora), origin: "generation_moved",
+        weight: Number.MAX_SAFE_INTEGER / 2 + Number(row.hit_count ?? 0) });
+    }
+  }
+  // 2. Recurring questions in their own audience.
+  const groups = new Map<string, { rows: RecallRow[] }>();
+  for (const row of recall) {
+    const key = candidateKey(row.questionHash, row.audienceKey, row.corpora);
+    const group = groups.get(key) ?? { rows: [] as RecallRow[] };
+    group.rows.push(row);
+    groups.set(key, group);
+  }
+  for (const [key, group] of groups) {
+    if (group.rows.length < minRecurrence || candidates.has(key)) continue;
+    const latest = group.rows[group.rows.length - 1]!;
+    const prior = latestObservation(db, agentId, latest.questionHash, latest.audienceKey, latest.corpora);
+    candidates.set(key, { question: latest.question, questionHash: latest.questionHash, audienceKey: latest.audienceKey,
+      corpora: latest.corpora, key, ...(prior ? { prior } : {}),
+      shared: workspaceVisible(latest.audienceKey, latest.corpora), origin: "recurring",
+      weight: group.rows.length });
+  }
+  const ordered = [...candidates.values()].sort((a, b) => b.weight - a.weight || a.key.localeCompare(b.key));
+  result.voltaire.candidates = ordered.length;
+  let used = 0;
+  for (const candidate of ordered) {
+    if (maxVoltaire > 0 && used >= maxVoltaire) break;
+    signal.throwIfAborted();
+    // Truth cannot move while the knowledge it was derived from is unchanged: no wasted investigation.
+    if (candidate.origin === "recurring" && await provenFresh(candidate.prior, candidate.corpora)) {
+      result.voltaire.skippedUnchanged++;
+      continue;
+    }
+    used++;
+    const fresh = await investigate(candidate, "voltaire");
+    if (!fresh) continue;
+    result.voltaire.investigated++;
+    const prior = candidate.prior;
+    if (!prior || !nonEmpty(prior.answer)) continue; // First verified answer: it seeds the next comparison.
+    if (normalizeDeepThoughtQuestion(prior.answer) === normalizeDeepThoughtQuestion(fresh.answer!)) continue;
+    const detectedAt = now();
+    const priorDateIso = new Date(prior.createdAt).toISOString();
+    const diff = await complete<VoltaireDiff>(VOLTAIRE_DIFF_SCHEMA, "overnight_voltaire", VOLTAIRE_PROMPT, {
+      question: redactSecrets(candidate.question),
+      priorAnswer: redactSecrets(prior.answer), priorDate: priorDateIso, priorConfidence: prior.confidence,
+      priorSources: [...new Set(prior.citations.map(citationSource))],
+      newAnswer: redactSecrets(fresh.answer!), newDate: new Date(detectedAt).toISOString(), newConfidence: fresh.confidence ?? null,
+      newCitations: fresh.citations.map(citation => ({ source: citationSource(citation), quote: citation.quote })),
+      newOpenQuestions: (fresh.openQuestions ?? []).map(redactSecrets),
+    });
+    if (!diff) continue;
+    result.voltaire.compared++;
+    const confidence = confidenceOf(diff.confidence);
+    if (diff.shifted !== true || !confidence) continue;
+    if (RANK[confidence] < RANK[minConfidence]) { result.voltaire.lowConfidence++; continue; }
+    const priorTruth = oneLine(diff.priorTruth) || oneLine(prior.answer);
+    const newTruth = oneLine(diff.newTruth) || oneLine(fresh.answer!);
+    const shiftType: VoltaireShiftType = diff.shiftType === "none" ? "updated" : diff.shiftType;
+    const newObservationId = fresh.derivedObservationId ?? null;
+    const id = `vshift_${sha([agentId, candidate.questionHash, candidate.audienceKey, candidate.corpora, prior.id,
+      newObservationId ?? sha(fresh.answer)]).slice(0, 32)}`;
+    shifts.push({ shared: candidate.shared, priorDateIso, shift: {
+      id, agentId, question: candidate.question, questionHash: candidate.questionHash, audienceKey: candidate.audienceKey,
+      priorObservationId: prior.id, newObservationId, shiftType, confidence, priorTruth, newTruth,
+      summary: oneLine(diff.summary) || `${priorTruth} → ${newTruth}`, citations: fresh.citations, detectedAtMs: detectedAt,
+    } });
+  }
+  return shifts;
+}
+
+/** Phase B: diagnose every undiagnosed `hurt` outcome once. */
+async function postmortemPhase(ctx: OvernightPhaseContext, maxPostmortems: number): Promise<ShortfallPostmortem[]> {
+  const { db, agentId, sinceMs, signal, now, result, complete } = ctx;
+  const postmortems: ShortfallPostmortem[] = [];
+  const outcomes = db.prepare(`SELECT o.* FROM memory_outcomes o WHERE o.agent_id=? AND o.verdict='hurt' AND o.measured_at>=?
+    AND NOT EXISTS (SELECT 1 FROM shortfall_postmortems p WHERE p.outcome_id=o.id)
+    ORDER BY o.measured_at DESC, o.id LIMIT ?`).all(agentId, sinceMs, maxPostmortems > 0 ? maxPostmortems : -1);
+  result.postmortems.candidates = outcomes.length;
+  const queryText = tableExists(db, "recall_queries")
+    ? db.prepare("SELECT coalesce(vec_query, lex_query) q, chat_type FROM recall_queries WHERE event_key=? AND agent_id=?") : undefined;
+  for (const outcome of outcomes) {
+    signal.throwIfAborted();
+    let signals: unknown = {};
+    try { signals = JSON.parse(redactSecrets(String(outcome.signals_json))); } catch { signals = {}; }
+    const evidence = String(outcome.evidence_turn_id);
+    const recalled = evidence.startsWith("query:") ? queryText?.get(evidence.slice(6), agentId) : undefined;
+    const data = await complete<ShortfallDiagnosis>(POSTMORTEM_SCHEMA, "overnight_postmortem", POSTMORTEM_PROMPT, {
+      subjectKind: String(outcome.subject_kind), subjectId: redactSecrets(String(outcome.subject_id)),
+      outcomeConfidence: Number(outcome.confidence), recipeHash: String(outcome.recipe_hash ?? "default"),
+      measuredAt: new Date(Number(outcome.measured_at)).toISOString(), signals,
+      ...(nonEmpty(recalled?.q) ? { recallQuery: redactSecrets(String(recalled!.q)) } : {}),
+    });
+    if (!data) continue;
+    const confidence = confidenceOf(data.confidence) ?? "low";
+    const rootCause = (["missed_memory", "stale_memory", "wrong_skill", "noisy_whisper", "other"] as const)
+      .find(cause => cause === data.rootCause) ?? "other";
+    postmortems.push({ id: `pm_${sha([agentId, String(outcome.id)]).slice(0, 32)}`, agentId, outcomeId: String(outcome.id),
+      evidenceTurnId: evidence, subjectKind: String(outcome.subject_kind), subjectId: String(outcome.subject_id), rootCause,
+      diagnosis: oneLine(data.diagnosis) || "No diagnosis returned.", recommendedFix: oneLine(data.recommendedFix) || "No fix returned.",
+      confidence, analyzedAtMs: now() });
+  }
+  return postmortems;
+}
+
+/** Phase C: investigate upcoming weekday/hour rhythms and topics ahead of time (answers land via `investigate`). */
+async function preAnswerPhase(ctx: OvernightPhaseContext, limits: {
+  minRecurrence: number; lookahead: number; maxPreAnswers: number;
+}): Promise<void> {
+  const { options, db, agentId, startedAt, timezone, signal, result, recall, workspaceVisible, provenFresh, investigate, investigated } = ctx;
+  const { minRecurrence, lookahead, maxPreAnswers } = limits;
+  const candidates = new Map<string, Candidate>();
+  const slots = upcomingSlots(startedAt, lookahead, timezone);
+  const rhythms = new Map<string, { rows: RecallRow[]; days: Map<string, Set<string>> }>();
+  for (const row of recall) {
+    const local = overnightLocalParts(row.at, timezone);
+    const slot = `${local.weekday}:${local.hour}`;
+    if (!slots.has(slot)) continue;
+    const key = candidateKey(row.questionHash, row.audienceKey, row.corpora);
+    const entry = rhythms.get(key) ?? { rows: [] as RecallRow[], days: new Map<string, Set<string>>() };
+    entry.rows.push(row);
+    entry.days.set(slot, (entry.days.get(slot) ?? new Set<string>()).add(local.dateKey));
+    rhythms.set(key, entry);
+  }
+  for (const [key, entry] of rhythms) {
+    // A rhythm = asked in the same upcoming weekday/hour slot on >= minRecurrence distinct days.
+    const best = [...entry.days].filter(([, days]) => days.size >= minRecurrence)
+      .sort((a, b) => (slots.get(a[0]) ?? 0) - (slots.get(b[0]) ?? 0))[0];
+    if (!best) continue;
+    const latest = entry.rows[entry.rows.length - 1]!;
+    candidates.set(key, { question: latest.question, questionHash: latest.questionHash, audienceKey: latest.audienceKey,
+      corpora: latest.corpora, key, shared: workspaceVisible(latest.audienceKey, latest.corpora),
+      origin: "rhythm",
+      weight: -(slots.get(best[0]) ?? 0) });
+  }
+  if (options.upcomingTopics) {
+    let topics: OvernightUpcomingTopic[] = [];
+    try {
+      topics = await abortable(options.upcomingTopics({ agentId, nowMs: startedAt, lookaheadMinutes: lookahead, signal }), signal);
+    } catch (error) { if (signal.aborted) throw error; result.errors.push("upcoming_topics:failed"); }
+    for (const item of Array.isArray(topics) ? topics : []) {
+      const topic = nonEmpty(item?.topic);
+      const question = topic === undefined ? undefined : nonEmpty(humanEvidenceText(topic, options.syntheticInput));
+      const audienceKey = nonEmpty(item?.audienceKey) ?? nonEmpty(options.defaultAudienceKey);
+      const corpora = canonicalCorpora(item?.corpora?.length ? item.corpora : options.defaultCorpora ?? []);
+      if (!question || !normalizeDeepThoughtQuestion(question) || !audienceKey || !corpora.length) continue;
+      const questionHash = deepThoughtQuestionHash(question);
+      const key = candidateKey(questionHash, audienceKey, corpora);
+      if (!candidates.has(key)) candidates.set(key, { question, questionHash, audienceKey, corpora, key,
+        shared: workspaceVisible(audienceKey, corpora),
+        origin: "upcoming", weight: Number.MAX_SAFE_INTEGER / 2 });
+    }
+  }
+  const ordered = [...candidates.values()].filter(candidate => !investigated.has(candidate.key))
+    .sort((a, b) => b.weight - a.weight || a.key.localeCompare(b.key));
+  result.preAnswers.candidates = ordered.length;
+  let used = 0;
+  for (const candidate of ordered) {
+    if (maxPreAnswers > 0 && used >= maxPreAnswers) break;
+    signal.throwIfAborted();
+    const prior = latestObservation(db, agentId, candidate.questionHash, candidate.audienceKey, candidate.corpora);
+    if (await provenFresh(prior, candidate.corpora)) { result.preAnswers.skippedFresh++; continue; }
+    used++;
+    result.preAnswers.investigated++;
+    if (await investigate(candidate, "pre_answer")) result.preAnswers.answered++;
+  }
+}
+
+/* ───────────────────────────── Pass ───────────────────────────── */
 
 /** Scheduled Overnight Thinking pass. Only a live WorkStore attempt may publish shifts, post-mortems or observations. */
 export async function runOvernightThinkingPass(options: OvernightThinkingPassOptions): Promise<OvernightThinkingPassResult> {
@@ -678,24 +886,20 @@ export async function runOvernightThinkingPass(options: OvernightThinkingPassOpt
   const retryDueAt = () => now() + Math.min(interval * 60_000, 15 * 60_000);
   const leaseMs = options.leaseMs ?? DEFAULTS.steward.leaseMs;
   const key = { kind: OVERNIGHT_KIND, scope: agentId, mode: "run" } as const;
-  const fence = new AbortController();
-  const signal = options.signal ? AbortSignal.any([options.signal, fence.signal]) : fence.signal;
+  const fence = createStewardFence(workStore, { signal: options.signal, leaseMs, heartbeatMs: options.heartbeatMs, now });
+  const { signal } = fence;
   let claim: WorkClaim | undefined;
-  let heartbeat: ReturnType<typeof startWorkHeartbeat> | undefined;
 
   try {
     workStore.enqueue({ ...key, dueAt: 0, now: startedAt });
     claim = workStore.claim({ ...key, owner: options.owner, leaseMs, now: startedAt, ...(options.ignoreDueAt ? { ignoreDueAt: true } : {}) });
     if (!claim) {
-      const item = workStore.get(key.kind, key.scope);
-      nextDueAt = item?.dueAt;
-      return finishWith(item?.status === "running" ? "already_running" : "not_due");
+      const miss = claimMissStatus(workStore, key);
+      nextDueAt = miss.dueAt;
+      return finishWith(miss.status);
     }
     const held = claim;
-    heartbeat = startWorkHeartbeat(workStore, held, {
-      intervalMs: options.heartbeatMs ?? Math.max(1, Math.floor(leaseMs / 3)), leaseMs, now,
-      onFenceLost: error => fence.abort(error), onError: error => fence.abort(error),
-    });
+    fence.startHeartbeat(held);
     ensureOvernightThinkingSchema(workStore.db);
     const db = workStore.db;
     const sinceMs = lookbackDays === 0 ? 0 : startedAt - lookbackDays * DAY_MS;
@@ -742,7 +946,7 @@ export async function runOvernightThinkingPass(options: OvernightThinkingPassOpt
       payload: unknown): Promise<T | undefined> => {
       const completion = await abortable(runner.complete<T>({ schema, purpose, systemPrompt, userPrompt: JSON.stringify(payload),
         timeoutMs, signal }), signal);
-      usage = addUsage(usage, completion.usage);
+      usage = mergeCompletionUsage(usage, completion.usage);
       if (completion.ok) return completion.data;
       if (completion.code === "aborted" && signal.aborted) signal.throwIfAborted();
       result.errors.push(`${purpose}:${completion.code}`);
@@ -776,8 +980,7 @@ export async function runOvernightThinkingPass(options: OvernightThinkingPassOpt
         return undefined;
       }
       // The normal deep_thought path saves its own observation; persist only what it could not.
-      if (options.saveDerivedObservations !== false && !cleaned.derivedObservationId && cleaned.citations.length &&
-          confidenceOf(cleaned.confidence)) {
+      if (options.saveDerivedObservations !== false && !cleaned.derivedObservationId && confidenceOf(cleaned.confidence)) {
         const generations = cleaned.collectionGenerations && Object.keys(cleaned.collectionGenerations).length
           ? cleaned.collectionGenerations : await currentGenerations(candidate.corpora);
         if (generations && Object.values(generations).every(value => Number.isSafeInteger(value) && value >= 0)) {
@@ -790,191 +993,12 @@ export async function runOvernightThinkingPass(options: OvernightThinkingPassOpt
       return cleaned;
     };
 
-    /* ── Phase A: Voltaire Drift ── */
-    const pendingShifts: PendingShift[] = [];
-    if (voltaireOn && options.investigate) {
-      const candidates = new Map<string, Candidate>();
-      // 1. Observations whose underlying knowledge actually moved (newest row per key decides).
-      if (options.getCollectionGenerations && tableExists(db, "derived_observations")) {
-        const seen = new Set<string>();
-        const rows = db.prepare(`SELECT * FROM derived_observations WHERE agent_id=? AND status IN ('fresh','stale')
-          ORDER BY created_at DESC, id`).all(agentId);
-        for (const row of rows) {
-          // A stored question that still carries runtime framing is never re-investigated: only its human text could
-          // be asked again, and that is a different investigation (the hash check below would reject it anyway).
-          if (humanEvidenceText(String(row.question), options.syntheticInput) !== String(row.question)) continue;
-          let corpora: string[];
-          try { corpora = canonicalCorpora(JSON.parse(String(row.corpora_json)) as string[]); } catch { continue; }
-          const audienceKey = String(row.audience_key), questionHash = String(row.question_hash);
-          // A focused investigation's hash folds in its focus, which a re-investigation cannot reproduce: re-asking the
-          // bare question would compare two different investigations and record a false shift every run.
-          if (questionHash !== deepThoughtQuestionHash(String(row.question))) continue;
-          const key = candidateKey(questionHash, audienceKey, corpora);
-          if (seen.has(key) || !corpora.length) continue;
-          seen.add(key);
-          const prior = priorFromRow(row);
-          if (!prior) continue;
-          const current = await currentGenerations(corpora);
-          if (!current || derivedObservationGenerationsFresh(prior.generations, current)) continue;
-          candidates.set(key, { question: String(row.question), questionHash, audienceKey, corpora, key, prior,
-            shared: workspaceVisible(audienceKey, corpora), origin: "generation_moved",
-            weight: Number.MAX_SAFE_INTEGER / 2 + Number(row.hit_count ?? 0) });
-        }
-      }
-      // 2. Recurring questions in their own audience.
-      const groups = new Map<string, { rows: RecallRow[] }>();
-      for (const row of recall) {
-        const key = candidateKey(row.questionHash, row.audienceKey, row.corpora);
-        const group = groups.get(key) ?? { rows: [] as RecallRow[] };
-        group.rows.push(row);
-        groups.set(key, group);
-      }
-      for (const [key, group] of groups) {
-        if (group.rows.length < minRecurrence || candidates.has(key)) continue;
-        const latest = group.rows[group.rows.length - 1]!;
-        const prior = latestObservation(db, agentId, latest.questionHash, latest.audienceKey, latest.corpora);
-        candidates.set(key, { question: latest.question, questionHash: latest.questionHash, audienceKey: latest.audienceKey,
-          corpora: latest.corpora, key, ...(prior ? { prior } : {}),
-          shared: workspaceVisible(latest.audienceKey, latest.corpora), origin: "recurring",
-          weight: group.rows.length });
-      }
-      const ordered = [...candidates.values()].sort((a, b) => b.weight - a.weight || a.key.localeCompare(b.key));
-      result.voltaire.candidates = ordered.length;
-      let used = 0;
-      for (const candidate of ordered) {
-        if (maxVoltaire > 0 && used >= maxVoltaire) break;
-        signal.throwIfAborted();
-        // Truth cannot move while the knowledge it was derived from is unchanged: no wasted investigation.
-        if (candidate.origin === "recurring" && await provenFresh(candidate.prior, candidate.corpora)) {
-          result.voltaire.skippedUnchanged++;
-          continue;
-        }
-        used++;
-        const fresh = await investigate(candidate, "voltaire");
-        if (!fresh) continue;
-        result.voltaire.investigated++;
-        const prior = candidate.prior;
-        if (!prior || !nonEmpty(prior.answer)) continue; // First verified answer: it seeds the next comparison.
-        if (normalizeDeepThoughtQuestion(prior.answer) === normalizeDeepThoughtQuestion(fresh.answer!)) continue;
-        const detectedAt = now();
-        const priorDateIso = new Date(prior.createdAt).toISOString();
-        const diff = await complete<VoltaireDiff>(VOLTAIRE_DIFF_SCHEMA, "overnight_voltaire", VOLTAIRE_PROMPT, {
-          question: redactSecrets(candidate.question),
-          priorAnswer: redactSecrets(prior.answer), priorDate: priorDateIso, priorConfidence: prior.confidence,
-          priorSources: [...new Set(prior.citations.map(citationSource))],
-          newAnswer: redactSecrets(fresh.answer!), newDate: new Date(detectedAt).toISOString(), newConfidence: fresh.confidence ?? null,
-          newCitations: fresh.citations.map(citation => ({ source: citationSource(citation), quote: citation.quote })),
-          newOpenQuestions: (fresh.openQuestions ?? []).map(redactSecrets),
-        });
-        if (!diff) continue;
-        result.voltaire.compared++;
-        const confidence = confidenceOf(diff.confidence);
-        if (diff.shifted !== true || !confidence) continue;
-        if (RANK[confidence] < RANK[minConfidence]) { result.voltaire.lowConfidence++; continue; }
-        const priorTruth = oneLine(diff.priorTruth) || oneLine(prior.answer);
-        const newTruth = oneLine(diff.newTruth) || oneLine(fresh.answer!);
-        const shiftType: VoltaireShiftType = diff.shiftType === "none" ? "updated" : diff.shiftType;
-        const newObservationId = fresh.derivedObservationId ?? null;
-        const id = `vshift_${sha([agentId, candidate.questionHash, candidate.audienceKey, candidate.corpora, prior.id,
-          newObservationId ?? sha(fresh.answer)]).slice(0, 32)}`;
-        pendingShifts.push({ shared: candidate.shared, priorDateIso, shift: {
-          id, agentId, question: candidate.question, questionHash: candidate.questionHash, audienceKey: candidate.audienceKey,
-          priorObservationId: prior.id, newObservationId, shiftType, confidence, priorTruth, newTruth,
-          summary: oneLine(diff.summary) || `${priorTruth} → ${newTruth}`, citations: fresh.citations, detectedAtMs: detectedAt,
-        } });
-      }
-    }
-
-    /* ── Phase B: Shortfall Post-Mortems ── */
-    const pendingPostmortems: ShortfallPostmortem[] = [];
-    if (postmortemsOn && tableExists(db, "memory_outcomes")) {
-      const outcomes = db.prepare(`SELECT o.* FROM memory_outcomes o WHERE o.agent_id=? AND o.verdict='hurt' AND o.measured_at>=?
-        AND NOT EXISTS (SELECT 1 FROM shortfall_postmortems p WHERE p.outcome_id=o.id)
-        ORDER BY o.measured_at DESC, o.id LIMIT ?`).all(agentId, sinceMs, maxPostmortems > 0 ? maxPostmortems : -1);
-      result.postmortems.candidates = outcomes.length;
-      const queryText = tableExists(db, "recall_queries")
-        ? db.prepare("SELECT coalesce(vec_query, lex_query) q, chat_type FROM recall_queries WHERE event_key=? AND agent_id=?") : undefined;
-      for (const outcome of outcomes) {
-        signal.throwIfAborted();
-        let signals: unknown = {};
-        try { signals = JSON.parse(redactSecrets(String(outcome.signals_json))); } catch { signals = {}; }
-        const evidence = String(outcome.evidence_turn_id);
-        const recalled = evidence.startsWith("query:") ? queryText?.get(evidence.slice(6), agentId) : undefined;
-        const data = await complete<ShortfallDiagnosis>(POSTMORTEM_SCHEMA, "overnight_postmortem", POSTMORTEM_PROMPT, {
-          subjectKind: String(outcome.subject_kind), subjectId: redactSecrets(String(outcome.subject_id)),
-          outcomeConfidence: Number(outcome.confidence), recipeHash: String(outcome.recipe_hash ?? "default"),
-          measuredAt: new Date(Number(outcome.measured_at)).toISOString(), signals,
-          ...(nonEmpty(recalled?.q) ? { recallQuery: redactSecrets(String(recalled!.q)) } : {}),
-        });
-        if (!data) continue;
-        const confidence = confidenceOf(data.confidence) ?? "low";
-        const rootCause = (["missed_memory", "stale_memory", "wrong_skill", "noisy_whisper", "other"] as const)
-          .find(cause => cause === data.rootCause) ?? "other";
-        pendingPostmortems.push({ id: `pm_${sha([agentId, String(outcome.id)]).slice(0, 32)}`, agentId, outcomeId: String(outcome.id),
-          evidenceTurnId: evidence, subjectKind: String(outcome.subject_kind), subjectId: String(outcome.subject_id), rootCause,
-          diagnosis: oneLine(data.diagnosis) || "No diagnosis returned.", recommendedFix: oneLine(data.recommendedFix) || "No fix returned.",
-          confidence, analyzedAtMs: now() });
-      }
-    }
-
-    /* ── Phase C: Anticipatory Pre-Answering ── */
-    if (preAnswerOn && options.investigate) {
-      const candidates = new Map<string, Candidate>();
-      const slots = upcomingSlots(startedAt, lookahead, timezone);
-      const rhythms = new Map<string, { rows: RecallRow[]; days: Map<string, Set<string>> }>();
-      for (const row of recall) {
-        const local = overnightLocalParts(row.at, timezone);
-        const slot = `${local.weekday}:${local.hour}`;
-        if (!slots.has(slot)) continue;
-        const key = candidateKey(row.questionHash, row.audienceKey, row.corpora);
-        const entry = rhythms.get(key) ?? { rows: [] as RecallRow[], days: new Map<string, Set<string>>() };
-        entry.rows.push(row);
-        entry.days.set(slot, (entry.days.get(slot) ?? new Set<string>()).add(local.dateKey));
-        rhythms.set(key, entry);
-      }
-      for (const [key, entry] of rhythms) {
-        // A rhythm = asked in the same upcoming weekday/hour slot on >= minRecurrence distinct days.
-        const best = [...entry.days].filter(([, days]) => days.size >= minRecurrence)
-          .sort((a, b) => (slots.get(a[0]) ?? 0) - (slots.get(b[0]) ?? 0))[0];
-        if (!best) continue;
-        const latest = entry.rows[entry.rows.length - 1]!;
-        candidates.set(key, { question: latest.question, questionHash: latest.questionHash, audienceKey: latest.audienceKey,
-          corpora: latest.corpora, key, shared: workspaceVisible(latest.audienceKey, latest.corpora),
-          origin: "rhythm",
-          weight: -(slots.get(best[0]) ?? 0) });
-      }
-      if (options.upcomingTopics) {
-        let topics: OvernightUpcomingTopic[] = [];
-        try {
-          topics = await abortable(options.upcomingTopics({ agentId, nowMs: startedAt, lookaheadMinutes: lookahead, signal }), signal);
-        } catch (error) { if (signal.aborted) throw error; result.errors.push("upcoming_topics:failed"); }
-        for (const item of Array.isArray(topics) ? topics : []) {
-          const topic = nonEmpty(item?.topic);
-          const question = topic === undefined ? undefined : nonEmpty(humanEvidenceText(topic, options.syntheticInput));
-          const audienceKey = nonEmpty(item?.audienceKey) ?? nonEmpty(options.defaultAudienceKey);
-          const corpora = canonicalCorpora(item?.corpora?.length ? item.corpora : options.defaultCorpora ?? []);
-          if (!question || !normalizeDeepThoughtQuestion(question) || !audienceKey || !corpora.length) continue;
-          const questionHash = deepThoughtQuestionHash(question);
-          const key = candidateKey(questionHash, audienceKey, corpora);
-          if (!candidates.has(key)) candidates.set(key, { question, questionHash, audienceKey, corpora, key,
-            shared: workspaceVisible(audienceKey, corpora),
-            origin: "upcoming", weight: Number.MAX_SAFE_INTEGER / 2 });
-        }
-      }
-      const ordered = [...candidates.values()].filter(candidate => !investigated.has(candidate.key))
-        .sort((a, b) => b.weight - a.weight || a.key.localeCompare(b.key));
-      result.preAnswers.candidates = ordered.length;
-      let used = 0;
-      for (const candidate of ordered) {
-        if (maxPreAnswers > 0 && used >= maxPreAnswers) break;
-        signal.throwIfAborted();
-        const prior = latestObservation(db, agentId, candidate.questionHash, candidate.audienceKey, candidate.corpora);
-        if (await provenFresh(prior, candidate.corpora)) { result.preAnswers.skippedFresh++; continue; }
-        used++;
-        result.preAnswers.investigated++;
-        if (await investigate(candidate, "pre_answer")) result.preAnswers.answered++;
-      }
-    }
+    const phase: OvernightPhaseContext = { options, db, agentId, startedAt, sinceMs, timezone, signal, now, result, recall,
+      workspaceVisible, currentGenerations, provenFresh, complete, investigate, investigated };
+    const pendingShifts = voltaireOn && options.investigate
+      ? await voltaireDriftPhase(phase, { minRecurrence, maxVoltaire, minConfidence }) : [];
+    const pendingPostmortems = postmortemsOn && tableExists(db, "memory_outcomes") ? await postmortemPhase(phase, maxPostmortems) : [];
+    if (preAnswerOn && options.investigate) await preAnswerPhase(phase, { minRecurrence, lookahead, maxPreAnswers });
 
     /* ── One fenced publication ── */
     if (pendingSaves.length && !tableExists(db, "derived_observations")) new DeepThoughtStore(db).close();
@@ -1004,7 +1028,7 @@ export async function runOvernightThinkingPass(options: OvernightThinkingPassOpt
       }
     });
     claim = undefined;
-    heartbeat.stop();
+    fence.stopHeartbeat();
     nextDueAt = targetDueAt;
 
     // Append-only daily-log notes, after the shift is durable. `dailyLogChatTypes` + `dailyLogCorpora` only.
@@ -1026,17 +1050,16 @@ export async function runOvernightThinkingPass(options: OvernightThinkingPassOpt
     return finishWith(didWork || result.errors.length ? "completed" : "empty");
   } catch (error) {
     if (options.signal?.aborted) return release("aborted");
-    return release("failed", error instanceof WorkFenceLostError || fence.signal.reason instanceof WorkFenceLostError
+    return release("failed", fence.lost(error)
       ? "fence_lost" : redactSecrets(error instanceof Error ? error.message : String(error)));
-  } finally { heartbeat?.stop(); }
+  } finally { fence.stopHeartbeat(); }
 
   function release(status: "aborted" | "failed", reason = "aborted"): OvernightThinkingPassResult {
     if (claim) {
-      try {
-        const retryAt = status === "failed" ? retryDueAt() : targetDueAt;
-        workStore.fail(claim, { error: reason, retryAt, usageJson: usage ? JSON.stringify(usage) : undefined, now: now() });
+      const retryAt = status === "failed" ? retryDueAt() : targetDueAt;
+      if (releaseFencedClaim(workStore, claim, { error: reason, retryAt, usageJson: usage ? JSON.stringify(usage) : undefined, now: now() })) {
         nextDueAt = retryAt;
-      } catch (error) { if (!(error instanceof WorkFenceLostError)) throw error; }
+      }
       claim = undefined;
     }
     // Nothing was published: report zero writes.
@@ -1049,16 +1072,11 @@ export async function runOvernightThinkingPass(options: OvernightThinkingPassOpt
 /** Mirrors `DeepThoughtStore.saveDerivedObservation` (supersede + insert) inside the caller's open transaction. */
 function saveObservation(db: DatabaseSync, agentId: string, save: PendingSave, nowMs: number): number {
   const { id, candidate, result, generations } = save;
-  const corpora = JSON.stringify(candidate.corpora);
+  // The id is deterministic: a replayed save is a no-op that counts nothing.
   if (db.prepare("SELECT 1 FROM derived_observations WHERE id=?").get(id)) return 0;
-  db.prepare(`UPDATE derived_observations SET status='superseded', invalidated_at=?
-    WHERE agent_id=? AND question_hash=? AND audience_key=? AND corpora_json=? AND status='fresh'`)
-    .run(nowMs, agentId, candidate.questionHash, candidate.audienceKey, corpora);
-  db.prepare(`INSERT INTO derived_observations (id,agent_id,question,question_hash,audience_key,corpora_json,collection_generations_json,
-      answer,confidence,citations_json,open_questions_json,source_job_id,status,hit_count,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'fresh',0,?)`)
-    .run(id, agentId, candidate.question, candidate.questionHash, candidate.audienceKey, corpora, JSON.stringify(generations), result.answer!,
-      result.confidence!, JSON.stringify(result.citations.map(storedCitation)), JSON.stringify(result.openQuestions ?? []),
-      `overnight:${candidate.origin}`, nowMs);
+  insertFreshObservationInTransaction(db, { id, agentId, question: candidate.question, questionHash: candidate.questionHash,
+    audienceKey: candidate.audienceKey, corporaJson: JSON.stringify(candidate.corpora), collectionGenerationsJson: JSON.stringify(generations),
+    answer: result.answer!, confidence: result.confidence!, citationsJson: JSON.stringify(result.citations.map(storedCitation)),
+    openQuestionsJson: JSON.stringify(result.openQuestions ?? []), sourceJobId: `overnight:${candidate.origin}`, nowMs });
   return 1;
 }

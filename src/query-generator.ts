@@ -8,6 +8,7 @@ import { CONVERSATION_INFO, queryUserText } from "./response-text.js";
 import { parseQueryPair, prepareQueryConversation, type QueryConversation, type QueryPair } from "./query-contract.js";
 import { nonBlank, record } from "./guards.js";
 import { classifySyntheticInput, isSyntheticEvidence, type SyntheticInputFilterConfig } from "./synthetic-input.js";
+import { sliceHeadSafe } from "./text-span.js";
 
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
 export function visibleQueryConversation(prompt: string, messages: readonly unknown[], currentUserMessage?: string,
@@ -76,15 +77,6 @@ const FALLBACK_STOP_WORDS = new Set(
 const { fallbackMaxLexTerms, fallbackMaxTermChars, fallbackMaxLexChars, fallbackMaxVecChars,
   fallbackHistoryUserMessages } = DEFAULTS.memoryWhisperer;
 
-function sliceHeadSafe(text: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
-  if (text.length <= maxChars) return text;
-  let end = maxChars;
-  const last = text.charCodeAt(end - 1);
-  if (last >= 0xd800 && last <= 0xdbff) end--;
-  return text.slice(0, end);
-}
-
 function sliceTailSafe(text: string, maxChars: number): string {
   if (maxChars <= 0) return "";
   if (text.length <= maxChars) return text;
@@ -143,10 +135,13 @@ export function fallbackQueries(conversation: QueryConversation): QueryPair {
       }
     }
   }
-  const rawTokens = [...new Set((request.match(/[\p{L}\p{N}_]+/gu) ?? [])
-    .map(token => sliceHeadSafe(token, fallbackMaxTermChars).toLowerCase())
-    .filter(Boolean))].slice(0, fallbackMaxLexTerms);
-  const lex = (joinBoundedTerms(terms) || joinBoundedTerms(rawTokens) || sliceHeadSafe(request, fallbackMaxLexChars)).trim();
+  let lex = joinBoundedTerms(terms);
+  if (!lex) {
+    const rawTokens = [...new Set((request.match(/[\p{L}\p{N}_]+/gu) ?? [])
+      .map(token => sliceHeadSafe(token, fallbackMaxTermChars).toLowerCase())
+      .filter(Boolean))].slice(0, fallbackMaxLexTerms);
+    lex = joinBoundedTerms(rawTokens) || sliceHeadSafe(request, fallbackMaxLexChars);
+  }
   const vecSource = requestTerms.length < 4 && recentUsers.length
     ? `${recentUsers.at(-1)!.content.trim()}\n${request}`
     : request;
@@ -155,7 +150,7 @@ export function fallbackQueries(conversation: QueryConversation): QueryPair {
     : request.length >= fallbackMaxVecChars
       ? sliceHeadSafe(request, fallbackMaxVecChars)
       : sliceTailSafe(vecSource, fallbackMaxVecChars)).trim();
-  return { lex, vec };
+  return { lex: lex.trim(), vec };
 }
 
 export class QueryApiError extends Error {

@@ -400,24 +400,27 @@ function latestValidRun(db: AnalysisDatabase): RunRow | undefined {
   return run && analysisSummary(db, run) ? run : undefined;
 }
 
-function sourcePaths(db: AnalysisDatabase, hash: string, limit: number): string[] {
-  if (limit <= 0) return [];
+function prepareSourcePaths(db: AnalysisDatabase) {
   return db.prepare(`
     SELECT collection, path
     FROM documents
     WHERE hash = ? AND active = 1
     ORDER BY collection, path
     LIMIT ?
-  `).all<SourcePathRow>(hash, limit).map((row) => `qmd://${row.collection}/${row.path}`);
+  `);
 }
 
-function sourceCollections(db: AnalysisDatabase, hash: string): string[] {
+function sourcePaths(statement: ReturnType<typeof prepareSourcePaths>, hash: string, limit: number): string[] {
+  return statement.all<SourcePathRow>(hash, limit).map((row) => `qmd://${row.collection}/${row.path}`);
+}
+
+function prepareSourceCollections(db: AnalysisDatabase) {
   return db.prepare(`
     SELECT DISTINCT collection
     FROM documents
     WHERE hash = ? AND active = 1
     ORDER BY collection
-  `).all<{ collection: string }>(hash).map((row) => row.collection);
+  `);
 }
 
 function byteSlice(text: string, maxBytes: number): string {
@@ -528,6 +531,8 @@ function members(
     limit,
     offset,
   );
+  let collections: ReturnType<typeof prepareSourceCollections> | undefined;
+  let paths: ReturnType<typeof prepareSourcePaths> | undefined;
   let remaining = DEFAULTS.analysis.totalExcerptMaxBytes;
   let remainingAliases = MAX_TOTAL_ALIASES;
   return rows.map((row, index) => {
@@ -537,11 +542,7 @@ function members(
     const text = byteSlice(fullText, excerptBudget);
     remaining -= Buffer.byteLength(text);
     const aliasBudget = Math.min(MAX_ALIASES_PER_MEMBER, Math.floor(remainingAliases / remainingRows));
-    const aliases = sourcePaths(
-      db,
-      row.hash,
-      aliasBudget,
-    );
+    const aliases = aliasBudget > 0 ? sourcePaths(paths ??= prepareSourcePaths(db), row.hash, aliasBudget) : [];
     remainingAliases -= aliases.length;
     return {
       hash: row.hash,
@@ -560,7 +561,8 @@ function members(
       sourcePaths: aliases,
       chunkPos: row.pos,
       chunkLen: row.chunk_len,
-      sourceCollections: sourceCollections(db, row.hash),
+      sourceCollections: (collections ??= prepareSourceCollections(db))
+        .all<{ collection: string }>(row.hash).map(source => source.collection),
     };
   });
 }
@@ -613,7 +615,7 @@ function clusterPreview(
     seq: row.seq,
     probability: row.probability,
     text: byteSlice(row.doc.slice(row.pos, row.pos + row.chunk_len), maxBytes),
-    sourcePaths: sourcePaths(db, row.hash, Math.min(MAX_ALIASES_PER_MEMBER, aliasLimit)),
+    sourcePaths: aliasLimit <= 0 ? [] : sourcePaths(prepareSourcePaths(db), row.hash, Math.min(MAX_ALIASES_PER_MEMBER, aliasLimit)),
   };
 }
 

@@ -1,3 +1,12 @@
+/** Truncate to at most `maxChars` UTF-16 units without leaving a lone high surrogate. */
+export function sliceHeadSafe(text, maxChars) {
+    if (maxChars <= 0)
+        return "";
+    if (text.length <= maxChars)
+        return text;
+    const last = text.charCodeAt(maxChars - 1);
+    return text.slice(0, last >= 0xd800 && last <= 0xdbff ? maxChars - 1 : maxChars);
+}
 /** Convert a code-point span (as some providers report) to UTF-16 offsets; undefined when out of range. */
 export function codePointSpanToUtf16(text, [cpStart, cpEnd]) {
     if (!Number.isSafeInteger(cpStart) || !Number.isSafeInteger(cpEnd) || cpStart < 0 || cpStart >= cpEnd)

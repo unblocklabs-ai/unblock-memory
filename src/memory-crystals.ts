@@ -729,8 +729,8 @@ function matchIn(db: DatabaseSync, resolved: ResolvedMatchQuery): CrystalMatch[]
     // Defense in depth on top of the SQL filter: exact agent, allowed audience, live, every corpus allowed.
     if (found.agentId !== resolved.agentId || found.status !== "active" || !audiences.includes(found.audienceKey)) continue;
     if (found.staleAfterMs !== null && found.staleAfterMs <= now) continue;
-    const corpora = parseCorpora(row.corpora_json);
-    if (!corpora?.length || !corpora.every(corpus => allowed.has(corpus))) continue;
+    // `crystal()` already decoded `corpora_json` (malformed JSON decodes to `[]`, which never matches).
+    if (!found.corpora.length || !found.corpora.every(corpus => allowed.has(corpus))) continue;
     const stored = derivedObservationTokens(`${found.title} ${found.summary}`);
     if (!stored.size) continue;
     let shared = 0;

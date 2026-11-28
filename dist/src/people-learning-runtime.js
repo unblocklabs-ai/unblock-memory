@@ -8,8 +8,8 @@ import { resolveAgentWorkspaceDir, resolveStateDir } from "openclaw/plugin-sdk/m
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 import { resolveConfig } from "./config.js";
 import { PeopleStores, recordDossierVerificationInTransaction } from "./people-store.js";
-import { inventoryPeople, dossierAssertions, privateJson } from "./people-learning-inventory.js";
-import { PeopleLearningStore, LEARNING_RECEIPT_SCHEMA, manifestRevision } from "./people-learning-store.js";
+import { inventoryPeople, dossierAssertions, privateJson, publishPeopleManifest } from "./people-learning-inventory.js";
+import { PeopleLearningStore, LEARNING_RECEIPT_SCHEMA } from "./people-learning-store.js";
 import { learningForAgent } from "./people-learning-config.js";
 import { resolveTimezone } from "./session-projector.js";
 import { reconcilePeopleLearning, learningSession, LEARNING_TOOLS } from "./people-learning-cron.js";
@@ -64,9 +64,6 @@ function isAnalysisApproved(config) {
 }
 function auditCohort(config) {
     return responseCohort(config.responseAudit, config.decisionModel.model, config.decisionModel.endpoint);
-}
-function publishManifest(root, manifest) {
-    return privateJson(root, `${manifestRevision(manifest)}.manifest.json`, manifest);
 }
 function reviewPaths(cfg, config, agentId, stateRoot) {
     if (!listAgentIds(cfg).includes(agentId))
@@ -150,7 +147,7 @@ function beginReview(cfg, config, stores, agentId, kind, stateRoot, day, resumeT
         ledger.planMissedWindows(manifest);
         let manifestFile = "";
         const run = ledger.begin(manifest, published => {
-            manifestFile = publishManifest(paths.root, published);
+            manifestFile = publishPeopleManifest(paths.root, published);
         });
         return { ...run, manifestFile, backlog: ledger.backlog() };
     });
@@ -357,7 +354,7 @@ function handleCheckpointAction(options) {
                 const dossier = people.getDossier(personId)?.dossier;
                 return dossier ? dossierAssertions(personId, dossier) : [];
             }),
-            beforeManifestCommit: published => { publishManifest(paths.root, published); },
+            beforeManifestCommit: published => { publishPeopleManifest(paths.root, published); },
             shouldFinalize: manifest => manifest.fullValidation,
         });
         return jsonResult(coverage);

@@ -5,6 +5,10 @@ export type EvidenceCitation = {
     from: number;
     lines: number;
 };
+export declare function readActiveDocument(db: QMDStore["internal"]["db"], collection: string, path: string): {
+    hash: string;
+    doc: string;
+} | undefined;
 export declare function reviewIndexedClaim(params: {
     db: QMDStore["internal"]["db"];
     sources: readonly ResolvedSource[];

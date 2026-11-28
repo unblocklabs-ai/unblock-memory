@@ -68,10 +68,14 @@ export function extractionHistory(messages: ExtractionMessage[], count: number):
  * Undefined for a malformed bookmark, which callers must treat as a source reset.
  */
 export function checkpointFence(cursor: string): string | undefined {
-  if (!cursor.startsWith(PREFIX)) return cursor;
+  return cursor.startsWith(PREFIX) ? decodeBookmark(cursor)?.fence : cursor;
+}
+
+/** A persisted `PREFIX` bookmark, or undefined when its payload is malformed (a source reset). */
+function decodeBookmark(cursor: string): Static<typeof bookmarkSchema> | undefined {
   try {
     const parsed: unknown = JSON.parse(cursor.slice(PREFIX.length));
-    return Value.Check(bookmarkSchema, parsed) ? parsed.fence : undefined;
+    return Value.Check(bookmarkSchema, parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }
@@ -92,14 +96,8 @@ export async function readExtractionChunk(params: { agentId: string; agentName: 
   };
   let resume: Static<typeof bookmarkSchema> | undefined;
   if (params.cursor?.startsWith(PREFIX)) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(params.cursor.slice(PREFIX.length));
-    } catch {
-      return { kind: "reset" as const, cursor: null };
-    }
-    if (!Value.Check(bookmarkSchema, parsed)) return { kind: "reset" as const, cursor: null };
-    resume = parsed;
+    resume = decodeBookmark(params.cursor);
+    if (!resume) return { kind: "reset" as const, cursor: null };
     const check = await fetchPage(resume.fence);
     if (check.kind !== "page") return check;
   }

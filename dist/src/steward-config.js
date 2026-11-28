@@ -123,19 +123,15 @@ function integer(value, min, key) {
     }
     return value;
 }
-function unitInterval(value, key) {
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
-        throw new Error(`steward.${key} must be a number between 0 and 1`);
+function numberBetweenZeroAnd(max, value, key) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > max) {
+        throw new Error(`steward.${key} must be a number between 0 and ${max}`);
     }
     return value;
 }
+const unitInterval = (value, key) => numberBetweenZeroAnd(1, value, key);
 /** Inside Out intensity scale, 0 (none) to 3 (overwhelming). */
-function intensity(value, key) {
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 3) {
-        throw new Error(`steward.${key} must be a number between 0 and 3`);
-    }
-    return value;
-}
+const intensity = (value, key) => numberBetweenZeroAnd(3, value, key);
 function enabled(value, label) {
     return boolean(value, `${label}.enabled`);
 }
@@ -144,32 +140,22 @@ function boolean(value, label) {
         throw new Error(`${label} must be a boolean`);
     return value;
 }
-function chatTypeList(value, key) {
+/** De-duplicated, in first-seen order; every entry must be one of `allowed`. */
+function enumList(allowed, value, key) {
     if (!Array.isArray(value))
         throw new Error(`steward.${key} must be an array`);
     const out = [];
     for (const entry of value) {
-        const matched = chatTypes.find(t => t === entry);
-        if (!matched)
+        const matched = allowed.find(t => t === entry);
+        if (matched === undefined)
             throw new Error(`Invalid steward.${key} entry`);
         if (!out.includes(matched))
             out.push(matched);
     }
     return out;
 }
-function expectationChatTypeList(value, key) {
-    if (!Array.isArray(value))
-        throw new Error(`steward.${key} must be an array`);
-    const out = [];
-    for (const entry of value) {
-        const matched = expectationChatTypes.find(t => t === entry);
-        if (!matched)
-            throw new Error(`Invalid steward.${key} entry`);
-        if (!out.includes(matched))
-            out.push(matched);
-    }
-    return out;
-}
+const chatTypeList = (value, key) => enumList(chatTypes, value, key);
+const expectationChatTypeList = (value, key) => enumList(expectationChatTypes, value, key);
 function corpusList(value, key) {
     if (!Array.isArray(value) || !value.every(entry => typeof entry === "string" && entry.trim())) {
         throw new Error(`steward.${key} must be an array of non-empty corpus names`);

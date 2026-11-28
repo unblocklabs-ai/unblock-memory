@@ -5,9 +5,11 @@ export class WhispererAdmissionTracker {
     #sessions = new Map();
     #maxSessions;
     #maxRuns;
+    #sessionKeyScope;
     constructor(options) {
         this.#maxSessions = options.maxSessions;
         this.#maxRuns = options.maxRunsPerSession;
+        this.#sessionKeyScope = options.sessionKeyScope ?? false;
     }
     get size() {
         return this.#sessions.size;
@@ -16,15 +18,26 @@ export class WhispererAdmissionTracker {
         this.#sessions.delete(key);
         this.#sessions.set(key, entry);
     }
+    #key(target) {
+        return this.#sessionKeyScope ? target.scope : admissionKey(target.agentId, target.scope);
+    }
+    #forget(key) {
+        this.#sessions.get(key)?.controller.abort();
+        this.#sessions.delete(key);
+    }
     /**
      * Classify a prompt without side effects beyond LRU recency. Call before any early-return input checks,
      * then `admit` only when the prompt should actually run.
      */
     lookup(target) {
-        const key = admissionKey(target.agentId, target.scope);
+        const key = this.#key(target);
         const previous = this.#sessions.get(key);
         if (!previous)
             return { kind: "fresh" };
+        if (this.#sessionKeyScope && previous.sessionId !== target.sessionId) {
+            this.#forget(key);
+            return { kind: "fresh" };
+        }
         this.#touch(key, previous);
         if (previous.runId === target.runId)
             return { kind: "replay", result: previous.result };
@@ -35,13 +48,11 @@ export class WhispererAdmissionTracker {
     }
     /** Supersede any previous run in this session, evict the LRU session when full, and track the new run. */
     admit(target) {
-        const key = admissionKey(target.agentId, target.scope);
+        const key = this.#key(target);
         const previous = this.#sessions.get(key);
         previous?.controller.abort();
         if (!previous && this.#sessions.size >= this.#maxSessions) {
-            const oldestKey = this.#sessions.keys().next().value;
-            this.#sessions.get(oldestKey)?.controller.abort();
-            this.#sessions.delete(oldestKey);
+            this.#forget(this.#sessions.keys().next().value);
         }
         const seenRuns = previous?.seenRuns ?? new Set();
         seenRuns.add(target.runId);
@@ -78,12 +89,12 @@ export class WhispererAdmissionTracker {
     /** Abort and forget sessions matching a `session_end` event. */
     endSession(event, context) {
         for (const [key, entry] of this.#sessions) {
-            if (context.agentId && entry.agentId !== context.agentId)
+            if (!this.#sessionKeyScope && context.agentId && entry.agentId !== context.agentId)
                 continue;
-            if (entry.sessionId === event.sessionId ||
+            const matchesId = (!this.#sessionKeyScope || Boolean(event.sessionId)) && entry.sessionId === event.sessionId;
+            if (matchesId ||
                 (entry.sessionKey && (entry.sessionKey === event.sessionKey || entry.sessionKey === context.sessionKey))) {
-                entry.controller.abort();
-                this.#sessions.delete(key);
+                this.#forget(key);
             }
         }
     }

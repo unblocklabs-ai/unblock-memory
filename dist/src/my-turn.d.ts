@@ -1,7 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
-import type { WhispererPrompt } from "./whisperer-prompt.js";
+import { type WhispererPrompt } from "./whisperer-prompt.js";
 export type MyTurnConfig = {
     enabled: boolean;
     historyMessages: number;

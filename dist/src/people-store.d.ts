@@ -105,6 +105,11 @@ export type Company = {
     updatedAt: string;
 };
 /**
+ * `FROM ... WHERE` selecting person `?`'s dossier (`d`) only while it is exactly the content of its latest change
+ * (`c`), a `replace` that a verification (`v`) certified. Any later edit makes the dossier unverified again.
+ */
+export declare const VERIFIED_DOSSIER_SQL = "\n  FROM person_dossiers d\n  JOIN person_dossier_verification v ON v.person_id = d.person_id\n  JOIN person_dossier_changes c ON c.person_id = d.person_id AND c.id = v.revision\n  WHERE d.person_id = ?\n    AND c.action = 'replace'\n    AND c.after_dossier_json = d.dossier_json\n    AND c.id = (\n      SELECT latest.id FROM person_dossier_changes latest\n      WHERE latest.person_id = d.person_id\n      ORDER BY latest.rowid DESC\n      LIMIT 1\n    )";
+/**
  * Records a dossier verification inside the caller's existing SQLite write transaction.
  * Callers sharing `unblock-memory.sqlite` use this to commit dossier verifications
  * atomically with learning-receipt completion without nesting BEGIN IMMEDIATE.

@@ -16,7 +16,7 @@ import { MEMORY_DATABASE } from "./memory-database.js";
 import { runOutcomeLedgerPass, summarizeOutcomeMetrics, type OutcomeLedgerPassResult } from "./outcome-ledger.js";
 import { responseCohort } from "./response-audit.js";
 import { resolveTimezone } from "./session-projector.js";
-import { listOpenBlockers, runCaptainsLogPass, type CaptainsLogPassResult } from "./steward-captains-log.js";
+import { listOpenBlockers, runCaptainsLogPass, type CaptainsLogPassOptions, type CaptainsLogPassResult } from "./steward-captains-log.js";
 import type { StewardConfig } from "./steward-config.js";
 import { CRYSTALS_KIND, runCrystalsPass, type CrystalsAnalysis, type CrystalsPassOptions, type CrystalsPassResult } from "./steward-crystals.js";
 import {
@@ -176,18 +176,32 @@ function expectationsPassOptions(
   };
 }
 
-/** Analysis adapter over one agent's memory manager. `recluster` is offered only with a configured analysis worker. */
-/** Captain's Log emotional-salience tuning shared by the background tick and the `captains-log` CLI. */
-function captainsLogSalience(cl: StewardConfig["captainsLog"], pluginConfig: UnblockMemoryConfig | undefined) {
+/** One Captain's Log pass, shared by the background tick and the `captains-log` CLI. */
+function captainsLogPassOptions(
+  config: StewardConfig["captainsLog"],
+  base: Pick<CaptainsLogPassOptions, "agentId" | "syntheticInput" | "databasePath" | "workspaceDir" | "workStore" | "runner" |
+    "owner" | "timezone" | "signal" | "dryRun">,
+  pluginConfig: UnblockMemoryConfig | undefined,
+): CaptainsLogPassOptions {
   return {
-    includeEmotionalSalience: cl.includeEmotionalSalience,
-    minSalienceScore: cl.minSalienceScore,
-    minAbsoluteIntensity: cl.minAbsoluteIntensity,
-    minRelativeIntensity: cl.minRelativeIntensity,
+    ...base,
+    intervalMinutes: config.intervalMinutes,
+    lookbackMinutes: config.lookbackMinutes,
+    maxSessionsPerRun: config.maxSessionsPerRun,
+    maxCharsPerSession: config.maxCharsPerSession,
+    maxExistingLogChars: config.maxExistingLogChars,
+    timeoutMs: config.timeoutMs,
+    excludeChatTypes: config.excludeChatTypes,
+    // Emotional-salience tuning.
+    includeEmotionalSalience: config.includeEmotionalSalience,
+    minSalienceScore: config.minSalienceScore,
+    minAbsoluteIntensity: config.minAbsoluteIntensity,
+    minRelativeIntensity: config.minRelativeIntensity,
     ...(pluginConfig ? { baselineMinInteractions: pluginConfig.insideOut.baselineMinInteractions } : {}),
   };
 }
 
+/** Analysis adapter over one agent's memory manager. `recluster` is offered only with a configured analysis worker. */
 function crystalsAnalysis(manager: StewardMemoryManager, analysisExecutable: boolean): CrystalsAnalysis {
   return {
     listClusters: limit => manager.listClusters(limit),
@@ -429,28 +443,17 @@ export function registerStewardRuntime(api: OpenClawPluginApi, options: StewardR
             }));
           }
           if (options.config.captainsLog.enabled && runner && !signal.aborted) {
-            const cl = options.config.captainsLog;
-            const workspaceDir = workspaceDirForAgent(api.config, agentId);
-            const databasePath = transcriptDbForAgent(api.config, agentId);
-            const captainsLog = await runCaptainsLogPass({
+            const captainsLog = await runCaptainsLogPass(captainsLogPassOptions(options.config.captainsLog, {
               agentId,
               syntheticInput: options.pluginConfig?.syntheticInput,
-              databasePath,
-              workspaceDir,
+              databasePath: transcriptDbForAgent(api.config, agentId),
+              workspaceDir: workspaceDirForAgent(api.config, agentId),
               workStore: store,
               runner,
               owner,
               timezone,
-              intervalMinutes: cl.intervalMinutes,
-              lookbackMinutes: cl.lookbackMinutes,
-              maxSessionsPerRun: cl.maxSessionsPerRun,
-              maxCharsPerSession: cl.maxCharsPerSession,
-              maxExistingLogChars: cl.maxExistingLogChars,
-              timeoutMs: cl.timeoutMs,
-              excludeChatTypes: cl.excludeChatTypes,
-              ...captainsLogSalience(cl, options.pluginConfig),
               signal,
-            });
+            }, options.pluginConfig));
             lastCaptainsLogResults.set(agentId, captainsLog);
             const followUp = await afterCaptainsLogAppend(options, { store, agentId, result: captainsLog, signal,
               warn: message => api.logger.warn(message) });
@@ -632,8 +635,7 @@ function registerStewardCli(
         if (!runner) { console.log(JSON.stringify({ status: "disabled" })); process.exitCode = 1; return; }
         const store = openWorkStore(dbPath);
         try {
-          const cl = options.config.captainsLog;
-          const result = await runCaptainsLogPass({
+          const result = await runCaptainsLogPass(captainsLogPassOptions(options.config.captainsLog, {
             agentId: opts.agent,
             syntheticInput: options.pluginConfig?.syntheticInput,
             databasePath: transcriptDbForAgent(cfg, opts.agent),
@@ -642,16 +644,8 @@ function registerStewardCli(
             runner,
             owner: `steward-cli:${process.pid}:${randomUUID()}`,
             timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
-            intervalMinutes: cl.intervalMinutes,
-            lookbackMinutes: cl.lookbackMinutes,
-            maxSessionsPerRun: cl.maxSessionsPerRun,
-            maxCharsPerSession: cl.maxCharsPerSession,
-            maxExistingLogChars: cl.maxExistingLogChars,
-            timeoutMs: cl.timeoutMs,
-            excludeChatTypes: cl.excludeChatTypes,
-            ...captainsLogSalience(cl, options.pluginConfig),
             dryRun: Boolean(opts.dryRun),
-          });
+          }, options.pluginConfig));
           // A dry run never appends, so it never resolves or mirrors anything either.
           const followUp = await afterCaptainsLogAppend(options, { store, agentId: opts.agent, result,
             warn: message => console.warn(message) });

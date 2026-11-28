@@ -77,6 +77,19 @@ function windowMetadata(window: WindowRow): SessionMetadata {
 
 type EventRows = SessionProjectionInput["events"];
 
+/**
+ * One snapshot window and what the snapshot learned about its transcript:
+ * - `unchanged`: provably identical to the previous manifest entry, so never read;
+ * - `needs-read`: changed, but a metadata-only snapshot did not read it;
+ * - `ready`: changed and read;
+ * - `unavailable`: changed, but cold or unreadable.
+ */
+type SnapshotWindow = {
+  row: WindowRow;
+  sourceFingerprint: string;
+  transcript: { state: "unchanged" | "needs-read" | "unavailable" } | { state: "ready"; events: EventRows };
+};
+
 type ProjectionOptions = {
   databasePath: string;
   agentId: string;
@@ -157,13 +170,7 @@ function readSnapshot(params: {
   previousManifest: SessionManifest;
   currentProjectionKey: string;
   metadataOnly?: boolean;
-}): {
-  windows: WindowRow[];
-  fingerprints: Map<string, string>;
-  events: Map<string, EventRows>;
-  changed: Set<string>;
-  unavailable: Set<string>;
-} {
+}): SnapshotWindow[] {
   const db = new DatabaseSync(params.databasePath, { readOnly: true });
   try {
     db.exec(`PRAGMA query_only = ON; PRAGMA busy_timeout = ${DEFAULTS.sqlite.mainBusyTimeoutMs}; BEGIN`);
@@ -195,16 +202,11 @@ function readSnapshot(params: {
       GROUP BY window.session_id
       ORDER BY window.created_at, window.session_id
     `).all(...params.chatTypes) as WindowRow[];
-    const fingerprints = new Map<string, string>();
-    const events = new Map<string, EventRows>();
-    const changed = new Set<string>();
-    const unavailable = new Set<string>();
-    for (const window of windows) {
+    const snapshot = windows.map((window): SnapshotWindow => {
       const metadata = windowMetadata(window);
       const previous = params.previousManifest.sessions[window.sessionId];
       const documentPath = sessionDocumentPath(metadata);
       const sourceFingerprint = JSON.stringify(window);
-      fingerprints.set(window.sessionId, sourceFingerprint);
       const entryProjectionKey = previous?.projectionKey ?? params.previousManifest.projectionKey;
       const previouslyFailed = params.previousManifest.failedSessions?.[window.sessionId] !== undefined;
       const unchanged = !window.cold && !params.force && !previouslyFailed &&
@@ -215,19 +217,16 @@ function readSnapshot(params: {
             previous.documentPath === documentPath
           : params.previousManifest.projectionKey === params.currentProjectionKey &&
             params.previousManifest.ignoredSessions?.[window.sessionId] === sourceFingerprint);
-      if (!unchanged) {
-        changed.add(window.sessionId);
-        if (!params.metadataOnly) {
-          try {
-            const snapshot = transcripts.read(window.sessionId);
-            if (snapshot.kind === "ready") events.set(window.sessionId, snapshot.rows);
-            else unavailable.add(window.sessionId);
-          } catch { unavailable.add(window.sessionId); }
-        }
-      }
-    }
+      const entry = (transcript: SnapshotWindow["transcript"]): SnapshotWindow => ({ row: window, sourceFingerprint, transcript });
+      if (unchanged) return entry({ state: "unchanged" });
+      if (params.metadataOnly) return entry({ state: "needs-read" });
+      try {
+        const read = transcripts.read(window.sessionId);
+        return entry(read.kind === "ready" ? { state: "ready", events: read.rows } : { state: "unavailable" });
+      } catch { return entry({ state: "unavailable" }); }
+    });
     db.exec("COMMIT");
-    return { windows, fingerprints, events, changed, unavailable };
+    return snapshot;
   } catch (error) {
     try { db.exec("ROLLBACK"); } catch { /* transaction may not have started */ }
     throw error;
@@ -256,8 +255,8 @@ export async function unchangedSessionSync(
     force: false,
     metadataOnly: true,
   });
-  const ids = new Set(snapshot.windows.map(window => window.sessionId));
-  if (snapshot.changed.size || Object.keys(manifest.sessions).some(id => !ids.has(id)) ||
+  const ids = new Set(snapshot.map(window => window.row.sessionId));
+  if (snapshot.some(window => window.transcript.state !== "unchanged") || Object.keys(manifest.sessions).some(id => !ids.has(id)) ||
     Object.keys(manifest.ignoredSessions ?? {}).some(id => !ids.has(id))) return;
   return { scanned: ids.size, unchanged: ids.size, updated: 0, removed: 0,
     skipped: 0, failed: 0, embedded: 0, lastSuccessfulSyncAt: manifest.lastSuccessfulSyncAt,
@@ -297,11 +296,8 @@ function retainPreviousSession(
 }
 
 function syncWindow(params: {
-  window: WindowRow;
-  sourceFingerprint: string;
+  window: SnapshotWindow;
   previous?: IndexedSession;
-  events?: EventRows;
-  unavailable: boolean;
   force: boolean;
   agentName: string;
   timezone: string;
@@ -310,7 +306,8 @@ function syncWindow(params: {
   previousManifestProjectionKey?: string;
   diagnostics: NonNullable<SessionProjectionInput["diagnostics"]>;
 }): WindowSyncOutcome {
-  const { window, sourceFingerprint, previous, events } = params;
+  const { row: window, sourceFingerprint, transcript } = params.window;
+  const { previous } = params;
   const metadata = windowMetadata(window);
   const documentPath = assertDocumentPath(sessionDocumentPath(metadata));
   const fail = (): WindowSyncOutcome => ({
@@ -318,12 +315,13 @@ function syncWindow(params: {
     session: retainPreviousSession(previous, params.previousManifestProjectionKey),
   });
 
-  if (params.unavailable) return fail();
-  if (events === undefined) {
+  if (transcript.state === "unavailable") return fail();
+  if (transcript.state !== "ready") {
     return previous
       ? { kind: "unchanged", session: previous }
       : { kind: "unchanged", ignoredFingerprint: sourceFingerprint };
   }
+  const { events } = transcript;
   if (events.length > 0 && (!window.sourceGeneration || window.maxSeq === null)) {
     return fail();
   }
@@ -423,14 +421,12 @@ export async function syncSessionProjections(params: ProjectionOptions & {
   // A failed window keeps whatever QMD already holds for it, at its previous or current path.
   const failedPaths = new Set<string>();
 
-  for (const window of snapshot.windows) {
+  for (const entry of snapshot) {
+    const window = entry.row;
     signal?.throwIfAborted();
     const outcome = syncWindow({
-      window,
-      sourceFingerprint: snapshot.fingerprints.get(window.sessionId)!,
+      window: entry,
       previous: previousManifest.sessions[window.sessionId],
-      events: snapshot.events.get(window.sessionId),
-      unavailable: snapshot.unavailable.has(window.sessionId),
       force: params.force === true,
       agentName: params.agentName,
       timezone: params.timezone,
@@ -441,7 +437,7 @@ export async function syncSessionProjections(params: ProjectionOptions & {
     });
     if (outcome.kind === "failed") {
       counts.failed += 1;
-      failedSessions[window.sessionId] = snapshot.fingerprints.get(window.sessionId)!;
+      failedSessions[window.sessionId] = entry.sourceFingerprint;
       failedPaths.add(sessionDocumentPath(windowMetadata(window)));
       if (outcome.session) sessions[window.sessionId] = outcome.session;
     } else if (outcome.kind === "unchanged") {
@@ -468,7 +464,7 @@ export async function syncSessionProjections(params: ProjectionOptions & {
     }
   }
 
-  const liveIds = new Set(snapshot.windows.map(window => window.sessionId));
+  const liveIds = new Set(snapshot.map(window => window.row.sessionId));
   for (const [sessionId, session] of Object.entries(previousManifest.sessions)) {
     if (sessions[sessionId] || liveIds.has(sessionId)) continue;
     retractions.add(session.documentPath);
@@ -533,7 +529,7 @@ export async function syncSessionProjections(params: ProjectionOptions & {
   params.state.write(manifest);
   return {
     result: {
-      scanned: snapshot.windows.length,
+      scanned: snapshot.length,
       ...counts,
       embedded,
       ...(lastSuccessfulSyncAt !== undefined ? { lastSuccessfulSyncAt } : {}),

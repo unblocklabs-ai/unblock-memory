@@ -15,7 +15,7 @@ import { startTiming, timeStage } from "./retrieval-timing.js";
 import { abortable, abortedByTimeout } from "./abortable.js";
 import { nonBlank } from "./guards.js";
 import type { RecallHitDisposition, RecallHitRecord, RecallLedgerWriter, RecallQueryOutcome } from "./recall-ledger.js";
-import type { WhispererPrompt } from "./whisperer-prompt.js";
+import { hasWhispererTrigger, trustedWhispererOrigin, type WhispererPrompt } from "./whisperer-prompt.js";
 import { WhispererAdmissionTracker } from "./whisperer-admission.js";
 import { planRecall, type RecallPlan } from "./memory-query-v2.js";
 import {
@@ -49,9 +49,22 @@ type DerivedHint = {
 /** An active Memory Crystal whispered verbatim; `source` is always `memory_crystal:<id>`. */
 type CrystalHint = { source: string; tier: CrystalTier; title: string; summary: string; revision: number };
 
-function encodeHints(items: readonly (MemoryHint | DerivedHint | CrystalHint)[]): string {
-  return JSON.stringify(items).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
+function packHints<T>(items: readonly T[], hint: (item: T) => MemoryHint | DerivedHint | CrystalHint, maxChars: number) {
+  const emitted: T[] = [];
+  const encoded: string[] = [];
+  let length = 2; // JSON brackets; each subsequent item also needs a comma.
+  for (const item of items) {
+    const json = JSON.stringify(hint(item)).replace(/</gu, "\\u003c").replace(/>/gu, "\\u003e");
+    const nextLength = length + json.length + (encoded.length ? 1 : 0);
+    if (maxChars > 0 && nextLength > maxChars) continue;
+    emitted.push(item);
+    encoded.push(json);
+    length = nextLength;
+  }
+  return { emitted, encoded };
 }
+
+const renderHints = (encoded: readonly string[]) => `<memory>\n[${encoded.join(",")}]\n</memory>`;
 
 /** Optional: whisper fresh, generation-verified `deep_thought` syntheses (`derived_observations`) matching the turn. */
 type DerivedObservationWhisperOptions = {
@@ -172,35 +185,9 @@ async function lookupDerivedObservations(params: {
   return maxHints > 0 ? verified.slice(0, maxHints) : verified;
 }
 
-/** Bound the derived entries without slicing any answer; `0` = unlimited. */
-function boundDerivedHints(matches: readonly DerivedObservationMatch[], maxChars: number): { emitted: DerivedObservationMatch[]; hints: DerivedHint[] } {
-  const emitted: DerivedObservationMatch[] = [];
-  const hints: DerivedHint[] = [];
-  for (const match of matches) {
-    const next = derivedHint(match);
-    if (maxChars > 0 && encodeHints([...hints, next]).length > maxChars) continue;
-    emitted.push(match);
-    hints.push(next);
-  }
-  return { emitted, hints };
-}
-
 function crystalHint({ crystal }: CrystalMatch): CrystalHint {
   return { source: `memory_crystal:${crystal.id}`, tier: crystal.tier, title: crystal.title, summary: crystal.summary,
     revision: crystal.revision };
-}
-
-/** Bound the crystal entries without slicing any summary; `0` = unlimited. */
-function boundCrystalHints(matches: readonly CrystalMatch[], maxChars: number): { emitted: CrystalMatch[]; hints: CrystalHint[] } {
-  const emitted: CrystalMatch[] = [];
-  const hints: CrystalHint[] = [];
-  for (const match of matches) {
-    const next = crystalHint(match);
-    if (maxChars > 0 && encodeHints([...hints, next]).length > maxChars) continue;
-    emitted.push(match);
-    hints.push(next);
-  }
-  return { emitted, hints };
 }
 
 const DEFAULT_CRYSTAL_MAX_HINTS = 2;
@@ -218,7 +205,17 @@ type MemoryWhispererRuntime = {
 };
 
 /** Per-session data carried across turns; admission bookkeeping lives in WhispererAdmissionTracker. */
-type SessionData = { recent: Map<string, number> };
+type SessionData = {
+  passages: Map<string, number>;
+  syntheses: Map<string, number>;
+  crystals: Map<string, number>;
+};
+
+function pruneCooldown(recent: Map<string, number>, turn: number, cooldownTurns: number): void {
+  for (const [id, recordedTurn] of recent) {
+    if (turn - recordedTurn > cooldownTurns) recent.delete(id);
+  }
+}
 type WhisperResult = { appendContext: string };
 
 type RankedHint = { hit: CorpusMemorySearchResult; excerpt: string; id: string };
@@ -236,6 +233,36 @@ type TurnTelemetry = {
 };
 
 type TurnLogger = (level: "info" | "warn", event: string, fields: Record<string, string | number | boolean | undefined>) => void;
+
+function startOptionalLookup<T>(signal: AbortSignal, log: TurnLogger, event: string, lookup?: () => T[] | Promise<T[]>) {
+  let settled = false;
+  let matches: T[] = [];
+  const ready = lookup ? (async () => {
+    try {
+      await Promise.resolve(); // Let normal retrieval start before the synchronous local read.
+      const found = lookup();
+      matches = Array.isArray(found) ? found : await found;
+    } catch (error) {
+      if (!signal.aborted) log("warn", event, failureFields(error));
+    } finally {
+      settled = true;
+    }
+  })() : Promise.resolve();
+  return {
+    get matches() { return matches; },
+    /** Wait at most until the turn deadline (or cancellation). */
+    async settle() {
+      if (settled) return true;
+      await new Promise<void>(resolve => {
+        if (signal.aborted) return resolve();
+        const onAbort = () => resolve();
+        signal.addEventListener("abort", onAbort, { once: true });
+        void ready.finally(() => { signal.removeEventListener("abort", onAbort); resolve(); });
+      });
+      return !signal.aborted;
+    },
+  };
+}
 
 async function generateQueriesWithFallback(params: {
   generator?: ApiQueryGenerator;
@@ -334,9 +361,9 @@ async function selectComplementaryHints(params: {
   agentId: string;
   diagnostics?: WhispererDiagnostics;
   log: TurnLogger;
-}): Promise<{ selected: RankedHint[]; redundantIds: Set<string> }> {
+}): Promise<{ selected: RankedHint[]; redundant: number[] }> {
   const { ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log } = params;
-  const baseline = { selected: ranked.slice(0, config.maxHints), redundantIds: new Set<string>() };
+  const baseline = { selected: ranked.slice(0, config.maxHints), redundant: [] };
   if (!config.complementaryHints || config.maxHints <= 1 || ranked.length <= 1) {
     return baseline;
   }
@@ -349,7 +376,7 @@ async function selectComplementaryHints(params: {
     const { selected, redundant } = complementaryIndices(ranked.length, pairs, config.maxHints);
     return {
       selected: selected.map(index => ranked[index]!),
-      redundantIds: new Set(redundant.map(index => ranked[index]!.id)),
+      redundant,
     };
   } catch (error) {
     // Preserve the original useful candidates when the optional refinement is unavailable.
@@ -361,83 +388,25 @@ async function selectComplementaryHints(params: {
   }
 }
 
-function renderBoundedHints(selected: readonly RankedHint[]): { emitted: RankedHint[]; rendered: string; hints: MemoryHint[] } {
-  // Bound the complete injected payload without slicing individual excerpts into misleading prefixes.
-  const emitted: RankedHint[] = [];
-  const hints: MemoryHint[] = [];
-  let rendered = "";
-  for (const candidate of selected) {
-    const nextHint = {
-      source: candidate.hit.path,
-      lines: `${candidate.hit.startLine}-${candidate.hit.endLine}`,
-      body: candidate.excerpt,
-    };
-    const nextRendered = encodeHints([...hints, nextHint]);
-    if (nextRendered.length > MAX_PAYLOAD_CHARS) continue;
-    emitted.push(candidate);
-    hints.push(nextHint);
-    rendered = nextRendered;
-  }
-  return { emitted, rendered, hints };
-}
+const memoryHint = ({ hit, excerpt }: RankedHint): MemoryHint => ({
+  source: hit.path, lines: `${hit.startLine}-${hit.endLine}`, body: excerpt,
+});
 
 type RecallLedgerSink = {
   writer: RecallLedgerWriter;
   dbPathForAgent: (agentId: string) => string;
 };
 
-function splitChannelThread(value: string | undefined): { channelId?: string; threadId?: string } {
-  if (!value) return {};
-  const lower = value.toLowerCase();
-  const threadIdx = lower.lastIndexOf(":thread:");
-  const topicIdx = lower.lastIndexOf(":topic:");
-  const splitAt = Math.max(threadIdx, topicIdx);
-  if (splitAt > 0) {
-    const markerLen = splitAt === threadIdx ? ":thread:".length : ":topic:".length;
-    return {
-      channelId: value.slice(0, splitAt).toLowerCase(),
-      threadId: nonBlank(value.slice(splitAt + markerLen)),
-    };
-  }
-  return { channelId: lower };
-}
-
-function whispererOrigin(context: Record<string, unknown>, sessionKey?: string) {
-  const provider = nonBlank(context.messageProvider)?.toLowerCase();
-  const accountId = nonBlank(context.accountId)?.toLowerCase();
-  const senderId = nonBlank(context.senderId);
-  const rawChannel = nonBlank(context.chatId) ?? nonBlank(context.channelId);
-  const split = splitChannelThread(rawChannel);
-  const channelId = split.channelId && split.channelId !== provider ? split.channelId : undefined;
-  const threadId = split.threadId ?? nonBlank(context.threadId);
-  const chatType = nonBlank(context.chatType)?.toLowerCase() ?? chatTypeFromSessionKey(sessionKey);
-  return { provider, accountId, senderId, channelId, threadId, chatType };
-}
+type RecallSelection = { disposition: RecallHitDisposition; finalRank?: number };
 
 function buildRecallHits(
   traces: readonly RecallCandidateTrace[],
-  emittedRanks: ReadonlyMap<string, number>,
-  selectedIds: ReadonlySet<string>,
-  redundantIds: ReadonlySet<string>,
+  selection?: ReadonlyMap<string, RecallSelection>,
 ): RecallHitRecord[] {
   return traces.map((trace) => {
-    let disposition: RecallHitDisposition;
-    let finalRank = trace.finalRank;
-    if (trace.disposition === "passed") {
-      const emittedRank = emittedRanks.get(trace.passageId);
-      if (emittedRank !== undefined) {
-        disposition = "emitted";
-        finalRank = emittedRank;
-      } else if (selectedIds.has(trace.passageId)) {
-        disposition = "payload_limit";
-        finalRank = undefined;
-      } else {
-        disposition = redundantIds.has(trace.passageId) ? "redundant" : "rank_limit";
-        finalRank = undefined;
-      }
-    } else {
-      disposition = trace.disposition;
-    }
+    const { disposition, finalRank }: RecallSelection = trace.disposition === "passed"
+      ? selection?.get(trace.passageId) ?? { disposition: "rank_limit" }
+      : { disposition: trace.disposition, finalRank: trace.finalRank };
     return {
       rawLeafId: trace.locator.rawLeafId,
       passageId: trace.passageId,
@@ -497,7 +466,7 @@ export function registerMemoryWhisperer(
   const beforePrompt: WhispererPrompt = async (event, context, surface) => {
     const { agentId, runId, sessionId, sessionKey } = context;
     const scope = sessionId || sessionKey;
-    if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope) return;
+    if (!hasWhispererTrigger(context.trigger, surface) || !agentId || !runId || !scope) return;
     const corpora = config.corpora;
     if (!corpora.length) return;
     const rawCurrent = event.currentUserMessage ?? event.prompt;
@@ -529,18 +498,20 @@ export function registerMemoryWhisperer(
       api.logger[level]("unblock-memory memory_whisperer " + JSON.stringify({ event: eventName, agentId, runId, sessionId, stage: turn.stage, ...fields }));
     const state = sessions.admit({
       agentId, scope, runId, sessionId, sessionKey,
-      init: previous => ({ recent: previous?.recent ?? new Map() }),
+      init: previous => previous ?? { passages: new Map(), syntheses: new Map(), crystals: new Map() },
     });
-    const { recent } = state.state;
-    for (const [id, recordedTurn] of recent) {
-      if (!id.startsWith("derived:") && state.turn - recordedTurn > config.cooldownTurns) recent.delete(id);
-    }
+    const { passages, syntheses, crystals: recentCrystals } = state.state;
+    pruneCooldown(passages, state.turn, config.cooldownTurns);
+    pruneCooldown(recentCrystals, state.turn, config.cooldownTurns);
     const { signal } = state;
     const clearDeadline = sessions.deadline(state, config.timeoutMs, "Memory deadline");
     const createdAtMs = Date.now();
     const rawMessageId = nonBlank((event as Record<string, unknown>).currentUserMessageId);
     const eventKey = `whisperer:${scope}:${rawMessageId ?? runId}`;
-    const origin = whispererOrigin(context as Record<string, unknown>, sessionKey);
+    const hostContext = context as Record<string, unknown>;
+    const origin = trustedWhispererOrigin(hostContext);
+    origin.threadId ??= nonBlank(hostContext.threadId);
+    const chatType = nonBlank(hostContext.chatType)?.toLowerCase() ?? chatTypeFromSessionKey(sessionKey);
     let generatedQueries: readonly QueryPair[] | undefined;
     let searchedCorpora: readonly string[] = corpora;
     let traces: RecallCandidateTrace[] = [];
@@ -549,9 +520,7 @@ export function registerMemoryWhisperer(
     const recordLedger = (
       outcome: RecallQueryOutcome,
       rankingMode: "decision" | "retrieval" = "decision",
-      emittedRanks = new Map<string, number>(),
-      selectedIds = new Set<string>(),
-      redundantIds = new Set<string>(),
+      selection?: ReadonlyMap<string, RecallSelection>,
     ) => {
       if (!recallLedger || ledgerRecorded) return;
       ledgerRecorded = true;
@@ -566,6 +535,7 @@ export function registerMemoryWhisperer(
           sessionKey,
           runId,
           ...origin,
+          chatType,
           inputFamily,
           lexQuery: generatedQueries?.map(pair => pair.lex).join("\n"),
           vecQuery: generatedQueries?.map(pair => pair.vec).join("\n"),
@@ -577,57 +547,37 @@ export function registerMemoryWhisperer(
           minUsefulness: config.minUsefulness,
           outcome,
           ...judgeUsage,
-          hits: buildRecallHits(traces, emittedRanks, selectedIds, redundantIds),
+          hits: buildRecallHits(traces, selection),
         },
       });
     };
     // Fresh verified deep_thought syntheses: started up front, in parallel, off the retrieval critical path.
     const derivedCooldownTurns = derivedObservations?.cooldownTurns ?? config.cooldownTurns;
-    for (const [id, recordedTurn] of recent) {
-      if (id.startsWith("derived:") && state.turn - recordedTurn > derivedCooldownTurns) recent.delete(id);
-    }
-    let derivedSettled = false;
-    let derivedMatches: DerivedObservationMatch[] = [];
-    const derivedReady: Promise<void> = derivedObservations ? (async () => {
-      try {
-        await Promise.resolve(); // Let normal retrieval start first; the local read is synchronous.
-        const audience = derivedAudienceContext(context as Record<string, unknown>, agentId, sessionKey);
-        const audienceKey = nonBlank((derivedObservations.audienceKey ?? deepThoughtAudienceKey)(audience));
-        if (!audienceKey) return;
-        derivedMatches = await lookupDerivedObservations({
-          options: derivedObservations, agentId, queryText: currentRequest, audienceKey, allowedCorpora: corpora,
-          isCoolingDown: id => recent.has(`derived:${id}`),
-        });
-      } catch (error) {
-        if (!signal.aborted) log("warn", "derived_unavailable", failureFields(error));
-      } finally {
-        derivedSettled = true;
-      }
-    })() : Promise.resolve();
+    pruneCooldown(syntheses, state.turn, derivedCooldownTurns);
+    const derivedLookup = startOptionalLookup(signal, log, "derived_unavailable", derivedObservations ? () => {
+      const audience = derivedAudienceContext(hostContext, agentId, sessionKey);
+      const audienceKey = nonBlank((derivedObservations.audienceKey ?? deepThoughtAudienceKey)(audience));
+      if (!audienceKey) return [];
+      return lookupDerivedObservations({
+        options: derivedObservations, agentId, queryText: currentRequest, audienceKey, allowedCorpora: corpora,
+        isCoolingDown: id => syntheses.has(id),
+      });
+    } : undefined);
     // Memory Crystals: one local read-only lookup (zero model calls), also off the retrieval critical path.
-    let crystalSettled = false;
-    let crystalMatches: CrystalMatch[] = [];
-    const crystalReady: Promise<void> = crystals ? (async () => {
-      try {
-        await Promise.resolve();
-        const audience = derivedAudienceContext(context as Record<string, unknown>, agentId, sessionKey);
-        const audienceKey = nonBlank((crystals.audienceKey ?? deepThoughtAudienceKey)(audience));
-        const matches = findMatchingCrystalsReadOnly(crystals.dbPathForAgent(agentId), {
-          agentId, queryText: currentRequest, audienceKeys: [WORKSPACE_AUDIENCE, ...(audienceKey ? [audienceKey] : [])], allowedCorpora: corpora,
-          ...(crystals.minTokenOverlap !== undefined ? { minTokenOverlap: crystals.minTokenOverlap } : {}),
-          ...(crystals.minSharedTokens !== undefined ? { minSharedTokens: crystals.minSharedTokens } : {}),
-          ...(crystals.ltmRankBoost !== undefined ? { ltmRankBoost: crystals.ltmRankBoost } : {}),
-          nowMs: Date.now(),
-        }).filter(match => !recent.has(`crystal:${match.crystal.id}`));
-        const maxHints = crystals.maxHints ?? DEFAULT_CRYSTAL_MAX_HINTS;
-        crystalMatches = maxHints > 0 ? matches.slice(0, maxHints) : matches;
-      } catch (error) {
-        if (!signal.aborted) log("warn", "crystals_unavailable", failureFields(error));
-      } finally {
-        crystalSettled = true;
-      }
-    })() : Promise.resolve();
-    let memoryHints: MemoryHint[] = [];
+    const crystalLookup = startOptionalLookup(signal, log, "crystals_unavailable", crystals ? () => {
+      const audience = derivedAudienceContext(hostContext, agentId, sessionKey);
+      const audienceKey = nonBlank((crystals.audienceKey ?? deepThoughtAudienceKey)(audience));
+      const matches = findMatchingCrystalsReadOnly(crystals.dbPathForAgent(agentId), {
+        agentId, queryText: currentRequest, audienceKeys: [WORKSPACE_AUDIENCE, ...(audienceKey ? [audienceKey] : [])], allowedCorpora: corpora,
+        ...(crystals.minTokenOverlap !== undefined ? { minTokenOverlap: crystals.minTokenOverlap } : {}),
+        ...(crystals.minSharedTokens !== undefined ? { minSharedTokens: crystals.minSharedTokens } : {}),
+        ...(crystals.ltmRankBoost !== undefined ? { ltmRankBoost: crystals.ltmRankBoost } : {}),
+        nowMs: Date.now(),
+      }).filter(match => !recentCrystals.has(match.crystal.id));
+      const maxHints = crystals.maxHints ?? DEFAULT_CRYSTAL_MAX_HINTS;
+      return maxHints > 0 ? matches.slice(0, maxHints) : matches;
+    } : undefined);
+    let memoryHints: string[] = [];
     const run = async () => {
       const visible = visibleQueryConversation(event.prompt, event.messages, currentRequest, options.syntheticInput);
       const judgeConversation = selectJudgeConversation(visible);
@@ -686,7 +636,7 @@ export function registerMemoryWhisperer(
       const search = await searchMemory(manager, queries, {
         corpora: searchedCorpora, signal, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, timeoutMs: decisionModel.timeoutMs, conversation: judgeConversation,
         asOf, timings: turn.measurement, minUsefulness: config.minUsefulness, maxResults: DEFAULTS.memoryWhisperer.maxFinalists,
-        maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: recent,
+        maxJudgeCandidates: MAX_JUDGE_CANDIDATES, excludedPassages: passages,
         ...(brightness ? { brightness: {
           recipe: brightness.recipe, weight: brightness.weight, maxBoost: brightness.maxBoost,
           lookup: (subjects: readonly string[]) => computeBrightnessMap(brightness.dbPathForAgent(agentId), {
@@ -750,63 +700,55 @@ export function registerMemoryWhisperer(
         recordLedger("rejected", search.rankingMode);
         return;
       }
-      const { selected, redundantIds } = await selectComplementaryHints({
+      const { selected, redundant } = await selectComplementaryHints({
         ranked, config, decisionModel, apiKey, signal, turn, agentId, diagnostics, log,
       });
       if (signal.aborted || !sessions.isCurrent(state)) return;
       turn.stage = "render";
-      const { emitted, rendered, hints } = renderBoundedHints(selected);
-      const selectedIds = new Set(selected.map(candidate => candidate.id));
-      const emittedRanks = new Map(emitted.map((candidate, index) => [candidate.id, index + 1]));
+      const { emitted, encoded } = packHints(selected, memoryHint, MAX_PAYLOAD_CHARS);
+      let selection: Map<string, RecallSelection> | undefined;
+      if (recallLedger) {
+        selection = new Map();
+        for (const index of redundant) selection.set(ranked[index]!.id, { disposition: "redundant" });
+        for (const { id } of selected) selection.set(id, { disposition: "payload_limit" });
+        for (const [index, { id }] of emitted.entries()) selection.set(id, { disposition: "emitted", finalRank: index + 1 });
+      }
       if (!emitted.length) {
         turn.reason = "payload_limit";
         diagnostics?.record(agentId, "memory", "payload_limit");
-        recordLedger("rejected", search.rankingMode, emittedRanks, selectedIds, redundantIds);
+        recordLedger("rejected", search.rankingMode, selection);
         return;
       }
-      for (const candidate of emitted) recent.set(candidate.id, state.turn);
-      memoryHints = hints;
+      for (const candidate of emitted) passages.set(candidate.id, state.turn);
+      memoryHints = encoded;
       diagnostics?.record(agentId, "memory", "emitted");
-      const appendContext = `<memory>\n${rendered}\n</memory>`;
+      const appendContext = renderHints(memoryHints);
       turn.measurement.outcome = "ok";
       turn.reason = "emitted";
       turn.measurement.results = emitted.length;
       turn.measurement.contextChars = appendContext.length;
-      recordLedger("emitted", search.rankingMode, emittedRanks, selectedIds, redundantIds);
+      recordLedger("emitted", search.rankingMode, selection);
       return { appendContext };
     };
     let derivedEmitted = 0;
     let crystalsEmitted = 0;
     let derivedWaitAborted = false;
-    /** Waits at most until the turn deadline; `false` when the deadline (or a cancel) ended the wait. */
-    const settle = async (settled: () => boolean, ready: Promise<void>): Promise<boolean> => {
-      if (settled()) return true;
-      await new Promise<void>(resolve => {
-        if (signal.aborted) return resolve();
-        const onAbort = () => resolve();
-        signal.addEventListener("abort", onAbort, { once: true });
-        void ready.finally(() => { signal.removeEventListener("abort", onAbort); resolve(); });
-      });
-      return !signal.aborted;
-    };
     /**
      * Folds verified syntheses (first), then matched crystals, into the same `<memory>` block ahead of raw chunks;
      * without any, the normal result is returned as-is. An abort here never discards the normal result.
      */
     const withDerived = async (normal: WhisperResult | undefined): Promise<WhisperResult | undefined> => {
       if ((!derivedObservations && !crystals) || signal.aborted) return normal;
-      if (!await settle(() => derivedSettled, derivedReady) || !await settle(() => crystalSettled, crystalReady)) {
+      if (!await derivedLookup.settle() || !await crystalLookup.settle()) {
         derivedWaitAborted = true;
         return normal;
       }
-      if ((!derivedMatches.length && !crystalMatches.length) || !sessions.isCurrent(state)) return normal;
-      const derived = derivedObservations && derivedMatches.length
-        ? boundDerivedHints(derivedMatches, derivedObservations.maxPayloadChars ?? MAX_PAYLOAD_CHARS) : { emitted: [], hints: [] };
-      const crystal = crystals && crystalMatches.length
-        ? boundCrystalHints(crystalMatches, crystals.maxPayloadChars ?? MAX_PAYLOAD_CHARS) : { emitted: [], hints: [] };
+      if ((!derivedLookup.matches.length && !crystalLookup.matches.length) || !sessions.isCurrent(state)) return normal;
+      const derived = packHints(derivedLookup.matches, derivedHint, derivedObservations?.maxPayloadChars ?? MAX_PAYLOAD_CHARS);
+      const crystal = packHints(crystalLookup.matches, crystalHint, crystals?.maxPayloadChars ?? MAX_PAYLOAD_CHARS);
       if (!derived.emitted.length && !crystal.emitted.length) return normal;
-      for (const match of derived.emitted) recent.set(`derived:${match.observation.id}`, state.turn);
-      for (const match of crystal.emitted) recent.set(`crystal:${match.crystal.id}`, state.turn);
+      for (const match of derived.emitted) syntheses.set(match.observation.id, state.turn);
+      for (const match of crystal.emitted) recentCrystals.set(match.crystal.id, state.turn);
       derivedEmitted = derived.emitted.length;
       crystalsEmitted = crystal.emitted.length;
       if (crystal.emitted.length) {
@@ -821,7 +763,7 @@ export function registerMemoryWhisperer(
         diagnostics?.record(agentId, "memory", "emitted");
         turn.reason = derived.emitted.length ? "derived_emitted" : "crystal_emitted";
       }
-      const appendContext = `<memory>\n${encodeHints([...derived.hints, ...crystal.hints, ...memoryHints])}\n</memory>`;
+      const appendContext = renderHints([...derived.encoded, ...crystal.encoded, ...memoryHints]);
       turn.measurement.outcome = "ok";
       turn.measurement.results = memoryHints.length + derived.emitted.length + crystal.emitted.length;
       turn.measurement.contextChars = appendContext.length;

@@ -1,5 +1,5 @@
 import { RESPONSE_EXTRACTOR_VERSION } from "./response-episodes.js";
-import { judgeResponse, judgeResponseFollowup, RESPONSE_STAGE_VERSIONS, } from "./response-judge.js";
+import { judgeResponse, judgeResponseFollowup, RESPONSE_STAGE_VERSIONS, runStageAttempt, } from "./response-judge.js";
 import { decisionModelScope, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import { jsonHash } from "./json-hash.js";
 export async function assessResponseStages(store, cohort, e, params, sentimentEnabled, usage) {
@@ -42,17 +42,13 @@ export async function assessResponseStages(store, cohort, e, params, sentimentEn
             usage.stageCacheHits++;
             return cached;
         }
-        cache.begin(["retrospective"]);
-        try {
+        return runStageAttempt({
+            begin: () => cache.begin(["retrospective"]), settle: () => cache.settle(["retrospective"]), signal: params.signal,
+        }, async () => {
             const retrospective = await judgeResponseFollowup(e, params);
             cache.save("retrospective", retrospective);
             return retrospective;
-        }
-        catch (error) {
-            if (!params.signal.aborted)
-                cache.settle(["retrospective"]);
-            throw error;
-        }
+        });
     };
     const [judgment, retrospective] = await Promise.allSettled([
         judgeResponse(e, params, sentimentEnabled, cache), assessRetrospective(),

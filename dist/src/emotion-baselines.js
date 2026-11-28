@@ -1,8 +1,14 @@
 import { DEFAULTS } from "./defaults.js";
 import { createHash } from "node:crypto";
-import { immediateTransaction, tableExists } from "./memory-database.js";
+import { immediateTransaction, readTableColumns, tableExists } from "./memory-database.js";
 import { jsonHash } from "./json-hash.js";
 export const INSIDE_OUT_EMOTIONS = ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
+/** Derived signed valence: joy against the strongest negative emotion, in -1..1. */
+export const INSIDE_OUT_VALENCE_SQL = "joy-max(sadness,fear,anger,disgust)";
+/** Stored valence where that column exists (NULL on grades written before it), else the derived formula. */
+export const insideOutValenceSql = (storedColumn) => storedColumn ? `coalesce(valence,${INSIDE_OUT_VALENCE_SQL})` : INSIDE_OUT_VALENCE_SQL;
+/** Float tolerance for midrank ties between stored expected scores. */
+export const MIDRANK_TIE_EPSILON = 1e-9;
 /** Erased by an operator purge: never retried, linked, aggregated or compared. */
 export const PURGED_GRADE = "Purged by operator";
 /** Builds a per-emotion record in canonical emotion order, so serialized key order is stable. */
@@ -289,6 +295,8 @@ function refreshPopulation(db, queue, assess, statements, group, options, person
     const { person, rubric, model } = group;
     const personId = String(person);
     const { now, cutoff, minimum } = options;
+    /** Whether this population's committed grades up to `end` still hash to what this pass read. */
+    const prefixMatches = (tx, end, expected) => populationPrefixDigest(tx, db, person, rubric, model, now, end) === expected;
     const existing = new Map(statements.stored.all(person, rubric, model).map(row => [Number(row.week_start), String(row.id)]));
     const source = iterateComparableGrades(statements.page, person, rubric, model, now);
     let next = source.next(), previous;
@@ -299,7 +307,7 @@ function refreshPopulation(db, queue, assess, statements, group, options, person
         const end = start + WEEK, weekly = histograms(), signatures = [];
         const previousEnd = previous ? previous.end : start;
         const previousExpectedPrefix = previous ? previous.expectedPrefix : null;
-        const prefixFence = tx => populationPrefixDigest(tx, db, person, rubric, model, now, previousEnd) === previousExpectedPrefix;
+        const prefixFence = tx => prefixMatches(tx, previousEnd, previousExpectedPrefix);
         // Grades compare only with completed weeks before their own; this week joins afterwards.
         let frozen;
         while (!next.done && Number(next.value.target_at) < end) {
@@ -336,7 +344,7 @@ function refreshPopulation(db, queue, assess, statements, group, options, person
                 // Fence against concurrent purges, relinks, regrades, or new grades affecting this week's prefix.
                 if (hasSeenGrades &&
                     personGenerationMatches(tx, personId) &&
-                    populationPrefixDigest(tx, db, person, rubric, model, now, end) === expectedPrefix) {
+                    prefixMatches(tx, end, expectedPrefix)) {
                     onSnapshot(Number(statements.upsert.run(person, rubric, model, start, id, VERSION, end, now, json).changes));
                 }
             });
@@ -349,7 +357,7 @@ function refreshPopulation(db, queue, assess, statements, group, options, person
         if (!current.has(start)) {
             queue.write(tx => {
                 if (personGenerationMatches(tx, personId) &&
-                    populationPrefixDigest(tx, db, person, rubric, model, now, Infinity) === expectedFull) {
+                    prefixMatches(tx, Infinity, expectedFull)) {
                     statements.remove.run(person, rubric, model, start, id);
                 }
             });
@@ -601,7 +609,8 @@ export function purgeEmotionProfile(db, personId, options = {}) {
             counts.assessments += Number(db.prepare(`DELETE FROM inside_out_deviations WHERE (interaction_id,rubric) IN
         (SELECT interaction_id,rubric FROM inside_out WHERE person_id=?)`).run(personId).changes);
             // Intensity, its distribution and valence are person-scoped emotion data too; drift reads only these columns.
-            const derived = PURGED_COLUMNS.filter(column => hasColumn(db, "inside_out", column));
+            const present = readTableColumns(db, "inside_out");
+            const derived = PURGED_COLUMNS.filter(column => present.has(column));
             counts.grades = Number(db.prepare(`UPDATE inside_out SET ${[...INSIDE_OUT_EMOTIONS, ...derived].map(e => `${e}=NULL`).join(",")},
         error=?,person_id=NULL WHERE person_id=?`).run(PURGED_GRADE, personId).changes);
             if (purged.length)
@@ -618,15 +627,17 @@ const OUTCOME_EMOTION_SIGNALS = ["insideOutValence", "insideOutIntensity", "insi
 function scrubDerivedEmotion(db, purged) {
     const scrubbed = { captainsLogEntries: 0, outcomes: 0 };
     const pairs = JSON.stringify(purged), sessions = JSON.stringify([...new Set(purged.map(([session]) => session))]);
-    if (tableExists(db, "captains_log_entries") && hasColumn(db, "captains_log_entries", "salience_signals_json")) {
-        const columns = CAPTAINS_LOG_SALIENCE.filter(column => hasColumn(db, "captains_log_entries", column));
+    const logColumns = readTableColumns(db, "captains_log_entries");
+    if (logColumns.has("salience_signals_json")) {
+        const columns = CAPTAINS_LOG_SALIENCE.filter(column => logColumns.has(column));
         scrubbed.captainsLogEntries = Number(db.prepare(`UPDATE captains_log_entries SET ${columns.map(c => `${c}=NULL`).join(",")}
       WHERE json_valid(salience_signals_json) AND EXISTS (
         SELECT 1 FROM json_each(salience_signals_json,'$.signals') s JOIN json_each(?) p
         ON json_extract(s.value,'$.sessionId')=json_extract(p.value,'$[0]') AND json_extract(s.value,'$.messageId')=json_extract(p.value,'$[1]'))`)
             .run(pairs).changes);
     }
-    if (tableExists(db, "memory_outcomes") && ["session_id", "signals_json"].every(column => hasColumn(db, "memory_outcomes", column))) {
+    const outcomeColumns = readTableColumns(db, "memory_outcomes");
+    if (["session_id", "signals_json"].every(column => outcomeColumns.has(column))) {
         // Outcome rows record the session, not the graded message: scrub every Inside Out reading in a purged session.
         const paths = OUTCOME_EMOTION_SIGNALS.map(key => `'$.${key}'`).join(",");
         scrubbed.outcomes = Number(db.prepare(`UPDATE memory_outcomes SET signals_json=json_remove(signals_json,${paths})
@@ -637,16 +648,11 @@ function scrubDerivedEmotion(db, purged) {
     return scrubbed;
 }
 const PURGED_COLUMNS = ["intensity", "intensity_probs_json", "intensity_rubric", "valence"];
-function hasColumn(db, table, column) {
-    return !!db.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name=?").get(table, column);
-}
 const mean = (values) => values.length ? values.reduce((sum, v) => sum + v, 0) / values.length : null;
 // ---------------------------------------------------------------------------------------------------------------
 // Unsigned intensity: absolute 0..3 level, kept separate from its one-sided person-relative position.
 // ---------------------------------------------------------------------------------------------------------------
 const INTENSITY_VERSION = "intensity-upper-tail-v1";
-/** Float tolerance for ties between stored expected scores. */
-const INTENSITY_EPSILON = 1e-9;
 /**
  * One-sided upper-tail intensity relative to the person's own earlier grades. Prepared once per export.
  * A stoic person's rare 2 lands near the top of their distribution even though it is only "clear" in absolute terms.
@@ -655,9 +661,10 @@ export function intensityReader(db, options = {}) {
     const minimum = options.minInteractions ?? DEFAULTS.insideOut.defaultBaselineMinInteractions;
     if (!Number.isInteger(minimum) || minimum < 1)
         throw new Error("Invalid intensity minInteractions");
-    const available = tableExists(db, "inside_out") && hasColumn(db, "inside_out", "intensity") && hasColumn(db, "inside_out", "person_id");
+    const columns = readTableColumns(db, "inside_out");
+    const available = columns.has("intensity") && columns.has("person_id");
     const prior = available ? db.prepare(`SELECT count(*) n,avg(intensity) mean,
-      coalesce(sum(intensity<:value-${INTENSITY_EPSILON}),0) below,coalesce(sum(abs(intensity-:value)<=${INTENSITY_EPSILON}),0) tied
+      coalesce(sum(intensity<:value-${MIDRANK_TIE_EPSILON}),0) below,coalesce(sum(abs(intensity-:value)<=${MIDRANK_TIE_EPSILON}),0) tied
     FROM inside_out WHERE person_id=:person AND rubric=:rubric AND model=:model AND intensity_rubric IS :intensityRubric
       AND error IS NULL AND intensity IS NOT NULL AND target_at IS NOT NULL AND target_at<:at`) : undefined;
     return (row) => {
@@ -684,7 +691,8 @@ export function intensityReader(db, options = {}) {
 }
 /** Per-person absolute intensity distribution (0..3), from grades that carry one. Old NULL rows are excluded, not zero. */
 export function intensityProfiles(db, options = {}) {
-    if (!tableExists(db, "inside_out") || !hasColumn(db, "inside_out", "intensity") || !hasColumn(db, "inside_out", "person_id"))
+    const columns = readTableColumns(db, "inside_out");
+    if (!columns.has("intensity") || !columns.has("person_id"))
         return [];
     const rows = db.prepare(`SELECT person_id,intensity_rubric,intensity,target_at FROM inside_out
     WHERE person_id IS NOT NULL AND (? IS NULL OR person_id=?) AND error IS NULL AND intensity IS NOT NULL
@@ -741,11 +749,11 @@ function thresholdMap(defaults, overrides, name) {
 }
 function driftSamples(db, options) {
     const samples = new Map(SENTIMENT_DRIFT_METRICS.map(metric => [metric, []]));
-    if (!tableExists(db, "inside_out") || !hasColumn(db, "inside_out", "person_id"))
+    const columns = readTableColumns(db, "inside_out");
+    if (!columns.has("person_id"))
         return samples;
     const person = options.personId ?? null;
-    const derived = "joy-max(sadness,fear,anger,disgust)";
-    const valence = hasColumn(db, "inside_out", "valence") ? `coalesce(valence,${derived})` : derived;
+    const valence = insideOutValenceSql(columns.has("valence"));
     // One sample per reply: an interaction regraded under several rubrics must not count twice.
     for (const row of db.prepare(`SELECT person_id,min(target_at) at,avg(${valence}) valence,avg(anger) anger FROM inside_out
     WHERE person_id IS NOT NULL AND (? IS NULL OR person_id=?) AND (? IS NULL OR rubric=?) AND error IS NULL
@@ -813,9 +821,8 @@ export function detectSentimentDrift(db, options = {}) {
     const samples = readSnapshot(db, () => driftSamples(db, { now, personId: options.personId, rubric: options.rubric,
         responseCohort: options.responseCohort, minResponseConfidence }));
     const reports = [];
-    const fmt = (value) => Number(value.toFixed(3));
+    const windows = { recentStart, anchorWeeks, minWeekly, minAnchor, minRecent };
     for (const metric of SENTIMENT_DRIFT_METRICS) {
-        const lowerIsWorse = LOWER_IS_WORSE[metric], sign = lowerIsWorse ? -1 : 1;
         const byPerson = new Map();
         for (const sample of samples.get(metric)) {
             const list = byPerson.get(sample.personId);
@@ -825,55 +832,61 @@ export function detectSentimentDrift(db, options = {}) {
                 byPerson.set(sample.personId, [sample]);
         }
         for (const [personId, personSamples] of [...byPerson].sort(([a], [b]) => a.localeCompare(b))) {
-            const weeks = new Map();
-            for (const { at, value } of personSamples) {
-                const list = weeks.get(weekStart(at));
-                if (list)
-                    list.push(value);
-                else
-                    weeks.set(weekStart(at), [value]);
-            }
-            const ordered = [...weeks].sort(([a], [b]) => a - b);
-            // Anchor: earliest stable weeks that finish before the recent window, so the two never overlap.
-            const anchor = ordered.filter(([start, values]) => start + WEEK <= recentStart && values.length >= minWeekly).slice(0, anchorWeeks);
-            const anchorValues = anchor.flatMap(([, values]) => values);
-            const recentValues = personSamples.filter(sample => sample.at >= recentStart).map(sample => sample.value);
-            const stable = ordered.filter(([, values]) => values.length >= minWeekly);
-            const [previousWeek, lastWeek] = stable.slice(-2);
-            const anchoredMean = anchorValues.length >= minAnchor ? mean(anchorValues) : null;
-            const recentMean = recentValues.length >= minRecent ? mean(recentValues) : null;
-            const absoluteDelta = anchoredMean !== null && recentMean !== null ? recentMean - anchoredMean : null;
-            const worsening = absoluteDelta === null ? null : sign * absoluteDelta;
-            const reasons = [];
-            let flagged = false;
-            if (recentMean === null)
-                reasons.push(`insufficient_recent_samples (${recentValues.length} < ${minRecent})`);
-            else {
-                const driftLimit = drift[metric], levelLimit = level[metric];
-                if (anchoredMean === null)
-                    reasons.push(`insufficient_anchor_history (${anchorValues.length} < ${minAnchor})`);
-                else if (driftLimit !== null && worsening >= driftLimit) {
-                    flagged = true;
-                    reasons.push(`anchored_drift: ${metric} ${lowerIsWorse ? "fell" : "rose"} ${fmt(Math.abs(absoluteDelta))} from the anchored baseline ${fmt(anchoredMean)} to ${fmt(recentMean)} (threshold ${driftLimit})`);
-                }
-                if (levelLimit !== null && sign * (recentMean - levelLimit) >= 0) {
-                    flagged = true;
-                    reasons.push(`sustained_level: recent ${metric} ${fmt(recentMean)} is ${lowerIsWorse ? "at or below" : "at or above"} ${levelLimit}`);
-                }
-                if (!reasons.length)
-                    reasons.push("stable");
-            }
-            reports.push({
-                personId, metric, direction: lowerIsWorse ? "lower_is_worse" : "higher_is_worse",
-                anchoredMean, anchorStart: anchor[0]?.[0] ?? null, anchorEnd: anchor.length ? anchor.at(-1)[0] + WEEK : null,
-                anchorSamples: anchorValues.length, recentMean, recentStart, recentSamples: recentValues.length,
-                absoluteDelta, worsening, recentAbsoluteLevel: recentMean,
-                rollingWeeklyDelta: previousWeek && lastWeek ? mean(lastWeek[1]) - mean(previousWeek[1]) : null,
-                weeksObserved: weeks.size, flagged, reason: reasons.join("; "),
-            });
+            reports.push(driftReport(personId, metric, personSamples, { ...windows, driftLimit: drift[metric], levelLimit: level[metric] }));
         }
     }
     return reports;
+}
+const fmt = (value) => Number(value.toFixed(3));
+/** Pure drift report for one person's samples of one metric. */
+function driftReport(personId, metric, personSamples, settings) {
+    const { recentStart, anchorWeeks, minWeekly, minAnchor, minRecent, driftLimit, levelLimit } = settings;
+    const lowerIsWorse = LOWER_IS_WORSE[metric], sign = lowerIsWorse ? -1 : 1;
+    const weeks = new Map();
+    for (const { at, value } of personSamples) {
+        const list = weeks.get(weekStart(at));
+        if (list)
+            list.push(value);
+        else
+            weeks.set(weekStart(at), [value]);
+    }
+    const ordered = [...weeks].sort(([a], [b]) => a - b);
+    // Anchor: earliest stable weeks that finish before the recent window, so the two never overlap.
+    const anchor = ordered.filter(([start, values]) => start + WEEK <= recentStart && values.length >= minWeekly).slice(0, anchorWeeks);
+    const anchorValues = anchor.flatMap(([, values]) => values);
+    const recentValues = personSamples.filter(sample => sample.at >= recentStart).map(sample => sample.value);
+    const stable = ordered.filter(([, values]) => values.length >= minWeekly);
+    const [previousWeek, lastWeek] = stable.slice(-2);
+    const anchoredMean = anchorValues.length >= minAnchor ? mean(anchorValues) : null;
+    const recentMean = recentValues.length >= minRecent ? mean(recentValues) : null;
+    const absoluteDelta = anchoredMean !== null && recentMean !== null ? recentMean - anchoredMean : null;
+    const worsening = absoluteDelta === null ? null : sign * absoluteDelta;
+    const reasons = [];
+    let flagged = false;
+    if (recentMean === null)
+        reasons.push(`insufficient_recent_samples (${recentValues.length} < ${minRecent})`);
+    else {
+        if (anchoredMean === null)
+            reasons.push(`insufficient_anchor_history (${anchorValues.length} < ${minAnchor})`);
+        else if (driftLimit !== null && worsening >= driftLimit) {
+            flagged = true;
+            reasons.push(`anchored_drift: ${metric} ${lowerIsWorse ? "fell" : "rose"} ${fmt(Math.abs(absoluteDelta))} from the anchored baseline ${fmt(anchoredMean)} to ${fmt(recentMean)} (threshold ${driftLimit})`);
+        }
+        if (levelLimit !== null && sign * (recentMean - levelLimit) >= 0) {
+            flagged = true;
+            reasons.push(`sustained_level: recent ${metric} ${fmt(recentMean)} is ${lowerIsWorse ? "at or below" : "at or above"} ${levelLimit}`);
+        }
+        if (!reasons.length)
+            reasons.push("stable");
+    }
+    return {
+        personId, metric, direction: lowerIsWorse ? "lower_is_worse" : "higher_is_worse",
+        anchoredMean, anchorStart: anchor[0]?.[0] ?? null, anchorEnd: anchor.length ? anchor.at(-1)[0] + WEEK : null,
+        anchorSamples: anchorValues.length, recentMean, recentStart, recentSamples: recentValues.length,
+        absoluteDelta, worsening, recentAbsoluteLevel: recentMean,
+        rollingWeeklyDelta: previousWeek && lastWeek ? mean(lastWeek[1]) - mean(previousWeek[1]) : null,
+        weeksObserved: weeks.size, flagged, reason: reasons.join("; "),
+    };
 }
 /** Compact view for `memory-emotions baselines`: flagged entries plus counts. */
 export function summarizeSentimentDrift(reports) {

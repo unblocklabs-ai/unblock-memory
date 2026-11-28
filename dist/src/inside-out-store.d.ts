@@ -1,8 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { refreshEmotionBaselines } from "./emotion-baselines.js";
 export declare const PERSON_MATCH = "SELECT min(i.person_id) person_id FROM person_identities i\n  WHERE i.provider=e.channel AND i.external_id=e.sender_id\n  AND (i.account_scope=json_extract(e.human_key,'$[1]') OR substr(json_extract(e.human_key,'$[1]'),1,8)='session:')\n  HAVING count(DISTINCT i.person_id)=1";
-/** Derived signed valence: joy against the strongest negative emotion, in -1..1. */
-export declare const INSIDE_OUT_VALENCE_SQL = "joy-max(sadness,fear,anger,disgust)";
 export declare function openInsideOutStore(path: string): DatabaseSync;
 /**
  * Refresh People links without loading transcripts or calling the decision model. Known accounts stay exact.

@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import { parseSafeVirtualPath } from "./sources.js";
 import { decisionModelScope, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import { reviewClaim } from "./decision-review.js";
+export function readActiveDocument(db, collection, path) {
+    return db.prepare(`SELECT d.hash, c.doc FROM documents d JOIN content c ON c.hash = d.hash
+    WHERE d.active = 1 AND d.collection = ? AND d.path = ?`).get(collection, path);
+}
 export async function reviewIndexedClaim(params) {
     const unavailable = (reason) => ({ status: "unavailable", verdict: "insufficient_evidence", needsReview: true, reason });
     if (!params.claim.trim() || params.claim.length > DEFAULTS.review.maxClaimChars || !params.citations.length || params.citations.length > 3)
@@ -16,8 +20,7 @@ export async function reviewIndexedClaim(params) {
             const safe = parseSafeVirtualPath(citation.path, sources);
             if (!safe || !Number.isInteger(citation.from) || citation.from < 1 || !Number.isInteger(citation.lines) || citation.lines < 1 || citation.lines > DEFAULTS.review.maxCitationLines)
                 return unavailable("Evidence is unavailable or outside approved corpora");
-            const row = params.db.prepare(`SELECT d.hash, c.doc FROM documents d JOIN content c ON c.hash = d.hash
-        WHERE d.active = 1 AND d.collection = ? AND d.path = ?`).get(safe.source.collection, safe.relativePath);
+            const row = readActiveDocument(params.db, safe.source.collection, safe.relativePath);
             if (!row)
                 return unavailable("Evidence is not indexed");
             const lines = row.doc.split("\n");

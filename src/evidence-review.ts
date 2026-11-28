@@ -7,6 +7,11 @@ import { reviewClaim } from "./decision-review.js";
 
 export type EvidenceCitation = { path: string; from: number; lines: number };
 
+export function readActiveDocument(db: QMDStore["internal"]["db"], collection: string, path: string) {
+  return db.prepare(`SELECT d.hash, c.doc FROM documents d JOIN content c ON c.hash = d.hash
+    WHERE d.active = 1 AND d.collection = ? AND d.path = ?`).get<{ hash: string; doc: string }>(collection, path);
+}
+
 export async function reviewIndexedClaim(params: {
   db: QMDStore["internal"]["db"]; sources: readonly ResolvedSource[];
   claim: string; citations: readonly EvidenceCitation[];
@@ -24,8 +29,7 @@ export async function reviewIndexedClaim(params: {
     for (const citation of params.citations) {
       const safe = parseSafeVirtualPath(citation.path, sources);
       if (!safe || !Number.isInteger(citation.from) || citation.from < 1 || !Number.isInteger(citation.lines) || citation.lines < 1 || citation.lines > DEFAULTS.review.maxCitationLines) return unavailable("Evidence is unavailable or outside approved corpora");
-      const row = params.db.prepare(`SELECT d.hash, c.doc FROM documents d JOIN content c ON c.hash = d.hash
-        WHERE d.active = 1 AND d.collection = ? AND d.path = ?`).get<{ hash: string; doc: string }>(safe.source.collection, safe.relativePath);
+      const row = readActiveDocument(params.db, safe.source.collection, safe.relativePath);
       if (!row) return unavailable("Evidence is not indexed");
       const lines = row.doc.split("\n");
       if (citation.from > lines.length) return unavailable("Evidence range is outside the indexed source");

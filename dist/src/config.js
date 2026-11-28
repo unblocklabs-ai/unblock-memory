@@ -1,5 +1,6 @@
 import { DEFAULTS } from "./defaults.js";
 import { isAbsolute } from "node:path";
+import { isRecord } from "./guards.js";
 import { resolveDecisionConfig, } from "@unblocklabs/decisions";
 import { resolveExtraction } from "./extraction-config.js";
 import { resolveResponseAudit } from "./response-config.js";
@@ -45,10 +46,7 @@ const DEFAULT_QUALITY_AUDIT = {
 function resolveQualityAudit(value, corpora) {
     if (value === undefined)
         return { ...DEFAULT_QUALITY_AUDIT };
-    if (!value || typeof value !== "object" || Array.isArray(value))
-        throw new Error("qualityAudit must be an object");
-    const config = value;
-    assertOnlyKeys(config, ["enabled", "corpora", "minNoise"], "qualityAudit");
+    const config = checkedConfig(value, ["enabled", "corpora", "minNoise"], "qualityAudit", "");
     const enabled = config.enabled ?? false;
     const selected = config.corpora ?? [];
     const minNoise = config.minNoise ?? DEFAULT_QUALITY_AUDIT.minNoise;
@@ -59,20 +57,14 @@ function resolveQualityAudit(value, corpora) {
     }
     if (enabled && !selected.length)
         throw new Error("enabled qualityAudit requires explicit corpora");
-    if (typeof minNoise !== "number" || !Number.isFinite(minNoise) || minNoise < 0 || minNoise > 1) {
-        throw new Error("qualityAudit.minNoise must be between 0 and 1");
-    }
-    return { enabled, corpora: [...new Set(selected)], minNoise };
+    const validatedMinNoise = probability(minNoise, "qualityAudit.minNoise");
+    return { enabled, corpora: [...new Set(selected)], minNoise: validatedMinNoise };
 }
 function resolveDecisionModel(value) {
     const label = "decisionModel";
     if (value === undefined)
         return { ...DEFAULT_DECISION_MODEL_CONFIG };
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error(`unblock-memory ${label} must be an object`);
-    }
-    const config = value;
-    assertOnlyKeys(config, ["enabled", "endpoint", "model", "apiKey", "apiKeyFile", "timeoutMs"], label);
+    const config = checkedConfig(value, ["enabled", "endpoint", "model", "apiKey", "apiKeyFile", "timeoutMs"], label);
     const enabled = config.enabled ?? true;
     if (typeof enabled !== "boolean")
         throw new Error(`unblock-memory ${label}.enabled must be a boolean`);
@@ -130,10 +122,7 @@ const DEFAULT_MEMORY_WHISPERER = {
 function resolveBrightness(value) {
     if (value === undefined)
         return { ...DEFAULT_BRIGHTNESS_CONFIG };
-    if (!value || typeof value !== "object" || Array.isArray(value))
-        throw new Error("unblock-memory memoryWhisperer.brightness must be an object");
-    const config = value;
-    assertOnlyKeys(config, Object.keys(DEFAULT_BRIGHTNESS_CONFIG), "memoryWhisperer.brightness");
+    const config = checkedConfig(value, Object.keys(DEFAULT_BRIGHTNESS_CONFIG), "memoryWhisperer.brightness");
     const recipe = config.recipe ?? DEFAULT_BRIGHTNESS_CONFIG.recipe;
     if (typeof recipe !== "string" || !BRIGHTNESS_RECIPES.includes(recipe)) {
         throw new Error(`unblock-memory memoryWhisperer.brightness.recipe must be one of ${BRIGHTNESS_RECIPES.join(", ")}`);
@@ -161,10 +150,7 @@ function resolveBrightness(value) {
 function resolveQueryApi(value) {
     if (value === undefined)
         value = {};
-    if (!value || typeof value !== "object" || Array.isArray(value))
-        throw new Error("memoryWhisperer.api must be an object");
-    const config = value;
-    assertOnlyKeys(config, ["endpoint", "apiKeyFile"], "memoryWhisperer.api");
+    const config = checkedConfig(value, ["endpoint", "apiKeyFile"], "memoryWhisperer.api", "");
     const endpoint = config.endpoint ?? DEFAULT_MEMORY_WHISPERER.api.endpoint;
     let url;
     if (endpoint !== "") {
@@ -188,17 +174,10 @@ function resolveMemoryWhisperer(value, corpora, extraction) {
     if (value === undefined) {
         return { ...DEFAULT_MEMORY_WHISPERER, api: resolveQueryApi(undefined), brightness: resolveBrightness(undefined) };
     }
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("unblock-memory memoryWhisperer must be an object");
-    }
-    const config = value;
-    assertOnlyKeys(config, [...Object.keys(DEFAULT_MEMORY_WHISPERER), "mlx"], "memoryWhisperer");
+    const config = checkedConfig(value, [...Object.keys(DEFAULT_MEMORY_WHISPERER), "mlx"], "memoryWhisperer");
     // Accept old fleet configs during migration, but never launch a local worker.
     if (config.mlx !== undefined) {
-        if (!config.mlx || typeof config.mlx !== "object" || Array.isArray(config.mlx))
-            throw new Error("memoryWhisperer.mlx must be an object");
-        const value = config.mlx;
-        assertOnlyKeys(value, ["pythonPath", "modelPath"], "memoryWhisperer.mlx");
+        const value = checkedConfig(config.mlx, ["pythonPath", "modelPath"], "memoryWhisperer.mlx", "");
         if (typeof value.pythonPath !== "string" || !isAbsolute(value.pythonPath) ||
             typeof value.modelPath !== "string" || !isAbsolute(value.modelPath)) {
             throw new Error("memoryWhisperer.mlx requires absolute pythonPath and modelPath");
@@ -227,42 +206,20 @@ function resolveMemoryWhisperer(value, corpora, extraction) {
     if (typeof cooldownTurns !== "number" || !Number.isInteger(cooldownTurns) || cooldownTurns < 0 || cooldownTurns > 1000) {
         throw new Error("unblock-memory memoryWhisperer.cooldownTurns must be an integer between 0 and 1000");
     }
-    const minUsefulness = config.minUsefulness ?? DEFAULT_MEMORY_WHISPERER.minUsefulness;
-    if (typeof minUsefulness !== "number" || !Number.isFinite(minUsefulness) || minUsefulness < 0 || minUsefulness > 1) {
-        throw new Error("unblock-memory memoryWhisperer.minUsefulness must be between 0 and 1");
-    }
+    const minUsefulness = probability(config.minUsefulness ?? DEFAULT_MEMORY_WHISPERER.minUsefulness, "unblock-memory memoryWhisperer.minUsefulness");
     const derivedObservations = config.derivedObservations ?? true;
     if (typeof derivedObservations !== "boolean")
         throw new Error("unblock-memory memoryWhisperer.derivedObservations must be a boolean");
-    const derivedMaxHints = config.derivedMaxHints ?? DEFAULT_MEMORY_WHISPERER.derivedMaxHints;
-    if (typeof derivedMaxHints !== "number" || !Number.isSafeInteger(derivedMaxHints) || derivedMaxHints < 0) {
-        throw new Error("unblock-memory memoryWhisperer.derivedMaxHints must be a non-negative integer (0 = unlimited)");
-    }
-    const derivedMinTokenOverlap = config.derivedMinTokenOverlap ?? DEFAULT_MEMORY_WHISPERER.derivedMinTokenOverlap;
-    if (typeof derivedMinTokenOverlap !== "number" || !Number.isFinite(derivedMinTokenOverlap) || derivedMinTokenOverlap < 0 || derivedMinTokenOverlap > 1) {
-        throw new Error("unblock-memory memoryWhisperer.derivedMinTokenOverlap must be between 0 and 1");
-    }
-    const derivedMinSharedTokens = config.derivedMinSharedTokens ?? DEFAULT_MEMORY_WHISPERER.derivedMinSharedTokens;
-    if (typeof derivedMinSharedTokens !== "number" || !Number.isSafeInteger(derivedMinSharedTokens) || derivedMinSharedTokens < 1) {
-        throw new Error("unblock-memory memoryWhisperer.derivedMinSharedTokens must be a positive integer");
-    }
+    const derivedMaxHints = hintCount(config.derivedMaxHints ?? DEFAULT_MEMORY_WHISPERER.derivedMaxHints, "derivedMaxHints", 0);
+    const derivedMinTokenOverlap = probability(config.derivedMinTokenOverlap ?? DEFAULT_MEMORY_WHISPERER.derivedMinTokenOverlap, "unblock-memory memoryWhisperer.derivedMinTokenOverlap");
+    const derivedMinSharedTokens = hintCount(config.derivedMinSharedTokens ?? DEFAULT_MEMORY_WHISPERER.derivedMinSharedTokens, "derivedMinSharedTokens", 1);
     const brightness = resolveBrightness(config.brightness);
     const crystalsEnabled = config.crystalsEnabled ?? DEFAULT_MEMORY_WHISPERER.crystalsEnabled;
     if (typeof crystalsEnabled !== "boolean")
         throw new Error("unblock-memory memoryWhisperer.crystalsEnabled must be a boolean");
-    const crystalMaxHints = config.crystalMaxHints ?? DEFAULT_MEMORY_WHISPERER.crystalMaxHints;
-    if (typeof crystalMaxHints !== "number" || !Number.isSafeInteger(crystalMaxHints) || crystalMaxHints < 0) {
-        throw new Error("unblock-memory memoryWhisperer.crystalMaxHints must be a non-negative integer (0 = unlimited)");
-    }
-    const crystalMinTokenOverlap = config.crystalMinTokenOverlap ?? DEFAULT_MEMORY_WHISPERER.crystalMinTokenOverlap;
-    if (typeof crystalMinTokenOverlap !== "number" || !Number.isFinite(crystalMinTokenOverlap) || crystalMinTokenOverlap < 0 ||
-        crystalMinTokenOverlap > 1) {
-        throw new Error("unblock-memory memoryWhisperer.crystalMinTokenOverlap must be between 0 and 1");
-    }
-    const crystalMinSharedTokens = config.crystalMinSharedTokens ?? DEFAULT_MEMORY_WHISPERER.crystalMinSharedTokens;
-    if (typeof crystalMinSharedTokens !== "number" || !Number.isSafeInteger(crystalMinSharedTokens) || crystalMinSharedTokens < 1) {
-        throw new Error("unblock-memory memoryWhisperer.crystalMinSharedTokens must be a positive integer");
-    }
+    const crystalMaxHints = hintCount(config.crystalMaxHints ?? DEFAULT_MEMORY_WHISPERER.crystalMaxHints, "crystalMaxHints", 0);
+    const crystalMinTokenOverlap = probability(config.crystalMinTokenOverlap ?? DEFAULT_MEMORY_WHISPERER.crystalMinTokenOverlap, "unblock-memory memoryWhisperer.crystalMinTokenOverlap");
+    const crystalMinSharedTokens = hintCount(config.crystalMinSharedTokens ?? DEFAULT_MEMORY_WHISPERER.crystalMinSharedTokens, "crystalMinSharedTokens", 1);
     const crystalLtmRankBoost = config.crystalLtmRankBoost ?? DEFAULT_MEMORY_WHISPERER.crystalLtmRankBoost;
     if (typeof crystalLtmRankBoost !== "number" || !Number.isFinite(crystalLtmRankBoost) || crystalLtmRankBoost < 0) {
         throw new Error("unblock-memory memoryWhisperer.crystalLtmRankBoost must be a non-negative number");
@@ -287,11 +244,7 @@ function resolveMemoryWhisperer(value, corpora, extraction) {
 function resolveExpectationsWhisperer(value) {
     if (value === undefined)
         return { ...EXPECTATIONS_WHISPERER_DEFAULTS };
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("unblock-memory expectationsWhisperer must be an object");
-    }
-    const config = value;
-    assertOnlyKeys(config, Object.keys(EXPECTATIONS_WHISPERER_DEFAULTS), "expectationsWhisperer");
+    const config = checkedConfig(value, Object.keys(EXPECTATIONS_WHISPERER_DEFAULTS), "expectationsWhisperer");
     const flag = (key) => {
         const resolved = config[key] ?? EXPECTATIONS_WHISPERER_DEFAULTS[key];
         if (typeof resolved !== "boolean")
@@ -316,14 +269,34 @@ function assertOnlyKeys(value, allowed, label) {
     if (unknown !== undefined)
         throw new Error(`unblock-memory ${label} has unknown property: ${unknown}`);
 }
+function checkedConfig(value, allowed, label, objectPrefix = "unblock-memory ") {
+    if (!isRecord(value))
+        throw new Error(`${objectPrefix}${label} must be an object`);
+    assertOnlyKeys(value, allowed, label);
+    return value;
+}
+function probability(value, label) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+        throw new Error(`${label} must be between 0 and 1`);
+    }
+    return value;
+}
+function hintCount(value, label, minimum) {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) {
+        throw new Error(`unblock-memory memoryWhisperer.${label} must be a ${minimum ? "positive integer" : "non-negative integer (0 = unlimited)"}`);
+    }
+    return value;
+}
+function corpusPaths(value, name) {
+    if (!Array.isArray(value) || !value.length || !value.every(path => typeof path === "string" && path.trim())) {
+        throw new Error(`unblock-memory corpus ${name} paths must be a non-empty array of non-empty strings`);
+    }
+    return value.map(path => path.trim());
+}
 function resolveWhispererTriggers(value) {
     if (value === undefined)
         return { cron: [], subagent: [], heartbeat: [] };
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("unblock-memory whispererTriggers must be an object");
-    }
-    const config = value;
-    assertOnlyKeys(config, ["cron", "subagent", "heartbeat"], "whispererTriggers");
+    const config = checkedConfig(value, ["cron", "subagent", "heartbeat"], "whispererTriggers");
     const namesFor = (surface) => {
         const names = config[surface];
         if (names === undefined)
@@ -345,10 +318,7 @@ function resolveWhispererTriggers(value) {
 function resolveSyntheticInput(value) {
     if (value === undefined)
         return;
-    if (!value || typeof value !== "object" || Array.isArray(value))
-        throw new Error("unblock-memory syntheticInput must be an object");
-    const config = value;
-    assertOnlyKeys(config, ["enabled", "skipFamilies", "extraExactAliases", "extraPrefixes"], "syntheticInput");
+    const config = checkedConfig(value, ["enabled", "skipFamilies", "extraExactAliases", "extraPrefixes"], "syntheticInput");
     const { enabled, skipFamilies } = config;
     if (enabled !== undefined && typeof enabled !== "boolean")
         throw new Error("unblock-memory syntheticInput.enabled must be a boolean");
@@ -384,9 +354,8 @@ function resolveCorpora(value) {
     }
     const names = new Set();
     const corpora = value.map((entry, index) => {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        if (!isRecord(entry))
             throw new Error(`unblock-memory corpora[${index}] must be an object`);
-        }
         const corpus = entry;
         if (typeof corpus.name !== "string" || !corpus.name.trim()) {
             throw new Error(`unblock-memory corpora[${index}].name must be a non-empty string`);
@@ -403,12 +372,7 @@ function resolveCorpora(value) {
             if (name !== "skills") {
                 throw new Error('unblock-memory skills corpus must be named "skills"');
             }
-            if (!Array.isArray(corpus.paths) ||
-                corpus.paths.length === 0 ||
-                !corpus.paths.every((path) => typeof path === "string" && path.trim())) {
-                throw new Error("unblock-memory corpus skills paths must be a non-empty array of non-empty strings");
-            }
-            return { name: "skills", kind: "skills", paths: corpus.paths.map((path) => path.trim()) };
+            return { name: "skills", kind: "skills", paths: corpusPaths(corpus.paths, name) };
         }
         if (corpus.kind === "sessions") {
             assertOnlyKeys(corpus, ["name", "kind", "chatTypes", "maxExpandedTokens", "syncIntervalMinutes"], `corpora[${index}]`);
@@ -444,12 +408,7 @@ function resolveCorpora(value) {
         if (corpus.kind !== "files") {
             throw new Error(`unblock-memory corpus ${name} must have kind "files", "skills", or "sessions"`);
         }
-        if (!Array.isArray(corpus.paths) ||
-            corpus.paths.length === 0 ||
-            !corpus.paths.every((path) => typeof path === "string" && path.trim())) {
-            throw new Error(`unblock-memory corpus ${name} paths must be a non-empty array of non-empty strings`);
-        }
-        return { name, kind: "files", paths: corpus.paths.map((path) => path.trim()) };
+        return { name, kind: "files", paths: corpusPaths(corpus.paths, name) };
     });
     if (corpora.filter((corpus) => corpus.name === "memory").length !== 1) {
         throw new Error('unblock-memory corpora must contain exactly one corpus named "memory"');
@@ -508,20 +467,14 @@ function resolvePeople(value) {
 export function resolveConfig(value) {
     if (value === undefined || value === null)
         value = {};
-    if (typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("unblock-memory config must be an object");
-    }
-    const config = value;
-    assertOnlyKeys(config, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers", "syntheticInput"], "config");
+    const config = checkedConfig(value, ["corpora", "keepEmbeddingModelWarm", "analysis", "people", "peoplePrimer", "skillWhisperer", "memoryWhisperer", "safetyWhisperer", "expectationsWhisperer", "myTurn", "decisionModel", "qualityAudit", "evidenceReview", "responseAudit", "insideOut", "extraction", "recallLedger", "steward", "whispererTriggers", "syntheticInput"], "config");
     const corpora = resolveCorpora(config.corpora);
     const people = resolvePeople(config.people);
     const peoplePrimer = resolvePeoplePrimer(config.peoplePrimer, corpora, people.enabled);
     let evidenceReview = { enabled: false, corpora: [] };
     if (config.evidenceReview !== undefined) {
         const value = config.evidenceReview;
-        if (!value || typeof value !== "object" || Array.isArray(value))
-            throw new Error("evidenceReview must be an object");
-        assertOnlyKeys(value, ["enabled", "corpora"], "evidenceReview");
+        checkedConfig(value, ["enabled", "corpora"], "evidenceReview", "");
         try {
             const approved = resolveQualityAudit(value, corpora);
             evidenceReview = { enabled: approved.enabled, corpora: approved.corpora };
@@ -537,11 +490,7 @@ export function resolveConfig(value) {
     const keepEmbeddingModelWarm = config.keepEmbeddingModelWarm ?? true;
     let analysisConfig = {};
     if (config.analysis !== undefined) {
-        if (!config.analysis || typeof config.analysis !== "object" || Array.isArray(config.analysis)) {
-            throw new Error("unblock-memory analysis must be an object");
-        }
-        const analysis = config.analysis;
-        assertOnlyKeys(analysis, ["executable"], "analysis");
+        const analysis = checkedConfig(config.analysis, ["executable"], "analysis");
         const configured = analysis.executable;
         if (configured !== undefined) {
             if (typeof configured !== "string" || !configured.trim() || !isAbsolute(configured.trim())) {
@@ -552,16 +501,10 @@ export function resolveConfig(value) {
     }
     let skillWhisperer = DEFAULT_SKILL_WHISPERER;
     if (config.skillWhisperer !== undefined) {
-        if (!config.skillWhisperer ||
-            typeof config.skillWhisperer !== "object" ||
-            Array.isArray(config.skillWhisperer)) {
-            throw new Error("unblock-memory skillWhisperer must be an object");
-        }
-        const value = config.skillWhisperer;
-        assertOnlyKeys(value, ["enabled", "historyMessages", "minScore", "cooldownTurns", "recipeHash"], "skillWhisperer");
+        const value = checkedConfig(config.skillWhisperer, ["enabled", "historyMessages", "minScore", "cooldownTurns", "recipeHash"], "skillWhisperer");
         const enabled = value.enabled ?? DEFAULT_SKILL_WHISPERER.enabled;
         const historyMessages = value.historyMessages ?? DEFAULT_SKILL_WHISPERER.historyMessages;
-        const minScore = value.minScore ?? DEFAULT_SKILL_WHISPERER.minScore;
+        const rawMinScore = value.minScore ?? DEFAULT_SKILL_WHISPERER.minScore;
         const cooldownTurns = value.cooldownTurns ?? DEFAULT_SKILL_WHISPERER.cooldownTurns;
         if (typeof enabled !== "boolean")
             throw new Error("unblock-memory skillWhisperer.enabled must be a boolean");
@@ -570,12 +513,7 @@ export function resolveConfig(value) {
             historyMessages < 0) {
             throw new Error("unblock-memory skillWhisperer.historyMessages must be a non-negative integer");
         }
-        if (typeof minScore !== "number" ||
-            !Number.isFinite(minScore) ||
-            minScore < 0 ||
-            minScore > 1) {
-            throw new Error("unblock-memory skillWhisperer.minScore must be between 0 and 1");
-        }
+        const minScore = probability(rawMinScore, "unblock-memory skillWhisperer.minScore");
         if (typeof cooldownTurns !== "number" ||
             !Number.isInteger(cooldownTurns) ||
             cooldownTurns < 0) {

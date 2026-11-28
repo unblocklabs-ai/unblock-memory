@@ -1,9 +1,9 @@
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import type { ChatType } from "./config.js";
 import { type EmotionalSalienceOptions } from "./emotional-salience.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
-import { type WorkStore } from "./work-store.js";
+import type { WorkStore } from "./work-store.js";
 import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 export declare const CAPTAINS_LOG_KIND = "captains_log";
 export declare const CAPTAINS_LOG_SCHEMA: Type.TObject<{

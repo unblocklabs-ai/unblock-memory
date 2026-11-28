@@ -7,6 +7,8 @@ import { isRecord, nonBlank } from "./guards.js";
 import { CONVERSATION_INFO, conversationEnvelope } from "./response-text.js";
 import { messageText, takeRecentWithinTokens } from "./whisperer-context.js";
 import { decideWithModel, estimateDecisionTokens, isDecisionTimeout, resolveDecisionCredential } from "./decision-client.js";
+import { hasWhispererTrigger } from "./whisperer-prompt.js";
+import { WhispererAdmissionTracker } from "./whisperer-admission.js";
 export function resolveMyTurn(value) {
     const config = value === undefined ? {} : value;
     if (!isRecord(config))
@@ -130,18 +132,12 @@ function buildMyTurnState(params) {
 export function registerMyTurn(api, config, decisionModel, diagnostics) {
     if (!config.enabled)
         return;
-    const sessions = new Map();
-    const touchSession = (key, session) => {
-        sessions.delete(key);
-        sessions.set(key, session);
-    };
-    const stop = (key) => {
-        sessions.get(key)?.current?.controller.abort();
-        sessions.delete(key);
-    };
+    const sessions = new WhispererAdmissionTracker({
+        maxSessions: MAX_SESSIONS, maxRunsPerSession: MAX_SEEN_RUNS, sessionKeyScope: true,
+    });
     const beforePrompt = async (event, context, surface) => {
         const agentId = nonBlank(context.agentId), runId = nonBlank(context.runId), scope = nonBlank(context.sessionKey);
-        if ((!surface && context.trigger !== "user") || !agentId || !runId || !scope)
+        if (!hasWhispererTrigger(context.trigger, surface) || !agentId || !runId || !scope)
             return;
         // Newer hosts expose provenance; retain compatibility with the plugin's minimum SDK.
         const provenance = "inputProvenance" in context ? context.inputProvenance : undefined;
@@ -154,33 +150,16 @@ export function registerMyTurn(api, config, decisionModel, diagnostics) {
             diagnostics?.record(agentId, "myTurn", "decision_disabled");
             return;
         }
-        let session = sessions.get(scope);
-        if (session && session.sessionId !== context.sessionId) {
-            stop(scope);
-            session = undefined;
-        }
-        if (session) {
-            touchSession(scope, session);
-            if (session.latest === runId)
-                return session.current?.result;
-            if (session.seenRuns.has(runId))
-                return undefined;
-        }
-        else {
-            if (sessions.size >= MAX_SESSIONS)
-                stop(sessions.keys().next().value);
-            session = { sessionId: context.sessionId, latest: runId, seenRuns: new Set() };
-            touchSession(scope, session);
-        }
-        session.current?.controller.abort();
-        session.latest = runId;
-        session.seenRuns.add(runId);
-        if (session.seenRuns.size > MAX_SEEN_RUNS)
-            session.seenRuns.delete(session.seenRuns.values().next().value);
-        const activeSession = session;
-        const controller = new AbortController(), { signal } = controller;
+        const target = { agentId, scope, runId, sessionId: context.sessionId };
+        const admission = sessions.lookup(target);
+        if (admission.kind === "replay")
+            return admission.result;
+        if (admission.kind === "superseded")
+            return;
+        const entry = sessions.admit({ ...target, sessionKey: scope, init: () => undefined });
+        const { signal } = entry;
         const record = (outcome) => diagnostics?.record(agentId, "myTurn", outcome);
-        const timer = setTimeout(() => controller.abort(new DOMException("My Turn deadline", "TimeoutError")), DEADLINE_MS);
+        const clearDeadline = sessions.deadline(entry, DEADLINE_MS, "My Turn deadline");
         const check = async () => {
             try {
                 const built = buildMyTurnState({
@@ -202,7 +181,7 @@ export function registerMyTurn(api, config, decisionModel, diagnostics) {
                     return;
                 }
                 const result = await abortable(decideWithModel({ apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, signal, timeoutMs: decisionModel.timeoutMs }, built.state, SHOULD_RESPOND_QUESTIONS, { validateModel: false }), signal);
-                if (sessions.get(scope) !== activeSession || activeSession.latest !== runId) {
+                if (!sessions.isCurrent(entry)) {
                     record("cancelled");
                     return;
                 }
@@ -223,20 +202,12 @@ export function registerMyTurn(api, config, decisionModel, diagnostics) {
                 return;
             }
             finally {
-                clearTimeout(timer);
+                clearDeadline();
             }
         };
-        const result = check();
-        session.current = { controller, result };
-        return result;
+        entry.result = check();
+        return entry.result;
     };
-    api.on("session_end", (event, context) => {
-        for (const [key, session] of sessions) {
-            if (key === event.sessionKey || key === context.sessionKey || (event.sessionId && session.sessionId === event.sessionId))
-                stop(key);
-        }
-    });
-    api.on("gateway_stop", () => { for (const key of sessions.keys())
-        stop(key); });
+    sessions.attach(api);
     return beforePrompt;
 }

@@ -571,6 +571,194 @@ async function awaitJob(
 
 /* ───────────────────────────── Core ───────────────────────────── */
 
+/* ───────────────────────────── Caller-bound tools ───────────────────────────── */
+
+/**
+ * What every investigation tool is bound to: the caller's exact context (identical `requestContext` and `agentId`), the
+ * approved corpora, and the job's own evidence log.
+ */
+type ToolBinding = {
+  active: ActiveContext;
+  manager: DeepThoughtManager;
+  approvedCorpora: string[];
+  /** Records the text a path or handle actually returned to the model: citation quotes must be grounded in it. */
+  remember: (source: string, text: string) => void;
+  /** Counts the call against the job and persists its progress. */
+  recordToolCall: (name: string) => void;
+  /** Paths surfaced by search; when corpora are narrowed, reads are confined to these. */
+  surfacedPaths: Set<string>;
+};
+
+function searchMemoryTool({ active, manager, approvedCorpora, remember, recordToolCall, surfacedPaths }: ToolBinding, settings: {
+  decisionModel: DeepThoughtDeps["decisionModel"]; apiKey: string | undefined; searchMinUsefulness: number;
+  defaultSearchResults: number; maxSnippetChars: number;
+}): StewardToolDef {
+  return {
+    name: "search_memory",
+    description: `Search approved memory corpora (${approvedCorpora.join(", ") || "none"}) with BM25 + vector queries. Returns qmd:// paths and snippets. Safe to call in parallel for multiple angles.`,
+    parameters: searchMemoryArgs,
+    async execute(raw, toolSignal) {
+      recordToolCall("search_memory");
+      const args = Value.Parse(searchMemoryArgs, raw);
+      const requested = resolveCorpora(args.corpora, approvedCorpora);
+      if ("error" in requested) return { status: "invalid_request", error: requested.error };
+      const queries = { lex: args.bm25Query.trim(), vec: args.vectorQuery.trim() };
+      const { conversation } = prepareQueryConversation([], queries.vec);
+      const search = await searchMemory(manager, queries, {
+        corpora: requested.corpora,
+        sessionFilter: args.sessionFilter,
+        maxResults: args.maxResults ?? settings.defaultSearchResults,
+        apiKey: settings.apiKey,
+        minUsefulness: settings.searchMinUsefulness,
+        endpoint: settings.decisionModel.endpoint,
+        model: settings.decisionModel.model,
+        timeoutMs: settings.decisionModel.timeoutMs,
+        conversation: selectJudgeConversation(conversation),
+        allowRetrievalFallback: true,
+        signal: toolSignal,
+        requestContext: active.requestContext,
+      });
+      const results = search.results.map(hit => {
+        const snippet = clip(hit.snippet, settings.maxSnippetChars);
+        remember(hit.path, snippet);
+        surfacedPaths.add(hit.path);
+        return {
+          path: hit.path,
+          corpus: hit.corpus,
+          startLine: hit.startLine,
+          endLine: hit.endLine,
+          score: Number(hit.score.toFixed(3)),
+          ...(hit.session ? { sessionStartedAt: new Date(hit.session.startedAt).toISOString() } : {}),
+          ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
+          ...(hit.extracted ? { observedAt: hit.extracted.observedAt } : {}),
+          snippet,
+        };
+      });
+      return { rankingMode: search.rankingMode, results };
+    },
+  };
+}
+
+/** `narrowed`: corpora were narrowed below everything searchable, so only search-surfaced paths may be read. */
+function readMemoryTool({ active, manager, remember, recordToolCall, surfacedPaths }: ToolBinding, narrowed: boolean): StewardToolDef {
+  return {
+    name: "read_memory",
+    description: "Read an exact qmd:// path returned by search_memory. Continue truncated reads with nextFrom (as from) or nextCursor (as cursor). Safe to call in parallel across multiple files.",
+    parameters: readMemoryArgs,
+    async execute(raw) {
+      recordToolCall("read_memory");
+      const args = Value.Parse(readMemoryArgs, raw);
+      const path = args.path.trim();
+      if (narrowed && !surfacedPaths.has(path)) {
+        return { status: "not_found", path, text: "", note: "Only paths returned by search_memory in approved corpora can be read" };
+      }
+      const result = await manager.readFile({
+        relPath: path,
+        ...(args.from !== undefined ? { from: args.from } : {}),
+        ...(args.lines !== undefined ? { lines: args.lines } : {}),
+        ...(args.cursor ? { cursor: args.cursor } : {}),
+        requestContext: active.requestContext,
+      });
+      if (result.status === "ok") {
+        remember(path, result.text);
+        if (result.path && result.path !== path) remember(result.path, result.text);
+      }
+      return result;
+    },
+  };
+}
+
+/**
+ * Read-only People lookup fenced to the caller's own provider + account. `markPeopleLookup` runs on every call: People
+ * dossiers can change without a collection generation change, so such an answer must never be cached.
+ */
+function lookupPersonTool({ active, remember, recordToolCall }: ToolBinding, people: DeepThoughtPeopleSource,
+  origin: { provider?: string; accountId?: string }, maxPeopleMatches: number, markPeopleLookup: () => void): StewardToolDef {
+  return {
+    name: "lookup_person",
+    description: "Read-only lookup of verified People dossiers within the caller's own account. Cite results as person:<id>.",
+    parameters: lookupPersonArgs,
+    async execute(raw) {
+      recordToolCall("lookup_person");
+      markPeopleLookup();
+      const { query } = Value.Parse(lookupPersonArgs, raw);
+      const store = people.get(active.agentId);
+      const matches: unknown[] = [];
+      for (let offset = 0; maxPeopleMatches <= 0 || matches.length < maxPeopleMatches; offset += PEOPLE_PAGE) {
+        const page = store.listActivePeople(PEOPLE_PAGE, offset, false);
+        for (const person of page) {
+          // People excluded from injection stay invisible here too (matches the People prompt hooks).
+          if (person.injectionEnabled === false) continue;
+          // Strict account fence: only identities in the caller's exact provider + account are visible.
+          const scoped = store.listIdentities(person.id).filter(identity => !identity.isDeactivated && identity.isBot !== true &&
+            identity.provider.toLowerCase() === origin.provider && identity.accountScope.toLowerCase() === origin.accountId);
+          if (!scoped.length || !personMatches(query, person, scoped)) continue;
+          const verified = store.getVerifiedDossier(person.id);
+          const handle = `person:${person.id}`;
+          const name = person.preferredName ?? person.displayName;
+          const identities = scoped.map(identity => ({ provider: identity.provider, externalId: identity.externalId,
+            handle: identity.handle, title: identity.title }));
+          const sections = verified?.dossier.sections.map(section => ({
+            category: section.category,
+            claims: section.claims.map(({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt }) =>
+              ({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt })),
+          }));
+          remember(handle, [name, person.displayName, ...identities.flatMap(i => [i.handle, i.title, i.externalId]),
+            verified?.dossier.blurb, ...(sections ?? []).flatMap(section => section.claims.flatMap(c => [c.statement, c.scope]))]
+            .filter((text): text is string => typeof text === "string" && text.length > 0).join("\n"));
+          matches.push({
+            source: handle,
+            name,
+            status: person.status,
+            identities,
+            dossier: verified ? { reviewedAt: verified.reviewedAt, blurb: verified.dossier.blurb, sections } : null,
+            dossierStatus: verified ? "verified" : "unverified_or_missing",
+          });
+          if (maxPeopleMatches > 0 && matches.length >= maxPeopleMatches) break;
+        }
+        if (page.length < PEOPLE_PAGE) break;
+      }
+      return { status: matches.length ? "ok" : "not_found", matches };
+    },
+  };
+}
+
+/**
+ * Polls (or, with `cancel`, cancels) a handed-off job. A live job is visible only to the caller that started it. After a
+ * restart, that same caller (and agent) can still collect the durable record until it expires; cancelling a finished
+ * durable record deletes it.
+ */
+async function pollDeepThoughtJob(active: ActiveContext, jobId: string, cancel: boolean, options: {
+  caller: string; store: DeepThoughtStore | undefined; syncWaitMs: number; signal: AbortSignal | undefined; now: () => number;
+  base: () => Pick<DeepThoughtOutcome, "citations" | "openQuestions" | "hopsUsed" | "toolCallsUsed" | "elapsedMs">;
+}): Promise<DeepThoughtOutcome> {
+  const { caller, store, syncWaitMs, signal, now, base } = options;
+  const jobs = jobRegistry();
+  const requestedId = jobId.trim();
+  const job = jobs.get(requestedId);
+  if (!job || job.ownerKey !== caller) {
+    // Restart fallback: the same caller can still collect a job persisted by an earlier process.
+    const stored = !job && store ? safely(() => store.getJob(requestedId)) : undefined;
+    if (stored && stored.ownerKey === caller && stored.agentId === active.agentId &&
+        (stored.expiresAt === undefined || Date.now() < stored.expiresAt)) {
+      const outcome = storedJobOutcome(stored);
+      if (cancel && outcome.status !== "running") safely(() => store!.deleteJob(requestedId));
+      return outcome;
+    }
+    return { ...base(), status: "invalid_request", error: `Unknown or expired deep_thought jobId: ${requestedId}` };
+  }
+  if (cancel) {
+    if (!job.outcome) job.controller.abort(new DOMException("Cancelled by caller", "AbortError"));
+    const outcome = await job.promise;
+    if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+    jobs.delete(job.id);
+    if (store) safely(() => store.deleteJob(job.id));
+    return outcome;
+  }
+  const waited = await awaitJob(job, syncWaitMs, signal, now, false);
+  return waited.outcome;
+}
+
 /**
  * Runs one caller-scoped multi-hop investigation (or polls/cancels a handed-off background job).
  * Every tool is bound to the caller's exact context: identical `requestContext`, `agentId`, approved corpora and account.
@@ -600,30 +788,7 @@ async function runDeepThought(
     if (params.question !== undefined) {
       return { ...base(), status: "invalid_request", error: "Pass either question or jobId, not both" };
     }
-    const jobs = jobRegistry();
-    const requestedId = params.jobId.trim();
-    const job = jobs.get(requestedId);
-    if (!job || job.ownerKey !== caller) {
-      // Restart fallback: the same caller can still collect a job persisted by an earlier process.
-      const stored = !job && store ? safely(() => store.getJob(requestedId)) : undefined;
-      if (stored && stored.ownerKey === caller && stored.agentId === active.agentId &&
-          (stored.expiresAt === undefined || Date.now() < stored.expiresAt)) {
-        const outcome = storedJobOutcome(stored);
-        if (params.cancel && outcome.status !== "running") safely(() => store!.deleteJob(requestedId));
-        return outcome;
-      }
-      return { ...base(), status: "invalid_request", error: `Unknown or expired deep_thought jobId: ${requestedId}` };
-    }
-    if (params.cancel) {
-      if (!job.outcome) job.controller.abort(new DOMException("Cancelled by caller", "AbortError"));
-      const outcome = await job.promise;
-      if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
-      jobs.delete(job.id);
-      if (store) safely(() => store.deleteJob(job.id));
-      return outcome;
-    }
-    const waited = await awaitJob(job, syncWaitMs, signal, now, false);
-    return waited.outcome;
+    return pollDeepThoughtJob(active, params.jobId, params.cancel === true, { caller, store, syncWaitMs, signal, now, base });
   }
 
   if (params.cancel || !nonBlank(params.question)) {
@@ -719,127 +884,15 @@ async function runDeepThought(
         } catch { /* Judging is optional; retrieval fallback still returns local evidence. */ }
       }
 
-      const tools: StewardToolDef[] = [];
-      tools.push({
-        name: "search_memory",
-        description: `Search approved memory corpora (${approvedCorpora.join(", ") || "none"}) with BM25 + vector queries. Returns qmd:// paths and snippets. Safe to call in parallel for multiple angles.`,
-        parameters: searchMemoryArgs,
-        async execute(raw, toolSignal) {
-          recordToolCall("search_memory");
-          const args = Value.Parse(searchMemoryArgs, raw);
-          const requested = resolveCorpora(args.corpora, approvedCorpora);
-          if ("error" in requested) return { status: "invalid_request", error: requested.error };
-          const queries = { lex: args.bm25Query.trim(), vec: args.vectorQuery.trim() };
-          const { conversation } = prepareQueryConversation([], queries.vec);
-          const search = await searchMemory(manager, queries, {
-            corpora: requested.corpora,
-            sessionFilter: args.sessionFilter,
-            maxResults: args.maxResults ?? defaultSearchResults,
-            apiKey: searchRanking === "decision" ? apiKey : undefined,
-            minUsefulness: searchMinUsefulness,
-            endpoint: deps.decisionModel.endpoint,
-            model: deps.decisionModel.model,
-            timeoutMs: deps.decisionModel.timeoutMs,
-            conversation: selectJudgeConversation(conversation),
-            allowRetrievalFallback: true,
-            signal: toolSignal,
-            requestContext: active.requestContext,
-          });
-          const results = search.results.map(hit => {
-            const snippet = clip(hit.snippet, maxSnippetChars);
-            remember(hit.path, snippet);
-            surfacedPaths.add(hit.path);
-            return {
-              path: hit.path,
-              corpus: hit.corpus,
-              startLine: hit.startLine,
-              endLine: hit.endLine,
-              score: Number(hit.score.toFixed(3)),
-              ...(hit.session ? { sessionStartedAt: new Date(hit.session.startedAt).toISOString() } : {}),
-              ...(hit.messageTimestamp ? { messageTimestamp: hit.messageTimestamp } : {}),
-              ...(hit.extracted ? { observedAt: hit.extracted.observedAt } : {}),
-              snippet,
-            };
-          });
-          return { rankingMode: search.rankingMode, results };
-        },
-      });
-      tools.push({
-        name: "read_memory",
-        description: "Read an exact qmd:// path returned by search_memory. Continue truncated reads with nextFrom (as from) or nextCursor (as cursor). Safe to call in parallel across multiple files.",
-        parameters: readMemoryArgs,
-        async execute(raw) {
-          recordToolCall("read_memory");
-          const args = Value.Parse(readMemoryArgs, raw);
-          const path = args.path.trim();
-          if (narrowed && !surfacedPaths.has(path)) {
-            return { status: "not_found", path, text: "", note: "Only paths returned by search_memory in approved corpora can be read" };
-          }
-          const result = await manager.readFile({
-            relPath: path,
-            ...(args.from !== undefined ? { from: args.from } : {}),
-            ...(args.lines !== undefined ? { lines: args.lines } : {}),
-            ...(args.cursor ? { cursor: args.cursor } : {}),
-            requestContext: active.requestContext,
-          });
-          if (result.status === "ok") {
-            remember(path, result.text);
-            if (result.path && result.path !== path) remember(result.path, result.text);
-          }
-          return result;
-        },
-      });
-
+      const bound: ToolBinding = { active, manager, approvedCorpora, remember, recordToolCall, surfacedPaths };
+      const tools: StewardToolDef[] = [
+        searchMemoryTool(bound, { decisionModel: deps.decisionModel, apiKey: searchRanking === "decision" ? apiKey : undefined,
+          searchMinUsefulness, defaultSearchResults, maxSnippetChars }),
+        readMemoryTool(bound, narrowed),
+      ];
       const origin = callerOrigin(active);
       if (deps.people?.enabled && origin.provider && origin.accountId) {
-        const peopleSource = deps.people.stores;
-        tools.push({
-          name: "lookup_person",
-          description: "Read-only lookup of verified People dossiers within the caller's own account. Cite results as person:<id>.",
-          parameters: lookupPersonArgs,
-          async execute(raw) {
-            recordToolCall("lookup_person");
-            usedPeopleLookup = true;
-            const { query } = Value.Parse(lookupPersonArgs, raw);
-            const store = peopleSource.get(active.agentId);
-            const matches: unknown[] = [];
-            for (let offset = 0; maxPeopleMatches <= 0 || matches.length < maxPeopleMatches; offset += PEOPLE_PAGE) {
-              const page = store.listActivePeople(PEOPLE_PAGE, offset, false);
-              for (const person of page) {
-                // People excluded from injection stay invisible here too (matches the People prompt hooks).
-                if (person.injectionEnabled === false) continue;
-                // Strict account fence: only identities in the caller's exact provider + account are visible.
-                const scoped = store.listIdentities(person.id).filter(identity => !identity.isDeactivated && identity.isBot !== true &&
-                  identity.provider.toLowerCase() === origin.provider && identity.accountScope.toLowerCase() === origin.accountId);
-                if (!scoped.length || !personMatches(query, person, scoped)) continue;
-                const verified = store.getVerifiedDossier(person.id);
-                const handle = `person:${person.id}`;
-                const name = person.preferredName ?? person.displayName;
-                const identities = scoped.map(identity => ({ provider: identity.provider, externalId: identity.externalId,
-                  handle: identity.handle, title: identity.title }));
-                const sections = verified?.dossier.sections.map(section => ({
-                  category: section.category,
-                  claims: section.claims.map(({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt }) =>
-                    ({ statement, epistemicType, confidence, scope, reviewedAt, expiresAt })),
-                }));
-                remember(handle, [name, person.displayName, ...identities.flatMap(i => [i.handle, i.title, i.externalId]),
-                  verified?.dossier.blurb, ...(sections ?? []).flatMap(section => section.claims.flatMap(c => [c.statement, c.scope]))]
-                  .filter((text): text is string => typeof text === "string" && text.length > 0).join("\n"));
-                matches.push({
-                  source: handle,
-                  name,
-                  status: person.status,
-                  identities,
-                  dossier: verified ? { reviewedAt: verified.reviewedAt, blurb: verified.dossier.blurb, sections } : null,
-                  dossierStatus: verified ? "verified" : "unverified_or_missing",
-                });
-                if (maxPeopleMatches > 0 && matches.length >= maxPeopleMatches) break;
-              }
-              if (page.length < PEOPLE_PAGE) break;
-            }
-            return { status: matches.length ? "ok" : "not_found", matches };
-          },
-        });
+        tools.push(lookupPersonTool(bound, deps.people.stores, origin, maxPeopleMatches, () => { usedPeopleLookup = true; }));
       }
 
       const input = [

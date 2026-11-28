@@ -27,6 +27,18 @@ export async function reviewRequestContext(runtime, active, decisionModel, signa
         return { status: "unavailable", reason: "Memory manager unavailable" };
     return { status: "ready", manager, apiKey, endpoint: decisionModel.endpoint, model: decisionModel.model, signal: combined, timeoutMs: decisionModel.timeoutMs };
 }
+async function runReview(runtime, active, decisionModel, signal, review, unavailable) {
+    try {
+        const context = await reviewRequestContext(runtime, active, decisionModel, signal);
+        if (context.status !== "ready")
+            return jsonResult(context);
+        const { status: _status, manager, ...request } = context;
+        return jsonResult(await review(manager, request));
+    }
+    catch {
+        return jsonResult(unavailable);
+    }
+}
 export function registerReviewTools(api, runtime, config, diagnostics) {
     api.registerTool(ctx => {
         const active = getContext(ctx);
@@ -75,16 +87,7 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
                 const parsed = Value.Parse(claimParameters, params);
                 if (!config.evidenceReview.enabled || !config.decisionModel.enabled)
                     return jsonResult({ status: "disabled" });
-                try {
-                    const context = await reviewRequestContext(runtime, active, config.decisionModel, signal);
-                    if (context.status !== "ready")
-                        return jsonResult(context);
-                    return jsonResult(await context.manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora,
-                        apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
-                }
-                catch {
-                    return jsonResult({ status: "unavailable", needsReview: true, reason: "Claim review failed or was cancelled; no claim verified" });
-                }
+                return runReview(runtime, active, config.decisionModel, signal, (manager, request) => manager.reviewClaim({ ...parsed, corpora: config.evidenceReview.corpora, ...request }), { status: "unavailable", needsReview: true, reason: "Claim review failed or was cancelled; no claim verified" });
             },
         };
     }, { names: ["memory_review_claim"] });
@@ -100,16 +103,7 @@ export function registerReviewTools(api, runtime, config, diagnostics) {
                 const parsed = Value.Parse(clusterParameters, params);
                 if (!config.qualityAudit.enabled || !config.decisionModel.enabled)
                     return jsonResult({ status: "disabled" });
-                try {
-                    const context = await reviewRequestContext(runtime, active, config.decisionModel, signal);
-                    if (context.status !== "ready")
-                        return jsonResult(context);
-                    return jsonResult(await context.manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora,
-                        apiKey: context.apiKey, endpoint: context.endpoint, model: context.model, timeoutMs: context.timeoutMs, signal: context.signal }));
-                }
-                catch {
-                    return jsonResult({ status: "unavailable", reason: "Cluster review failed or was cancelled; no cluster judgment made" });
-                }
+                return runReview(runtime, active, config.decisionModel, signal, (manager, request) => manager.reviewCluster({ ...parsed, corpora: config.qualityAudit.corpora, ...request }), { status: "unavailable", reason: "Cluster review failed or was cancelled; no cluster judgment made" });
             },
         };
     }, { names: ["memory_review_cluster"] });

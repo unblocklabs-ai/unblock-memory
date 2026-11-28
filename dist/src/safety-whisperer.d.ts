@@ -1,7 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { UnblockMemoryConfig } from "./config.js";
 import type { WhispererDiagnostics } from "./diagnostics.js";
-import type { WhispererPrompt } from "./whisperer-prompt.js";
+import { type WhispererPrompt } from "./whisperer-prompt.js";
 type SafetyPluginConfig = Pick<UnblockMemoryConfig, "safetyWhisperer" | "decisionModel" | "memoryWhisperer" | "skillWhisperer">;
 /**
  * The complete current human message, the channel context that arrived with it, and whole recent

@@ -6,8 +6,10 @@ import { judgeMemoryPassage, memoryUsefulnessRequest } from "./decision-ranking.
 import { startTiming, retrievalParts, unaccounted } from "./retrieval-timing.js";
 import { parseDailyFilenameDateMs } from "./recall-ledger.js";
 export function memoryPassageId(text) {
-    return createHash("sha256").update(text.replace(/\s+/gu, " ").trim()).digest("hex");
+    return hashPassage(normalizePassage(text));
 }
+const normalizePassage = (text) => text.replace(/\s+/gu, " ").trim();
+const hashPassage = (text) => createHash("sha256").update(text).digest("hex");
 function rankHits(entries, hitOf, brightness) {
     const baseline = (a, b) => hitOf(b).score - hitOf(a).score;
     if (brightness?.lookup && brightness.recipe !== "off" && entries.length) {
@@ -61,36 +63,31 @@ const TOPIC_RRF_K = 60;
  */
 function fuseTopicHits(lists) {
     const fused = new Map();
-    const topicRanks = new Map();
     let order = 0;
     for (const [topic, hits] of lists.entries()) {
-        const seenInTopic = new Set();
         let rank = 0;
         for (const hit of hits) {
             const passageId = memoryPassageId(hit.snippet);
-            if (seenInTopic.has(passageId))
+            let entry = fused.get(passageId);
+            if (entry?.topicRanks[topic] !== undefined)
                 continue;
-            seenInTopic.add(passageId);
             rank++;
-            const ranks = topicRanks.get(passageId) ?? Array.from({ length: lists.length }, () => undefined);
-            ranks[topic] = rank;
-            topicRanks.set(passageId, ranks);
             const contribution = 1 / (TOPIC_RRF_K + rank);
-            const existing = fused.get(passageId);
-            if (!existing) {
-                fused.set(passageId, { hit, rrf: contribution, order: order++ });
+            if (!entry) {
+                entry = { hit, topicRanks: [], rrf: contribution, order: order++ };
+                fused.set(passageId, entry);
             }
             else {
-                existing.rrf += contribution;
-                if (hit.score > existing.hit.score)
-                    existing.hit = hit;
+                entry.rrf += contribution;
+                if (hit.score > entry.hit.score)
+                    entry.hit = hit;
             }
+            entry.topicRanks[topic] = rank;
         }
     }
-    const hits = [...fused.values()]
+    return [...fused.values()]
         .sort((a, b) => b.rrf - a.rrf || a.order - b.order)
-        .map(({ hit, rrf }) => ({ ...hit, score: rrf }));
-    return { hits, topicRanks, topicCount: lists.length };
+        .map(({ hit, rrf, topicRanks }) => ({ hit: { ...hit, score: rrf }, topicRanks }));
 }
 const timingCounters = new Set(["metadataReloads", "vectorScanAttempts"]);
 /**
@@ -121,14 +118,14 @@ async function searchTopics(manager, topics, options) {
     }
 }
 /** Reserve the best eligible candidate of each topic first, then fill by fused score up to `limit`. */
-function reserveTopicCandidates(candidates, fusion, limit) {
-    const ranked = [...candidates].sort((a, b) => b.score - a.score);
+function reserveTopicCandidates(candidates, topicCount, limit) {
+    const ranked = [...candidates].sort((a, b) => b.hit.score - a.hit.score);
     const picked = new Set();
-    for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
+    for (let topic = 0; topic < topicCount && picked.size < limit; topic++) {
         let best;
         let bestRank = Number.POSITIVE_INFINITY;
         for (const candidate of ranked) {
-            const rank = fusion.topicRanks.get(memoryPassageId(candidate.snippet))?.[topic];
+            const rank = candidate.topicRanks?.[topic];
             if (rank !== undefined && rank < bestRank) {
                 best = candidate;
                 bestRank = rank;
@@ -150,10 +147,10 @@ function reserveTopicCandidates(candidates, fusion, limit) {
  * Reserve the highest-ranked qualifying passage of each topic first, then fill in ranked order, so one topic's
  * many strong hits cannot push another topic's qualifying hit out of the results.
  */
-function reserveTopicFinalists(ranked, fusion, limit) {
+function reserveTopicFinalists(ranked, topicCount, limit) {
     const picked = new Set();
-    for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
-        const best = ranked.find(entry => fusion.topicRanks.get(memoryPassageId(entry.result.snippet))?.[topic] !== undefined);
+    for (let topic = 0; topic < topicCount && picked.size < limit; topic++) {
+        const best = ranked.find(entry => entry.topicRanks?.[topic] !== undefined);
         if (best)
             picked.add(best);
     }
@@ -183,11 +180,11 @@ export async function searchMemory(manager, queries, options) {
         sources: options.sources, signal, maxSnippetChars: MEMORY_PASSAGE_CHARS, timings,
     };
     let hits;
-    let fusion;
+    let topicCount = 0;
     let topicsFailed;
     try {
         if (topics.length === 1) {
-            hits = await manager.searchCandidates(topics[0], searchOptions);
+            hits = (await manager.searchCandidates(topics[0], searchOptions)).map(hit => ({ hit }));
         }
         else {
             const settled = await searchTopics(manager, topics, searchOptions);
@@ -196,8 +193,8 @@ export async function searchMemory(manager, queries, options) {
             if (settled.every(result => result.status === "rejected"))
                 throw settled[0].reason;
             topicsFailed = settled.filter(result => result.status === "rejected").length;
-            fusion = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
-            hits = fusion.hits;
+            topicCount = settled.length;
+            hits = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
         }
     }
     finally {
@@ -211,19 +208,25 @@ export async function searchMemory(manager, queries, options) {
         ...(topicsFailed !== undefined ? { topicsFailed } : {}) };
     const trackTrace = Boolean(options.onTrace);
     const candidates = [];
+    // Up to two hits need at most one comparison; only larger lists need a dedup index.
+    const dedup = hits.length > 2 ? {
+        seenText: new Set(),
+        rangesByPath: new Map(),
+    } : undefined;
     const traces = [];
     const traceByCandidate = new Map();
     const endCandidatePrep = startTiming("candidatePrepMs", timings, signal);
     try {
         let retrievalRank = 0;
-        for (const hit of hits) {
+        for (const { hit, topicRanks } of hits) {
             // Defense in depth before disclosing passages to the external judge.
             if (options.corpora && !options.corpora.includes("all") && !options.corpora.includes(hit.corpus))
                 continue;
             const excerpt = hit.snippet.trim();
             if (!excerpt || excerpt.length > MEMORY_PASSAGE_CHARS)
                 continue;
-            const passageId = memoryPassageId(excerpt);
+            const normalized = normalizePassage(excerpt);
+            const passageId = hashPassage(normalized);
             if (options.excludedPassages?.has(passageId)) {
                 if (trackTrace) {
                     retrievalRank++;
@@ -238,10 +241,26 @@ export async function searchMemory(manager, queries, options) {
                 }
                 continue;
             }
-            if (duplicateMemoryPassage({ ...hit, text: excerpt }, candidates.map(candidate => ({ ...candidate, text: candidate.snippet }))))
-                continue;
+            if (dedup) {
+                if (dedup.seenText.has(normalized))
+                    continue;
+                const { path, startLine, endLine } = hit;
+                const ranges = dedup.rangesByPath.get(path);
+                if (ranges?.some(range => range.startLine <= endLine && startLine <= range.endLine))
+                    continue;
+                dedup.seenText.add(normalized);
+                if (ranges)
+                    ranges.push({ startLine, endLine });
+                else
+                    dedup.rangesByPath.set(path, [{ startLine, endLine }]);
+            }
+            else if (candidates.length) {
+                const previous = candidates[0].hit;
+                if (duplicateMemoryPassage({ ...hit, text: excerpt }, [{ ...previous, text: previous.snippet }]))
+                    continue;
+            }
             const candidate = { ...hit, snippet: excerpt };
-            candidates.push(candidate);
+            candidates.push({ hit: candidate, topicRanks });
             if (trackTrace) {
                 retrievalRank++;
                 const trace = {
@@ -264,7 +283,7 @@ export async function searchMemory(manager, queries, options) {
     options.onCandidates?.(observation);
     const fallback = (reason) => {
         // Retrieval scores are not decision model usefulness probabilities.
-        const ranked = rankHits([...candidates], hit => hit, options.brightness);
+        const ranked = rankHits([...candidates], entry => entry.hit, options.brightness).map(entry => entry.hit);
         const limit = options.maxResults ?? 5;
         const results = ranked.slice(0, limit);
         if (trackTrace) {
@@ -296,15 +315,15 @@ export async function searchMemory(manager, queries, options) {
         : undefined;
     const judgePool = maxJudge === undefined
         ? candidates
-        : fusion
-            ? reserveTopicCandidates(candidates, fusion, maxJudge)
-            : [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge);
+        : topicCount
+            ? reserveTopicCandidates(candidates, topicCount, maxJudge)
+            : [...candidates].sort((a, b) => b.hit.score - a.hit.score).slice(0, maxJudge);
     const minUsefulness = options.minUsefulness ?? 0.7;
     const apiKey = options.apiKey;
     const endJudge = startTiming("judgeMs", timings, signal);
     let judged;
     try {
-        judged = (await Promise.all(judgePool.map(async (hit, candidateIndex) => {
+        judged = (await Promise.all(judgePool.map(async ({ hit, topicRanks }, candidateIndex) => {
             const requestStarted = performance.now();
             const trace = trackTrace ? traceByCandidate.get(hit) : undefined;
             try {
@@ -331,7 +350,7 @@ export async function searchMemory(manager, queries, options) {
                 // Discovery reciprocal ranks are not vector similarity or usefulness.
                 const { vectorScore: _vectorScore, textScore: _textScore, ...result } = hit;
                 const scored = { ...result, score: probability };
-                return [{ result: scored, trace }];
+                return [{ result: scored, trace, topicRanks }];
             }
             catch (error) {
                 if (signal?.aborted)
@@ -353,8 +372,8 @@ export async function searchMemory(manager, queries, options) {
         return fallback("all_judgments_failed");
     const ranked = rankHits(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result, options.brightness);
     const maxResults = options.maxResults ?? 5;
-    const passed = fusion
-        ? reserveTopicFinalists(ranked, fusion, maxResults)
+    const passed = topicCount
+        ? reserveTopicFinalists(ranked, topicCount, maxResults)
         : ranked.slice(0, maxResults);
     if (trackTrace) {
         for (const [index, entry] of passed.entries()) {

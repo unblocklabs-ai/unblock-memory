@@ -61,6 +61,23 @@ function getFreshCorrelation<T>(
   return entry;
 }
 
+/** Maps keep insertion order oldest-first: drop the expired prefix, stopping at the first fresh entry. */
+function pruneExpiredPrefix<V>(map: Map<string, V>, now: number, observedAt: (value: V) => number | undefined): void {
+  for (const [existingKey, value] of map) {
+    const at = observedAt(value);
+    if (at !== undefined && now - at <= CORRELATION_TTL_MS) break;
+    map.delete(existingKey);
+  }
+}
+
+function evictOldestBeyondCap(map: Map<string, unknown>): void {
+  while (map.size > MAX_CORRELATION_ENTRIES) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
 function setBoundedCorrelation<T>(
   map: Map<string, TimedCorrelation<T>>,
   key: string,
@@ -69,16 +86,9 @@ function setBoundedCorrelation<T>(
   messageId?: string,
 ): void {
   map.delete(key);
-  for (const [existingKey, entry] of map) {
-    if (now - entry.observedAt <= CORRELATION_TTL_MS) break;
-    map.delete(existingKey);
-  }
+  pruneExpiredPrefix(map, now, entry => entry.observedAt);
   map.set(key, { threadKey, messageId, observedAt: now });
-  while (map.size > MAX_CORRELATION_ENTRIES) {
-    const oldest = map.keys().next().value;
-    if (oldest === undefined) break;
-    map.delete(oldest);
-  }
+  evictOldestBeyondCap(map);
 }
 
 function enqueuePendingCorrelation(
@@ -90,22 +100,14 @@ function enqueuePendingCorrelation(
 ): void {
   const existing = map.get(key) ?? [];
   map.delete(key);
-  for (const [existingKey, entries] of map) {
-    const latest = entries[entries.length - 1];
-    if (latest && now - latest.observedAt <= CORRELATION_TTL_MS) break;
-    map.delete(existingKey);
-  }
+  pruneExpiredPrefix(map, now, entries => entries[entries.length - 1]?.observedAt);
   const fresh = existing.filter((entry) => now - entry.observedAt <= CORRELATION_TTL_MS);
   fresh.push({ threadKey, messageId, observedAt: now });
   if (fresh.length > MAX_PENDING_PER_IDENTITY) {
     fresh.splice(0, fresh.length - MAX_PENDING_PER_IDENTITY);
   }
   map.set(key, fresh);
-  while (map.size > MAX_CORRELATION_ENTRIES) {
-    const oldest = map.keys().next().value;
-    if (oldest === undefined) break;
-    map.delete(oldest);
-  }
+  evictOldestBeyondCap(map);
 }
 
 function removeMatchingPendingCorrelation(

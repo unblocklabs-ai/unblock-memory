@@ -149,6 +149,23 @@ function company(row) {
         updatedAt: row.updated_at,
     };
 }
+/**
+ * `FROM ... WHERE` selecting person `?`'s dossier (`d`) only while it is exactly the content of its latest change
+ * (`c`), a `replace` that a verification (`v`) certified. Any later edit makes the dossier unverified again.
+ */
+export const VERIFIED_DOSSIER_SQL = `
+  FROM person_dossiers d
+  JOIN person_dossier_verification v ON v.person_id = d.person_id
+  JOIN person_dossier_changes c ON c.person_id = d.person_id AND c.id = v.revision
+  WHERE d.person_id = ?
+    AND c.action = 'replace'
+    AND c.after_dossier_json = d.dossier_json
+    AND c.id = (
+      SELECT latest.id FROM person_dossier_changes latest
+      WHERE latest.person_id = d.person_id
+      ORDER BY latest.rowid DESC
+      LIMIT 1
+    )`;
 function ensureDossierVerificationTable(db) {
     db.exec(`CREATE TABLE IF NOT EXISTS person_dossier_verification (
     person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
@@ -286,9 +303,7 @@ export class PeopleStore {
             const existing = this.#identityRow(provider, accountScope, externalId);
             const personId = existing?.person_id ?? randomUUID();
             if (existing) {
-                const existingPerson = this.#db
-                    .prepare("SELECT * FROM people WHERE id = ?")
-                    .get(personId);
+                const existingPerson = this.#personRow(personId);
                 if (existingPerson.status !== "active") {
                     return { person: person(existingPerson), identity: identity(existing), created: false };
                 }
@@ -358,9 +373,7 @@ export class PeopleStore {
         `)
                     .run(now, personId);
             }
-            const personRow = this.#db
-                .prepare("SELECT * FROM people WHERE id = ?")
-                .get(personId);
+            const personRow = this.#personRow(personId);
             const identityRow = this.#identityRow(provider, accountScope, externalId);
             return { person: person(personRow), identity: identity(identityRow), created: !existing };
         });
@@ -378,8 +391,11 @@ export class PeopleStore {
         return row ? person(row) : undefined;
     }
     getPerson(personId) {
-        const row = this.#db.prepare("SELECT * FROM people WHERE id = ?").get(personId);
+        const row = this.#personRow(personId);
         return row ? person(row) : undefined;
+    }
+    #personRow(personId) {
+        return this.#db.prepare("SELECT * FROM people WHERE id = ?").get(personId);
     }
     listIdentities(personId) {
         return this.#db
@@ -462,42 +478,14 @@ export class PeopleStore {
     isDossierVerified(personId) {
         this.#ensureDossierVerification();
         const row = this.#db
-            .prepare(`
-        SELECT 1
-        FROM person_dossiers d
-        JOIN person_dossier_verification v ON v.person_id = d.person_id
-        JOIN person_dossier_changes c ON c.person_id = d.person_id AND c.id = v.revision
-        WHERE d.person_id = ?
-          AND c.action = 'replace'
-          AND c.after_dossier_json = d.dossier_json
-          AND c.id = (
-            SELECT latest.id FROM person_dossier_changes latest
-            WHERE latest.person_id = d.person_id
-            ORDER BY latest.rowid DESC
-            LIMIT 1
-          )
-      `)
+            .prepare(`SELECT 1 ${VERIFIED_DOSSIER_SQL}`)
             .get(personId);
         return row !== undefined;
     }
     getVerifiedDossier(personId) {
         this.#ensureDossierVerification();
         const row = this.#db
-            .prepare(`
-        SELECT d.dossier_json, d.reviewed_at
-        FROM person_dossiers d
-        JOIN person_dossier_verification v ON v.person_id = d.person_id
-        JOIN person_dossier_changes c ON c.person_id = d.person_id AND c.id = v.revision
-        WHERE d.person_id = ?
-          AND c.action = 'replace'
-          AND c.after_dossier_json = d.dossier_json
-          AND c.id = (
-            SELECT latest.id FROM person_dossier_changes latest
-            WHERE latest.person_id = d.person_id
-            ORDER BY latest.rowid DESC
-            LIMIT 1
-          )
-      `)
+            .prepare(`SELECT d.dossier_json, d.reviewed_at ${VERIFIED_DOSSIER_SQL}`)
             .get(personId);
         return row
             ? {
@@ -740,9 +728,7 @@ export class PeopleStore {
         const now = new Date().toISOString();
         if (!this.#resolveTodoRow(deduplicationKey, note, now))
             return undefined;
-        const row = this.#db
-            .prepare("SELECT * FROM people_todos WHERE deduplication_key = ?")
-            .get(deduplicationKey);
+        const row = this.#todoRowByKey(deduplicationKey);
         return row ? todo(row) : undefined;
     }
     upsertTodo(input) {
@@ -768,9 +754,7 @@ export class PeopleStore {
     }
     #upsertTodoRow(input, now) {
         const contextJson = JSON.stringify(input.context ?? {});
-        const row = this.#db
-            .prepare("SELECT * FROM people_todos WHERE deduplication_key = ?")
-            .get(input.deduplicationKey);
+        const row = this.#todoRowByKey(input.deduplicationKey);
         if (!row || row.status === "resolved") {
             const count = this.#db
                 .prepare("SELECT COUNT(*) AS count FROM people_todos WHERE status = 'open'")
@@ -787,7 +771,7 @@ export class PeopleStore {
         WHERE id = ?
       `)
                 .run(contextJson, now, row.id);
-            return this.#db.prepare("SELECT * FROM people_todos WHERE id = ?").get(row.id);
+            return this.#todoRowById(row.id);
         }
         if (row) {
             this.#db
@@ -797,7 +781,7 @@ export class PeopleStore {
         WHERE id = ?
       `)
                 .run(contextJson, now, row.id);
-            return this.#db.prepare("SELECT * FROM people_todos WHERE id = ?").get(row.id);
+            return this.#todoRowById(row.id);
         }
         const id = randomUUID();
         this.#db
@@ -808,12 +792,10 @@ export class PeopleStore {
       VALUES (?, ?, ?, ?, 'open', 1, ?, ?)
     `)
             .run(id, input.deduplicationKey, input.kind, contextJson, now, now);
-        return this.#db.prepare("SELECT * FROM people_todos WHERE id = ?").get(id);
+        return this.#todoRowById(id);
     }
     #incrementOverflowTodo(now) {
-        const row = this.#db
-            .prepare("SELECT * FROM people_todos WHERE deduplication_key = ?")
-            .get(OVERFLOW_KEY);
+        const row = this.#todoRowByKey(OVERFLOW_KEY);
         if (row) {
             this.#db
                 .prepare(`
@@ -822,7 +804,7 @@ export class PeopleStore {
         WHERE id = ?
       `)
                 .run(now, row.id);
-            return this.#db.prepare("SELECT * FROM people_todos WHERE id = ?").get(row.id);
+            return this.#todoRowById(row.id);
         }
         const id = randomUUID();
         this.#db
@@ -833,7 +815,13 @@ export class PeopleStore {
       VALUES (?, ?, 'overflow', '{}', 'overflow', 1, ?, ?)
     `)
             .run(id, OVERFLOW_KEY, now, now);
+        return this.#todoRowById(id);
+    }
+    #todoRowById(id) {
         return this.#db.prepare("SELECT * FROM people_todos WHERE id = ?").get(id);
+    }
+    #todoRowByKey(deduplicationKey) {
+        return this.#db.prepare("SELECT * FROM people_todos WHERE deduplication_key = ?").get(deduplicationKey);
     }
     #resolveTodoRow(deduplicationKey, note, now) {
         const changed = this.#db

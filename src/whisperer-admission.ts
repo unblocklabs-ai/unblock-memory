@@ -44,6 +44,8 @@ type LifecycleApi = Pick<OpenClawPluginApi, "on">;
 export type WhispererAdmissionOptions = {
   maxSessions: number;
   maxRunsPerSession: number;
+  /** My Turn tracks a session key across runs, resetting it when the host session ID changes. */
+  sessionKeyScope?: boolean;
 };
 
 export function admissionKey(agentId: string, scope: string): string {
@@ -54,10 +56,12 @@ export class WhispererAdmissionTracker<TState, TResult> {
   readonly #sessions = new Map<string, AdmissionEntry<TState, TResult>>();
   readonly #maxSessions: number;
   readonly #maxRuns: number;
+  readonly #sessionKeyScope: boolean;
 
   constructor(options: WhispererAdmissionOptions) {
     this.#maxSessions = options.maxSessions;
     this.#maxRuns = options.maxRunsPerSession;
+    this.#sessionKeyScope = options.sessionKeyScope ?? false;
   }
 
   get size(): number {
@@ -69,14 +73,27 @@ export class WhispererAdmissionTracker<TState, TResult> {
     this.#sessions.set(key, entry);
   }
 
+  #key(target: AdmissionTarget): string {
+    return this.#sessionKeyScope ? target.scope : admissionKey(target.agentId, target.scope);
+  }
+
+  #forget(key: string): void {
+    this.#sessions.get(key)?.controller.abort();
+    this.#sessions.delete(key);
+  }
+
   /**
    * Classify a prompt without side effects beyond LRU recency. Call before any early-return input checks,
    * then `admit` only when the prompt should actually run.
    */
-  lookup(target: AdmissionTarget): AdmissionLookup<TState, TResult> {
-    const key = admissionKey(target.agentId, target.scope);
+  lookup(target: AdmissionTarget & { sessionId?: string }): AdmissionLookup<TState, TResult> {
+    const key = this.#key(target);
     const previous = this.#sessions.get(key);
     if (!previous) return { kind: "fresh" };
+    if (this.#sessionKeyScope && previous.sessionId !== target.sessionId) {
+      this.#forget(key);
+      return { kind: "fresh" };
+    }
     this.#touch(key, previous);
     if (previous.runId === target.runId) return { kind: "replay", result: previous.result };
     // Ignore delayed prompt rebuilds for already-superseded runs so they never replace the latest run.
@@ -90,13 +107,11 @@ export class WhispererAdmissionTracker<TState, TResult> {
     sessionKey?: string;
     init: (previous?: TState) => TState;
   }): AdmissionEntry<TState, TResult> {
-    const key = admissionKey(target.agentId, target.scope);
+    const key = this.#key(target);
     const previous = this.#sessions.get(key);
     previous?.controller.abort();
     if (!previous && this.#sessions.size >= this.#maxSessions) {
-      const oldestKey = this.#sessions.keys().next().value!;
-      this.#sessions.get(oldestKey)?.controller.abort();
-      this.#sessions.delete(oldestKey);
+      this.#forget(this.#sessions.keys().next().value!);
     }
     const seenRuns = previous?.seenRuns ?? new Set<string>();
     seenRuns.add(target.runId);
@@ -135,11 +150,11 @@ export class WhispererAdmissionTracker<TState, TResult> {
   /** Abort and forget sessions matching a `session_end` event. */
   endSession(event: { sessionId?: string; sessionKey?: string }, context: { agentId?: string; sessionKey?: string }): void {
     for (const [key, entry] of this.#sessions) {
-      if (context.agentId && entry.agentId !== context.agentId) continue;
-      if (entry.sessionId === event.sessionId ||
+      if (!this.#sessionKeyScope && context.agentId && entry.agentId !== context.agentId) continue;
+      const matchesId = (!this.#sessionKeyScope || Boolean(event.sessionId)) && entry.sessionId === event.sessionId;
+      if (matchesId ||
         (entry.sessionKey && (entry.sessionKey === event.sessionKey || entry.sessionKey === context.sessionKey))) {
-        entry.controller.abort();
-        this.#sessions.delete(key);
+        this.#forget(key);
       }
     }
   }

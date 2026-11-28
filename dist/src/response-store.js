@@ -7,6 +7,21 @@ import { ResponsePeople } from "./response-identity.js";
 import { ResponseReviews, RESPONSE_REVIEW_POLICY } from "./response-reviews.js";
 const MAX_RETRY_ATTEMPTS = DEFAULTS.responseAudit.maxRetries;
 const RETRY_BACKOFF_MS = DEFAULTS.responseAudit.retryBackoffMs;
+/** An episode result still owes work: not judged ok yet, or judged ok while memory was unavailable. */
+const RESULT_UNSETTLED = "(status!='ok' OR json_extract(result,'$.memory.status')='unavailable')";
+/** Retry budget left and backoff elapsed; binds `retryWindow(now)` in this placeholder order. */
+const RETRY_WINDOW_OPEN = "attempts<? AND (attempted_at IS NULL OR attempted_at<=?)";
+const retryWindow = (now) => [MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS];
+/** A stage linked to result row `r` that has not settled ok; `nonMemory` ignores the memory stage. */
+function incompleteStageExists(nonMemory) {
+    return `EXISTS (
+          SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
+          WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
+            ${nonMemory ? "AND l.stage!='memory' " : ""}AND (s.status IS NULL OR s.status!='ok')
+        )`;
+}
+const INCOMPLETE_STAGE = incompleteStageExists(false);
+const INCOMPLETE_NON_MEMORY_STAGE = incompleteStageExists(true);
 /** Operator-only tables: not a memory corpus and never injected into agent prompts. */
 export class ResponseAuditStore {
     #db;
@@ -92,20 +107,15 @@ export class ResponseAuditStore {
     needsJudgment(cohort, e, now) {
         const row = this.#db.prepare(`SELECT 1 FROM response_results
       WHERE cohort=? AND id=? AND input_hash=? AND active=1
-      AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable')
-      AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?)`)
-            .get(cohort, e.id, e.inputHash, MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS);
+      AND ${RESULT_UNSETTLED} AND ${RETRY_WINDOW_OPEN}`)
+            .get(cohort, e.id, e.inputHash, ...retryWindow(now));
         return !!row;
     }
     memoryRetryResult(cohort, e) {
         const row = this.#db.prepare(`SELECT result FROM response_results r
       WHERE cohort=? AND id=? AND input_hash=? AND active=1 AND status='ok'
       AND json_extract(result,'$.memory.status')='unavailable'
-      AND NOT EXISTS (
-        SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
-        WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
-          AND l.stage!='memory' AND (s.status IS NULL OR s.status!='ok')
-      )`).get(cohort, e.id, e.inputHash);
+      AND NOT ${INCOMPLETE_NON_MEMORY_STAGE}`).get(cohort, e.id, e.inputHash);
         return row && typeof row.result === "string" ? JSON.parse(row.result) : undefined;
     }
     attempted(cohort, e, now) {
@@ -164,24 +174,21 @@ export class ResponseAuditStore {
         this.#db.prepare("DELETE FROM response_checkpoints WHERE cohort=? AND session_id=?").run(cohort, session);
     }
     sessionWork(cohort, session, since, now) {
-        const row = this.#db.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN (status!='ok' OR json_extract(result,'$.memory.status')='unavailable')
-      AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?) THEN 1 ELSE 0 END) due FROM response_results
+        const row = this.#db.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN ${RESULT_UNSETTLED}
+      AND ${RETRY_WINDOW_OPEN} THEN 1 ELSE 0 END) due FROM response_results
       WHERE cohort=? AND session_id=? AND active=1 AND episode_at>=?`)
-            .get(MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS, cohort, session, since);
+            .get(...retryWindow(now), cohort, session, since);
         return { total: Number(row.total), due: Number(row.due ?? 0) };
     }
     pendingWork(cohort, since, now) {
         return Number(this.#db.prepare(`SELECT COUNT(*) n FROM response_results WHERE cohort=? AND active=1 AND episode_at>=?
-      AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable')
-      AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?)`)
-            .get(cohort, since, MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS).n);
+      AND ${RESULT_UNSETTLED} AND ${RETRY_WINDOW_OPEN}`)
+            .get(cohort, since, ...retryWindow(now)).n);
     }
     /** Retry eligibility is not completion: include backoff and exhausted work. */
     unresolvedWork(cohort, since, until) {
         return Number(this.#db.prepare(`SELECT COUNT(*) n FROM response_results r WHERE cohort=? AND active=1
-      AND episode_at>=? AND episode_at<? AND (status!='ok' OR json_extract(result,'$.memory.status')='unavailable' OR EXISTS (
-        SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
-        WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash AND (s.status IS NULL OR s.status!='ok')))`)
+      AND episode_at>=? AND episode_at<? AND (${RESULT_UNSETTLED} OR ${INCOMPLETE_STAGE})`)
             .get(cohort, since, until).n);
     }
     stage(cohort, e, stage, key, contract) {
@@ -215,8 +222,8 @@ export class ResponseAuditStore {
         immediateTransaction(this.#db, () => {
             for (const key of keys) {
                 const changed = this.#db.prepare(`UPDATE response_stages SET attempts=attempts+1,attempted_at=?,status='failed'
-          WHERE key=? AND status!='ok' AND attempts<? AND (attempted_at IS NULL OR attempted_at<=?)`)
-                    .run(now, key, MAX_RETRY_ATTEMPTS, now - RETRY_BACKOFF_MS).changes;
+          WHERE key=? AND status!='ok' AND ${RETRY_WINDOW_OPEN}`)
+                    .run(now, key, ...retryWindow(now)).changes;
                 if (!changed)
                     throw new Error("Response stage in backoff or retry exhausted");
             }
@@ -231,25 +238,13 @@ export class ResponseAuditStore {
         return immediateTransaction(this.#db, () => {
             const memoryOnly = this.#db.prepare(`UPDATE response_results AS r SET attempts=0,attempted_at=NULL
         WHERE cohort=? AND active=1 AND status='ok' AND json_extract(result,'$.memory.status')='unavailable'
-        AND NOT EXISTS (
-          SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
-          WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
-            AND l.stage!='memory' AND (s.status IS NULL OR s.status!='ok')
-        )`).run(cohort).changes;
+        AND NOT ${INCOMPLETE_NON_MEMORY_STAGE}`).run(cohort).changes;
             const reset = this.#db.prepare(`UPDATE response_results AS r
         SET attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL,status='pending'
         WHERE cohort=? AND active=1 AND (
           status!='ok'
-          OR (NOT (status='ok' AND COALESCE(json_extract(result,'$.memory.status'),'')='unavailable') AND EXISTS (
-            SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
-            WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
-              AND (s.status IS NULL OR s.status!='ok')
-          ))
-          OR EXISTS (
-            SELECT 1 FROM response_stage_links l LEFT JOIN response_stages s ON s.key=l.key
-            WHERE l.cohort=r.cohort AND l.episode_id=r.id AND l.input_hash=r.input_hash
-              AND l.stage!='memory' AND (s.status IS NULL OR s.status!='ok')
-          )
+          OR (NOT (status='ok' AND COALESCE(json_extract(result,'$.memory.status'),'')='unavailable') AND ${INCOMPLETE_STAGE})
+          OR ${INCOMPLETE_NON_MEMORY_STAGE}
         )`).run(cohort).changes;
             const stages = this.#db.prepare(`UPDATE response_stages SET attempts=0,attempted_at=NULL,assessed_at=NULL,result=NULL,status='pending'
         WHERE status!='ok' AND key IN (SELECT l.key FROM response_stage_links l JOIN response_results r

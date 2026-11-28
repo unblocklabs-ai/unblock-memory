@@ -1,19 +1,18 @@
 import { DEFAULTS } from "./defaults.js";
 import { normalizeAgentIdStrict } from "openclaw/plugin-sdk/routing";
+import { isRecord } from "./guards.js";
 const DEFAULT_SAFETY_MIN_PROBABILITY = DEFAULTS.safetyWhisperer.defaultMinProbability;
 const MAX_SCENARIOS = 20;
 const MAX_TEXT_CHARS = 2000;
 const MAX_ENTRIES = 500;
 const SCENARIO_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
-function record(value, label) {
-    if (!value || typeof value !== "object" || Array.isArray(value))
+function checkedConfig(value, label, allowed) {
+    if (!isRecord(value))
         throw new Error(`${label} must be an object`);
-    return value;
-}
-function onlyKeys(value, allowed, label) {
     const unknown = Object.keys(value).find(key => !allowed.includes(key));
     if (unknown)
         throw new Error(`${label} has unknown property: ${unknown}`);
+    return value;
 }
 function text(value, label, maximum = 256) {
     if (typeof value !== "string" || !value.trim() || value.trim().length > maximum) {
@@ -35,8 +34,8 @@ function optionalName(value, label) {
 // case-insensitively. Sender IDs stay exact because they approve.
 function channels(value, label) {
     return list(value, label).map((entry, index) => {
-        const at = `${label}[${index}]`, channel = record(entry, at);
-        onlyKeys(channel, ["name", "provider", "accountId", "channelId"], at);
+        const at = `${label}[${index}]`;
+        const channel = checkedConfig(entry, at, ["name", "provider", "accountId", "channelId"]);
         return { ...optionalName(channel, at), provider: text(channel.provider, `${at}.provider`).toLowerCase(),
             accountId: text(channel.accountId, `${at}.accountId`).toLowerCase(),
             channelId: text(channel.channelId, `${at}.channelId`).toLowerCase() };
@@ -44,16 +43,16 @@ function channels(value, label) {
 }
 function requestors(value, label) {
     return list(value, label).map((entry, index) => {
-        const at = `${label}[${index}]`, requestor = record(entry, at);
-        onlyKeys(requestor, ["name", "provider", "accountId", "senderId"], at);
+        const at = `${label}[${index}]`;
+        const requestor = checkedConfig(entry, at, ["name", "provider", "accountId", "senderId"]);
         return { ...optionalName(requestor, at), provider: text(requestor.provider, `${at}.provider`).toLowerCase(),
             accountId: text(requestor.accountId, `${at}.accountId`).toLowerCase(), senderId: text(requestor.senderId, `${at}.senderId`) };
     });
 }
 function scenario(value, index) {
-    const at = `safetyWhisperer.scenarios[${index}]`, entry = record(value, at);
-    onlyKeys(entry, ["id", "enabled", "instructions", "flaggedPrompt", "minProbability", "approvedRequestors",
-        "excludedChannels", "agentIds"], at);
+    const at = `safetyWhisperer.scenarios[${index}]`;
+    const entry = checkedConfig(value, at, ["id", "enabled", "instructions", "flaggedPrompt", "minProbability",
+        "approvedRequestors", "excludedChannels", "agentIds"]);
     const id = typeof entry.id === "string" ? entry.id : "";
     if (!SCENARIO_ID.test(id))
         throw new Error(`${at}.id must be 1-64 letters, digits, '.', '_' or '-'`);
@@ -90,8 +89,7 @@ export function resolveSafetyWhisperer(value) {
     const defaults = { enabled: false, historyMessages: DEFAULTS.safetyWhisperer.defaultHistoryMessages, timeoutMs: DEFAULTS.safetyWhisperer.defaultTimeoutMs, excludedChannels: [], scenarios: [] };
     if (value === undefined)
         return defaults;
-    const config = record(value, "safetyWhisperer");
-    onlyKeys(config, ["enabled", "historyMessages", "timeoutMs", "excludedChannels", "scenarios"], "safetyWhisperer");
+    const config = checkedConfig(value, "safetyWhisperer", ["enabled", "historyMessages", "timeoutMs", "excludedChannels", "scenarios"]);
     const enabled = config.enabled ?? false;
     if (typeof enabled !== "boolean")
         throw new Error("safetyWhisperer.enabled must be a boolean");

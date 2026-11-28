@@ -235,8 +235,13 @@ export async function primePersonDossier(params: {
       const ranked = [...graded].sort((a, b) =>
         b.usefulness[q.id] - a.usefulness[q.id] || a.hit.path.localeCompare(b.hit.path));
       const eligibility = (g: Graded) => Math.min(g.aboutPerson, g.explicitBackground, g.enduring, g.recognition, g.usefulness[q.id]);
-      const selected = ranked.filter(g => eligibility(g) >= config.minUsefulness);
-      const uncertain = ranked.filter(g => !selected.includes(g) && eligibility(g) >= DEFAULTS.people.primerUncertainFloor);
+      // One pass keeps both partitions in ranked order.
+      const selected: Graded[] = [], uncertain: Graded[] = [];
+      for (const g of ranked) {
+        const score = eligibility(g);
+        if (score >= config.minUsefulness) selected.push(g);
+        else if (score >= DEFAULTS.people.primerUncertainFloor) uncertain.push(g);
+      }
       return { ...q, ...counts.get(q.id), graded: ranked.length, qualifying: selected.length,
         coverage: selected.length ? "evidence_found" as const : uncertain.length || failed ? "uncertain" as const : "unknown" as const,
         evidence: selected.slice(0, config.maxEvidencePerQuestion).map(g => evidence(g, q.id)),

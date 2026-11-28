@@ -1,7 +1,7 @@
 import { DEFAULTS } from "./defaults.js";
 import { randomUUID } from "node:crypto";
 import { responseOutcome } from "./response-outcome.js";
-import { immediateTransaction } from "./memory-database.js";
+import { immediateTransaction, readTableColumns } from "./memory-database.js";
 import { jsonHash } from "./json-hash.js";
 export const RESPONSE_REVIEW_POLICY = "response-review-v2";
 const DECISION_PROVENANCE_COLUMNS = ["cohort", "input_hash", "evidence_hash"];
@@ -31,8 +31,7 @@ export class ResponseReviews {
         id TEXT PRIMARY KEY, occurred_at INTEGER NOT NULL, kind TEXT NOT NULL, note TEXT NOT NULL);`);
     }
     #decisionColumns() {
-        const rows = this.db.prepare("PRAGMA table_info(response_review_decisions)").all();
-        return new Set(rows.map(row => String(row.name)));
+        return readTableColumns(this.db, "response_review_decisions");
     }
     #ensureDecisionProvenanceColumns() {
         if (this.#provenanceColumnsReady)

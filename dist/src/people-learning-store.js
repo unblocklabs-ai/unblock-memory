@@ -258,9 +258,6 @@ export class PeopleLearningStore {
                 const sourcesChanged = jsonHash([prior.sessions, prior.sourceGaps, prior.roster]) !== jsonHash([sessions, sourceGaps, roster]);
                 const nextManifest = { ...next, refreshedAt: new Date(Date.now()).toISOString() };
                 const nextRevision = manifestRevision(nextManifest);
-                // Publish the manifest artifact BEFORE committing the ledger/run row pointing to it.
-                beforeCommit?.(nextManifest);
-                this.#rememberInventory(previous.manifest);
                 const gapIds = new Set(sourceGaps.map(g => g.id));
                 const receipt = previous.receipt ? {
                     ...previous.receipt,
@@ -272,15 +269,10 @@ export class PeopleLearningStore {
                     sourceGapReviews: sourcesChanged ? [] : previous.receipt.sourceGapReviews.filter(r => gapIds.has(r.sourceGapId)),
                     analysis: sourcesChanged ? { status: "unresolved", reason: "Source inventory changed; recheck analysis" } : previous.receipt.analysis,
                 } : undefined;
-                // Record reopened_revision whenever a run's manifest refreshes (even before
-                // any receipt was saved) so an unversioned receipt for an earlier export
-                // can never mark the refreshed manifest complete.
-                const reopenedRevision = nextRevision;
-                if (sourcesChanged)
-                    this.#db.prepare("DELETE FROM people_learning_analysis WHERE run_id=?").run(nextManifest.id);
-                this.#db.prepare("UPDATE people_learning_runs SET manifest=?,receipt=?,status='partial',coverage=?,reopened_revision=? WHERE id=?")
-                    .run(JSON.stringify(nextManifest), receipt ? JSON.stringify(receipt) : null, JSON.stringify(receipt ? verifyLearningCoverage(nextManifest, receipt) : { missing: ["receipt"] }), reopenedRevision, nextManifest.id);
-                this.#rememberInventory(nextManifest);
+                this.#reopenRun(nextManifest.id, previous.manifest, nextManifest, nextRevision, receipt, beforeCommit, () => {
+                    if (sourcesChanged)
+                        this.#db.prepare("DELETE FROM people_learning_analysis WHERE run_id=?").run(nextManifest.id);
+                });
             }
             else if (!previous) {
                 // Publish the manifest artifact BEFORE committing the ledger/run row pointing to it.
@@ -295,6 +287,19 @@ export class PeopleLearningStore {
             }
             return this.get(manifest.id);
         });
+    }
+    /**
+     * Persist a refreshed manifest for run `id`: publish its artifact BEFORE committing the run row pointing to it, keep
+     * both inventories, and reopen the run. reopened_revision is recorded whenever a manifest refreshes (even before any
+     * receipt was saved) so an unversioned receipt for an earlier export can never mark the refreshed manifest complete.
+     */
+    #reopenRun(id, prior, next, nextRevision, receipt, publish, beforeUpdate, now) {
+        publish?.(next);
+        this.#rememberInventory(prior);
+        beforeUpdate?.();
+        this.#db.prepare("UPDATE people_learning_runs SET manifest=?,receipt=?,status='partial',coverage=?,reopened_revision=? WHERE id=?")
+            .run(JSON.stringify(next), receipt ? JSON.stringify(receipt) : null, JSON.stringify(receipt ? verifyLearningCoverage(next, receipt, now) : { missing: ["receipt"] }), nextRevision, id);
+        this.#rememberInventory(next);
     }
     planMissedWindows(manifest) {
         const last = this.#db.prepare("SELECT id FROM people_learning_runs WHERE id LIKE ? ORDER BY id DESC LIMIT 1").get(`${manifest.kind}:%`);
@@ -391,9 +396,7 @@ export class PeopleLearningStore {
     }
     checkpoint(id, input, now = Date.now(), checkSaves, finalize, expectedManifestRevision, options) {
         const patch = Value.Parse(LEARNING_RECEIPT_SCHEMA, input);
-        let staged;
-        let stagedManifest;
-        const result = immediateTransaction(this.#db, () => {
+        const outcome = immediateTransaction(this.#db, () => {
             let run = this.#getRunRow(id);
             if (!run)
                 throw new Error("Unknown review run");
@@ -424,7 +427,7 @@ export class PeopleLearningStore {
                 const receiptId = jsonHash([id, patch, now]);
                 this.#db.prepare("INSERT INTO people_learning_receipts VALUES (?,?,?,?,?)")
                     .run(receiptId, id, JSON.stringify(patch), JSON.stringify(coverage), new Date(now).toISOString());
-                return { receiptId, manifestRevision: run.manifestRevision, ...coverage, backlog: this.backlog() };
+                return { kind: "finished", result: { receiptId, manifestRevision: run.manifestRevision, ...coverage, backlog: this.backlog() } };
             }
             // Revision is CAS-verified inside BEGIN IMMEDIATE. Only now expand newly
             // acquired dossier assertions — never touching sessions, roster, or sourceGaps.
@@ -440,15 +443,11 @@ export class PeopleLearningStore {
                         refreshedAt: new Date(now).toISOString(),
                     };
                     const nextRevision = manifestRevision(nextManifest);
-                    options.beforeManifestCommit?.(nextManifest);
-                    this.#rememberInventory(run.manifest);
                     const updatedPriorReceipt = run.receipt ? {
                         ...run.receipt,
                         manifestRevision: run.receipt.manifestRevision !== undefined ? nextRevision : undefined,
                     } : undefined;
-                    this.#db.prepare("UPDATE people_learning_runs SET manifest=?,receipt=?,status='partial',coverage=?,reopened_revision=? WHERE id=?")
-                        .run(JSON.stringify(nextManifest), updatedPriorReceipt ? JSON.stringify(updatedPriorReceipt) : null, JSON.stringify(updatedPriorReceipt ? verifyLearningCoverage(nextManifest, updatedPriorReceipt, now) : { missing: ["receipt"] }), nextRevision, id);
-                    this.#rememberInventory(nextManifest);
+                    this.#reopenRun(id, run.manifest, nextManifest, nextRevision, updatedPriorReceipt, options.beforeManifestCommit, undefined, now);
                     run = {
                         ...run,
                         manifest: nextManifest,
@@ -482,16 +481,15 @@ export class PeopleLearningStore {
                 this.#db.prepare("UPDATE people_learning_runs SET receipt=?,status=?,coverage=? WHERE id=?")
                     .run(JSON.stringify(receipt), coverage.status, JSON.stringify(coverage), id);
             }
-            if (coverage.unresolved.includes("dossier-verification")) {
-                staged = {
-                    manifest: JSON.stringify(run.manifest), receipt: JSON.stringify(receipt), coverage: JSON.stringify(coverage),
-                };
-                stagedManifest = run.manifest;
-            }
-            return { receiptId, manifestRevision: run.manifestRevision, ...coverage, backlog: this.backlog() };
+            const result = { receiptId, manifestRevision: run.manifestRevision, ...coverage, backlog: this.backlog() };
+            if (!coverage.unresolved.includes("dossier-verification"))
+                return { kind: "finished", result };
+            const pending = { manifest: JSON.stringify(run.manifest), receipt: JSON.stringify(receipt), coverage: JSON.stringify(coverage) };
+            return { kind: "staged", result, pending, manifest: run.manifest };
         });
-        if (!finalize || !staged || !stagedManifest || !result.unresolved.includes("dossier-verification"))
-            return result;
-        return this.#publishFinalized(id, staged, stagedManifest, result, finalize);
+        // Transaction 2 (dossier verification + completion) runs only for a checkpoint staged for finalization.
+        if (!finalize || outcome.kind === "finished")
+            return outcome.result;
+        return this.#publishFinalized(id, outcome.pending, outcome.manifest, outcome.result, finalize);
     }
 }

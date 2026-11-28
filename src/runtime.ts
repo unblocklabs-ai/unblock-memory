@@ -56,6 +56,9 @@ function liveRun(row: WorkItem | undefined, now = Date.now()): row is WorkItem {
   return row?.status === "running" && row.leaseUntil > now;
 }
 
+const curationDatabasePath = (directory: string) => join(directory, MEMORY_DATABASE);
+const qmdDatabasePath = (directory: string) => join(directory, "index.sqlite");
+
 export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   readonly #corpora: readonly CorpusConfig[];
   readonly #extraction?: ExtractionConfig;
@@ -72,8 +75,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   /** Lease owner for this runtime's session syncs; `close()` (gateway_stop) releases it with 0 strikes. */
   readonly #workOwner = `session-sync:${process.pid}:${randomUUID()}`;
   readonly #runningSyncs = new Set<{ work: WorkStore; abort: AbortController }>();
-  #closing = false;
-  #closed = false;
+  #shutdownStarted = false;
   #reloadFences = 0;
   #closeAllFences = 0;
   #closePromise?: Promise<void>;
@@ -82,7 +84,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   startSessionSyncSchedule(cfg: OpenClawConfig, onError: (error: unknown) => void): void {
     this.stopSessionSyncSchedule();
-    if (this.#closing || this.#closed) return;
+    if (this.#shutdownStarted) return;
     const sessions = this.#corpora.find((corpus) => corpus.kind === "sessions");
     if (!sessions?.syncIntervalMinutes) return;
     this.#schedule = { cfg, onError };
@@ -103,8 +105,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   #maybeResumeSessionSyncSchedule(): void {
     if (
-      this.#closing ||
-      this.#closed ||
+      this.#shutdownStarted ||
       this.#reloadFences > 0 ||
       this.#closeAllFences > 0 ||
       this.#sessionSyncTimer ||
@@ -131,7 +132,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   }
 
   #admissionBlockedReason(): string | undefined {
-    if (this.#closing || this.#closed) return "memory runtime is closing";
+    if (this.#shutdownStarted) return "memory runtime is closing";
     if (this.#reloadFences > 0) return "memory runtime is reloading";
     if (this.#closeAllFences > 0) return "memory runtime is closing";
     return undefined;
@@ -145,7 +146,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   #openSessionWork(agentId: string): { work: WorkStore; state: SessionSyncState; directory: string } {
     const directory = this.#stateDir(agentId);
-    const work = new WorkStore(join(directory, MEMORY_DATABASE));
+    const work = new WorkStore(curationDatabasePath(directory));
     try { return { work, state: new SessionSyncState(work.db, agentId, directory), directory }; }
     catch (error) { work.close(); throw error; }
   }
@@ -173,7 +174,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   }
 
   memoryDatabasePath(agentId: string): string {
-    return join(this.#stateDir(agentId), MEMORY_DATABASE);
+    return curationDatabasePath(this.#stateDir(agentId));
   }
 
   searchableCorpora(): string[] {
@@ -328,7 +329,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       const sessions = this.#sessionConfig(params.cfg, params.agentId);
       let result = !force && sessions
         ? await unchangedSessionSync({ ...sessions, state: { read: () => state.readManifest() } },
-          join(run.directory, "index.sqlite"))
+          qmdDatabasePath(run.directory))
         : undefined;
       if (!result) {
         abort.signal.throwIfAborted();
@@ -367,7 +368,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
 
   async sessionSyncStatus(agentId: string): Promise<SessionSyncStatus> {
     const directory = this.#stateDir(agentId);
-    if (!lstatSync(join(directory, MEMORY_DATABASE), { throwIfNoEntry: false }) &&
+    if (!lstatSync(curationDatabasePath(directory), { throwIfNoEntry: false }) &&
       !lstatSync(join(directory, "session-sync-status.json"), { throwIfNoEntry: false })) {
       return { status: "idle" };
     }
@@ -407,6 +408,16 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     }
   }
 
+  #hasWorkToDrain(): boolean {
+    return this.#pendingSessionSyncStarts.size > 0 || this.#activeSessionSyncs.size > 0 ||
+      this.#managers.size > 0 || this.#closingManagers.size > 0;
+  }
+
+  #closeManagerBatch(): Promise<PromiseSettledResult<void>[]> | undefined {
+    const agentIds = new Set([...this.#managers.keys(), ...this.#closingManagers.keys()]);
+    if (agentIds.size) return Promise.allSettled([...agentIds].map(agentId => this.closeMemorySearchManager({ agentId })));
+  }
+
   prepareReload(
     change: Parameters<NonNullable<MemoryPluginRuntimeContract["prepareReload"]>>[0],
   ): ReturnType<NonNullable<MemoryPluginRuntimeContract["prepareReload"]>> {
@@ -428,29 +439,16 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
           drainPromise = (async () => {
             const errors: unknown[] = [];
             if (resumed) return { errors };
-            let ranOnce = false;
-            while (
-              !ranOnce ||
-              (!resumed && (
-                this.#pendingSessionSyncStarts.size > 0 ||
-                this.#activeSessionSyncs.size > 0 ||
-                this.#managers.size > 0 ||
-                this.#closingManagers.size > 0
-              ))
-            ) {
-              ranOnce = true;
+            do {
               await this.#drainSessionSyncs();
               if (resumed) break;
-              const agentIds = new Set([...this.#managers.keys(), ...this.#closingManagers.keys()]);
-              if (agentIds.size > 0) {
-                const settled = await Promise.allSettled(
-                  [...agentIds].map((agentId) => this.closeMemorySearchManager({ agentId })),
-                );
-                for (const outcome of settled) {
+              const batch = this.#closeManagerBatch();
+              if (batch) {
+                for (const outcome of await batch) {
                   if (outcome.status === "rejected") errors.push(outcome.reason);
                 }
               }
-            }
+            } while (!resumed && this.#hasWorkToDrain());
             return { errors };
           })();
         }
@@ -515,47 +513,26 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
   async closeAllMemorySearchManagers(): Promise<void> {
     this.#closeAllFences += 1;
     this.stopSessionSyncSchedule();
-    let firstError: unknown;
-    let hasError = false;
+    let failure: PromiseRejectedResult | undefined;
     try {
-      while (
-        this.#pendingSessionSyncStarts.size > 0 ||
-        this.#activeSessionSyncs.size > 0 ||
-        this.#managers.size > 0 ||
-        this.#closingManagers.size > 0
-      ) {
+      while (this.#hasWorkToDrain()) {
         await this.#drainSessionSyncs();
-        const agentIds = new Set([...this.#managers.keys(), ...this.#closingManagers.keys()]);
-        if (agentIds.size > 0) {
-          const settled = await Promise.allSettled(
-            [...agentIds].map((agentId) => this.closeMemorySearchManager({ agentId })),
-          );
-          for (const outcome of settled) {
-            if (outcome.status === "rejected" && !hasError) {
-              hasError = true;
-              firstError = outcome.reason;
-            }
-          }
-        }
+        const batch = this.#closeManagerBatch();
+        if (!batch) continue;
+        const settled = await batch;
+        failure ??= settled.find(outcome => outcome.status === "rejected");
       }
     } finally {
       this.#closeAllFences = Math.max(0, this.#closeAllFences - 1);
     }
-    if (hasError) throw firstError;
+    if (failure) throw failure.reason;
   }
 
   async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
-    this.#closing = true;
+    this.#shutdownStarted = true;
     this.#interruptSessionSyncs();
-    const closing = (async () => {
-      try {
-        await this.closeAllMemorySearchManagers();
-      } finally {
-        this.#closed = true;
-        this.#closing = false;
-      }
-    })();
+    const closing = (async () => { await this.closeAllMemorySearchManagers(); })();
     this.#closePromise = closing;
     return closing;
   }
@@ -598,8 +575,8 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
     if (sessions) sources.push(this.#sessionSource(agentId, sessions.chatTypes));
     return new QmdMemoryManager({
       workspaceDir,
-      dbPath: join(stateDir, "index.sqlite"),
-      curationPath: join(stateDir, MEMORY_DATABASE),
+      dbPath: qmdDatabasePath(stateDir),
+      curationPath: curationDatabasePath(stateDir),
       extraction: this.#extraction,
       sources,
       keepModelsWarm: this.#keepEmbeddingModelWarm,
@@ -628,7 +605,7 @@ export class QmdMemoryRuntime implements MemoryPluginRuntimeContract {
       chatTypes: corpus.chatTypes, maxExpandedTokens: corpus.maxExpandedTokens,
       collection: this.#sessionSource(agentId, corpus.chatTypes).collection,
       databasePath: agentTranscriptDatabase(cfg, agentId),
-      statePath: join(stateDir, MEMORY_DATABASE),
+      statePath: curationDatabasePath(stateDir),
       legacyStateDir: stateDir,
       timezone: resolveTimezone(cfg.agents?.defaults?.userTimezone?.trim()),
       syntheticInput: this.#syntheticInput,

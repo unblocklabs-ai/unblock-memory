@@ -4,7 +4,9 @@ import { DEFAULTS } from "./defaults.js";
 import { decideWithModel, extractWithModel } from "./decision-client.js";
 import { fallbackQueries } from "./query-generator.js";
 import type { QueryConversation, QueryPair } from "./query-contract.js";
-import { codePointSpanToUtf16 } from "./text-span.js";
+import { codePointSpanToUtf16, sliceHeadSafe } from "./text-span.js";
+
+export { sliceHeadSafe } from "./text-span.js";
 
 /**
  * Memory Whisperer v2 query planning, powered only by the decision model and local text. Two calls run in
@@ -118,16 +120,6 @@ export function conversationText(conversation: QueryConversation): string {
   return conversationLines(conversation).text;
 }
 
-/** Truncate to at most `maxChars` UTF-16 units without leaving a lone high surrogate. */
-export function sliceHeadSafe(text: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
-  if (text.length <= maxChars) return text;
-  let end = maxChars;
-  const last = text.charCodeAt(end - 1);
-  if (last >= 0xd800 && last <= 0xdbff) end--;
-  return text.slice(0, end);
-}
-
 function normalizeAnchor(text: string): string {
   return text.replace(/\s+/gu, " ").trim().toLowerCase();
 }
@@ -194,7 +186,15 @@ export function groundAnchors(
   spans: readonly (readonly [number, number])[] | undefined,
   max: number = MW.maxTopics,
 ): string[] {
-  const { text, bodies } = conversationLines(conversation);
+  return groundTranscript(conversationLines(conversation), values, spans, max);
+}
+
+function groundTranscript(
+  { text, bodies }: ReturnType<typeof conversationLines>,
+  values: readonly unknown[],
+  spans: readonly (readonly [number, number])[] | undefined,
+  max: number,
+): string[] {
   const seen = new Set<string>();
   const anchors: string[] = [];
   for (const [index, value] of values.entries()) {
@@ -302,13 +302,14 @@ async function extractTopicAnchors(params: DecisionAccess & {
   const { conversation, signal } = params;
   const timeoutMs = boundedTimeout(params.extractTimeoutMs ?? MW.extractTimeoutMs, params.timeoutMs);
   const callSignal = stageSignal(signal, timeoutMs, params.deadline);
+  const transcript = conversationLines(conversation);
   const { answers } = await abortable(extractWithModel(
     { apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs, signal: callSignal },
-    conversationText(conversation), TOPIC_FIELDS, { validateModel: false },
+    transcript.text, TOPIC_FIELDS, { validateModel: false },
   ), callSignal);
   signal.throwIfAborted();
   if (answers.topics.p_null === 1 || !answers.topics.value) return [];
-  return groundAnchors(conversation, answers.topics.value, answers.topics.spans, Number.POSITIVE_INFINITY);
+  return groundTranscript(transcript, answers.topics.value, answers.topics.spans, Number.POSITIVE_INFINITY);
 }
 
 type ExtractionOutcome = { anchors: string[] } | { cause: unknown };
@@ -353,10 +354,12 @@ export async function planRecall(params: DecisionAccess & {
     const base = { shouldRecall: true, corpora: gate.corpora,
       ...(gate.gateScore !== undefined ? { gateScore: gate.gateScore } : {}),
       ...(gate.error ? { gateFallback: gate.error } : {}) };
-    const fallback = { topics: [fallbackQueries(conversation)], anchors: [], queryFallback: true };
-    if ("cause" in extracted) return { ...base, ...fallback, extractionFallback: { reason: "error", cause: extracted.cause } };
+    const fallback = (extractionFallback: NonNullable<RecallPlan["extractionFallback"]>): RecallPlan =>
+      ({ ...base, topics: [fallbackQueries(conversation)], anchors: [], queryFallback: true, extractionFallback });
+    if ("cause" in extracted) return fallback({ reason: "error", cause: extracted.cause });
+    if (!conversation.currentRequest.trim()) throw new Error("Missing or unparseable current request");
     const { topics, anchors } = boundedTopics(extracted.anchors, conversation.currentRequest, params.maxTopics ?? MW.maxTopics);
-    if (!topics.length) return { ...base, ...fallback, extractionFallback: { reason: "no_grounded_topics" } };
+    if (!topics.length) return fallback({ reason: "no_grounded_topics" });
     return { ...base, topics, anchors, queryFallback: false };
   } finally {
     stopExtraction.abort();

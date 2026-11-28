@@ -10,8 +10,8 @@ import { extractionSessions } from "./extraction-source.js";
 import { dateOption } from "./date-option.js";
 import { agentStateDir, agentTranscriptDatabase } from "./agent-paths.js";
 export function registerExtraction(api, config, runtime, deps) {
+    // gateway_stop aborts `lifetime`; gateway_start replaces an aborted one. Its signal is the stopped flag.
     let lifetime = new AbortController();
-    let stopped = false;
     let timer, running;
     const activeRuns = new Set();
     const track = (pending) => {
@@ -87,7 +87,7 @@ export function registerExtraction(api, config, runtime, deps) {
             respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "Invalid extraction parameters"));
             return;
         }
-        if (stopped || lifetime.signal.aborted) {
+        if (lifetime.signal.aborted) {
             respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Extraction failed; check host prerequisites and operator report"));
             return;
         }
@@ -99,7 +99,6 @@ export function registerExtraction(api, config, runtime, deps) {
         }
     }, { scope: "operator.admin" });
     api.on("gateway_stop", async () => {
-        stopped = true;
         lifetime.abort();
         if (timer)
             clearInterval(timer);
@@ -109,12 +108,12 @@ export function registerExtraction(api, config, runtime, deps) {
         }
     });
     const tick = () => {
-        if (stopped || running || lifetime.signal.aborted)
+        if (running || lifetime.signal.aborted)
             return;
         const signal = lifetime.signal;
         running = (async () => {
             for (const agentId of listAgentIds(api.config)) {
-                if (stopped || signal.aborted)
+                if (signal.aborted)
                     break;
                 try {
                     const result = await run(api.config, agentId, signal, undefined, undefined, true);
@@ -129,7 +128,6 @@ export function registerExtraction(api, config, runtime, deps) {
         })().finally(() => { running = undefined; });
     };
     api.on("gateway_start", () => {
-        stopped = false;
         if (timer)
             clearInterval(timer);
         timer = undefined;

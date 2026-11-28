@@ -1,7 +1,7 @@
 import { Type, type Static } from "typebox";
 import type { MemoryAnalysisSummary, MemoryClusterDetail, MemoryClusterList, MemoryClusterSort } from "./analysis.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
-import { type WorkStore } from "./work-store.js";
+import type { WorkStore } from "./work-store.js";
 export declare const CRYSTALS_KIND = "memory_crystals";
 export declare const CRYSTALS_DEFAULTS: {
     readonly intervalMinutes: 360;

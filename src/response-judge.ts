@@ -210,45 +210,30 @@ type StageCache = Partial<Pick<ResponseStages, JudgeStage>> & {
   settle?: (stages: JudgeStage[]) => void;
 };
 
-function qualityFields({
-  taskType,
-  assessability,
-  fitAssessability,
-  underdelivery,
-  failureReason,
-  fulfillment,
-  deliverableFit,
-  consistency,
-}: ResponseQuality): ResponseQuality {
-  return {
-    taskType,
-    assessability,
-    fitAssessability,
-    underdelivery,
-    failureReason,
-    fulfillment,
-    deliverableFit,
-    consistency,
-  };
+/** Project exactly the stage schema's own fields, in schema order, dropping any extra decision keys. */
+function schemaFields<T extends object>(schema: { properties: Record<string, unknown> }, value: T): T {
+  const source = value as Record<string, unknown>;
+  return Object.fromEntries(Object.keys(schema.properties).map(key => [key, source[key]])) as T;
 }
+const qualityFields = (value: ResponseQuality) => schemaFields(qualitySchema, value);
+const feedbackBaseFields = (value: ResponseFeedbackBase) => schemaFields(feedbackSchema, value);
+const sentimentFields = (value: ResponseSentiment) => schemaFields(sentimentSchema, value);
+const retrospectiveFields = (value: ResponseRetrospective) => schemaFields(retrospectiveSchema, value);
 
-function feedbackBaseFields({ feedbackType, target, avoidableRework, repeatedConstraint, memoryGap }: ResponseFeedbackBase): ResponseFeedbackBase {
-  return { feedbackType, target, avoidableRework, repeatedConstraint, memoryGap };
-}
-
-function sentimentFields({ sentiment, annoyance, frustration, dissatisfactionIntensity }: ResponseSentiment): ResponseSentiment {
-  return { sentiment, annoyance, frustration, dissatisfactionIntensity };
-}
-
-function retrospectiveFields({
-  correction,
-  deliveryAdmission,
-  regression,
-  scopeClarification,
-  outcome,
-  reason,
-}: ResponseRetrospective): ResponseRetrospective {
-  return { correction, deliveryAdmission, regression, scopeClarification, outcome, reason };
+/**
+ * Begin one stage attempt and run it. A failure that is not cancellation settles the attempt (spent, never refunded);
+ * a cancelled attempt stays in flight so the caller can refund it.
+ */
+export async function runStageAttempt<T>(
+  attempt: { begin: () => void; settle?: () => void; signal?: AbortSignal },
+  run: () => Promise<T>,
+): Promise<T> {
+  attempt.begin();
+  try { return await run(); }
+  catch (error) {
+    if (!attempt.signal?.aborted) attempt.settle?.();
+    throw error;
+  }
 }
 
 function validateDistributions(answers: Record<string, { type: string; probabilities?: Record<string, number>; score?: number }>) {
@@ -583,14 +568,9 @@ export async function judgeResponse(
     evidenceLimit: "Visible conversation only. Artifacts, tool results and external facts are not provided.",
   };
 
-  const attempt = async <T>(stages: JudgeStage[], run: () => Promise<T>): Promise<T> => {
-    cache?.begin(stages);
-    try { return await run(); }
-    catch (error) {
-      if (!params.signal?.aborted) cache?.settle?.(stages);
-      throw error;
-    }
-  };
+  const attempt = <T>(stages: JudgeStage[], run: () => Promise<T>): Promise<T> => runStageAttempt({
+    begin: () => cache?.begin(stages), settle: () => cache?.settle?.(stages), signal: params.signal,
+  }, run);
 
   const assessQuality = async (): Promise<ResponseQuality> => {
     if (cache?.quality) return validateCachedQuality(cache.quality);

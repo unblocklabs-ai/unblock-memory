@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { DEFAULTS } from "./defaults.js";
 import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
@@ -409,6 +409,71 @@ function clampUnitOrNull(value: number | undefined): number | null {
   return value;
 }
 
+function writeQuery(insertQuery: StatementSync, insertHit: StatementSync, r: RecallQueryRecord, fallbackNow: number): number {
+  const createdAtMs = requiredInt(r.createdAtMs, fallbackNow);
+  const result = insertQuery.run({
+    eventKey: r.eventKey,
+    createdAtMs,
+    agentId: r.agentId,
+    source: r.source,
+    sessionId: r.sessionId ?? null,
+    sessionKey: r.sessionKey ?? null,
+    runId: r.runId ?? null,
+    provider: r.provider ?? null,
+    accountId: r.accountId ?? null,
+    senderId: r.senderId ?? null,
+    channelId: r.channelId ?? null,
+    threadId: r.threadId ?? null,
+    chatType: r.chatType ?? null,
+    lexQuery: r.lexQuery ?? null,
+    vecQuery: r.vecQuery ?? null,
+    queryFallback: r.queryFallback ? 1 : 0,
+    corporaJson: JSON.stringify(r.corpora),
+    sessionFilterJson: r.sessionFilterJson ?? null,
+    rankingMode: r.rankingMode,
+    fallbackReason: r.fallbackReason ?? null,
+    decisionModel: r.decisionModel ?? null,
+    minUsefulness: finiteOrNull(r.minUsefulness),
+    outcome: r.outcome,
+    parentQueryId: positiveIntOrNull(r.parentQueryId),
+    inputTokens: truncIntOrNull(r.inputTokens),
+    outputTokens: truncIntOrNull(r.outputTokens),
+    recipeHash: r.recipeHash?.trim() || "default",
+    inputFamily: r.inputFamily ?? null,
+  });
+  if (Number(result.changes) <= 0) return 0;
+  const queryId = Number(result.lastInsertRowid);
+  for (const hit of r.hits) {
+    const observedAtMs = truncIntOrNull(hit.observedAtMs);
+    const observedAtBasis: ObservedAtBasis = observedAtMs === null ? "unknown" : hit.observedAtBasis;
+    insertHit.run({
+      queryId,
+      createdAtMs,
+      rawLeafId: hit.rawLeafId,
+      passageId: hit.passageId,
+      docHash: hit.docHash ?? null,
+      qmdSeq: truncIntOrNull(hit.qmdSeq),
+      chunkPos: truncIntOrNull(hit.chunkPos),
+      chunkLen: truncIntOrNull(hit.chunkLen),
+      corpus: hit.corpus,
+      sourcePath: hit.sourcePath,
+      startLine: requiredInt(hit.startLine, 1),
+      endLine: requiredInt(hit.endLine, 1),
+      targetSessionId: hit.targetSessionId ?? null,
+      extractedId: hit.extractedId ?? null,
+      extractedRevision: truncIntOrNull(hit.extractedRevision),
+      observedAtMs,
+      observedAtBasis,
+      retrievalRank: Math.max(1, requiredInt(hit.retrievalRank, 1)),
+      retrievalScore: finiteOrNull(hit.retrievalScore),
+      usefulnessScore: clampUnitOrNull(hit.usefulnessScore),
+      disposition: hit.disposition,
+      finalRank: positiveIntOrNull(hit.finalRank),
+    });
+  }
+  return 1;
+}
+
 function writeRecallBatchIntoDb(
   db: DatabaseSync,
   events: readonly RecallLedgerEvent[],
@@ -423,12 +488,12 @@ function writeRecallBatchIntoDb(
       corpora_json, session_filter_json, ranking_mode, fallback_reason, decision_model, min_usefulness,
       outcome, parent_query_id, input_tokens, output_tokens, recipe_hash, input_family
     ) VALUES (
-      ?, ?, ?, ?,
-      ?, ?, ?,
-      ?, ?, ?, ?, ?, ?,
-      ?, ?, ?,
-      ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?, ?
+      :eventKey, :createdAtMs, :agentId, :source,
+      :sessionId, :sessionKey, :runId,
+      :provider, :accountId, :senderId, :channelId, :threadId, :chatType,
+      :lexQuery, :vecQuery, :queryFallback,
+      :corporaJson, :sessionFilterJson, :rankingMode, :fallbackReason, :decisionModel, :minUsefulness,
+      :outcome, :parentQueryId, :inputTokens, :outputTokens, :recipeHash, :inputFamily
     )
     ON CONFLICT(event_key) DO NOTHING
   `);
@@ -441,12 +506,12 @@ function writeRecallBatchIntoDb(
       observed_at_ms, observed_at_basis,
       retrieval_rank, retrieval_score, usefulness_score, disposition, final_rank
     ) VALUES (
-      ?, ?,
-      ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?,
-      ?, ?, ?,
-      ?, ?,
-      ?, ?, ?, ?, ?
+      :queryId, :createdAtMs,
+      :rawLeafId, :passageId, :docHash, :qmdSeq, :chunkPos, :chunkLen,
+      :corpus, :sourcePath, :startLine, :endLine,
+      :targetSessionId, :extractedId, :extractedRevision,
+      :observedAtMs, :observedAtBasis,
+      :retrievalRank, :retrievalScore, :usefulnessScore, :disposition, :finalRank
     )
   `);
   const insertRead = db.prepare(`
@@ -470,97 +535,43 @@ function writeRecallBatchIntoDb(
   const fallbackNow = Math.trunc(options.nowMs ?? Date.now());
   immediateTransaction(db, () => {
     for (const event of events) {
-      if (event.kind === "query") {
-        const r = event.record;
-        const createdAtMs = requiredInt(r.createdAtMs, fallbackNow);
-        const result = insertQuery.run(
-          r.eventKey,
-          createdAtMs,
-          r.agentId,
-          r.source,
-          r.sessionId ?? null,
-          r.sessionKey ?? null,
-          r.runId ?? null,
-          r.provider ?? null,
-          r.accountId ?? null,
-          r.senderId ?? null,
-          r.channelId ?? null,
-          r.threadId ?? null,
-          r.chatType ?? null,
-          r.lexQuery ?? null,
-          r.vecQuery ?? null,
-          r.queryFallback ? 1 : 0,
-          JSON.stringify(r.corpora),
-          r.sessionFilterJson ?? null,
-          r.rankingMode,
-          r.fallbackReason ?? null,
-          r.decisionModel ?? null,
-          finiteOrNull(r.minUsefulness),
-          r.outcome,
-          positiveIntOrNull(r.parentQueryId),
-          truncIntOrNull(r.inputTokens),
-          truncIntOrNull(r.outputTokens),
-          r.recipeHash?.trim() || "default",
-          r.inputFamily ?? null,
-        );
-        if (Number(result.changes) > 0) {
-          written++;
-          const queryId = Number(result.lastInsertRowid);
-          for (const hit of r.hits) {
-            const observedAtMs = truncIntOrNull(hit.observedAtMs);
-            const observedAtBasis: ObservedAtBasis = observedAtMs === null ? "unknown" : hit.observedAtBasis;
-            insertHit.run(
-              queryId,
-              createdAtMs,
-              hit.rawLeafId,
-              hit.passageId,
-              hit.docHash ?? null,
-              truncIntOrNull(hit.qmdSeq),
-              truncIntOrNull(hit.chunkPos),
-              truncIntOrNull(hit.chunkLen),
-              hit.corpus,
-              hit.sourcePath,
-              requiredInt(hit.startLine, 1),
-              requiredInt(hit.endLine, 1),
-              hit.targetSessionId ?? null,
-              hit.extractedId ?? null,
-              truncIntOrNull(hit.extractedRevision),
-              observedAtMs,
-              observedAtBasis,
-              Math.max(1, requiredInt(hit.retrievalRank, 1)),
-              finiteOrNull(hit.retrievalScore),
-              clampUnitOrNull(hit.usefulnessScore),
-              hit.disposition,
-              positiveIntOrNull(hit.finalRank),
-            );
-          }
+      switch (event.kind) {
+        case "query":
+          written += writeQuery(insertQuery, insertHit, event.record, fallbackNow);
+          break;
+        case "read": {
+          const r = event.record;
+          const result = insertRead.run(
+            r.eventKey,
+            requiredInt(r.readAtMs, fallbackNow),
+            r.agentId,
+            r.sessionId ?? null,
+            r.runId ?? null,
+            r.sourcePath,
+            truncIntOrNull(r.startLine),
+            truncIntOrNull(r.lineCount),
+            r.status,
+          );
+          if (Number(result.changes) > 0) written++;
+          break;
         }
-      } else if (event.kind === "read") {
-        const r = event.record;
-        const result = insertRead.run(
-          r.eventKey,
-          requiredInt(r.readAtMs, fallbackNow),
-          r.agentId,
-          r.sessionId ?? null,
-          r.runId ?? null,
-          r.sourcePath,
-          truncIntOrNull(r.startLine),
-          truncIntOrNull(r.lineCount),
-          r.status,
-        );
-        if (Number(result.changes) > 0) written++;
-      } else if (event.kind === "skill_routing") {
-        const r = event.record;
-        written += Number(insertRouting.run(
-          r.eventKey, r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null,
-          r.surface ?? null, r.catalogRevision ?? null, r.mode, r.candidateCount, JSON.stringify(r.emitted),
-          JSON.stringify(r.scores), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), finiteOrNull(r.elapsedMs), r.outcome,
-          r.recipeHash?.trim() || "default",
-        ).changes);
-      } else {
-        const r = event.record;
-        written += Number(insertOpen.run(r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null,
-          r.skillPath, r.toolName, Number(r.wasWhispered), Number(r.wasPinned)).changes);
+        case "skill_routing": {
+          const r = event.record;
+          written += Number(insertRouting.run(
+            r.eventKey, r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null,
+            r.surface ?? null, r.catalogRevision ?? null, r.mode, r.candidateCount, JSON.stringify(r.emitted),
+            JSON.stringify(r.scores), truncIntOrNull(r.inputTokens), truncIntOrNull(r.outputTokens), finiteOrNull(r.elapsedMs), r.outcome,
+            r.recipeHash?.trim() || "default",
+          ).changes);
+          break;
+        }
+        case "skill_open":
+        default: {
+          const r = event.record;
+          written += Number(insertOpen.run(r.createdAtMs, r.agentId, r.sessionId ?? null, r.sessionKey ?? null, r.runId ?? null,
+            r.skillPath, r.toolName, Number(r.wasWhispered), Number(r.wasPinned)).changes);
+          break;
+        }
       }
     }
     if (options.prune && options.retentionDays && options.retentionDays > 0) {
@@ -591,11 +602,19 @@ export function writeRecallBatch(
 
 export type RecallPurgeResult = { queries: number; skillEvents: number };
 
-function purgeRecallPersonInDb(db: DatabaseSync, identity: RecallPersonIdentity): RecallPurgeResult {
+const recallAccountKey = (identity: RecallPersonIdentity) => identity.accountId?.trim().toLowerCase();
+
+function recallPersonKeys(identity: RecallPersonIdentity, includeAccount: boolean) {
   const provider = identity.provider.trim().toLowerCase();
   const senderId = identity.senderId.trim();
-  const accountId = identity.accountId?.trim().toLowerCase();
+  const accountId = includeAccount ? recallAccountKey(identity) : undefined;
   if (!provider || !senderId) throw new Error("provider and senderId are required");
+  return { provider, senderId, accountId };
+}
+
+function purgeRecallPersonInDb(
+  db: DatabaseSync, { provider, senderId, accountId }: ReturnType<typeof recallPersonKeys>,
+): RecallPurgeResult {
   if (!tableExists(db, "recall_queries")) return { queries: 0, skillEvents: 0 };
   let queries = 0, skillEvents = 0;
   immediateTransaction(db, () => {
@@ -620,13 +639,12 @@ function purgeRecallPersonInDb(db: DatabaseSync, identity: RecallPersonIdentity)
 
 /** Operator erasure for one person's recall history (queries, hits and linked skill events); never creates tables. */
 export function purgeRecallPerson(path: string, identity: RecallPersonIdentity): RecallPurgeResult {
-  const provider = identity.provider.trim().toLowerCase();
-  const senderId = identity.senderId.trim();
-  if (!provider || !senderId) throw new Error("provider and senderId are required");
+  // Validate the required keys even if there is no database; account scope only matters once open.
+  const keys = recallPersonKeys(identity, false);
   if (!existsSync(path)) return { queries: 0, skillEvents: 0 };
   const db = openMemoryDatabase(path);
   try {
-    return purgeRecallPersonInDb(db, identity);
+    return purgeRecallPersonInDb(db, { ...keys, accountId: recallAccountKey(identity) });
   } finally {
     db.close();
   }
@@ -680,7 +698,7 @@ export function createRecallWorkerHandler(): {
       }
       const existing = openDbs.get(request.path);
       if (existing) {
-        return { id: request.id, ok: true, result: purgeRecallPersonInDb(existing, request.identity) };
+        return { id: request.id, ok: true, result: purgeRecallPersonInDb(existing, recallPersonKeys(request.identity, true)) };
       }
       return { id: request.id, ok: true, result: purgeRecallPerson(request.path, request.identity) };
     } catch (error) {
@@ -813,25 +831,21 @@ export class RecallLedgerWriter {
       if (handle.pending.size === 0) worker.unref();
       pending.resolve(response);
     });
-    const failHandle = (error: unknown) => {
-      if (handle.terminated) return;
-      handle.terminated = true;
-      if (this.#handle === handle) this.#handle = undefined;
-      for (const pending of handle.pending.values()) pending.reject(error);
-      handle.pending.clear();
-    };
-    worker.on("error", failHandle);
+    worker.on("error", error => this.#retireWorker(handle, error));
     worker.on("exit", (code) => {
-      if (handle.pending.size > 0) {
-        failHandle(new Error(`Recall ledger worker exited unexpectedly (code ${code})`));
-      } else {
-        handle.terminated = true;
-        if (this.#handle === handle) this.#handle = undefined;
-      }
+      this.#retireWorker(handle, handle.pending.size > 0 ? new Error(`Recall ledger worker exited unexpectedly (code ${code})`) : undefined);
     });
     worker.unref();
     this.#handle = handle;
     return handle;
+  }
+
+  #retireWorker(handle: WorkerHandle, error?: unknown): void {
+    if (handle.terminated) return;
+    handle.terminated = true;
+    if (this.#handle === handle) this.#handle = undefined;
+    for (const pending of handle.pending.values()) pending.reject(error);
+    handle.pending.clear();
   }
 
   #rpc(request: WorkerRequestPayload): Promise<WorkerResponse> {
@@ -941,9 +955,8 @@ export class RecallLedgerWriter {
           }
           if (!handle.terminated) {
             await handle.worker.terminate().catch(() => undefined);
-            handle.terminated = true;
+            this.#retireWorker(handle);
           }
-          if (this.#handle === handle) this.#handle = undefined;
         }
       };
       let timer: NodeJS.Timeout | undefined;
@@ -956,11 +969,8 @@ export class RecallLedgerWriter {
               const timeoutError = new Error(`Recall ledger shutdown timed out after ${timeoutMs}ms`);
               this.#discardPendingQueue(timeoutError);
               const handle = this.#handle;
-              this.#handle = undefined;
               if (handle && !handle.terminated) {
-                handle.terminated = true;
-                for (const pending of handle.pending.values()) pending.reject(timeoutError);
-                handle.pending.clear();
+                this.#retireWorker(handle, timeoutError);
                 void handle.worker.terminate().catch(() => undefined).finally(() => resolve());
               } else {
                 resolve();

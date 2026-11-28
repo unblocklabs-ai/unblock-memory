@@ -1,14 +1,13 @@
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { DEFAULTS } from "./defaults.js";
-import { gradeSignature } from "./emotion-baselines.js";
-import { readTableColumns, tableExists } from "./memory-database.js";
+import { INSIDE_OUT_EMOTIONS as EMOTIONS, MIDRANK_TIE_EPSILON, gradeSignature } from "./emotion-baselines.js";
+import { readTableColumns } from "./memory-database.js";
 export const DEFAULT_EMOTIONAL_SALIENCE_OPTIONS = {
     minSalienceScore: 0.7, minAbsoluteIntensity: 2.2, minRelativeIntensity: 1.5, relativeWeight: 0.6,
     legacyConfidence: 0.85, mixedEmotionThreshold: 0.5,
     baselineMinInteractions: DEFAULTS.insideOut.defaultBaselineMinInteractions,
 };
-const EMOTIONS = ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
 const NEGATIVE = new Set(["sadness", "fear", "anger", "disgust"]);
 const MAX_INTENSITY = 3;
 /** One bound JSON parameter, so batch size never hits SQLite's variable limit. */
@@ -107,11 +106,24 @@ function parseDeviation(json) {
     }
     return { percentile: null, unusualness: null };
 }
-function label(grade, resolved, dominant) {
-    const ranked = EMOTIONS.flatMap(emotion => grade.emotions[emotion] === undefined ? [] : [[emotion, grade.emotions[emotion]]])
-        .sort((a, b) => b[1] - a[1]);
-    const positive = ranked.find(([e]) => e === "joy"), negative = ranked.find(([e]) => NEGATIVE.has(e));
-    if (positive && negative && positive[1] >= resolved.mixedEmotionThreshold && negative[1] >= resolved.mixedEmotionThreshold) {
+/** One scan of the graded emotions: the hottest (earliest wins ties), joy, and the hottest negative emotion. */
+function peaks(grade) {
+    const found = { top: null, joy: undefined, negative: undefined };
+    for (const emotion of EMOTIONS) {
+        const value = grade.emotions[emotion];
+        if (value === undefined)
+            continue;
+        if (!found.top || value > found.top[1])
+            found.top = [emotion, value];
+        if (emotion === "joy")
+            found.joy = value;
+        else if (NEGATIVE.has(emotion) && (found.negative === undefined || value > found.negative))
+            found.negative = value;
+    }
+    return found;
+}
+function label(grade, resolved, { joy, negative }, dominant) {
+    if (joy !== undefined && negative !== undefined && joy >= resolved.mixedEmotionThreshold && negative >= resolved.mixedEmotionThreshold) {
         return "mixed/bittersweet";
     }
     const valence = grade.valence;
@@ -122,41 +134,31 @@ function label(grade, resolved, dominant) {
     return `${word}/${polarity}`;
 }
 function score(grade, resolved) {
-    const values = EMOTIONS.flatMap(emotion => grade.emotions[emotion] === undefined ? [] : [[emotion, grade.emotions[emotion]]]);
-    const top = values.reduce((best, entry) => !best || entry[1] > best[1] ? entry : best, null);
+    const found = peaks(grade), { top } = found;
     const dominantEmotion = top && top[1] > 0 ? top[0] : null;
     const { percentile, unusualness } = grade.comparison;
     const upperTail = percentile === null ? null : unit(2 * percentile - 1);
     const w = resolved.relativeWeight;
-    let salienceScore;
-    if (grade.intensity !== null) {
-        const absolute = unit(grade.intensity / MAX_INTENSITY);
-        // An objectively huge event scores on its own; a rare spike for a stoic person blends in its upper tail.
-        const relative = upperTail !== null && grade.intensity >= resolved.minRelativeIntensity ? absolute * (1 - w) + upperTail * w : 0;
-        salienceScore = Math.max(absolute, relative);
-    }
-    else {
-        // Legacy: the hottest emotion stands in for intensity, discounted for lower confidence.
-        const peak = top ? unit(top[1]) : 0;
-        const tail = upperTail ?? unusualness;
-        const relative = tail !== null && peak * MAX_INTENSITY >= resolved.minRelativeIntensity ? peak * (1 - w) + tail * w : 0;
-        salienceScore = resolved.legacyConfidence * Math.max(peak, relative);
-    }
-    salienceScore = unit(salienceScore);
+    // Legacy rows have no intensity: the hottest emotion stands in for it, discounted for lower confidence.
+    const legacy = grade.intensity === null;
+    const base = legacy ? (top ? unit(top[1]) : 0) : unit(grade.intensity / MAX_INTENSITY);
+    const level = legacy ? base * MAX_INTENSITY : grade.intensity;
+    const tail = legacy ? upperTail ?? unusualness : upperTail;
+    // An objectively huge event scores on its own; a rare spike for a stoic person blends in its upper tail.
+    const relative = tail !== null && level >= resolved.minRelativeIntensity ? base * (1 - w) + tail * w : 0;
+    const salienceScore = unit(legacy ? resolved.legacyConfidence * Math.max(base, relative) : Math.max(base, relative));
     const highSalience = salienceScore >= resolved.minSalienceScore ||
         (grade.intensity !== null && grade.intensity >= resolved.minAbsoluteIntensity);
     return {
         sessionId: grade.sessionId, messageId: grade.messageId, absoluteIntensity: grade.intensity,
         relativeIntensityPercentile: percentile, maxEmotionUnusualness: unusualness, valence: grade.valence,
-        dominantEmotion, salienceScore, highSalience, label: label(grade, resolved, dominantEmotion),
+        dominantEmotion, salienceScore, highSalience, label: label(grade, resolved, found, dominantEmotion),
     };
 }
 /** Columns the per-person intensity percentile needs; older schemas fall back to deviation percentiles. */
 const INTENSITY_HISTORY = ["intensity", "intensity_rubric", "person_id", "rubric", "model", "target_at", "error"];
 /** Columns a grade signature hashes; deviations are only trusted for the exact grade they assessed. */
 const SIGNATURE = ["interaction_id", "rubric", "model", "person_id", "target_at", "reviewed_at", "error", ...EMOTIONS];
-/** Float tolerance for ties between stored expected scores (matches `intensityReader`). */
-const INTENSITY_EPSILON = 1e-9;
 const DAY_MS = 86_400_000;
 function gradeWindow(options) {
     const { nowMs, lookbackDays } = options;
@@ -224,8 +226,9 @@ function personalIntensityPercentiles(db, targets, minimum) {
                 add(lowerBound(values, rows[next++].value));
             if (next < minimum)
                 continue;
-            const below = prefix(lowerBound(values, target.value - INTENSITY_EPSILON));
-            const tied = prefix(lowerBound(values, target.value + INTENSITY_EPSILON, true)) - below;
+            // Same tie tolerance as `intensityReader`.
+            const below = prefix(lowerBound(values, target.value - MIDRANK_TIE_EPSILON));
+            const tied = prefix(lowerBound(values, target.value + MIDRANK_TIE_EPSILON, true)) - below;
             target.percentile = (below + tied / 2) / next;
         }
     }
@@ -251,8 +254,9 @@ function readDeviations(db, interactions) {
  */
 function readGrades(db, sessionIds, resolved, window) {
     const ids = [...new Set(sessionIds)];
-    if (!ids.length || !tableExists(db, "inside_out"))
+    if (!ids.length)
         return [];
+    // An absent table reads as no columns.
     const have = readTableColumns(db, "inside_out");
     if (!have.has("session_id"))
         return [];

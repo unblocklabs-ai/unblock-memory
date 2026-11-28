@@ -177,6 +177,27 @@ export declare function readDerivedObservationCandidates(dbPath: string, query: 
  * skipped, not marked). `[]` when the database or `derived_observations` table does not exist.
  */
 export declare function findMatchingDerivedObservationsReadOnly(dbPath: string, params: FindMatchingDerivedObservationsParams): DerivedObservationMatch[];
+/** A fully prepared `derived_observations` row: canonical hash, corpora and generations, everything already JSON-encoded. */
+type FreshObservationRow = {
+    id: string;
+    agentId: string;
+    question: string;
+    questionHash: string;
+    audienceKey: string;
+    corporaJson: string;
+    collectionGenerationsJson: string;
+    answer: string;
+    confidence: string;
+    citationsJson: string;
+    openQuestionsJson: string;
+    sourceJobId: string | null;
+    nowMs: number;
+};
+/**
+ * The single writer of new `derived_observations` rows: supersedes any `fresh` row for the same key, then inserts this one
+ * as `fresh`. Runs inside the caller's open transaction and never begins its own.
+ */
+export declare function insertFreshObservationInTransaction(db: DatabaseSync, row: FreshObservationRow): void;
 export declare class DeepThoughtStore {
     #private;
     readonly db: DatabaseSync;

@@ -3,7 +3,7 @@ import { setImmediate } from "node:timers/promises";
 import { abortable } from "./abortable.js";
 import { decisionModelScope, resolveDecisionCredential, DEFAULT_DECISION_MODEL } from "./decision-client.js";
 import { RESPONSE_EXTRACTOR_VERSION, ResponseTranscriptReader } from "./response-episodes.js";
-import { responseRubricVersion, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity, } from "./response-judge.js";
+import { responseRubricVersion, RESPONSE_STAGE_VERSIONS, judgeMemoryOpportunity, runStageAttempt, } from "./response-judge.js";
 import { ResponseAuditStore } from "./response-store.js";
 import { responseMemoryCandidates } from "./response-memory.js";
 import { assessResponseStages } from "./response-stages.js";
@@ -145,56 +145,12 @@ export async function auditResponses(options) {
                     continue;
                 }
                 coverage.attempted++;
-                const existing = store.memoryRetryResult(cohort, e);
-                store.inFlight.clear();
-                store.attempted(cohort, e, Date.now());
-                try {
-                    const params = {
-                        apiKey: key, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model,
-                        timeoutMs: config.decisionModel.timeoutMs, signal,
-                    };
-                    const result = existing
-                        ? {
-                            ...existing,
-                            memory: await assessMemoryOpportunity(store, cohort, e, existing.feedback, options, params, coverage),
-                        }
-                        : await (async () => {
-                            const judgment = await abortable(assessResponseStages(store, cohort, e, params, config.responseAudit.sentimentEnabled, coverage), signal);
-                            const memory = await assessMemoryOpportunity(store, cohort, e, judgment.feedback, options, params, coverage);
-                            return {
-                                ...judgment,
-                                human: people.resolve(e),
-                                references: references(e),
-                                agentModel: e.model,
-                                contextLimited: e.contextLimited,
-                                memorySearchCalls: e.memorySearchCalls,
-                                memory,
-                            };
-                        })();
-                    signal.throwIfAborted();
-                    const fresh = reader.read(session, config.responseAudit, snapshot.revision);
-                    if (!fresh || (!("unchanged" in fresh) && !fresh.episodes.some(candidate => candidate.id === e.id && candidate.inputHash === e.inputHash))) {
-                        coverage.stale++;
-                        store.stale(cohort, e);
-                        if (fresh !== undefined) {
-                            store.observe(cohort, session, fresh?.episodes ?? []);
-                            store.checkpointForget(cohort, session);
-                        }
-                        break;
-                    }
-                    store.save(cohort, e, result, Date.now());
-                    if (existing && result.memory.status === "unavailable")
-                        coverage.failed++;
-                    else
-                        coverage.evaluated++;
-                }
-                catch {
-                    if (signal.aborted) {
-                        refundCancelledAttempt(store, cohort, e);
-                        throw new Error("Audit cancelled");
-                    }
-                    coverage.failed++;
-                }
+                const outcome = await attemptAdmittedEpisode({
+                    store: store, reader, people, cohort, session, revision: snapshot.revision, options, apiKey: key, signal, coverage,
+                }, e);
+                // A snapshot race leaves this session's remaining episodes for its next scan.
+                if (outcome === "stale")
+                    break;
             }
             // Let stop/cancellation handlers run between bounded synchronous session reads.
             await setImmediate();
@@ -223,6 +179,65 @@ export async function auditResponses(options) {
         people?.close();
     }
 }
+/**
+ * Judge one admitted episode and record its coverage. `stale` means the transcript moved under the judgment, so the
+ * result was discarded and its attempt refunded; cancellation refunds in-flight work and rethrows.
+ */
+async function attemptAdmittedEpisode(run, e) {
+    const { store, reader, cohort, session, options, signal, coverage } = run;
+    const { config } = options;
+    const existing = store.memoryRetryResult(cohort, e);
+    store.inFlight.clear();
+    store.attempted(cohort, e, Date.now());
+    try {
+        const params = {
+            apiKey: run.apiKey, endpoint: config.decisionModel.endpoint, model: config.decisionModel.model,
+            timeoutMs: config.decisionModel.timeoutMs, signal,
+        };
+        const result = existing
+            ? {
+                ...existing,
+                memory: await assessMemoryOpportunity(store, cohort, e, existing.feedback, options, params, coverage),
+            }
+            : await (async () => {
+                const judgment = await abortable(assessResponseStages(store, cohort, e, params, config.responseAudit.sentimentEnabled, coverage), signal);
+                const memory = await assessMemoryOpportunity(store, cohort, e, judgment.feedback, options, params, coverage);
+                return {
+                    ...judgment,
+                    human: run.people.resolve(e),
+                    references: references(e),
+                    agentModel: e.model,
+                    contextLimited: e.contextLimited,
+                    memorySearchCalls: e.memorySearchCalls,
+                    memory,
+                };
+            })();
+        signal.throwIfAborted();
+        const fresh = reader.read(session, config.responseAudit, run.revision);
+        if (!fresh || (!("unchanged" in fresh) && !fresh.episodes.some(candidate => candidate.id === e.id && candidate.inputHash === e.inputHash))) {
+            // Counted on detection: a failing cleanup below still also counts as failed, without stopping the session.
+            coverage.stale++;
+            store.stale(cohort, e);
+            if (fresh !== undefined) {
+                store.observe(cohort, session, fresh?.episodes ?? []);
+                store.checkpointForget(cohort, session);
+            }
+            return "stale";
+        }
+        store.save(cohort, e, result, Date.now());
+        const outcome = existing && result.memory.status === "unavailable" ? "failed" : "evaluated";
+        coverage[outcome]++;
+        return outcome;
+    }
+    catch {
+        if (signal.aborted) {
+            refundCancelledAttempt(store, cohort, e);
+            throw new Error("Audit cancelled");
+        }
+        coverage.failed++;
+        return "failed";
+    }
+}
 function addCoverage(target, delta) {
     for (const key of Object.keys(delta))
         target[key] += delta[key];
@@ -244,16 +259,11 @@ async function assessMemoryOpportunity(store, cohort, e, feedback, options, para
         if (judged)
             usage.stageCacheHits++;
         else {
-            store.stageBegin([memoryKey], Date.now());
-            usage.stageAttempts++;
-            try {
-                judged = await abortable(judgeMemoryOpportunity(e, candidates, params), params.signal);
-            }
-            catch (error) {
-                if (!params.signal.aborted)
-                    store.stageSettled([memoryKey]);
-                throw error;
-            }
+            judged = await runStageAttempt({
+                begin: () => { store.stageBegin([memoryKey], Date.now()); usage.stageAttempts++; },
+                settle: () => store.stageSettled([memoryKey]),
+                signal: params.signal,
+            }, () => abortable(judgeMemoryOpportunity(e, candidates, params), params.signal));
             store.stageSave(memoryKey, judged, Date.now());
         }
         return { status: "checked", candidates: judged };

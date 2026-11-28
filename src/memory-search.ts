@@ -19,8 +19,11 @@ export type MemoryCandidateManager = {
 };
 
 export function memoryPassageId(text: string): string {
-  return createHash("sha256").update(text.replace(/\s+/gu, " ").trim()).digest("hex");
+  return hashPassage(normalizePassage(text));
 }
+
+const normalizePassage = (text: string) => text.replace(/\s+/gu, " ").trim();
+const hashPassage = (text: string) => createHash("sha256").update(text).digest("hex");
 
 export type MemorySearchObservation = RetrievalTimings & {
   retrievalMs: number; judgeMs: number; candidates: number; eligible: number;
@@ -103,46 +106,40 @@ function resolveLocator(hit: CorpusMemorySearchResult, passageId: string): Recal
 /** Reciprocal-rank constant for cross-topic fusion, matching QMD's own lane fusion. */
 const TOPIC_RRF_K = 60;
 
-type TopicFusion = {
-  hits: CorpusMemorySearchResult[];
-  /** passageId -> 1-based rank within each topic's own result list (undefined when absent). */
-  topicRanks: Map<string, (number | undefined)[]>;
-  topicCount: number;
+type SearchEntry = {
+  hit: CorpusMemorySearchResult;
+  /** 1-based rank within each topic's own result list (undefined when absent). */
+  topicRanks?: (number | undefined)[];
 };
 
 /**
  * Deterministic passage-level RRF across topics: score = sum over topics of 1 / (60 + rank). Each passage keeps
  * the metadata of its highest-scoring occurrence; ties keep first-seen order (topic order, then rank).
  */
-function fuseTopicHits(lists: readonly CorpusMemorySearchResult[][]): TopicFusion {
-  const fused = new Map<string, { hit: CorpusMemorySearchResult; rrf: number; order: number }>();
-  const topicRanks = new Map<string, (number | undefined)[]>();
+function fuseTopicHits(lists: readonly CorpusMemorySearchResult[][]): SearchEntry[] {
+  const fused = new Map<string, { hit: CorpusMemorySearchResult; topicRanks: (number | undefined)[]; rrf: number; order: number }>();
   let order = 0;
   for (const [topic, hits] of lists.entries()) {
-    const seenInTopic = new Set<string>();
     let rank = 0;
     for (const hit of hits) {
       const passageId = memoryPassageId(hit.snippet);
-      if (seenInTopic.has(passageId)) continue;
-      seenInTopic.add(passageId);
+      let entry = fused.get(passageId);
+      if (entry?.topicRanks[topic] !== undefined) continue;
       rank++;
-      const ranks = topicRanks.get(passageId) ?? Array.from({ length: lists.length }, () => undefined);
-      ranks[topic] = rank;
-      topicRanks.set(passageId, ranks);
       const contribution = 1 / (TOPIC_RRF_K + rank);
-      const existing = fused.get(passageId);
-      if (!existing) {
-        fused.set(passageId, { hit, rrf: contribution, order: order++ });
+      if (!entry) {
+        entry = { hit, topicRanks: [], rrf: contribution, order: order++ };
+        fused.set(passageId, entry);
       } else {
-        existing.rrf += contribution;
-        if (hit.score > existing.hit.score) existing.hit = hit;
+        entry.rrf += contribution;
+        if (hit.score > entry.hit.score) entry.hit = hit;
       }
+      entry.topicRanks[topic] = rank;
     }
   }
-  const hits = [...fused.values()]
+  return [...fused.values()]
     .sort((a, b) => b.rrf - a.rrf || a.order - b.order)
-    .map(({ hit, rrf }) => ({ ...hit, score: rrf }));
-  return { hits, topicRanks, topicCount: lists.length };
+    .map(({ hit, rrf, topicRanks }) => ({ hit: { ...hit, score: rrf }, topicRanks }));
 }
 
 const timingCounters = new Set(["metadataReloads", "vectorScanAttempts"]);
@@ -180,17 +177,17 @@ async function searchTopics(
 
 /** Reserve the best eligible candidate of each topic first, then fill by fused score up to `limit`. */
 function reserveTopicCandidates(
-  candidates: readonly CorpusMemorySearchResult[],
-  fusion: TopicFusion,
+  candidates: readonly SearchEntry[],
+  topicCount: number,
   limit: number,
-): CorpusMemorySearchResult[] {
-  const ranked = [...candidates].sort((a, b) => b.score - a.score);
-  const picked = new Set<CorpusMemorySearchResult>();
-  for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
-    let best: CorpusMemorySearchResult | undefined;
+): SearchEntry[] {
+  const ranked = [...candidates].sort((a, b) => b.hit.score - a.hit.score);
+  const picked = new Set<SearchEntry>();
+  for (let topic = 0; topic < topicCount && picked.size < limit; topic++) {
+    let best: SearchEntry | undefined;
     let bestRank = Number.POSITIVE_INFINITY;
     for (const candidate of ranked) {
-      const rank = fusion.topicRanks.get(memoryPassageId(candidate.snippet))?.[topic];
+      const rank = candidate.topicRanks?.[topic];
       if (rank !== undefined && rank < bestRank) { best = candidate; bestRank = rank; }
     }
     // A passage that is already the best hit of an earlier topic covers this topic too.
@@ -208,14 +205,14 @@ function reserveTopicCandidates(
  * Reserve the highest-ranked qualifying passage of each topic first, then fill in ranked order, so one topic's
  * many strong hits cannot push another topic's qualifying hit out of the results.
  */
-function reserveTopicFinalists<T extends { result: CorpusMemorySearchResult }>(
+function reserveTopicFinalists<T extends Pick<SearchEntry, "topicRanks">>(
   ranked: readonly T[],
-  fusion: TopicFusion,
+  topicCount: number,
   limit: number,
 ): T[] {
   const picked = new Set<T>();
-  for (let topic = 0; topic < fusion.topicCount && picked.size < limit; topic++) {
-    const best = ranked.find(entry => fusion.topicRanks.get(memoryPassageId(entry.result.snippet))?.[topic] !== undefined);
+  for (let topic = 0; topic < topicCount && picked.size < limit; topic++) {
+    const best = ranked.find(entry => entry.topicRanks?.[topic] !== undefined);
     if (best) picked.add(best);
   }
   for (const entry of ranked) {
@@ -255,20 +252,20 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
     corpora: options.corpora, sessionFilter: options.sessionFilter, requestContext: options.requestContext,
     sources: options.sources, signal, maxSnippetChars: MEMORY_PASSAGE_CHARS, timings,
   };
-  let hits: CorpusMemorySearchResult[];
-  let fusion: TopicFusion | undefined;
+  let hits: SearchEntry[];
+  let topicCount = 0;
   let topicsFailed: number | undefined;
   try {
     if (topics.length === 1) {
-      hits = await manager.searchCandidates(topics[0]!, searchOptions);
+      hits = (await manager.searchCandidates(topics[0]!, searchOptions)).map(hit => ({ hit }));
     } else {
       const settled = await searchTopics(manager, topics, searchOptions);
       signal?.throwIfAborted();
       // One failed topic must not hide the others; fail only when every topic search failed.
       if (settled.every(result => result.status === "rejected")) throw (settled[0] as PromiseRejectedResult).reason;
       topicsFailed = settled.filter(result => result.status === "rejected").length;
-      fusion = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
-      hits = fusion.hits;
+      topicCount = settled.length;
+      hits = fuseTopicHits(settled.map(result => result.status === "fulfilled" ? result.value : []));
     }
   } finally {
     endRetrieval();
@@ -279,18 +276,24 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
     candidates: hits.length, eligible: 0, requestsSucceeded: 0, requestsFailed: 0,
     ...(topicsFailed !== undefined ? { topicsFailed } : {}) };
   const trackTrace = Boolean(options.onTrace);
-  const candidates: CorpusMemorySearchResult[] = [];
+  const candidates: SearchEntry[] = [];
+  // Up to two hits need at most one comparison; only larger lists need a dedup index.
+  const dedup = hits.length > 2 ? {
+    seenText: new Set<string>(),
+    rangesByPath: new Map<string, Pick<CorpusMemorySearchResult, "startLine" | "endLine">[]>(),
+  } : undefined;
   const traces: RecallCandidateTrace[] = [];
   const traceByCandidate = new Map<CorpusMemorySearchResult, RecallCandidateTrace>();
   const endCandidatePrep = startTiming("candidatePrepMs", timings, signal);
   try {
     let retrievalRank = 0;
-    for (const hit of hits) {
+    for (const { hit, topicRanks } of hits) {
       // Defense in depth before disclosing passages to the external judge.
       if (options.corpora && !options.corpora.includes("all") && !options.corpora.includes(hit.corpus)) continue;
       const excerpt = hit.snippet.trim();
       if (!excerpt || excerpt.length > MEMORY_PASSAGE_CHARS) continue;
-      const passageId = memoryPassageId(excerpt);
+      const normalized = normalizePassage(excerpt);
+      const passageId = hashPassage(normalized);
       if (options.excludedPassages?.has(passageId)) {
         if (trackTrace) {
           retrievalRank++;
@@ -305,9 +308,20 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
         }
         continue;
       }
-      if (duplicateMemoryPassage({ ...hit, text: excerpt }, candidates.map(candidate => ({ ...candidate, text: candidate.snippet })))) continue;
+      if (dedup) {
+        if (dedup.seenText.has(normalized)) continue;
+        const { path, startLine, endLine } = hit;
+        const ranges = dedup.rangesByPath.get(path);
+        if (ranges?.some(range => range.startLine <= endLine && startLine <= range.endLine)) continue;
+        dedup.seenText.add(normalized);
+        if (ranges) ranges.push({ startLine, endLine });
+        else dedup.rangesByPath.set(path, [{ startLine, endLine }]);
+      } else if (candidates.length) {
+        const previous = candidates[0]!.hit;
+        if (duplicateMemoryPassage({ ...hit, text: excerpt }, [{ ...previous, text: previous.snippet }])) continue;
+      }
       const candidate: CorpusMemorySearchResult = { ...hit, snippet: excerpt };
-      candidates.push(candidate);
+      candidates.push({ hit: candidate, topicRanks });
       if (trackTrace) {
         retrievalRank++;
         const trace: RecallCandidateTrace = {
@@ -327,7 +341,7 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
   options.onCandidates?.(observation);
   const fallback = (reason: NonNullable<MemoryRanking["fallbackReason"]>) => {
     // Retrieval scores are not decision model usefulness probabilities.
-    const ranked = rankHits([...candidates], hit => hit, options.brightness);
+    const ranked = rankHits([...candidates], entry => entry.hit, options.brightness).map(entry => entry.hit);
     const limit = options.maxResults ?? 5;
     const results = ranked.slice(0, limit);
     if (trackTrace) {
@@ -358,15 +372,15 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
     : undefined;
   const judgePool = maxJudge === undefined
     ? candidates
-    : fusion
-      ? reserveTopicCandidates(candidates, fusion, maxJudge)
-      : [...candidates].sort((a, b) => b.score - a.score).slice(0, maxJudge);
+    : topicCount
+      ? reserveTopicCandidates(candidates, topicCount, maxJudge)
+      : [...candidates].sort((a, b) => b.hit.score - a.hit.score).slice(0, maxJudge);
   const minUsefulness = options.minUsefulness ?? 0.7;
   const apiKey = options.apiKey;
   const endJudge = startTiming("judgeMs", timings, signal);
-  let judged: { result: CorpusMemorySearchResult; trace?: RecallCandidateTrace }[];
+  let judged: { result: CorpusMemorySearchResult; trace?: RecallCandidateTrace; topicRanks?: SearchEntry["topicRanks"] }[];
   try {
-    judged = (await Promise.all(judgePool.map(async (hit, candidateIndex) => {
+    judged = (await Promise.all(judgePool.map(async ({ hit, topicRanks }, candidateIndex) => {
       const requestStarted = performance.now();
       const trace = trackTrace ? traceByCandidate.get(hit) : undefined;
       try {
@@ -393,7 +407,7 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
         // Discovery reciprocal ranks are not vector similarity or usefulness.
         const { vectorScore: _vectorScore, textScore: _textScore, ...result } = hit;
         const scored: CorpusMemorySearchResult = { ...result, score: probability };
-        return [{ result: scored, trace }];
+        return [{ result: scored, trace, topicRanks }];
       } catch (error) {
         if (signal?.aborted) return [];
         observation.requestsFailed++;
@@ -409,8 +423,8 @@ export async function searchMemory(manager: MemoryCandidateManager, queries: Que
     return fallback("all_judgments_failed");
   const ranked = rankHits(judged.filter(({ result }) => result.score >= minUsefulness), entry => entry.result, options.brightness);
   const maxResults = options.maxResults ?? 5;
-  const passed = fusion
-    ? reserveTopicFinalists(ranked, fusion, maxResults)
+  const passed = topicCount
+    ? reserveTopicFinalists(ranked, topicCount, maxResults)
     : ranked.slice(0, maxResults);
   if (trackTrace) {
     for (const [index, entry] of passed.entries()) {

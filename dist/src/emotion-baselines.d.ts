@@ -1,5 +1,11 @@
 import type { DatabaseSync, SQLOutputValue } from "node:sqlite";
 export declare const INSIDE_OUT_EMOTIONS: readonly ["joy", "sadness", "fear", "anger", "disgust", "surprise"];
+/** Derived signed valence: joy against the strongest negative emotion, in -1..1. */
+export declare const INSIDE_OUT_VALENCE_SQL = "joy-max(sadness,fear,anger,disgust)";
+/** Stored valence where that column exists (NULL on grades written before it), else the derived formula. */
+export declare const insideOutValenceSql: (storedColumn: boolean) => "joy-max(sadness,fear,anger,disgust)" | "coalesce(valence,joy-max(sadness,fear,anger,disgust))";
+/** Float tolerance for midrank ties between stored expected scores. */
+export declare const MIDRANK_TIE_EPSILON = 1e-9;
 /** Erased by an operator purge: never retried, linked, aggregated or compared. */
 export declare const PURGED_GRADE = "Purged by operator";
 type Emotion = typeof INSIDE_OUT_EMOTIONS[number];

@@ -45,6 +45,12 @@ export type RecordAnalysisOptions = {
     sequence?: number;
     instanceId?: string;
 };
+type CoverageResult = ReturnType<typeof verifyLearningCoverage>;
+type CheckpointResult = {
+    receiptId: string;
+    manifestRevision: string;
+    backlog: ReturnType<PeopleLearningStore["backlog"]>;
+} & CoverageResult;
 export declare function manifestRevision(manifest: ReviewManifest): string;
 export declare function verifyLearningCoverage(manifest: ReviewManifest, receipt: LearningReceipt, now?: number): {
     status: "partial" | "complete" | "invalid";
@@ -157,20 +163,6 @@ export declare class PeopleLearningStore {
         collectAssertions?: (manifest: ReviewManifest) => ReviewManifest["assertions"];
         beforeManifestCommit?: (manifest: ReviewManifest) => void;
         shouldFinalize?: (manifest: ReviewManifest) => boolean;
-    }): {
-        backlog: {
-            id: string;
-            status: string;
-            coverage: unknown;
-        }[];
-        receiptId: string;
-        manifestRevision: string;
-        status: "partial" | "complete" | "invalid";
-        expectedPeople: number;
-        expectedSessions: number;
-        expectedAssertions: number;
-        missing: string[];
-        errors: string[];
-        unresolved: string[];
-    };
+    }): CheckpointResult;
 }
+export {};

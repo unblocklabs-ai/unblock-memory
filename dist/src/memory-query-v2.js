@@ -3,7 +3,8 @@ import { abortable } from "./abortable.js";
 import { DEFAULTS } from "./defaults.js";
 import { decideWithModel, extractWithModel } from "./decision-client.js";
 import { fallbackQueries } from "./query-generator.js";
-import { codePointSpanToUtf16 } from "./text-span.js";
+import { codePointSpanToUtf16, sliceHeadSafe } from "./text-span.js";
+export { sliceHeadSafe } from "./text-span.js";
 /**
  * Memory Whisperer v2 query planning, powered only by the decision model and local text. Two calls run in
  * parallel under one planning deadline (at most half of the turn budget):
@@ -72,18 +73,6 @@ function conversationLines(conversation) {
 export function conversationText(conversation) {
     return conversationLines(conversation).text;
 }
-/** Truncate to at most `maxChars` UTF-16 units without leaving a lone high surrogate. */
-export function sliceHeadSafe(text, maxChars) {
-    if (maxChars <= 0)
-        return "";
-    if (text.length <= maxChars)
-        return text;
-    let end = maxChars;
-    const last = text.charCodeAt(end - 1);
-    if (last >= 0xd800 && last <= 0xdbff)
-        end--;
-    return text.slice(0, end);
-}
 function normalizeAnchor(text) {
     return text.replace(/\s+/gu, " ").trim().toLowerCase();
 }
@@ -147,7 +136,9 @@ function findVerbatim(bodies, needle) {
  * caps at `max`.
  */
 export function groundAnchors(conversation, values, spans, max = MW.maxTopics) {
-    const { text, bodies } = conversationLines(conversation);
+    return groundTranscript(conversationLines(conversation), values, spans, max);
+}
+function groundTranscript({ text, bodies }, values, spans, max) {
     const seen = new Set();
     const anchors = [];
     for (const [index, value] of values.entries()) {
@@ -244,11 +235,12 @@ async function extractTopicAnchors(params) {
     const { conversation, signal } = params;
     const timeoutMs = boundedTimeout(params.extractTimeoutMs ?? MW.extractTimeoutMs, params.timeoutMs);
     const callSignal = stageSignal(signal, timeoutMs, params.deadline);
-    const { answers } = await abortable(extractWithModel({ apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs, signal: callSignal }, conversationText(conversation), TOPIC_FIELDS, { validateModel: false }), callSignal);
+    const transcript = conversationLines(conversation);
+    const { answers } = await abortable(extractWithModel({ apiKey: params.apiKey, endpoint: params.endpoint, model: params.model, timeoutMs, signal: callSignal }, transcript.text, TOPIC_FIELDS, { validateModel: false }), callSignal);
     signal.throwIfAborted();
     if (answers.topics.p_null === 1 || !answers.topics.value)
         return [];
-    return groundAnchors(conversation, answers.topics.value, answers.topics.spans, Number.POSITIVE_INFINITY);
+    return groundTranscript(transcript, answers.topics.value, answers.topics.spans, Number.POSITIVE_INFINITY);
 }
 /**
  * Gate, route and extract in parallel under one planning deadline. A gate skip aborts the in-flight extraction;
@@ -276,12 +268,14 @@ export async function planRecall(params) {
         const base = { shouldRecall: true, corpora: gate.corpora,
             ...(gate.gateScore !== undefined ? { gateScore: gate.gateScore } : {}),
             ...(gate.error ? { gateFallback: gate.error } : {}) };
-        const fallback = { topics: [fallbackQueries(conversation)], anchors: [], queryFallback: true };
+        const fallback = (extractionFallback) => ({ ...base, topics: [fallbackQueries(conversation)], anchors: [], queryFallback: true, extractionFallback });
         if ("cause" in extracted)
-            return { ...base, ...fallback, extractionFallback: { reason: "error", cause: extracted.cause } };
+            return fallback({ reason: "error", cause: extracted.cause });
+        if (!conversation.currentRequest.trim())
+            throw new Error("Missing or unparseable current request");
         const { topics, anchors } = boundedTopics(extracted.anchors, conversation.currentRequest, params.maxTopics ?? MW.maxTopics);
         if (!topics.length)
-            return { ...base, ...fallback, extractionFallback: { reason: "no_grounded_topics" } };
+            return fallback({ reason: "no_grounded_topics" });
         return { ...base, topics, anchors, queryFallback: false };
     }
     finally {

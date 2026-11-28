@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { Type, type Static } from "typebox";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
-import { type WorkStore } from "./work-store.js";
+import type { WorkStore } from "./work-store.js";
 import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 /**
  * Overnight Thinking Steward: a fenced `WorkStore` run (`kind='overnight_thinking'`, `scope=agentId`) that uses

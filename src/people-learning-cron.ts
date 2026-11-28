@@ -90,11 +90,15 @@ export async function reconcilePeopleLearning(
   const all = await cron.list({ includeDisabled: true });
   if (!Array.isArray(all)) throw new Error("Unsupported service cron.list response");
   const jobs: Record<string, unknown>[] = [];
+  // Every learning-job match is agent-scoped, so each agent only ever scans its own jobs (in inventory order).
+  const jobsByAgent = new Map<unknown, Record<string, unknown>[]>();
   const recognized = new Map<string, LearningJob>();
   for (const item of all) {
     const job = record(item);
     if (!job || !nonBlank(job.id)) throw new Error("Invalid cron job inventory");
     jobs.push(job);
+    const agentJobs = jobsByAgent.get(job.agentId);
+    if (agentJobs) agentJobs.push(job); else jobsByAgent.set(job.agentId, [job]);
     const parsed = parseDeclarationKey(job.declarationKey);
     if (parsed && job.agentId === parsed.agentId) {
       const id = String(job.id);
@@ -110,9 +114,10 @@ export async function reconcilePeopleLearning(
   }[] = [];
   for (const agentId of listAgentIds(cfg)) {
     const options = learningForAgent(config, agentId);
+    const agentJobs = jobsByAgent.get(agentId) ?? [];
     for (const kind of ["nightly", "weekly"] as const) {
       const key = `${PREFIX}${agentId}:${kind}`;
-      const matches = jobs.filter(job => matchesLearningJob(job, agentId, kind, key, options.legacyJobIds));
+      const matches = agentJobs.filter(job => matchesLearningJob(job, agentId, kind, key, options.legacyJobIds));
       for (const match of matches) {
         const id = String(match.id);
         recognized.set(`${agentId}:${id}`, { id, agentId, kind });

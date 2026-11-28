@@ -4,7 +4,7 @@ import type { WhispererDiagnostics } from "./diagnostics.js";
 import { type SyntheticInputFilterConfig } from "./synthetic-input.js";
 import { type MemoryCandidateManager } from "./memory-search.js";
 import type { RecallLedgerWriter } from "./recall-ledger.js";
-import type { WhispererPrompt } from "./whisperer-prompt.js";
+import { type WhispererPrompt } from "./whisperer-prompt.js";
 import { type DeepThoughtAudienceIdentity } from "./deep-thought-store.js";
 import { type BrightnessConfig } from "./memory-brightness.js";
 /** Optional: whisper fresh, generation-verified `deep_thought` syntheses (`derived_observations`) matching the turn. */

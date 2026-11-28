@@ -2,8 +2,8 @@ import { DEFAULTS } from "./defaults.js";
 import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
-import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
-import { PURGED_GRADE, baselineFingerprints, baselineInputSnapshot, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
+import { immediateTransaction, openMemoryDatabase, readTableColumns, tableExists } from "./memory-database.js";
+import { INSIDE_OUT_VALENCE_SQL, PURGED_GRADE, baselineFingerprints, baselineInputSnapshot, purgeEmotionProfile, refreshEmotionBaselines } from "./emotion-baselines.js";
 
 // Imported by the baseline worker with plain Node resolution: host SDK aliases do not
 // reach worker threads, so this module and its imports must stay free of `openclaw`.
@@ -31,9 +31,6 @@ export const PERSON_MATCH = `SELECT min(i.person_id) person_id FROM person_ident
   AND (i.account_scope=json_extract(e.human_key,'$[1]') OR substr(json_extract(e.human_key,'$[1]'),1,8)='session:')
   HAVING count(DISTINCT i.person_id)=1`;
 
-/** Derived signed valence: joy against the strongest negative emotion, in -1..1. */
-export const INSIDE_OUT_VALENCE_SQL = "joy-max(sadness,fear,anger,disgust)";
-
 /**
  * Additive columns (never a rubric change, so per-person 6-emotion history and grade caches stay valid):
  * - `intensity`: expected unsigned 0..3 emotional weight; NULL on rows graded before it existed (unknown, not calm).
@@ -47,12 +44,14 @@ const ADDITIVE_COLUMNS = [
 
 function ensureInsideOutSchema(db: DatabaseSync) {
   db.exec(SCHEMA);
-  const present = new Set(db.prepare("SELECT name FROM pragma_table_info('inside_out')").all().map(row => row.name));
-  const missing = ADDITIVE_COLUMNS.filter(([name]) => !present.has(name));
+  const initial = readTableColumns(db, "inside_out");
+  const missing = ADDITIVE_COLUMNS.filter(([name]) => !initial.has(name));
   if (missing.length) {
     immediateTransaction(db, () => {
+      // Rechecked under the write lock: a concurrent opener may have added some columns meanwhile.
+      const present = readTableColumns(db, "inside_out");
       for (const [name, type] of missing) {
-        if (!db.prepare("SELECT 1 FROM pragma_table_info('inside_out') WHERE name=?").get(name)) {
+        if (!present.has(name)) {
           db.exec(`ALTER TABLE inside_out ADD COLUMN ${name} ${type}`);
           if (name === "valence") {
             db.exec(`UPDATE inside_out SET valence=${INSIDE_OUT_VALENCE_SQL} WHERE error IS NULL AND (${INSIDE_OUT_VALENCE_SQL}) IS NOT NULL`);

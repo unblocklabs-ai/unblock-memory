@@ -235,24 +235,25 @@ function latestValidRun(db) {
     const run = latestRun(db);
     return run && analysisSummary(db, run) ? run : undefined;
 }
-function sourcePaths(db, hash, limit) {
-    if (limit <= 0)
-        return [];
+function prepareSourcePaths(db) {
     return db.prepare(`
     SELECT collection, path
     FROM documents
     WHERE hash = ? AND active = 1
     ORDER BY collection, path
     LIMIT ?
-  `).all(hash, limit).map((row) => `qmd://${row.collection}/${row.path}`);
+  `);
 }
-function sourceCollections(db, hash) {
+function sourcePaths(statement, hash, limit) {
+    return statement.all(hash, limit).map((row) => `qmd://${row.collection}/${row.path}`);
+}
+function prepareSourceCollections(db) {
     return db.prepare(`
     SELECT DISTINCT collection
     FROM documents
     WHERE hash = ? AND active = 1
     ORDER BY collection
-  `).all(hash).map((row) => row.collection);
+  `);
 }
 function byteSlice(text, maxBytes) {
     const bytes = Buffer.from(text);
@@ -344,6 +345,8 @@ function members(db, runId, clusterId, limit, offset, sort, temporal) {
     ORDER BY ${order}
     LIMIT ? OFFSET ?
   `).all(temporal.sessionCollection ?? "", temporal.sessionCollection ?? "", temporal.sessionCollection ?? "", runId, clusterId, runId, clusterId, limit, offset);
+    let collections;
+    let paths;
     let remaining = DEFAULTS.analysis.totalExcerptMaxBytes;
     let remainingAliases = MAX_TOTAL_ALIASES;
     return rows.map((row, index) => {
@@ -353,7 +356,7 @@ function members(db, runId, clusterId, limit, offset, sort, temporal) {
         const text = byteSlice(fullText, excerptBudget);
         remaining -= Buffer.byteLength(text);
         const aliasBudget = Math.min(MAX_ALIASES_PER_MEMBER, Math.floor(remainingAliases / remainingRows));
-        const aliases = sourcePaths(db, row.hash, aliasBudget);
+        const aliases = aliasBudget > 0 ? sourcePaths(paths ??= prepareSourcePaths(db), row.hash, aliasBudget) : [];
         remainingAliases -= aliases.length;
         return {
             hash: row.hash,
@@ -372,7 +375,8 @@ function members(db, runId, clusterId, limit, offset, sort, temporal) {
             sourcePaths: aliases,
             chunkPos: row.pos,
             chunkLen: row.chunk_len,
-            sourceCollections: sourceCollections(db, row.hash),
+            sourceCollections: (collections ??= prepareSourceCollections(db))
+                .all(row.hash).map(source => source.collection),
         };
     });
 }
@@ -417,7 +421,7 @@ function clusterPreview(db, runId, clusterId, maxBytes, aliasLimit) {
         seq: row.seq,
         probability: row.probability,
         text: byteSlice(row.doc.slice(row.pos, row.pos + row.chunk_len), maxBytes),
-        sourcePaths: sourcePaths(db, row.hash, Math.min(MAX_ALIASES_PER_MEMBER, aliasLimit)),
+        sourcePaths: aliasLimit <= 0 ? [] : sourcePaths(prepareSourcePaths(db), row.hash, Math.min(MAX_ALIASES_PER_MEMBER, aliasLimit)),
     };
 }
 function toSummary(db, run, row, previewBytes = 0, aliasLimit = MAX_TOTAL_ALIASES) {

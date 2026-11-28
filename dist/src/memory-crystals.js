@@ -548,8 +548,8 @@ function matchIn(db, resolved) {
             continue;
         if (found.staleAfterMs !== null && found.staleAfterMs <= now)
             continue;
-        const corpora = parseCorpora(row.corpora_json);
-        if (!corpora?.length || !corpora.every(corpus => allowed.has(corpus)))
+        // `crystal()` already decoded `corpora_json` (malformed JSON decodes to `[]`, which never matches).
+        if (!found.corpora.length || !found.corpora.every(corpus => allowed.has(corpus)))
             continue;
         const stored = derivedObservationTokens(`${found.title} ${found.summary}`);
         if (!stored.size)

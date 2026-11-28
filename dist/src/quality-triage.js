@@ -1,5 +1,6 @@
 import { DEFAULTS } from "./defaults.js";
 import { chunkFingerprint } from "./curation.js";
+import { readActiveDocument } from "./evidence-review.js";
 /** Routing hints only: low evidence is not permission to delete. */
 export function qualityTriage(noise, evidence, encodingDefect = false) {
     if (noise < DEFAULTS.quality.triageNoiseThreshold && !encodingDefect)
@@ -21,9 +22,7 @@ export function qualityTaskPresence(db, task, cache = new Map()) {
     let fingerprints = cache.get(key);
     if (!fingerprints) {
         fingerprints = new Set();
-        const document = db.prepare(`SELECT d.hash, c.doc FROM documents d JOIN content c ON c.hash = d.hash
-      WHERE d.active = 1 AND d.collection = ? AND d.path = ?`)
-            .get(task.collection, task.path);
+        const document = readActiveDocument(db, task.collection, task.path);
         if (document) {
             const chunks = db.prepare("SELECT pos, chunk_len FROM content_vectors WHERE hash = ?")
                 .all(document.hash);

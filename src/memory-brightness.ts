@@ -44,10 +44,6 @@ const OUTCOME_WEIGHTS = { helped: 1, hurt: -1.5, ignored: -0.12 } as const;
 // One bound batch parameter, without a SQLite variable-count limit on the number of subjects.
 const SUBJECTS = "(SELECT value FROM json_each(:subjects))";
 
-/** Grounded emotional salience (0..1) per subject; zero or unknown salience is no Flashbulb signal. */
-const salienceScores = (paths: ReadonlyMap<string, { salienceScore: number }>) =>
-  new Map([...paths].flatMap(([path, { salienceScore }]) => salienceScore > 0 ? [[path, salienceScore] as const] : []));
-
 /** Missing or unavailable evidence is neutral. Never initialize or migrate a ledger on the search path. */
 export function computeBrightnessMap(dbOrPath: DatabaseSync | string, options: Pick<BrightnessConfig, "recipe"> &
   Partial<Pick<BrightnessConfig, "decayRate" | "lookbackDays" | "emotionDecayStretch" | "emotionMaxBonus">> & {
@@ -106,15 +102,20 @@ export function computeBrightnessMap(dbOrPath: DatabaseSync | string, options: P
         }
       } else {
         // The same evidence window as outcomes: a grade or log entry outside the lookback is no Flashbulb signal.
-        const salience = recipe === "emotion_v1" ? salienceScores(readPathSalience(db, agentId, [...keys], {
-          nowMs, lookbackDays, ...(options.baselineMinInteractions !== undefined
-            ? { baselineMinInteractions: options.baselineMinInteractions } : {}),
-        })) : undefined;
+        const emotionalEvidence = new Map<string, { salience: number; decayDelta: number; hurt: boolean }>();
+        if (recipe === "emotion_v1") {
+          const paths = readPathSalience(db, agentId, [...keys], {
+            nowMs, lookbackDays, ...(options.baselineMinInteractions !== undefined
+              ? { baselineMinInteractions: options.baselineMinInteractions } : {}),
+          });
+          for (const [path, { salienceScore }] of paths) {
+            if (salienceScore > 0) emotionalEvidence.set(path, { salience: salienceScore, decayDelta: 0, hurt: false });
+          }
+        }
         const hasOutcomes = hasColumns("memory_outcomes", "subject_id", "verdict", "confidence", "measured_at", "agent_id", "subject_kind");
         const hasCore = hasColumns("core_memories", "agent_id", "source_path");
         const hasExpectations = hasColumns("expectations", "evidence_json", "surprise_score", "agent_id", "status", "resolved_at_ms");
-        if (!hasOutcomes && !hasCore && !hasExpectations && !salience?.size) return result;
-        const flashbulb = new Map<string, { decayDelta: number; hurt: boolean }>();
+        if (!hasOutcomes && !hasCore && !hasExpectations && !emotionalEvidence.size) return result;
         const stretch = Math.max(0, Math.min(EMOTION_BRIGHTNESS_LIMITS.emotionDecayStretch, emotionDecayStretch));
         const maxBonus = Math.max(0, Math.min(EMOTION_BRIGHTNESS_LIMITS.emotionMaxBonus, emotionMaxBonus));
         if (hasOutcomes) {
@@ -127,12 +128,10 @@ export function computeBrightnessMap(dbOrPath: DatabaseSync | string, options: P
             const age = (nowMs - Number(row.measured_at)) / OUTCOME_DECAY_MS;
             const baseline = value * Math.exp(-age);
             add(subject, baseline);
-            const emotion = salience?.get(subject);
+            const emotion = emotionalEvidence.get(subject);
             if (emotion) {
-              const adjustment = flashbulb.get(subject) ?? { decayDelta: 0, hurt: false };
-              adjustment.decayDelta += value * Math.exp(-age / (1 + emotion * stretch)) - baseline;
-              adjustment.hurt ||= row.verdict === "hurt" && value < 0;
-              flashbulb.set(subject, adjustment);
+              emotion.decayDelta += value * Math.exp(-age / (1 + emotion.salience * stretch)) - baseline;
+              emotion.hurt ||= row.verdict === "hurt" && value < 0;
             }
           }
         }
@@ -150,10 +149,9 @@ export function computeBrightnessMap(dbOrPath: DatabaseSync | string, options: P
             add(String(row.source_path), 0.35 * Number(row.surprise_score));
           }
         }
-        for (const [subject, emotion] of salience ?? []) {
-          const { decayDelta = 0, hurt = false } = flashbulb.get(subject) ?? {};
+        for (const [subject, { salience, decayDelta, hurt }] of emotionalEvidence) {
           // A confirmed hurt may persist longer, but emotion cannot improve that subject over outcome_v1.
-          const adjustment = hurt ? Math.min(0, decayDelta) : decayDelta + maxBonus * emotion;
+          const adjustment = hurt ? Math.min(0, decayDelta) : decayDelta + maxBonus * salience;
           if (adjustment) add(subject, adjustment);
         }
       }

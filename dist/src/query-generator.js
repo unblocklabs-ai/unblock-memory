@@ -7,6 +7,7 @@ import { CONVERSATION_INFO, queryUserText } from "./response-text.js";
 import { parseQueryPair, prepareQueryConversation } from "./query-contract.js";
 import { nonBlank, record } from "./guards.js";
 import { classifySyntheticInput, isSyntheticEvidence } from "./synthetic-input.js";
+import { sliceHeadSafe } from "./text-span.js";
 /** Preserve whole visible messages and the complete current request, never tool/thinking text. */
 export function visibleQueryConversation(prompt, messages, currentUserMessage, syntheticInput) {
     const currentRequest = queryUserText(currentUserMessage !== undefined ? currentUserMessage : prompt) ?? "";
@@ -77,17 +78,6 @@ const FALLBACK_STOP_WORDS = new Set(("a about all also am an and any are as at b
     "she should so some still such than that the their them then there these they think this those through " +
     "to too under up very was we were what whats when where which who why will with would you your").split(" "));
 const { fallbackMaxLexTerms, fallbackMaxTermChars, fallbackMaxLexChars, fallbackMaxVecChars, fallbackHistoryUserMessages } = DEFAULTS.memoryWhisperer;
-function sliceHeadSafe(text, maxChars) {
-    if (maxChars <= 0)
-        return "";
-    if (text.length <= maxChars)
-        return text;
-    let end = maxChars;
-    const last = text.charCodeAt(end - 1);
-    if (last >= 0xd800 && last <= 0xdbff)
-        end--;
-    return text.slice(0, end);
-}
 function sliceTailSafe(text, maxChars) {
     if (maxChars <= 0)
         return "";
@@ -153,10 +143,13 @@ export function fallbackQueries(conversation) {
             }
         }
     }
-    const rawTokens = [...new Set((request.match(/[\p{L}\p{N}_]+/gu) ?? [])
-            .map(token => sliceHeadSafe(token, fallbackMaxTermChars).toLowerCase())
-            .filter(Boolean))].slice(0, fallbackMaxLexTerms);
-    const lex = (joinBoundedTerms(terms) || joinBoundedTerms(rawTokens) || sliceHeadSafe(request, fallbackMaxLexChars)).trim();
+    let lex = joinBoundedTerms(terms);
+    if (!lex) {
+        const rawTokens = [...new Set((request.match(/[\p{L}\p{N}_]+/gu) ?? [])
+                .map(token => sliceHeadSafe(token, fallbackMaxTermChars).toLowerCase())
+                .filter(Boolean))].slice(0, fallbackMaxLexTerms);
+        lex = joinBoundedTerms(rawTokens) || sliceHeadSafe(request, fallbackMaxLexChars);
+    }
     const vecSource = requestTerms.length < 4 && recentUsers.length
         ? `${recentUsers.at(-1).content.trim()}\n${request}`
         : request;
@@ -165,7 +158,7 @@ export function fallbackQueries(conversation) {
         : request.length >= fallbackMaxVecChars
             ? sliceHeadSafe(request, fallbackMaxVecChars)
             : sliceTailSafe(vecSource, fallbackMaxVecChars)).trim();
-    return { lex, vec };
+    return { lex: lex.trim(), vec };
 }
 export class QueryApiError extends Error {
     code;

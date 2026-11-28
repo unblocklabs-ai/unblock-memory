@@ -1,8 +1,9 @@
-import { createHash } from "node:crypto";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { setImmediate } from "node:timers/promises";
 import { DEFAULTS } from "./defaults.js";
-import { immediateTransaction, openMemoryDatabase, tableExists } from "./memory-database.js";
+import { INSIDE_OUT_VALENCE_SQL } from "./emotion-baselines.js";
+import { jsonHash } from "./json-hash.js";
+import { immediateTransaction, openMemoryDatabase, readTableColumns, tableExists } from "./memory-database.js";
 import { responseOutcome } from "./response-outcome.js";
 import { WorkFenceLostError, type WorkStore } from "./work-store.js";
 
@@ -65,7 +66,6 @@ type Verdict = "helped" | "ignored" | "hurt";
 type ResponseOutcome = ReturnType<typeof responseOutcome>;
 type Row = Record<string, SQLOutputValue>;
 const stringOrNull = (value: SQLOutputValue | undefined) => typeof value === "string" && value !== "" ? value : null;
-const digest = (parts: readonly string[]) => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 
 export type OutcomeLedgerPassOptions = {
   agentId: string;
@@ -115,15 +115,11 @@ function readWatermark(json: string | null): Watermark {
   return value;
 }
 
-function columns(db: DatabaseSync, table: string): Set<SQLOutputValue> {
-  return new Set(db.prepare("SELECT name FROM pragma_table_info(?)").all(table).map(row => row.name));
-}
-
 /** Read one page of distinct subjects. The tuple cursor also works when a turn contributes more rows than the cap. */
 function exposures(db: DatabaseSync, agentId: string, sweep: Sweep, limit: number): Row[] {
   const sources: string[] = [];
   if (tableExists(db, "recall_queries") && tableExists(db, "recall_hits")) {
-    const recipe = columns(db, "recall_queries").has("recipe_hash") ? "q.recipe_hash" : "NULL";
+    const recipe = readTableColumns(db, "recall_queries").has("recipe_hash") ? "q.recipe_hash" : "NULL";
     sources.push(`SELECT q.created_at_ms at, 'memory_hit' kind, 'query:'||q.event_key evidence, h.source_path subject,
       q.id source_id, q.session_id session, q.session_key session_key, q.run_id run, ${recipe} recipe,
       max(h.disposition IN ('emitted','returned')) delivered, q.provider, q.account_id account, q.sender_id sender
@@ -132,14 +128,14 @@ function exposures(db: DatabaseSync, agentId: string, sweep: Sweep, limit: numbe
       GROUP BY q.id,h.source_path`);
   }
   if (tableExists(db, "skill_routing_events")) {
-    const recipe = columns(db, "skill_routing_events").has("recipe_hash") ? "s.recipe_hash" : "NULL";
+    const recipe = readTableColumns(db, "skill_routing_events").has("recipe_hash") ? "s.recipe_hash" : "NULL";
     sources.push(`SELECT DISTINCT s.created_at_ms, 'skill', 'route:'||s.event_key, j.value,
       s.id, s.session_id, s.session_key, s.run_id, ${recipe}, 1, NULL, NULL, NULL
       FROM skill_routing_events s JOIN json_each(s.emitted_json) j, bounds b
       WHERE s.agent_id=b.agent AND s.created_at_ms BETWEEN b.since AND b.until AND j.type='text' AND j.value!=''`);
   }
   if (tableExists(db, "person_whisper_receipts")) {
-    const recipe = columns(db, "person_whisper_receipts").has("recipe_hash") ? "p.recipe_hash" : "NULL";
+    const recipe = readTableColumns(db, "person_whisper_receipts").has("recipe_hash") ? "p.recipe_hash" : "NULL";
     sources.push(`SELECT CAST(round(unixepoch(min(p.injected_at),'subsec')*1000) AS INTEGER), 'person_whisper',
       'receipt:'||p.run_id, p.person_id,
       0, NULL, NULL, p.run_id, ${recipe}, 1, NULL, NULL, NULL
@@ -210,9 +206,9 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
   const insideOut = tableExists(db, "inside_out");
   // Per-exposure grade lookups are keyed by session and time; keep them off a full table scan.
   if (insideOut) db.exec("CREATE INDEX IF NOT EXISTS idx_inside_out_session_target ON inside_out(session_id, target_at)");
-  const insideOutColumns = insideOut ? columns(db, "inside_out") : new Set<SQLOutputValue>();
+  const insideOutColumns = readTableColumns(db, "inside_out");
   const hasPerson = insideOutColumns.has("person_id");
-  const valence = "joy-max(sadness,fear,anger,disgust)";
+  const valence = INSIDE_OUT_VALENCE_SQL;
   // Unsigned 0..3 intensity exists only on grades written since it was added; NULL is unknown, never calm.
   const intensity = insideOutColumns.has("intensity") ? "intensity" : "NULL";
   const grade = insideOut ? db.prepare(`SELECT interaction_id,rubric,human_key,${hasPerson ? "person_id" : "NULL"} person_id,
@@ -273,19 +269,7 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
         sharpDrop = insideOutDelta <= -Math.max(0.25, 2 * Math.sqrt(Math.max(0, Number(history.squareMean) - mean * mean)));
       }
     }
-    // Only agent-attributed evidence is negative. An Inside Out valence drop is the human's own emotion about
-    // anything (grief, bad news, a crisis), so it stays observational telemetry and never blames recalled memory.
-    const shortfall = response?.status === "reported_shortfall";
-    const negative = shortfall;
-    const positive = response?.status === "acknowledged_success";
-    const used = kind === "skill" ? opened : kind === "memory_hit" ? read || exposure.delivered : exposure.delivered;
-    const explicitUse = read || opened;
-    const verdict: Verdict = negative && used ? "hurt"
-      : !negative && (explicitUse || (used && positive)) ? "helped" : "ignored";
-    const reason = negative ? !used ? "negative_without_exposure" : "reported_shortfall"
-      : read ? "read" : opened ? "opened" : used && positive ? "acknowledged_success" : "no_use_or_outcome_signal";
-    const confidence = verdict === "hurt" ? 0.9
-      : verdict === "helped" ? (explicitUse && positive ? 0.95 : 0.8) : explicitUse || !used ? 0.8 : 0.5;
+    const { verdict, reason, confidence, negative } = scoreOutcome(kind, { delivered: exposure.delivered, read, opened, response });
     const episodeId = stringOrNull(episode?.id);
     const turnId = episodeId ? `episode:${episodeId}` : run ? `run:${run}` : exposure.evidence;
     return {
@@ -295,6 +279,25 @@ function evidenceReader(db: DatabaseSync, options: OutcomeLedgerPassOptions, win
         insideOutDelta, insideOutValence, insideOutIntensity, baselineCount, sharpDrop, negative, turnId, reason },
     };
   };
+}
+
+/** Pure verdict rules for one exposure, from whether it was used and what the audited response reported. */
+function scoreOutcome(kind: OutcomeSubjectKind,
+  evidence: { delivered: boolean; read: boolean; opened: boolean; response: ResponseOutcome | null }) {
+  const { delivered, read, opened, response } = evidence;
+  // Only agent-attributed evidence is negative. An Inside Out valence drop is the human's own emotion about
+  // anything (grief, bad news, a crisis), so it stays observational telemetry and never blames recalled memory.
+  const negative = response?.status === "reported_shortfall";
+  const positive = response?.status === "acknowledged_success";
+  const used = kind === "skill" ? opened : kind === "memory_hit" ? read || delivered : delivered;
+  const explicitUse = read || opened;
+  const verdict: Verdict = negative && used ? "hurt"
+    : !negative && (explicitUse || (used && positive)) ? "helped" : "ignored";
+  const reason = negative ? !used ? "negative_without_exposure" : "reported_shortfall"
+    : read ? "read" : opened ? "opened" : used && positive ? "acknowledged_success" : "no_use_or_outcome_signal";
+  const confidence = verdict === "hurt" ? 0.9
+    : verdict === "helped" ? (explicitUse && positive ? 0.95 : 0.8) : explicitUse || !used ? 0.8 : 0.5;
+  return { verdict, reason, confidence, negative };
 }
 
 /**
@@ -398,7 +401,7 @@ export async function runOutcomeLedgerPass(options: OutcomeLedgerPassOptions): P
       const exposure = last = decodeExposure(row);
       const evidence = evaluate(exposure, startedAt);
       const recipe = exposure.kind === "person_whisper" ? exposure.recipe || recipeHash : exposure.recipe ?? "default";
-      const id = digest([agentId, exposure.kind, exposure.subject, exposure.evidence, recipe]);
+      const id = jsonHash([agentId, exposure.kind, exposure.subject, exposure.evidence, recipe]);
       // Drop rows earlier versions scored for candidates that were never shown to the model.
       if (evidence) outcomes.push({ ...evidence, id, recipe, exposure }); else unexposed.push(id);
     }

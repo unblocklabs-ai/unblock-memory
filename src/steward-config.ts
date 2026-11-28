@@ -350,19 +350,15 @@ function integer(value: unknown, min: number, key: string) {
   }
   return value;
 }
-function unitInterval(value: unknown, key: string) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
-    throw new Error(`steward.${key} must be a number between 0 and 1`);
+function numberBetweenZeroAnd(max: number, value: unknown, key: string) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > max) {
+    throw new Error(`steward.${key} must be a number between 0 and ${max}`);
   }
   return value;
 }
+const unitInterval = (value: unknown, key: string) => numberBetweenZeroAnd(1, value, key);
 /** Inside Out intensity scale, 0 (none) to 3 (overwhelming). */
-function intensity(value: unknown, key: string) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 3) {
-    throw new Error(`steward.${key} must be a number between 0 and 3`);
-  }
-  return value;
-}
+const intensity = (value: unknown, key: string) => numberBetweenZeroAnd(3, value, key);
 function enabled(value: unknown, label: string) {
   return boolean(value, `${label}.enabled`);
 }
@@ -370,26 +366,19 @@ function boolean(value: unknown, label: string) {
   if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
   return value;
 }
-function chatTypeList(value: unknown, key: string): ChatType[] {
+/** De-duplicated, in first-seen order; every entry must be one of `allowed`. */
+function enumList<T>(allowed: readonly T[], value: unknown, key: string): T[] {
   if (!Array.isArray(value)) throw new Error(`steward.${key} must be an array`);
-  const out: ChatType[] = [];
+  const out: T[] = [];
   for (const entry of value) {
-    const matched = chatTypes.find(t => t === entry);
-    if (!matched) throw new Error(`Invalid steward.${key} entry`);
+    const matched = allowed.find(t => t === entry);
+    if (matched === undefined) throw new Error(`Invalid steward.${key} entry`);
     if (!out.includes(matched)) out.push(matched);
   }
   return out;
 }
-function expectationChatTypeList(value: unknown, key: string): ExpectationChatType[] {
-  if (!Array.isArray(value)) throw new Error(`steward.${key} must be an array`);
-  const out: ExpectationChatType[] = [];
-  for (const entry of value) {
-    const matched = expectationChatTypes.find(t => t === entry);
-    if (!matched) throw new Error(`Invalid steward.${key} entry`);
-    if (!out.includes(matched)) out.push(matched);
-  }
-  return out;
-}
+const chatTypeList = (value: unknown, key: string): ChatType[] => enumList(chatTypes, value, key);
+const expectationChatTypeList = (value: unknown, key: string): ExpectationChatType[] => enumList(expectationChatTypes, value, key);
 function corpusList(value: unknown, key: string): string[] {
   if (!Array.isArray(value) || !value.every(entry => typeof entry === "string" && entry.trim())) {
     throw new Error(`steward.${key} must be an array of non-empty corpus names`);

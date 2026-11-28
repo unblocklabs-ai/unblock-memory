@@ -9,9 +9,9 @@ import type { UnblockMemoryConfig } from "./config.js";
 import { DEFAULTS } from "./defaults.js";
 import { jsonHash } from "./json-hash.js";
 import { record, nonBlank } from "./guards.js";
-import { dossierAssertions, privateJson, type ReviewAssertion, type ReviewManifest } from "./people-learning-inventory.js";
+import { blurbSentenceSpans, dossierAssertions, publishPeopleManifest, type ReviewAssertion, type ReviewManifest } from "./people-learning-inventory.js";
 import { manifestRevision, LEARNING_RECEIPT_SCHEMA, PeopleLearningStore, type LearningReceipt } from "./people-learning-store.js";
-import { PeopleStore, recordDossierVerificationInTransaction, type PersonDossier } from "./people-store.js";
+import { PeopleStore, recordDossierVerificationInTransaction, VERIFIED_DOSSIER_SQL, type PersonDossier } from "./people-store.js";
 import type { PeopleManifestEnsureResult } from "./people-learning-runtime.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
 import { startWorkHeartbeat, WorkFenceLostError, type WorkClaim, type WorkItem, type WorkStore } from "./work-store.js";
@@ -624,7 +624,7 @@ function normalizeClaim(text: string): string {
 
 function knownStatements(dossier: PersonDossier | undefined): Set<string> {
   if (!dossier) return new Set();
-  return new Set([...sentenceSpans(dossier.blurb).map(span => dossier.blurb.slice(span.start, span.end)),
+  return new Set([...blurbSentenceSpans(dossier.blurb).map(span => dossier.blurb.slice(span.start, span.end)),
     ...dossier.sections.flatMap(section => section.claims.map(claim => claim.statement))].map(normalizeClaim).filter(Boolean));
 }
 
@@ -633,7 +633,7 @@ function buildInteractionPrompt(manifest: ReviewManifest, personId: string, doss
   const person = manifest.roster.find(p => p.personId === personId);
   const name = person?.name ?? "(unknown)";
   const existing = dossier ? [
-    ...sentenceSpans(dossier.blurb).map(span => `- [blurb] ${dossier.blurb.slice(span.start, span.end)}`),
+    ...blurbSentenceSpans(dossier.blurb).map(span => `- [blurb] ${dossier.blurb.slice(span.start, span.end)}`),
     ...dossier.sections.flatMap(section => section.claims.map(claim =>
       `- [${section.category}] ${claim.statement}${claim.scope ? ` (scope: ${claim.scope})` : ""}`)),
   ] : [];
@@ -715,18 +715,6 @@ function evidenceRefsOf(evidence: PeopleShadowArtifact["evidence"]): EvidenceRef
   return refs;
 }
 
-/** Trimmed, non-empty sentence spans of a blurb, in exactly the order `dossierAssertions` enumerates them. */
-function sentenceSpans(blurb: string): { start: number; end: number; segmentEnd: number }[] {
-  const spans: { start: number; end: number; segmentEnd: number }[] = [];
-  for (const part of new Intl.Segmenter("en", { granularity: "sentence" }).segment(blurb)) {
-    const trimmed = part.segment.trim();
-    if (!trimmed) continue;
-    const start = part.index + (part.segment.length - part.segment.trimStart().length);
-    spans.push({ start, end: start + trimmed.length, segmentEnd: part.index + part.segment.length });
-  }
-  return spans;
-}
-
 type DossierEdit = { dossier: PersonDossier } | { recordOnly: string } | { skip: string };
 
 /**
@@ -736,7 +724,7 @@ type DossierEdit = { dossier: PersonDossier } | { recordOnly: string } | { skip:
 function editDossier(dossier: PersonDossier, index: number, proposal: PeopleShadowProposal,
   evidence: PeopleShadowArtifact["evidence"], at: string): DossierEdit {
   const next = structuredClone(dossier);
-  const spans = sentenceSpans(dossier.blurb);
+  const spans = blurbSentenceSpans(dossier.blurb);
   if (index < spans.length) {
     const span = spans[index]!;
     if (proposal.disposition === "revalidated") return { recordOnly: "Blurb sentence revalidated; prose carries no per-sentence review date" };
@@ -773,12 +761,7 @@ function editDossier(dossier: PersonDossier, index: number, proposal: PeopleShad
 
 function dossierIsVerified(db: DatabaseSync, personId: string): boolean {
   if (!hasTable(db, "person_dossier_verification")) return false;
-  return Boolean(db.prepare(`SELECT 1 FROM person_dossiers d
-    JOIN person_dossier_verification v ON v.person_id = d.person_id
-    JOIN person_dossier_changes c ON c.person_id = d.person_id AND c.id = v.revision
-    WHERE d.person_id = ? AND c.action = 'replace' AND c.after_dossier_json = d.dossier_json
-      AND c.id = (SELECT latest.id FROM person_dossier_changes latest WHERE latest.person_id = d.person_id
-        ORDER BY latest.rowid DESC LIMIT 1)`).get(personId));
+  return Boolean(db.prepare(`SELECT 1 ${VERIFIED_DOSSIER_SQL}`).get(personId));
 }
 
 /**
@@ -962,10 +945,17 @@ function parseArtifact(json: string | null | undefined): PeopleShadowArtifact | 
  * move when an unrelated assertion is appended, so an unresolved person is not re-learned over identical evidence.
  * Publication still fences on the live manifest revision.
  */
-function interactionInputRevision(manifest: ReviewManifest, person: ReviewManifest["roster"][number]): string {
-  const exports = new Map(manifest.sessions.map(session => [session.sessionId, session.revision]));
+function interactionInputRevision(manifest: ReviewManifest, person: ReviewManifest["roster"][number],
+  exports: SessionExports): string {
   return jsonHash(["people_interactions_input", manifest.id, manifest.window, person.personId, person.name, person.status,
     person.injectionEnabled, person.identities, [...person.sessionIds].sort().map(id => [id, exports.get(id) ?? null])]);
+}
+
+/** Each inventoried session's export fingerprint. Built once per manifest, then shared by every roster person. */
+type SessionExports = ReadonlyMap<string, string>;
+
+function sessionExports(manifest: ReviewManifest): SessionExports {
+  return new Map(manifest.sessions.map(session => [session.sessionId, session.revision]));
 }
 
 /** Stable key matching a dossier assertion to a claim Steward interaction learning applied. */
@@ -1036,7 +1026,8 @@ function checkpointManifest(input: {
   const roster = new Map(manifest.roster.map(person => [person.personId, person]));
   /** Claims Steward interaction learning applied for this manifest, per person (any revision). */
   const stewardApplied = new Map<string, Set<string>>();
-  const learnedRows = manifest.kind !== "nightly" ? [] : input.workStore.list(PEOPLE_INTERACTIONS_KIND).flatMap(row => {
+  const exports = manifest.kind !== "nightly" ? undefined : sessionExports(manifest);
+  const learnedRows = !exports ? [] : input.workStore.list(PEOPLE_INTERACTIONS_KIND).flatMap(row => {
     const artifact = row.status === "completed" ? parseInteractionArtifact(row.artifactJson) : undefined;
     if (!artifact?.publication || artifact.mode !== "publish" || artifact.manifestId !== manifest.id ||
         row.scope !== interactionScope(manifest.id, artifact.personId)) return [];
@@ -1048,7 +1039,7 @@ function checkpointManifest(input: {
     }
     // A review over identical evidence stays valid when only the manifest revision moved (e.g. an appended assertion).
     const person = roster.get(artifact.personId);
-    if (!person || row.inputRevision !== interactionInputRevision(manifest, person)) return [];
+    if (!person || row.inputRevision !== interactionInputRevision(manifest, person, exports)) return [];
     return [{ artifact, publication: artifact.publication }];
   });
   if (!rows.length && !learnedRows.length) return undefined;
@@ -1137,7 +1128,7 @@ function checkpointManifest(input: {
           });
         },
         beforeManifestCommit: published => {
-          privateJson(join(dirname(input.dbPath), "people-learning"), `${manifestRevision(published)}.manifest.json`, published);
+          publishPeopleManifest(join(dirname(input.dbPath), "people-learning"), published);
         },
         shouldFinalize: current => current.fullValidation,
       });
@@ -1363,12 +1354,13 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
       // A people review this revision's receipt already resolved (cron or Steward) is never re-learned.
       const receipt = run.receipt && (run.receipt.manifestRevision ?? run.revision) === run.revision ? run.receipt : undefined;
       const resolved = new Set((receipt?.peopleReviews ?? []).filter(r => r.status !== "unresolved").map(r => r.personId));
+      const exports = sessionExports(run.manifest);
       for (const person of run.manifest.roster) {
         // Paused/inactive (roster snapshot OR live record) and session-less people spend no tokens.
         if (!person.sessionIds.length || resolved.has(person.personId) || person.status !== "active" || !person.injectionEnabled ||
             !personIsActive(db, person.personId)) continue;
         learnTasks.push({ scope: interactionScope(run.manifest.id, person.personId), manifest: run.manifest, revision: run.revision,
-          inputRevision: interactionInputRevision(run.manifest, person), personId: person.personId });
+          inputRevision: interactionInputRevision(run.manifest, person, exports), personId: person.personId });
       }
     }
   } finally { db.close(); }
@@ -1427,24 +1419,57 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
     const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
     const maxStrikes = options.maxStrikes;
     const ctx: PassContext = { options, result, leaseMs };
+    // Claim/stage fence mechanics shared by the assertion and interaction loops.
+    /** The item row, unless it is gone, settled, quarantined or was enqueued for another input revision. */
+    const admit = (kind: string, scope: string, inputRevision: string): WorkItem | undefined => {
+      const existing = options.workStore.get(kind, scope);
+      if (existing && existing.status !== "completed" && existing.status !== "quarantined" && existing.inputRevision === inputRevision) {
+        return existing;
+      }
+      result.skipped += 1;
+      result.items.push({ scope, outcome: "skipped", detail: existing?.status });
+      return undefined;
+    };
+    /** Claim bound to the exact input revision and recipe the task was built from: a row that advanced is not ours. */
+    const claimItem = (kind: string, scope: string, inputRevision: string, recipeHash: string) => {
+      const claim = options.workStore.claim({ kind, scope, mode: "item", owner: options.owner,
+        leaseMs, maxStrikes, now: now(), expectedInputRevision: inputRevision, expectedRecipeHash: recipeHash });
+      if (!claim) { result.items.push({ scope, outcome: "busy" }); return undefined; }
+      return { claim, priorUsage: options.workStore.get(kind, scope)?.usageJson ?? null };
+    };
+    /** A host-verification failure is the item's fault: strike it toward quarantine, billing the attempt's usage. */
+    const rejectProposal = (scope: string, claim: WorkClaim, reason: string, priorUsage: string | null, usage: StewardUsage | undefined) => {
+      tryFail(options.workStore, claim, reason, true, maxStrikes, cumulativeUsage(priorUsage, usage));
+      result.rejected += 1;
+      result.items.push({ scope, outcome: "rejected", detail: reason });
+    };
+    /**
+     * Stage a proposal artifact on the claim. A host verdict (no model call) bills zero requests and, unlike a model
+     * proposal, a failure to stage it is not counted as a failed item.
+     */
+    const stageProposal = (scope: string, claim: WorkClaim, priorUsage: string | null, artifact: unknown,
+      usage: Partial<StewardUsage> | "host"): WorkClaim | undefined => {
+      try {
+        return options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
+          usageJson: cumulativeUsage(priorUsage, usage === "host" ? { requests: 0 } : usage) ?? null, now: now() });
+      } catch (error) {
+        if (usage !== "host") result.failed += 1;
+        result.items.push({ scope, outcome: "failed", detail: safeError(error) });
+        return undefined;
+      }
+    };
     let stopped = false;
     for (const task of tasks) {
       if (options.signal?.aborted) { result.interrupted = true; stopped = true; break; }
-      const existing = options.workStore.get(PEOPLE_SHADOW_KIND, task.scope);
-      if (!existing || existing.status === "completed" || existing.status === "quarantined" || existing.inputRevision !== task.revision) {
-        result.skipped += 1;
-        result.items.push({ scope: task.scope, outcome: "skipped", detail: existing?.status });
-        continue;
-      }
+      const existing = admit(PEOPLE_SHADOW_KIND, task.scope, task.revision);
+      if (!existing) continue;
       // Resume a staged proposal at publication without re-running the model, only for this exact manifest revision.
       const resumable = existing.status === "staged" && existing.stage === PROPOSAL_STAGE &&
         artifactRevision(existing.artifactJson) === task.revision;
       if (!resumable && result.attempted >= maxItems) break;
-      // Bind the claim to the revision this task was built from: a manifest that advanced since is not ours to adjudicate.
-      const claim = options.workStore.claim({ kind: PEOPLE_SHADOW_KIND, scope: task.scope, mode: "item", owner: options.owner,
-        leaseMs, maxStrikes, now: now(), expectedInputRevision: task.revision, expectedRecipeHash: recipe });
-      if (!claim) { result.items.push({ scope: task.scope, outcome: "busy" }); continue; }
-      const priorUsage = options.workStore.get(PEOPLE_SHADOW_KIND, task.scope)?.usageJson ?? null;
+      const claimed = claimItem(PEOPLE_SHADOW_KIND, task.scope, task.revision, recipe);
+      if (!claimed) continue;
+      const { claim, priorUsage } = claimed;
       if (claim.stage === PROPOSAL_STAGE && artifactRevision(claim.artifactJson) === task.revision) {
         const stagedArtifact = parseArtifact(claim.artifactJson);
         const publish = stagedArtifact && stagedArtifact.assertionId === task.assertion.id && stagedArtifact.personId === task.assertion.personId
@@ -1473,12 +1498,11 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
         // No approved in-account evidence: the only honest answer is unresolved; spend no tokens.
         const artifact: PeopleShadowArtifact = { ...artifactBase, source: "host", evidence: [], proposedAt: new Date(now()).toISOString(),
           proposal: { disposition: "unresolved", reason: "No approved in-account evidence excerpts for this person", citedHandles: [], confidence: "low" } };
-        try {
-          const staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
-            usageJson: cumulativeUsage(priorUsage, { requests: 0 }) ?? null, now: now() });
+        const staged = stageProposal(task.scope, claim, priorUsage, artifact, "host");
+        if (staged) {
           settle(task.scope, commit(options.workStore, staged, publisher(staged, artifact, task.assertion)), "host_unresolved", "failed", staged,
             countPublished);
-        } catch (error) { result.items.push({ scope: task.scope, outcome: "failed", detail: safeError(error) }); }
+        }
         continue;
       }
 
@@ -1489,12 +1513,7 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
       if (!called.ok) { if (called.stop) { stopped = true; break; } continue; }
       const usage = called.usage;
       const verified = verifyProposal(called.data, minted);
-      if (!verified.ok) {
-        tryFail(options.workStore, claim, verified.reason, true, maxStrikes, cumulativeUsage(priorUsage, usage));
-        result.rejected += 1;
-        result.items.push({ scope: task.scope, outcome: "rejected", detail: verified.reason });
-        continue;
-      }
+      if (!verified.ok) { rejectProposal(task.scope, claim, verified.reason, priorUsage, usage); continue; }
       const cited = new Set(verified.proposal.citedHandles);
       const artifact: PeopleShadowArtifact = {
         ...artifactBase, source: "model", proposal: verified.proposal,
@@ -1502,15 +1521,8 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
         ...(usage ? { usage } : {}),
         proposedAt: new Date(now()).toISOString(),
       };
-      let staged: WorkClaim;
-      try {
-        staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
-          usageJson: cumulativeUsage(priorUsage, usage ?? { requests: 1 }) ?? null, now: now() });
-      } catch (error) {
-        result.failed += 1;
-        result.items.push({ scope: task.scope, outcome: "failed", detail: safeError(error) });
-        continue;
-      }
+      const staged = stageProposal(task.scope, claim, priorUsage, artifact, usage ?? { requests: 1 });
+      if (!staged) continue;
       settle(task.scope, commit(options.workStore, staged, publisher(staged, artifact, task.assertion)), "completed", "staged", staged,
         countPublished);
     }
@@ -1518,12 +1530,8 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
     // Interaction learning: net-new claims per (manifest, person), after assertion adjudication in the same pass.
     for (const task of stopped ? [] : learnTasks) {
       if (options.signal?.aborted) { result.interrupted = true; break; }
-      const existing = options.workStore.get(PEOPLE_INTERACTIONS_KIND, task.scope);
-      if (!existing || existing.status === "completed" || existing.status === "quarantined" || existing.inputRevision !== task.inputRevision) {
-        result.skipped += 1;
-        result.items.push({ scope: task.scope, outcome: "skipped", detail: existing?.status });
-        continue;
-      }
+      const existing = admit(PEOPLE_INTERACTIONS_KIND, task.scope, task.inputRevision);
+      if (!existing) continue;
       // A staged proposal resumes only for this manifest revision AND the dossier revision it was learned against.
       const dossierNow = readDossierAt(options.dbPath, task.personId);
       const resumableArtifact = (json: string | null | undefined) => {
@@ -1533,10 +1541,9 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
       };
       const resumable = existing.status === "staged" && existing.stage === PROPOSAL_STAGE && Boolean(resumableArtifact(existing.artifactJson));
       if (!resumable && result.attempted >= maxItems) break;
-      const claim = options.workStore.claim({ kind: PEOPLE_INTERACTIONS_KIND, scope: task.scope, mode: "item", owner: options.owner,
-        leaseMs, maxStrikes, now: now(), expectedInputRevision: task.inputRevision, expectedRecipeHash: interactionRecipe });
-      if (!claim) { result.items.push({ scope: task.scope, outcome: "busy" }); continue; }
-      const priorUsage = options.workStore.get(PEOPLE_INTERACTIONS_KIND, task.scope)?.usageJson ?? null;
+      const claimed = claimItem(PEOPLE_INTERACTIONS_KIND, task.scope, task.inputRevision, interactionRecipe);
+      if (!claimed) continue;
+      const { claim, priorUsage } = claimed;
       // Live pause/opt-out (e.g. paused while an earlier person was being learned): release without a strike, spend
       // nothing, and never send this person's dossier or excerpts to the model.
       const releaseIfPaused = () => {
@@ -1577,11 +1584,8 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
         // Nothing citable (or nothing to extend): the only honest answer is unresolved; spend no tokens.
         const artifact: PeopleInteractionArtifact = { ...base, source: "host", decisions: [], proposedAt: new Date(now()).toISOString(),
           result: { status: "unresolved", proposals: [], summary: hostUnresolved } };
-        try {
-          const staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
-            usageJson: cumulativeUsage(priorUsage, { requests: 0 }) ?? null, now: now() });
-          settle(task.scope, commit(options.workStore, staged, learnPublisher(staged, artifact)), "host_unresolved", "failed", staged, countLearned);
-        } catch (error) { result.items.push({ scope: task.scope, outcome: "failed", detail: safeError(error) }); }
+        const staged = stageProposal(task.scope, claim, priorUsage, artifact, "host");
+        if (staged) settle(task.scope, commit(options.workStore, staged, learnPublisher(staged, artifact)), "host_unresolved", "failed", staged, countLearned);
         continue;
       }
 
@@ -1594,13 +1598,8 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
       if (!called.ok) { if (called.stop) break; continue; }
       const usage = called.usage;
       const verified = verifyInteractionResult(called.data, minted);
-      if (!verified.ok) {
-        // Same rule as assertion adjudication: an invented handle strikes the item toward quarantine.
-        tryFail(options.workStore, claim, verified.reason, true, maxStrikes, cumulativeUsage(priorUsage, usage));
-        result.rejected += 1;
-        result.items.push({ scope: task.scope, outcome: "rejected", detail: verified.reason });
-        continue;
-      }
+      // Same rule as assertion adjudication: an invented handle strikes the item toward quarantine.
+      if (!verified.ok) { rejectProposal(task.scope, claim, verified.reason, priorUsage, usage); continue; }
       const artifact: PeopleInteractionArtifact = {
         ...base, source: "model", result: verified.result,
         decisions: screenProposals(verified.result, minted, dossierNow.dossier,
@@ -1608,15 +1607,8 @@ export async function runPeopleShadowPass(options: PeopleShadowPassOptions): Pro
         ...(usage ? { usage } : {}),
         proposedAt: new Date(now()).toISOString(),
       };
-      let staged: WorkClaim;
-      try {
-        staged = options.workStore.stageArtifact(claim, { stage: PROPOSAL_STAGE, artifactJson: JSON.stringify(artifact),
-          usageJson: cumulativeUsage(priorUsage, usage ?? { requests: 1 }) ?? null, now: now() });
-      } catch (error) {
-        result.failed += 1;
-        result.items.push({ scope: task.scope, outcome: "failed", detail: safeError(error) });
-        continue;
-      }
+      const staged = stageProposal(task.scope, claim, priorUsage, artifact, usage ?? { requests: 1 });
+      if (!staged) continue;
       settle(task.scope, commit(options.workStore, staged, learnPublisher(staged, artifact)), "completed", "staged", staged, countLearned);
     }
 

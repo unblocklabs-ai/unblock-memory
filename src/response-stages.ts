@@ -4,6 +4,7 @@ import {
   judgeResponse,
   judgeResponseFollowup,
   RESPONSE_STAGE_VERSIONS,
+  runStageAttempt,
   type ResponseJudgeParams,
   type ResponseStages,
 } from "./response-judge.js";
@@ -55,15 +56,13 @@ export async function assessResponseStages(store: ResponseAuditStore, cohort: st
       usage.stageCacheHits++;
       return cached;
     }
-    cache.begin(["retrospective"]);
-    try {
+    return runStageAttempt({
+      begin: () => cache.begin(["retrospective"]), settle: () => cache.settle(["retrospective"]), signal: params.signal,
+    }, async () => {
       const retrospective = await judgeResponseFollowup(e, params);
       cache.save("retrospective", retrospective);
       return retrospective;
-    } catch (error) {
-      if (!params.signal.aborted) cache.settle(["retrospective"]);
-      throw error;
-    }
+    });
   };
   const [judgment, retrospective] = await Promise.allSettled([
     judgeResponse(e, params, sentimentEnabled, cache), assessRetrospective(),

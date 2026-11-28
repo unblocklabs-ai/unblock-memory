@@ -15,13 +15,13 @@ import {
 } from "./decision-client.js";
 import { readInsideOutSources, type InsideOutSource } from "./inside-out-sources.js";
 import {
-  INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, detectSentimentDrift, emotionBaselineHistory, intensityProfiles,
-  intensityReader, summarizeSentimentDrift, type SentimentDriftOptions,
+  INSIDE_OUT_EMOTIONS, PURGED_GRADE, deviationReader, detectSentimentDrift, emotionBaselineHistory, insideOutValenceSql,
+  intensityProfiles, intensityReader, summarizeSentimentDrift, type SentimentDriftOptions,
 } from "./emotion-baselines.js";
-import { INSIDE_OUT_VALENCE_SQL, PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
+import { PERSON_MATCH, openInsideOutStore, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
 import { jsonHash } from "./json-hash.js";
 import { humanEvidenceText, type SyntheticInputFilterConfig } from "./synthetic-input.js";
-import { tableExists } from "./memory-database.js";
+import { readTableColumns, tableExists } from "./memory-database.js";
 import { WorkFenceLostError, WorkStore, startWorkHeartbeat, type WorkClaim } from "./work-store.js";
 
 export { linkInsideOutPeople, purgeInsideOutPerson, refreshInsideOutBaselines, refreshInsideOutBaselinesAsync } from "./inside-out-store.js";
@@ -33,6 +33,13 @@ export const INSIDE_OUT_WORK_SCOPE = "agent";
 const LEASE_MS = 120_000;
 const HEARTBEAT_MS = 20_000;
 const CONTEXT_ERROR = "Target reply and preceding assistant exceed context budget";
+/**
+ * A failed grade that may be re-sent: never a purge tombstone; an explicit `retry` takes every other failure,
+ * otherwise only non-context failures reviewed before the retry floor. Bind {@link retryableGradeArgs}.
+ */
+const RETRYABLE_GRADE = "error IS NOT NULL AND error<>? AND (? OR (error<>? AND reviewed_at<=?))";
+const retryableGradeArgs = (retry: boolean | undefined, retryCutoff: number) =>
+  [PURGED_GRADE, Number(retry ?? false), CONTEXT_ERROR, retryCutoff] as const;
 
 function insideOutRubric(endpoint: string): string {
   const canonical = endpoint.replace(/\/+$/u, "");
@@ -323,15 +330,12 @@ function loadRetryTargets(
   options: { retry?: boolean; sessionId?: string; retryCutoff: number },
 ): Map<string, Set<string>> {
   const failures = store.prepare(`SELECT interaction_id,source FROM inside_out
-    WHERE rubric=? AND error IS NOT NULL AND error<>? AND (? OR (error<>? AND reviewed_at<=?))
+    WHERE rubric=? AND ${RETRYABLE_GRADE}
     AND (? IS NULL OR session_id=?) ORDER BY reviewed_at,interaction_id`);
   const pending = new Map<string, Set<string>>();
   for (const row of failures.all(
     rubric,
-    PURGED_GRADE,
-    Number(options.retry ?? false),
-    CONTEXT_ERROR,
-    options.retryCutoff,
+    ...retryableGradeArgs(options.retry, options.retryCutoff),
     options.sessionId ?? null,
     options.sessionId ?? null,
   )) {
@@ -377,14 +381,7 @@ async function reviewSource(
     signal?.throwIfAborted();
     if (budgetExhausted()) return;
     // Recheck retry eligibility immediately before inference so purged grades are never re-sent to the decision model.
-    if (retryPass && !statements.retryable.get(
-      interaction.id,
-      rubric,
-      PURGED_GRADE,
-      Number(retry ?? false),
-      CONTEXT_ERROR,
-      retryPass.retryCutoff,
-    )) {
+    if (retryPass && !statements.retryable.get(interaction.id, rubric, ...retryableGradeArgs(retry, retryPass.retryCutoff))) {
       continue;
     }
     const { probabilities, intensity, error, model } = await gradeInteraction(interaction, { apiKey, config, signal });
@@ -470,9 +467,7 @@ export async function runInsideOut(options: InsideOutRunOptions) {
           ? store.prepare(`SELECT (${PERSON_MATCH}) person_id FROM (SELECT ? channel,? human_key,? sender_id) e`)
           : undefined,
         existing: store.prepare("SELECT 1 FROM inside_out WHERE interaction_id=? AND rubric=?"),
-        retryable: store.prepare(`SELECT 1 FROM inside_out
-          WHERE interaction_id=? AND rubric=? AND error IS NOT NULL AND error<>?
-          AND (? OR (error<>? AND reviewed_at<=?))`),
+        retryable: store.prepare(`SELECT 1 FROM inside_out WHERE interaction_id=? AND rubric=? AND ${RETRYABLE_GRADE}`),
         // Never let a late errored write replace a successful grade, and never revive a purge tombstone.
         save: store.prepare(`INSERT INTO inside_out (
           interaction_id,rubric,session_id,message_id,assistant_id,human_key,sender_id,channel,source,
@@ -604,7 +599,8 @@ export function reportInsideOut(path: string, options: { summary?: boolean; send
   const db = new DatabaseSync(path, { readOnly: true });
   try {
     if (!tableExists(db, "inside_out")) return [];
-    if (options.personId && !db.prepare("SELECT 1 FROM pragma_table_info('inside_out') WHERE name='person_id'").get()) return [];
+    const columns = readTableColumns(db, "inside_out");
+    if (options.personId && !columns.has("person_id")) return [];
     const where = `WHERE (? IS NULL OR session_id=?) AND (? IS NULL OR sender_id=?) AND (? IS NULL OR target_at>=?)${options.emotion ? ` AND ${options.emotion}>=?` : ""}${options.personId ? " AND person_id=?" : ""}`;
     const params = [options.sessionId ?? null, options.sessionId ?? null, options.sender ?? null, options.sender ?? null, options.since ?? null, options.since ?? null,
       ...(options.emotion ? [min] : []), ...(options.personId ? [options.personId] : [])];
@@ -614,10 +610,9 @@ export function reportInsideOut(path: string, options: { summary?: boolean; send
       .map((row): Record<string, unknown> => deviation ? { ...row, personal_deviation: deviation(row, options.deviationHistory),
         personal_intensity: intensity!(row) } : row);
     const bucket = options.bucket === "week" ? "date(target_at/1000,'unixepoch','-6 days','weekday 1')" : "date(target_at/1000,'unixepoch')";
-    const columns = new Set(db.prepare("SELECT name FROM pragma_table_info('inside_out')").all().map(row => row.name));
     // Absolute levels per bucket. Intensity averages only rows that have one; `intensity_interactions` says how many.
     const absolute = [
-      `avg(${columns.has("valence") ? `coalesce(valence,${INSIDE_OUT_VALENCE_SQL})` : INSIDE_OUT_VALENCE_SQL}) valence`,
+      `avg(${insideOutValenceSql(columns.has("valence"))}) valence`,
       ...(columns.has("intensity") ? ["avg(intensity) intensity", "count(intensity) intensity_interactions"] : []),
     ].join(",");
     return db.prepare(`SELECT human_key,channel,rubric,model,${bucket} bucket,count(*) interactions,

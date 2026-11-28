@@ -9,8 +9,9 @@ import { readPathSalience } from "./emotional-salience.js";
 import { redactSecrets, WORKSPACE_AUDIENCE } from "./expectations-store.js";
 import { tableExists } from "./memory-database.js";
 import { ensureMemoryCrystalsSchema, recordCoreMemory } from "./memory-crystals.js";
+import { claimMissStatus, createStewardFence, releaseFencedClaim } from "./steward-pass.js";
 import type { StewardRunner, StewardUsage } from "./steward-runner.js";
-import { startWorkHeartbeat, WorkFenceLostError, type WorkClaim, type WorkStore } from "./work-store.js";
+import type { WorkClaim, WorkStore } from "./work-store.js";
 
 export const CRYSTALS_KIND = "memory_crystals";
 export const CRYSTALS_DEFAULTS = {
@@ -229,6 +230,31 @@ function matchCrystal(crystals: readonly Crystal[], inputDigest: string, evidenc
   return best;
 }
 
+type PathSalience = ReadonlyMap<string, { salienceScore: number; highSalience: boolean }>;
+
+/**
+ * The evidence sent for one cluster, in prompt order: up to `reserved` high-salience non-representative members
+ * (strongest first), then the representative sample filling the remaining slots, each redacted. `peak` is the cluster's
+ * strongest high-salience grade (`0` = none). Only the configured high-salience gate counts; a routine nonzero grade
+ * never moves evidence.
+ */
+function rankCrystalEvidence(members: readonly EvidenceCandidate[], salience: PathSalience, memberLimit: number, reserved: number):
+  { evidence: Evidence[]; peak: number } {
+  const scored = members.map((item, index) => ({ item, index, salience: Math.max(0, ...item.paths.map(path => {
+    const signal = salience.get(path);
+    return signal?.highSalience ? signal.salienceScore : 0;
+  })) }));
+  const peak = scored.reduce((max, entry) => Math.max(max, entry.salience), 0);
+  // Representatives keep their native order and the top slots, so a new grade swaps at most the bounded reserve
+  // and the input digest stays stable across passes.
+  const flashbulb = scored.filter(({ item, salience }) => !item.representative && salience > 0)
+    .sort((a, b) => b.salience - a.salience || a.index - b.index).slice(0, Math.min(reserved, memberLimit));
+  const representatives = scored.filter(({ item }) => item.representative).slice(0, memberLimit - flashbulb.length);
+  const evidence: Evidence[] = [...flashbulb, ...representatives]
+    .map(({ item: { paths: _paths, representative: _representative, ...item } }) => ({ ...item, text: redactSecrets(item.member.text) }));
+  return { evidence, peak };
+}
+
 type Plan = { id: string; inputDigest: string; clusterId: string; brightness: number;
   synthesis?: { title: string; summary: string; citations: Evidence[]; corpora: string[] } };
 
@@ -339,21 +365,19 @@ export async function runCrystalsPass(options: CrystalsPassOptions): Promise<Cry
   const targetDueAt = startedAt + intervalMinutes * MINUTE_MS;
   const key = { kind: CRYSTALS_KIND, scope: agentId, mode: "run" } as const;
   let claim: WorkClaim | undefined;
-  let heartbeat: ReturnType<typeof startWorkHeartbeat> | undefined;
-  const fence = new AbortController();
-  const signal = options.signal ? AbortSignal.any([options.signal, fence.signal]) : fence.signal;
+  const fence = createStewardFence(workStore, { signal: options.signal, leaseMs, heartbeatMs, now });
+  const { signal } = fence;
 
   try {
     workStore.enqueue({ ...key, now: startedAt });
     claim = workStore.claim({ ...key, owner: options.owner, leaseMs, now: startedAt, ...(options.ignoreDueAt ? { ignoreDueAt: true } : {}) });
     if (!claim) {
-      const item = workStore.get(key.kind, key.scope);
-      nextDueAt = item?.dueAt;
-      return result({ status: item?.status === "running" ? "already_running" : "not_due" });
+      const miss = claimMissStatus(workStore, key);
+      nextDueAt = miss.dueAt;
+      return result({ status: miss.status });
     }
     const held = claim;
-    heartbeat = startWorkHeartbeat(workStore, held, { leaseMs, intervalMs: heartbeatMs, now,
-      onFenceLost: error => fence.abort(error), onError: error => fence.abort(error) });
+    fence.startHeartbeat(held);
     const watermark: unknown = held.artifactJson === null ? undefined : JSON.parse(held.artifactJson);
     if (watermark !== undefined && !Value.Check(WATERMARK, watermark)) throw new Error("Invalid crystals watermark");
     const lastReclusterAtMs = watermark?.lastReclusterAtMs;
@@ -398,32 +422,22 @@ export async function runCrystalsPass(options: CrystalsPassOptions): Promise<Cry
       }
       signal.throwIfAborted();
       // Only after every alias and member passed ACL do we read salience for those sources, and never grades from the future.
-      const salience = prioritizeEmotionalSalience && paths.size
+      const salience: PathSalience = prioritizeEmotionalSalience && paths.size
         ? readPathSalience(workStore.db, agentId, [...paths], { nowMs: startedAt,
           ...(options.baselineMinInteractions !== undefined ? { baselineMinInteractions: options.baselineMinInteractions } : {}) })
-        : new Map<string, { salienceScore: number; highSalience: boolean }>();
+        : new Map();
       const reserved = Math.max(1, Math.floor(memberLimit * EMOTION_SLOT_SHARE));
-      const ranked = candidates.map(({ cluster, members }) => {
-        // Only the configured high-salience gate counts; a routine nonzero grade never moves evidence.
-        const scored = members.map((item, index) => ({ item, index, salience: Math.max(0, ...item.paths.map(path => {
-          const signal = salience.get(path);
-          return signal?.highSalience ? signal.salienceScore : 0;
-        })) }));
-        const peak = scored.reduce((max, entry) => Math.max(max, entry.salience), 0);
-        // Representatives keep their native order and the top slots, so a new grade swaps at most the bounded reserve
-        // and the input digest stays stable across passes.
-        const flashbulb = scored.filter(({ item, salience }) => !item.representative && salience > 0)
-          .sort((a, b) => b.salience - a.salience || a.index - b.index).slice(0, Math.min(reserved, memberLimit));
-        const representatives = scored.filter(({ item }) => item.representative).slice(0, memberLimit - flashbulb.length);
-        const evidence: Evidence[] = [...flashbulb, ...representatives]
-          .map(({ item: { paths: _paths, representative: _representative, ...item } }) => ({ ...item, text: redactSecrets(item.member.text) }));
-        return { cluster, evidence, peak };
-      });
+      const ranked = candidates.map(({ cluster, members }) => ({ cluster, ...rankCrystalEvidence(members, salience, memberLimit, reserved) }));
       if (maxClustersPerRun > 0 && ranked.some(entry => entry.peak > 0)) {
         // Native analysis orders by size. The bounded boost can move close peers ahead, not swamp cluster size.
         const priority = ({ cluster, peak }: typeof ranked[number]) => Math.log1p(cluster.size) + 0.1 * peak;
         ranked.sort((a, b) => priority(b) - priority(a));
       }
+      const addPlan = (plan: Plan) => {
+        plans.push(plan);
+        plannedIds.add(plan.id);
+        plannedDigests.add(plan.inputDigest);
+      };
       // No further model calls after a credential fault; unchanged crystals still re-verify (and renew) for free.
       let modelUnavailable = false;
       // The cap counts synthesis attempts only: unchanged, private or ineligible clusters never consume the budget.
@@ -444,9 +458,7 @@ export async function runCrystalsPass(options: CrystalsPassOptions): Promise<Cry
         if (prior?.status === "retired") continue;
         const plan = { id, inputDigest, clusterId, brightness };
         if (prior?.inputDigest === inputDigest) {
-          plans.push(plan);
-          plannedIds.add(id);
-          plannedDigests.add(inputDigest);
+          addPlan(plan);
           continue;
         }
 
@@ -473,9 +485,7 @@ export async function runCrystalsPass(options: CrystalsPassOptions): Promise<Cry
         const title = redactSecrets(completion.data.title).trim(), summary = redactSecrets(completion.data.summary).trim();
         if (!citations.length || !title || !summary) continue;
         const corpora = [...new Set(evidence.flatMap(member => member.corpora))].sort();
-        plans.push({ ...plan, synthesis: { title, summary, citations, corpora } });
-        plannedIds.add(id);
-        plannedDigests.add(inputDigest);
+        addPlan({ ...plan, synthesis: { title, summary, citations, corpora } });
       }
     }
 
@@ -490,20 +500,17 @@ export async function runCrystalsPass(options: CrystalsPassOptions): Promise<Cry
     nextDueAt = targetDueAt;
     return result({ status: "ok" });
   } catch (error) {
-    if (error instanceof WorkFenceLostError || fence.signal.reason instanceof WorkFenceLostError) return result({ status: "failed", reason: "fence_lost" });
+    if (fence.lost(error)) return result({ status: "failed", reason: "fence_lost" });
     if (options.signal?.aborted) return release("aborted", "aborted");
     return release("failed", redactSecrets(error instanceof Error ? error.message : String(error)));
-  } finally { heartbeat?.stop(); }
+  } finally { fence.stopHeartbeat(); }
 
   function release(status: "failed" | "aborted", reason: string): CrystalsPassResult {
     if (claim) {
-      try {
-        workStore.fail(claim, { error: reason, retryAt: targetDueAt, usageJson: usage && JSON.stringify(usage), now: now() });
-        nextDueAt = targetDueAt;
-      } catch (error) {
-        if (!(error instanceof WorkFenceLostError)) throw error;
+      if (!releaseFencedClaim(workStore, claim, { error: reason, retryAt: targetDueAt, usageJson: usage && JSON.stringify(usage), now: now() })) {
         return result({ status: "failed", reason: "fence_lost" });
       }
+      nextDueAt = targetDueAt;
     }
     return result(status === "aborted" ? { status } : { status, reason });
   }
